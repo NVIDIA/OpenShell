@@ -4196,15 +4196,15 @@ async fn handle_forward_proxy(
                 dst_host = %host_lc,
                 dst_port = port,
                 error = %e,
-                "token grant failed in forward proxy"
+                "credential injection failed in forward proxy"
             );
             respond(
                 client,
                 &build_json_error_response(
                     502,
                     "Bad Gateway",
-                    "token_grant_failed",
-                    "dynamic token grant failed",
+                    "credential_injection_failed",
+                    "credential injection failed",
                 ),
             )
             .await?;
@@ -7144,6 +7144,60 @@ network_policies:
         assert!(err.to_string().contains("Token grant failed"));
         assert!(err.to_string().contains("oauth unavailable"));
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
+    }
+
+    #[tokio::test]
+    async fn forward_proxy_rejects_placeholder_profile_collision() {
+        // Build a static credential context (no token grant) for the forward
+        // proxy.  The request already contains a placeholder-based value for
+        // Authorization, which should trigger the fail-closed collision check.
+        let env_var = "MY_API_TOKEN";
+        let (_, resolver) = SecretResolver::from_provider_env(
+            std::iter::once((env_var.to_string(), "secret-value".to_string())).collect(),
+        );
+        let key = "api.example.test\t8080\t\tprovider:api_token";
+        let mut dynamic_credentials = std::collections::HashMap::new();
+        dynamic_credentials.insert(
+            key.to_string(),
+            openshell_core::proto::ProviderProfileCredential {
+                name: "api_token".to_string(),
+                env_vars: vec![env_var.to_string()],
+                auth_style: "bearer".to_string(),
+                header_name: "Authorization".to_string(),
+                token_grant: None,
+                ..Default::default()
+            },
+        );
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: resolver.map(Arc::new),
+            activity_tx: None,
+            dynamic_credentials: Some(Arc::new(std::sync::RwLock::new(dynamic_credentials))),
+            token_grant_resolver: None,
+        };
+
+        let raw = format!(
+            "GET http://api.example.test:8080/data HTTP/1.1\r\n\
+             Host: api.example.test:8080\r\n\
+             Authorization: Bearer {}MY_API_TOKEN\r\n\
+             Connection: close\r\n\r\n",
+            openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC,
+        )
+        .into_bytes();
+
+        let err = inject_token_grant_for_forward_request("GET", "/data", raw, &ctx)
+            .await
+            .expect_err("placeholder/profile collision must fail closed in forward proxy");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("placeholder"),
+            "error should mention placeholder conflict, got: {msg}"
+        );
     }
 
     #[test]

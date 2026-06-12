@@ -414,8 +414,13 @@ async fn apply_minted_credential(
     } else {
         updated.credential_expires_at_ms.remove(credential_key);
     }
-    crate::grpc::provider::validate_provider_update_against_attached_sandboxes(store, &updated)
-        .await?;
+    let providers_v2_enabled = crate::grpc::policy::is_providers_v2_enabled(store).await;
+    crate::grpc::provider::validate_provider_update_against_attached_sandboxes(
+        store,
+        &updated,
+        providers_v2_enabled,
+    )
+    .await?;
     store
         .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
             current

@@ -5,6 +5,7 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
+use crate::grpc::policy::is_providers_v2_enabled;
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
 };
@@ -222,6 +223,9 @@ pub(super) async fn update_provider_record(
         provider.credential_expires_at_ms,
     );
 
+    // check the providers_v2_enabled flag, which affects provider validation
+    let providers_v2_enabled = is_providers_v2_enabled(store).await;
+
     // Validate BEFORE writing to prevent persisting invalid state.
     // Validate only the mutable fields (credentials/config) plus metadata and
     // attached-sandbox invariants. The immutable name/type are carried forward
@@ -230,7 +234,8 @@ pub(super) async fn update_provider_record(
     // #1347.
     super::validation::validate_object_metadata(candidate.metadata.as_ref(), "provider")?;
     validate_provider_mutable_fields(&candidate)?;
-    validate_provider_update_against_attached_sandboxes(store, &candidate).await?;
+    validate_provider_update_against_attached_sandboxes(store, &candidate, providers_v2_enabled)
+        .await?;
 
     // Serialize labels for storage
     let labels_map = candidate.object_labels();
@@ -434,6 +439,7 @@ fn merge_i64_map(
 pub(super) async fn resolve_provider_environment(
     store: &Store,
     provider_names: &[String],
+    providers_v2_enabled: bool,
 ) -> Result<ProviderEnvironment, Status> {
     if provider_names.is_empty() {
         return Ok(ProviderEnvironment::default());
@@ -442,7 +448,14 @@ pub(super) async fn resolve_provider_environment(
     let mut env = std::collections::HashMap::new();
     let mut expires = std::collections::HashMap::new();
     let now_ms = crate::persistence::current_time_ms();
-    validate_provider_environment_keys_unique_at(store, provider_names, None, now_ms).await?;
+    validate_provider_environment_keys_unique_at(
+        store,
+        provider_names,
+        None,
+        now_ms,
+        providers_v2_enabled,
+    )
+    .await?;
     let registry = openshell_providers::ProviderRegistry::new();
 
     for name in provider_names {
@@ -495,7 +508,13 @@ pub(super) async fn resolve_provider_environment(
     Ok(ProviderEnvironment {
         environment: env,
         credential_expires_at_ms: expires,
-        dynamic_credentials: resolve_dynamic_credentials(store, provider_names).await?,
+        dynamic_credentials: resolve_dynamic_credentials(
+            store,
+            provider_names,
+            providers_v2_enabled,
+            now_ms,
+        )
+        .await?,
     })
 }
 
@@ -507,6 +526,8 @@ pub(super) async fn resolve_provider_environment(
 pub(super) async fn resolve_dynamic_credentials(
     store: &Store,
     provider_names: &[String],
+    providers_v2_enabled: bool,
+    now_ms: i64,
 ) -> Result<std::collections::HashMap<String, ProviderProfileCredential>, Status> {
     if provider_names.is_empty() {
         return Ok(std::collections::HashMap::new());
@@ -534,7 +555,9 @@ pub(super) async fn resolve_dynamic_credentials(
         insert_dynamic_credentials_for_profile(
             &mut dynamic_creds,
             &profile.to_proto(),
-            provider_name,
+            &provider,
+            providers_v2_enabled,
+            now_ms,
         );
     }
 
@@ -544,10 +567,13 @@ pub(super) async fn resolve_dynamic_credentials(
 fn insert_dynamic_credentials_for_profile(
     dynamic_creds: &mut std::collections::HashMap<String, ProviderProfileCredential>,
     profile: &ProviderProfile,
-    provider_name: &str,
+    provider: &Provider,
+    providers_v2_enabled: bool,
+    now_ms: i64,
 ) {
+    let provider_name = provider.object_name();
     for credential in &profile.credentials {
-        if credential.token_grant.is_none() {
+        if !can_inject_credential(credential, provider, providers_v2_enabled, now_ms) {
             continue;
         }
         for endpoint in &profile.endpoints {
@@ -817,12 +843,14 @@ fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
 pub async fn validate_provider_environment_keys_unique(
     store: &Store,
     provider_names: &[String],
+    providers_v2_enabled: bool,
 ) -> Result<(), Status> {
     validate_provider_environment_keys_unique_at(
         store,
         provider_names,
         None,
         crate::persistence::current_time_ms(),
+        providers_v2_enabled,
     )
     .await
 }
@@ -831,6 +859,7 @@ pub async fn validate_provider_credential_key_available_for_attached_sandboxes(
     store: &Store,
     provider: &Provider,
     credential_key: &str,
+    providers_v2_enabled: bool,
 ) -> Result<(), Status> {
     let mut candidate = provider.clone();
     candidate
@@ -838,12 +867,14 @@ pub async fn validate_provider_credential_key_available_for_attached_sandboxes(
         .entry(credential_key.to_string())
         .or_insert_with(|| "pending".to_string());
     candidate.credential_expires_at_ms.remove(credential_key);
-    validate_provider_update_against_attached_sandboxes(store, &candidate).await
+    validate_provider_update_against_attached_sandboxes(store, &candidate, providers_v2_enabled)
+        .await
 }
 
 pub async fn validate_provider_update_against_attached_sandboxes(
     store: &Store,
     provider: &Provider,
+    providers_v2_enabled: bool,
 ) -> Result<(), Status> {
     let provider_name = provider.object_name().to_string();
     for sandbox in sandboxes_using_provider_records(store, &provider_name).await? {
@@ -856,6 +887,7 @@ pub async fn validate_provider_update_against_attached_sandboxes(
             &spec.providers,
             Some(provider),
             crate::persistence::current_time_ms(),
+            providers_v2_enabled,
         )
         .await
         .map_err(|err| {
@@ -873,6 +905,7 @@ async fn validate_provider_environment_keys_unique_at(
     provider_names: &[String],
     candidate_provider: Option<&Provider>,
     now_ms: i64,
+    providers_v2_enabled: bool,
 ) -> Result<(), Status> {
     let mut seen = std::collections::HashMap::<String, String>::new();
     let mut dynamic_bindings = Vec::new();
@@ -899,14 +932,17 @@ async fn validate_provider_environment_keys_unique_at(
                 seen.insert(key, provider_name.clone());
             }
         }
-        dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider(store, &provider).await?);
+        dynamic_bindings.extend(
+            credential_bindings_for_provider(store, &provider, providers_v2_enabled, now_ms)
+                .await?,
+        );
     }
-    validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)?;
+    validate_credential_bindings_unambiguous(&dynamic_bindings)?;
     Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DynamicTokenGrantBinding {
+struct CredentialBinding {
     provider_name: String,
     credential_name: String,
     host: String,
@@ -915,33 +951,39 @@ struct DynamicTokenGrantBinding {
     score: u32,
 }
 
-async fn dynamic_token_grant_bindings_for_provider(
+async fn credential_bindings_for_provider(
     store: &Store,
     provider: &Provider,
-) -> Result<Vec<DynamicTokenGrantBinding>, Status> {
-    let provider_name = provider.object_name().to_string();
+    providers_v2_enabled: bool,
+    now_ms: i64,
+) -> Result<Vec<CredentialBinding>, Status> {
     let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
     let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
         return Ok(Vec::new());
     };
-    Ok(dynamic_token_grant_bindings_for_profile(
-        &provider_name,
+    Ok(credential_bindings_for_profile(
         &profile.to_proto(),
+        provider,
+        providers_v2_enabled,
+        now_ms,
     ))
 }
 
-fn dynamic_token_grant_bindings_for_profile(
-    provider_name: &str,
+fn credential_bindings_for_profile(
     profile: &ProviderProfile,
-) -> Vec<DynamicTokenGrantBinding> {
+    provider: &Provider,
+    providers_v2_enabled: bool,
+    now_ms: i64,
+) -> Vec<CredentialBinding> {
+    let provider_name = provider.object_name();
     let mut bindings = Vec::new();
     for credential in &profile.credentials {
-        if credential.token_grant.is_none() {
+        if !can_inject_credential(credential, provider, providers_v2_enabled, now_ms) {
             continue;
         }
         for endpoint in &profile.endpoints {
             for port in endpoint_ports(endpoint.port, &endpoint.ports) {
-                push_dynamic_token_grant_bindings_for_endpoint(
+                push_credential_bindings_for_endpoint(
                     &mut bindings,
                     provider_name,
                     credential,
@@ -955,15 +997,15 @@ fn dynamic_token_grant_bindings_for_profile(
     bindings
 }
 
-fn push_dynamic_token_grant_bindings_for_endpoint(
-    bindings: &mut Vec<DynamicTokenGrantBinding>,
+fn push_credential_bindings_for_endpoint(
+    bindings: &mut Vec<CredentialBinding>,
     provider_name: &str,
     credential: &ProviderProfileCredential,
     endpoint_host: &str,
     endpoint_port: u32,
     endpoint_path: &str,
 ) {
-    push_dynamic_token_grant_binding(
+    push_credential_binding(
         bindings,
         provider_name,
         &credential.name,
@@ -995,7 +1037,7 @@ fn push_dynamic_token_grant_bindings_for_endpoint(
         } else {
             override_config.path.as_str()
         };
-        push_dynamic_token_grant_binding(
+        push_credential_binding(
             bindings,
             provider_name,
             &credential.name,
@@ -1006,15 +1048,15 @@ fn push_dynamic_token_grant_bindings_for_endpoint(
     }
 }
 
-fn push_dynamic_token_grant_binding(
-    bindings: &mut Vec<DynamicTokenGrantBinding>,
+fn push_credential_binding(
+    bindings: &mut Vec<CredentialBinding>,
     provider_name: &str,
     credential_name: &str,
     host: &str,
     port: u32,
     path: &str,
 ) {
-    let candidate = DynamicTokenGrantBinding {
+    let candidate = CredentialBinding {
         provider_name: provider_name.to_string(),
         credential_name: credential_name.to_string(),
         host: host.to_ascii_lowercase(),
@@ -1027,9 +1069,7 @@ fn push_dynamic_token_grant_binding(
     }
 }
 
-fn validate_dynamic_token_grant_bindings_unambiguous(
-    bindings: &[DynamicTokenGrantBinding],
-) -> Result<(), Status> {
+fn validate_credential_bindings_unambiguous(bindings: &[CredentialBinding]) -> Result<(), Status> {
     for (index, first) in bindings.iter().enumerate() {
         for second in bindings.iter().skip(index + 1) {
             if first.provider_name == second.provider_name
@@ -1043,7 +1083,7 @@ fn validate_dynamic_token_grant_bindings_unambiguous(
                 && path_patterns_can_overlap(&first.path, &second.path)
             {
                 return Err(Status::failed_precondition(format!(
-                    "dynamic token grants for '{}:{}' and '{}:{}' are ambiguous for {}:{} path selectors '{}' and '{}'; make one host/path selector more specific or attach only one matching provider",
+                    "credentials for '{}:{}' and '{}:{}' are ambiguous for {}:{} path selectors '{}' and '{}'; make one host/path selector more specific or attach only one matching provider",
                     first.provider_name,
                     first.credential_name,
                     second.provider_name,
@@ -1079,18 +1119,27 @@ async fn active_provider_environment_keys(
     Ok(keys)
 }
 
+/// Whether a single credential key is currently active: not a non-injectable
+/// special-case key, syntactically valid as an env var, and not expired.
+///
+/// Shared between `active_provider_credential_keys` (env-var resolution) and
+/// `can_inject_credential` (static injection metadata) so the two paths always
+/// agree on which keys are live.
+fn is_credential_key_active(provider: &Provider, key: &str, now_ms: i64) -> bool {
+    provider.credentials.contains_key(key)
+        && !is_non_injectable_provider_credential(provider, key)
+        && is_valid_env_key(key)
+        && provider
+            .credential_expires_at_ms
+            .get(key)
+            .is_none_or(|expires_at_ms| *expires_at_ms <= 0 || *expires_at_ms > now_ms)
+}
+
 fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<String> {
     provider
         .credentials
         .keys()
-        .filter(|key| !is_non_injectable_provider_credential(provider, key))
-        .filter(|key| is_valid_env_key(key))
-        .filter(|key| {
-            provider
-                .credential_expires_at_ms
-                .get(*key)
-                .is_none_or(|expires_at_ms| *expires_at_ms <= 0 || *expires_at_ms > now_ms)
-        })
+        .filter(|key| is_credential_key_active(provider, key, now_ms))
         .cloned()
         .collect()
 }
@@ -1110,6 +1159,38 @@ pub(super) fn is_valid_env_key(key: &str) -> bool {
         return false;
     }
     bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+// Which static cred auth styles we currently support injecting into the sandbox
+const INJECTABLE_STATIC_AUTH_STYLES: &[&str] = &["bearer", "header"];
+
+/// Whether a credential should produce injection bindings for this provider.
+///
+/// Token grants are unconditional — they resolve via SPIFFE, not env vars.
+/// Static credentials require (a) `providers_v2` enabled, (b) a supported
+/// `auth_style`, and (c) that the provider actually has at least one of the
+/// credential's env vars populated **and active** (not expired, valid key
+/// name, not a non-injectable special-case key).  Condition (c) matters for
+/// profiles like google-vertex-ai that declare multiple credentials targeting
+/// the same header, only one of which is active at a time.  The active-key
+/// check uses `is_credential_key_active` — the same predicate used by
+/// `active_provider_credential_keys` — so the two paths always agree.
+fn can_inject_credential(
+    cred: &ProviderProfileCredential,
+    provider: &Provider,
+    providers_v2_enabled: bool,
+    now_ms: i64,
+) -> bool {
+    if cred.token_grant.is_some() {
+        return true;
+    }
+    providers_v2_enabled
+        && INJECTABLE_STATIC_AUTH_STYLES
+            .contains(&cred.auth_style.trim().to_ascii_lowercase().as_str())
+        && cred
+            .env_vars
+            .iter()
+            .any(|env| is_credential_key_active(provider, env, now_ms))
 }
 
 // ---------------------------------------------------------------------------
@@ -1728,6 +1809,7 @@ async fn profile_attached_sandbox_diagnostics(
     profiles: &[(String, ProviderTypeProfile)],
     operation: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
+    let now_ms = crate::persistence::current_time_ms();
     let mut candidate_profiles =
         std::collections::HashMap::<String, (String, ProviderProfile)>::new();
     for (source, profile) in profiles {
@@ -1748,6 +1830,9 @@ async fn profile_attached_sandbox_diagnostics(
             .then_some(sandbox)
     })
     .await?;
+
+    let providers_v2_enabled = is_providers_v2_enabled(store).await;
+
     let mut diagnostics = Vec::new();
     for sandbox in sandboxes {
         let sandbox_name = sandbox.object_name().to_string();
@@ -1766,23 +1851,33 @@ async fn profile_attached_sandbox_diagnostics(
             let profile_id =
                 normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
             if let Some((source, profile)) = candidate_profiles.get(profile_id) {
-                bindings.extend(dynamic_token_grant_bindings_for_profile(
-                    provider.object_name(),
+                bindings.extend(credential_bindings_for_profile(
                     profile,
+                    &provider,
+                    providers_v2_enabled,
+                    now_ms,
                 ));
                 let used = (source.clone(), profile_id.to_string());
                 if !imported_profiles_used.contains(&used) {
                     imported_profiles_used.push(used);
                 }
             } else {
-                bindings.extend(dynamic_token_grant_bindings_for_provider(store, &provider).await?);
+                bindings.extend(
+                    credential_bindings_for_provider(
+                        store,
+                        &provider,
+                        providers_v2_enabled,
+                        now_ms,
+                    )
+                    .await?,
+                );
             }
         }
 
         if imported_profiles_used.is_empty() {
             continue;
         }
-        if let Err(err) = validate_dynamic_token_grant_bindings_unambiguous(&bindings) {
+        if let Err(err) = validate_credential_bindings_unambiguous(&bindings) {
             for (source, profile_id) in &imported_profiles_used {
                 diagnostics.push(ProfileValidationDiagnostic {
                     source: source.clone(),
@@ -2058,10 +2153,13 @@ pub(super) async fn handle_configure_provider_refresh(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
+
+    let providers_v2_enabled = is_providers_v2_enabled(state.store.as_ref()).await;
     validate_provider_credential_key_available_for_attached_sandboxes(
         state.store.as_ref(),
         &provider,
         credential_key,
+        providers_v2_enabled,
     )
     .await?;
     let refresh_defaults =
@@ -2470,8 +2568,9 @@ mod tests {
             discovery: None,
         };
 
+        let provider = test_provider("keycloak", &[]);
         let mut dynamic_creds = HashMap::new();
-        insert_dynamic_credentials_for_profile(&mut dynamic_creds, &profile, "keycloak");
+        insert_dynamic_credentials_for_profile(&mut dynamic_creds, &profile, &provider, false, 0);
 
         assert_eq!(dynamic_creds.len(), 4);
         for (host, audience) in service_audiences {
@@ -2481,6 +2580,350 @@ mod tests {
             assert_eq!(grant.scopes, vec![audience.to_string()]);
             assert!(grant.audience_overrides.is_empty());
         }
+    }
+
+    #[test]
+    fn static_credentials_included_when_flag_enabled() {
+        let credential = ProviderProfileCredential {
+            name: "api_token".to_string(),
+            env_vars: vec!["GITHUB_TOKEN".to_string(), "GH_TOKEN".to_string()],
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            token_grant: None,
+            ..Default::default()
+        };
+        let profile = ProviderProfile {
+            id: "github".to_string(),
+            display_name: "GitHub".to_string(),
+            description: String::new(),
+            category: ProviderProfileCategory::SourceControl as i32,
+            credentials: vec![credential],
+            endpoints: vec![
+                NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+                NetworkEndpoint {
+                    host: "github.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+            ],
+            binaries: Vec::new(),
+            inference_capable: false,
+            discovery: None,
+            resource_version: 0,
+        };
+
+        let provider = test_provider("my-github", &["GITHUB_TOKEN"]);
+
+        // With flag off, no static credentials emitted.
+        let mut creds_off = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds_off, &profile, &provider, false, 0);
+        assert!(
+            creds_off.is_empty(),
+            "static credentials should be skipped when flag is false"
+        );
+
+        // With flag on, static credentials are emitted for each endpoint.
+        let mut creds_on = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds_on, &profile, &provider, true, 0);
+        assert_eq!(creds_on.len(), 2, "one entry per endpoint expected");
+
+        let api_key = dynamic_credential_key("api.github.com", 443, "", "my-github", "api_token");
+        let web_key = dynamic_credential_key("github.com", 443, "", "my-github", "api_token");
+        let api_cred = &creds_on[&api_key];
+        assert_eq!(api_cred.auth_style, "bearer");
+        assert_eq!(api_cred.env_vars, vec!["GITHUB_TOKEN", "GH_TOKEN"]);
+        assert!(api_cred.token_grant.is_none());
+        assert!(creds_on.contains_key(&web_key));
+    }
+
+    #[test]
+    fn static_credentials_flag_does_not_affect_token_grants() {
+        let credential = ProviderProfileCredential {
+            name: "access_token".to_string(),
+            env_vars: Vec::new(),
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            token_grant: Some(ProviderCredentialTokenGrant {
+                token_endpoint: "https://auth.example.com/token".to_string(),
+                audience: "api://default".to_string(),
+                jwt_svid_audience: "https://auth.example.com".to_string(),
+                client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+                    .to_string(),
+                scopes: vec!["read".to_string()],
+                cache_ttl_seconds: 300,
+                audience_overrides: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let profile = ProviderProfile {
+            id: "example".to_string(),
+            display_name: "Example".to_string(),
+            description: String::new(),
+            category: ProviderProfileCategory::Other as i32,
+            credentials: vec![credential],
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: Vec::new(),
+            inference_capable: false,
+            discovery: None,
+            resource_version: 0,
+        };
+
+        let provider = test_provider("example", &[]);
+        let mut creds_off = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds_off, &profile, &provider, false, 0);
+        let mut creds_on = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds_on, &profile, &provider, true, 0);
+
+        assert_eq!(
+            creds_off.len(),
+            1,
+            "token grant should be emitted regardless of flag"
+        );
+        assert_eq!(creds_off.len(), creds_on.len());
+        let key = dynamic_credential_key("api.example.com", 443, "", "example", "access_token");
+        assert!(creds_off[&key].token_grant.is_some());
+        assert!(creds_on[&key].token_grant.is_some());
+    }
+
+    #[test]
+    fn multi_credential_profile_without_auth_style_not_injected() {
+        // Simulates a Codex-like profile: multiple credentials, none with auth_style.
+        let credentials = vec![
+            ProviderProfileCredential {
+                name: "access_token".to_string(),
+                env_vars: vec!["CODEX_AUTH_ACCESS_TOKEN".to_string()],
+                ..Default::default()
+            },
+            ProviderProfileCredential {
+                name: "refresh_token".to_string(),
+                env_vars: vec!["CODEX_AUTH_REFRESH_TOKEN".to_string()],
+                ..Default::default()
+            },
+            ProviderProfileCredential {
+                name: "account_id".to_string(),
+                env_vars: vec!["CODEX_AUTH_ACCOUNT_ID".to_string()],
+                ..Default::default()
+            },
+        ];
+        let profile = ProviderProfile {
+            id: "codex-like".to_string(),
+            display_name: "Codex-like".to_string(),
+            credentials,
+            endpoints: vec![
+                NetworkEndpoint {
+                    host: "api.openai.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+                NetworkEndpoint {
+                    host: "auth.openai.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let provider = test_provider("codex-like", &[]);
+        let mut creds = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds, &profile, &provider, true, 0);
+
+        assert!(
+            creds.is_empty(),
+            "credentials without explicit auth_style should not be injected even with v2 enabled"
+        );
+    }
+
+    #[test]
+    fn vertex_only_active_token_source_produces_bindings() {
+        // Simulates google-vertex-ai: two credentials both target Authorization
+        // on the same endpoints, but only one has an active env var in the
+        // provider.  Without the active-env-var gate, both would emit bindings
+        // and cause a false ambiguity rejection.
+        let sa_credential = ProviderProfileCredential {
+            name: "service_account_token".to_string(),
+            env_vars: vec![
+                "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
+                "VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
+            ],
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            token_grant: None,
+            ..Default::default()
+        };
+        let adc_credential = ProviderProfileCredential {
+            name: "gcloud_adc_token".to_string(),
+            env_vars: vec![
+                "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+                "VERTEX_AI_TOKEN".to_string(),
+            ],
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            token_grant: None,
+            ..Default::default()
+        };
+        let profile = ProviderProfile {
+            id: "google-vertex-ai".to_string(),
+            display_name: "Google Vertex AI".to_string(),
+            credentials: vec![sa_credential, adc_credential],
+            endpoints: vec![NetworkEndpoint {
+                host: "us-central1-aiplatform.googleapis.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Only the service-account token is active.
+        let provider = test_provider("my-vertex", &["GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"]);
+        let mut creds = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds, &profile, &provider, true, 0);
+        assert_eq!(
+            creds.len(),
+            1,
+            "only the active credential should produce a binding"
+        );
+        let key = dynamic_credential_key(
+            "us-central1-aiplatform.googleapis.com",
+            443,
+            "",
+            "my-vertex",
+            "service_account_token",
+        );
+        assert!(creds.contains_key(&key));
+
+        // Neither token source is active — no bindings at all.
+        let provider_none = test_provider("my-vertex", &[]);
+        let mut creds_none = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds_none, &profile, &provider_none, true, 0);
+        assert!(
+            creds_none.is_empty(),
+            "no bindings when no active env var is present"
+        );
+    }
+
+    #[test]
+    fn expired_static_credential_excluded_from_bindings() {
+        // Simulates google-vertex-ai with two token sources targeting the same
+        // header on the same endpoint.  One token source is expired and the
+        // other is active.  Only the active one should produce bindings —
+        // matching the filtering done by active_provider_credential_keys.
+        let sa_credential = ProviderProfileCredential {
+            name: "service_account_token".to_string(),
+            env_vars: vec!["VERTEX_SA_TOKEN".to_string()],
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            token_grant: None,
+            ..Default::default()
+        };
+        let adc_credential = ProviderProfileCredential {
+            name: "gcloud_adc_token".to_string(),
+            env_vars: vec!["VERTEX_ADC_TOKEN".to_string()],
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            token_grant: None,
+            ..Default::default()
+        };
+        let profile = ProviderProfile {
+            id: "google-vertex-ai".to_string(),
+            display_name: "Google Vertex AI".to_string(),
+            credentials: vec![sa_credential, adc_credential],
+            endpoints: vec![NetworkEndpoint {
+                host: "us-central1-aiplatform.googleapis.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let now_ms = 1_000_000;
+        // Both keys present, but VERTEX_SA_TOKEN is expired.
+        let mut provider = test_provider("my-vertex", &["VERTEX_SA_TOKEN", "VERTEX_ADC_TOKEN"]);
+        provider.credential_expires_at_ms = [
+            ("VERTEX_SA_TOKEN".to_string(), now_ms - 60_000),
+            ("VERTEX_ADC_TOKEN".to_string(), now_ms + 60_000),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut creds = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds, &profile, &provider, true, now_ms);
+        assert_eq!(
+            creds.len(),
+            1,
+            "only the non-expired credential should produce a binding"
+        );
+        let key = dynamic_credential_key(
+            "us-central1-aiplatform.googleapis.com",
+            443,
+            "",
+            "my-vertex",
+            "gcloud_adc_token",
+        );
+        assert!(
+            creds.contains_key(&key),
+            "active (non-expired) credential should produce binding"
+        );
+
+        // Both expired — no bindings at all.
+        provider.credential_expires_at_ms = [
+            ("VERTEX_SA_TOKEN".to_string(), now_ms - 60_000),
+            ("VERTEX_ADC_TOKEN".to_string(), now_ms - 30_000),
+        ]
+        .into_iter()
+        .collect();
+        let mut creds_expired = HashMap::new();
+        insert_dynamic_credentials_for_profile(
+            &mut creds_expired,
+            &profile,
+            &provider,
+            true,
+            now_ms,
+        );
+        assert!(
+            creds_expired.is_empty(),
+            "no bindings when all credentials are expired"
+        );
+    }
+
+    async fn import_static_credential_profile(
+        state: &Arc<ServerState>,
+        id: &str,
+        host: &str,
+        port: u32,
+        path: &str,
+    ) {
+        // Derive env_var from profile id so it matches the credential key in
+        // create_static_credential_provider (which uses provider_type = id).
+        let env_var = format!("{}_TOKEN", id.to_ascii_uppercase().replace('-', "_"));
+        let mut profile = custom_profile(id);
+        profile.credentials = vec![static_credential("api_token", &env_var, true)];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: host.to_string(),
+            port,
+            path: path.to_string(),
+            protocol: "rest".to_string(),
+            ..Default::default()
+        }];
+        handle_import_provider_profiles(
+            state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: format!("{id}.yaml"),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
     }
 
     async fn import_token_grant_profile(
@@ -2537,6 +2980,60 @@ mod tests {
         .unwrap()
     }
 
+    async fn create_static_credential_provider(
+        store: &Store,
+        name: &str,
+        provider_type: &str,
+    ) -> Provider {
+        // Derive the credential key from provider_type to match the profile's
+        // env_var (import_static_credential_profile uses the same derivation).
+        // Different profile ids produce unique env_vars, avoiding the env-key
+        // uniqueness check while still satisfying can_inject_credential's
+        // active-env-var gate.
+        let credential_key = format!(
+            "{}_TOKEN",
+            provider_type.to_ascii_uppercase().replace('-', "_")
+        );
+        create_provider_record(
+            store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: provider_type.to_string(),
+                credentials: std::iter::once((credential_key, "secret".to_string())).collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Build a minimal `Provider` for unit tests that don't need store persistence.
+    fn test_provider(name: &str, credential_keys: &[&str]) -> Provider {
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: name.to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: String::new(),
+            credentials: credential_keys
+                .iter()
+                .map(|k| (k.to_string(), "secret".to_string()))
+                .collect(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+        }
+    }
+
     #[tokio::test]
     async fn dynamic_token_grants_reject_equal_specificity_overlap() {
         let state = test_server_state().await;
@@ -2549,12 +3046,13 @@ mod tests {
         let err = validate_provider_environment_keys_unique(
             store,
             &["provider-a".to_string(), "provider-b".to_string()],
+            false,
         )
         .await
         .expect_err("equal-specificity dynamic grants should be ambiguous");
 
         assert_eq!(err.code(), Code::FailedPrecondition);
-        assert!(err.message().contains("dynamic token grants"));
+        assert!(err.message().contains("credential"));
         assert!(err.message().contains("ambiguous"));
     }
 
@@ -2577,9 +3075,81 @@ mod tests {
         validate_provider_environment_keys_unique(
             store,
             &["provider-default".to_string(), "provider-admin".to_string()],
+            false,
         )
         .await
         .expect("more-specific path should make dynamic grants deterministic");
+    }
+
+    #[tokio::test]
+    async fn static_credentials_reject_equal_specificity_overlap() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_static_credential_profile(&state, "static-a", "api.example.com", 443, "").await;
+        import_static_credential_profile(&state, "static-b", "api.example.com", 443, "").await;
+        create_static_credential_provider(store, "provider-static-a", "static-a").await;
+        create_static_credential_provider(store, "provider-static-b", "static-b").await;
+
+        let err = validate_provider_environment_keys_unique(
+            store,
+            &[
+                "provider-static-a".to_string(),
+                "provider-static-b".to_string(),
+            ],
+            true,
+        )
+        .await
+        .expect_err("equal-specificity static credentials should be ambiguous");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("credential"));
+        assert!(err.message().contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn static_credentials_not_checked_when_v2_disabled() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_static_credential_profile(&state, "static-c", "api.example.com", 443, "").await;
+        import_static_credential_profile(&state, "static-d", "api.example.com", 443, "").await;
+        create_static_credential_provider(store, "provider-static-c", "static-c").await;
+        create_static_credential_provider(store, "provider-static-d", "static-d").await;
+
+        validate_provider_environment_keys_unique(
+            store,
+            &[
+                "provider-static-c".to_string(),
+                "provider-static-d".to_string(),
+            ],
+            false,
+        )
+        .await
+        .expect("static credential overlap should not be checked when v2 is disabled");
+    }
+
+    #[tokio::test]
+    async fn static_vs_token_grant_reject_equal_specificity_overlap() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_static_credential_profile(&state, "static-mixed", "api.example.com", 443, "/v1/**")
+            .await;
+        import_token_grant_profile(&state, "grant-mixed", "api.example.com", 443, "/v1/**").await;
+        create_static_credential_provider(store, "provider-static-mixed", "static-mixed").await;
+        create_empty_token_grant_provider(store, "provider-grant-mixed", "grant-mixed").await;
+
+        let err = validate_provider_environment_keys_unique(
+            store,
+            &[
+                "provider-static-mixed".to_string(),
+                "provider-grant-mixed".to_string(),
+            ],
+            true,
+        )
+        .await
+        .expect_err("static vs token grant at equal specificity should be ambiguous");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("ambiguous"));
     }
 
     #[tokio::test]
@@ -4978,7 +5548,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = test_store().await;
-        let result = resolve_provider_environment(&store, &[]).await.unwrap();
+        let result = resolve_provider_environment(&store, &[], false)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -5009,7 +5581,7 @@ mod tests {
         };
         create_provider_record(&store, provider).await.unwrap();
 
-        let result = resolve_provider_environment(&store, &["claude-local".to_string()])
+        let result = resolve_provider_environment(&store, &["claude-local".to_string()], false)
             .await
             .unwrap();
         assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
@@ -5027,7 +5599,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["static-provider".to_string()])
+        let result = resolve_provider_environment(&store, &["static-provider".to_string()], false)
             .await
             .unwrap();
 
@@ -5064,9 +5636,10 @@ mod tests {
         };
         create_provider_record(&store, provider).await.unwrap();
 
-        let result = resolve_provider_environment(&store, &["expiring-provider".to_string()])
-            .await
-            .unwrap();
+        let result =
+            resolve_provider_environment(&store, &["expiring-provider".to_string()], false)
+                .await
+                .unwrap();
         assert_eq!(result.get("FRESH_TOKEN"), Some(&"fresh".to_string()));
         assert!(!result.contains_key("STALE_TOKEN"));
         assert_eq!(
@@ -5078,7 +5651,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_provider_env_unknown_name_returns_error() {
         let store = test_store().await;
-        let err = resolve_provider_environment(&store, &["nonexistent".to_string()])
+        let err = resolve_provider_environment(&store, &["nonexistent".to_string()], false)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
@@ -5109,7 +5682,7 @@ mod tests {
         };
         create_provider_record(&store, provider).await.unwrap();
 
-        let result = resolve_provider_environment(&store, &["test-provider".to_string()])
+        let result = resolve_provider_environment(&store, &["test-provider".to_string()], false)
             .await
             .unwrap();
         assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
@@ -5165,6 +5738,7 @@ mod tests {
         let result = resolve_provider_environment(
             &store,
             &["claude-local".to_string(), "gitlab-local".to_string()],
+            false,
         )
         .await
         .unwrap();
@@ -5220,6 +5794,7 @@ mod tests {
         let err = resolve_provider_environment(
             &store,
             &["provider-a".to_string(), "provider-b".to_string()],
+            false,
         )
         .await
         .unwrap_err();
@@ -5263,7 +5838,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["vertex-local".to_string()])
+        let result = resolve_provider_environment(&store, &["vertex-local".to_string()], false)
             .await
             .unwrap();
 
@@ -5336,7 +5911,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["vertex-bootstrap".to_string()])
+        let result = resolve_provider_environment(&store, &["vertex-bootstrap".to_string()], false)
             .await
             .unwrap();
 
@@ -5373,7 +5948,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["vertex-no-config".to_string()])
+        let result = resolve_provider_environment(&store, &["vertex-no-config".to_string()], false)
             .await
             .unwrap();
 
@@ -5431,7 +6006,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["vertex-collision".to_string()])
+        let result = resolve_provider_environment(&store, &["vertex-collision".to_string()], false)
             .await
             .unwrap();
 
@@ -5465,7 +6040,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["openai-local".to_string()])
+        let result = resolve_provider_environment(&store, &["openai-local".to_string()], false)
             .await
             .unwrap();
 
@@ -5623,7 +6198,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let env = resolve_provider_environment(&store, &spec.providers, false)
             .await
             .unwrap();
 
@@ -5656,7 +6231,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let env = resolve_provider_environment(&store, &spec.providers, false)
             .await
             .unwrap();
 

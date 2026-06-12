@@ -1220,8 +1220,12 @@ pub(super) async fn handle_get_sandbox_config(
 
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
     let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
-    let provider_env_revision =
-        compute_provider_env_revision(state.store.as_ref(), &sandbox_provider_names).await?;
+    let provider_env_revision = compute_provider_env_revision(
+        state.store.as_ref(),
+        &sandbox_provider_names,
+        providers_v2_enabled,
+    )
+    .await?;
 
     Ok(Response::new(GetSandboxConfigResponse {
         policy,
@@ -1238,9 +1242,11 @@ pub(super) async fn handle_get_sandbox_config(
 pub(super) async fn compute_provider_env_revision(
     store: &Store,
     provider_names: &[String],
+    providers_v2_enabled: bool,
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
     hasher.update(b"openshell-provider-env-revision-v1");
+    hasher.update([u8::from(providers_v2_enabled)]);
 
     for provider_name in provider_names {
         hasher.update(provider_name.as_bytes());
@@ -1367,6 +1373,16 @@ async fn profile_provider_policy_layers(
     Ok(layers)
 }
 
+pub async fn is_providers_v2_enabled(store: &Store) -> bool {
+    load_global_settings(store)
+        .await
+        .and_then(|s| bool_setting_enabled(&s, settings::PROVIDERS_V2_ENABLED_KEY))
+        .unwrap_or_else(|e| {
+            warn!("failed to read providers_v2_enabled setting, defaulting to false: {e}");
+            false
+        })
+}
+
 fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
     match settings.settings.get(key) {
         None => Ok(false),
@@ -1408,12 +1424,19 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .spec
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
+    let providers_v2_enabled = is_providers_v2_enabled(state.store.as_ref()).await;
+
     let provider_names = spec.providers;
     let provider_env_revision =
-        compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
-    let provider_environment =
-        super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
+        compute_provider_env_revision(state.store.as_ref(), &provider_names, providers_v2_enabled)
             .await?;
+
+    let provider_environment = super::provider::resolve_provider_environment(
+        state.store.as_ref(),
+        &provider_names,
+        providers_v2_enabled,
+    )
+    .await?;
 
     info!(
         sandbox_id = %sandbox_id,
@@ -5171,10 +5194,13 @@ mod tests {
             .await
             .unwrap();
 
-        let first =
-            compute_provider_env_revision(state.store.as_ref(), &["work-custom-token".to_string()])
-                .await
-                .unwrap();
+        let first = compute_provider_env_revision(
+            state.store.as_ref(),
+            &["work-custom-token".to_string()],
+            false,
+        )
+        .await
+        .unwrap();
 
         tokio::time::sleep(Duration::from_millis(2)).await;
         let mut rotated_profile = token_grant_profile("https://auth.example.com/rotated-token")
@@ -5204,14 +5230,40 @@ mod tests {
         .await
         .unwrap();
 
-        let second =
-            compute_provider_env_revision(state.store.as_ref(), &["work-custom-token".to_string()])
-                .await
-                .unwrap();
+        let second = compute_provider_env_revision(
+            state.store.as_ref(),
+            &["work-custom-token".to_string()],
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_ne!(
             first, second,
             "custom provider profile updates must trigger sandbox dynamic credential refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_env_revision_changes_when_providers_v2_enabled_toggles() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        let provider = test_provider("work-github", "github");
+        store.put_message(&provider).await.unwrap();
+
+        let revision_v2_off =
+            compute_provider_env_revision(store, &["work-github".to_string()], false)
+                .await
+                .unwrap();
+
+        let revision_v2_on =
+            compute_provider_env_revision(store, &["work-github".to_string()], true)
+                .await
+                .unwrap();
+
+        assert_ne!(
+            revision_v2_off, revision_v2_on,
+            "toggling providers_v2_enabled must change provider_env_revision so running sandboxes refresh"
         );
     }
 

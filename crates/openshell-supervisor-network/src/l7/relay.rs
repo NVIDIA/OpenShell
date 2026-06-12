@@ -450,8 +450,23 @@ where
         let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+            let req_with_auth =
+                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
+                    Ok(req) => req,
+                    Err(e) => {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %e,
+                            "credential injection failed in route-selected L7 relay"
+                        );
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
+
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
-                &req,
+                &req_with_auth,
                 client,
                 upstream,
                 crate::l7::rest::RelayRequestOptions {
@@ -480,7 +495,7 @@ where
                         ctx,
                         websocket_request,
                         &redacted_target,
-                        &req.query_params,
+                        &req_with_auth.query_params,
                         Some(&engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
@@ -911,7 +926,7 @@ where
                             host = %ctx.host,
                             port = ctx.port,
                             error = %e,
-                            "Token grant failed in L7 relay"
+                            "credential injection failed in L7 relay"
                         );
                         write_bad_gateway_response(client).await?;
                         return Ok(());
@@ -1336,8 +1351,23 @@ where
         let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+            let req_with_auth =
+                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
+                    Ok(req) => req,
+                    Err(e) => {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %e,
+                            "credential injection failed in GraphQL L7 relay"
+                        );
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
+
             let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
-                &req,
+                &req_with_auth,
                 client,
                 upstream,
                 ctx.secret_resolver.as_deref(),
@@ -1764,7 +1794,7 @@ where
                     host = %ctx.host,
                     port = ctx.port,
                     error = %e,
-                    "Token grant failed in passthrough relay"
+                    "credential injection failed in passthrough relay"
                 );
                 write_bad_gateway_response(client).await?;
                 return Ok(());

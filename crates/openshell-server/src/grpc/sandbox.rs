@@ -10,6 +10,7 @@
 #![allow(clippy::cast_possible_wrap)] // Intentional u32->i32 conversions for proto compat
 
 use crate::ServerState;
+use crate::grpc::policy::is_providers_v2_enabled;
 use crate::persistence::{ObjectType, WriteCondition, generate_name};
 use futures::future;
 use openshell_core::proto::{
@@ -149,7 +150,13 @@ async fn handle_create_sandbox_inner(
             .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
     }
-    validate_provider_environment_keys_unique(state.store.as_ref(), &spec.providers).await?;
+    let providers_v2_enabled = is_providers_v2_enabled(state.store.as_ref()).await;
+    validate_provider_environment_keys_unique(
+        state.store.as_ref(),
+        &spec.providers,
+        providers_v2_enabled,
+    )
+    .await?;
 
     // Ensure the template always carries the resolved image.
     let mut spec = spec;
@@ -356,8 +363,13 @@ pub(super) async fn handle_attach_sandbox_provider(
         candidate_spec.providers.push(request.provider_name.clone());
     }
     validate_sandbox_spec(&request.sandbox_name, &candidate_spec)?;
-    validate_provider_environment_keys_unique(state.store.as_ref(), &candidate_spec.providers)
-        .await?;
+    let providers_v2_enabled = is_providers_v2_enabled(state.store.as_ref()).await;
+    validate_provider_environment_keys_unique(
+        state.store.as_ref(),
+        &candidate_spec.providers,
+        providers_v2_enabled,
+    )
+    .await?;
 
     let provider_name = request.provider_name.clone();
     let attached = Arc::new(AtomicBool::new(false));

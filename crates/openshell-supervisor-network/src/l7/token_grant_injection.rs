@@ -65,95 +65,241 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
 /// Checks for endpoint-bound token grant credentials and injects an
 /// Authorization header before forwarding the request upstream.
 pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
-    let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
-    let token_grant_credential = ctx.dynamic_credentials.as_ref().and_then(|dyn_creds| {
+    let request_path = req
+        .target
+        .split('?')
+        .next()
+        .unwrap_or(req.target.as_str())
+        .to_string();
+    let matched_credential = ctx.dynamic_credentials.as_ref().and_then(|dyn_creds| {
         dyn_creds.read().map_or(None, |creds_guard| {
             creds_guard
                 .iter()
                 .filter_map(|(key, cred)| {
-                    let score =
-                        dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)?;
-                    cred.token_grant
-                        .is_some()
-                        .then(|| (score, key.clone(), cred.clone()))
+                    let score = dynamic_credential_key_match_score(
+                        key,
+                        &ctx.host,
+                        ctx.port,
+                        &request_path,
+                    )?;
+                    Some((score, key.clone(), cred.clone()))
                 })
                 .max_by_key(|(score, key, _)| (*score, key.clone()))
                 .map(|(_, key, cred)| (key, cred))
         })
     });
 
-    if let Some((provider_key, cred)) = token_grant_credential
-        && let Some(ref token_grant) = cred.token_grant
-    {
-        let resolver = ctx
-            .token_grant_resolver
-            .as_ref()
-            .ok_or_else(|| miette!("token grant resolver unavailable"))?;
-        let request = token_grant_request(&provider_key, token_grant);
+    if let Some((provider_key, cred)) = matched_credential {
+        check_placeholder_collision(&req.raw_header, &cred, &ctx.host, ctx.port, &provider_key)?;
+        if let Some(ref token_grant) = cred.token_grant {
+            inject_token_grant(req, ctx, &request_path, &provider_key, token_grant, &cred).await
+        } else {
+            inject_static_credential(req, ctx, &request_path, &provider_key, &cred)
+        }
+    } else {
+        Ok(req)
+    }
+}
 
-        match resolver.obtain(request).await {
-            Ok(access_token) => {
-                let modified_raw_header =
-                    inject_token_grant_header(&req.raw_header, &cred, &access_token)?;
-                let provider_key = ocsf_message_field(&provider_key);
-                ocsf_emit!(
-                    HttpActivityBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Other)
-                        .action(ActionId::Allowed)
-                        .disposition(DispositionId::Allowed)
-                        .severity(SeverityId::Informational)
-                        .http_request(HttpRequest::new(
-                            &req.action,
-                            OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                        .message(format!(
-                            "Token grant successful for {} to {}:{}",
-                            provider_key, ctx.host, ctx.port
-                        ))
-                        .build()
-                );
-                return Ok(L7Request {
-                    action: req.action,
-                    target: req.target,
-                    query_params: req.query_params,
-                    raw_header: modified_raw_header,
-                    body_length: req.body_length,
-                });
+async fn inject_token_grant(
+    req: L7Request,
+    ctx: &L7EvalContext,
+    request_path: &str,
+    provider_key: &str,
+    token_grant: &ProviderCredentialTokenGrant,
+    cred: &ProviderProfileCredential,
+) -> Result<L7Request> {
+    let resolver = ctx
+        .token_grant_resolver
+        .as_ref()
+        .ok_or_else(|| miette!("token grant resolver unavailable"))?;
+    let request = token_grant_request(provider_key, token_grant);
+
+    match resolver.obtain(request).await {
+        Ok(access_token) => {
+            let modified_raw_header =
+                inject_token_grant_header(&req.raw_header, cred, &access_token)?;
+            let provider_key = ocsf_message_field(provider_key);
+            ocsf_emit!(
+                HttpActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .disposition(DispositionId::Allowed)
+                    .severity(SeverityId::Informational)
+                    .http_request(HttpRequest::new(
+                        &req.action,
+                        OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message(format!(
+                        "Token grant successful for {} to {}:{}",
+                        provider_key, ctx.host, ctx.port
+                    ))
+                    .build()
+            );
+            Ok(L7Request {
+                action: req.action,
+                target: req.target,
+                query_params: req.query_params,
+                raw_header: modified_raw_header,
+                body_length: req.body_length,
+            })
+        }
+        Err(e) => {
+            warn!(
+                host = %ctx.host,
+                port = ctx.port,
+                provider = %provider_key,
+                error = %e,
+                "Token grant failed"
+            );
+            let provider_key = ocsf_message_field(provider_key);
+            ocsf_emit!(
+                HttpActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Fail)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .http_request(HttpRequest::new(
+                        &req.action,
+                        OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message(format!(
+                        "Token grant failed for {} to {}:{}: {}",
+                        provider_key, ctx.host, ctx.port, e
+                    ))
+                    .build()
+            );
+            Err(miette!("Token grant failed: {}", e))
+        }
+    }
+}
+
+fn inject_static_credential(
+    req: L7Request,
+    ctx: &L7EvalContext,
+    request_path: &str,
+    provider_key: &str,
+    cred: &ProviderProfileCredential,
+) -> Result<L7Request> {
+    let Some(value) = cred.env_vars.iter().find_map(|env_var| {
+        let placeholder = format!(
+            "{}{env_var}",
+            openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC
+        );
+        ctx.secret_resolver
+            .as_ref()
+            .and_then(|r| r.resolve_placeholder(&placeholder))
+    }) else {
+        let provider_key = ocsf_message_field(provider_key);
+        ocsf_emit!(
+            HttpActivityBuilder::new(ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .http_request(HttpRequest::new(
+                    &req.action,
+                    OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .message(format!(
+                    "No credential found for {} on provider {}",
+                    cred.name, provider_key
+                ))
+                .build()
+        );
+        return Err(miette!(
+            "no credential value found for credential '{}' on provider {}",
+            cred.name,
+            provider_key,
+        ));
+    };
+    match cred.auth_style.trim().to_ascii_lowercase().as_str() {
+        "bearer" | "header" => {
+            validate_static_credential_value(value)?;
+            let (header_name, header_value) = credential_auth_header(cred, value)?;
+            let modified_raw_header = inject_header(&req.raw_header, &header_name, &header_value)?;
+            let provider_key = ocsf_message_field(provider_key);
+            ocsf_emit!(
+                HttpActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .disposition(DispositionId::Allowed)
+                    .severity(SeverityId::Informational)
+                    .http_request(HttpRequest::new(
+                        &req.action,
+                        OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message(format!(
+                        "Provider credential injected for {} on {}:{}",
+                        provider_key, ctx.host, ctx.port
+                    ))
+                    .build()
+            );
+            Ok(L7Request {
+                action: req.action,
+                target: req.target,
+                query_params: req.query_params,
+                raw_header: modified_raw_header,
+                body_length: req.body_length,
+            })
+        }
+        other => Err(miette!(
+            "credential injection for auth_style '{}' is not yet supported",
+            other
+        )),
+    }
+}
+
+/// Fail-closed check: reject injection if the request already has a
+/// placeholder-based value for the header this credential targets.
+/// Applies to both token grant and static credential paths.
+fn check_placeholder_collision(
+    raw_header: &[u8],
+    cred: &ProviderProfileCredential,
+    host: &str,
+    port: u16,
+    provider_key: &str,
+) -> Result<()> {
+    let header_name = match cred.auth_style.trim().to_ascii_lowercase().as_str() {
+        "" | "bearer" => {
+            if cred.header_name.trim().is_empty() {
+                "Authorization"
+            } else {
+                cred.header_name.trim()
             }
-            Err(e) => {
-                warn!(
-                    host = %ctx.host,
-                    port = ctx.port,
-                    provider = %provider_key,
-                    error = %e,
-                    "Token grant failed"
-                );
-                let provider_key = ocsf_message_field(&provider_key);
-                ocsf_emit!(
-                    HttpActivityBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .http_request(HttpRequest::new(
-                            &req.action,
-                            OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                        .message(format!(
-                            "Token grant failed for {} to {}:{}: {}",
-                            provider_key, ctx.host, ctx.port, e
-                        ))
-                        .build()
-                );
-                return Err(miette!("Token grant failed: {}", e));
+        }
+        "header" => cred.header_name.trim(),
+        _ => return Ok(()),
+    };
+    if header_name.is_empty() {
+        return Ok(());
+    }
+    if let Ok(header_block) = std::str::from_utf8(raw_header) {
+        let end = header_block.find("\r\n\r\n").unwrap_or(header_block.len());
+        for line in header_block[..end].split("\r\n").skip(1) {
+            if let Some((name, val)) = line.split_once(':')
+                && name.trim().eq_ignore_ascii_case(header_name)
+                && openshell_core::secrets::contains_reserved_credential_marker(val)
+            {
+                return Err(miette!(
+                    "credential injection rejected: header '{}' on {}:{} already \
+                     contains a placeholder-based value from provider {}; remove \
+                     the placeholder or the profile credential to resolve the conflict",
+                    header_name,
+                    host,
+                    port,
+                    provider_key,
+                ));
             }
         }
     }
-
-    Ok(req)
+    Ok(())
 }
 
 fn ocsf_message_field(value: &str) -> String {
@@ -261,17 +407,32 @@ fn count_as_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
+/// Validates a static credential value at the injection sink.  Unlike
+/// `validate_access_token` (token68 for token grants), this only rejects
+/// characters that would enable HTTP header injection.
+fn validate_static_credential_value(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(miette!("static credential value must not be empty"));
+    }
+    if value.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
+        return Err(miette!(
+            "static credential value contains unsafe HTTP header bytes (CR, LF, or NUL)"
+        ));
+    }
+    Ok(())
+}
+
 fn inject_token_grant_header(
     raw_header: &[u8],
     credential: &ProviderProfileCredential,
     access_token: &str,
 ) -> Result<Vec<u8>> {
     crate::token_grant::validate_access_token(access_token)?;
-    let (header_name, header_value) = token_grant_header(credential, access_token)?;
+    let (header_name, header_value) = credential_auth_header(credential, access_token)?;
     inject_header(raw_header, &header_name, &header_value)
 }
 
-fn token_grant_header(
+fn credential_auth_header(
     credential: &ProviderProfileCredential,
     access_token: &str,
 ) -> Result<(String, String)> {
@@ -289,14 +450,14 @@ fn token_grant_header(
             let header_name = credential.header_name.trim();
             if header_name.is_empty() {
                 return Err(miette!(
-                    "token grant auth_style header requires header_name"
+                    "credential auth_style header requires header_name"
                 ));
             }
             validate_header_name(header_name)?;
             Ok((header_name.to_string(), access_token.to_string()))
         }
         other => Err(miette!(
-            "token grant auth_style '{other}' is not supported; use bearer or header"
+            "credential auth_style '{other}' is not supported; use bearer or header"
         )),
     }
 }
@@ -325,12 +486,12 @@ fn validate_header_name(header_name: &str) -> Result<()> {
         });
     if !valid {
         return Err(miette!(
-            "token grant header_name is not a valid HTTP header name"
+            "credential header_name is not a valid HTTP header name"
         ));
     }
     match header_name.to_ascii_lowercase().as_str() {
         "host" | "content-length" | "transfer-encoding" | "connection" => Err(miette!(
-            "token grant header_name may not override HTTP framing or connection headers"
+            "credential header_name may not override HTTP framing or connection headers"
         )),
         _ => Ok(()),
     }
@@ -662,13 +823,13 @@ mod tests {
     }
 
     #[test]
-    fn token_grant_header_rejects_framing_and_connection_headers() {
+    fn credential_auth_header_rejects_framing_and_connection_headers() {
         for header_name in ["Host", "Content-Length", "Transfer-Encoding", "Connection"] {
-            let err = token_grant_header(&credential("header", header_name), "grant-token")
+            let err = credential_auth_header(&credential("header", header_name), "grant-token")
                 .expect_err("framing header override should be rejected");
             assert_eq!(
                 err.to_string(),
-                "token grant header_name may not override HTTP framing or connection headers"
+                "credential header_name may not override HTTP framing or connection headers"
             );
         }
     }
@@ -790,5 +951,324 @@ mod tests {
             "token grant returned a malformed access token"
         );
         fixture.assert_one_request("api.example.com\t443\t/v1/**\tprovider:access_token");
+    }
+
+    fn static_credential_ctx(
+        env_var: &str,
+        secret_value: &str,
+        auth_style: &str,
+        header_name: &str,
+    ) -> (L7EvalContext, String) {
+        let (_, resolver) = openshell_core::secrets::SecretResolver::from_provider_env(
+            std::iter::once((env_var.to_string(), secret_value.to_string())).collect(),
+        );
+
+        let key = format!("api.example.com\t443\t\tmy-provider:{env_var}");
+        let mut dynamic_credentials = std::collections::HashMap::new();
+        dynamic_credentials.insert(
+            key.clone(),
+            ProviderProfileCredential {
+                name: "api_token".to_string(),
+                env_vars: vec![env_var.to_string()],
+                auth_style: auth_style.to_string(),
+                header_name: header_name.to_string(),
+                token_grant: None,
+                ..Default::default()
+            },
+        );
+
+        let ctx = L7EvalContext {
+            host: "api.example.com".into(),
+            port: 443,
+            policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: resolver.map(Arc::new),
+            activity_tx: None,
+            dynamic_credentials: Some(Arc::new(std::sync::RwLock::new(dynamic_credentials))),
+            token_grant_resolver: None,
+        };
+        (ctx, key)
+    }
+
+    #[tokio::test]
+    async fn inject_static_credential_injects_bearer_token() {
+        let (ctx, _) =
+            static_credential_ctx("GITHUB_TOKEN", "ghp_secret123", "bearer", "Authorization");
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/repos/owner/repo".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /repos/owner/repo HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let rewritten = inject_if_needed(req, &ctx)
+            .await
+            .expect("static credential injection should succeed");
+        let rewritten =
+            String::from_utf8(rewritten.raw_header).expect("rewritten request should be UTF-8");
+
+        assert!(rewritten.contains("Authorization: Bearer ghp_secret123\r\n"));
+    }
+
+    #[tokio::test]
+    async fn inject_static_credential_injects_custom_header() {
+        let (ctx, _) =
+            static_credential_ctx("ANTHROPIC_API_KEY", "sk-ant-secret", "header", "x-api-key");
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/messages".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /v1/messages HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let rewritten = inject_if_needed(req, &ctx)
+            .await
+            .expect("static credential injection should succeed");
+        let rewritten =
+            String::from_utf8(rewritten.raw_header).expect("rewritten request should be UTF-8");
+
+        assert!(rewritten.contains("x-api-key: sk-ant-secret\r\n"));
+        assert!(!rewritten.contains("Bearer"));
+    }
+
+    #[tokio::test]
+    async fn inject_static_credential_fails_when_credential_missing() {
+        // Set up a credential entry pointing to an env var that is NOT in the resolver.
+        let mut dynamic_credentials = std::collections::HashMap::new();
+        dynamic_credentials.insert(
+            "api.example.com\t443\t\tmy-provider:MISSING_TOKEN".to_string(),
+            ProviderProfileCredential {
+                name: "api_token".to_string(),
+                env_vars: vec!["MISSING_TOKEN".to_string()],
+                auth_style: "bearer".to_string(),
+                header_name: "Authorization".to_string(),
+                token_grant: None,
+                ..Default::default()
+            },
+        );
+        let ctx = L7EvalContext {
+            host: "api.example.com".into(),
+            port: 443,
+            policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: Some(Arc::new(std::sync::RwLock::new(dynamic_credentials))),
+            token_grant_resolver: None,
+        };
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/data".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /v1/data HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let err = inject_if_needed(req, &ctx)
+            .await
+            .expect_err("missing credential should fail closed");
+        assert!(err.to_string().contains("no credential value found"));
+    }
+
+    #[tokio::test]
+    async fn inject_static_credential_resolves_fallback_env_var() {
+        // Credential declares two env vars, only the second is in the resolver.
+        let (_, resolver) = openshell_core::secrets::SecretResolver::from_provider_env(
+            std::iter::once(("GH_TOKEN".to_string(), "ghp_fallback".to_string())).collect(),
+        );
+        let mut dynamic_credentials = std::collections::HashMap::new();
+        dynamic_credentials.insert(
+            "api.example.com\t443\t\tmy-provider:api_token".to_string(),
+            ProviderProfileCredential {
+                name: "api_token".to_string(),
+                env_vars: vec!["GITHUB_TOKEN".to_string(), "GH_TOKEN".to_string()],
+                auth_style: "bearer".to_string(),
+                header_name: "Authorization".to_string(),
+                token_grant: None,
+                ..Default::default()
+            },
+        );
+        let ctx = L7EvalContext {
+            host: "api.example.com".into(),
+            port: 443,
+            policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: resolver.map(Arc::new),
+            activity_tx: None,
+            dynamic_credentials: Some(Arc::new(std::sync::RwLock::new(dynamic_credentials))),
+            token_grant_resolver: None,
+        };
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/repos".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /repos HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let rewritten = inject_if_needed(req, &ctx)
+            .await
+            .expect("should resolve fallback env var");
+        let rewritten =
+            String::from_utf8(rewritten.raw_header).expect("rewritten request should be UTF-8");
+
+        assert!(rewritten.contains("Authorization: Bearer ghp_fallback\r\n"));
+    }
+
+    #[tokio::test]
+    async fn inject_static_credential_rejects_unsupported_auth_style() {
+        let (ctx, _) = static_credential_ctx("API_KEY", "secret123", "query", "");
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/data".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /v1/data HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let err = inject_if_needed(req, &ctx)
+            .await
+            .expect_err("unsupported auth_style should fail");
+        assert!(err.to_string().contains("not yet supported"));
+    }
+
+    #[tokio::test]
+    async fn inject_static_credential_rejects_placeholder_collision() {
+        let (ctx, _) =
+            static_credential_ctx("GITHUB_TOKEN", "ghp_secret123", "bearer", "Authorization");
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/repos/owner/repo".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /repos/owner/repo HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer openshell:resolve:env:GITHUB_TOKEN\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let err = inject_if_needed(req, &ctx)
+            .await
+            .expect_err("placeholder/profile collision must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("placeholder"),
+            "error should mention placeholder conflict, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_token_grant_rejects_placeholder_collision() {
+        let fixture = TokenGrantTestFixture::success(
+            "api.example.com\t443\t/v1/**\tprovider:access_token",
+            "grant-token",
+        );
+        let ctx = L7EvalContext {
+            host: "api.example.com".into(),
+            port: 443,
+            policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            token_grant_resolver: Some(fixture.resolver()),
+        };
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/projects".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\nAuthorization: Bearer openshell:resolve:env:MY_TOKEN\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let err = inject_if_needed(req, &ctx)
+            .await
+            .expect_err("placeholder/profile collision must fail closed for token grants too");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("placeholder"),
+            "error should mention placeholder conflict, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_static_credential_rejects_crlf_value_end_to_end() {
+        // SecretResolver also rejects CRLF at resolution time, so the e2e
+        // path fails before reaching the sink validation.  This test ensures
+        // the overall pipeline fails closed for CRLF credential values.
+        let (ctx, _) = static_credential_ctx(
+            "API_KEY",
+            "secret\r\nX-Injected: yes",
+            "header",
+            "x-api-key",
+        );
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/data".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /v1/data HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        inject_if_needed(req, &ctx)
+            .await
+            .expect_err("CRLF in credential value must be rejected");
+    }
+
+    #[test]
+    fn validate_static_credential_value_rejects_crlf() {
+        let err = validate_static_credential_value("secret\r\nX-Injected: yes")
+            .expect_err("CRLF must be rejected");
+        assert!(err.to_string().contains("unsafe HTTP header bytes"));
+    }
+
+    #[test]
+    fn validate_static_credential_value_rejects_null() {
+        let err =
+            validate_static_credential_value("secret\0rest").expect_err("NUL must be rejected");
+        assert!(err.to_string().contains("unsafe HTTP header bytes"));
+    }
+
+    #[test]
+    fn validate_static_credential_value_rejects_empty() {
+        let err = validate_static_credential_value("").expect_err("empty must be rejected");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_static_credential_value_accepts_non_token68() {
+        // Static credentials can contain characters outside the token68
+        // alphabet — this is the key difference from token grant validation.
+        validate_static_credential_value("sk-ant-api03-abc123")
+            .expect("API key with non-token68 chars should be accepted");
+    }
+
+    #[tokio::test]
+    async fn inject_no_match_passes_request_through() {
+        let (ctx, _) = static_credential_ctx("TOKEN", "secret", "bearer", "Authorization");
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/data".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /data HTTP/1.1\r\nHost: other.example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        // Host doesn't match, so request should pass through unmodified.
+        let mut ctx_wrong_host = ctx;
+        ctx_wrong_host.host = "other.example.com".into();
+
+        let result = inject_if_needed(req, &ctx_wrong_host)
+            .await
+            .expect("unmatched request should pass through");
+        let raw = String::from_utf8(result.raw_header).expect("UTF-8");
+        assert!(!raw.contains("Authorization"));
     }
 }
