@@ -8,5 +8,10 @@ network_policies:
       - host: example.com
         port: 443
         protocol: https
-    binaries:
-      - path: /usr/bin/curl
+      - host: google.com
+        port: 443
+        protocol: https
+      - host: nvidia.com
+        port: 443
+        protocol: https
+    binaries: []
