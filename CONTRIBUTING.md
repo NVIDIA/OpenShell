@@ -94,6 +94,7 @@ Skills connect into pipelines. Individual skill files don't describe these relat
 
 Workflow state labels use the `state:*` prefix, and security work uses `topic:security`. GitHub issue templates assign built-in issue types where applicable, and agent-created issues should use issue types or manual follow-up rather than type labels.
 New issues opened by users without `write`, `maintain`, or `admin` repository permission are automatically labeled `state:triage-needed` by the issue triage workflow.
+Inactive issues and pull requests are automatically labeled `state:stale` after 14 days without activity and may be closed after 7 more days without activity. Comment on the item or remove `state:stale` to keep it open. Issues labeled `state:triage-needed` or `roadmap` are exempt from stale handling.
 
 ## Prerequisites
 

@@ -1,0 +1,43 @@
+name: Mark stale issues and pull requests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899 # v10.3.0
+        with:
+          stale-issue-label: state:stale
+          stale-pr-label: state:stale
+
+          days-before-issue-stale: 14
+          days-before-issue-close: -1 # -1 puts this into dry-run mode. Update to 7 to enable closing.
+          days-before-pr-stale: 14
+          days-before-pr-close: -1 # -1 puts this into dry-run mode. Update to 7 to enable closing.
+
+          exempt-issue-labels: state:triage-needed,roadmap
+          exempt-draft-pr: true
+          close-issue-reason: not_planned
+
+          stale-issue-message: >
+            This issue has had no activity for 14 days and is now marked stale.
+            It may be closed in 7 days if there is no further activity.
+            Comment or remove the state:stale label to keep it open.
+          close-issue-message: >
+            Closing this issue after 7 days with no activity since it was marked stale.
+            Reopen it if the work is still relevant.
+          stale-pr-message: >
+            This pull request has had no activity for 14 days and is now marked stale.
+            It may be closed in 7 days if there is no further activity.
+          close-pr-message: >
+            Closing this pull request after 7 days with no activity since it was marked stale.
