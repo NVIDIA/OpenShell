@@ -202,6 +202,12 @@ pub struct EndpointProfile {
     pub graphql_max_body_bytes: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credential_signing: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signing_service: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signing_region: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -744,6 +750,9 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
         path: endpoint.path.clone(),
+        credential_signing: endpoint.credential_signing.clone(),
+        signing_service: endpoint.signing_service.clone(),
+        signing_region: endpoint.signing_region.clone(),
     }
 }
 
@@ -774,6 +783,9 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
         path: endpoint.path.clone(),
+        credential_signing: endpoint.credential_signing.clone(),
+        signing_service: endpoint.signing_service.clone(),
+        signing_region: endpoint.signing_region.clone(),
     }
 }
 

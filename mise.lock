@@ -63,6 +63,18 @@ checksum = "sha256:a781e8018260ab128e7690d8497736fa231b6ca895d57131d5b5b966ca987
 url = "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-aarch64-apple-darwin.tar.gz"
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/353135984"
 
+[[tools."github:mozilla/sccache"]]
+version = "0.14.0"
+backend = "github:mozilla/sccache"
+
+[tools."github:mozilla/sccache".options]
+asset_pattern = "sccache-v*x86_64*linux*.tar.gz"
+
+[tools."github:mozilla/sccache"."platforms.linux-x64"]
+checksum = "sha256:8424b38cda4ecce616a1557d81328f3d7c96503a171eab79942fad618b42af44"
+url = "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/353136108"
+
 [[tools."github:rust-cross/cargo-zigbuild"]]
 version = "0.22.3"
 backend = "github:rust-cross/cargo-zigbuild"

@@ -12,15 +12,20 @@ use crate::opa::PolicyGenerationGuard;
 use crate::secrets::{
     SecretResolver, contains_reserved_credential_marker, rewrite_http_header_block,
 };
+use aws_sigv4::http_request::SignableBody;
 use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
 const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
+/// Maximum body bytes for `SigV4` body-signing mode. Larger than the credential
+/// rewrite limit because Bedrock payloads can be several megabytes.
+const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
 const RELAY_BUF_SIZE: usize = 8192;
 /// Idle timeout for `relay_until_eof`.  If no data arrives within this window
 /// the body is considered complete.  Prevents blocking on servers that keep
@@ -377,6 +382,11 @@ where
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
+            credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: "",
+            signing_region: "",
+            host: "",
+            port: 0,
         },
     )
     .await
@@ -395,6 +405,11 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
+    pub(crate) credential_signing: crate::l7::CredentialSigning,
+    pub(crate) signing_service: &'a str,
+    pub(crate) signing_region: &'a str,
+    pub(crate) host: &'a str,
+    pub(crate) port: u16,
 }
 
 pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
@@ -421,8 +436,19 @@ where
         parse_websocket_upgrade_request(&req.raw_header[..header_end])?
     };
 
+    // When SigV4 signing is configured, strip AWS auth headers before credential
+    // rewriting so the fail-closed placeholder scan doesn't reject the SigV4
+    // Authorization header (which embeds placeholder strings).
+    let raw_for_rewrite;
+    let header_source = if options.credential_signing.is_sigv4() {
+        raw_for_rewrite = crate::sigv4::strip_aws_headers(&req.raw_header[..header_end]);
+        &raw_for_rewrite[..]
+    } else {
+        &req.raw_header[..header_end]
+    };
+
     let (header_bytes, expected_websocket_extension) = rewrite_websocket_extensions_for_mode(
-        &req.raw_header[..header_end],
+        header_source,
         options.websocket_extensions,
         websocket_request.is_some(),
     )?;
@@ -442,7 +468,213 @@ where
         guard.ensure_current()?;
     }
 
-    if options.request_body_credential_rewrite {
+    // Apply SigV4 signing if configured.
+    if options.credential_signing.is_sigv4() {
+        // Defense-in-depth: credential_signing and request_body_credential_rewrite
+        // are mutually exclusive (validated at policy load time).
+        if options.request_body_credential_rewrite {
+            return Err(miette!(
+                "credential_signing and request_body_credential_rewrite are \
+                 mutually exclusive on the same endpoint"
+            ));
+        }
+        // SigV4 re-signing needs the body before forwarding. If the client
+        // sent `Expect: 100-continue`, acknowledge it so the client transmits
+        // the body. Scoped to SigV4 paths only — non-SigV4 traffic forwards
+        // the Expect header to upstream for normal handling.
+        if has_expect_continue(header_str) {
+            client
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .into_diagnostic()?;
+            client.flush().await.into_diagnostic()?;
+        }
+        if let Some(resolver) = options.resolver {
+            let access_key_placeholder =
+                crate::secrets::placeholder_for_env_key("AWS_ACCESS_KEY_ID");
+            let secret_key_placeholder =
+                crate::secrets::placeholder_for_env_key("AWS_SECRET_ACCESS_KEY");
+            let session_token_placeholder =
+                crate::secrets::placeholder_for_env_key("AWS_SESSION_TOKEN");
+
+            match (
+                resolver.resolve_placeholder(&access_key_placeholder),
+                resolver.resolve_placeholder(&secret_key_placeholder),
+            ) {
+                (Some(access_key), Some(secret_key)) => {
+                    let session_token = resolver.resolve_placeholder(&session_token_placeholder);
+                    // Use explicit signing_region from policy if set,
+                    // otherwise extract from hostname.
+                    let region = if options.signing_region.is_empty() {
+                        match crate::sigv4::extract_aws_region(options.host) {
+                            Some(r) => r,
+                            None => {
+                                return Err(miette!(
+                                    "SigV4 signing: cannot extract AWS region from \
+                                     hostname '{host}'; set signing_region in the \
+                                     policy endpoint",
+                                    host = options.host,
+                                ));
+                            }
+                        }
+                    } else {
+                        options.signing_region.to_string()
+                    };
+                    let service = &options.signing_service;
+                    if service.is_empty() {
+                        return Err(miette!(
+                            "SigV4 signing configured but signing_service not set in policy"
+                        ));
+                    }
+
+                    let payload_mode = match options.credential_signing {
+                        crate::l7::CredentialSigning::SigV4Body => SigV4PayloadMode::SignBody,
+                        crate::l7::CredentialSigning::SigV4NoBody => {
+                            SigV4PayloadMode::UnsignedPayload
+                        }
+                        crate::l7::CredentialSigning::SigV4 => detect_payload_mode(header_str)?,
+                        crate::l7::CredentialSigning::None => unreachable!(),
+                    };
+
+                    if payload_mode == SigV4PayloadMode::SignBody {
+                        // Buffer body and include its hash in the signature.
+                        // This requires Content-Length — chunked bodies cannot
+                        // be buffered for signing. detect_payload_mode() should
+                        // route chunked requests to the streaming path, but
+                        // guard here as defense-in-depth.
+                        if matches!(parse_body_length(header_str)?, BodyLength::Chunked) {
+                            return Err(miette!(
+                                "SigV4 body signing requires Content-Length; \
+                                 chunked transfer encoding is not supported in this mode"
+                            ));
+                        }
+                        let overflow = &req.raw_header[header_end..];
+                        let mut full_request = rewrite_result.rewritten.clone();
+                        full_request.extend_from_slice(overflow);
+                        if let BodyLength::ContentLength(body_len) = parse_body_length(header_str)?
+                        {
+                            if body_len > MAX_SIGV4_BODY_BYTES as u64 {
+                                return Err(miette!(
+                                    "SigV4 body signing buffers at most {MAX_SIGV4_BODY_BYTES} bytes"
+                                ));
+                            }
+                            let already_have = overflow.len() as u64;
+                            if body_len > already_have {
+                                let remaining =
+                                    usize::try_from(body_len - already_have).unwrap_or(usize::MAX);
+                                let mut body_buf = vec![0u8; remaining];
+                                client.read_exact(&mut body_buf).await.into_diagnostic()?;
+                                full_request.extend_from_slice(&body_buf);
+                            }
+                        }
+
+                        // Re-check policy after body buffering — a slow upload
+                        // may have outlived a policy reload.
+                        if let Some(guard) = options.generation_guard {
+                            guard.ensure_current()?;
+                        }
+
+                        let signed = crate::sigv4::apply_sigv4_to_request(
+                            &full_request,
+                            options.host,
+                            &region,
+                            service,
+                            access_key,
+                            secret_key,
+                            session_token,
+                        )?;
+                        upstream.write_all(&signed).await.into_diagnostic()?;
+                    } else {
+                        // Sign headers only, stream body through.
+                        let signable_body = match payload_mode {
+                            SigV4PayloadMode::StreamingUnsignedTrailer => {
+                                SignableBody::StreamingUnsignedPayloadTrailer
+                            }
+                            _ => SignableBody::UnsignedPayload,
+                        };
+                        let signed_headers = crate::sigv4::apply_sigv4_headers_only_with_body(
+                            &rewrite_result.rewritten,
+                            options.host,
+                            &region,
+                            service,
+                            access_key,
+                            secret_key,
+                            session_token,
+                            signable_body,
+                        )?;
+                        upstream
+                            .write_all(&signed_headers)
+                            .await
+                            .into_diagnostic()?;
+
+                        let overflow = &req.raw_header[header_end..];
+                        if !overflow.is_empty() {
+                            if let Some(guard) = options.generation_guard {
+                                guard.ensure_current()?;
+                            }
+                            upstream.write_all(overflow).await.into_diagnostic()?;
+                        }
+                        let overflow_len = overflow.len() as u64;
+
+                        match req.body_length {
+                            BodyLength::ContentLength(len) => {
+                                let remaining = len.saturating_sub(overflow_len);
+                                if remaining > 0 {
+                                    relay_fixed(
+                                        client,
+                                        upstream,
+                                        remaining,
+                                        options.generation_guard,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            BodyLength::Chunked => {
+                                relay_chunked(
+                                    client,
+                                    upstream,
+                                    &req.raw_header[header_end..],
+                                    options.generation_guard,
+                                )
+                                .await?;
+                            }
+                            BodyLength::None => {}
+                        }
+                    }
+
+                    // OCSF event after successful signing and upstream write.
+                    let event = openshell_ocsf::NetworkActivityBuilder::new(
+                        crate::ocsf_ctx(),
+                    )
+                    .activity(openshell_ocsf::ActivityId::Traffic)
+                    .action(openshell_ocsf::ActionId::Allowed)
+                    .disposition(openshell_ocsf::DispositionId::Allowed)
+                    .severity(openshell_ocsf::SeverityId::Informational)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .dst_endpoint(openshell_ocsf::Endpoint::from_domain(
+                        options.host,
+                        options.port,
+                    ))
+                    .message(format!(
+                        "SigV4 re-signed {host}:{port} service={service} region={region} mode={payload_mode}",
+                        host = options.host,
+                        port = options.port,
+                    ))
+                    .build();
+                    openshell_ocsf::ocsf_emit!(event);
+                }
+                _ => {
+                    return Err(miette!(
+                        "SigV4 signing configured but AWS credentials not found in provider"
+                    ));
+                }
+            }
+        } else {
+            return Err(miette!(
+                "SigV4 signing configured but no secret resolver available"
+            ));
+        }
+    } else if options.request_body_credential_rewrite {
         let body = collect_and_rewrite_request_body(
             req,
             client,
@@ -1326,6 +1558,76 @@ fn deny_response_body(
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// Check if the request includes `Expect: 100-continue`.
+fn has_expect_continue(headers: &str) -> bool {
+    headers.lines().skip(1).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("expect:")
+            && lower
+                .split_once(':')
+                .is_some_and(|(_, v)| v.trim() == "100-continue")
+    })
+}
+
+/// Resolved payload signing mode for a `SigV4` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SigV4PayloadMode {
+    /// Buffer body and include its SHA-256 hash in the signature.
+    SignBody,
+    /// Use literal `UNSIGNED-PAYLOAD` — no body buffering needed.
+    UnsignedPayload,
+    /// Use `STREAMING-UNSIGNED-PAYLOAD-TRAILER` for `aws-chunked` streams.
+    StreamingUnsignedTrailer,
+}
+
+impl fmt::Display for SigV4PayloadMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SignBody => write!(f, "sign_body"),
+            Self::UnsignedPayload => write!(f, "unsigned_payload"),
+            Self::StreamingUnsignedTrailer => write!(f, "streaming_unsigned_trailer"),
+        }
+    }
+}
+
+/// Auto-detect the payload signing mode from the client's original headers.
+///
+/// Mirrors the mode the client SDK chose by inspecting `x-amz-content-sha256`:
+/// - `STREAMING-UNSIGNED-PAYLOAD-TRAILER` → `StreamingUnsignedTrailer`
+/// - `UNSIGNED-PAYLOAD` → `UnsignedPayload`
+/// - Hex hash → `SignBody` (buffer + hash, requires `Content-Length`)
+/// - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` → **rejected** (the proxy cannot
+///   reproduce per-chunk signatures; use `sigv4:no_body` instead)
+/// - Other `STREAMING-*` values → **rejected** (unsupported streaming mode)
+/// - Absent → `SignBody` if `Content-Length` present, else `UnsignedPayload`
+fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
+    for line in headers.lines().skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("x-amz-content-sha256:") {
+            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
+            return match val {
+                "streaming-unsigned-payload-trailer" => {
+                    Ok(SigV4PayloadMode::StreamingUnsignedTrailer)
+                }
+                "unsigned-payload" => Ok(SigV4PayloadMode::UnsignedPayload),
+                v if v.starts_with("streaming-") => Err(miette!(
+                    "SigV4 auto-detect does not support chunk-signed streaming mode \
+                     '{v}'; use credential_signing: sigv4:no_body to stream \
+                     with UNSIGNED-PAYLOAD instead"
+                )),
+                _ => Ok(SigV4PayloadMode::SignBody),
+            };
+        }
+    }
+    Ok(
+        if matches!(parse_body_length(headers)?, BodyLength::ContentLength(_)) {
+            SigV4PayloadMode::SignBody
+        } else {
+            SigV4PayloadMode::UnsignedPayload
+        },
+    )
 }
 
 /// Parse Content-Length or Transfer-Encoding from HTTP headers.
@@ -5009,6 +5311,70 @@ mod tests {
         assert!(
             result.is_err(),
             "Relay should fail when path placeholder cannot be resolved"
+        );
+    }
+
+    #[test]
+    fn detect_payload_mode_unsigned_payload() {
+        let headers = "PUT /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\nX-Amz-Content-Sha256: UNSIGNED-PAYLOAD\r\n\r\n";
+        assert_eq!(
+            detect_payload_mode(headers).unwrap(),
+            SigV4PayloadMode::UnsignedPayload
+        );
+    }
+
+    #[test]
+    fn detect_payload_mode_streaming_unsigned_trailer() {
+        let headers = "PUT /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\nX-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\r\n";
+        assert_eq!(
+            detect_payload_mode(headers).unwrap(),
+            SigV4PayloadMode::StreamingUnsignedTrailer
+        );
+    }
+
+    #[test]
+    fn detect_payload_mode_hex_hash_is_sign_body() {
+        let headers = "POST /model/invoke HTTP/1.1\r\nHost: bedrock.amazonaws.com\r\nX-Amz-Content-Sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\r\nContent-Length: 10\r\n\r\n";
+        assert_eq!(
+            detect_payload_mode(headers).unwrap(),
+            SigV4PayloadMode::SignBody
+        );
+    }
+
+    #[test]
+    fn detect_payload_mode_rejects_chunk_signed_streaming() {
+        let headers = "PUT /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\nX-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\r\n";
+        let result = detect_payload_mode(headers);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("sigv4:no_body"),
+            "error should suggest sigv4:no_body, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_payload_mode_rejects_unknown_streaming() {
+        let headers = "PUT /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\nX-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER\r\n\r\n";
+        let result = detect_payload_mode(headers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn detect_payload_mode_absent_with_content_length() {
+        let headers = "POST /model/invoke HTTP/1.1\r\nHost: bedrock.amazonaws.com\r\nContent-Length: 42\r\n\r\n";
+        assert_eq!(
+            detect_payload_mode(headers).unwrap(),
+            SigV4PayloadMode::SignBody
+        );
+    }
+
+    #[test]
+    fn detect_payload_mode_absent_without_content_length() {
+        let headers = "GET /bucket HTTP/1.1\r\nHost: s3.amazonaws.com\r\n\r\n";
+        assert_eq!(
+            detect_payload_mode(headers).unwrap(),
+            SigV4PayloadMode::UnsignedPayload
         );
     }
 }

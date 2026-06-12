@@ -1121,6 +1121,9 @@ fn network_endpoint_from_json(
         graphql_persisted_queries: HashMap::new(),
         graphql_max_body_bytes: 0,
         path: String::new(),
+        credential_signing: String::new(),
+        signing_service: String::new(),
+        signing_region: String::new(),
     })
 }
 
