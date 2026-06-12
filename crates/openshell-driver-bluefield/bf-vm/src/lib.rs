@@ -10,6 +10,7 @@ pub mod extensions;
 pub mod guest_egress;
 mod host_pf;
 pub mod kernel;
+mod qemu_kernel_resolver;
 mod slots;
 mod state;
 pub mod vf;

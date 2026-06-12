@@ -24,9 +24,11 @@ use crate::lifecycle::{
 
 use bf_inventory::{VfPool, VfSlot};
 
-use crate::config::{bluefield_kernel_from_config, guest_egress_from_config, reject_deferred_proxy};
+use crate::config::{
+    bluefield_kernel_from_config, guest_egress_from_config, reject_deferred_proxy,
+};
 use crate::guest_egress::{self, GuestEgress};
-use crate::kernel::BluefieldKernel;
+use crate::kernel::{BluefieldKernel, MELLANOX_VF_MODULES};
 use crate::slots::{HostSlotConfig, prepare_host_slots, resolve_host_pf_bdf};
 use crate::state::{self, AttachmentRecord, EXTENSION_NAME};
 use crate::vf::{HostReadiness, SysfsHostReadiness, SysfsVfBinder, VfBinder};
@@ -41,6 +43,25 @@ fn deterministic_vf_mac(sandbox_id: &str) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+fn qemu_kernel_from_config(config: &BluefieldDriverConfig) -> Result<BluefieldKernel, String> {
+    let image = crate::qemu_kernel_resolver::resolve_qemu_kernel_image(
+        config.kernel_image.clone(),
+        &crate::qemu_kernel_resolver::default_runtime_roots(),
+    )?;
+    let mut kernel = bluefield_kernel_from_config(config)
+        .unwrap_or_else(|| BluefieldKernel::from_image(image.clone()));
+    if kernel.image.is_none() {
+        kernel.image = Some(image);
+    }
+    if kernel.required_modules.is_empty() {
+        kernel.required_modules = MELLANOX_VF_MODULES
+            .iter()
+            .map(|module| (*module).to_string())
+            .collect();
+    }
+    Ok(kernel)
 }
 
 /// BlueField lifecycle extension: claims a VF, binds it for passthrough, and
@@ -83,8 +104,10 @@ impl BluefieldExtension {
         let host_pf = resolve_host_pf_bdf(config)?;
         let sysfs = SysfsRoot::system();
         let slots = prepare_host_slots(HostSlotConfig::from(config), &sysfs, &host_pf)?;
+        let kernel = qemu_kernel_from_config(config)?;
 
         let extension = Self::new(VfPool::new(slots))
+            .with_kernel(kernel)
             .with_host_readiness(Arc::new(SysfsHostReadiness::new(sysfs.clone())))
             .with_vf_binder(Arc::new(SysfsVfBinder::new(sysfs)));
 
@@ -100,9 +123,6 @@ impl BluefieldExtension {
     }
 
     fn apply_runtime_options(mut self, config: &BluefieldDriverConfig) -> Result<Self, String> {
-        if let Some(kernel) = bluefield_kernel_from_config(config) {
-            self = self.with_kernel(kernel);
-        }
         if let Some(egress) = guest_egress_from_config(config)? {
             self = self.with_guest_egress(egress);
         }
@@ -182,8 +202,10 @@ impl LifecycleExtension for BluefieldExtension {
 
     fn descriptor(&self) -> ExtensionDescriptor {
         let mut descriptor = ExtensionDescriptor::new(EXTENSION_NAME);
-        descriptor.required_backend_features =
-            vec![BackendFeature::PciPassthrough, BackendFeature::GuestInitDropins];
+        descriptor.required_backend_features = vec![
+            BackendFeature::PciPassthrough,
+            BackendFeature::GuestInitDropins,
+        ];
         descriptor
     }
 
@@ -436,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn before_launch_claims_slot_records_bind_state_and_injects_egress_env() {
         let extension = ext(VfPool::new([
-            VfSlot::new("vf0", "0000:03:00.2").with_representor("pf0vf0"),
+            VfSlot::new("vf0", "0000:03:00.2").with_representor("pf0vf0")
         ]))
         .with_guest_egress(GuestEgress {
             address_cidr: "10.0.120.10/22".to_string(),
@@ -504,7 +526,10 @@ mod tests {
             .before_launch(&sandbox("sb-del"), &state, &mut plan)
             .await
             .unwrap();
-        extension.after_delete(&sandbox("sb-del"), &state).await.unwrap();
+        extension
+            .after_delete(&sandbox("sb-del"), &state)
+            .await
+            .unwrap();
 
         assert!(extension.take_attachment("sb-del").is_none());
         assert!(state::load_bind_state("sb-del", &state).is_err());
@@ -514,7 +539,9 @@ mod tests {
     #[tokio::test]
     async fn configure_launch_selects_kernel_and_declares_vf_passthrough() {
         let extension = BluefieldExtension::new(VfPool::new([VfSlot::new("vf0", "0000:03:00.2")]))
-            .with_kernel(BluefieldKernel::from_image("/opt/openshell/kernels/bf-vmlinux"));
+            .with_kernel(BluefieldKernel::from_image(
+                "/opt/openshell/kernels/bf-vmlinux",
+            ));
 
         let mut plan = sample_plan();
         extension
@@ -543,7 +570,7 @@ mod tests {
     async fn before_restore_reclaims_and_records() {
         let state = state_dir("restore");
         let initial = ext(VfPool::new([
-            VfSlot::new("vf0", "0000:03:00.2").with_representor("pf0vf0"),
+            VfSlot::new("vf0", "0000:03:00.2").with_representor("pf0vf0")
         ]));
         let mut plan = sample_plan();
         initial
@@ -552,7 +579,7 @@ mod tests {
             .unwrap();
 
         let extension = ext(VfPool::new([
-            VfSlot::new("vf0", "0000:03:00.2").with_representor("pf0vf0"),
+            VfSlot::new("vf0", "0000:03:00.2").with_representor("pf0vf0")
         ]));
         let ctx = RestoreContext {
             sandbox: sandbox("sb-restore"),
