@@ -5445,6 +5445,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr".into()],
                 read_write: vec!["/tmp".into()],
+                ..Default::default()
             }),
             landlock: Some(LandlockPolicy {
                 compatibility: "best_effort".into(),

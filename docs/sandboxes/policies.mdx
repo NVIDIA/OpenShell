@@ -66,6 +66,10 @@ For GPU sandboxes, OpenShell also adds existing GPU device nodes as read-write p
 
 This filtering prevents a missing baseline path from degrading Landlock enforcement. Without it, a single missing path could cause the entire Landlock ruleset to fail, leaving the sandbox with no filesystem restrictions at all.
 
+Some runtime features add extra baseline paths. GPU-enabled sandboxes may require read-write access to `/proc` and GPU device nodes. If a runtime-required read-write path is already listed as `read_only`, OpenShell rejects the policy unless promotion is allowed by `filesystem_policy.runtime_baseline_conflicts.read_only_to_read_write`.
+
+When this field is omitted, OpenShell allows `/proc` promotion and rejects other read-only to read-write conflicts. To opt out completely, set `mode: reject_all`. To permit specific device-node promotions, keep `mode: reject_unlisted` and add absolute full-path glob patterns such as `/dev/nvidia*` to `allow_promotion`.
+
 User-specified paths in your policy YAML are not pre-filtered. If you list a path that does not exist:
 
 - In `best_effort` mode, the path is skipped with a warning and remaining rules are still applied.

@@ -21,12 +21,26 @@ For the field-by-field YAML reference, use
 Filesystem and process policy are startup-time controls. Network policy is
 dynamic and can be hot-reloaded when the new policy validates successfully.
 
-Before applying Landlock, the supervisor enriches baseline filesystem paths that
-the runtime needs. Missing baseline paths are skipped so one absent runtime path
-does not weaken the whole ruleset. When GPU devices are present, GPU baseline
-enrichment adds existing GPU device nodes as read-write paths and promotes
-`/proc` to read-write because CUDA workloads write thread metadata under
-`/proc/<pid>/task/<tid>/comm`.
+## Filesystem Baseline
+
+The supervisor enriches filesystem policy at startup with OpenShell runtime
+baseline paths required by proxy mode and optional runtime features such as GPU
+support. Baseline paths are only added if they exist in the sandbox image, which
+prevents a missing baseline path from causing the whole Landlock ruleset to be
+skipped under best-effort mode.
+
+`filesystem_policy.runtime_baseline_conflicts` controls how OpenShell resolves
+conflicts between runtime baseline requirements and the effective filesystem
+policy. The current conflict policy is `read_only_to_read_write`, where the
+default is equivalent to `mode: reject_unlisted` with
+`allow_promotion: [/proc]`: `/proc` may be promoted from read-only to
+read-write for GPU runtime needs because CUDA workloads write thread metadata
+under `/proc/<pid>/task/<tid>/comm`, while device-node conflicts are rejected
+unless the policy explicitly allows a matching promotion pattern or sets `mode:
+promote_all`. `mode: reject_all` disables promotion entirely.
+
+The promotion allow list is not an access grant by itself. It only applies to
+paths that are already part of the active OpenShell runtime baseline.
 
 ## Network Decisions
 

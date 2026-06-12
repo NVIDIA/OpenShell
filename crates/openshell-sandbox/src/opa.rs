@@ -7,7 +7,10 @@
 //! access decisions. The engine is loaded once at sandbox startup and queried
 //! on every proxy CONNECT request.
 
-use crate::policy::{FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy};
+use crate::policy::{
+    FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
+    ReadOnlyToReadWriteConflictPolicy, RuntimeBaselineConflictsPolicy,
+};
 use miette::Result;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use std::path::{Path, PathBuf};
@@ -661,6 +664,18 @@ fn get_bool(val: &regorus::Value, key: &str) -> Option<bool> {
     }
 }
 
+/// Extract an object field from a `regorus::Value` object.
+fn get_object<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Value> {
+    let key_val = regorus::Value::String(key.into());
+    match val {
+        regorus::Value::Object(map) => {
+            let value = map.get(&key_val)?;
+            matches!(value, regorus::Value::Object(_)).then_some(value)
+        }
+        _ => None,
+    }
+}
+
 /// Extract a string array from a `regorus::Value` object field.
 fn get_str_array(val: &regorus::Value, key: &str) -> Vec<String> {
     let key_val = regorus::Value::String(key.into());
@@ -682,6 +697,20 @@ fn get_str_array(val: &regorus::Value, key: &str) -> Vec<String> {
     }
 }
 
+fn parse_runtime_baseline_conflicts(
+    val: &regorus::Value,
+) -> Option<RuntimeBaselineConflictsPolicy> {
+    let conflicts = get_object(val, "runtime_baseline_conflicts")?;
+    Some(RuntimeBaselineConflictsPolicy {
+        read_only_to_read_write: get_object(conflicts, "read_only_to_read_write").map(|policy| {
+            ReadOnlyToReadWriteConflictPolicy {
+                mode: get_str(policy, "mode").unwrap_or_default(),
+                allow_promotion: get_str_array(policy, "allow_promotion"),
+            }
+        }),
+    })
+}
+
 fn parse_filesystem_policy(val: &regorus::Value) -> FilesystemPolicy {
     FilesystemPolicy {
         read_only: get_str_array(val, "read_only")
@@ -693,6 +722,7 @@ fn parse_filesystem_policy(val: &regorus::Value) -> FilesystemPolicy {
             .map(PathBuf::from)
             .collect(),
         include_workdir: get_bool(val, "include_workdir").unwrap_or(true),
+        runtime_baseline_conflicts: parse_runtime_baseline_conflicts(val),
     }
 }
 
@@ -948,11 +978,22 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
             })
         },
         |fs| {
-            serde_json::json!({
+            let mut policy = serde_json::json!({
                 "include_workdir": fs.include_workdir,
                 "read_only": fs.read_only,
                 "read_write": fs.read_write,
-            })
+            });
+            if let Some(conflicts) = &fs.runtime_baseline_conflicts {
+                let mut conflicts_json = serde_json::json!({});
+                if let Some(read_only_to_read_write) = &conflicts.read_only_to_read_write {
+                    conflicts_json["read_only_to_read_write"] = serde_json::json!({
+                        "mode": read_only_to_read_write.mode,
+                        "allow_promotion": read_only_to_read_write.allow_promotion,
+                    });
+                }
+                policy["runtime_baseline_conflicts"] = conflicts_json;
+            }
+            policy
         },
     );
 
@@ -1253,6 +1294,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr".to_string(), "/lib".to_string()],
                 read_write: vec!["/sandbox".to_string(), "/tmp".to_string()],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -1409,6 +1451,39 @@ mod tests {
                 .filesystem
                 .read_write
                 .contains(&PathBuf::from("/tmp"))
+        );
+    }
+
+    #[test]
+    fn query_sandbox_config_extracts_runtime_baseline_conflicts() {
+        let data = r#"
+network_policies: {}
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr]
+  read_write: [/tmp]
+  runtime_baseline_conflicts:
+    read_only_to_read_write:
+      mode: reject_unlisted
+      allow_promotion: [/proc, "/dev/nvidia*"]
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let config = engine.query_sandbox_config().unwrap();
+
+        let conflict_policy = config
+            .filesystem
+            .runtime_baseline_conflicts
+            .and_then(|conflicts| conflicts.read_only_to_read_write)
+            .expect("runtime conflict policy");
+        assert_eq!(conflict_policy.mode, "reject_unlisted");
+        assert_eq!(
+            conflict_policy.allow_promotion,
+            vec!["/proc", "/dev/nvidia*"]
         );
     }
 
@@ -2509,6 +2584,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -2632,6 +2708,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -2689,6 +2766,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -2746,6 +2824,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -3695,6 +3774,7 @@ process:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -3749,6 +3829,7 @@ process:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -3819,6 +3900,7 @@ process:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -4049,6 +4131,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -5008,6 +5091,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
@@ -5085,6 +5169,7 @@ network_policies:
                 include_workdir: true,
                 read_only: vec![],
                 read_write: vec![],
+                ..Default::default()
             }),
             landlock: Some(openshell_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),

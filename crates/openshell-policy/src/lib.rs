@@ -20,7 +20,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
     LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
-    SandboxPolicy,
+    ReadOnlyToReadWriteConflictPolicy, RuntimeBaselineConflicts, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,11 @@ pub use merge::{
     PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
     merge_policy, policy_covers_rule,
 };
+
+pub const RUNTIME_BASELINE_CONFLICT_MODE_REJECT_UNLISTED: &str = "reject_unlisted";
+pub const RUNTIME_BASELINE_CONFLICT_MODE_PROMOTE_ALL: &str = "promote_all";
+pub const RUNTIME_BASELINE_CONFLICT_MODE_REJECT_ALL: &str = "reject_all";
+pub const DEFAULT_RUNTIME_BASELINE_ALLOW_PROMOTION: &[&str] = &["/proc"];
 
 // ---------------------------------------------------------------------------
 // YAML serde types (canonical — used for both parsing and serialization)
@@ -57,6 +62,24 @@ struct FilesystemDef {
     read_only: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     read_write: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_baseline_conflicts: Option<RuntimeBaselineConflictsDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeBaselineConflictsDef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    read_only_to_read_write: Option<ReadOnlyToReadWriteConflictPolicyDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadOnlyToReadWriteConflictPolicyDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allow_promotion: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -369,6 +392,9 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
             include_workdir: fs.include_workdir,
             read_only: fs.read_only,
             read_write: fs.read_write,
+            runtime_baseline_conflicts: fs
+                .runtime_baseline_conflicts
+                .map(runtime_baseline_conflicts_to_proto),
         }),
         landlock: raw.landlock.map(|ll| LandlockPolicy {
             compatibility: ll.compatibility,
@@ -381,6 +407,32 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
     }
 }
 
+fn runtime_baseline_conflicts_to_proto(
+    conflicts: RuntimeBaselineConflictsDef,
+) -> RuntimeBaselineConflicts {
+    RuntimeBaselineConflicts {
+        read_only_to_read_write: conflicts.read_only_to_read_write.map(|policy| {
+            ReadOnlyToReadWriteConflictPolicy {
+                mode: policy.mode,
+                allow_promotion: policy.allow_promotion,
+            }
+        }),
+    }
+}
+
+fn runtime_baseline_conflicts_from_proto(
+    conflicts: &RuntimeBaselineConflicts,
+) -> RuntimeBaselineConflictsDef {
+    RuntimeBaselineConflictsDef {
+        read_only_to_read_write: conflicts.read_only_to_read_write.as_ref().map(|policy| {
+            ReadOnlyToReadWriteConflictPolicyDef {
+                mode: policy.mode.clone(),
+                allow_promotion: policy.allow_promotion.clone(),
+            }
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Proto → YAML conversion
 // ---------------------------------------------------------------------------
@@ -390,6 +442,10 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         include_workdir: fs.include_workdir,
         read_only: fs.read_only.clone(),
         read_write: fs.read_write.clone(),
+        runtime_baseline_conflicts: fs
+            .runtime_baseline_conflicts
+            .as_ref()
+            .map(runtime_baseline_conflicts_from_proto),
     });
 
     let landlock = policy.landlock.as_ref().map(|ll| LandlockDef {
@@ -640,6 +696,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
                 "/var/log".into(),
             ],
             read_write: vec!["/sandbox".into(), "/tmp".into(), "/dev/null".into()],
+            runtime_baseline_conflicts: None,
         }),
         landlock: Some(LandlockPolicy {
             compatibility: "best_effort".into(),
@@ -694,6 +751,10 @@ pub enum PolicyViolation {
     TooManyPaths { count: usize },
     /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
     TldWildcard { policy_name: String, host: String },
+    /// Runtime baseline read-only conflict mode is not recognized.
+    InvalidRuntimeBaselineConflictMode { value: String },
+    /// Runtime baseline promotion pattern is invalid.
+    InvalidRuntimeBaselinePromotionPattern { pattern: String, reason: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -730,6 +791,21 @@ impl fmt::Display for PolicyViolation {
                      use subdomain wildcards like '*.example.com' instead"
                 )
             }
+            Self::InvalidRuntimeBaselineConflictMode { value } => {
+                write!(
+                    f,
+                    "runtime baseline read_only_to_read_write mode must be one of \
+                     '{RUNTIME_BASELINE_CONFLICT_MODE_REJECT_UNLISTED}', \
+                     '{RUNTIME_BASELINE_CONFLICT_MODE_PROMOTE_ALL}', or \
+                     '{RUNTIME_BASELINE_CONFLICT_MODE_REJECT_ALL}', got '{value}'"
+                )
+            }
+            Self::InvalidRuntimeBaselinePromotionPattern { pattern, reason } => {
+                write!(
+                    f,
+                    "runtime baseline promotion pattern is invalid: {pattern} ({reason})"
+                )
+            }
         }
     }
 }
@@ -747,6 +823,8 @@ impl fmt::Display for PolicyViolation {
 /// - Read-write paths must not be overly broad (just `/`)
 /// - Individual path lengths must not exceed [`MAX_PATH_LENGTH`]
 /// - Total path count must not exceed [`MAX_FILESYSTEM_PATHS`]
+/// - Runtime baseline conflict controls must use known modes and absolute
+///   promotion patterns without `..`
 /// - Network endpoint hosts must not use TLD wildcards (e.g. `*.com`)
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
@@ -815,6 +893,12 @@ pub fn validate_sandbox_policy(
                 });
             }
         }
+
+        if let Some(conflicts) = &fs.runtime_baseline_conflicts
+            && let Some(policy) = &conflicts.read_only_to_read_write
+        {
+            validate_runtime_baseline_conflict_policy(policy, &mut violations);
+        }
     }
 
     // Check network policy endpoint hosts for TLD wildcards.
@@ -841,6 +925,55 @@ pub fn validate_sandbox_policy(
         Ok(())
     } else {
         Err(violations)
+    }
+}
+
+fn validate_runtime_baseline_conflict_policy(
+    policy: &ReadOnlyToReadWriteConflictPolicy,
+    violations: &mut Vec<PolicyViolation>,
+) {
+    let mode = policy.mode.as_str();
+    if !mode.is_empty()
+        && mode != RUNTIME_BASELINE_CONFLICT_MODE_REJECT_UNLISTED
+        && mode != RUNTIME_BASELINE_CONFLICT_MODE_PROMOTE_ALL
+        && mode != RUNTIME_BASELINE_CONFLICT_MODE_REJECT_ALL
+    {
+        violations.push(PolicyViolation::InvalidRuntimeBaselineConflictMode {
+            value: policy.mode.clone(),
+        });
+    }
+
+    for pattern in &policy.allow_promotion {
+        if pattern.is_empty() {
+            violations.push(PolicyViolation::InvalidRuntimeBaselinePromotionPattern {
+                pattern: pattern.clone(),
+                reason: "pattern must not be empty".to_string(),
+            });
+            continue;
+        }
+
+        let path = Path::new(pattern);
+        if !path.has_root() {
+            violations.push(PolicyViolation::InvalidRuntimeBaselinePromotionPattern {
+                pattern: pattern.clone(),
+                reason: "pattern must be absolute".to_string(),
+            });
+        }
+        if path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            violations.push(PolicyViolation::InvalidRuntimeBaselinePromotionPattern {
+                pattern: pattern.clone(),
+                reason: "pattern must not contain '..' components".to_string(),
+            });
+        }
+        if let Err(error) = glob::Pattern::new(pattern) {
+            violations.push(PolicyViolation::InvalidRuntimeBaselinePromotionPattern {
+                pattern: pattern.clone(),
+                reason: error.to_string(),
+            });
+        }
     }
 }
 
@@ -974,6 +1107,38 @@ network_policies:
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
         let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
         assert_eq!(proto2.network_policies["my_api"].name, "my-custom-api-name");
+    }
+
+    #[test]
+    fn round_trip_preserves_runtime_baseline_conflicts() {
+        let yaml = r#"
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /proc]
+  read_write: [/sandbox, /tmp]
+  runtime_baseline_conflicts:
+    read_only_to_read_write:
+      mode: reject_unlisted
+      allow_promotion:
+        - /proc
+        - "/dev/nvidia*"
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let conflicts = proto2
+            .filesystem
+            .as_ref()
+            .and_then(|fs| fs.runtime_baseline_conflicts.as_ref())
+            .and_then(|conflicts| conflicts.read_only_to_read_write.as_ref())
+            .expect("runtime conflict policy");
+        assert_eq!(
+            conflicts.mode,
+            RUNTIME_BASELINE_CONFLICT_MODE_REJECT_UNLISTED
+        );
+        assert_eq!(conflicts.allow_promotion, vec!["/proc", "/dev/nvidia*"]);
     }
 
     #[test]
@@ -1207,6 +1372,7 @@ network_policies:
             include_workdir: true,
             read_only: vec!["/usr/../etc/shadow".into()],
             read_write: vec!["/tmp".into()],
+            ..Default::default()
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(
@@ -1223,6 +1389,7 @@ network_policies:
             include_workdir: true,
             read_only: vec!["usr/lib".into()],
             read_write: vec!["/tmp".into()],
+            ..Default::default()
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(
@@ -1239,6 +1406,7 @@ network_policies:
             include_workdir: true,
             read_only: vec!["/usr".into()],
             read_write: vec!["/".into()],
+            ..Default::default()
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(
@@ -1285,6 +1453,7 @@ network_policies:
             include_workdir: true,
             read_only: many_paths,
             read_write: vec!["/tmp".into()],
+            ..Default::default()
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(
@@ -1295,6 +1464,42 @@ network_policies:
     }
 
     #[test]
+    fn validate_rejects_invalid_runtime_baseline_conflict_mode() {
+        let mut policy = restrictive_default_policy();
+        let fs = policy.filesystem.as_mut().expect("filesystem policy");
+        fs.runtime_baseline_conflicts = Some(RuntimeBaselineConflicts {
+            read_only_to_read_write: Some(ReadOnlyToReadWriteConflictPolicy {
+                mode: "ask".into(),
+                allow_promotion: vec!["/proc".into()],
+            }),
+        });
+
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            PolicyViolation::InvalidRuntimeBaselineConflictMode { .. }
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_runtime_baseline_promotion_pattern() {
+        let mut policy = restrictive_default_policy();
+        let fs = policy.filesystem.as_mut().expect("filesystem policy");
+        fs.runtime_baseline_conflicts = Some(RuntimeBaselineConflicts {
+            read_only_to_read_write: Some(ReadOnlyToReadWriteConflictPolicy {
+                mode: RUNTIME_BASELINE_CONFLICT_MODE_REJECT_UNLISTED.into(),
+                allow_promotion: vec!["dev/nvidia*".into(), "/proc/../etc".into()],
+            }),
+        });
+
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            PolicyViolation::InvalidRuntimeBaselinePromotionPattern { .. }
+        )));
+    }
+
+    #[test]
     fn validate_rejects_path_too_long() {
         let mut policy = restrictive_default_policy();
         let long_path = format!("/{}", "a".repeat(5000));
@@ -1302,6 +1507,7 @@ network_policies:
             include_workdir: true,
             read_only: vec![long_path],
             read_write: vec!["/tmp".into()],
+            ..Default::default()
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(
