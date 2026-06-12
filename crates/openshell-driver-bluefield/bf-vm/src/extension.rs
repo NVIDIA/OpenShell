@@ -579,6 +579,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configure_launch_sets_qemu_requirements_without_manual_internal_args() {
+        let extension = ext(VfPool::new([
+            VfSlot::new("vf29", "0000:b1:04.1").with_vf_index(29),
+        ]))
+        .with_kernel(BluefieldKernel::from_image("/runtime/vmlinux"));
+
+        let mut plan = sample_plan();
+        extension
+            .configure_launch(&sandbox("sandbox-bluefield"), &PathBuf::from("/tmp/s"), &mut plan)
+            .await
+            .unwrap();
+
+        assert!(
+            plan.required_backend_features
+                .contains(&BackendFeature::PciPassthrough)
+        );
+        assert!(
+            plan.required_backend_features
+                .contains(&BackendFeature::GuestInitDropins)
+        );
+        assert!(
+            plan.required_backend_features
+                .contains(&BackendFeature::ExternalKernelImage)
+        );
+        assert_eq!(plan.kernel_image.as_deref(), Some(Path::new("/runtime/vmlinux")));
+        assert!(plan.tap_device.is_none());
+        assert!(plan.guest_ip.is_none());
+        assert!(plan.host_ip.is_none());
+        assert!(plan.vsock_cid.is_none());
+        assert!(plan.guest_mac.is_none());
+        assert!(plan.gateway_port.is_none());
+    }
+
+    #[tokio::test]
     async fn before_restore_reclaims_and_records() {
         let state = state_dir("restore");
         let initial = ext(VfPool::new([
