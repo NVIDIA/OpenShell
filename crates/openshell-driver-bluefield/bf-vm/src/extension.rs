@@ -27,7 +27,7 @@ use bf_inventory::{VfPool, VfSlot};
 use crate::config::{bluefield_kernel_from_config, guest_egress_from_config, reject_deferred_proxy};
 use crate::guest_egress::{self, GuestEgress};
 use crate::kernel::BluefieldKernel;
-use crate::slots::{HostSlotConfig, prepare_host_slots, require_host_pf};
+use crate::slots::{HostSlotConfig, prepare_host_slots, resolve_host_pf_bdf};
 use crate::state::{self, AttachmentRecord, EXTENSION_NAME};
 use crate::vf::{HostReadiness, SysfsHostReadiness, SysfsVfBinder, VfBinder};
 
@@ -80,9 +80,9 @@ impl BluefieldExtension {
         }
         reject_deferred_proxy(config)?;
 
-        let host_pf = require_host_pf(config)?;
+        let host_pf = resolve_host_pf_bdf(config)?;
         let sysfs = SysfsRoot::system();
-        let slots = prepare_host_slots(HostSlotConfig::from(config), &sysfs, host_pf)?;
+        let slots = prepare_host_slots(HostSlotConfig::from(config), &sysfs, &host_pf)?;
 
         let extension = Self::new(VfPool::new(slots))
             .with_host_readiness(Arc::new(SysfsHostReadiness::new(sysfs.clone())))

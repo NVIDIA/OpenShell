@@ -8,6 +8,7 @@ mod config;
 pub mod extension;
 pub mod extensions;
 pub mod guest_egress;
+mod host_pf;
 pub mod kernel;
 mod slots;
 mod state;

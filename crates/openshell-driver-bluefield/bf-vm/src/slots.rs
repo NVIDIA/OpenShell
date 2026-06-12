@@ -9,6 +9,7 @@ use bf_inventory::{SysfsVfInventory, VfInventory, VfSlot};
 use openshell_vfio::SysfsRoot;
 
 use crate::config::BluefieldDriverConfig;
+use crate::host_pf::resolve_host_pf;
 
 pub(crate) struct HostSlotConfig<'a> {
     reserved_vf_indexes: &'a [u32],
@@ -26,12 +27,9 @@ impl<'a> From<&'a BluefieldDriverConfig> for HostSlotConfig<'a> {
     }
 }
 
-pub(crate) fn require_host_pf(config: &BluefieldDriverConfig) -> Result<&str, String> {
-    config
-        .host_pf
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "BlueField is enabled but no host PF was configured".to_string())
+pub(crate) fn resolve_host_pf_bdf(config: &BluefieldDriverConfig) -> Result<String, String> {
+    let resolved = resolve_host_pf(config.host_pf.as_deref(), std::path::Path::new("/sys"))?;
+    Ok(resolved.bdf)
 }
 
 /// Discover the local VF slots for `host_pf` and apply the operator's
