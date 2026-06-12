@@ -32,13 +32,14 @@ when a sandbox create request asks for GPU resources.
 |---|---|---|---|
 | Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
+| Apple Container | Local macOS development on Apple silicon. | One lightweight Linux VM per sandbox container, plus the nested OpenShell sandbox namespace. | Uses Apple's `container` CLI and a host-reachable supervisor callback endpoint for guest-to-gateway communication. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
-template resource limits. Docker and Podman apply them as runtime limits.
-Kubernetes mirrors each limit into the matching request. VM accepts the fields
-but currently ignores them.
+template resource limits. Docker, Podman, and Apple Container apply them as
+runtime limits. Kubernetes mirrors each limit into the matching request. VM
+accepts the fields but currently ignores them.
 
 Docker and Podman also accept per-sandbox driver-config mounts for existing
 runtime-managed named volumes and tmpfs mounts. Podman additionally accepts
@@ -66,6 +67,7 @@ Runtime-specific implementation notes belong in the driver crate README:
 - `crates/openshell-driver-docker/README.md`
 - `crates/openshell-driver-podman/README.md`
 - `crates/openshell-driver-kubernetes/README.md`
+- `crates/openshell-driver-apple-container/README.md`
 - `crates/openshell-driver-vm/README.md`
 
 ## Supervisor Delivery
@@ -77,6 +79,7 @@ The supervisor must be available inside each sandbox workload:
 | Docker | Bind-mounted local supervisor binary, or a binary extracted from the configured supervisor image. |
 | Podman | Read-only OCI image volume containing the supervisor binary. |
 | Kubernetes | Sandbox pod image or pod template configuration. |
+| Apple Container | Host bind-mounted Linux `openshell-sandbox` binary from `supervisor_bin_dir`. |
 | VM | Embedded in the guest rootfs bundle. |
 
 Driver-controlled environment variables must override sandbox image or template

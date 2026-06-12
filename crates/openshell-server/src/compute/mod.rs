@@ -6,6 +6,7 @@
 pub mod lease;
 pub mod vm;
 
+pub use openshell_driver_apple_container::AppleContainerComputeConfig;
 pub use openshell_driver_docker::DockerComputeConfig;
 pub use vm::VmComputeConfig;
 
@@ -28,6 +29,9 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
     SandboxTemplate, SshSession,
+};
+use openshell_driver_apple_container::{
+    AppleContainerComputeDriver, ComputeDriverService as AppleContainerDriverService,
 };
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
@@ -71,8 +75,23 @@ impl ShutdownCleanup for DockerComputeDriver {
     }
 }
 
+#[tonic::async_trait]
+impl ShutdownCleanup for AppleContainerComputeDriver {
+    async fn cleanup_on_shutdown(&self) -> Result<(), String> {
+        let stopped = self
+            .stop_managed_containers_on_shutdown()
+            .await
+            .map_err(|err| err.to_string())?;
+        info!(
+            stopped_containers = stopped,
+            "Stopped Apple Container sandboxes during gateway shutdown"
+        );
+        Ok(())
+    }
+}
+
 /// Resume a single sandbox whose store record indicates it should be
-/// running. Implemented by drivers (currently only Docker) where compute
+/// running. Implemented by local drivers where compute
 /// resources do not auto-restart with the gateway. Returns `Ok(true)` if
 /// the backend resource was found and resumed (or was already running),
 /// `Ok(false)` if no backend resource exists.
@@ -89,6 +108,16 @@ impl StartupResume for DockerComputeDriver {
             .map_err(|err| err.to_string())
     }
 }
+
+#[tonic::async_trait]
+impl StartupResume for AppleContainerComputeDriver {
+    async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
+        Self::resume_sandbox(self, sandbox_id, sandbox_name)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
 /// Interval between store-vs-backend reconciliation sweeps.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -412,6 +441,41 @@ impl ComputeRuntime {
         .await
     }
 
+    /// Create a compute runtime backed by the local Apple Container service.
+    pub async fn new_apple_container(
+        config: AppleContainerComputeConfig,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let driver = Arc::new(
+            AppleContainerComputeDriver::new(config, supervisor_sessions.clone())
+                .await
+                .map_err(|err| ComputeError::Message(err.to_string()))?,
+        );
+        let gateway_bind_addresses = driver.gateway_bind_addresses();
+        let shutdown_cleanup: Arc<dyn ShutdownCleanup> = driver.clone();
+        let startup_resume: Arc<dyn StartupResume> = driver.clone();
+        let driver: SharedComputeDriver = Arc::new(AppleContainerDriverService::new(driver));
+        Self::from_driver(
+            ComputeDriverKind::AppleContainer,
+            driver,
+            Some(shutdown_cleanup),
+            Some(startup_resume),
+            None,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+            true,
+            gateway_bind_addresses,
+        )
+        .await
+    }
+
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
@@ -443,6 +507,10 @@ impl ComputeRuntime {
         sandbox: Sandbox,
         sandbox_token: Option<String>,
     ) -> Result<Sandbox, Status> {
+        // Keep store insertion and backend creation ordered against delete and
+        // watch reconciliation. Without this, a delete can remove the store
+        // record in the narrow window before the driver creates the backend.
+        let _guard = self.sync_lock.lock().await;
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox =
             driver_sandbox_from_public(&sandbox, self.driver_kind).map_err(|status| *status)?;
@@ -601,7 +669,7 @@ impl ComputeRuntime {
 
     /// Resume sandboxes whose store records say they should be running.
     /// Drivers that do not auto-restart compute resources across gateway
-    /// restarts (currently only Docker) implement `StartupResume`. For
+    /// restarts (Docker and Apple Container) implement `StartupResume`. For
     /// each sandbox in the store whose phase is not `Deleting` or
     /// `Error`, we ask the driver to resume the underlying resource. If
     /// the driver reports that the resource no longer exists or fails to

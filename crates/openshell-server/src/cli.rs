@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::certgen;
-use crate::compute::{DockerComputeConfig, VmComputeConfig};
+use crate::compute::{AppleContainerComputeConfig, DockerComputeConfig, VmComputeConfig};
 use crate::config_file::{self, ConfigFile, GatewayFileSection};
 use crate::defaults::{self, LocalTlsPaths};
 use crate::{run_server, tracing_bus::TracingLogBus};
@@ -96,12 +96,14 @@ struct RunArgs {
 
     /// Compute drivers configured for this gateway.
     ///
-    /// Accepts a comma-delimited list such as `kubernetes` or
-    /// `kubernetes,podman`. The configuration format is future-proofed for
-    /// multiple drivers, but the gateway currently requires exactly one.
+    /// Accepts exactly one driver name today: `kubernetes`, `podman`, `docker`,
+    /// `vm`, or `apple-container`. The value is parsed as a list because the
+    /// configuration format reserves room for multiple drivers, but the gateway
+    /// currently rejects more than one.
     /// When unset, the gateway auto-detects the driver based on the runtime
     /// environment (Kubernetes → Podman → Docker CLI or socket). VM is never
-    /// auto-detected and requires explicit configuration.
+    /// auto-detected and requires explicit configuration. Apple Container is
+    /// also explicit because it is macOS-specific and not a package default.
     #[arg(
         long,
         alias = "driver",
@@ -411,6 +413,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         args.port,
     )?;
     let docker_config = build_docker_config(file.as_ref(), local_tls.as_ref())?;
+    let apple_container_config = build_apple_container_config(file.as_ref(), local_tls.as_ref())?;
 
     if args.disable_tls {
         warn!("TLS disabled — listening on plaintext HTTP");
@@ -450,6 +453,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         config,
         vm_config,
         docker_config,
+        apple_container_config,
         file,
         tracing_log_bus,
     ))
@@ -668,7 +672,12 @@ fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
 fn is_singleplayer_driver(args: &RunArgs) -> bool {
     matches!(
         effective_single_driver(args),
-        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
+        Some(
+            ComputeDriverKind::Docker
+                | ComputeDriverKind::Podman
+                | ComputeDriverKind::Vm
+                | ComputeDriverKind::AppleContainer,
+        )
     )
 }
 
@@ -746,6 +755,34 @@ fn build_docker_config(
     } else {
         DockerComputeConfig::default()
     };
+    apply_guest_tls_defaults(
+        &mut cfg.guest_tls_ca,
+        &mut cfg.guest_tls_cert,
+        &mut cfg.guest_tls_key,
+        local_tls,
+    );
+    Ok(cfg)
+}
+
+/// Build [`AppleContainerComputeConfig`] using the same inheritance pattern as
+/// [`build_vm_config`].
+fn build_apple_container_config(
+    file: Option<&ConfigFile>,
+    local_tls: Option<&LocalTlsPaths>,
+) -> Result<AppleContainerComputeConfig> {
+    let mut cfg = file.map_or_else(
+        || Ok(AppleContainerComputeConfig::default()),
+        |file| {
+            let merged = config_file::driver_table(
+                ComputeDriverKind::AppleContainer,
+                &file.openshell.gateway,
+                file.openshell.drivers.get("apple-container"),
+            );
+            merged.try_into().map_err(|e| {
+                miette::miette!("invalid [openshell.drivers.apple-container] table: {e}")
+            })
+        },
+    )?;
     apply_guest_tls_defaults(
         &mut cfg.guest_tls_ca,
         &mut cfg.guest_tls_cert,
@@ -1269,6 +1306,30 @@ mod tests {
     }
 
     #[test]
+    fn mtls_auth_auto_defaults_for_apple_container_driver() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_ENABLE_MTLS_AUTH");
+
+        let (args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "apple-container",
+            "--tls-cert",
+            "/tmp/server.crt",
+            "--tls-key",
+            "/tmp/server.key",
+            "--tls-client-ca",
+            "/tmp/ca.crt",
+        ]);
+
+        assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
+    }
+
+    #[test]
     fn file_mtls_auth_value_overrides_local_auto_default() {
         let _lock = ENV_LOCK
             .lock()
@@ -1528,7 +1589,7 @@ ssh_session_ttl_secs = 1234
 
     #[test]
     fn singleplayer_driver_matches_only_one_local_driver() {
-        for driver in ["docker", "podman", "vm"] {
+        for driver in ["docker", "podman", "vm", "apple-container"] {
             let (args, _) = parse_with_args(&[
                 "openshell-gateway",
                 "--db-url",

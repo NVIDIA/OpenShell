@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Sandbox Compute Drivers"
 sidebar-title: "Compute Drivers"
-description: "Reference for Docker, Podman, MicroVM, and Kubernetes sandbox compute drivers."
-keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, Reference"
+description: "Reference for Docker, Podman, Apple Container, MicroVM, and Kubernetes sandbox compute drivers."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, Apple Container, MicroVM, Kubernetes, Reference"
 position: 4
 ---
 
@@ -21,22 +21,24 @@ Configure the compute driver on the gateway. Current releases accept one driver 
 compute_drivers = ["docker"]
 ```
 
-Supported values are `docker`, `podman`, `kubernetes`, and `vm`.
+Supported values are `docker`, `podman`, `apple-container`, `kubernetes`, and `vm`.
 
-When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
+When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM and Apple Container drivers are never auto-detected; configure them explicitly with `compute_drivers = ["vm"]`, `compute_drivers = ["apple-container"]`, or the matching `OPENSHELL_DRIVERS` value in the launch environment.
 
 Common gateway options:
 
 | Gateway TOML option | Description |
 |---|---|
-| `compute_drivers = ["<driver>"]` | Select the compute driver. Supported values are `docker`, `podman`, `kubernetes`, and `vm`. |
+| `compute_drivers = ["<driver>"]` | Select the compute driver. Supported values are `docker`, `podman`, `apple-container`, `kubernetes`, and `vm`. |
 
 Set driver-specific values such as sandbox images, callback endpoints, network names, TLS material, and VM sizing in the gateway TOML file. See the [Gateway Configuration File](./gateway-config) reference for the full `[openshell.drivers.<name>]` schema.
 
 Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
-Docker and Podman apply them as runtime limits. Kubernetes applies them as both
-container requests and limits. The VM driver accepts the fields but currently
-ignores them.
+Docker, Podman, and Apple Container apply them as runtime limits. Kubernetes
+applies them as both container requests and limits. The VM driver accepts the
+fields but currently ignores them. Apple Container requires `--cpu` values that
+resolve to a whole CPU count because Apple's `container` CLI accepts integer
+CPU counts.
 
 Sandbox create also accepts experimental driver-owned config through
 `--driver-config-json`. The value is a JSON object keyed by driver name. The
@@ -197,6 +199,22 @@ config. OpenShell rejects mount targets that replace the workspace root,
 container root, supervisor files, `/etc/openshell`, `/etc/openshell-tls`,
 authentication material, or network namespace paths. These checks do not make
 host bind mounts safe.
+
+## Apple Container Driver
+
+[Apple Container](https://opensource.apple.com/projects/container/)-backed sandboxes run as Linux containers inside lightweight VMs on macOS. Use Apple Container for local macOS workflows on Apple silicon when you want a native Apple container runtime instead of Docker Desktop or a Podman machine.
+
+The gateway invokes Apple's `container` CLI and reads JSON output for service, network, and container state. The driver requires the `container` CLI to be installed on the gateway host.
+
+For maintainer-level implementation details, refer to the [Apple Container driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-apple-container/README.md).
+
+Select Apple Container with `compute_drivers = ["apple-container"]` in `[openshell.gateway]`. Configure Apple Container driver values such as `container_bin`, `default_image`, `sandbox_namespace`, `grpc_endpoint`, `gateway_port`, `host_callback_host`, `supervisor_bin_dir`, `sandbox_ssh_socket_path`, `stop_timeout_secs`, and `guest_tls_*` in `[openshell.drivers.apple-container]`.
+
+Apple Container guests call back from inside a lightweight VM, so `127.0.0.1:<gateway-port>` points at the guest rather than the macOS host. When `grpc_endpoint` is empty, the driver builds a callback URL from `host_callback_host` and the gateway bind port. The default host callback name is `host.container.internal`. The gateway also registers the Apple Container default network gateway address as an extra listener when the driver discovers it.
+
+The Apple Container driver requires gateway JWT auth because the supervisor token is delivered through a host-owned auth directory mounted read-only into the sandbox.
+
+Partial guest TLS configuration is rejected. Set all of `guest_tls_ca`, `guest_tls_cert`, and `guest_tls_key` for an HTTPS supervisor callback, or leave all three unset for plaintext local development.
 
 ## MicroVM Driver
 

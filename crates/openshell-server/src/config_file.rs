@@ -119,6 +119,9 @@ pub struct GatewayFileSection {
     pub service_account_name: Option<String>,
     #[serde(default)]
     pub host_gateway_ip: Option<String>,
+    /// Hostname or IP copied into drivers whose guests call back through host DNS.
+    #[serde(default)]
+    pub host_callback_host: Option<String>,
     #[serde(default)]
     pub enable_user_namespaces: Option<bool>,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
@@ -284,6 +287,14 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
+        ComputeDriverKind::AppleContainer => &[
+            "sandbox_namespace",
+            "default_image",
+            "host_callback_host",
+            "guest_tls_ca",
+            "guest_tls_cert",
+            "guest_tls_key",
+        ],
         ComputeDriverKind::Vm => &[
             "default_image",
             "guest_tls_ca",
@@ -301,6 +312,7 @@ fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Va
         "client_tls_secret_name" => g.client_tls_secret_name.as_deref().map(string_value),
         "service_account_name" => g.service_account_name.as_deref().map(string_value),
         "host_gateway_ip" => g.host_gateway_ip.as_deref().map(string_value),
+        "host_callback_host" => g.host_callback_host.as_deref().map(string_value),
         "enable_user_namespaces" => g.enable_user_namespaces.map(toml::Value::Boolean),
         "sa_token_ttl_secs" => g.sa_token_ttl_secs.map(toml::Value::Integer),
         "guest_tls_ca" => g.guest_tls_ca.as_deref().map(path_value),
@@ -543,6 +555,45 @@ version = 2
         assert_eq!(
             table.get("host_gateway_ip").and_then(|v| v.as_str()),
             Some("192.168.127.254")
+        );
+    }
+
+    #[test]
+    fn apple_container_driver_table_inherits_gateway_defaults() {
+        let gateway = GatewayFileSection {
+            sandbox_namespace: Some("agents".to_string()),
+            default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
+            host_callback_host: Some("host.container.internal".to_string()),
+            guest_tls_ca: Some(PathBuf::from("/gateway/ca.crt")),
+            guest_tls_cert: Some(PathBuf::from("/gateway/tls.crt")),
+            guest_tls_key: Some(PathBuf::from("/gateway/tls.key")),
+            ..Default::default()
+        };
+        let merged = driver_table(ComputeDriverKind::AppleContainer, &gateway, None);
+        let table = merged.as_table().expect("table");
+        assert_eq!(
+            table.get("sandbox_namespace").and_then(|v| v.as_str()),
+            Some("agents")
+        );
+        assert_eq!(
+            table.get("default_image").and_then(|v| v.as_str()),
+            Some("ghcr.io/nvidia/openshell/sandbox:0.9")
+        );
+        assert_eq!(
+            table.get("host_callback_host").and_then(|v| v.as_str()),
+            Some("host.container.internal")
+        );
+        assert_eq!(
+            table.get("guest_tls_ca").and_then(|v| v.as_str()),
+            Some("/gateway/ca.crt")
+        );
+        assert_eq!(
+            table.get("guest_tls_cert").and_then(|v| v.as_str()),
+            Some("/gateway/tls.crt")
+        );
+        assert_eq!(
+            table.get("guest_tls_key").and_then(|v| v.as_str()),
+            Some("/gateway/tls.key")
         );
     }
 
