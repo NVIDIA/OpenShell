@@ -425,6 +425,27 @@ Driver implementation settings live in the TOML driver tables. See
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
 
+### Policy sources
+
+`[openshell.gateway.policies]` configures an optional governed source for
+sandbox policy YAML and provider profile YAML. `location` accepts a filesystem
+directory, `file://` URI, or `grpc+unix://` Unix socket. Filesystem sources use
+`policies/<name>.yaml` and `providers/<name>.yaml`. gRPC sources implement
+`openshell.policy_source.v1.PolicySource` with `ListPolicies`, `GetPolicy`,
+`ListProviders`, and `GetProvider`; getters return only UTF-8 YAML document
+bytes.
+
+Policy sources are loaded at gateway startup. The gateway stores exact source
+bytes under an internal object type with a SHA-256 digest, parses the YAML into
+the existing sandbox policy and provider profile models, and marks imported
+provider profiles as source-backed. Source-backed profiles may be updated by the
+source on restart, but regular provider profile import/delete APIs cannot
+overwrite or remove them.
+
+`default_policy` names the policy applied to new sandboxes when
+`CreateSandbox` omits `spec.policy`. Request-supplied policies remain the
+highest-precedence sandbox policy input for creation.
+
 ### Driver inheritance
 
 `[openshell.gateway]` carries a small set of values (`sandbox_namespace`,

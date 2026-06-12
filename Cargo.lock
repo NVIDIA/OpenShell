@@ -3519,6 +3519,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-policy-source-example"
+version = "0.0.0"
+dependencies = [
+ "hyper-util",
+ "openshell-core",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "openshell-prover"
 version = "0.0.0"
 dependencies = [

@@ -30,6 +30,7 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
+mod policy_source;
 pub(crate) mod policy_store;
 mod provider_refresh;
 mod readiness;
@@ -135,6 +136,9 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+
+    /// Optional governed policy/provider source loaded at gateway startup.
+    pub(crate) policy_source: Option<policy_source::LoadedPolicySource>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -157,7 +161,7 @@ impl ServerState {
     /// Create new server state.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         config: Config,
         store: Arc<Store>,
         compute: ComputeRuntime,
@@ -166,6 +170,7 @@ impl ServerState {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
+        policy_source: Option<policy_source::LoadedPolicySource>,
     ) -> Self {
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         Self {
@@ -185,6 +190,7 @@ impl ServerState {
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
             grpc_rate_limiter,
+            policy_source,
         }
     }
 }
@@ -209,6 +215,13 @@ pub async fn run_server(
     }
 
     let store = Arc::new(Store::connect(database_url).await?);
+    let policy_source = policy_source::load_policy_source(
+        store.as_ref(),
+        config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.policies.as_ref()),
+    )
+    .await?;
 
     let oidc_cache = if let Some(ref oidc) = config.oidc {
         // Validate RBAC configuration before starting.
@@ -252,6 +265,7 @@ pub async fn run_server(
         tracing_log_bus,
         supervisor_sessions,
         oidc_cache,
+        policy_source,
     );
 
     // Load the gateway-minted sandbox JWT signing key when configured.
@@ -993,6 +1007,7 @@ mod tests {
             crate::sandbox_watch::SandboxWatchBus::new(),
             crate::tracing_bus::TracingLogBus::new(),
             Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+            None,
             None,
         ))
     }

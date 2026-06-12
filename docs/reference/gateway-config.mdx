@@ -46,6 +46,9 @@ version = 1
 [openshell.gateway.oidc]
 # ... JWT bearer auth ...
 
+[openshell.gateway.policies]
+# ... governed policy/provider profile source ...
+
 [openshell.drivers.kubernetes]
 # ... driver-specific settings ...
 ```
@@ -103,6 +106,12 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 grpc_rate_limit_requests       = 120
 grpc_rate_limit_window_seconds = 60
 
+[openshell.gateway.policies]
+# Filesystem directory, file:// URI, or grpc+unix:// socket.
+location = "grpc+unix:///var/run/openshell/policy-source.sock"
+# Applied to new sandboxes only when CreateSandbox omits spec.policy.
+default_policy = "default"
+
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
@@ -141,6 +150,33 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
+
+## Policy Sources
+
+`[openshell.gateway.policies]` configures an optional startup-loaded source for governed sandbox policies and provider type profiles. Set `location` to a filesystem directory, a `file://` URI, or a `grpc+unix://` Unix socket. Set `default_policy` to the policy document name the gateway should apply when `CreateSandbox` omits `spec.policy`; an explicit request policy always wins.
+
+Filesystem sources use this layout:
+
+```text
+<location>/
+  policies/
+    default.yaml
+  providers/
+    example.yaml
+```
+
+Both `.yaml` and `.yml` are accepted. Document names are derived from the file stem.
+
+gRPC sources implement `openshell.policy_source.v1.PolicySource` from `proto/policy_source.proto`:
+
+```proto
+rpc ListPolicies(ListDocumentsRequest) returns (ListDocumentsResponse);
+rpc GetPolicy(GetDocumentRequest) returns (Document);
+rpc ListProviders(ListDocumentsRequest) returns (ListDocumentsResponse);
+rpc GetProvider(GetDocumentRequest) returns (Document);
+```
+
+`GetPolicy` and `GetProvider` return only `bytes document = 1`. Documents must be UTF-8 YAML. The gateway stores the exact YAML bytes with a SHA-256 digest for later verification, parses policy YAML into the sandbox policy model, and imports provider YAML as source-backed provider profiles. Source-backed provider profiles can be updated by the source on restart, but regular provider-profile import and delete APIs cannot overwrite or remove them.
 
 ## Driver References
 

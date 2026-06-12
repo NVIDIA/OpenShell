@@ -89,6 +89,10 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub compute_drivers: Option<Vec<ComputeDriverKind>>,
 
+    // ── Governed policy/provider source ──────────────────────────────────
+    #[serde(default)]
+    pub policies: Option<GatewayPoliciesSection>,
+
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
     pub sandbox_namespace: Option<String>,
@@ -158,6 +162,18 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// `[openshell.gateway.policies]` section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayPoliciesSection {
+    /// Filesystem location or `grpc+unix://` socket serving YAML documents.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Policy document name applied when `CreateSandbox` omits `spec.policy`.
+    #[serde(default)]
+    pub default_policy: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -471,6 +487,26 @@ version = 2
             err,
             ConfigFileError::UnsupportedVersion { version: 2 }
         ));
+    }
+
+    #[test]
+    fn parses_gateway_policies_section() {
+        let toml = r#"
+[openshell]
+version = 1
+
+[openshell.gateway.policies]
+location = "grpc+unix:///var/run/openshell/policy-source.sock"
+default_policy = "default"
+"#;
+        let tmp = write_tmp(toml);
+        let config = load(tmp.path()).expect("policy source config should parse");
+        let policies = config.openshell.gateway.policies.expect("policies section");
+        assert_eq!(
+            policies.location.as_deref(),
+            Some("grpc+unix:///var/run/openshell/policy-source.sock")
+        );
+        assert_eq!(policies.default_policy.as_deref(), Some("default"));
     }
 
     #[test]

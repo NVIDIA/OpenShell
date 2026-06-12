@@ -616,7 +616,7 @@ pub(super) fn validate_object_metadata(
 ///
 /// Delegates to [`openshell_policy::validate_sandbox_policy`] and converts
 /// violations into a gRPC `INVALID_ARGUMENT` status.
-pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+pub(crate) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
     if let Err(violations) = openshell_policy::validate_sandbox_policy(policy) {
         let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
         return Err(Status::invalid_argument(format!(

@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-policy-source-example"
+description = "Example gRPC policy/provider profile source for OpenShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+hyper-util = { workspace = true }
+openshell-core = { path = "../../crates/openshell-core", default-features = false }
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+tonic = { workspace = true }
+tower = { workspace = true }
+
+[[bin]]
+name = "policy-source-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "policy-source-check"
+path = "src/bin/check.rs"
+
+[lints]
+workspace = true

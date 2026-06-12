@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+network_policies:
+  github-api:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: https
+      - host: github.com
+        port: 443
+        protocol: https
+    binaries:
+      - path: /usr/bin/curl
+      - path: /usr/bin/git

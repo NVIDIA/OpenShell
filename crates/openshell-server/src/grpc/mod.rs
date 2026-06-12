@@ -8,7 +8,7 @@ pub mod policy;
 pub mod provider;
 mod sandbox;
 mod service;
-mod validation;
+pub(crate) mod validation;
 
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
@@ -696,6 +696,7 @@ pub mod test_support {
             SandboxWatchBus::new(),
             TracingLogBus::new(),
             Arc::new(SupervisorSessionRegistry::new()),
+            None,
             None,
         ))
     }

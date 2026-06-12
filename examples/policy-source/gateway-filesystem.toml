@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example gateway configuration for a filesystem policy/provider profile
+# source. Run the gateway from the repository root, or replace this with an
+# absolute path to a deployed bundle directory.
+
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address = "127.0.0.1:17670"
+log_level = "info"
+
+[openshell.gateway.policies]
+location = "./examples/policy-source/bundle"
+default_policy = "default"

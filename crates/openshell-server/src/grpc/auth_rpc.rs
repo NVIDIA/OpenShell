@@ -177,6 +177,7 @@ mod tests {
             TracingLogBus::new(),
             Arc::new(SupervisorSessionRegistry::new()),
             None,
+            None,
         );
         // We don't need the authenticator for these tests; only the issuer.
         let issuer = SandboxJwtIssuer::from_pem(
@@ -352,6 +353,7 @@ mod tests {
             SandboxWatchBus::new(),
             TracingLogBus::new(),
             Arc::new(SupervisorSessionRegistry::new()),
+            None,
             None,
         ));
         insert_sandbox(&state, "sandbox-a").await;

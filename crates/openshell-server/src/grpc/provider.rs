@@ -1256,6 +1256,20 @@ impl ObjectType for StoredProviderProfile {
     }
 }
 
+pub(crate) const SOURCE_PROVIDER_PROFILE_LABEL_KEY: &str = "openshell.io/source";
+pub(crate) const SOURCE_PROVIDER_PROFILE_LABEL_VALUE: &str = "policy-source";
+pub(crate) const SOURCE_PROVIDER_PROFILE_FORMAT_LABEL_KEY: &str = "openshell.io/source-format";
+pub(crate) const SOURCE_PROVIDER_PROFILE_DIGEST_PREFIX_LABEL_KEY: &str =
+    "openshell.io/source-digest-prefix";
+
+fn is_source_backed_provider_profile(profile: &StoredProviderProfile) -> bool {
+    profile
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.labels.get(SOURCE_PROVIDER_PROFILE_LABEL_KEY))
+        .is_some_and(|value| value == SOURCE_PROVIDER_PROFILE_LABEL_VALUE)
+}
+
 pub(super) async fn handle_list_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<ListProviderProfilesRequest>,
@@ -1373,8 +1387,11 @@ pub(super) async fn handle_delete_provider_profile(
         .get_message_by_name::<StoredProviderProfile>(&id)
         .await
         .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?;
-    if existing.is_none() {
-        return Err(Status::not_found("provider profile not found"));
+    let existing = existing.ok_or_else(|| Status::not_found("provider profile not found"))?;
+    if is_source_backed_provider_profile(&existing) {
+        return Err(Status::failed_precondition(
+            "source-backed provider profiles cannot be deleted",
+        ));
     }
 
     let blocking_sandboxes = sandboxes_using_profile(state.store.as_ref(), &id).await?;
@@ -1392,6 +1409,103 @@ pub(super) async fn handle_delete_provider_profile(
         .map_err(|e| Status::internal(format!("delete provider profile failed: {e}")))?;
 
     Ok(Response::new(DeleteProviderProfileResponse { deleted }))
+}
+
+pub(crate) async fn upsert_source_provider_profile(
+    store: &Store,
+    source: &str,
+    profile: ProviderTypeProfile,
+    digest_hex: &str,
+) -> Result<(), Status> {
+    let Some(id) = normalize_profile_id(&profile.id) else {
+        return Err(Status::failed_precondition(format!(
+            "provider profile '{}' has an invalid id",
+            profile.id
+        )));
+    };
+    if get_default_profile(&id).is_some() {
+        return Err(Status::failed_precondition(format!(
+            "provider profile '{id}' is built-in and cannot be managed by a policy source"
+        )));
+    }
+
+    let existing = store
+        .get_message_by_name::<StoredProviderProfile>(&id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?;
+    if existing
+        .as_ref()
+        .is_some_and(|stored| !is_source_backed_provider_profile(stored))
+    {
+        return Err(Status::failed_precondition(format!(
+            "custom provider profile '{id}' already exists and is not source-backed"
+        )));
+    }
+
+    let profiles = vec![(source.to_string(), profile.clone())];
+    let mut diagnostics = validate_profile_set(&profiles);
+    if !has_errors(&diagnostics) {
+        diagnostics.extend(profile_import_attached_sandbox_diagnostics(store, &profiles).await?);
+    }
+    if has_errors(&diagnostics) {
+        let messages = diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity == "error")
+            .map(|diagnostic| {
+                format!(
+                    "{} {}: {}",
+                    diagnostic.profile_id, diagnostic.field, diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(Status::failed_precondition(format!(
+            "source provider profile '{id}' failed validation: {messages}"
+        )));
+    }
+
+    let mut stored = stored_provider_profile(profile.to_proto());
+    if let (Some(existing), Some(metadata)) = (existing.as_ref(), stored.metadata.as_mut())
+        && let Some(existing_metadata) = existing.metadata.as_ref()
+    {
+        metadata.id.clone_from(&existing_metadata.id);
+        metadata.created_at_ms = existing_metadata.created_at_ms;
+    }
+    if let Some(metadata) = stored.metadata.as_mut() {
+        metadata.labels.insert(
+            SOURCE_PROVIDER_PROFILE_LABEL_KEY.to_string(),
+            SOURCE_PROVIDER_PROFILE_LABEL_VALUE.to_string(),
+        );
+        metadata.labels.insert(
+            SOURCE_PROVIDER_PROFILE_FORMAT_LABEL_KEY.to_string(),
+            "yaml".to_string(),
+        );
+        metadata.labels.insert(
+            SOURCE_PROVIDER_PROFILE_DIGEST_PREFIX_LABEL_KEY.to_string(),
+            digest_hex.chars().take(16).collect(),
+        );
+    }
+    let labels_json = stored
+        .object_labels()
+        .filter(|labels| !labels.is_empty())
+        .map(|labels| {
+            serde_json::to_string(&labels).map_err(|e| {
+                Status::internal(format!("serialize provider profile labels failed: {e}"))
+            })
+        })
+        .transpose()?;
+    store
+        .put_if(
+            StoredProviderProfile::object_type(),
+            stored.object_id(),
+            stored.object_name(),
+            &stored.encode_to_vec(),
+            labels_json.as_deref(),
+            WriteCondition::Unconditional,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("persist provider profile failed: {e}")))?;
+    Ok(())
 }
 
 pub(super) async fn get_provider_type_profile(
@@ -1557,17 +1671,21 @@ async fn profile_conflict_diagnostics(
             });
             continue;
         }
-        if store
+        if let Some(existing) = store
             .get_message_by_name::<StoredProviderProfile>(&id)
             .await
             .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
-            .is_some()
         {
+            let message = if is_source_backed_provider_profile(&existing) {
+                format!("provider profile '{id}' is managed by a policy source")
+            } else {
+                format!("custom provider profile '{id}' already exists")
+            };
             diagnostics.push(ProfileValidationDiagnostic {
                 source: source.clone(),
                 profile_id: id.clone(),
                 field: "id".to_string(),
-                message: format!("custom provider profile '{id}' already exists"),
+                message,
                 severity: "error".to_string(),
             });
         }
@@ -2743,6 +2861,50 @@ mod tests {
         .profile
         .unwrap();
         assert_eq!(fetched.id, "custom-api");
+    }
+
+    #[tokio::test]
+    async fn source_backed_provider_profiles_reject_regular_import_and_delete() {
+        let state = test_server_state().await;
+        upsert_source_provider_profile(
+            state.store.as_ref(),
+            "policy-source/provider/source-api",
+            ProviderTypeProfile::from_proto(&custom_profile("source-api")),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap();
+
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("source-api")),
+                    source: "source-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!response.imported);
+        assert!(
+            response
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("managed by a policy source"))
+        );
+
+        let err = handle_delete_provider_profile(
+            &state,
+            Request::new(DeleteProviderProfileRequest {
+                id: "source-api".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("source-backed"));
     }
 
     #[tokio::test]

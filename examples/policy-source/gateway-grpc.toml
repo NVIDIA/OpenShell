@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example gateway configuration for a policy/provider profile source. The
+# source service listens on a local Unix domain socket and implements
+# openshell.policy_source.v1.PolicySource.
+
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address = "127.0.0.1:17670"
+log_level = "info"
+
+[openshell.gateway.policies]
+location = "grpc+unix:///tmp/openshell-policy-source.sock"
+default_policy = "default"

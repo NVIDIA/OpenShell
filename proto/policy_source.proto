@@ -1,0 +1,38 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.policy_source.v1;
+
+// PolicySource serves governed sandbox policies and provider type profiles to
+// the gateway. Documents are always UTF-8 YAML. Responses intentionally carry
+// only the document bytes so the gateway can compute a digest over the exact
+// source payload.
+service PolicySource {
+  // List available sandbox policy document names.
+  rpc ListPolicies(ListDocumentsRequest) returns (ListDocumentsResponse);
+
+  // Return a sandbox policy YAML document by name.
+  rpc GetPolicy(GetDocumentRequest) returns (Document);
+
+  // List available provider profile document names.
+  rpc ListProviders(ListDocumentsRequest) returns (ListDocumentsResponse);
+
+  // Return a provider profile YAML document by name.
+  rpc GetProvider(GetDocumentRequest) returns (Document);
+}
+
+message ListDocumentsRequest {}
+
+message ListDocumentsResponse {
+  repeated string names = 1;
+}
+
+message GetDocumentRequest {
+  string name = 1;
+}
+
+message Document {
+  bytes document = 1;
+}

@@ -145,6 +145,15 @@ async fn handle_create_sandbox_inner(
 
     // Ensure the template always carries the resolved image.
     let mut spec = spec;
+    if spec.policy.is_none()
+        && let Some(default_policy) = state
+            .policy_source
+            .as_ref()
+            .and_then(|source| source.default_policy.as_ref())
+    {
+        spec.policy = Some(default_policy.clone());
+    }
+
     let template = spec.template.get_or_insert_with(SandboxTemplate::default);
     if template.image.is_empty() {
         template.image = state.compute.default_image().to_string();
@@ -2586,6 +2595,58 @@ mod tests {
         assert!(err.message().contains("TOKEN"));
         assert!(err.message().contains("provider-a"));
         assert!(err.message().contains("provider-b"));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_applies_configured_default_policy() {
+        let store = Arc::new(
+            crate::persistence::Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let compute = crate::compute::new_test_runtime(store.clone()).await;
+        let default_policy = openshell_policy::parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  github:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: https
+    binaries:
+      - path: /usr/bin/curl
+",
+        )
+        .expect("default policy");
+        let state = Arc::new(ServerState::new(
+            openshell_core::Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            store,
+            compute,
+            crate::sandbox_index::SandboxIndex::new(),
+            crate::sandbox_watch::SandboxWatchBus::new(),
+            crate::tracing_bus::TracingLogBus::new(),
+            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+            None,
+            Some(crate::policy_source::LoadedPolicySource {
+                default_policy: Some(default_policy),
+            }),
+        ));
+
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "uses-default-policy".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .expect("create")
+        .into_inner();
+
+        let sandbox = response.sandbox.expect("sandbox");
+        assert!(sandbox.spec.expect("spec").policy.is_some());
     }
 
     #[tokio::test]
