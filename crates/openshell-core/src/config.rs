@@ -91,15 +91,32 @@ impl FromStr for ComputeDriverKind {
     }
 }
 
-/// Result of [`detect_driver`]: the driver kind plus any connection
-/// metadata discovered during probing (e.g. the Podman API socket path).
+/// Result of [`detect_driver`] or an explicitly configured driver, carrying
+/// any driver-specific connection metadata discovered during probing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DetectedDriver {
-    pub kind: ComputeDriverKind,
-    /// API socket path discovered during detection (Podman only, for now).
-    /// Always populated for Podman so the driver connects to the exact
-    /// socket that detection verified.  `None` for non-Podman drivers.
-    pub socket_path: Option<PathBuf>,
+pub enum DetectedDriver {
+    Kubernetes,
+    Docker,
+    /// VM is never auto-detected but flows through the same path when
+    /// explicitly configured via `--drivers vm`.
+    Vm,
+    Podman {
+        /// API socket path verified during detection.
+        socket_path: PathBuf,
+    },
+}
+
+impl DetectedDriver {
+    /// The [`ComputeDriverKind`] for logging and match guards.
+    #[must_use]
+    pub fn kind(&self) -> ComputeDriverKind {
+        match self {
+            Self::Kubernetes => ComputeDriverKind::Kubernetes,
+            Self::Docker => ComputeDriverKind::Docker,
+            Self::Vm => ComputeDriverKind::Vm,
+            Self::Podman { .. } => ComputeDriverKind::Podman,
+        }
+    }
 }
 
 /// Auto-detect the appropriate compute driver based on the runtime environment.
@@ -112,27 +129,18 @@ pub struct DetectedDriver {
 pub fn detect_driver() -> Option<DetectedDriver> {
     // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
     if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        return Some(DetectedDriver {
-            kind: ComputeDriverKind::Kubernetes,
-            socket_path: None,
-        });
+        return Some(DetectedDriver::Kubernetes);
     }
 
     // Podman: check for a reachable local API socket, falling back to CLI
     // discovery which also resolves the host-side socket path.
     if let Some(socket_path) = detect_podman() {
-        return Some(DetectedDriver {
-            kind: ComputeDriverKind::Podman,
-            socket_path,
-        });
+        return Some(DetectedDriver::Podman { socket_path });
     }
 
     // Docker: check if the CLI is available or a local Docker socket exists.
     if is_docker_available() {
-        return Some(DetectedDriver {
-            kind: ComputeDriverKind::Docker,
-            socket_path: None,
-        });
+        return Some(DetectedDriver::Docker);
     }
 
     None
@@ -148,18 +156,15 @@ fn is_binary_available(name: &str) -> bool {
 
 /// Detect whether Podman is available and discover the API socket path.
 ///
-/// Returns `Some(path)` when Podman is reachable — the path is always
-/// populated so the driver uses the exact socket that detection verified.
-///
-/// Returns `None` when Podman is not available at all.
-fn detect_podman() -> Option<Option<PathBuf>> {
+/// Returns the verified socket path, or `None` when Podman is not
+/// available at all.
+fn detect_podman() -> Option<PathBuf> {
     // Fast path: one of the well-known socket candidates responds.
-    // Return the path that worked so the driver doesn't have to rediscover it.
     if let Some(path) = podman_socket_candidates()
         .into_iter()
         .find(|path| podman_socket_responds(path))
     {
-        return Some(Some(path));
+        return Some(path);
     }
 
     // Slow path: the socket symlink is missing or at a non-standard
@@ -177,7 +182,7 @@ fn detect_podman() -> Option<Option<PathBuf>> {
 ///    is the VM-internal path, which is not reachable from the host).
 /// 3. If `serviceIsRemote` is false, use `remoteSocket.path` directly
 ///    (on native Linux this IS the real local socket).
-fn discover_podman_socket() -> Option<Option<PathBuf>> {
+fn discover_podman_socket() -> Option<PathBuf> {
     let output = Command::new("podman")
         .args(["info", "--format", "json"])
         .stdin(Stdio::null())
@@ -199,18 +204,18 @@ fn discover_podman_socket() -> Option<Option<PathBuf>> {
 
 /// Extract the socket path from `podman info` JSON output.
 /// Used on native Linux where `remoteSocket.path` is the real local socket.
-fn parse_podman_info_socket(info: &serde_json::Value) -> Option<Option<PathBuf>> {
+fn parse_podman_info_socket(info: &serde_json::Value) -> Option<PathBuf> {
     let path_str = info["host"]["remoteSocket"]["path"].as_str()?;
     let path = path_str.strip_prefix("unix://").unwrap_or(path_str);
     if path.is_empty() {
         return None;
     }
-    Some(Some(PathBuf::from(path)))
+    Some(PathBuf::from(path))
 }
 
 /// Run `podman machine inspect` to discover the host-side forwarded socket.
 /// Used on macOS/Windows where the Podman service runs inside a VM.
-fn discover_podman_machine_socket() -> Option<Option<PathBuf>> {
+fn discover_podman_machine_socket() -> Option<PathBuf> {
     let output = Command::new("podman")
         .args(["machine", "inspect"])
         .stdin(Stdio::null())
@@ -225,7 +230,7 @@ fn discover_podman_machine_socket() -> Option<Option<PathBuf>> {
 }
 
 /// Extract the host-side socket path from `podman machine inspect` JSON.
-fn parse_podman_machine_inspect(machines: &serde_json::Value) -> Option<Option<PathBuf>> {
+fn parse_podman_machine_inspect(machines: &serde_json::Value) -> Option<PathBuf> {
     let path_str = machines
         .as_array()
         .and_then(|arr| arr.first())
@@ -233,7 +238,7 @@ fn parse_podman_machine_inspect(machines: &serde_json::Value) -> Option<Option<P
     if path_str.is_empty() {
         return None;
     }
-    Some(Some(PathBuf::from(path_str)))
+    Some(PathBuf::from(path_str))
 }
 
 fn podman_socket_candidates() -> Vec<PathBuf> {
@@ -1124,13 +1129,7 @@ mod tests {
         }
 
         let result = detect_driver();
-        assert_eq!(
-            result,
-            Some(DetectedDriver {
-                kind: ComputeDriverKind::Kubernetes,
-                socket_path: None,
-            })
-        );
+        assert_eq!(result, Some(DetectedDriver::Kubernetes));
 
         // Restore the original env var
         unsafe {
@@ -1154,7 +1153,7 @@ mod tests {
         });
         assert_eq!(
             parse_podman_info_socket(&info),
-            Some(Some(PathBuf::from("/run/user/1000/podman/podman.sock")))
+            Some(PathBuf::from("/run/user/1000/podman/podman.sock"))
         );
     }
 
@@ -1170,7 +1169,7 @@ mod tests {
         });
         assert_eq!(
             parse_podman_info_socket(&info),
-            Some(Some(PathBuf::from("/run/user/1000/podman/podman.sock")))
+            Some(PathBuf::from("/run/user/1000/podman/podman.sock"))
         );
     }
 
@@ -1212,9 +1211,9 @@ mod tests {
         ]);
         assert_eq!(
             parse_podman_machine_inspect(&machines),
-            Some(Some(PathBuf::from(
+            Some(PathBuf::from(
                 "/var/folders/1q/jx7s14b928n8zvstgfk98lj00000gn/T/podman/podman-machine-default-api.sock"
-            )))
+            ))
         );
     }
 
