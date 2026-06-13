@@ -23,8 +23,11 @@ def extract_licenses(component: dict) -> str:
     licenses = component.get("licenses", [])
     ids = []
     for entry in licenses:
-        lic = entry.get("license", {})
-        ids.append(lic.get("id") or lic.get("name", ""))
+        if "expression" in entry:
+            ids.append(entry["expression"])
+        else:
+            lic = entry.get("license", {})
+            ids.append(lic.get("id") or lic.get("name", ""))
     return " | ".join(filter(None, ids))
 
 
