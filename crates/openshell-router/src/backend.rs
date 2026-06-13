@@ -1088,7 +1088,7 @@ mod tests {
         .await;
 
         assert!(
-            matches!(result, Err(crate::RouterError::UpstreamProtocol(_))),
+            matches!(result, Err(RouterError::UpstreamProtocol(_))),
             "over-cap response must fail as UpstreamProtocol, got: {result:?}"
         );
     }
@@ -1133,7 +1133,7 @@ mod tests {
         );
         let result = super::read_capped_response_body(response, 8).await;
         assert!(
-            matches!(result, Err(crate::RouterError::UpstreamProtocol(_))),
+            matches!(result, Err(RouterError::UpstreamProtocol(_))),
             "over-cap chunked body must be rejected by the loop, got: {result:?}"
         );
     }
