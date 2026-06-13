@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use bf_vm::{
+    BluefieldDriverArgs, BluefieldDriverConfig,
+    extensions::{ExtensionRuntimeConfig, build_lifecycle_extensions},
+};
 use clap::Parser;
 use futures::Stream;
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::VERSION;
-use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::proto::compute::v1::compute_driver_server::{
+    ComputeDriver, ComputeDriverServer,
+};
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
@@ -20,7 +26,7 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "openshell-driver-vm")]
+#[command(name = "openshell-driver-bluefield")]
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
@@ -132,6 +138,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_GPU_VCPUS", default_value_t = 4)]
     gpu_vcpus: u8,
 
+    #[command(flatten)]
+    bluefield: BluefieldDriverArgs,
+
     #[arg(long, hide = true)]
     vm_backend: Option<String>,
 
@@ -198,39 +207,77 @@ async fn main() -> Result<()> {
         );
     }
 
-    let driver = VmDriver::new(VmDriverConfig {
-        openshell_endpoint: args
-            .openshell_endpoint
-            .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
-        state_dir: args.state_dir.clone(),
-        launcher_bin: None,
-        default_image: args.default_image.clone(),
-        bootstrap_image: args.bootstrap_image.clone(),
-        log_level: args.log_level.clone(),
-        krun_log_level: args.krun_log_level,
-        vcpus: args.vcpus,
-        mem_mib: args.mem_mib,
-        overlay_disk_mib: args.overlay_disk_mib,
-        guest_tls_ca: args.guest_tls_ca.clone(),
-        guest_tls_cert: args.guest_tls_cert.clone(),
-        guest_tls_key: args.guest_tls_key.clone(),
-        gpu_enabled: args.gpu,
-        gpu_mem_mib: args.gpu_mem_mib,
-        gpu_vcpus: args.gpu_vcpus,
-    })
-    .await
-    .map_err(|err| miette::miette!("{err}"))?;
+    let bluefield_config = bluefield_config_from_args(&args).map_err(bluefield_driver_error)?;
 
+    // This stage runs the workload-side VM driver that binds a VF per
+    // sandbox. The leader/control-plane role is layered on in a later stage.
+    let driver = build_vm_driver(&args, bluefield_config).await?;
+    serve_compute_driver(driver, listen_mode).await
+}
+
+/// Build the workload-running VM driver (all-in-one or compute-node role).
+async fn build_vm_driver(args: &Args, bluefield: BluefieldDriverConfig) -> Result<VmDriver> {
+    let openshell_endpoint = args
+        .openshell_endpoint
+        .clone()
+        .ok_or_else(|| miette!("OPENSHELL_GRPC_ENDPOINT is required"))?;
+    let extension_config = ExtensionRuntimeConfig { bluefield };
+    let lifecycle_extensions =
+        build_lifecycle_extensions(&extension_config).map_err(bluefield_driver_error)?;
+
+    VmDriver::new_with_extensions(
+        VmDriverConfig {
+            openshell_endpoint,
+            state_dir: args.state_dir.clone(),
+            launcher_bin: None,
+            default_image: args.default_image.clone(),
+            bootstrap_image: args.bootstrap_image.clone(),
+            log_level: args.log_level.clone(),
+            krun_log_level: args.krun_log_level,
+            vcpus: args.vcpus,
+            mem_mib: args.mem_mib,
+            overlay_disk_mib: args.overlay_disk_mib,
+            guest_tls_ca: args.guest_tls_ca.clone(),
+            guest_tls_cert: args.guest_tls_cert.clone(),
+            guest_tls_key: args.guest_tls_key.clone(),
+            gpu_enabled: args.gpu,
+            gpu_mem_mib: args.gpu_mem_mib,
+            gpu_vcpus: args.gpu_vcpus,
+        },
+        lifecycle_extensions,
+    )
+    .await
+    .map_err(|err| miette!("{err}"))
+}
+
+fn bluefield_config_from_args(args: &Args) -> std::result::Result<BluefieldDriverConfig, String> {
+    let mut config = args
+        .bluefield
+        .to_driver_config(args.openshell_endpoint.clone())?;
+    config.enabled = true;
+    Ok(config)
+}
+
+fn bluefield_driver_error(message: impl std::fmt::Display) -> miette::Report {
+    miette!("{message}")
+}
+
+/// Serve any `ComputeDriver` over the selected listener. Shared by every role
+/// so the leader and the workload driver are served identically.
+async fn serve_compute_driver<T>(driver: T, listen_mode: ComputeDriverListenMode) -> Result<()>
+where
+    T: ComputeDriver,
+{
     match listen_mode {
         ComputeDriverListenMode::Unix {
             socket_path,
             expected_peer_pid,
         } => {
-            prepare_compute_driver_socket(&socket_path).map_err(|err| miette::miette!("{err}"))?;
+            prepare_compute_driver_socket(&socket_path).map_err(|err| miette!("{err}"))?;
 
             info!(socket = %socket_path.display(), "Starting vm compute driver");
             let listener = UnixListener::bind(&socket_path).into_diagnostic()?;
-            restrict_socket_permissions(&socket_path).map_err(|err| miette::miette!("{err}"))?;
+            restrict_socket_permissions(&socket_path).map_err(|err| miette!("{err}"))?;
             let result = tonic::transport::Server::builder()
                 .add_service(ComputeDriverServer::new(driver))
                 .serve_with_incoming(AuthenticatedUnixIncoming::new(listener, expected_peer_pid))
@@ -720,5 +767,38 @@ mod tests {
                 expected_peer_pid: None,
             }
         );
+    }
+
+    #[test]
+    fn bluefield_binary_enables_bluefield_extension_without_flag() {
+        let args = Args::parse_from([
+            "openshell-driver-bluefield",
+            "--allow-unauthenticated-tcp",
+            "--bind-address",
+            "127.0.0.1:50061",
+            "--openshell-endpoint",
+            "http://127.0.0.1:8080",
+        ]);
+
+        let config = super::bluefield_config_from_args(&args).unwrap();
+
+        assert!(config.enabled);
+        assert_eq!(
+            config.openshell_endpoint.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+    }
+
+    #[test]
+    fn build_driver_error_preserves_bluefield_preflight_text() {
+        let err = super::bluefield_driver_error(
+            "BlueField QEMU host preflight failed:\n- missing qemu-system-x86_64",
+        );
+
+        assert!(
+            err.to_string()
+                .contains("BlueField QEMU host preflight failed")
+        );
+        assert!(err.to_string().contains("missing qemu-system-x86_64"));
     }
 }

@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "bf-driver"
+description = "External BlueField compute driver for OpenShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "openshell-driver-bluefield"
+path = "src/main.rs"
+
+[features]
+default = []
+
+[dependencies]
+bf-vm = { path = "../bf-vm" }
+
+clap = { workspace = true }
+futures = { workspace = true }
+miette = { workspace = true }
+openshell-core = { path = "../../openshell-core", default-features = false }
+openshell-driver-vm = { path = "../../openshell-driver-vm" }
+rustix = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

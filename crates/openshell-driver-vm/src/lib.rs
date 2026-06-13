@@ -13,9 +13,9 @@ mod runtime;
 
 pub use driver::{VmDriver, VmDriverConfig};
 pub use lifecycle::{
-    BackendFeature, ExtensionCapabilities, ExtensionDescriptor, GuestInitDropin, LaunchAbortReason,
-    LaunchPlan, LifecycleError, LifecycleExtension, LifecycleExtensionRegistry, LifecycleResult,
-    RestoreContext,
+    BackendFeature, ExtensionCapabilities, ExtensionDescriptor, GuestInitDropin, GuestResource,
+    LaunchAbortReason, LaunchPlan, LifecycleError, LifecycleExtension, LifecycleExtensionRegistry,
+    LifecycleResult, PciPassthroughDevice, RestoreContext,
 };
 pub use runtime::{
     VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, cleanup_stale_tap_interfaces,

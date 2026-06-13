@@ -971,6 +971,16 @@ mod tests {
     }
 
     #[test]
+    fn guest_init_dropin_manifest_loop_does_not_require_dev_fd() {
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+
+        assert!(
+            !script.contains("< <("),
+            "guest init runs before /dev/fd is guaranteed to exist"
+        );
+    }
+
+    #[test]
     fn prepare_sandbox_rootfs_preserves_image_workdir_contents_in_rootfs() {
         let dir = unique_temp_dir();
         let rootfs = dir.join("rootfs");

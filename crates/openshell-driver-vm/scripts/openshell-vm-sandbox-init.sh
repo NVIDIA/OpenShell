@@ -603,9 +603,16 @@ run_openshell_init_dropins() {
     # rather than run a half-configured sandbox. Aborting exits this init
     # non-zero; the VM helper then exits and the driver runs
     # lifecycle-extension cleanup, so a failed init does not leak resources.
-    # The loop runs in the main shell (process substitution, not a pipe), so
-    # `exit` here terminates init as intended.
-    local name dropin rc
+    # The loop reads a regular file instead of process substitution because
+    # this init runs before /dev/fd is guaranteed to exist. It still runs in
+    # the main shell, so `exit` here terminates init as intended.
+    local name dropin rc sorted_manifest
+    sorted_manifest="$(root_path "/tmp/openshell-init-dropins.$$.manifest")"
+    if ! LC_ALL=C sort -u "$manifest" > "$sorted_manifest"; then
+        ts "FATAL: could not sort OpenShell VM init drop-in manifest"
+        exit 1
+    fi
+
     while IFS= read -r name; do
         [ -n "$name" ] || continue
         # Manifest entries are bare file names that the driver already
@@ -641,7 +648,8 @@ run_openshell_init_dropins() {
             ts "FATAL: OpenShell VM init drop-in ${name} failed with exit code ${rc}"
             exit 1
         fi
-    done < <(LC_ALL=C sort -u "$manifest")
+    done < "$sorted_manifest"
+    rm -f "$sorted_manifest"
 }
 
 run_post_overlay_setup() {
