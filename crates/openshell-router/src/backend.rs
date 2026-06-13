@@ -870,8 +870,9 @@ fn parse_bedrock_invocation_path(path: &str) -> Option<(&str, &'static str, &str
     // Slice up to but not including `?`, then keep the `?`-prefixed
     // tail so callers can re-attach it without reconstructing the
     // delimiter.
-    let (path_only, query_tail) =
-        path.find('?').map_or((path, ""), |idx| (&path[..idx], &path[idx..]));
+    let (path_only, query_tail) = path
+        .find('?')
+        .map_or((path, ""), |idx| (&path[..idx], &path[idx..]));
     let rest = path_only.strip_prefix("/model/")?;
     let slash_at = rest.find('/')?;
     if slash_at == 0 {
