@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: aws-bedrock
+display_name: AWS Bedrock
+description: |
+  Anthropic + Mistral + Llama models served via the AWS Bedrock InvokeModel API.
+
+  This profile supports a bridge-fronted shape only: operators point
+  `BEDROCK_BASE_URL` at a translating bridge or Bedrock-compatible
+  proxy that handles AWS auth in its own pod, and the bridge — not
+  this profile — is responsible for declaring its own egress endpoint
+  and binary attribution. As a result the profile is intentionally
+  non-egress-granting: `endpoints` and `binaries` are empty so that
+  selecting `aws-bedrock` does not implicitly punch a hole to AWS for
+  any sandbox.
+
+  Direct AWS Bedrock with router-side SigV4 signing is a separate
+  follow-up; until that lands the AWS_* credentials below are
+  declarative schema only — none are required, none are
+  auto-discovered, and the router does not consume them. The SigV4
+  follow-up will populate `endpoints` and `binaries` once the router
+  can sign outbound requests itself.
+category: inference
+inference_capable: true
+credentials:
+  # Declarative-only until the SigV4 follow-up lands. None of these are
+  # required for the bridge-fronted shape; the router does not inject
+  # them on outbound requests.
+  - name: aws_access_key_id
+    description: AWS access key id (used by the SigV4 signer follow-up; unused today)
+    env_vars: [AWS_ACCESS_KEY_ID]
+    required: false
+  - name: aws_secret_access_key
+    description: AWS secret access key (used by the SigV4 signer follow-up; unused today)
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: false
+  - name: aws_session_token
+    description: Optional session token for temporary credentials (STS, IAM Roles for Service Accounts)
+    env_vars: [AWS_SESSION_TOKEN]
+    required: false
+  - name: aws_region
+    description: AWS region (used by the SigV4 signer follow-up; unused today)
+    env_vars: [AWS_REGION, AWS_DEFAULT_REGION]
+    required: false
+discovery:
+  # Bridge-fronted routing intentionally does not consume AWS
+  # credentials, so `--from-existing` does not scan for them today.
+  # The SigV4 follow-up will repopulate this list.
+  credentials: []
+# Endpoints and binaries are intentionally empty: this profile does
+# not grant direct egress to AWS Bedrock. Operators expose their own
+# bridge service (and its egress endpoint / binary attribution) via
+# their cluster network policies. The SigV4 follow-up will add the
+# Bedrock runtime endpoint and Claude binaries once router-side
+# signing exists.
+endpoints: []
+binaries: []

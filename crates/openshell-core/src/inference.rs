@@ -18,6 +18,15 @@ pub enum AuthHeader {
     Bearer,
     /// Custom header name (e.g. `x-api-key` for Anthropic).
     Custom(&'static str),
+    /// Do not inject any auth header on outgoing requests. The upstream
+    /// is expected to authenticate itself — used when the configured
+    /// `default_base_url` (or operator-supplied base-URL override) points
+    /// at a translating bridge / proxy that holds operator-side
+    /// credentials in its own pod and ignores caller-supplied auth.
+    /// Currently used by the `aws-bedrock` profile, where `SigV4` signing
+    /// is deferred to a follow-up PR; today the only supported shape is
+    /// a bridge-fronted upstream.
+    None,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,6 +77,14 @@ const ANTHROPIC_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
 /// endpoint with `openai_chat_completions`. This default applies only to the
 /// base-URL-override escape hatch path.
 const VERTEX_AI_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
+
+// `aws_bedrock_invoke_stream` (`/model/{id}/invoke-with-response-stream`) is
+// deferred to a follow-up alongside protocol-aware AWS event-stream error
+// handling: the shared streaming relay's truncation/timeout path injects
+// SSE-formatted error frames, which would corrupt downstream Bedrock
+// event-stream parsers. Until that lands, this profile advertises only
+// the buffered `InvokeModel` shape.
+const AWS_BEDROCK_PROTOCOLS: &[&str] = &["aws_bedrock_invoke"];
 
 static OPENAI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     provider_type: "openai",
@@ -155,6 +172,38 @@ static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     passthrough_headers: &["x-model-id"],
 };
 
+// AWS Bedrock — registered as bridge-fronted (no router-side auth
+// injection). Real AWS Bedrock requires `SigV4` signing of every request,
+// which is deferred to a follow-up PR (see #1704 thread). Until then,
+// operators point `BEDROCK_BASE_URL` at a translating bridge or
+// Bedrock-compatible proxy that handles auth in its own pod. The router
+// passes Bedrock `InvokeModel` requests through opaquely; the L7 pattern
+// `/model/{modelId}/invoke` is wired up in
+// `crates/openshell-sandbox/src/l7/inference.rs`. `InvokeModelWithResponseStream`
+// is deferred to the same follow-up that adds protocol-aware error framing.
+//
+// Note: `default_base_url` is intentionally an empty string. Without
+// `BEDROCK_BASE_URL` config, route resolution rejects the provider
+// rather than silently forwarding prompts to real AWS Bedrock with
+// `auth: None` (which would fail upstream and risks operator
+// surprise). Once the `SigV4` follow-up lands, the default can revert
+// to `https://bedrock-runtime.us-east-1.amazonaws.com`.
+static AWS_BEDROCK_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "aws-bedrock",
+    default_base_url: "",
+    protocols: AWS_BEDROCK_PROTOCOLS,
+    // No single API key for Bedrock — `SigV4` takes four credentials
+    // (access key id, secret, session token, region) and signs requests
+    // rather than injecting a header. Until the `SigV4` follow-up lands
+    // the router-side auth shape is `None` and no credential lookup is
+    // required at route time.
+    credential_key_names: &[],
+    base_url_config_keys: &["BEDROCK_BASE_URL"],
+    auth: AuthHeader::None,
+    default_headers: &[],
+    passthrough_headers: &[],
+};
+
 /// Canonicalize an inference provider type string to a well-known identifier.
 ///
 /// Returns `Some(canonical_name)` for recognized inference providers,
@@ -167,6 +216,7 @@ pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
         "openai" => Some("openai"),
         "anthropic" => Some("anthropic"),
         "nvidia" => Some("nvidia"),
+        "aws-bedrock" => Some("aws-bedrock"),
         "google-vertex-ai" | "vertex" | "vertex-ai" | "google-vertex" | "gcp-vertex" => {
             Some("google-vertex-ai")
         }
@@ -184,6 +234,7 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
         "anthropic" => Some(&ANTHROPIC_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
         "google-vertex-ai" => Some(&VERTEX_AI_PROFILE),
+        "aws-bedrock" => Some(&AWS_BEDROCK_PROFILE),
         _ => None,
     }
 }
@@ -303,7 +354,34 @@ mod tests {
         assert!(profile_for("openai").is_some());
         assert!(profile_for("anthropic").is_some());
         assert!(profile_for("nvidia").is_some());
+        assert!(profile_for("aws-bedrock").is_some());
         assert!(profile_for("OpenAI").is_some()); // case insensitive
+        assert!(profile_for("AWS-Bedrock").is_some()); // case insensitive
+    }
+
+    #[test]
+    fn aws_bedrock_uses_no_auth_header() {
+        let (auth, headers) = auth_for_provider_type("aws-bedrock");
+        assert_eq!(auth, AuthHeader::None);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn aws_bedrock_profile_has_no_credential_keys() {
+        let profile = profile_for("aws-bedrock").expect("profile registered");
+        // No router-side credential lookup until the `SigV4` follow-up.
+        assert!(profile.credential_key_names.is_empty());
+        assert_eq!(profile.base_url_config_keys, &["BEDROCK_BASE_URL"]);
+    }
+
+    #[test]
+    fn aws_bedrock_protocols_are_bedrock_specific() {
+        let profile = profile_for("aws-bedrock").expect("profile registered");
+        assert!(profile.protocols.contains(&"aws_bedrock_invoke"));
+        // `aws_bedrock_invoke_stream` is deferred to the follow-up that adds
+        // protocol-aware AWS event-stream error framing; until then the
+        // profile advertises only the buffered `InvokeModel` shape.
+        assert!(!profile.protocols.contains(&"aws_bedrock_invoke_stream"));
     }
 
     #[test]

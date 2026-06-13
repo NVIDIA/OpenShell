@@ -60,7 +60,7 @@ impl InferenceApiPattern {
     }
 }
 
-/// Default patterns for known inference APIs (`OpenAI`, Anthropic).
+/// Default patterns for known inference APIs (`OpenAI`, Anthropic, AWS Bedrock).
 pub fn default_patterns() -> Vec<InferenceApiPattern> {
     vec![
         InferenceApiPattern {
@@ -114,10 +114,40 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
             kind: "models_get".to_string(),
             framing: ResponseFraming::Buffered,
         },
+        // AWS Bedrock InvokeModel. The `*` segment is the Bedrock model id
+        // (e.g. `anthropic.claude-opus-4-7`).
+        //
+        // InvokeModel returns ONE JSON object the client decodes whole — it
+        // must be served buffered with an accurate `Content-Length`, otherwise
+        // the streaming proxy's size-cap or idle-timeout failure mode would
+        // append an SSE error event to bytes the caller decodes as one JSON
+        // object, silently corrupting it.
+        //
+        // `InvokeModelWithResponseStream`
+        // (`/model/{id}/invoke-with-response-stream`) is deferred to a
+        // follow-up: Bedrock streams use AWS event-stream framing, but the
+        // shared streaming relay's truncation/timeout/upstream-error path
+        // emits SSE-formatted error frames, which would corrupt downstream
+        // event-stream parsers. The follow-up adds protocol-aware error
+        // termination before re-introducing the streaming pattern.
+        InferenceApiPattern {
+            method: "POST".to_string(),
+            path_glob: "/model/*/invoke".to_string(),
+            protocol: "aws_bedrock_invoke".to_string(),
+            kind: "messages".to_string(),
+            framing: ResponseFraming::Buffered,
+        },
     ]
 }
 
 /// Check if an HTTP request matches a known inference API pattern.
+///
+/// Path globs support two wildcard shapes (one per pattern, not both):
+/// - **Trailing `/*`**: `/v1/models/*` matches `/v1/models` and any
+///   `/v1/models/<rest>` (one or many path segments).
+/// - **Middle `/*/`**: `/model/*/invoke` matches `/model/<id>/invoke`
+///   for a single non-empty segment that contains no `/`. Used for
+///   AWS Bedrock's `/model/{modelId}/invoke[-with-response-stream]`.
 pub fn detect_inference_pattern<'a>(
     method: &str,
     path: &str,
@@ -135,6 +165,21 @@ pub fn detect_inference_pattern<'a>(
                 || path_only
                     .strip_prefix(prefix)
                     .is_some_and(|suffix| suffix.starts_with('/'));
+        }
+
+        if let Some((before, after)) = p.path_glob.split_once("/*/") {
+            let Some(rest) = path_only.strip_prefix(before) else {
+                return false;
+            };
+            let Some(rest) = rest.strip_prefix('/') else {
+                return false;
+            };
+            // rest must look like `<id>/<after>` where <id> is non-empty
+            // and contains no `/` (single path segment).
+            let Some(slash_at) = rest.find('/') else {
+                return false;
+            };
+            return slash_at > 0 && rest[slash_at + 1..] == *after;
         }
 
         path_only == p.path_glob
@@ -531,7 +576,7 @@ mod tests {
         for pattern in &patterns {
             let expected_buffered = matches!(
                 pattern.protocol.as_str(),
-                "model_discovery" | "openai_embeddings"
+                "model_discovery" | "openai_embeddings" | "aws_bedrock_invoke"
             );
             assert_eq!(
                 pattern.is_buffered(),
@@ -541,6 +586,101 @@ mod tests {
                 pattern.path_glob
             );
         }
+    }
+
+    #[test]
+    fn detect_aws_bedrock_invoke() {
+        let patterns = default_patterns();
+        let result =
+            detect_inference_pattern("POST", "/model/anthropic.claude-opus-4-7/invoke", &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().protocol, "aws_bedrock_invoke");
+        assert_eq!(result.unwrap().kind, "messages");
+    }
+
+    /// `InvokeModelWithResponseStream` is intentionally NOT advertised by
+    /// the default pattern set today. The shared streaming relay's
+    /// truncation/timeout/upstream-error path emits SSE-formatted error
+    /// frames, which would corrupt the AWS event-stream framing Bedrock
+    /// streams use. The pattern is restored alongside protocol-aware
+    /// error termination in a follow-up; until then, intercepted
+    /// `/invoke-with-response-stream` requests fall through to the
+    /// non-inference path rather than being mis-routed through the
+    /// SSE-injecting relay.
+    #[test]
+    fn aws_bedrock_invoke_stream_pattern_is_deferred() {
+        let patterns = default_patterns();
+        assert!(
+            detect_inference_pattern(
+                "POST",
+                "/model/anthropic.claude-opus-4-7/invoke-with-response-stream",
+                &patterns,
+            )
+            .is_none(),
+            "InvokeModelWithResponseStream must not be advertised until \
+             protocol-aware AWS event-stream error framing exists"
+        );
+        assert!(
+            !patterns
+                .iter()
+                .any(|p| p.protocol == "aws_bedrock_invoke_stream"),
+            "no pattern should declare protocol=aws_bedrock_invoke_stream"
+        );
+    }
+
+    #[test]
+    fn aws_bedrock_invoke_with_query_string() {
+        let patterns = default_patterns();
+        let result = detect_inference_pattern("POST", "/model/foo.bar/invoke?trace=1", &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().protocol, "aws_bedrock_invoke");
+    }
+
+    #[test]
+    fn aws_bedrock_rejects_empty_model_id() {
+        let patterns = default_patterns();
+        // `/model//invoke` — empty wildcard segment is not a valid Bedrock id.
+        assert!(detect_inference_pattern("POST", "/model//invoke", &patterns).is_none());
+    }
+
+    #[test]
+    fn aws_bedrock_rejects_multi_segment_model_id() {
+        let patterns = default_patterns();
+        // The `*` matches a single path segment only; multi-segment ids must
+        // not match (would be a path-traversal liability otherwise).
+        assert!(detect_inference_pattern("POST", "/model/foo/bar/invoke", &patterns).is_none());
+    }
+
+    #[test]
+    fn aws_bedrock_rejects_get() {
+        let patterns = default_patterns();
+        assert!(
+            detect_inference_pattern("GET", "/model/anthropic.claude-opus-4-7/invoke", &patterns)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn aws_bedrock_rejects_unknown_action() {
+        let patterns = default_patterns();
+        assert!(detect_inference_pattern("POST", "/model/foo/converse", &patterns).is_none());
+    }
+
+    /// `InvokeModel` returns one JSON object — must be served buffered.
+    /// Sending it through the streaming proxy would risk truncation or an
+    /// appended SSE error event corrupting the JSON body the caller decodes.
+    #[test]
+    fn aws_bedrock_invoke_is_buffered() {
+        let patterns = default_patterns();
+        let invoke =
+            detect_inference_pattern("POST", "/model/anthropic.claude-opus-4-7/invoke", &patterns)
+                .expect("InvokeModel pattern must match");
+        assert_eq!(invoke.protocol, "aws_bedrock_invoke");
+        assert!(
+            invoke.is_buffered(),
+            "InvokeModel must be Buffered (one JSON object, accurate Content-Length); \
+             streaming would risk corrupting the response"
+        );
     }
 
     #[test]
