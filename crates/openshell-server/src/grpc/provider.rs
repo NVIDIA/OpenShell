@@ -434,6 +434,7 @@ fn merge_i64_map(
 pub(super) async fn resolve_provider_environment(
     store: &Store,
     provider_names: &[String],
+    include_static_credentials: bool,
 ) -> Result<ProviderEnvironment, Status> {
     if provider_names.is_empty() {
         return Ok(ProviderEnvironment::default());
@@ -539,7 +540,12 @@ pub(super) async fn resolve_provider_environment(
     Ok(ProviderEnvironment {
         environment: env,
         credential_expires_at_ms: expires,
-        dynamic_credentials: resolve_dynamic_credentials(store, provider_names).await?,
+        dynamic_credentials: resolve_dynamic_credentials(
+            store,
+            provider_names,
+            include_static_credentials,
+        )
+        .await?,
     })
 }
 
@@ -551,6 +557,7 @@ pub(super) async fn resolve_provider_environment(
 pub(super) async fn resolve_dynamic_credentials(
     store: &Store,
     provider_names: &[String],
+    include_static_credentials: bool,
 ) -> Result<std::collections::HashMap<String, ProviderProfileCredential>, Status> {
     if provider_names.is_empty() {
         return Ok(std::collections::HashMap::new());
@@ -579,6 +586,7 @@ pub(super) async fn resolve_dynamic_credentials(
             &mut dynamic_creds,
             &profile.to_proto(),
             provider_name,
+            include_static_credentials,
         );
     }
 
@@ -589,9 +597,10 @@ fn insert_dynamic_credentials_for_profile(
     dynamic_creds: &mut std::collections::HashMap<String, ProviderProfileCredential>,
     profile: &ProviderProfile,
     provider_name: &str,
+    include_static_credentials: bool,
 ) {
     for credential in &profile.credentials {
-        if credential.token_grant.is_none() {
+        if credential.token_grant.is_none() && !include_static_credentials {
             continue;
         }
         for endpoint in &profile.endpoints {
@@ -2298,7 +2307,7 @@ mod tests {
         };
 
         let mut dynamic_creds = HashMap::new();
-        insert_dynamic_credentials_for_profile(&mut dynamic_creds, &profile, "keycloak");
+        insert_dynamic_credentials_for_profile(&mut dynamic_creds, &profile, "keycloak", false);
 
         assert_eq!(dynamic_creds.len(), 4);
         for (host, audience) in service_audiences {
@@ -2308,6 +2317,112 @@ mod tests {
             assert_eq!(grant.scopes, vec![audience.to_string()]);
             assert!(grant.audience_overrides.is_empty());
         }
+    }
+
+    #[test]
+    fn static_credentials_included_when_flag_enabled() {
+        let credential = ProviderProfileCredential {
+            name: "api_token".to_string(),
+            env_vars: vec!["GITHUB_TOKEN".to_string(), "GH_TOKEN".to_string()],
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            token_grant: None,
+            ..Default::default()
+        };
+        let profile = ProviderProfile {
+            id: "github".to_string(),
+            display_name: "GitHub".to_string(),
+            description: String::new(),
+            category: ProviderProfileCategory::SourceControl as i32,
+            credentials: vec![credential],
+            endpoints: vec![
+                NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+                NetworkEndpoint {
+                    host: "github.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+            ],
+            binaries: Vec::new(),
+            inference_capable: false,
+            discovery: None,
+        };
+
+        // With flag off, no static credentials emitted.
+        let mut creds_off = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds_off, &profile, "my-github", false);
+        assert!(
+            creds_off.is_empty(),
+            "static credentials should be skipped when flag is false"
+        );
+
+        // With flag on, static credentials are emitted for each endpoint.
+        let mut creds_on = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds_on, &profile, "my-github", true);
+        assert_eq!(creds_on.len(), 2, "one entry per endpoint expected");
+
+        let api_key = dynamic_credential_key("api.github.com", 443, "", "my-github", "api_token");
+        let web_key = dynamic_credential_key("github.com", 443, "", "my-github", "api_token");
+        let api_cred = &creds_on[&api_key];
+        assert_eq!(api_cred.auth_style, "bearer");
+        assert_eq!(api_cred.env_vars, vec!["GITHUB_TOKEN", "GH_TOKEN"]);
+        assert!(api_cred.token_grant.is_none());
+        assert!(creds_on.contains_key(&web_key));
+    }
+
+    #[test]
+    fn static_credentials_flag_does_not_affect_token_grants() {
+        let credential = ProviderProfileCredential {
+            name: "access_token".to_string(),
+            env_vars: Vec::new(),
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            token_grant: Some(ProviderCredentialTokenGrant {
+                token_endpoint: "https://auth.example.com/token".to_string(),
+                audience: "api://default".to_string(),
+                jwt_svid_audience: "https://auth.example.com".to_string(),
+                client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+                    .to_string(),
+                scopes: vec!["read".to_string()],
+                cache_ttl_seconds: 300,
+                audience_overrides: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let profile = ProviderProfile {
+            id: "example".to_string(),
+            display_name: "Example".to_string(),
+            description: String::new(),
+            category: ProviderProfileCategory::Other as i32,
+            credentials: vec![credential],
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: Vec::new(),
+            inference_capable: false,
+            discovery: None,
+        };
+
+        let mut creds_off = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds_off, &profile, "example", false);
+        let mut creds_on = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut creds_on, &profile, "example", true);
+
+        assert_eq!(
+            creds_off.len(),
+            1,
+            "token grant should be emitted regardless of flag"
+        );
+        assert_eq!(creds_off.len(), creds_on.len());
+        let key = dynamic_credential_key("api.example.com", 443, "", "example", "access_token");
+        assert!(creds_off[&key].token_grant.is_some());
+        assert!(creds_on[&key].token_grant.is_some());
     }
 
     async fn import_token_grant_profile(
@@ -4436,7 +4551,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = test_store().await;
-        let result = resolve_provider_environment(&store, &[]).await.unwrap();
+        let result = resolve_provider_environment(&store, &[], false)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -4467,7 +4584,7 @@ mod tests {
         };
         create_provider_record(&store, provider).await.unwrap();
 
-        let result = resolve_provider_environment(&store, &["claude-local".to_string()])
+        let result = resolve_provider_environment(&store, &["claude-local".to_string()], false)
             .await
             .unwrap();
         assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
@@ -4485,7 +4602,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["static-provider".to_string()])
+        let result = resolve_provider_environment(&store, &["static-provider".to_string()], false)
             .await
             .unwrap();
 
@@ -4522,9 +4639,10 @@ mod tests {
         };
         create_provider_record(&store, provider).await.unwrap();
 
-        let result = resolve_provider_environment(&store, &["expiring-provider".to_string()])
-            .await
-            .unwrap();
+        let result =
+            resolve_provider_environment(&store, &["expiring-provider".to_string()], false)
+                .await
+                .unwrap();
         assert_eq!(result.get("FRESH_TOKEN"), Some(&"fresh".to_string()));
         assert!(!result.contains_key("STALE_TOKEN"));
         assert_eq!(
@@ -4536,7 +4654,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_provider_env_unknown_name_returns_error() {
         let store = test_store().await;
-        let err = resolve_provider_environment(&store, &["nonexistent".to_string()])
+        let err = resolve_provider_environment(&store, &["nonexistent".to_string()], false)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
@@ -4567,7 +4685,7 @@ mod tests {
         };
         create_provider_record(&store, provider).await.unwrap();
 
-        let result = resolve_provider_environment(&store, &["test-provider".to_string()])
+        let result = resolve_provider_environment(&store, &["test-provider".to_string()], false)
             .await
             .unwrap();
         assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
@@ -4623,6 +4741,7 @@ mod tests {
         let result = resolve_provider_environment(
             &store,
             &["claude-local".to_string(), "gitlab-local".to_string()],
+            false,
         )
         .await
         .unwrap();
@@ -4678,6 +4797,7 @@ mod tests {
         let err = resolve_provider_environment(
             &store,
             &["provider-a".to_string(), "provider-b".to_string()],
+            false,
         )
         .await
         .unwrap_err();
@@ -4721,7 +4841,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["vertex-local".to_string()])
+        let result = resolve_provider_environment(&store, &["vertex-local".to_string()], false)
             .await
             .unwrap();
 
@@ -4794,7 +4914,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["vertex-bootstrap".to_string()])
+        let result = resolve_provider_environment(&store, &["vertex-bootstrap".to_string()], false)
             .await
             .unwrap();
 
@@ -4831,7 +4951,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["vertex-no-config".to_string()])
+        let result = resolve_provider_environment(&store, &["vertex-no-config".to_string()], false)
             .await
             .unwrap();
 
@@ -4889,7 +5009,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["vertex-collision".to_string()])
+        let result = resolve_provider_environment(&store, &["vertex-collision".to_string()], false)
             .await
             .unwrap();
 
@@ -4923,7 +5043,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(&store, &["openai-local".to_string()])
+        let result = resolve_provider_environment(&store, &["openai-local".to_string()], false)
             .await
             .unwrap();
 
@@ -5081,7 +5201,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let env = resolve_provider_environment(&store, &spec.providers, false)
             .await
             .unwrap();
 
@@ -5114,7 +5234,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let env = resolve_provider_environment(&store, &spec.providers, false)
             .await
             .unwrap();
 
