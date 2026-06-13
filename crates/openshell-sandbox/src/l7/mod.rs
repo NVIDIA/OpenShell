@@ -9,7 +9,9 @@
 //! evaluated against OPA policy, and either forwarded or denied.
 
 pub mod graphql;
+pub(crate) mod http;
 pub mod inference;
+pub mod jsonrpc;
 pub mod path;
 pub mod provider;
 pub mod relay;
@@ -25,6 +27,7 @@ pub enum L7Protocol {
     Websocket,
     Graphql,
     Sql,
+    JsonRpc,
 }
 
 impl L7Protocol {
@@ -34,6 +37,7 @@ impl L7Protocol {
             "websocket" => Some(Self::Websocket),
             "graphql" => Some(Self::Graphql),
             "sql" => Some(Self::Sql),
+            "json-rpc" => Some(Self::JsonRpc),
             _ => None,
         }
     }
@@ -76,6 +80,8 @@ pub struct L7EndpointConfig {
     pub enforcement: EnforcementMode,
     /// Maximum GraphQL request body bytes to buffer for inspection.
     pub graphql_max_body_bytes: usize,
+    /// Maximum JSON-RPC request body bytes to buffer for inspection.
+    pub json_rpc_max_body_bytes: usize,
     /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
     /// rather than rejected at the parser. Needed by upstreams like GitLab
     /// that embed `%2F` in namespaced project paths. Defaults to false.
@@ -110,6 +116,8 @@ pub struct L7RequestInfo {
     pub query_params: std::collections::HashMap<String, Vec<String>>,
     /// Parsed GraphQL operation metadata for GraphQL endpoints.
     pub graphql: Option<graphql::GraphqlRequestInfo>,
+    /// Parsed JSON-RPC request metadata for JSON-RPC endpoints.
+    pub jsonrpc: Option<jsonrpc::JsonRpcRequestInfo>,
 }
 
 /// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
@@ -165,6 +173,10 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         .and_then(|v| usize::try_from(v).ok())
         .filter(|v| *v > 0)
         .unwrap_or(graphql::DEFAULT_MAX_BODY_BYTES);
+    let json_rpc_max_body_bytes = get_object_u64(val, "json_rpc_max_body_bytes")
+        .and_then(|v| usize::try_from(v).ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(jsonrpc::DEFAULT_MAX_BODY_BYTES);
 
     Some(L7EndpointConfig {
         protocol,
@@ -172,6 +184,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         tls,
         enforcement,
         graphql_max_body_bytes,
+        json_rpc_max_body_bytes,
         allow_encoded_slash,
         websocket_credential_rewrite,
         request_body_credential_rewrite,
@@ -598,7 +611,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
 
             if !protocol.is_empty() && L7Protocol::parse(protocol).is_none() {
                 errors.push(format!(
-                    "{loc}: unknown protocol '{protocol}' (expected rest, websocket, graphql, or sql)"
+                    "{loc}: unknown protocol '{protocol}' (expected rest, websocket, graphql, sql, or json-rpc)"
                 ));
             }
 
@@ -624,6 +637,18 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
             }
 
+            if ep.get("json_rpc_max_body_bytes").is_some() {
+                let valid_max = ep
+                    .get("json_rpc_max_body_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|v| v > 0);
+                if !valid_max {
+                    errors.push(format!(
+                        "{loc}: json_rpc_max_body_bytes must be a positive integer"
+                    ));
+                }
+            }
+
             if protocol != "graphql"
                 && protocol != "websocket"
                 && (ep.get("persisted_queries").is_some()
@@ -632,6 +657,12 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             {
                 warnings.push(format!(
                     "{loc}: GraphQL-specific endpoint fields are ignored unless protocol is graphql or websocket"
+                ));
+            }
+
+            if protocol != "json-rpc" && ep.get("json_rpc_max_body_bytes").is_some() {
+                warnings.push(format!(
+                    "{loc}: JSON-RPC-specific endpoint fields are ignored unless protocol is json-rpc"
                 ));
             }
 
@@ -1195,6 +1226,46 @@ mod tests {
         assert_eq!(config.protocol, L7Protocol::Rest);
         assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Audit);
+        assert_eq!(
+            config.json_rpc_max_body_bytes,
+            jsonrpc::DEFAULT_MAX_BODY_BYTES
+        );
+    }
+
+    #[test]
+    fn parse_l7_config_jsonrpc_max_body_bytes() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "json-rpc", "host": "mcp.example.com", "port": 443, "json_rpc_max_body_bytes": 131072}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.protocol, L7Protocol::JsonRpc);
+        assert_eq!(config.json_rpc_max_body_bytes, 131_072);
+    }
+
+    #[test]
+    fn validate_jsonrpc_max_body_bytes_must_be_positive() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "protocol": "json-rpc",
+                        "access": "full",
+                        "json_rpc_max_body_bytes": 0
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("json_rpc_max_body_bytes must be a positive integer")),
+            "should reject non-positive JSON-RPC max body size, got errors: {errors:?}"
+        );
     }
 
     #[test]

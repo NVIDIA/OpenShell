@@ -155,7 +155,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `host` | string | Yes | Hostname or IP address. Supports a `*` wildcard inside the first DNS label only: `*.example.com`, `**.example.com`, and intra-label patterns like `*-aiplatform.googleapis.com` are accepted; bare `*`/`**`, TLD wildcards (`*.com`), and wildcards outside the first label are rejected at load time. |
 | `port` | integer | Yes | TCP port number. |
 | `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
-| `protocol` | string | No | Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, or `graphql` for GraphQL-over-HTTP operation inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Omit for TCP passthrough. |
+| `protocol` | string | No | Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, `graphql` for GraphQL-over-HTTP operation inspection, or `json-rpc` for sandbox-to-server JSON-RPC-over-HTTP method and params inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Omit for TCP passthrough. |
 | `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
 | `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
@@ -168,6 +168,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `persisted_queries` | string | No | GraphQL hash-only behavior for `protocol: graphql` and GraphQL-over-WebSocket operation policy. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
 | `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
 | `graphql_max_body_bytes` | integer | No | Maximum GraphQL-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
+| `json_rpc` | object | No | JSON-RPC endpoint options. For `protocol: json-rpc`, `json_rpc.max_body_bytes` sets the maximum JSON-RPC-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
 
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 
@@ -175,11 +176,13 @@ Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placehol
 
 The `access` field accepts one of the following values:
 
-| Value | REST expansion | WebSocket expansion | GraphQL expansion |
-|---|---|---|---|
-| `full` | All methods and paths. | WebSocket upgrade and all inspected client text-message paths. | All operation types. |
-| `read-only` | `GET`, `HEAD`, `OPTIONS`. | WebSocket upgrade handshake only. | `query` operations. |
-| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. | WebSocket upgrade handshake and client text messages. | `query` and `mutation` operations. |
+| Value | REST expansion | WebSocket expansion | GraphQL expansion | JSON-RPC behavior |
+|---|---|---|---|---|
+| `full` | All methods and paths. | WebSocket upgrade and all inspected client text-message paths. | All operation types. | Allows matching HTTP requests without constraining JSON-RPC methods. |
+| `read-only` | `GET`, `HEAD`, `OPTIONS`. | WebSocket upgrade handshake only. | `query` operations. | Expands to HTTP read methods and does not allow typical JSON-RPC `POST` calls. |
+| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. | WebSocket upgrade handshake and client text messages. | `query` and `mutation` operations. | Allows matching HTTP write requests without constraining JSON-RPC methods. |
+
+For JSON-RPC endpoints, prefer explicit `rules` with `rpc_method` and optional `params` when you need method-level control.
 
 #### Allow Rule Objects
 
@@ -274,6 +277,42 @@ rules:
 
 Do not combine `method`, `path`, or `query` with `operation_type`, `operation_name`, or `fields` inside the same WebSocket rule. When a WebSocket endpoint has GraphQL operation policy, use GraphQL rules for client messages instead of a raw `WEBSOCKET_TEXT` allow rule.
 
+##### JSON-RPC Allow Rule (`protocol: json-rpc`)
+
+JSON-RPC allow rules match sandbox-to-server JSON-RPC-over-HTTP request objects by RPC method and optional params. They apply to single JSON-RPC requests and batch requests. For a batch, OpenShell evaluates each call independently. JSON-RPC responses and server-to-client messages on response bodies or MCP SSE streams are relayed but are not currently parsed for policy enforcement.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `rpc_method` | string | Yes | JSON-RPC method name or glob, such as `initialize`, `tools/list`, or `tools/*`. |
+| `params` | map | No | Params matchers keyed by flattened object-param path. Use dot-separated keys for nested object params, such as `arguments.scope`. Matcher value can be a glob string or an object with `any`. Strings, numbers, and booleans are converted to strings; arrays, `null`, and non-object top-level params do not produce matcher keys. |
+
+Example JSON-RPC allow rules:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    path: /mcp
+    protocol: json-rpc
+    enforcement: enforce
+    json_rpc:
+      max_body_bytes: 131072
+    rules:
+      - allow:
+          rpc_method: initialize
+      - allow:
+          rpc_method: tools/list
+      - allow:
+          rpc_method: tools/call
+          params:
+            name: read_status
+      - allow:
+          rpc_method: tools/call
+          params:
+            name: submit_report
+            arguments.scope: workspace/main
+```
+
 #### Deny Rule Objects
 
 Blocks specific operations on endpoints that otherwise have broad access. Deny rules are evaluated after allow rules and take precedence: if a request matches any deny rule, it is blocked regardless of what the allow rules or access preset permit.
@@ -354,6 +393,33 @@ endpoints:
         fields: [deleteRepository]
       - operation_type: mutation
         operation_name: Admin*
+```
+
+##### JSON-RPC Deny Rule (`protocol: json-rpc`)
+
+JSON-RPC deny rules use the same field names as JSON-RPC allow rules, but they appear directly under each `deny_rules` entry instead of under an `allow` wrapper. Deny rules take precedence over allow rules. In a batch request, one denied call denies the full batch.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `rpc_method` | string | Yes | JSON-RPC method name or glob to deny. |
+| `params` | map | No | Params matchers keyed by flattened object-param path. Omit to deny every call matching `rpc_method`. Strings, numbers, and booleans are converted to strings; arrays, `null`, and non-object top-level params do not produce matcher keys. |
+
+Example JSON-RPC deny rules:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    path: /mcp
+    protocol: json-rpc
+    enforcement: enforce
+    rules:
+      - allow:
+          rpc_method: tools/*
+    deny_rules:
+      - rpc_method: tools/call
+        params:
+          name: delete_resource
 ```
 
 ### Binary Object

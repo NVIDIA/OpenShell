@@ -200,6 +200,8 @@ pub struct EndpointProfile {
     pub graphql_persisted_queries: HashMap<String, GraphqlOperationProfile>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub graphql_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub json_rpc_max_body_bytes: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
 }
@@ -743,6 +745,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
             .map(|(name, operation)| (name.clone(), graphql_operation_to_proto(operation)))
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
+        json_rpc_max_body_bytes: endpoint.json_rpc_max_body_bytes,
         path: endpoint.path.clone(),
     }
 }
@@ -773,6 +776,7 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
             .map(|(name, operation)| (name.clone(), graphql_operation_from_proto(operation)))
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
+        json_rpc_max_body_bytes: endpoint.json_rpc_max_body_bytes,
         path: endpoint.path.clone(),
     }
 }
@@ -816,6 +820,8 @@ fn allow_to_proto(allow: &L7AllowProfile) -> L7Allow {
         operation_type: allow.operation_type.clone(),
         operation_name: allow.operation_name.clone(),
         fields: allow.fields.clone(),
+        rpc_method: String::new(),
+        params: HashMap::new(),
     }
 }
 
@@ -848,6 +854,8 @@ fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
         operation_type: rule.operation_type.clone(),
         operation_name: rule.operation_name.clone(),
         fields: rule.fields.clone(),
+        rpc_method: String::new(),
+        params: HashMap::new(),
     }
 }
 

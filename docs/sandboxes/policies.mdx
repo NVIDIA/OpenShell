@@ -148,7 +148,7 @@ The following steps outline the hot-reload policy update workflow.
 
    To inspect a stored sandbox-authored revision instead of the current effective policy, pass `--rev <version>`.
 
-5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
+5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, `rules`, or protocol-specific matchers such as GraphQL operation fields and JSON-RPC `rpc_method` / `params` rules.
 
 6. Push the updated policy when you need a full replacement. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
 
@@ -173,7 +173,7 @@ Use `openshell policy update` when you want to merge network policy changes into
 - remove one endpoint or one named rule without rewriting the rest of the file.
 - preview a merged result locally with `--dry-run` before you send it to the gateway.
 
-Use `openshell policy set` instead when you want to replace the full policy, update static sections, or make broader edits that are easier to express in YAML.
+Use `openshell policy set` instead when you want to replace the full policy, update static sections, or make broader edits that are easier to express in YAML. Use full YAML for GraphQL and JSON-RPC rule shapes.
 
 ### Update Commands
 
@@ -210,6 +210,7 @@ This is the practical difference:
 Current constraints:
 
 - `--add-allow` and `--add-deny` work on `protocol: rest` and `protocol: websocket` endpoints.
+- GraphQL and JSON-RPC fine-grained rules require full policy YAML applied with `openshell policy set`.
 - `--add-deny` requires the endpoint to already have an allow base, either an `access` preset or explicit allow `rules`.
 - `protocol: sql` is not a practical incremental workflow today. OpenShell does not do full SQL parsing, and SQL enforcement is not meaningfully supported yet.
 
@@ -228,7 +229,7 @@ Each segment has a fixed meaning:
 | `host` | Yes | Destination hostname. |
 | `port` | Yes | Destination port, `1` through `65535`. |
 | `access` | No | Access preset for L7 endpoints: `read-only`, `read-write`, or `full`. Incremental updates expand presets into protocol-specific method/path rules for REST and WebSocket endpoints. |
-| `protocol` | No | L7 inspection mode: `rest`, `websocket`, or `sql`. `sql` is audit-only and not a recommended workflow today. |
+| `protocol` | No | L7 inspection mode accepted by `openshell policy update`: `rest`, `websocket`, or `sql`. `sql` is audit-only and not a recommended workflow today. Full policy YAML also supports `graphql` and `json-rpc`. |
 | `enforcement` | No | Enforcement mode for inspected traffic: `enforce` or `audit`. |
 | `options` | No | Comma-separated endpoint options. Use `websocket-credential-rewrite` with `protocol: websocket` or REST compatibility endpoints that perform a WebSocket upgrade. Use `request-body-credential-rewrite` only with `protocol: rest`. |
 
@@ -548,7 +549,7 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
       - { path: /usr/bin/gh }
 ```
 
-Endpoints with `protocol: rest` enable HTTP request inspection and can opt in to supported text request body credential rewrite. Endpoints with `protocol: websocket` validate WebSocket upgrades and inspect client text messages on the upgraded request path. WebSocket endpoints can also classify GraphQL-over-WebSocket operation messages with the same operation rules used by GraphQL-over-HTTP. Endpoints with `protocol: graphql` parse GraphQL-over-HTTP payloads before evaluating rules. The endpoint-level `path` field lets these protocols share `api.github.com:443` without treating GraphQL payloads as plain REST `POST /graphql` requests.
+Endpoints with `protocol: rest` enable HTTP request inspection and can opt in to supported text request body credential rewrite. Endpoints with `protocol: websocket` validate WebSocket upgrades and inspect client text messages on the upgraded request path. WebSocket endpoints can also classify GraphQL-over-WebSocket operation messages with the same operation rules used by GraphQL-over-HTTP. Endpoints with `protocol: graphql` parse GraphQL-over-HTTP payloads before evaluating rules. Endpoints with `protocol: json-rpc` parse JSON-RPC-over-HTTP request bodies and evaluate `rpc_method` and optional params rules. The endpoint-level `path` field lets these protocols share `api.github.com:443` without treating GraphQL payloads as plain REST `POST /graphql` requests.
 </Tab>
 
 </Tabs>
@@ -578,6 +579,51 @@ REST rules can also constrain query parameter values:
 ```
 
 `query` matchers are case-sensitive and run on decoded values. If a request has duplicate keys (for example, `tag=a&tag=b`), every value for that key must match the configured glob(s).
+
+### JSON-RPC matching
+
+JSON-RPC endpoints use `protocol: json-rpc`. The proxy parses sandbox-to-server JSON-RPC-over-HTTP request bodies, evaluates the `method` field against `rpc_method`, and can match object params through dot-separated `params` keys.
+
+JSON-RPC policy enforcement is directional. It applies to HTTP request bodies sent by the sandboxed process to the configured endpoint. JSON-RPC responses and server-to-client messages carried on response bodies or MCP SSE streams are relayed but are not currently parsed for policy enforcement.
+
+JSON-RPC endpoint policies currently require full policy YAML applied with `openshell policy set`; the incremental `openshell policy update --add-endpoint` parser does not accept `json-rpc` as a protocol.
+
+```yaml showLineNumbers={false}
+  mcp_server:
+    name: mcp_server
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        path: /mcp
+        protocol: json-rpc
+        enforcement: enforce
+        json_rpc:
+          max_body_bytes: 131072
+        rules:
+          - allow:
+              rpc_method: initialize
+          - allow:
+              rpc_method: tools/list
+          - allow:
+              rpc_method: tools/call
+              params:
+                name: read_status
+          - allow:
+              rpc_method: tools/call
+              params:
+                name: submit_report
+                arguments.scope: workspace/main
+        deny_rules:
+          - rpc_method: tools/call
+            params:
+              name: delete_resource
+    binaries:
+      - { path: /usr/bin/python3 }
+```
+
+`json_rpc.max_body_bytes` controls how many JSON-RPC-over-HTTP request body bytes OpenShell buffers for inspection. It defaults to `65536`.
+
+`params` matchers are case-sensitive and use the same string glob or `{ any: [...] }` matcher syntax as REST query parameters. They match scalar leaf values from object params: strings, numbers, and booleans are converted to strings, and nested JSON object params are flattened with dot-separated keys before matching. Arrays, `null`, and non-object top-level params do not produce matcher keys. This is useful for controls such as matching MCP `tools/call` by `params.name`, but it is not a complete MCP payload policy for rich nested content. For batch requests, OpenShell evaluates each JSON-RPC call independently and denies the whole batch if any call is denied.
 
 ### GraphQL matching
 

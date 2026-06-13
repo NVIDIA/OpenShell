@@ -3394,11 +3394,63 @@ async fn handle_forward_proxy(
         } else {
             None
         };
+        let jsonrpc = if l7_config.config.protocol == crate::l7::L7Protocol::JsonRpc {
+            let header_end = forward_request_bytes
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(forward_request_bytes.len(), |p| p + 4);
+            let header_str = std::str::from_utf8(&forward_request_bytes[..header_end])
+                .map_err(|_| miette::miette!("Forward JSON-RPC headers contain invalid UTF-8"))?;
+            let body_length = crate::l7::rest::parse_body_length(header_str)?;
+            let mut jsonrpc_request = crate::l7::provider::L7Request {
+                action: method.to_string(),
+                target: path.clone(),
+                query_params: query_params.clone(),
+                raw_header: forward_request_bytes,
+                body_length,
+            };
+            let body = match crate::l7::http::read_body_for_inspection(
+                client,
+                &mut jsonrpc_request,
+                l7_config.config.json_rpc_max_body_bytes,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(e) => {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message(format!("FORWARD_JSONRPC_L7 request rejected: {e}"))
+                        .build();
+                    ocsf_emit!(event);
+                    emit_activity_simple(activity_tx, true, "l7_parse_rejection");
+                    respond(
+                        client,
+                        &build_json_error_response(
+                            400,
+                            "Bad Request",
+                            "invalid_jsonrpc_request",
+                            &format!("JSON-RPC request rejected before policy evaluation: {e}"),
+                        ),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            forward_request_bytes = jsonrpc_request.raw_header;
+            Some(crate::l7::jsonrpc::parse_jsonrpc_body(&body))
+        } else {
+            None
+        };
         let request_info = crate::l7::L7RequestInfo {
             action: method.to_string(),
             target: path.clone(),
             query_params,
             graphql,
+            jsonrpc,
         };
 
         let parse_error_reason = request_info
@@ -4090,6 +4142,7 @@ mod tests {
             tls: crate::l7::TlsMode::Auto,
             enforcement: crate::l7::EnforcementMode::Enforce,
             graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+            json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             allow_encoded_slash: false,
             websocket_credential_rewrite,
             request_body_credential_rewrite: false,
@@ -4689,6 +4742,7 @@ network_policies:
                     tls: crate::l7::TlsMode::Auto,
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+                    json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
@@ -4702,6 +4756,7 @@ network_policies:
                     tls: crate::l7::TlsMode::Auto,
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+                    json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,

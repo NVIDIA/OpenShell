@@ -128,6 +128,9 @@ message NetworkEndpoint {
   // Advisor-proposed endpoints must not satisfy exact-host SSRF trust unless
   // they are converted through an explicit user-authored policy path.
   bool advisor_proposed = 18;
+  // Maximum JSON-RPC-over-HTTP request body bytes to buffer for inspection.
+  // Defaults to 65536 when unset.
+  uint32 json_rpc_max_body_bytes = 19;
 }
 
 // Trusted GraphQL operation classification.
@@ -160,6 +163,11 @@ message L7DenyRule {
   // GraphQL root field globs. Deny rules match when any selected root field
   // matches any configured glob.
   repeated string fields = 7;
+  // JSON-RPC method name (JSON-RPC): exact name or glob, e.g. "tools/call".
+  string rpc_method = 8;
+  // JSON-RPC params matcher map. Dot-separated keys select nested params
+  // fields, e.g. "arguments.scope".
+  map<string, L7QueryMatcher> params = 9;
 }
 
 // An L7 policy rule (allow-only).
@@ -186,6 +194,11 @@ message L7Allow {
   // GraphQL root field globs. Allow rules match only when every selected root
   // field matches one of the configured globs. Omit to match all fields.
   repeated string fields = 7;
+  // JSON-RPC method name (JSON-RPC): exact name or glob, e.g. "tools/call".
+  string rpc_method = 8;
+  // JSON-RPC params matcher map. Dot-separated keys select nested params
+  // fields, e.g. "arguments.scope".
+  map<string, L7QueryMatcher> params = 9;
 }
 
 // Query value matcher for one query parameter key.

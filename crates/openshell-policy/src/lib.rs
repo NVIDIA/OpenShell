@@ -135,6 +135,8 @@ struct NetworkEndpointDef {
     graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     graphql_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    json_rpc: Option<JsonRpcConfigDef>,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -147,6 +149,25 @@ fn is_zero(v: &u16) -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonRpcConfigDef {
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    on_parse_error: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    batch_policy: String,
+}
+
+fn json_rpc_config_from_proto(max_body_bytes: u32) -> Option<JsonRpcConfigDef> {
+    (max_body_bytes > 0).then_some(JsonRpcConfigDef {
+        max_body_bytes,
+        on_parse_error: String::new(),
+        batch_policy: String::new(),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -183,6 +204,10 @@ struct L7AllowDef {
     operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    rpc_method: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    params: BTreeMap<String, QueryMatcherDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -216,6 +241,10 @@ struct L7DenyRuleDef {
     operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    rpc_method: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    params: BTreeMap<String, QueryMatcherDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -231,6 +260,24 @@ struct NetworkBinaryDef {
 // ---------------------------------------------------------------------------
 // YAML → proto conversion
 // ---------------------------------------------------------------------------
+
+fn matcher_def_to_proto(matcher: QueryMatcherDef) -> L7QueryMatcher {
+    match matcher {
+        QueryMatcherDef::Glob(glob) => L7QueryMatcher { glob, any: vec![] },
+        QueryMatcherDef::Any(any) => L7QueryMatcher {
+            glob: String::new(),
+            any: any.any,
+        },
+    }
+}
+
+fn matcher_proto_to_def(matcher: L7QueryMatcher) -> QueryMatcherDef {
+    if matcher.any.is_empty() {
+        QueryMatcherDef::Glob(matcher.glob)
+    } else {
+        QueryMatcherDef::Any(QueryAnyDef { any: matcher.any })
+    }
+}
 
 fn to_proto(raw: PolicyFile) -> SandboxPolicy {
     let network_policies = raw
@@ -276,21 +323,21 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                         operation_type: r.allow.operation_type,
                                         operation_name: r.allow.operation_name,
                                         fields: r.allow.fields,
+                                        rpc_method: r.allow.rpc_method,
                                         query: r
                                             .allow
                                             .query
                                             .into_iter()
                                             .map(|(key, matcher)| {
-                                                let proto = match matcher {
-                                                    QueryMatcherDef::Glob(glob) => {
-                                                        L7QueryMatcher { glob, any: vec![] }
-                                                    }
-                                                    QueryMatcherDef::Any(any) => L7QueryMatcher {
-                                                        glob: String::new(),
-                                                        any: any.any,
-                                                    },
-                                                };
-                                                (key, proto)
+                                                (key, matcher_def_to_proto(matcher))
+                                            })
+                                            .collect(),
+                                        params: r
+                                            .allow
+                                            .params
+                                            .into_iter()
+                                            .map(|(key, matcher)| {
+                                                (key, matcher_def_to_proto(matcher))
                                             })
                                             .collect(),
                                     }),
@@ -307,21 +354,16 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                     operation_type: d.operation_type,
                                     operation_name: d.operation_name,
                                     fields: d.fields,
+                                    rpc_method: d.rpc_method,
                                     query: d
                                         .query
                                         .into_iter()
-                                        .map(|(key, matcher)| {
-                                            let proto = match matcher {
-                                                QueryMatcherDef::Glob(glob) => {
-                                                    L7QueryMatcher { glob, any: vec![] }
-                                                }
-                                                QueryMatcherDef::Any(any) => L7QueryMatcher {
-                                                    glob: String::new(),
-                                                    any: any.any,
-                                                },
-                                            };
-                                            (key, proto)
-                                        })
+                                        .map(|(key, matcher)| (key, matcher_def_to_proto(matcher)))
+                                        .collect(),
+                                    params: d
+                                        .params
+                                        .into_iter()
+                                        .map(|(key, matcher)| (key, matcher_def_to_proto(matcher)))
                                         .collect(),
                                 })
                                 .collect(),
@@ -347,6 +389,10 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
+                            json_rpc_max_body_bytes: e
+                                .json_rpc
+                                .as_ref()
+                                .map_or(0, |config| config.max_body_bytes),
                         }
                     })
                     .collect(),
@@ -448,18 +494,19 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                             operation_type: a.operation_type,
                                             operation_name: a.operation_name,
                                             fields: a.fields,
+                                            rpc_method: a.rpc_method,
                                             query: a
                                                 .query
                                                 .into_iter()
                                                 .map(|(key, matcher)| {
-                                                    let yaml_matcher = if matcher.any.is_empty() {
-                                                        QueryMatcherDef::Glob(matcher.glob)
-                                                    } else {
-                                                        QueryMatcherDef::Any(QueryAnyDef {
-                                                            any: matcher.any,
-                                                        })
-                                                    };
-                                                    (key, yaml_matcher)
+                                                    (key, matcher_proto_to_def(matcher))
+                                                })
+                                                .collect(),
+                                            params: a
+                                                .params
+                                                .into_iter()
+                                                .map(|(key, matcher)| {
+                                                    (key, matcher_proto_to_def(matcher))
                                                 })
                                                 .collect(),
                                         },
@@ -477,18 +524,19 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                     operation_type: d.operation_type.clone(),
                                     operation_name: d.operation_name.clone(),
                                     fields: d.fields.clone(),
+                                    rpc_method: d.rpc_method.clone(),
                                     query: d
                                         .query
                                         .iter()
                                         .map(|(key, matcher)| {
-                                            let yaml_matcher = if matcher.any.is_empty() {
-                                                QueryMatcherDef::Glob(matcher.glob.clone())
-                                            } else {
-                                                QueryMatcherDef::Any(QueryAnyDef {
-                                                    any: matcher.any.clone(),
-                                                })
-                                            };
-                                            (key.clone(), yaml_matcher)
+                                            (key.clone(), matcher_proto_to_def(matcher.clone()))
+                                        })
+                                        .collect(),
+                                    params: d
+                                        .params
+                                        .iter()
+                                        .map(|(key, matcher)| {
+                                            (key.clone(), matcher_proto_to_def(matcher.clone()))
                                         })
                                         .collect(),
                                 })
@@ -512,6 +560,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
+                            json_rpc: json_rpc_config_from_proto(e.json_rpc_max_body_bytes),
                         }
                     })
                     .collect(),
@@ -1713,6 +1762,35 @@ network_policies:
         assert_eq!(ep.rules[1].allow.as_ref().unwrap().operation_name, "Issue*");
         assert_eq!(ep.deny_rules[0].operation_type, "mutation");
         assert_eq!(ep.deny_rules[0].fields, vec!["deleteRepository"]);
+    }
+
+    #[test]
+    fn round_trip_preserves_json_rpc_max_body_bytes() {
+        let yaml = r"
+version: 1
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: json-rpc
+        enforcement: enforce
+        json_rpc:
+          max_body_bytes: 131072
+        rules:
+          - allow:
+              rpc_method: initialize
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["mcp"].endpoints[0];
+        assert_eq!(ep.protocol, "json-rpc");
+        assert_eq!(ep.json_rpc_max_body_bytes, 131_072);
     }
 
     #[test]
