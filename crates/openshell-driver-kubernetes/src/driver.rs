@@ -5,11 +5,11 @@
 
 use crate::config::{
     AppArmorProfile, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, SupervisorSideloadMethod,
+    KubernetesComputeConfig, SharedVolumeSpec, SupervisorSideloadMethod, WarmPoolSpec,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
-use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
+use kube::api::{Api, ApiResource, DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
@@ -25,7 +25,7 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
     DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    GetCapabilitiesResponse, WarmClaimBinding, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
@@ -77,9 +77,36 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
 /// API server is unreachable or slow.
 const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
-const SANDBOX_GROUP: &str = "agents.x-k8s.io";
-const SANDBOX_VERSION: &str = "v1alpha1";
-pub const SANDBOX_KIND: &str = "Sandbox";
+// agent-sandbox CRD identity. Single source of truth in `openshell-core` so the
+// gateway's auth re-anchor stays byte-identical with what this driver writes.
+const SANDBOX_GROUP: &str = openshell_core::driver_utils::SANDBOX_CRD_GROUP;
+const SANDBOX_VERSION: &str = openshell_core::driver_utils::SANDBOX_CRD_VERSION;
+pub const SANDBOX_KIND: &str = openshell_core::driver_utils::SANDBOX_CRD_KIND;
+
+// agent-sandbox warm-pool extension CRDs (extensions.agents.x-k8s.io/v1alpha1).
+const EXT_GROUP: &str = openshell_core::driver_utils::SANDBOX_EXT_GROUP;
+const EXT_VERSION: &str = openshell_core::driver_utils::SANDBOX_CRD_VERSION;
+const SANDBOX_CLAIM_KIND: &str = openshell_core::driver_utils::SANDBOX_CLAIM_KIND;
+const SANDBOX_TEMPLATE_KIND: &str = openshell_core::driver_utils::SANDBOX_TEMPLATE_KIND;
+const SANDBOX_WARM_POOL_KIND: &str = openshell_core::driver_utils::SANDBOX_WARM_POOL_KIND;
+
+/// Pod annotation carrying the per-sandbox identity. On the warm path it is
+/// injected via `SandboxClaim.spec.additionalPodMetadata.annotations`; the
+/// gateway resolves a pod's SA token back to this value during
+/// `IssueSandboxToken`. Mirrors `auth::k8s_sa::SANDBOX_ID_ANNOTATION`.
+const SANDBOX_ID_ANNOTATION: &str = openshell_core::driver_utils::SANDBOX_ID_ANNOTATION;
+/// Label the upstream warm-pool controller stamps onto a bound `Sandbox` CR,
+/// carrying the binding `SandboxClaim`'s UID. The driver distinguishes warm
+/// Sandboxes from cold ones by the *absence* of `LABEL_SANDBOX_ID` (see
+/// `is_cold_openshell_sandbox`), so this label is referenced only by tests that
+/// construct representative bound-warm Sandboxes.
+#[cfg(test)]
+const CLAIM_UID_LABEL: &str = openshell_core::driver_utils::CLAIM_UID_LABEL;
+/// Label the gateway stamps onto the `SandboxClaim`/`SandboxTemplate`/
+/// `SandboxWarmPool` it owns, naming the originating pool.
+const WARM_POOL_LABEL: &str = "openshell.ai/warm-pool";
+/// Field manager used for server-side-apply of pool resources.
+const WARM_POOL_FIELD_MANAGER: &str = "openshell-gateway-warmpool";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
@@ -267,6 +294,250 @@ impl KubernetesComputeDriver {
         Api::namespaced_with(self.client.clone(), &self.config.namespace, &resource)
     }
 
+    fn ext_api(&self, client: &Client, kind: &str) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk(EXT_GROUP, EXT_VERSION, kind);
+        let resource = ApiResource::from_gvk(&gvk);
+        Api::namespaced_with(client.clone(), &self.config.namespace, &resource)
+    }
+
+    fn claims_api(&self) -> Api<DynamicObject> {
+        self.ext_api(&self.client, SANDBOX_CLAIM_KIND)
+    }
+
+    fn watch_claims_api(&self) -> Api<DynamicObject> {
+        self.ext_api(&self.watch_client, SANDBOX_CLAIM_KIND)
+    }
+
+    /// Whether warm pooling is enabled in driver config.
+    fn warm_pool_enabled(&self) -> bool {
+        self.config.warm_pool.enabled
+    }
+
+    /// Resolve the warm pool that a `CreateSandbox` request maps to, if any.
+    ///
+    /// Only the gateway's trusted `default_image` with no per-request template
+    /// or env overrides is warm-pooled (issue #1879, remediation #7); anything
+    /// else falls back to the cold path. Pools are matched by GPU shape.
+    fn matching_warm_pool(&self, sandbox: &Sandbox) -> Option<&WarmPoolSpec> {
+        if !self.warm_pool_enabled() {
+            return None;
+        }
+        let spec = sandbox.spec.as_ref()?;
+        if !warm_eligible(spec, &self.config.default_image) {
+            return None;
+        }
+        self.config
+            .warm_pool
+            .pools
+            .iter()
+            .find(|pool| pool.gpu == spec.gpu)
+    }
+
+    /// Reconcile the operator-declared warm pools: server-side-apply one
+    /// `SandboxTemplate` + one `SandboxWarmPool` per configured pool. Idempotent
+    /// and safe to call on every startup. Non-fatal on individual failures —
+    /// the cold path stays available regardless.
+    pub async fn reconcile_warm_pools(&self) -> Result<(), KubernetesDriverError> {
+        if !self.warm_pool_enabled() {
+            return Ok(());
+        }
+        for pool in &self.config.warm_pool.pools {
+            self.apply_warm_pool(pool).await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_warm_pool(&self, pool: &WarmPoolSpec) -> Result<(), KubernetesDriverError> {
+        let resource_name = warm_resource_name(&pool.name);
+        let labels = warm_pool_labels(&pool.name);
+
+        // SandboxTemplate: the shared, identity-free pod blueprint.
+        let template_spec = build_warm_sandbox_template_spec(&self.config, pool);
+        self.apply_ext_object(
+            SANDBOX_TEMPLATE_KIND,
+            &resource_name,
+            &labels,
+            serde_json::json!({ "spec": template_spec }),
+        )
+        .await?;
+
+        // SandboxWarmPool: keeps `replicas` pods warm against that template.
+        self.apply_ext_object(
+            SANDBOX_WARM_POOL_KIND,
+            &resource_name,
+            &labels,
+            serde_json::json!({
+                "spec": {
+                    "replicas": pool.replicas,
+                    "sandboxTemplateRef": { "name": resource_name },
+                }
+            }),
+        )
+        .await?;
+
+        info!(
+            pool = %pool.name,
+            replicas = pool.replicas,
+            gpu = pool.gpu,
+            "Reconciled warm pool"
+        );
+        Ok(())
+    }
+
+    async fn apply_ext_object(
+        &self,
+        kind: &str,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+        spec: serde_json::Value,
+    ) -> Result<(), KubernetesDriverError> {
+        let gvk = GroupVersionKind::gvk(EXT_GROUP, EXT_VERSION, kind);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut obj = DynamicObject::new(name, &resource);
+        obj.metadata = ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(self.config.namespace.clone()),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        };
+        obj.data = spec;
+        let api = self.ext_api(&self.client, kind);
+        let params = PatchParams::apply(WARM_POOL_FIELD_MANAGER).force();
+        tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            api.patch(name, &params, &Patch::Apply(&obj)),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out applying {kind}/{name} after {}s",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+        Ok(())
+    }
+
+    /// Bind a pre-warmed pod by creating a `SandboxClaim`. Returns the claim
+    /// identity so the gateway can record the durable claim->sandbox-id mapping.
+    async fn create_warm_claim(
+        &self,
+        sandbox: &Sandbox,
+        pool: &WarmPoolSpec,
+    ) -> Result<WarmClaimBinding, KubernetesDriverError> {
+        let name = sandbox.name.as_str();
+        let resource_name = warm_resource_name(&pool.name);
+
+        let mut labels = warm_pool_labels(&pool.name);
+        labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
+
+        let gvk = GroupVersionKind::gvk(EXT_GROUP, EXT_VERSION, SANDBOX_CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut obj = DynamicObject::new(name, &resource);
+        obj.metadata = ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(self.config.namespace.clone()),
+            labels: Some(labels),
+            ..Default::default()
+        };
+        obj.data = warm_claim_spec(&resource_name, &sandbox.id);
+
+        let created = tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            self.claims_api().create(&PostParams::default(), &obj),
+        )
+        .await
+        .map_err(|_| {
+            KubernetesDriverError::Message(format!(
+                "timed out creating SandboxClaim after {}s",
+                KUBE_API_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(KubernetesDriverError::from_kube)?;
+
+        let claim_uid = created.metadata.uid.unwrap_or_default();
+        if claim_uid.is_empty() {
+            return Err(KubernetesDriverError::Message(
+                "created SandboxClaim has no UID".to_string(),
+            ));
+        }
+        info!(
+            sandbox_id = %sandbox.id,
+            claim = %name,
+            claim_uid = %claim_uid,
+            pool = %pool.name,
+            "Bound warm sandbox via SandboxClaim"
+        );
+        Ok(WarmClaimBinding {
+            namespace: self.config.namespace.clone(),
+            claim_name: name.to_string(),
+            claim_uid,
+        })
+    }
+
+    async fn get_warm_sandbox(&self, name: &str) -> Result<Option<Sandbox>, String> {
+        let api = self.claims_api();
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get_opt(name)).await {
+            Ok(Ok(Some(obj))) => sandbox_from_claim_object(&self.config.namespace, obj).map(Some),
+            Ok(Ok(None)) => Ok(None),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_elapsed) => Err(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    async fn list_warm_sandboxes(&self) -> Result<Vec<Sandbox>, String> {
+        let selector = format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}");
+        let params = ListParams::default().labels(&selector);
+        let api = self.claims_api();
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&params)).await {
+            Ok(Ok(list)) => list
+                .items
+                .into_iter()
+                .filter(|obj| {
+                    obj.metadata
+                        .labels
+                        .as_ref()
+                        .is_some_and(|labels| labels.contains_key(LABEL_SANDBOX_ID))
+                })
+                .map(|obj| sandbox_from_claim_object(&self.config.namespace, obj))
+                .collect::<Result<Vec<_>, _>>(),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_elapsed) => Err(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
+    /// Delete a warm-pool `SandboxClaim` by name. `shutdownPolicy: Delete`
+    /// cascades teardown to the bound `Sandbox` + Pod. Returns `Ok(true)` when a
+    /// claim was deleted; `Ok(false)` when warm pooling is disabled or no such
+    /// claim exists (the caller then falls through to the cold `Sandbox` path —
+    /// e.g. a cold sandbox created while warm pooling was on).
+    async fn delete_warm_claim(&self, name: &str) -> Result<bool, String> {
+        if !self.warm_pool_enabled() {
+            return Ok(false);
+        }
+        let api = self.claims_api();
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(name, &DeleteParams::default()))
+            .await
+        {
+            Ok(Ok(_)) => {
+                info!(claim = %name, "Deleted warm SandboxClaim");
+                Ok(true)
+            }
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(false),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_elapsed) => Err(format!(
+                "timed out after {}s waiting for Kubernetes API",
+                KUBE_API_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
     async fn has_gpu_capacity(&self) -> Result<bool, KubeError> {
         let nodes: Api<Node> = Api::all(self.client.clone());
         let node_list = nodes.list(&ListParams::default()).await?;
@@ -302,11 +573,11 @@ impl KubernetesComputeDriver {
         );
 
         let api = self.api();
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
-            Ok(Ok(obj)) => sandbox_from_object(&self.config.namespace, obj).map(Some),
+        let cold = match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
+            Ok(Ok(obj)) => Some(obj),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => {
                 debug!(sandbox_name = %name, "Sandbox not found in Kubernetes");
-                Ok(None)
+                None
             }
             Ok(Err(err)) => {
                 warn!(
@@ -314,7 +585,7 @@ impl KubernetesComputeDriver {
                     error = %err,
                     "Failed to fetch sandbox from Kubernetes"
                 );
-                Err(err.to_string())
+                return Err(err.to_string());
             }
             Err(_elapsed) => {
                 warn!(
@@ -322,12 +593,26 @@ impl KubernetesComputeDriver {
                     timeout_secs = KUBE_API_TIMEOUT.as_secs(),
                     "Timed out fetching sandbox from Kubernetes"
                 );
-                Err(format!(
+                return Err(format!(
                     "timed out after {}s waiting for Kubernetes API",
                     KUBE_API_TIMEOUT.as_secs()
-                ))
+                ));
             }
+        };
+
+        // A cold Sandbox CR named `name` resolves directly; warm-pool Sandbox
+        // CRs (pooled or claim-bound) lack the openshell sandbox-id label and
+        // are addressed via their SandboxClaim instead, so fall through to the
+        // warm lookup for those.
+        if let Some(obj) = cold
+            && is_cold_openshell_sandbox(&obj)
+        {
+            return sandbox_from_object(&self.config.namespace, obj).map(Some);
         }
+        if self.warm_pool_enabled() {
+            return self.get_warm_sandbox(name).await;
+        }
+        Ok(None)
     }
 
     pub async fn list_sandboxes(&self) -> Result<Vec<Sandbox>, String> {
@@ -339,11 +624,19 @@ impl KubernetesComputeDriver {
         let api = self.api();
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&ListParams::default())).await {
             Ok(Ok(list)) => {
+                // Cold Sandbox CRs only; warm-pool Sandboxes (pooled or bound)
+                // are surfaced via their SandboxClaim below — their generic
+                // names carry no openshell sandbox-id and would otherwise fail
+                // to map.
                 let mut sandboxes = list
                     .items
                     .into_iter()
+                    .filter(is_cold_openshell_sandbox)
                     .map(|obj| sandbox_from_object(&self.config.namespace, obj))
                     .collect::<Result<Vec<_>, _>>()?;
+                if self.warm_pool_enabled() {
+                    sandboxes.extend(self.list_warm_sandboxes().await?);
+                }
                 sandboxes.sort_by(|left, right| {
                     left.name
                         .cmp(&right.name)
@@ -373,10 +666,21 @@ impl KubernetesComputeDriver {
         }
     }
 
-    pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
+    pub async fn create_sandbox(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<Option<WarmClaimBinding>, KubernetesDriverError> {
         let _ = KubernetesSandboxDriverConfig::from_sandbox(sandbox)
             .map_err(KubernetesDriverError::InvalidArgument)?;
         let name = sandbox.name.as_str();
+
+        // Warm path: when the request matches an operator-declared pool, bind a
+        // pre-warmed pod via a SandboxClaim instead of cold-creating a Sandbox.
+        if let Some(pool) = self.matching_warm_pool(sandbox) {
+            let pool = pool.clone();
+            return self.create_warm_claim(sandbox, &pool).await.map(Some);
+        }
+
         info!(
             sandbox_id = %sandbox.id,
             sandbox_name = %name,
@@ -428,7 +732,7 @@ impl KubernetesComputeDriver {
                     sandbox_name = %name,
                     "Sandbox created in Kubernetes successfully"
                 );
-                Ok(())
+                Ok(None)
             }
             Ok(Err(err)) => {
                 warn!(
@@ -460,6 +764,14 @@ impl KubernetesComputeDriver {
             namespace = %self.config.namespace,
             "Deleting sandbox from Kubernetes"
         );
+
+        // Warm path: a matching SandboxClaim is single-use; deleting it
+        // cascades teardown to the bound Sandbox + Pod (shutdownPolicy: Delete),
+        // so a claimed pod/Sandbox is never returned to the pool. A miss falls
+        // through to the cold Sandbox delete below.
+        if self.delete_warm_claim(name).await? {
+            return Ok(true);
+        }
 
         let api = self.api();
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(name, &DeleteParams::default()))
@@ -516,6 +828,14 @@ impl KubernetesComputeDriver {
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
         let mut sandbox_stream = watcher::watcher(sandbox_api, watcher::Config::default()).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
+        // Watch warm-pool SandboxClaims only when warm pooling is enabled; the
+        // extension CRDs may not be installed otherwise. A `pending` stream
+        // keeps the select arm inert when disabled.
+        let mut claim_stream = if self.warm_pool_enabled() {
+            watcher::watcher(self.watch_claims_api(), watcher::Config::default()).boxed()
+        } else {
+            futures::stream::pending().boxed()
+        };
         let (tx, rx) = mpsc::channel(256);
 
         tokio::spawn(async move {
@@ -525,7 +845,13 @@ impl KubernetesComputeDriver {
             loop {
                 tokio::select! {
                     result = sandbox_stream.try_next() => match result {
+                        // Only cold OpenShell Sandbox CRs are mapped here; warm-
+                        // pool Sandboxes (pooled or claim-bound) lack the
+                        // openshell sandbox-id label and are surfaced via the
+                        // SandboxClaim watcher below, so skip them to avoid
+                        // failing on their identity-free generic names.
                         Ok(Some(Event::Applied(obj))) => {
+                            if !is_cold_openshell_sandbox(&obj) { continue; }
                             match sandbox_from_object(&namespace, obj) {
                                 Ok(sandbox) => {
                                     update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox);
@@ -546,6 +872,7 @@ impl KubernetesComputeDriver {
                             }
                         }
                         Ok(Some(Event::Deleted(obj))) => {
+                            if !is_cold_openshell_sandbox(&obj) { continue; }
                             match sandbox_id_from_object(&obj) {
                                 Ok(sandbox_id) => {
                                     remove_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox_id);
@@ -567,6 +894,7 @@ impl KubernetesComputeDriver {
                         }
                         Ok(Some(Event::Restarted(objs))) => {
                             for obj in objs {
+                                if !is_cold_openshell_sandbox(&obj) { continue; }
                                 match sandbox_from_object(&namespace, obj) {
                                     Ok(sandbox) => {
                                         update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox);
@@ -590,6 +918,59 @@ impl KubernetesComputeDriver {
                         Ok(None) => {
                             let _ = tx.send(Err(KubernetesDriverError::Message(
                                 "sandbox watcher stream ended unexpectedly".to_string()
+                            ))).await;
+                            break;
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
+                            break;
+                        }
+                    },
+                    result = claim_stream.try_next() => match result {
+                        Ok(Some(Event::Applied(obj))) => {
+                            if let Some(sandbox) = managed_claim_sandbox(&namespace, &obj) {
+                                update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox);
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                        WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Some(Event::Deleted(obj))) => {
+                            if let Some(sandbox_id) = sandbox_id_from_claim_object(&obj) {
+                                remove_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox_id);
+                                let event = WatchSandboxesEvent {
+                                    payload: Some(watch_sandboxes_event::Payload::Deleted(
+                                        WatchSandboxesDeletedEvent { sandbox_id }
+                                    )),
+                                };
+                                if tx.send(Ok(event)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Some(Event::Restarted(objs))) => {
+                            for obj in objs {
+                                if let Some(sandbox) = managed_claim_sandbox(&namespace, &obj) {
+                                    update_indexes(&mut sandbox_name_to_id, &mut agent_pod_to_id, &sandbox);
+                                    let event = WatchSandboxesEvent {
+                                        payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                                            WatchSandboxesSandboxEvent { sandbox: Some(sandbox) }
+                                        )),
+                                    };
+                                    if tx.send(Ok(event)).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = tx.send(Err(KubernetesDriverError::Message(
+                                "sandbox claim watcher stream ended".to_string()
                             ))).await;
                             break;
                         }
@@ -680,6 +1061,357 @@ fn sandbox_from_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, S
         spec: None,
         status,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Warm-pool helpers
+// ---------------------------------------------------------------------------
+
+/// True when a `Sandbox` CR is a cold `OpenShell`-created sandbox — it carries
+/// the `openshell.ai/sandbox-id` label set by `sandbox_labels`. Warm-pool
+/// Sandbox CRs (created by the `SandboxWarmPool`) never carry it: while still
+/// pooled they have neither identity label, and once bound they carry only the
+/// upstream `agents.x-k8s.io/claim-uid` label. Both are surfaced to the gateway
+/// via the `SandboxClaim` watcher instead, so the cold Sandbox watcher/list
+/// must skip everything that is not a cold sandbox — otherwise it fails to map
+/// their identity-free generic names ("sandbox id not found on object").
+fn is_cold_openshell_sandbox(obj: &DynamicObject) -> bool {
+    obj.metadata
+        .labels
+        .as_ref()
+        .is_some_and(|labels| labels.contains_key(LABEL_SANDBOX_ID))
+}
+
+/// Name shared by a pool's `SandboxTemplate` and `SandboxWarmPool`.
+fn warm_resource_name(pool_name: &str) -> String {
+    format!("openshell-warmpool-{pool_name}")
+}
+
+/// Labels stamped onto gateway-owned warm-pool resources.
+fn warm_pool_labels(pool_name: &str) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        LABEL_MANAGED_BY.to_string(),
+        LABEL_MANAGED_BY_VALUE.to_string(),
+    );
+    labels.insert(WARM_POOL_LABEL.to_string(), pool_name.to_string());
+    labels
+}
+
+/// Whether a `CreateSandbox` request is eligible for warm pooling. Only the
+/// gateway's trusted `default_image` with no per-request template or env
+/// overrides qualifies (issue #1879, remediation #7); anything else falls back
+/// to the cold path (where per-sandbox env/identity can be injected freely).
+///
+/// Fail-closed *by construction*: both the spec and its template are
+/// destructured exhaustively, so adding a field to `DriverSandboxSpec` or
+/// `DriverSandboxTemplate` will not compile here until the new field is
+/// explicitly classified as warm-safe or cold-only. This forecloses the
+/// silent-drop class of bug where a per-request field is honored on the cold
+/// path but ignored by the pooled template (issue #1879, PR #1813 review #1).
+fn warm_eligible(spec: &SandboxSpec, default_image: &str) -> bool {
+    let SandboxSpec {
+        // The gateway forbids warm-pooling requests carrying a custom policy: a
+        // warm pod boots on the pool's baseline policy and cannot late-bind a
+        // per-sandbox policy (Landlock is applied once at process start), so
+        // warm-pooling such a request would silently downgrade its policy.
+        disallow_warm_pool,
+        // Warm-safe. `gpu` selects the matching pool shape (see
+        // `matching_warm_pool`); `sandbox_token` is ignored by the Kubernetes
+        // driver (identity comes from the projected ServiceAccount token), so
+        // neither forces the cold path.
+        gpu: _,
+        sandbox_token: _,
+        // Cold-only. The pooled pod's env/log level are fixed at warm-up time
+        // (the cold path threads these into the pod env via `spec_pod_env`).
+        // (A specific GPU device now rides in the template's `driver_config`,
+        // which the template check below rejects, so it also forces cold.)
+        log_level,
+        environment,
+        // Per-request runtime overrides — validated field-by-field below.
+        template,
+    } = spec;
+
+    if *disallow_warm_pool || !log_level.is_empty() || !environment.is_empty() {
+        return false;
+    }
+
+    let Some(template) = template.as_ref() else {
+        return true;
+    };
+    let SandboxTemplate {
+        // Warm-safe only when empty or equal to the pool's default image.
+        image,
+        // Cold-only: consumed cold-side as the Sandbox spec's `agentSocket`;
+        // the pooled template uses the default, so a per-request value would be
+        // silently ignored.
+        agent_socket_path,
+        // Cold-only: the pooled pod's labels/env/resources are fixed at warm-up
+        // and platform/driver config is baked into the `SandboxTemplate`.
+        labels,
+        environment,
+        resources,
+        platform_config,
+        driver_config,
+    } = template;
+
+    (image.is_empty() || image.as_str() == default_image)
+        && agent_socket_path.is_empty()
+        && labels.is_empty()
+        && environment.is_empty()
+        && resources.is_none()
+        && platform_config
+            .as_ref()
+            .is_none_or(|pc| pc.fields.is_empty())
+        && driver_config.as_ref().is_none_or(|dc| dc.fields.is_empty())
+}
+
+/// Build the `SandboxTemplate.spec` for a warm pool: the shared pod blueprint
+/// with **no** per-sandbox identity (no `openshell.io/sandbox-id` annotation, no
+/// per-sandbox env). The writable `/sandbox` workspace is an ephemeral
+/// `emptyDir` seeded from the image (single-use, nothing to orphan); an optional
+/// shared volume is mounted read-only.
+fn build_warm_sandbox_template_spec(
+    config: &KubernetesComputeConfig,
+    pool: &WarmPoolSpec,
+) -> serde_json::Value {
+    let runtime_class = if pool.runtime_class_name.is_empty() {
+        config.default_runtime_class_name.clone()
+    } else {
+        pool.runtime_class_name.clone()
+    };
+    let params = SandboxPodParams {
+        default_image: &config.default_image,
+        image_pull_policy: &config.image_pull_policy,
+        image_pull_secrets: &config.image_pull_secrets,
+        supervisor_image: &config.supervisor_image,
+        supervisor_image_pull_policy: &config.supervisor_image_pull_policy,
+        supervisor_sideload_method: config.supervisor_sideload_method,
+        service_account_name: &config.service_account_name,
+        // Pooled pods are identity-free; the per-sandbox id is late-bound via
+        // the SandboxClaim annotation + the IssueSandboxToken exchange.
+        sandbox_id: "",
+        sandbox_name: "",
+        grpc_endpoint: &config.grpc_endpoint,
+        ssh_socket_path: &config.ssh_socket_path,
+        client_tls_secret_name: &config.client_tls_secret_name,
+        host_gateway_ip: &config.host_gateway_ip,
+        enable_user_namespaces: config.enable_user_namespaces,
+        app_armor_profile: config.app_armor_profile.as_ref(),
+        workspace_default_storage_size: &config.workspace_default_storage_size,
+        default_runtime_class_name: &runtime_class,
+        sa_token_ttl_secs: config.effective_sa_token_ttl_secs(),
+        // Pooled pods are identity-free and carry no per-sandbox providers, so
+        // they never mount provider-token-grant SPIFFE material. If a claimed
+        // warm sandbox needs providers that is late-bound (out of scope here).
+        provider_spiffe_enabled: false,
+        provider_spiffe_workload_api_socket_path: "",
+    };
+
+    let empty_env = std::collections::HashMap::new();
+    // inject_workspace=false: suppress the cold-path PVC workspace; an ephemeral
+    // emptyDir workspace is attached below instead.
+    let mut pod_template = sandbox_template_to_k8s(
+        &SandboxTemplate::default(),
+        pool.gpu,
+        &empty_env,
+        false,
+        &params,
+    );
+    apply_ephemeral_workspace(
+        &mut pod_template,
+        &config.default_image,
+        &config.image_pull_policy,
+    );
+    if let Some(shared) = pool.shared_volume.as_ref() {
+        apply_shared_readonly_volume(&mut pod_template, shared);
+    }
+
+    serde_json::json!({
+        "podTemplate": pod_template,
+        // Reject per-claim env injection on the warm path: pod env is immutable
+        // once running and identity must never ride pod env.
+        "envVarsInjectionPolicy": "Disallowed",
+        // Do NOT let the warm-pool controller manage a NetworkPolicy for these
+        // pods. With no rules a Managed (the upstream default) NetworkPolicy is
+        // default-deny and blocks the pod's egress to the gateway, so the
+        // supervisor can never reach `IssueSandboxToken` / open its relay
+        // session. OpenShell enforces egress itself via the supervisor proxy +
+        // Landlock, so cluster NetworkPolicy management is left off here, matching
+        // the cold path (which has no NetworkPolicy at all).
+        "networkPolicyManagement": "Unmanaged",
+    })
+}
+
+/// Build the `SandboxClaim.spec` JSON that binds a pre-warmed pod: it references
+/// the pool template/warmpool, injects only the per-sandbox identity annotation,
+/// and forces single-use teardown (`shutdownPolicy: Delete`, never `Retain`).
+fn warm_claim_spec(resource_name: &str, sandbox_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "spec": {
+            "sandboxTemplateRef": { "name": resource_name },
+            "warmpool": resource_name,
+            "additionalPodMetadata": {
+                "annotations": { SANDBOX_ID_ANNOTATION: sandbox_id }
+            },
+            // Single-use: claim deletion must destroy the bound Sandbox/Pod (and
+            // any backing storage). Never `Retain` (orphans data).
+            "lifecycle": { "shutdownPolicy": "Delete" }
+        }
+    })
+}
+
+/// Attach an ephemeral `emptyDir` writable workspace at `/sandbox`, seeded from
+/// the image on first start. Single-use and fail-safe: the kubelet reclaims it
+/// with the pod, so there is nothing to orphan (vs. the cold path's PVC).
+fn apply_ephemeral_workspace(
+    pod_template: &mut serde_json::Value,
+    image: &str,
+    image_pull_policy: &str,
+) {
+    // The cold path relies on the Sandbox CRD controller to materialise a PVC
+    // volume from `volumeClaimTemplates`; warm pods have none, so add the
+    // emptyDir volume here. The mount + seed init-container are shared.
+    if let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut())
+        && let Some(volumes) = spec
+            .entry("volumes")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+    {
+        volumes.push(serde_json::json!({
+            "name": WORKSPACE_VOLUME_NAME,
+            "emptyDir": {}
+        }));
+    }
+    apply_workspace_persistence(pod_template, image, image_pull_policy);
+}
+
+/// Mount a pre-existing PVC read-only into the agent container (shared datasets
+/// / models / caches). Safe to share precisely because it is read-only and
+/// holds no per-agent state.
+fn apply_shared_readonly_volume(pod_template: &mut serde_json::Value, shared: &SharedVolumeSpec) {
+    const SHARED_VOLUME_NAME: &str = "openshell-shared-data";
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    if let Some(volumes) = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+    {
+        volumes.push(serde_json::json!({
+            "name": SHARED_VOLUME_NAME,
+            "persistentVolumeClaim": {
+                "claimName": shared.claim_name,
+                "readOnly": true
+            }
+        }));
+    }
+
+    let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let index = containers
+        .iter()
+        .position(|c| c.get("name").and_then(|v| v.as_str()) == Some("agent"))
+        .unwrap_or(0);
+    if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
+        let mut mount = serde_json::json!({
+            "name": SHARED_VOLUME_NAME,
+            "mountPath": shared.mount_path,
+            "readOnly": true
+        });
+        if !shared.sub_path.is_empty() {
+            mount["subPath"] = serde_json::json!(shared.sub_path);
+        }
+        if let Some(mounts) = container
+            .entry("volumeMounts")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+        {
+            mounts.push(mount);
+        }
+    }
+}
+
+/// Extract the gateway sandbox-id stamped on a managed `SandboxClaim`.
+fn sandbox_id_from_claim_object(obj: &DynamicObject) -> Option<String> {
+    obj.metadata
+        .labels
+        .as_ref()?
+        .get(LABEL_SANDBOX_ID)
+        .filter(|v| !v.is_empty())
+        .cloned()
+}
+
+/// Map a managed warm-pool `SandboxClaim` to a driver `Sandbox`, or `None` when
+/// it is not one of ours (missing the gateway sandbox-id label).
+fn managed_claim_sandbox(namespace: &str, obj: &DynamicObject) -> Option<Sandbox> {
+    sandbox_id_from_claim_object(obj)?;
+    sandbox_from_claim_object(namespace, obj.clone()).ok()
+}
+
+/// Build a driver `Sandbox` from a warm-pool `SandboxClaim`. The id comes from
+/// the gateway-set `openshell.ai/sandbox-id` label; status is derived from the
+/// claim binding.
+fn sandbox_from_claim_object(namespace: &str, obj: DynamicObject) -> Result<Sandbox, String> {
+    let id = sandbox_id_from_claim_object(&obj)
+        .ok_or_else(|| "SandboxClaim missing openshell.ai/sandbox-id label".to_string())?;
+    let name = obj.metadata.name.clone().unwrap_or_default();
+    let namespace = obj
+        .metadata
+        .namespace
+        .clone()
+        .unwrap_or_else(|| namespace.to_string());
+    let status = Some(claim_status_to_sandbox_status(&obj));
+    Ok(Sandbox {
+        id,
+        name,
+        namespace,
+        spec: None,
+        status,
+    })
+}
+
+/// Derive a driver status from a `SandboxClaim`. The bound `Sandbox`'s name is
+/// used as the instance id (best-effort event correlation) and the claim
+/// identity is surfaced so the gateway can back-fill or GC the durable claim
+/// mapping. Readiness is ultimately driven by the supervisor session.
+fn claim_status_to_sandbox_status(obj: &DynamicObject) -> SandboxStatus {
+    let claim_name = obj.metadata.name.clone().unwrap_or_default();
+    let claim_uid = obj.metadata.uid.clone().unwrap_or_default();
+    let status_obj = obj.data.get("status").and_then(|s| s.as_object());
+
+    let bound_sandbox = status_obj
+        .and_then(|s| s.get("sandbox"))
+        .and_then(|s| s.as_object())
+        .and_then(|s| s.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let conditions = status_obj
+        .and_then(|s| s.get("conditions"))
+        .and_then(|val| val.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(condition_from_value)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    SandboxStatus {
+        sandbox_name: bound_sandbox.clone(),
+        instance_id: bound_sandbox,
+        agent_fd: String::new(),
+        sandbox_fd: String::new(),
+        conditions,
+        deleting: obj.metadata.deletion_timestamp.is_some(),
+        claim_name,
+        claim_uid,
+    }
 }
 
 fn update_indexes(
@@ -1739,8 +2471,18 @@ fn apply_required_env(
     tls_enabled: bool,
     provider_spiffe_socket_path: Option<&str>,
 ) {
-    upsert_env(env, openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
-    upsert_env(env, openshell_core::sandbox_env::SANDBOX, sandbox_name);
+    // Identity vars are set only when known at pod-create time. Warm-pool
+    // template pods boot without an identity (assigned at claim time), so these
+    // are omitted there — leaving `OPENSHELL_SANDBOX_ID`/`OPENSHELL_SANDBOX`
+    // unset (clap sees `None`) so the supervisor cleanly skips identity-gated
+    // startup (per-sandbox policy fetch, log push) and instead boots on the
+    // baseline policy, then establishes identity over the relay after the claim.
+    if !sandbox_id.is_empty() {
+        upsert_env(env, openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
+    }
+    if !sandbox_name.is_empty() {
+        upsert_env(env, openshell_core::sandbox_env::SANDBOX, sandbox_name);
+    }
     upsert_env(env, openshell_core::sandbox_env::ENDPOINT, grpc_endpoint);
     upsert_env(
         env,
@@ -1894,6 +2636,9 @@ fn status_from_object(obj: &DynamicObject) -> Option<SandboxStatus> {
             .to_string(),
         conditions,
         deleting: obj.metadata.deletion_timestamp.is_some(),
+        // Cold-path Sandbox CRs are not warm-pool claims.
+        claim_name: String::new(),
+        claim_uid: String::new(),
     })
 }
 
@@ -3491,5 +4236,313 @@ mod tests {
         let vct = default_workspace_volume_claim_templates("");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
+    }
+}
+
+#[cfg(test)]
+mod warm_pool_tests {
+    use super::*;
+    use crate::config::{KubernetesWarmPoolConfig, SharedVolumeSpec, WarmPoolSpec};
+
+    fn pool(name: &str, gpu: bool) -> WarmPoolSpec {
+        WarmPoolSpec {
+            name: name.to_string(),
+            replicas: 2,
+            runtime_class_name: String::new(),
+            gpu,
+            shared_volume: None,
+        }
+    }
+
+    fn warm_config(pools: Vec<WarmPoolSpec>) -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            default_image: "ghcr.io/openshell/sandbox:latest".to_string(),
+            warm_pool: KubernetesWarmPoolConfig {
+                enabled: true,
+                pools,
+            },
+            ..KubernetesComputeConfig::default()
+        }
+    }
+
+    fn claim_object(
+        sandbox_id: Option<&str>,
+        bound: Option<&str>,
+        claim_uid: &str,
+    ) -> DynamicObject {
+        let gvk = GroupVersionKind::gvk(EXT_GROUP, EXT_VERSION, SANDBOX_CLAIM_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut obj = DynamicObject::new("sb-name", &resource);
+        obj.metadata.uid = Some(claim_uid.to_string());
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            LABEL_MANAGED_BY.to_string(),
+            LABEL_MANAGED_BY_VALUE.to_string(),
+        );
+        if let Some(id) = sandbox_id {
+            labels.insert(LABEL_SANDBOX_ID.to_string(), id.to_string());
+        }
+        obj.metadata.labels = Some(labels);
+        if let Some(name) = bound {
+            obj.data = serde_json::json!({ "status": { "sandbox": { "name": name } } });
+        }
+        obj
+    }
+
+    #[test]
+    fn warm_eligible_accepts_default_image_without_overrides() {
+        let spec = SandboxSpec::default();
+        assert!(warm_eligible(&spec, "img"));
+
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                image: "img".to_string(),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+        assert!(warm_eligible(&spec, "img"));
+    }
+
+    #[test]
+    fn warm_eligible_rejects_overrides() {
+        // Custom image.
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                image: "other/image:tag".to_string(),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+        assert!(!warm_eligible(&spec, "img"));
+
+        // Per-request env.
+        let mut env = std::collections::HashMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let spec = SandboxSpec {
+            environment: env,
+            ..SandboxSpec::default()
+        };
+        assert!(!warm_eligible(&spec, "img"));
+
+        // Per-request driver config (e.g. a specific GPU device, which moved
+        // into driver_config) must fall back to cold — the pooled template
+        // bakes a fixed shape.
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "gpu_device".to_string(),
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue("0".to_string())),
+            },
+        );
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(prost_types::Struct { fields }),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+        assert!(!warm_eligible(&spec, "img"));
+
+        // Custom template labels.
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("team".to_string(), "x".to_string());
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                labels,
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+        assert!(!warm_eligible(&spec, "img"));
+
+        // Custom policy (gateway-signalled): must fall back to cold so the
+        // per-sandbox policy is not silently downgraded to the pool baseline.
+        let spec = SandboxSpec {
+            disallow_warm_pool: true,
+            ..SandboxSpec::default()
+        };
+        assert!(!warm_eligible(&spec, "img"));
+
+        // Per-request log level: cold-only (threaded into pod env); the warm
+        // template is built from defaults, so it would be silently dropped.
+        let spec = SandboxSpec {
+            log_level: "debug".to_string(),
+            ..SandboxSpec::default()
+        };
+        assert!(!warm_eligible(&spec, "img"));
+
+        // Per-request agent socket: cold-only (Sandbox `agentSocket`).
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                agent_socket_path: "/run/agent.sock".to_string(),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+        assert!(!warm_eligible(&spec, "img"));
+    }
+
+    #[test]
+    fn matching_warm_pool_selects_by_gpu_shape() {
+        let config = warm_config(vec![pool("default", false), pool("gpu", true)]);
+
+        // Driver matching is config-only; mimic it without a live client.
+        let pools = &config.warm_pool.pools;
+        let cpu_spec = SandboxSpec::default();
+        let selected = pools.iter().find(|p| p.gpu == cpu_spec.gpu).unwrap();
+        assert_eq!(selected.name, "default");
+
+        let gpu_spec = SandboxSpec {
+            gpu: true,
+            ..SandboxSpec::default()
+        };
+        let selected = pools.iter().find(|p| p.gpu == gpu_spec.gpu).unwrap();
+        assert_eq!(selected.name, "gpu");
+    }
+
+    #[test]
+    fn warm_claim_spec_is_single_use_and_identity_only() {
+        let spec = warm_claim_spec("openshell-warmpool-default", "sandbox-123");
+        let claim = &spec["spec"];
+        assert_eq!(
+            claim["sandboxTemplateRef"]["name"],
+            "openshell-warmpool-default"
+        );
+        assert_eq!(claim["warmpool"], "openshell-warmpool-default");
+        assert_eq!(
+            claim["additionalPodMetadata"]["annotations"]["openshell.io/sandbox-id"],
+            "sandbox-123"
+        );
+        // Single-use teardown is mandatory; Retain would orphan workspace data.
+        assert_eq!(claim["lifecycle"]["shutdownPolicy"], "Delete");
+        // Per-claim env must never be set on the warm path.
+        assert!(claim.get("env").is_none());
+    }
+
+    #[test]
+    fn warm_template_uses_ephemeral_workspace_and_no_identity() {
+        let config = warm_config(vec![pool("default", false)]);
+        let spec = build_warm_sandbox_template_spec(&config, &config.warm_pool.pools[0]);
+
+        // Disallow per-claim env injection.
+        assert_eq!(spec["envVarsInjectionPolicy"], "Disallowed");
+        // SandboxTemplate.spec carries no PVC volumeClaimTemplates (the orphan
+        // risk); the writable workspace is an emptyDir instead.
+        assert!(spec.get("volumeClaimTemplates").is_none());
+
+        let pod_spec = &spec["podTemplate"]["spec"];
+        let volumes = pod_spec["volumes"].as_array().expect("volumes");
+        let workspace = volumes
+            .iter()
+            .find(|v| v["name"] == WORKSPACE_VOLUME_NAME)
+            .expect("workspace volume present");
+        assert!(
+            workspace.get("emptyDir").is_some(),
+            "warm workspace must be an emptyDir, got {workspace}"
+        );
+        assert!(
+            workspace.get("persistentVolumeClaim").is_none(),
+            "warm workspace must not be PVC-backed"
+        );
+
+        // The pooled template must not bake any per-sandbox identity annotation.
+        let annotations = spec["podTemplate"]["metadata"].get("annotations");
+        let has_sandbox_id = annotations
+            .and_then(|a| a.get("openshell.io/sandbox-id"))
+            .is_some();
+        assert!(!has_sandbox_id, "pooled template must be identity-free");
+    }
+
+    #[test]
+    fn warm_template_mounts_shared_volume_read_only() {
+        let mut config = warm_config(vec![pool("data", false)]);
+        config.warm_pool.pools[0].shared_volume = Some(SharedVolumeSpec {
+            claim_name: "models".to_string(),
+            mount_path: "/models".to_string(),
+            sub_path: "llama".to_string(),
+        });
+        let spec = build_warm_sandbox_template_spec(&config, &config.warm_pool.pools[0]);
+        let pod_spec = &spec["podTemplate"]["spec"];
+
+        let shared_vol = pod_spec["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["persistentVolumeClaim"]["claimName"] == "models")
+            .expect("shared volume present");
+        assert_eq!(shared_vol["persistentVolumeClaim"]["readOnly"], true);
+
+        let agent = pod_spec["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "agent")
+            .expect("agent container");
+        let mount = agent["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["mountPath"] == "/models")
+            .expect("shared mount present");
+        assert_eq!(mount["readOnly"], true);
+        assert_eq!(mount["subPath"], "llama");
+    }
+
+    #[test]
+    fn is_cold_openshell_sandbox_requires_sandbox_id_label() {
+        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+
+        // Cold OpenShell sandbox: carries openshell.ai/sandbox-id.
+        let mut cold = DynamicObject::new("cold-sb", &resource);
+        cold.metadata.labels = Some(BTreeMap::from([(
+            LABEL_SANDBOX_ID.to_string(),
+            "sandbox-1".to_string(),
+        )]));
+        assert!(is_cold_openshell_sandbox(&cold));
+
+        // Bound warm Sandbox: only the upstream claim-uid label.
+        let mut bound_warm = DynamicObject::new("bound-sb", &resource);
+        bound_warm.metadata.labels = Some(BTreeMap::from([(
+            CLAIM_UID_LABEL.to_string(),
+            "claim-uid".to_string(),
+        )]));
+        assert!(!is_cold_openshell_sandbox(&bound_warm));
+
+        // Unbound pooled warm Sandbox: neither identity label — this is the
+        // case that previously slipped through and broke the watch loop.
+        let mut pooled_warm = DynamicObject::new("openshell-warmpool-default-abc", &resource);
+        pooled_warm.metadata.labels = Some(BTreeMap::from([(
+            WARM_POOL_LABEL.to_string(),
+            "default".to_string(),
+        )]));
+        assert!(!is_cold_openshell_sandbox(&pooled_warm));
+    }
+
+    #[test]
+    fn sandbox_from_claim_object_maps_id_and_bound_status() {
+        let obj = claim_object(Some("sandbox-9"), Some("bound-sandbox-xyz"), "claim-uid-9");
+        let sandbox = sandbox_from_claim_object("openshell", obj).unwrap();
+        assert_eq!(sandbox.id, "sandbox-9");
+        assert_eq!(sandbox.name, "sb-name");
+        let status = sandbox.status.expect("status");
+        assert_eq!(status.sandbox_name, "bound-sandbox-xyz");
+        assert_eq!(status.instance_id, "bound-sandbox-xyz");
+        assert_eq!(status.claim_name, "sb-name");
+        assert_eq!(status.claim_uid, "claim-uid-9");
+    }
+
+    #[test]
+    fn sandbox_from_claim_object_requires_sandbox_id_label() {
+        let obj = claim_object(None, None, "claim-uid-0");
+        assert!(sandbox_from_claim_object("openshell", obj).is_err());
+        let obj = claim_object(None, None, "claim-uid-0");
+        assert!(managed_claim_sandbox("openshell", &obj).is_none());
+    }
+
+    #[test]
+    fn warm_resource_name_is_prefixed() {
+        assert_eq!(warm_resource_name("default"), "openshell-warmpool-default");
     }
 }

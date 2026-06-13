@@ -211,6 +211,68 @@ pub struct KubernetesComputeConfig {
         deserialize_with = "deserialize_provider_spiffe_workload_api_socket_path"
     )]
     pub provider_spiffe_workload_api_socket_path: String,
+    /// Warm-pool configuration. When enabled, the gateway pre-declares one or
+    /// more operator-owned `SandboxWarmPool`s and satisfies matching
+    /// `CreateSandbox` requests by binding a pre-warmed pod via a `SandboxClaim`
+    /// instead of cold-creating a `Sandbox`. Off by default.
+    #[serde(default)]
+    pub warm_pool: KubernetesWarmPoolConfig,
+}
+
+/// Warm-pool configuration for the Kubernetes driver.
+///
+/// Only **operator-declared** pools using the gateway's trusted default image
+/// are warm-pooled. Requests for a user-supplied image or that carry a custom
+/// template fall back to the cold path — per-tenant pool isolation for
+/// untrusted images is out of scope (see RFC 0005 / issue #1879).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesWarmPoolConfig {
+    /// Master switch. When false the driver never creates extension CRDs and
+    /// every request takes the cold path.
+    pub enabled: bool,
+    /// Declared pools. Each maps to exactly one (image, runtimeClass, gpu)
+    /// shape; the image is always the driver `default_image`.
+    pub pools: Vec<WarmPoolSpec>,
+}
+
+/// One operator-declared warm pool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WarmPoolSpec {
+    /// Pool name. Also names the backing `SandboxWarmPool` and `SandboxTemplate`
+    /// (suffixed). Must be a DNS-1123 label.
+    pub name: String,
+    /// Number of pods to keep warm.
+    pub replicas: i32,
+    /// `runtimeClassName` baked into the pool's `SandboxTemplate`. Empty uses
+    /// the driver's `default_runtime_class_name`.
+    #[serde(default)]
+    pub runtime_class_name: String,
+    /// Whether pooled pods request a GPU. GPU pools hold accelerators idle, so
+    /// they are opt-in per pool.
+    #[serde(default)]
+    pub gpu: bool,
+    /// Optional shared, read-only data volume mounted into every pooled pod
+    /// (datasets / models / caches). Safe to share precisely because it is
+    /// read-only and holds no per-agent state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_volume: Option<SharedVolumeSpec>,
+}
+
+/// A pre-existing PVC mounted read-only into pooled pods.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SharedVolumeSpec {
+    /// Name of an existing `PersistentVolumeClaim` in the sandbox namespace.
+    /// Must support a read-many access mode (`ReadOnlyMany`/`ReadWriteMany`)
+    /// when pods land on multiple nodes.
+    pub claim_name: String,
+    /// Absolute path the volume is mounted at inside the sandbox.
+    pub mount_path: String,
+    /// Optional sub-path within the volume to mount.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sub_path: String,
 }
 
 /// Lower bound enforced by kubelet for projected SA tokens.
@@ -246,6 +308,7 @@ impl Default for KubernetesComputeConfig {
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
             provider_spiffe_workload_api_socket_path: String::new(),
+            warm_pool: KubernetesWarmPoolConfig::default(),
         }
     }
 }
@@ -458,5 +521,57 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.image_pull_secrets, ["regcred", "backup-regcred"]);
+    }
+
+    #[test]
+    fn default_warm_pool_is_disabled() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(!cfg.warm_pool.enabled);
+        assert!(cfg.warm_pool.pools.is_empty());
+    }
+
+    #[test]
+    fn serde_override_warm_pool() {
+        let json = serde_json::json!({
+            "warm_pool": {
+                "enabled": true,
+                "pools": [
+                    { "name": "default", "replicas": 3 },
+                    {
+                        "name": "gpu",
+                        "replicas": 1,
+                        "gpu": true,
+                        "runtime_class_name": "nvidia",
+                        "shared_volume": {
+                            "claim_name": "models",
+                            "mount_path": "/models",
+                            "sub_path": "llama"
+                        }
+                    }
+                ]
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.warm_pool.enabled);
+        assert_eq!(cfg.warm_pool.pools.len(), 2);
+        assert_eq!(cfg.warm_pool.pools[0].name, "default");
+        assert_eq!(cfg.warm_pool.pools[0].replicas, 3);
+        assert!(!cfg.warm_pool.pools[0].gpu);
+        assert!(cfg.warm_pool.pools[0].shared_volume.is_none());
+        let gpu = &cfg.warm_pool.pools[1];
+        assert!(gpu.gpu);
+        assert_eq!(gpu.runtime_class_name, "nvidia");
+        let shared = gpu.shared_volume.as_ref().unwrap();
+        assert_eq!(shared.claim_name, "models");
+        assert_eq!(shared.mount_path, "/models");
+        assert_eq!(shared.sub_path, "llama");
+    }
+
+    #[test]
+    fn serde_rejects_unknown_warm_pool_field() {
+        let json = serde_json::json!({
+            "warm_pool": { "enabled": true, "bogus": 1 }
+        });
+        assert!(serde_json::from_value::<KubernetesComputeConfig>(json).is_err());
     }
 }

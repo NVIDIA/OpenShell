@@ -32,6 +32,53 @@ This is a stopgap persistence model. It preserves user files across pod
 rescheduling but duplicates the base workspace and does not automatically apply
 image updates to existing PVCs. Future snapshotting should replace it.
 
+## Warm Pools
+
+When `warm_pool.enabled` is set, the driver pre-declares one operator-owned
+`SandboxTemplate` + `SandboxWarmPool` per configured pool (extension CRDs
+`extensions.agents.x-k8s.io/v1alpha1`) and satisfies a matching `CreateSandbox`
+by creating a `SandboxClaim` that binds a pre-warmed pod (~0.1s) instead of
+cold-creating a `Sandbox`. Only the trusted `default_image` with no per-request
+template or env overrides is pooled; everything else takes the cold path.
+
+The pooled `SandboxTemplate` bakes the shared pod blueprint (image, mTLS mount,
+projected SA token, supervisor sideload, capabilities, runtimeClass, optional
+read-only shared data volume) but carries **no per-sandbox identity**. The
+template sets `networkPolicyManagement: Unmanaged` — OpenShell enforces egress
+itself (supervisor proxy + Landlock), and the controller's default `Managed`
+mode would otherwise impose a rule-less, default-deny `NetworkPolicy` that blocks
+the pod's own egress to the gateway. The writable `/sandbox` workspace is an
+ephemeral `emptyDir` seeded from the image: single-use and fail-safe (the kubelet
+reclaims it with the pod, so there is nothing to orphan). Claims set
+`shutdownPolicy: Delete` so teardown cascades to the bound `Sandbox`/Pod, and a
+claimed pod is never returned to the pool.
+
+### Identity and policy on the warm path
+
+A pooled pod boots **before** its claim assigns an identity, so the supervisor
+cannot fetch a per-sandbox policy or assert a sandbox-id at startup. Instead it:
+
+- boots on the image's **baseline policy** (Landlock is applied once at process
+  start and cannot be loosened later, so the baseline is what a pooled pod
+  enforces);
+- runs with `OPENSHELL_SANDBOX_ID` unset, skipping identity-gated startup;
+- establishes its relay session with an empty `hello.sandbox_id`; the gateway
+  derives the identity from the gateway-minted JWT obtained via
+  `IssueSandboxToken` (resolved server-side from the claim-injected
+  `openshell.io/sandbox-id` annotation + the durable claim mapping). The
+  supervisor retries the bootstrap at a steady cadence until the claim binds.
+
+Because a pooled pod can only enforce the baseline policy, a `CreateSandbox`
+request that carries a **custom policy** is never warm-pooled — the gateway sets
+`DriverSandboxSpec.disallow_warm_pool`, and such requests take the cold path so
+their policy is applied faithfully (no silent downgrade). Claim `env` injection
+is likewise disallowed.
+
+The driver surfaces a warm sandbox to the gateway by watching `SandboxClaim`s
+(correlated to the gateway sandbox-id via the `openshell.ai/sandbox-id` label it
+stamps on each claim) and returns the bound claim's `(name, uid)` so the gateway
+can record the durable claim → sandbox-id mapping used by the auth re-anchor.
+
 ## Credentials, TLS, and Relay
 
 The driver injects gateway callback configuration, sandbox identity, TLS client
