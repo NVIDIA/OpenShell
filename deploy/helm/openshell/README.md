@@ -213,6 +213,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants. |
 | server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into sandbox pods. |
+| server.sandboxAutomountServiceAccountToken | bool | `false` | Whether sandbox pods should use Kubernetes' default service account token automount. Keep false unless sandbox-local tools need Kubernetes API access and the sandbox service account has explicit least-privilege RBAC. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
 | server.sandboxImagePullSecrets | list | `[]` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |

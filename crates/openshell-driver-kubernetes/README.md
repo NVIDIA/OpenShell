@@ -38,11 +38,14 @@ The driver injects gateway callback configuration, sandbox identity, TLS client
 material, and the supervisor SSH socket path into the workload. Driver-owned
 values must override image-provided environment variables.
 
-Sandbox pods run as `service_account_name` and keep
+Sandbox pods run as `service_account_name` and default to
 `automountServiceAccountToken: false`. The only Kubernetes token exposed to the
-supervisor is an explicit, audience-bound projected token mounted at
+supervisor by default is an explicit, audience-bound projected token mounted at
 `/var/run/secrets/openshell/token` for the one-shot `IssueSandboxToken`
-bootstrap exchange.
+bootstrap exchange. Operators can opt into Kubernetes' default service account
+token mount with `automount_service_account_token = true` when sandbox-local
+tools need Kubernetes API access and the sandbox service account has explicit
+least-privilege RBAC.
 
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.

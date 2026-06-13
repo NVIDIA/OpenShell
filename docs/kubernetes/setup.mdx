@@ -149,6 +149,7 @@ The most commonly changed values are:
 | `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
 | `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
+| `server.sandboxAutomountServiceAccountToken` | Opt sandbox pods into Kubernetes' default service account token mount. Keep false unless sandbox-local tools need Kubernetes API access and the sandbox service account has explicit least-privilege RBAC. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
 | `server.appArmorProfile` | AppArmor profile requested for sandbox agent containers. Defaults to `Unconfined`. |
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |

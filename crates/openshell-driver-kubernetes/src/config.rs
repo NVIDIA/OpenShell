@@ -163,6 +163,10 @@ pub struct KubernetesComputeConfig {
     /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
     /// the gateway's `TokenReview` bootstrap authenticator.
     pub service_account_name: String,
+    /// Whether sandbox pods should use Kubernetes' default ServiceAccount token
+    /// automount. Disabled by default so sandbox pods cannot access the
+    /// Kubernetes API unless the operator opts in and grants RBAC explicitly.
+    pub automount_service_account_token: bool,
     pub default_image: String,
     pub image_pull_policy: String,
     /// Kubernetes `imagePullSecrets` names attached to sandbox pods.
@@ -226,6 +230,7 @@ impl Default for KubernetesComputeConfig {
         Self {
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME.to_string(),
+            automount_service_account_token: false,
             default_image: openshell_core::image::default_sandbox_image(),
             // Default empty so the gateway omits `imagePullPolicy` from pod
             // specs and Kubernetes applies its own default (Always for `latest`,

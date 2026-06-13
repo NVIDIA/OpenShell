@@ -166,6 +166,10 @@ server:
   # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
   # in the sandbox namespace.
   sandboxImagePullSecrets: []
+  # -- Whether sandbox pods should use Kubernetes' default service account
+  # token automount. Keep false unless sandbox-local tools need Kubernetes API
+  # access and the sandbox service account has explicit least-privilege RBAC.
+  sandboxAutomountServiceAccountToken: false
   # -- Default storage size for the workspace PVC in sandbox pods.
   # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
   # Empty = built-in default (2Gi).
