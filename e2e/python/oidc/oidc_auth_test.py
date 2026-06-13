@@ -149,7 +149,7 @@ def _grpc_channel() -> grpc.Channel:
     return grpc.insecure_channel(target)
 
 
-def _stub_with_token(token: str) -> openshell_pb2_grpc.OpenShellStub:
+def _stub_with_token(token: str) -> tuple[openshell_pb2_grpc.OpenShellStub, list[tuple[str, str]]]:
     """Create a gRPC stub that injects a Bearer token."""
     channel = _grpc_channel()
     return openshell_pb2_grpc.OpenShellStub(channel), [
