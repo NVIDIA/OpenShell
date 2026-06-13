@@ -889,14 +889,23 @@ pub async fn run_sandbox(
     }
 
     // Spawn the persistent supervisor session if we have a gateway endpoint
-    // and sandbox identity. The session provides relay channels for SSH
-    // connect and ExecSandbox through the gateway.
-    if let (Some(endpoint), Some(id), Some(socket)) = (
-        openshell_endpoint.as_ref(),
-        sandbox_id.as_ref(),
-        ssh_socket_path.as_ref(),
-    ) {
-        supervisor_session::spawn(endpoint.clone(), id.clone(), socket.clone(), ssh_netns_fd);
+    // and a relay socket. The session provides relay channels for SSH connect
+    // and ExecSandbox through the gateway.
+    //
+    // A boot-time sandbox identity is NOT required: warm-pooled pods boot
+    // before a claim assigns their `openshell.io/sandbox-id`, so the session
+    // sends an empty id in its hello and the gateway derives the sandbox
+    // identity from the gateway-minted JWT (resolved server-side from the pod
+    // annotation during `IssueSandboxToken`). Cold sandboxes pass their known
+    // id through unchanged.
+    if let (Some(endpoint), Some(socket)) = (openshell_endpoint.as_ref(), ssh_socket_path.as_ref())
+    {
+        supervisor_session::spawn(
+            endpoint.clone(),
+            sandbox_id.clone(),
+            socket.clone(),
+            ssh_netns_fd,
+        );
         info!("supervisor session task spawned");
     }
 
@@ -2135,8 +2144,26 @@ async fn load_policy(
         return Ok((policy, Some(Arc::new(engine)), None));
     }
 
-    // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
-    if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+    // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data.
+    if let Some(endpoint) = &openshell_endpoint {
+        let identity = sandbox_id.as_deref().filter(|id| !id.is_empty());
+
+        // Warm-pool path: a pooled pod boots before its claim assigns an
+        // identity, so there is no per-sandbox policy to fetch yet. Boot on the
+        // image's baseline policy (default-deny) and enforce it; the per-sandbox
+        // policy is NOT applied on the warm path because Landlock is applied
+        // once at process start and cannot be loosened afterwards. Requests that
+        // carry a custom policy fall back to the cold path (see the driver's
+        // warm-pool eligibility check), so there is no silent policy downgrade.
+        let Some(id) = identity else {
+            info!("Warm-pool sandbox: loading baseline policy (no boot-time identity)");
+            let mut proto_policy = discover_policy_from_disk_or_default();
+            enrich_proto_baseline_paths(&mut proto_policy);
+            let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
+            let policy = SandboxPolicy::try_from(proto_policy.clone())?;
+            return Ok((policy, opa_engine, Some(proto_policy)));
+        };
+
         info!(
             sandbox_id = %id,
             endpoint = %endpoint,

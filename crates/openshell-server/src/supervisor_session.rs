@@ -591,13 +591,27 @@ pub async fn handle_connect_supervisor(
         None => return Err(Status::invalid_argument("stream closed before hello")),
     };
 
-    let sandbox_id = hello.sandbox_id.clone();
-    if sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
-    if let Some(principal) = principal.as_ref() {
-        crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
-    }
+    // Resolve the session's sandbox identity. A warm-pooled supervisor boots
+    // without an identity and sends an empty `sandbox_id`; in that case the
+    // identity is taken from the authenticated (gateway-minted) JWT principal,
+    // which the K8s SA bootstrap re-anchor already resolved server-side from
+    // the pod annotation + the durable claim mapping. A supervisor that does
+    // assert an id must match its principal (unchanged cross-check).
+    let sandbox_id = if hello.sandbox_id.is_empty() {
+        match principal.as_ref() {
+            Some(Principal::Sandbox(p)) if !p.sandbox_id.is_empty() => p.sandbox_id.clone(),
+            _ => {
+                return Err(Status::unauthenticated(
+                    "supervisor hello has no sandbox_id and no authenticated sandbox identity",
+                ));
+            }
+        }
+    } else {
+        if let Some(principal) = principal.as_ref() {
+            crate::auth::guard::ensure_sandbox_principal_scope(principal, &hello.sandbox_id)?;
+        }
+        hello.sandbox_id.clone()
+    };
     require_persisted_sandbox(&state.store, &sandbox_id).await?;
 
     let session_id = Uuid::new_v4().to_string();
