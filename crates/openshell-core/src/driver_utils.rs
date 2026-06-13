@@ -53,8 +53,9 @@ pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sand
 // ---------------------------------------------------------------------------
 // In-container mount paths for guest TLS materials and the sandbox token.
 //
-// All container-based drivers (Docker, Podman, Kubernetes) mount the gateway's
-// mTLS client credentials at these fixed paths inside every sandbox container.
+// All container-based drivers (Docker, Podman, Apple Container, Kubernetes)
+// mount the gateway's mTLS client credentials at these fixed paths inside every
+// sandbox container.
 // The supervisor reads these paths on startup to establish its gRPC-over-mTLS
 // connection back to the gateway. The paths must remain stable across driver
 // versions since the supervisor binary is built and packaged separately.

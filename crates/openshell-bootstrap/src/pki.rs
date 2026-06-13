@@ -28,7 +28,8 @@ pub struct PkiBundle {
 ///
 /// Covers the host aliases used by every supported runtime: Kubernetes service DNS,
 /// `host.docker.internal` for Docker Desktop and rootless Docker on Linux,
-/// and `host.containers.internal` for Podman containers reaching their host.
+/// `host.containers.internal` for Podman containers reaching their host, and
+/// `host.container.internal` for Apple Container guests reaching their host.
 pub const DEFAULT_SERVER_SANS: &[&str] = &[
     "openshell",
     "openshell.openshell.svc",
@@ -38,6 +39,7 @@ pub const DEFAULT_SERVER_SANS: &[&str] = &[
     "*.openshell.localhost",
     "host.docker.internal",
     "host.containers.internal",
+    "host.container.internal",
     "127.0.0.1",
 ];
 
@@ -190,5 +192,6 @@ mod tests {
     fn default_server_sans_include_local_container_hostnames() {
         assert!(DEFAULT_SERVER_SANS.contains(&"host.docker.internal"));
         assert!(DEFAULT_SERVER_SANS.contains(&"host.containers.internal"));
+        assert!(DEFAULT_SERVER_SANS.contains(&"host.container.internal"));
     }
 }

@@ -1962,6 +1962,10 @@ mod tests {
             TelemetryComputeDriver::Vm
         );
         assert_eq!(
+            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::AppleContainer)),
+            TelemetryComputeDriver::AppleContainer
+        );
+        assert_eq!(
             telemetry_compute_driver(None),
             TelemetryComputeDriver::Unknown
         );

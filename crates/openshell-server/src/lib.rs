@@ -60,7 +60,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
+use compute::{AppleContainerComputeConfig, ComputeRuntime, DockerComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -200,6 +200,7 @@ pub async fn run_server(
     config: Config,
     vm_config: VmComputeConfig,
     docker_config: DockerComputeConfig,
+    apple_container_config: AppleContainerComputeConfig,
     config_file: Option<config_file::ConfigFile>,
     tracing_log_bus: TracingLogBus,
 ) -> Result<()> {
@@ -235,6 +236,7 @@ pub async fn run_server(
         &config,
         &vm_config,
         &docker_config,
+        &apple_container_config,
         config_file.as_ref(),
         store.clone(),
         sandbox_index.clone(),
@@ -702,6 +704,7 @@ async fn build_compute_runtime(
     config: &Config,
     vm_config: &VmComputeConfig,
     docker_config: &DockerComputeConfig,
+    apple_container_config: &AppleContainerComputeConfig,
     file: Option<&config_file::ConfigFile>,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
@@ -768,6 +771,31 @@ async fn build_compute_runtime(
 
             ComputeRuntime::new_podman(
                 podman,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
+        ComputeDriverKind::AppleContainer => {
+            let mut apple_container = apple_container_config.clone();
+            let gateway_port = config.bind_address.port();
+            if gateway_port == 0 {
+                return Err(Error::config(
+                    "apple-container compute driver requires a fixed non-zero gateway bind port",
+                ));
+            }
+            apple_container.gateway_port = gateway_port;
+            if let Ok(path) = std::env::var("OPENSHELL_APPLE_CONTAINER_SUPERVISOR_BIN_DIR") {
+                apple_container.supervisor_bin_dir = PathBuf::from(path);
+            }
+            apple_container.log_level.clone_from(&config.log_level);
+
+            ComputeRuntime::new_apple_container(
+                apple_container,
                 store,
                 sandbox_index,
                 sandbox_watch_bus,
@@ -865,14 +893,15 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
             Some(driver) => Ok(driver),
             None => Err(Error::config(
                 "no compute driver configured and auto-detection found no suitable driver; \
-                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
+                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, vm, or apple-container",
             )),
         },
         [
             driver @ (ComputeDriverKind::Kubernetes
             | ComputeDriverKind::Vm
             | ComputeDriverKind::Docker
-            | ComputeDriverKind::Podman),
+            | ComputeDriverKind::Podman
+            | ComputeDriverKind::AppleContainer),
         ] => Ok(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
@@ -1309,6 +1338,15 @@ mod tests {
         assert_eq!(
             configured_compute_driver(&config).unwrap(),
             ComputeDriverKind::Docker
+        );
+    }
+
+    #[test]
+    fn configured_compute_driver_accepts_apple_container() {
+        let config = Config::new(None).with_compute_drivers([ComputeDriverKind::AppleContainer]);
+        assert_eq!(
+            configured_compute_driver(&config).unwrap(),
+            ComputeDriverKind::AppleContainer
         );
     }
 

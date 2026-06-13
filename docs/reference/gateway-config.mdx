@@ -69,7 +69,7 @@ metrics_bind_address  = "0.0.0.0:9090"
 log_level             = "info"
 
 # When empty, the gateway auto-detects Kubernetes, then Podman, then Docker.
-# VM is never auto-detected and requires an explicit entry here.
+# VM and Apple Container are never auto-detected and require an explicit entry here.
 compute_drivers       = ["kubernetes"]
 
 sandbox_namespace     = "openshell"
@@ -134,9 +134,9 @@ user_role     = "openshell-user"
 scopes_claim  = ""
 ```
 
-Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
+Local Docker, Podman, Apple Container, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
 
-`[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. When omitted, it defaults to `0`: the token `exp` claim and `expires_at_ms` response field become `0`, and the sandbox JWT does not expire. Use that default only for local single-player Docker, Podman, or VM gateways. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway uses `0`.
+`[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. When omitted, it defaults to `0`: the token `exp` claim and `expires_at_ms` response field become `0`, and the sandbox JWT does not expire. Use that default only for local single-player Docker, Podman, Apple Container, or VM gateways. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway uses `0`.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
@@ -252,7 +252,7 @@ socket_path             = "/run/user/1000/podman/podman.sock"
 default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy       = "missing"   # always | missing | never | newer
 grpc_endpoint           = "https://host.containers.internal:17670"
-# The gateway overwrites gateway_port from bind_address at runtime.
+# The gateway replaces this with bind_address.port at runtime.
 gateway_port            = 17670
 network_name            = "openshell"
 # Omit for the platform default: empty on Linux, 192.168.127.254 on macOS Podman machine.
@@ -274,6 +274,43 @@ sandbox_pids_limit      = 2048
 # but increase process churn (each check spawns a conmon subprocess).
 # Set to 0 to disable health checks entirely. Default: 10.
 health_check_interval_secs = 10
+```
+
+### Apple Container
+
+Sandboxes run as Linux containers inside Apple Container lightweight VMs on macOS. The gateway invokes Apple's `container` CLI and uses JSON output for service, network, and container status.
+
+When `grpc_endpoint` is empty, the driver builds `http://<host_callback_host>:<gateway_port>` for the sandbox supervisor callback. If `guest_tls_ca`, `guest_tls_cert`, and `guest_tls_key` are all configured, the implicit callback switches to `https://<host_callback_host>:<gateway_port>` and the driver bind-mounts those files into the sandbox at the standard supervisor TLS paths. The gateway replaces `gateway_port` with `bind_address.port` at runtime and rejects port `0`, matching the other local drivers. The default `host_callback_host` is `host.container.internal`, which Apple Container resolves inside the sandbox VM. The gateway also inspects `container network list --format json` and registers an extra listener on the default network `ipv4Gateway` address so loopback-only gateway configs remain reachable from Apple Container VMs.
+
+Apple Container is treated as a local single-player driver for local mTLS auto-defaults, matching Docker, Podman, and VM. Partial guest TLS configuration is rejected so a typo cannot silently downgrade the supervisor callback to plaintext.
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:17670"
+log_level       = "info"
+compute_drivers = ["apple-container"]
+
+[openshell.drivers.apple-container]
+container_bin           = "container"
+default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
+sandbox_namespace       = "default"
+# Empty uses http://host.container.internal:<gateway_port>, or https:// when
+# all guest_tls_* fields are set.
+grpc_endpoint           = ""
+# The gateway replaces this with bind_address.port at runtime.
+gateway_port            = 17670
+host_callback_host      = "host.container.internal"
+# Directory containing a Linux openshell-sandbox binary. Can also be set with
+# OPENSHELL_APPLE_CONTAINER_SUPERVISOR_BIN_DIR.
+supervisor_bin_dir      = "/usr/local/libexec/openshell"
+sandbox_ssh_socket_path = "/run/openshell/ssh.sock"
+stop_timeout_secs       = 10
+guest_tls_ca            = "/etc/openshell/certs/ca.pem"
+guest_tls_cert          = "/etc/openshell/certs/client.pem"
+guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 ```
 
 ### MicroVM

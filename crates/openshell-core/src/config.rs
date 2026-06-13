@@ -55,6 +55,8 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
+    #[serde(rename = "apple-container")]
+    AppleContainer,
 }
 
 impl ComputeDriverKind {
@@ -65,6 +67,7 @@ impl ComputeDriverKind {
             Self::Vm => "vm",
             Self::Docker => "docker",
             Self::Podman => "podman",
+            Self::AppleContainer => "apple-container",
         }
     }
 }
@@ -84,8 +87,9 @@ impl FromStr for ComputeDriverKind {
             "vm" => Ok(Self::Vm),
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
+            "apple-container" => Ok(Self::AppleContainer),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman, apple-container"
             )),
         }
     }
@@ -94,7 +98,7 @@ impl FromStr for ComputeDriverKind {
 /// Auto-detect the appropriate compute driver based on the runtime environment.
 ///
 /// Priority order: Kubernetes → Podman → Docker.
-/// VM is never auto-detected (requires explicit `--drivers vm`).
+/// VM and Apple Container are never auto-detected and require explicit drivers.
 ///
 /// Returns the first driver where the environment check passes.
 /// Returns `None` if no compatible driver is found.
@@ -795,12 +799,24 @@ mod tests {
             "docker".parse::<ComputeDriverKind>().unwrap(),
             ComputeDriverKind::Docker
         );
+        assert_eq!(
+            "apple-container".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::AppleContainer
+        );
+        assert_eq!(
+            " Apple-Container ".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::AppleContainer
+        );
     }
 
     #[test]
     fn compute_driver_kind_rejects_unknown_values() {
         let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
         assert!(err.contains("unsupported compute driver 'firecracker'"));
+        let err = "apple_container".parse::<ComputeDriverKind>().unwrap_err();
+        assert!(err.contains("unsupported compute driver 'apple_container'"));
+        let err = "apple".parse::<ComputeDriverKind>().unwrap_err();
+        assert!(err.contains("unsupported compute driver 'apple'"));
     }
 
     #[test]
