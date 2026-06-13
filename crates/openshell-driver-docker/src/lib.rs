@@ -1357,7 +1357,7 @@ impl ComputeDriver for DockerComputeDriver {
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.create_sandbox_inner(&sandbox).await?;
-        Ok(Response::new(CreateSandboxResponse {}))
+        Ok(Response::new(CreateSandboxResponse { warm_claim: None }))
     }
 
     async fn stop_sandbox(
@@ -1482,6 +1482,8 @@ fn pending_sandbox_snapshot(
             sandbox_fd: String::new(),
             conditions: vec![condition],
             deleting,
+            // Warm-pool claim fields apply to the Kubernetes driver only.
+            ..Default::default()
         }),
     }
 }
@@ -2624,6 +2626,8 @@ fn driver_status_from_summary(
             last_transition_time: String::new(),
         }],
         deleting,
+        // Warm-pool claim fields apply to the Kubernetes driver only.
+        ..Default::default()
     }
 }
 
