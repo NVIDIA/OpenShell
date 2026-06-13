@@ -997,7 +997,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_get(&ts.endpoint, "my-claude", &ts.tls)
         .await
         .expect("provider get");
-    run::provider_list(&ts.endpoint, 100, 0, false, &ts.tls)
+    run::provider_list(&ts.endpoint, 100, 0, false, "table", &ts.tls)
         .await
         .expect("provider list");
 
