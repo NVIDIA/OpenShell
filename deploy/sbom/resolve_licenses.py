@@ -211,9 +211,9 @@ def _rate_limit(domain: str, interval: float = 0.15) -> None:
         now = time.time()
         last = _last_request.get(domain, 0)
         wait = interval - (now - last)
-        if wait > 0:
-            time.sleep(wait)
-        _last_request[domain] = time.time()
+        _last_request[domain] = now
+    if wait > 0:
+        time.sleep(wait)
 
 
 def _get_json(url: str, domain: str) -> dict | None:
