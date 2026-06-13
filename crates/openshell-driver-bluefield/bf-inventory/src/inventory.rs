@@ -1,81 +1,87 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! VF inventory discovery.
+//! Network-function inventory discovery.
 //!
-//! Replaces hand-fed VF slots with discovery behind a trait, so the same
+//! Replaces hand-fed function slots with discovery behind a trait, so the same
 //! extension works in both topologies and is unit-testable against a mock
 //! `/sys` (no hardware):
 //!
-//! - [`StaticVfInventory`] — an explicit slot list (pinned setups, tests).
+//! - [`StaticFunctionInventory`] — an explicit slot list (pinned setups, tests).
 //! - [`SysfsVfInventory`] — **host** side: enumerates a PF's VFs from
 //!   `/sys/bus/pci/devices/<pf>/virtfn<N>` to get each VF's BDF + index.
 //! - [`SysfsRepresentorInventory`] — **DPU** side: enumerates switchdev
 //!   representor netdevs and reads `phys_port_name` (`pfXvfY`) to map a VF
 //!   coordinate to its representor / OVS port.
 //!
-//! The two sides agree on a [`VfRef`] = `(pf, vf_index)`. The host uses the
-//! PF's PCI BDF as the `pf` key; the DPU uses the e-switch PF index. Mapping
+//! Other function kinds (SF, virtio-net) plug in as additional implementations
+//! of [`FunctionInventory`] without changing the allocation layer.
+//!
+//! The two sides agree on a [`NetFunction`] = `(kind, pf, index)`. The host uses
+//! the PF's PCI BDF as the `pf` key; the DPU uses the e-switch PF index. Mapping
 //! one to the other on a given deployment is a config concern (the host PF
 //! BDF that backs `pf0`), kept out of this mechanical discovery layer.
 
 use std::path::PathBuf;
 
-use bf_core::{VfRef, VfSlot};
+use bf_core::{FunctionSlot, NetFunction};
 use openshell_vfio::SysfsRoot;
 
 /// Error surface for inventory discovery.
 #[derive(Debug, Clone)]
-pub enum VfError {
+pub enum InventoryError {
     Discovery(String),
 }
 
-impl core::fmt::Display for VfError {
+impl core::fmt::Display for InventoryError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Discovery(m) => write!(f, "vf discovery failed: {m}"),
+            Self::Discovery(m) => write!(f, "function discovery failed: {m}"),
         }
     }
 }
 
-impl std::error::Error for VfError {}
+impl std::error::Error for InventoryError {}
 
-pub type VfResult<T> = Result<T, VfError>;
+pub type InventoryResult<T> = Result<T, InventoryError>;
 
-/// Source of the VF slots a [`super::pool::VfPool`] hands to sandboxes.
-pub trait VfInventory: core::fmt::Debug + Send + Sync {
-    /// Enumerate all VF slots this inventory knows about.
-    fn discover(&self) -> VfResult<Vec<VfSlot>>;
+/// Source of the function slots a [`super::pool::FunctionPool`] hands to
+/// sandboxes.
+pub trait FunctionInventory: core::fmt::Debug + Send + Sync {
+    /// Enumerate all function slots this inventory knows about.
+    fn discover(&self) -> InventoryResult<Vec<FunctionSlot>>;
 
-    /// Resolve the representor for a VF coordinate. Defaults to a scan of
+    /// Resolve the representor for a function coordinate. Defaults to a scan of
     /// [`discover`](Self::discover); sysfs impls may override for efficiency.
-    fn resolve_representor(&self, vf: &VfRef) -> VfResult<Option<String>> {
+    fn resolve_representor(&self, function: &NetFunction) -> InventoryResult<Option<String>> {
         Ok(self
             .discover()?
             .into_iter()
-            .find(|s| s.pf.as_deref() == Some(vf.pf.as_str()) && s.vf_index == Some(vf.vf_index))
+            .find(|s| {
+                s.pf.as_deref() == Some(function.pf.as_str()) && s.index == Some(function.index)
+            })
             .and_then(|s| s.representor))
     }
 }
 
-/// Explicit, hand-fed inventory. Equivalent to the original `VfPool::new`
+/// Explicit, hand-fed inventory. Equivalent to the original `FunctionPool::new`
 /// behavior; ideal for tests and pinned deployments.
 #[derive(Debug, Default, Clone)]
-pub struct StaticVfInventory {
-    slots: Vec<VfSlot>,
+pub struct StaticFunctionInventory {
+    slots: Vec<FunctionSlot>,
 }
 
-impl StaticVfInventory {
+impl StaticFunctionInventory {
     #[must_use]
-    pub fn new(slots: impl IntoIterator<Item = VfSlot>) -> Self {
+    pub fn new(slots: impl IntoIterator<Item = FunctionSlot>) -> Self {
         Self {
             slots: slots.into_iter().collect(),
         }
     }
 }
 
-impl VfInventory for StaticVfInventory {
-    fn discover(&self) -> VfResult<Vec<VfSlot>> {
+impl FunctionInventory for StaticFunctionInventory {
+    fn discover(&self) -> InventoryResult<Vec<FunctionSlot>> {
         Ok(self.slots.clone())
     }
 }
@@ -101,8 +107,8 @@ impl SysfsVfInventory {
     }
 }
 
-impl VfInventory for SysfsVfInventory {
-    fn discover(&self) -> VfResult<Vec<VfSlot>> {
+impl FunctionInventory for SysfsVfInventory {
+    fn discover(&self) -> InventoryResult<Vec<FunctionSlot>> {
         let mut slots = Vec::new();
         for pf in &self.pfs {
             let pf_dir = self.sysfs.pci_device(pf);
@@ -114,23 +120,23 @@ impl VfInventory for SysfsVfInventory {
                     break;
                 }
                 let target = std::fs::read_link(&link).map_err(|e| {
-                    VfError::Discovery(format!("read_link {}: {e}", link.display()))
+                    InventoryError::Discovery(format!("read_link {}: {e}", link.display()))
                 })?;
                 let vf_bdf = target
                     .file_name()
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| {
-                        VfError::Discovery(format!(
+                        InventoryError::Discovery(format!(
                             "virtfn target has no bdf: {}",
                             target.display()
                         ))
                     })?
                     .to_string();
-                let mut slot = VfSlot::new(vf_bdf.clone(), vf_bdf.clone())
+                let mut slot = FunctionSlot::new(vf_bdf.clone(), vf_bdf.clone())
                     .with_pf(pf.clone())
-                    .with_vf_index(index);
+                    .with_index(index);
                 if let Some(mac) = read_vf_mac(&self.sysfs, &vf_bdf) {
-                    slot = slot.with_guest_mac(mac);
+                    slot = slot.with_mac(mac);
                 }
                 slots.push(slot);
             }
@@ -196,14 +202,14 @@ fn parse_phys_port_name(s: &str) -> Option<(u32, u32)> {
     Some((pf_num, vf_num))
 }
 
-impl VfInventory for SysfsRepresentorInventory {
-    fn discover(&self) -> VfResult<Vec<VfSlot>> {
+impl FunctionInventory for SysfsRepresentorInventory {
+    fn discover(&self) -> InventoryResult<Vec<FunctionSlot>> {
         let mut slots = Vec::new();
         let entries = std::fs::read_dir(&self.net_sysfs).map_err(|e| {
-            VfError::Discovery(format!("read_dir {}: {e}", self.net_sysfs.display()))
+            InventoryError::Discovery(format!("read_dir {}: {e}", self.net_sysfs.display()))
         })?;
         for entry in entries {
-            let entry = entry.map_err(|e| VfError::Discovery(e.to_string()))?;
+            let entry = entry.map_err(|e| InventoryError::Discovery(e.to_string()))?;
             let ifname = entry.file_name().to_string_lossy().into_owned();
             let ppn_path = entry.path().join("phys_port_name");
             let Ok(ppn) = std::fs::read_to_string(&ppn_path) else {
@@ -213,9 +219,9 @@ impl VfInventory for SysfsRepresentorInventory {
                 continue;
             };
             slots.push(
-                VfSlot::new(ifname.clone(), String::new())
+                FunctionSlot::new(ifname.clone(), String::new())
                     .with_pf(pf_index.to_string())
-                    .with_vf_index(vf_index)
+                    .with_index(vf_index)
                     .with_representor(ifname.clone())
                     .with_ovs_port(ifname),
             );
@@ -239,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn sysfs_vf_inventory_reads_guest_mac_from_vf_netdev() {
+    fn sysfs_vf_inventory_reads_mac_from_vf_netdev() {
         let root = temp_sysfs_root("vf-mac");
         let devices = root.join("bus/pci/devices");
         let pf = devices.join("0000:03:00.0");
@@ -254,8 +260,8 @@ mod tests {
 
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].host_bdf, "0000:03:00.2");
-        assert_eq!(slots[0].vf_index, Some(0));
-        assert_eq!(slots[0].guest_mac.as_deref(), Some("86:7f:6e:5b:e0:7b"));
+        assert_eq!(slots[0].index, Some(0));
+        assert_eq!(slots[0].mac.as_deref(), Some("86:7f:6e:5b:e0:7b"));
 
         std::fs::remove_dir_all(root).unwrap();
     }

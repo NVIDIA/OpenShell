@@ -67,13 +67,36 @@ set_optional_mac() {
     fi
 }
 
+remove_inherited_default_routes() {
+    while ip route show default 2>/dev/null | grep -q '^default '; do
+        ip route del default
+    done
+}
+
+verify_vf_default_route() {
+    local vf_nic="$1"
+    local route
+
+    route="$(ip route get "${OPENSHELL_VM_DATA_GW}" 2>/dev/null || true)"
+    case "${route}" in
+        *" dev ${vf_nic} "*|*" dev ${vf_nic}")
+            return 0
+            ;;
+    esac
+
+    echo "openshell: bluefield VF egress route check failed: gateway ${OPENSHELL_VM_DATA_GW} route was ${route}" >&2
+    return 1
+}
+
 configure_static_ip() {
     local vf_nic="$1"
 
     ip link set "${vf_nic}" up
     ip addr flush dev "${vf_nic}" 2>/dev/null || true
     ip addr add "${OPENSHELL_VM_DATA_IP}" dev "${vf_nic}"
+    remove_inherited_default_routes
     ip route replace default via "${OPENSHELL_VM_DATA_GW}" dev "${vf_nic}"
+    verify_vf_default_route "${vf_nic}"
 }
 
 configure_resolv_conf() {

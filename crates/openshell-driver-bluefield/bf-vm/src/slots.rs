@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use bf_inventory::{SysfsVfInventory, VfInventory, VfSlot};
+use bf_inventory::{FunctionInventory, FunctionSlot, SysfsVfInventory};
 use openshell_vfio::SysfsRoot;
 
 use crate::config::BluefieldDriverConfig;
@@ -39,7 +39,7 @@ pub(crate) fn prepare_host_slots(
     config: HostSlotConfig<'_>,
     sysfs: &SysfsRoot,
     host_pf: &str,
-) -> Result<Vec<VfSlot>, String> {
+) -> Result<Vec<FunctionSlot>, String> {
     let inventory = SysfsVfInventory::new(sysfs.clone(), [host_pf.to_string()]);
     let mut slots = inventory
         .discover()
@@ -51,10 +51,13 @@ pub(crate) fn prepare_host_slots(
     Ok(slots)
 }
 
-fn apply_slot_config(config: &HostSlotConfig<'_>, slots: &mut Vec<VfSlot>) -> Result<(), String> {
+fn apply_slot_config(
+    config: &HostSlotConfig<'_>,
+    slots: &mut Vec<FunctionSlot>,
+) -> Result<(), String> {
     if !config.reserved_vf_indexes.is_empty() {
         let reserved: HashSet<u32> = config.reserved_vf_indexes.iter().copied().collect();
-        slots.retain(|slot| match slot.vf_index {
+        slots.retain(|slot| match slot.index {
             Some(index) => !reserved.contains(&index),
             None => true,
         });
@@ -73,7 +76,7 @@ fn apply_slot_config(config: &HostSlotConfig<'_>, slots: &mut Vec<VfSlot>) -> Re
             ));
         }
         for (slot, address) in slots.iter_mut().zip(config.egress_cidr_pool.iter()) {
-            slot.guest_datapath_address = Some(address.clone());
+            slot.datapath_address = Some(address.clone());
         }
     }
     Ok(())
@@ -82,17 +85,17 @@ fn apply_slot_config(config: &HostSlotConfig<'_>, slots: &mut Vec<VfSlot>) -> Re
 #[cfg(test)]
 mod tests {
     use super::{HostSlotConfig, apply_slot_config};
-    use bf_inventory::VfSlot;
+    use bf_inventory::FunctionSlot;
 
     #[test]
     fn applies_reserved_indexes_pf_key_and_egress_pool() {
         let mut slots = vec![
-            VfSlot::new("vf0", "0000:03:00.2")
+            FunctionSlot::new("vf0", "0000:03:00.2")
                 .with_pf("p0")
-                .with_vf_index(0),
-            VfSlot::new("vf1", "0000:03:00.3")
+                .with_index(0),
+            FunctionSlot::new("vf1", "0000:03:00.3")
                 .with_pf("p0")
-                .with_vf_index(1),
+                .with_index(1),
         ];
         let egress_pool = vec!["10.0.120.61/22".to_string()];
         let config = HostSlotConfig {
@@ -106,17 +109,14 @@ mod tests {
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].host_bdf, "0000:03:00.3");
         assert_eq!(slots[0].pf.as_deref(), Some("bf-a"));
-        assert_eq!(
-            slots[0].guest_datapath_address.as_deref(),
-            Some("10.0.120.61/22")
-        );
+        assert_eq!(slots[0].datapath_address.as_deref(), Some("10.0.120.61/22"));
     }
 
     #[test]
     fn rejects_egress_pool_shorter_than_usable_slots() {
         let mut slots = vec![
-            VfSlot::new("vf0", "0000:03:00.2").with_vf_index(0),
-            VfSlot::new("vf1", "0000:03:00.3").with_vf_index(1),
+            FunctionSlot::new("vf0", "0000:03:00.2").with_index(0),
+            FunctionSlot::new("vf1", "0000:03:00.3").with_index(1),
         ];
         let egress_pool = vec!["10.0.120.61/22".to_string()];
         let config = HostSlotConfig {

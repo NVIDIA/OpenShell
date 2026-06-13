@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bf_inventory::VfSlot;
+use bf_inventory::FunctionSlot;
 use serde::{Deserialize, Serialize};
 
 use crate::lifecycle::{LifecycleError, LifecycleResult, extension_state_dir};
@@ -18,7 +18,7 @@ const PCI_BIND_STATE_FILE: &str = "pci-bind-state.json";
 /// Per-sandbox bookkeeping for reverse-order teardown.
 #[derive(Debug, Clone)]
 pub(crate) struct AttachmentRecord {
-    pub(crate) slot: VfSlot,
+    pub(crate) slot: FunctionSlot,
 }
 
 /// Persisted record of the VF bound to a sandbox, for crash recovery.
@@ -27,14 +27,14 @@ pub(crate) struct BluefieldPciBindState {
     pub(crate) host_bdf: String,
     pub(crate) sandbox_id: String,
     #[serde(default)]
-    pub(crate) guest_mac: Option<String>,
+    pub(crate) mac: Option<String>,
     pub(crate) bound_at_ms: u128,
 }
 
 pub(crate) fn persist_bind_state(
     sandbox_id: &str,
     sandbox_state_dir: &Path,
-    slot: &VfSlot,
+    slot: &FunctionSlot,
 ) -> LifecycleResult<()> {
     let path = bind_state_path(sandbox_state_dir)?;
     if let Some(parent) = path.parent() {
@@ -48,14 +48,18 @@ pub(crate) fn persist_bind_state(
     let state = BluefieldPciBindState {
         host_bdf: slot.host_bdf.clone(),
         sandbox_id: sandbox_id.to_string(),
-        guest_mac: slot.guest_mac.clone(),
+        mac: slot.mac.clone(),
         bound_at_ms: now_millis(),
     };
     let data = serde_json::to_string_pretty(&state)
         .map_err(|err| LifecycleError::new(format!("serialize bluefield bind state: {err}")))?;
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)
-        .map_err(|err| LifecycleError::new(format!("write bluefield bind state {}: {err}", tmp.display())))?;
+    std::fs::write(&tmp, data).map_err(|err| {
+        LifecycleError::new(format!(
+            "write bluefield bind state {}: {err}",
+            tmp.display()
+        ))
+    })?;
     std::fs::rename(&tmp, &path).map_err(|err| {
         LifecycleError::new(format!(
             "commit bluefield bind state {}: {err}",
@@ -69,10 +73,18 @@ pub(crate) fn load_bind_state(
     sandbox_state_dir: &Path,
 ) -> LifecycleResult<BluefieldPciBindState> {
     let path = bind_state_path(sandbox_state_dir)?;
-    let data = std::fs::read_to_string(&path)
-        .map_err(|err| LifecycleError::new(format!("read bluefield bind state {}: {err}", path.display())))?;
-    let state: BluefieldPciBindState = serde_json::from_str(&data)
-        .map_err(|err| LifecycleError::new(format!("parse bluefield bind state {}: {err}", path.display())))?;
+    let data = std::fs::read_to_string(&path).map_err(|err| {
+        LifecycleError::new(format!(
+            "read bluefield bind state {}: {err}",
+            path.display()
+        ))
+    })?;
+    let state: BluefieldPciBindState = serde_json::from_str(&data).map_err(|err| {
+        LifecycleError::new(format!(
+            "parse bluefield bind state {}: {err}",
+            path.display()
+        ))
+    })?;
     if state.sandbox_id != sandbox_id {
         return Err(LifecycleError::new(format!(
             "bluefield bind state sandbox mismatch: expected {sandbox_id}, got {}",

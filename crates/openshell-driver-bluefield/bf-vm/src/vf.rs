@@ -12,7 +12,7 @@ use openshell_vfio::{
     validate_pci_for_passthrough,
 };
 
-use bf_inventory::VfSlot;
+use bf_inventory::FunctionSlot;
 
 /// Host capability probe for VF passthrough. Injectable so tests (and hosts
 /// without the device) don't need real hardware. Implementations check that
@@ -65,9 +65,9 @@ impl VfBinding for RealVfBinding {
 }
 
 pub(crate) trait VfBinder: std::fmt::Debug + Send + Sync {
-    fn bind_slot(&self, slot: &VfSlot) -> Result<Box<dyn VfBinding>, String>;
-    fn adopt_slot(&self, slot: &VfSlot) -> Result<Box<dyn VfBinding>, String>;
-    fn release_slot(&self, slot: &VfSlot) -> Result<(), String>;
+    fn bind_slot(&self, slot: &FunctionSlot) -> Result<Box<dyn VfBinding>, String>;
+    fn adopt_slot(&self, slot: &FunctionSlot) -> Result<Box<dyn VfBinding>, String>;
+    fn release_slot(&self, slot: &FunctionSlot) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +88,7 @@ impl Default for SysfsVfBinder {
 }
 
 impl VfBinder for SysfsVfBinder {
-    fn bind_slot(&self, slot: &VfSlot) -> Result<Box<dyn VfBinding>, String> {
+    fn bind_slot(&self, slot: &FunctionSlot) -> Result<Box<dyn VfBinding>, String> {
         bind_slot(&self.sysfs, slot)
             .map(|guard| {
                 let binding: Box<dyn VfBinding> = Box::new(RealVfBinding(guard));
@@ -97,7 +97,7 @@ impl VfBinder for SysfsVfBinder {
             .map_err(|err| err.to_string())
     }
 
-    fn adopt_slot(&self, slot: &VfSlot) -> Result<Box<dyn VfBinding>, String> {
+    fn adopt_slot(&self, slot: &FunctionSlot) -> Result<Box<dyn VfBinding>, String> {
         adopt_slot(&self.sysfs, slot)
             .map(|guard| {
                 let binding: Box<dyn VfBinding> = Box::new(RealVfBinding(guard));
@@ -106,7 +106,7 @@ impl VfBinder for SysfsVfBinder {
             .map_err(|err| err.to_string())
     }
 
-    fn release_slot(&self, slot: &VfSlot) -> Result<(), String> {
+    fn release_slot(&self, slot: &FunctionSlot) -> Result<(), String> {
         release_slot(&self.sysfs, slot).map_err(|err| err.to_string())
     }
 }
@@ -117,7 +117,7 @@ impl VfBinder for SysfsVfBinder {
 /// and to persist the binding for restart reconciliation.
 pub fn bind_slot(
     sysfs: &SysfsRoot,
-    slot: &VfSlot,
+    slot: &FunctionSlot,
 ) -> Result<PciBindGuard, openshell_vfio::VfioError> {
     prepare_pci_for_passthrough(sysfs, &slot.host_bdf)
 }
@@ -126,12 +126,15 @@ pub fn bind_slot(
 /// restart, without rebinding or mutating sysfs.
 pub fn adopt_slot(
     sysfs: &SysfsRoot,
-    slot: &VfSlot,
+    slot: &FunctionSlot,
 ) -> Result<PciBindGuard, openshell_vfio::VfioError> {
     PciBindGuard::adopt(sysfs, &slot.host_bdf)
 }
 
 /// Restore a VF slot's device to its host driver at teardown time.
-pub fn release_slot(sysfs: &SysfsRoot, slot: &VfSlot) -> Result<(), openshell_vfio::VfioError> {
+pub fn release_slot(
+    sysfs: &SysfsRoot,
+    slot: &FunctionSlot,
+) -> Result<(), openshell_vfio::VfioError> {
     release_pci_from_passthrough(sysfs, &slot.host_bdf)
 }

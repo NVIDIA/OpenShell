@@ -1,8 +1,9 @@
-//! The VF assignment the control-plane leader hands to a compute node.
+//! The network-function assignment the control-plane leader hands to a compute
+//! node.
 //!
-//! The leader allocates a VF, programs OVS via the DPU controller, then stamps
-//! the resulting assignment into the sandbox's `template.labels`. The
-//! compute-node role reads it back and binds exactly that VF. Carrying the
+//! The leader allocates a function, programs OVS via the DPU controller, then
+//! stamps the resulting assignment into the sandbox's `template.labels`. The
+//! compute-node role reads it back and binds exactly that function. Carrying the
 //! assignment as labels keeps it on the existing `ComputeDriver` contract with
 //! no new proto, and makes it policy-stamped (a guest cannot forge it).
 
@@ -10,31 +11,37 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::FunctionKind;
+
 /// Label key prefix for all BlueField assignment fields.
 pub const LABEL_PREFIX: &str = "openshell.io/bluefield.";
 
 pub const LABEL_HOST_BDF: &str = "openshell.io/bluefield.host-bdf";
 pub const LABEL_LEASE_GENERATION: &str = "openshell.io/bluefield.lease-generation";
-pub const LABEL_GUEST_MAC: &str = "openshell.io/bluefield.guest-mac";
+pub const LABEL_MAC: &str = "openshell.io/bluefield.mac";
 pub const LABEL_ATTACHMENT_ID: &str = "openshell.io/bluefield.attachment-id";
+pub const LABEL_KIND: &str = "openshell.io/bluefield.kind";
 pub const LABEL_PF: &str = "openshell.io/bluefield.pf";
-pub const LABEL_VF_INDEX: &str = "openshell.io/bluefield.vf-index";
+pub const LABEL_INDEX: &str = "openshell.io/bluefield.index";
 
-/// A leader-decided VF assignment for one sandbox.
+/// A leader-decided network-function assignment for one sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BluefieldAssignment {
-    /// Host PCI BDF of the VF the compute node must bind.
+    /// Host PCI BDF of the function the compute node must bind.
     pub host_bdf: String,
     /// Controller lease generation. Carried for correlation/fencing; the
     /// compute node never detaches, so it does not act on this directly.
     pub lease_generation: u64,
-    /// Guest-visible VF MAC (the leader derives this deterministically).
-    pub guest_mac: String,
+    /// Guest-visible function MAC (the leader derives this deterministically).
+    pub mac: String,
     /// Controller attachment id, for logging/correlation.
     pub attachment_id: String,
+    /// Kind of network function the leader allocated. Defaults to `Vf`.
+    pub kind: FunctionKind,
     /// Optional cross-host coordinate; not required to bind.
     pub pf: Option<String>,
-    pub vf_index: Option<u32>,
+    /// Identity index within the parent PF (`vf_index`, `sf_num`, ...).
+    pub index: Option<u32>,
 }
 
 impl BluefieldAssignment {
@@ -54,14 +61,15 @@ impl BluefieldAssignment {
                 LABEL_LEASE_GENERATION.to_string(),
                 self.lease_generation.to_string(),
             ),
-            (LABEL_GUEST_MAC.to_string(), self.guest_mac.clone()),
+            (LABEL_MAC.to_string(), self.mac.clone()),
             (LABEL_ATTACHMENT_ID.to_string(), self.attachment_id.clone()),
+            (LABEL_KIND.to_string(), self.kind.as_str().to_string()),
         ];
         if let Some(pf) = &self.pf {
             out.push((LABEL_PF.to_string(), pf.clone()));
         }
-        if let Some(vf_index) = self.vf_index {
-            out.push((LABEL_VF_INDEX.to_string(), vf_index.to_string()));
+        if let Some(index) = self.index {
+            out.push((LABEL_INDEX.to_string(), index.to_string()));
         }
         out
     }
@@ -85,20 +93,26 @@ impl BluefieldAssignment {
         };
 
         let host_bdf = required(LABEL_HOST_BDF)?;
-        let guest_mac = required(LABEL_GUEST_MAC)?;
+        let mac = required(LABEL_MAC)?;
         let attachment_id = required(LABEL_ATTACHMENT_ID)?;
         let lease_generation = required(LABEL_LEASE_GENERATION)?
             .parse::<u64>()
             .map_err(|err| format!("invalid {LABEL_LEASE_GENERATION}: {err}"))?;
 
+        let kind = match labels.get(LABEL_KIND).map(|v| v.trim()) {
+            Some(v) if !v.is_empty() => {
+                FunctionKind::parse(v).ok_or_else(|| format!("invalid {LABEL_KIND}: {v}"))?
+            }
+            _ => FunctionKind::Vf,
+        };
         let pf = labels
             .get(LABEL_PF)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        let vf_index = match labels.get(LABEL_VF_INDEX).map(|v| v.trim()) {
+        let index = match labels.get(LABEL_INDEX).map(|v| v.trim()) {
             Some(v) if !v.is_empty() => Some(
                 v.parse::<u32>()
-                    .map_err(|err| format!("invalid {LABEL_VF_INDEX}: {err}"))?,
+                    .map_err(|err| format!("invalid {LABEL_INDEX}: {err}"))?,
             ),
             _ => None,
         };
@@ -106,10 +120,11 @@ impl BluefieldAssignment {
         Ok(Self {
             host_bdf,
             lease_generation,
-            guest_mac,
+            mac,
             attachment_id,
+            kind,
             pf,
-            vf_index,
+            index,
         })
     }
 }
@@ -122,10 +137,11 @@ mod tests {
         BluefieldAssignment {
             host_bdf: "0000:03:00.2".to_string(),
             lease_generation: 42,
-            guest_mac: "02:00:00:00:00:01".to_string(),
+            mac: "02:00:00:00:00:01".to_string(),
             attachment_id: "bf-sb-1".to_string(),
+            kind: FunctionKind::Vf,
             pf: Some("0".to_string()),
-            vf_index: Some(3),
+            index: Some(3),
         }
     }
 
@@ -145,7 +161,7 @@ mod tests {
     fn round_trips_without_optional_coordinate() {
         let assignment = BluefieldAssignment {
             pf: None,
-            vf_index: None,
+            index: None,
             ..sample()
         };
         let mut labels = HashMap::new();

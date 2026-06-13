@@ -1,30 +1,79 @@
 //! Shared BlueField handles that cross the driver, host, and DPU seam.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VfSlot {
-    pub id: String,
-    pub host_bdf: String,
-    pub pf: Option<String>,
-    pub vf_index: Option<u32>,
-    pub representor: Option<String>,
-    pub ovs_port: Option<String>,
-    pub guest_datapath_address: Option<String>,
-    pub guest_mac: Option<String>,
+use serde::{Deserialize, Serialize};
+
+/// The kind of network function backing a sandbox.
+///
+/// BlueField can hand a sandbox different function types depending on the
+/// runtime and fabric configuration. The discovery and allocation layers are
+/// kind-agnostic; this discriminant lets a consumer (and the attach mechanism)
+/// know which kind a slot represents.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FunctionKind {
+    /// SR-IOV virtual function (the `bf-vm` passthrough path).
+    #[default]
+    Vf,
+    /// Scalable Function (e.g. container/Kubernetes adapters via `mlnx-sf`).
+    Sf,
 }
 
-impl VfSlot {
+impl FunctionKind {
+    /// Stable wire/label string for this kind.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vf => "vf",
+            Self::Sf => "sf",
+        }
+    }
+
+    /// Parse a [`FunctionKind`] from its wire/label string.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "vf" => Some(Self::Vf),
+            "sf" => Some(Self::Sf),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionSlot {
+    pub id: String,
+    pub host_bdf: String,
+    pub kind: FunctionKind,
+    pub pf: Option<String>,
+    /// Identity index within the parent PF. `vf_index` for a VF, `sf_num` for
+    /// an SF, function index for a virtio-net device.
+    pub index: Option<u32>,
+    pub representor: Option<String>,
+    pub ovs_port: Option<String>,
+    pub datapath_address: Option<String>,
+    pub mac: Option<String>,
+}
+
+impl FunctionSlot {
     #[must_use]
     pub fn new(id: impl Into<String>, host_bdf: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             host_bdf: host_bdf.into(),
+            kind: FunctionKind::Vf,
             pf: None,
-            vf_index: None,
+            index: None,
             representor: None,
             ovs_port: None,
-            guest_datapath_address: None,
-            guest_mac: None,
+            datapath_address: None,
+            mac: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_kind(mut self, kind: FunctionKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     #[must_use]
@@ -34,8 +83,8 @@ impl VfSlot {
     }
 
     #[must_use]
-    pub fn with_vf_index(mut self, vf_index: u32) -> Self {
-        self.vf_index = Some(vf_index);
+    pub fn with_index(mut self, index: u32) -> Self {
+        self.index = Some(index);
         self
     }
 
@@ -52,39 +101,48 @@ impl VfSlot {
     }
 
     #[must_use]
-    pub fn with_guest_datapath_address(mut self, address: impl Into<String>) -> Self {
-        self.guest_datapath_address = Some(address.into());
+    pub fn with_datapath_address(mut self, address: impl Into<String>) -> Self {
+        self.datapath_address = Some(address.into());
         self
     }
 
     #[must_use]
-    pub fn with_guest_mac(mut self, mac: impl Into<String>) -> Self {
-        self.guest_mac = Some(mac.into());
+    pub fn with_mac(mut self, mac: impl Into<String>) -> Self {
+        self.mac = Some(mac.into());
         self
     }
 
     #[must_use]
-    pub fn vf_ref(&self) -> Option<VfRef> {
-        match (&self.pf, self.vf_index) {
-            (Some(pf), Some(idx)) => Some(VfRef::new(pf.clone(), idx)),
+    pub fn net_function(&self) -> Option<NetFunction> {
+        match (&self.pf, self.index) {
+            (Some(pf), Some(idx)) => Some(NetFunction::new(pf.clone(), idx).with_kind(self.kind)),
             _ => None,
         }
     }
 }
 
+/// A reference to a single network function: `(kind, pf, index)`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct VfRef {
+pub struct NetFunction {
+    pub kind: FunctionKind,
     pub pf: String,
-    pub vf_index: u32,
+    pub index: u32,
 }
 
-impl VfRef {
+impl NetFunction {
     #[must_use]
-    pub fn new(pf: impl Into<String>, vf_index: u32) -> Self {
+    pub fn new(pf: impl Into<String>, index: u32) -> Self {
         Self {
+            kind: FunctionKind::Vf,
             pf: pf.into(),
-            vf_index,
+            index,
         }
+    }
+
+    #[must_use]
+    pub fn with_kind(mut self, kind: FunctionKind) -> Self {
+        self.kind = kind;
+        self
     }
 }
 
@@ -98,11 +156,11 @@ pub enum ProxyPlacement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachSpec {
     pub sandbox_id: String,
-    pub vf: VfRef,
+    pub function: NetFunction,
     pub host_bdf: String,
     pub representor: Option<String>,
-    pub guest_ip: Option<String>,
-    pub guest_mac: Option<String>,
+    pub endpoint_ip: Option<String>,
+    pub mac: Option<String>,
     pub openshell_endpoint: Option<String>,
     pub sandbox_token: Option<String>,
 }

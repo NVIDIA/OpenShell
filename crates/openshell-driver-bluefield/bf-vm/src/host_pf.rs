@@ -108,7 +108,11 @@ fn is_bluefield_network_pf(path: &Path) -> bool {
 }
 
 fn has_any_virtfn(path: &Path) -> bool {
-    (0..256).any(|index| path.join(format!("virtfn{index}")).symlink_metadata().is_ok())
+    (0..256).any(|index| {
+        path.join(format!("virtfn{index}"))
+            .symlink_metadata()
+            .is_ok()
+    })
 }
 
 fn read_trimmed(path: PathBuf) -> Option<String> {

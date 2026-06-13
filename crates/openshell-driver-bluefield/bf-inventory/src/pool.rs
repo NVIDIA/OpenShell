@@ -1,42 +1,47 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! VF slot pool. In-memory claim/release of BlueField VFs to sandboxes.
+//! Function slot pool. In-memory claim/release of BlueField functions to
+//! sandboxes.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-pub use bf_core::VfSlot;
+pub use bf_core::FunctionSlot;
 
-/// Inventory of VF slots with per-sandbox claim tracking.
+/// Inventory of function slots with per-sandbox claim tracking.
 #[derive(Debug, Default)]
-pub struct VfPool {
-    slots: Vec<VfSlot>,
+pub struct FunctionPool {
+    slots: Vec<FunctionSlot>,
     /// sandbox_id -> slot index.
     claims: Mutex<HashMap<String, usize>>,
 }
 
-impl VfPool {
+impl FunctionPool {
     #[must_use]
-    pub fn new(slots: impl IntoIterator<Item = VfSlot>) -> Self {
+    pub fn new(slots: impl IntoIterator<Item = FunctionSlot>) -> Self {
         Self {
             slots: slots.into_iter().collect(),
             claims: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Build a pool from a [`VfInventory`](super::inventory::VfInventory),
-    /// discovering the available slots at startup instead of hand-feeding them.
+    /// Build a pool from a
+    /// [`FunctionInventory`](super::inventory::FunctionInventory), discovering
+    /// the available slots at startup instead of hand-feeding them.
     pub fn from_inventory(
-        inventory: &dyn crate::inventory::VfInventory,
-    ) -> Result<Self, crate::inventory::VfError> {
+        inventory: &dyn crate::inventory::FunctionInventory,
+    ) -> Result<Self, crate::inventory::InventoryError> {
         Ok(Self::new(inventory.discover()?))
     }
 
     /// Claim a free slot for `sandbox_id`. Idempotent: a sandbox that already
     /// holds a slot gets the same one back. Returns `None` when exhausted.
-    pub fn claim(&self, sandbox_id: &str) -> Option<VfSlot> {
-        let mut claims = self.claims.lock().expect("vf pool claims lock poisoned");
+    pub fn claim(&self, sandbox_id: &str) -> Option<FunctionSlot> {
+        let mut claims = self
+            .claims
+            .lock()
+            .expect("function pool claims lock poisoned");
         if let Some(&idx) = claims.get(sandbox_id) {
             return self.slots.get(idx).cloned();
         }
@@ -48,8 +53,11 @@ impl VfPool {
 
     /// Claim a specific host BDF for `sandbox_id`. Idempotent for an existing
     /// matching claim and fails if another sandbox owns the slot.
-    pub fn claim_by_host_bdf(&self, sandbox_id: &str, host_bdf: &str) -> Option<VfSlot> {
-        let mut claims = self.claims.lock().expect("vf pool claims lock poisoned");
+    pub fn claim_by_host_bdf(&self, sandbox_id: &str, host_bdf: &str) -> Option<FunctionSlot> {
+        let mut claims = self
+            .claims
+            .lock()
+            .expect("function pool claims lock poisoned");
         let idx = self
             .slots
             .iter()
@@ -68,7 +76,7 @@ impl VfPool {
 
     /// Return the slot with the given host BDF.
     #[must_use]
-    pub fn slot_by_host_bdf(&self, host_bdf: &str) -> Option<VfSlot> {
+    pub fn slot_by_host_bdf(&self, host_bdf: &str) -> Option<FunctionSlot> {
         self.slots
             .iter()
             .find(|slot| slot.host_bdf == host_bdf)
@@ -79,18 +87,18 @@ impl VfPool {
     pub fn release(&self, sandbox_id: &str) {
         self.claims
             .lock()
-            .expect("vf pool claims lock poisoned")
+            .expect("function pool claims lock poisoned")
             .remove(sandbox_id);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{VfPool, VfSlot};
+    use super::{FunctionPool, FunctionSlot};
 
     #[test]
     fn claim_is_idempotent_per_sandbox() {
-        let pool = VfPool::new([VfSlot::new("vf0", "0000:03:00.2")]);
+        let pool = FunctionPool::new([FunctionSlot::new("vf0", "0000:03:00.2")]);
         let a = pool.claim("sandbox-1").unwrap();
         let b = pool.claim("sandbox-1").unwrap();
         assert_eq!(a, b);
@@ -98,9 +106,9 @@ mod tests {
 
     #[test]
     fn distinct_sandboxes_get_distinct_slots_and_release_frees() {
-        let pool = VfPool::new([
-            VfSlot::new("vf0", "0000:03:00.2"),
-            VfSlot::new("vf1", "0000:03:00.3"),
+        let pool = FunctionPool::new([
+            FunctionSlot::new("vf0", "0000:03:00.2"),
+            FunctionSlot::new("vf1", "0000:03:00.3"),
         ]);
         let s1 = pool.claim("sandbox-1").unwrap();
         let s2 = pool.claim("sandbox-2").unwrap();
@@ -114,9 +122,9 @@ mod tests {
 
     #[test]
     fn claim_by_host_bdf_reuses_matching_restore_slot() {
-        let pool = VfPool::new([
-            VfSlot::new("vf0", "0000:03:00.2"),
-            VfSlot::new("vf1", "0000:03:00.3"),
+        let pool = FunctionPool::new([
+            FunctionSlot::new("vf0", "0000:03:00.2"),
+            FunctionSlot::new("vf1", "0000:03:00.3"),
         ]);
 
         let restored = pool.claim_by_host_bdf("sandbox-1", "0000:03:00.3").unwrap();

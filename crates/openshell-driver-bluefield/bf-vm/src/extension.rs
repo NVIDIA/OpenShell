@@ -9,11 +9,13 @@
 //! is layered on in later stages.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
 use openshell_vfio::SysfsRoot;
+use url::{Host, Url};
 
 use crate::gpu::mac_from_sandbox_id;
 use crate::lifecycle::{
@@ -22,7 +24,7 @@ use crate::lifecycle::{
     RestoreContext,
 };
 
-use bf_inventory::{VfPool, VfSlot};
+use bf_inventory::{FunctionPool, FunctionSlot};
 
 use crate::config::{
     bluefield_kernel_from_config, guest_egress_from_config, reject_deferred_proxy,
@@ -68,9 +70,10 @@ fn qemu_kernel_from_config(config: &BluefieldDriverConfig) -> Result<BluefieldKe
 /// wires optional guest egress into the launch plan.
 #[derive(Debug)]
 pub struct BluefieldExtension {
-    pool: VfPool,
+    pool: FunctionPool,
     egress: Option<GuestEgress>,
     kernel: Option<BluefieldKernel>,
+    openshell_endpoint: Option<String>,
     readiness: Arc<dyn HostReadiness>,
     binder: Arc<dyn VfBinder>,
     attachments: Mutex<HashMap<String, AttachmentRecord>>,
@@ -78,11 +81,12 @@ pub struct BluefieldExtension {
 
 impl BluefieldExtension {
     #[must_use]
-    pub fn new(pool: VfPool) -> Self {
+    pub fn new(pool: FunctionPool) -> Self {
         Self {
             pool,
             egress: None,
             kernel: None,
+            openshell_endpoint: None,
             readiness: Arc::new(SysfsHostReadiness::default()),
             binder: Arc::new(SysfsVfBinder::default()),
             attachments: Mutex::new(HashMap::new()),
@@ -118,7 +122,7 @@ impl BluefieldExtension {
             },
         )?;
 
-        let extension = Self::new(VfPool::new(slots))
+        let extension = Self::new(FunctionPool::new(slots))
             .with_kernel(kernel)
             .with_host_readiness(Arc::new(SysfsHostReadiness::new(sysfs.clone())))
             .with_vf_binder(Arc::new(SysfsVfBinder::new(sysfs)));
@@ -135,6 +139,7 @@ impl BluefieldExtension {
     }
 
     fn apply_runtime_options(mut self, config: &BluefieldDriverConfig) -> Result<Self, String> {
+        self.openshell_endpoint = config.openshell_endpoint.clone();
         if let Some(egress) = guest_egress_from_config(config)? {
             self = self.with_guest_egress(egress);
         }
@@ -144,6 +149,16 @@ impl BluefieldExtension {
     #[must_use]
     pub fn with_guest_egress(mut self, egress: GuestEgress) -> Self {
         self.egress = Some(egress);
+        self
+    }
+
+    /// Preserve a non-loopback gateway endpoint for split deployments where
+    /// the gateway runs somewhere other than the compute host. The generic VM
+    /// QEMU TAP path rewrites the endpoint to the TAP host IP; this override is
+    /// appended later and lets the guest route to the real gateway via TAP NAT.
+    #[must_use]
+    pub fn with_openshell_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.openshell_endpoint = Some(endpoint.into());
         self
     }
 
@@ -182,21 +197,25 @@ impl BluefieldExtension {
             .remove(sandbox_id)
     }
 
-    fn release_binding(&self, sandbox_state_dir: &Path, slot: &VfSlot) -> LifecycleResult<()> {
+    fn release_binding(
+        &self,
+        sandbox_state_dir: &Path,
+        slot: &FunctionSlot,
+    ) -> LifecycleResult<()> {
         self.binder.release_slot(slot).map_err(|err| {
             LifecycleError::new(format!("bluefield: release VF {}: {err}", slot.host_bdf))
         })?;
         state::remove_bind_state(sandbox_state_dir)
     }
 
-    fn claim_slot(&self, sandbox_id: &str) -> LifecycleResult<VfSlot> {
+    fn claim_slot(&self, sandbox_id: &str) -> LifecycleResult<FunctionSlot> {
         let mut slot = self.pool.claim(sandbox_id).ok_or_else(|| {
             LifecycleError::resource_exhausted(format!(
                 "bluefield: no free VF for sandbox {sandbox_id}"
             ))
         })?;
-        if slot.guest_mac.is_none() {
-            slot.guest_mac = Some(deterministic_vf_mac(sandbox_id));
+        if slot.mac.is_none() {
+            slot.mac = Some(deterministic_vf_mac(sandbox_id));
         }
         Ok(slot)
     }
@@ -246,6 +265,12 @@ impl LifecycleExtension for BluefieldExtension {
         // assigned VF is not an inert PCI function in the guest.
         if let Some(kernel) = &self.kernel {
             kernel.apply(plan)?;
+        }
+        if let Some(endpoint) = self.guest_routable_openshell_endpoint() {
+            plan.env.push(format!(
+                "{}={endpoint}",
+                openshell_core::sandbox_env::ENDPOINT
+            ));
         }
         Ok(())
     }
@@ -355,9 +380,9 @@ impl LifecycleExtension for BluefieldExtension {
                     bind_state.host_bdf, ctx.sandbox.id
                 ))
             })?;
-        if slot.guest_mac.is_none() {
-            slot.guest_mac = bind_state
-                .guest_mac
+        if slot.mac.is_none() {
+            slot.mac = bind_state
+                .mac
                 .clone()
                 .or_else(|| Some(deterministic_vf_mac(&ctx.sandbox.id)));
         }
@@ -371,6 +396,33 @@ impl LifecycleExtension for BluefieldExtension {
         self.record_attachment(&ctx.sandbox.id, AttachmentRecord { slot });
         Ok(())
     }
+}
+
+impl BluefieldExtension {
+    fn guest_routable_openshell_endpoint(&self) -> Option<&str> {
+        let endpoint = self.openshell_endpoint.as_deref()?;
+        if endpoint_host_is_guest_routable(endpoint) {
+            Some(endpoint)
+        } else {
+            None
+        }
+    }
+}
+
+fn endpoint_host_is_guest_routable(endpoint: &str) -> bool {
+    let Ok(url) = Url::parse(endpoint) else {
+        return false;
+    };
+    match url.host() {
+        Some(Host::Ipv4(ip)) => ip_is_guest_routable(IpAddr::V4(ip)),
+        Some(Host::Ipv6(ip)) => ip_is_guest_routable(IpAddr::V6(ip)),
+        Some(Host::Domain(host)) => !host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+fn ip_is_guest_routable(ip: IpAddr) -> bool {
+    !ip.is_loopback() && !ip.is_unspecified()
 }
 
 #[cfg(test)]
@@ -403,13 +455,16 @@ mod tests {
     #[derive(Debug)]
     struct TestVfBinder;
     impl VfBinder for TestVfBinder {
-        fn bind_slot(&self, _slot: &VfSlot) -> Result<Box<dyn crate::vf::VfBinding>, String> {
+        fn bind_slot(&self, _slot: &FunctionSlot) -> Result<Box<dyn crate::vf::VfBinding>, String> {
             Ok(Box::new(TestVfBinding))
         }
-        fn adopt_slot(&self, _slot: &VfSlot) -> Result<Box<dyn crate::vf::VfBinding>, String> {
+        fn adopt_slot(
+            &self,
+            _slot: &FunctionSlot,
+        ) -> Result<Box<dyn crate::vf::VfBinding>, String> {
             Ok(Box::new(TestVfBinding))
         }
-        fn release_slot(&self, _slot: &VfSlot) -> Result<(), String> {
+        fn release_slot(&self, _slot: &FunctionSlot) -> Result<(), String> {
             Ok(())
         }
     }
@@ -461,7 +516,7 @@ mod tests {
         }
     }
 
-    fn ext(pool: VfPool) -> BluefieldExtension {
+    fn ext(pool: FunctionPool) -> BluefieldExtension {
         BluefieldExtension::new(pool)
             .with_host_readiness(Arc::new(AlwaysReady))
             .with_vf_binder(Arc::new(TestVfBinder))
@@ -469,9 +524,11 @@ mod tests {
 
     #[tokio::test]
     async fn before_launch_claims_slot_records_bind_state_and_injects_egress_env() {
-        let extension = ext(VfPool::new([
-            VfSlot::new("vf0", "0000:03:00.2").with_representor("pf0vf0")
-        ]))
+        let extension = ext(FunctionPool::new([FunctionSlot::new(
+            "vf0",
+            "0000:03:00.2",
+        )
+        .with_representor("pf0vf0")]))
         .with_guest_egress(GuestEgress {
             address_cidr: "10.0.120.10/22".to_string(),
             gateway: "10.0.120.254".to_string(),
@@ -489,6 +546,17 @@ mod tests {
                 .iter()
                 .any(|e| e == "OPENSHELL_VM_DATA_IP=10.0.120.10/22")
         );
+        assert!(
+            plan.env
+                .iter()
+                .any(|e| e == "OPENSHELL_VM_DATA_EGRESS=external-vf")
+        );
+        assert!(
+            plan.env
+                .iter()
+                .any(|e| e == "OPENSHELL_VM_DATA_GW=10.0.120.254")
+        );
+        assert!(!plan.env.iter().any(|e| e.contains("veth")));
         assert_eq!(passthrough_bdfs(&plan), vec!["0000:03:00.2"]);
 
         let bind_state = state::load_bind_state("sandbox-1", &state).unwrap();
@@ -503,7 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn before_launch_fails_closed_when_pool_exhausted() {
-        let extension = ext(VfPool::new([]));
+        let extension = ext(FunctionPool::new([]));
         let mut plan = sample_plan();
         let err = extension
             .before_launch(&sandbox("sandbox-1"), &PathBuf::from("/tmp/s"), &mut plan)
@@ -514,9 +582,12 @@ mod tests {
 
     #[tokio::test]
     async fn before_launch_fails_closed_when_host_not_vfio_ready() {
-        let extension = BluefieldExtension::new(VfPool::new([VfSlot::new("vf0", "0000:03:00.2")]))
-            .with_host_readiness(Arc::new(NeverReady))
-            .with_vf_binder(Arc::new(TestVfBinder));
+        let extension = BluefieldExtension::new(FunctionPool::new([FunctionSlot::new(
+            "vf0",
+            "0000:03:00.2",
+        )]))
+        .with_host_readiness(Arc::new(NeverReady))
+        .with_vf_binder(Arc::new(TestVfBinder));
 
         let mut plan = sample_plan();
         let err = extension
@@ -531,7 +602,10 @@ mod tests {
 
     #[tokio::test]
     async fn after_delete_releases_slot_and_state() {
-        let extension = ext(VfPool::new([VfSlot::new("vf0", "0000:03:00.2")]));
+        let extension = ext(FunctionPool::new([FunctionSlot::new(
+            "vf0",
+            "0000:03:00.2",
+        )]));
         let state = state_dir("delete");
         let mut plan = sample_plan();
         extension
@@ -550,10 +624,13 @@ mod tests {
 
     #[tokio::test]
     async fn configure_launch_selects_kernel_and_declares_vf_passthrough() {
-        let extension = BluefieldExtension::new(VfPool::new([VfSlot::new("vf0", "0000:03:00.2")]))
-            .with_kernel(BluefieldKernel::from_image(
-                "/opt/openshell/kernels/bf-vmlinux",
-            ));
+        let extension = BluefieldExtension::new(FunctionPool::new([FunctionSlot::new(
+            "vf0",
+            "0000:03:00.2",
+        )]))
+        .with_kernel(BluefieldKernel::from_image(
+            "/opt/openshell/kernels/bf-vmlinux",
+        ));
 
         let mut plan = sample_plan();
         extension
@@ -580,14 +657,20 @@ mod tests {
 
     #[tokio::test]
     async fn configure_launch_sets_qemu_requirements_without_manual_internal_args() {
-        let extension = ext(VfPool::new([
-            VfSlot::new("vf29", "0000:b1:04.1").with_vf_index(29),
-        ]))
+        let extension = ext(FunctionPool::new([FunctionSlot::new(
+            "vf29",
+            "0000:b1:04.1",
+        )
+        .with_index(29)]))
         .with_kernel(BluefieldKernel::from_image("/runtime/vmlinux"));
 
         let mut plan = sample_plan();
         extension
-            .configure_launch(&sandbox("sandbox-bluefield"), &PathBuf::from("/tmp/s"), &mut plan)
+            .configure_launch(
+                &sandbox("sandbox-bluefield"),
+                &PathBuf::from("/tmp/s"),
+                &mut plan,
+            )
             .await
             .unwrap();
 
@@ -603,7 +686,10 @@ mod tests {
             plan.required_backend_features
                 .contains(&BackendFeature::ExternalKernelImage)
         );
-        assert_eq!(plan.kernel_image.as_deref(), Some(Path::new("/runtime/vmlinux")));
+        assert_eq!(
+            plan.kernel_image.as_deref(),
+            Some(Path::new("/runtime/vmlinux"))
+        );
         assert!(plan.tap_device.is_none());
         assert!(plan.guest_ip.is_none());
         assert!(plan.host_ip.is_none());
@@ -613,20 +699,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configure_launch_preserves_non_loopback_gateway_endpoint() {
+        let extension = ext(FunctionPool::new([FunctionSlot::new(
+            "vf29",
+            "0000:b1:04.1",
+        )
+        .with_index(29)]))
+        .with_openshell_endpoint("http://10.0.110.4:18091/");
+
+        let mut plan = sample_plan();
+        extension
+            .configure_launch(
+                &sandbox("sandbox-bluefield"),
+                &PathBuf::from("/tmp/s"),
+                &mut plan,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            plan.env
+                .iter()
+                .any(|env| env == "OPENSHELL_ENDPOINT=http://10.0.110.4:18091/")
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_launch_does_not_preserve_loopback_gateway_endpoint() {
+        let extension = ext(FunctionPool::new([FunctionSlot::new(
+            "vf29",
+            "0000:b1:04.1",
+        )
+        .with_index(29)]))
+        .with_openshell_endpoint("http://127.0.0.1:18091/");
+
+        let mut plan = sample_plan();
+        extension
+            .configure_launch(
+                &sandbox("sandbox-bluefield"),
+                &PathBuf::from("/tmp/s"),
+                &mut plan,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !plan
+                .env
+                .iter()
+                .any(|env| env.starts_with("OPENSHELL_ENDPOINT="))
+        );
+    }
+
+    #[tokio::test]
     async fn before_restore_reclaims_and_records() {
         let state = state_dir("restore");
-        let initial = ext(VfPool::new([
-            VfSlot::new("vf0", "0000:03:00.2").with_representor("pf0vf0")
-        ]));
+        let initial = ext(FunctionPool::new([FunctionSlot::new(
+            "vf0",
+            "0000:03:00.2",
+        )
+        .with_representor("pf0vf0")]));
         let mut plan = sample_plan();
         initial
             .before_launch(&sandbox("sb-restore"), &state, &mut plan)
             .await
             .unwrap();
 
-        let extension = ext(VfPool::new([
-            VfSlot::new("vf0", "0000:03:00.2").with_representor("pf0vf0")
-        ]));
+        let extension = ext(FunctionPool::new([FunctionSlot::new(
+            "vf0",
+            "0000:03:00.2",
+        )
+        .with_representor("pf0vf0")]));
         let ctx = RestoreContext {
             sandbox: sandbox("sb-restore"),
             state_dir: state.clone(),

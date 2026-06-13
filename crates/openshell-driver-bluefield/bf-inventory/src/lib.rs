@@ -3,12 +3,13 @@
 
 //! BlueField function inventory, discovery, and allocation.
 
-pub use bf_core::{VfRef, VfSlot};
+pub use bf_core::{FunctionKind, FunctionSlot, NetFunction};
 
 pub mod inventory;
 pub mod pool;
 
 pub use inventory::{
-    StaticVfInventory, SysfsRepresentorInventory, SysfsVfInventory, VfError, VfInventory, VfResult,
+    FunctionInventory, InventoryError, InventoryResult, StaticFunctionInventory,
+    SysfsRepresentorInventory, SysfsVfInventory,
 };
-pub use pool::VfPool;
+pub use pool::FunctionPool;

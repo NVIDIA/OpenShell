@@ -12,7 +12,7 @@ pub mod state;
 pub use assignment::BluefieldAssignment;
 pub use claim::{DpuClaim, NetworkMode, StorageMode};
 pub use error::{BluefieldError, Result};
-pub use handles::{AttachSpec, ProxyPlacement, VfRef, VfSlot};
+pub use handles::{AttachSpec, FunctionKind, FunctionSlot, NetFunction, ProxyPlacement};
 pub use lifecycle::{
     BluefieldLifecycleExtension, LaunchAbortReason, LifecycleActivation, LifecycleContext,
     LifecycleRegistry, RestoreContext, RuntimePlan, SandboxIdentity,

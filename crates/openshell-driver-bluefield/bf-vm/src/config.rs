@@ -126,7 +126,7 @@ pub(crate) fn guest_egress_from_config(
             address_cidr,
             gateway: gateway.clone(),
         })),
-        (None, None) => Ok(None),
+        (None, None) if !config.enabled => Ok(None),
         _ => Err(
             "BlueField guest egress requires OPENSHELL_BLUEFIELD_EGRESS_GATEWAY with OPENSHELL_BLUEFIELD_EGRESS_CIDR or OPENSHELL_BLUEFIELD_EGRESS_CIDR_POOL"
                 .to_string(),
@@ -136,7 +136,7 @@ pub(crate) fn guest_egress_from_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{BluefieldDriverConfig, reject_deferred_proxy};
+    use super::{BluefieldDriverConfig, guest_egress_from_config, reject_deferred_proxy};
     use bf_core::ProxyPlacement;
 
     #[test]
@@ -163,5 +163,60 @@ mod tests {
         let err = reject_deferred_proxy(&config).unwrap_err();
 
         assert!(err.contains("explicit proxy URL is deferred"));
+    }
+
+    #[test]
+    fn guest_egress_from_config_accepts_cidr_and_gateway() {
+        let config = BluefieldDriverConfig {
+            enabled: true,
+            egress_cidr: Some("10.0.120.10/22".to_string()),
+            egress_gateway: Some("10.0.120.254".to_string()),
+            ..Default::default()
+        };
+
+        let egress = guest_egress_from_config(&config)
+            .unwrap()
+            .expect("egress config");
+
+        assert_eq!(egress.address_cidr, "10.0.120.10/22");
+        assert_eq!(egress.gateway, "10.0.120.254");
+    }
+
+    #[test]
+    fn guest_egress_requires_cidr_and_gateway_when_bluefield_enabled() {
+        let config = BluefieldDriverConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let err = guest_egress_from_config(&config).unwrap_err();
+
+        assert!(err.contains("BlueField guest egress requires"));
+    }
+
+    #[test]
+    fn guest_egress_requires_gateway_with_cidr() {
+        let config = BluefieldDriverConfig {
+            enabled: true,
+            egress_cidr: Some("10.0.120.10/22".to_string()),
+            ..Default::default()
+        };
+
+        let err = guest_egress_from_config(&config).unwrap_err();
+
+        assert!(err.contains("BlueField guest egress requires"));
+    }
+
+    #[test]
+    fn guest_egress_requires_cidr_with_gateway() {
+        let config = BluefieldDriverConfig {
+            enabled: true,
+            egress_gateway: Some("10.0.120.254".to_string()),
+            ..Default::default()
+        };
+
+        let err = guest_egress_from_config(&config).unwrap_err();
+
+        assert!(err.contains("BlueField guest egress requires"));
     }
 }

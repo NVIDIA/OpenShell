@@ -6,7 +6,7 @@
 
 use crate::lifecycle::GuestInitDropin;
 
-use bf_inventory::VfSlot;
+use bf_inventory::FunctionSlot;
 
 const ENV_EGRESS: &str = "OPENSHELL_VM_DATA_EGRESS";
 const ENV_IP_MODE: &str = "OPENSHELL_VM_DATA_IP_MODE";
@@ -26,32 +26,32 @@ pub struct GuestEgress {
 
 impl GuestEgress {
     /// Build the `OPENSHELL_VM_DATA_*` env vars the guest-init drop-in reads.
-    /// A per-slot `guest_datapath_address` overrides `address_cidr`.
+    /// A per-slot `datapath_address` overrides `address_cidr`.
     #[must_use]
-    pub fn env(&self, slot: &VfSlot) -> Vec<String> {
+    pub fn env(&self, slot: &FunctionSlot) -> Vec<String> {
         GuestEgressEnv::for_slot(self, slot).to_env()
     }
 }
 
-/// Concrete guest-init environment for one sandbox VF.
+/// Concrete guest-init environment for one sandbox function.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GuestEgressEnv {
     address_cidr: String,
     gateway: String,
-    guest_mac: Option<String>,
+    mac: Option<String>,
 }
 
 impl GuestEgressEnv {
     #[must_use]
-    fn for_slot(egress: &GuestEgress, slot: &VfSlot) -> Self {
+    fn for_slot(egress: &GuestEgress, slot: &FunctionSlot) -> Self {
         let address = slot
-            .guest_datapath_address
+            .datapath_address
             .as_deref()
             .unwrap_or(&egress.address_cidr);
         Self {
             address_cidr: address.to_string(),
             gateway: egress.gateway.clone(),
-            guest_mac: slot.guest_mac.clone(),
+            mac: slot.mac.clone(),
         }
     }
 
@@ -63,7 +63,7 @@ impl GuestEgressEnv {
             format!("{}={}", ENV_IP, self.address_cidr),
             format!("{}={}", ENV_GATEWAY, self.gateway),
         ];
-        if let Some(mac) = self.guest_mac.as_deref() {
+        if let Some(mac) = self.mac.as_deref() {
             env.push(format!("{ENV_MAC}={mac}"));
         }
         env
@@ -85,7 +85,7 @@ pub fn dropin() -> GuestInitDropin {
 #[cfg(test)]
 mod tests {
     use super::GuestEgress;
-    use bf_inventory::VfSlot;
+    use bf_inventory::FunctionSlot;
 
     #[test]
     fn env_contract_uses_default_address_without_dns_or_mac() {
@@ -93,7 +93,7 @@ mod tests {
             address_cidr: "10.0.120.10/22".to_string(),
             gateway: "10.0.120.254".to_string(),
         };
-        let slot = VfSlot::new("vf0", "0000:03:00.2");
+        let slot = FunctionSlot::new("vf0", "0000:03:00.2");
         let env = egress.env(&slot);
         assert_eq!(
             env,
@@ -112,8 +112,8 @@ mod tests {
             address_cidr: "10.0.120.10/22".to_string(),
             gateway: "10.0.120.254".to_string(),
         };
-        let slot = VfSlot::new("vf0", "0000:03:00.2").with_guest_datapath_address("10.0.120.61/22");
-        let slot = slot.with_guest_mac("02:bf:64:04:00:10");
+        let slot = FunctionSlot::new("vf0", "0000:03:00.2").with_datapath_address("10.0.120.61/22");
+        let slot = slot.with_mac("02:bf:64:04:00:10");
         let env = egress.env(&slot);
         assert_eq!(
             env,
@@ -138,10 +138,15 @@ mod tests {
         assert!(script.contains("find_bluefield_vf()"));
         assert!(script.contains("configure_static_ip()"));
         assert!(script.contains("configure_resolv_conf()"));
+        assert!(script.contains("remove_inherited_default_routes()"));
+        assert!(script.contains("verify_vf_default_route()"));
         assert!(script.contains("main \"$@\""));
         assert!(script.contains("ip link set dev \"${vf_nic}\" address"));
         assert!(script.contains("ip addr add"));
+        assert!(script.contains("ip route del default"));
         assert!(script.contains("ip route replace default"));
+        assert!(script.contains("ip route get \"${OPENSHELL_VM_DATA_GW}\""));
+        assert!(script.contains("dev ${vf_nic}"));
         assert!(!script.contains("OPENSHELL_VM_DATA_DNS"));
         assert!(script.contains("resolv.conf"));
         assert!(script.contains("DPU-side policy"));
