@@ -127,10 +127,12 @@ pub(crate) fn guest_egress_from_config(
             gateway: gateway.clone(),
         })),
         (None, None) if !config.enabled => Ok(None),
-        _ => Err(
-            "BlueField guest egress requires OPENSHELL_BLUEFIELD_EGRESS_GATEWAY with OPENSHELL_BLUEFIELD_EGRESS_CIDR or OPENSHELL_BLUEFIELD_EGRESS_CIDR_POOL"
-                .to_string(),
-        ),
+        _ => Err(format!(
+            "BlueField guest egress requires {} with {} or {}",
+            bf_core::env::BLUEFIELD_EGRESS_GATEWAY,
+            bf_core::env::BLUEFIELD_EGRESS_CIDR,
+            bf_core::env::BLUEFIELD_EGRESS_CIDR_POOL
+        )),
     }
 }
 

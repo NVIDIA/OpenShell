@@ -6,13 +6,14 @@
 
 use crate::lifecycle::GuestInitDropin;
 
+use bf_core::env;
 use bf_inventory::FunctionSlot;
 
-const ENV_EGRESS: &str = "OPENSHELL_VM_DATA_EGRESS";
-const ENV_IP_MODE: &str = "OPENSHELL_VM_DATA_IP_MODE";
-const ENV_IP: &str = "OPENSHELL_VM_DATA_IP";
-const ENV_GATEWAY: &str = "OPENSHELL_VM_DATA_GW";
-const ENV_MAC: &str = "OPENSHELL_VM_DATA_MAC";
+const ENV_EGRESS: &str = env::VM_DATA_EGRESS;
+const ENV_IP_MODE: &str = env::VM_DATA_IP_MODE;
+const ENV_IP: &str = env::VM_DATA_IP;
+const ENV_GATEWAY: &str = env::VM_DATA_GW;
+const ENV_MAC: &str = env::VM_DATA_MAC;
 const EGRESS_EXTERNAL_VF: &str = "external-vf";
 const IP_MODE_STATIC: &str = "static";
 const DROPIN_SCRIPT: &[u8] = include_bytes!("../scripts/guest-egress-dropin.sh");

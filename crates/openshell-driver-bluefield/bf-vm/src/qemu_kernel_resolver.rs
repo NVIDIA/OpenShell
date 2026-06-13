@@ -27,12 +27,13 @@ pub(crate) fn resolve_qemu_kernel_image(
     }
 
     Err(format!(
-        "BlueField QEMU kernel image not found; searched: {}. Set OPENSHELL_BLUEFIELD_KERNEL_IMAGE or place vmlinux in the OpenShell vm-runtime directory. Docker and Kubernetes BlueField runtimes do not use this QEMU kernel path.",
+        "BlueField QEMU kernel image not found; searched: {}. Set {} or place vmlinux in the OpenShell vm-runtime directory. Docker and Kubernetes BlueField runtimes do not use this QEMU kernel path.",
         runtime_roots
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        bf_core::env::BLUEFIELD_KERNEL_IMAGE
     ))
 }
 

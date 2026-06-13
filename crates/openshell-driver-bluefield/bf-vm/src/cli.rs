@@ -17,7 +17,7 @@ use super::{BluefieldDriverConfig, ProxyPlacement};
 pub struct BluefieldDriverArgs {
     #[arg(
         long = "bluefield",
-        env = "OPENSHELL_BLUEFIELD",
+        env = bf_core::env::BLUEFIELD,
         default_value_t = false
     )]
     pub enabled: bool,
@@ -27,110 +27,110 @@ pub struct BluefieldDriverArgs {
     /// topology.
     #[arg(
         long = "bluefield-role",
-        env = "OPENSHELL_BLUEFIELD_ROLE",
+        env = bf_core::env::BLUEFIELD_ROLE,
         default_value = "all-in-one"
     )]
     pub role: String,
 
     #[arg(
         long = "bluefield-controller-endpoint",
-        env = "OPENSHELL_BLUEFIELD_CONTROLLER_ENDPOINT"
+        env = bf_core::env::BLUEFIELD_CONTROLLER_ENDPOINT
     )]
     pub controller_endpoint: Option<String>,
 
-    #[arg(long = "bluefield-tls-dir", env = "OPENSHELL_BLUEFIELD_TLS_DIR")]
+    #[arg(long = "bluefield-tls-dir", env = bf_core::env::BLUEFIELD_TLS_DIR)]
     pub tls_dir: Option<PathBuf>,
 
     #[arg(
         long = "bluefield-tls-domain",
-        env = "OPENSHELL_BLUEFIELD_TLS_DOMAIN",
+        env = bf_core::env::BLUEFIELD_TLS_DOMAIN,
         default_value = "bluefield-controller"
     )]
     pub tls_domain: String,
 
-    #[arg(long = "bluefield-host-pf", env = "OPENSHELL_BLUEFIELD_HOST_PF")]
+    #[arg(long = "bluefield-host-pf", env = bf_core::env::BLUEFIELD_HOST_PF)]
     pub host_pf: Option<String>,
 
     #[arg(
         long = "bluefield-reserved-vf-index",
-        env = "OPENSHELL_BLUEFIELD_RESERVED_VF_INDEXES",
+        env = bf_core::env::BLUEFIELD_RESERVED_VF_INDEXES,
         value_delimiter = ','
     )]
     pub reserved_vf_indexes: Vec<u32>,
 
-    #[arg(long = "bluefield-pf-key", env = "OPENSHELL_BLUEFIELD_PF_KEY")]
+    #[arg(long = "bluefield-pf-key", env = bf_core::env::BLUEFIELD_PF_KEY)]
     pub pf_key: Option<String>,
 
-    #[arg(long = "bluefield-snat-ip", env = "OPENSHELL_BLUEFIELD_SNAT_IP")]
+    #[arg(long = "bluefield-snat-ip", env = bf_core::env::BLUEFIELD_SNAT_IP)]
     pub snat_ip: Option<String>,
 
     #[arg(
         long = "bluefield-uplink-port",
-        env = "OPENSHELL_BLUEFIELD_UPLINK_PORT"
+        env = bf_core::env::BLUEFIELD_UPLINK_PORT
     )]
     pub uplink_port: Option<String>,
 
     #[arg(
         long = "bluefield-kernel-image",
-        env = "OPENSHELL_BLUEFIELD_KERNEL_IMAGE"
+        env = bf_core::env::BLUEFIELD_KERNEL_IMAGE
     )]
     pub kernel_image: Option<PathBuf>,
 
     #[arg(
         long = "bluefield-kernel-version",
-        env = "OPENSHELL_BLUEFIELD_KERNEL_VERSION"
+        env = bf_core::env::BLUEFIELD_KERNEL_VERSION
     )]
     pub kernel_version: Option<String>,
 
     #[arg(
         long = "bluefield-kernel-sha256",
-        env = "OPENSHELL_BLUEFIELD_KERNEL_SHA256"
+        env = bf_core::env::BLUEFIELD_KERNEL_SHA256
     )]
     pub kernel_sha256: Option<String>,
 
     #[arg(
         long = "bluefield-kernel-modules",
-        env = "OPENSHELL_BLUEFIELD_KERNEL_MODULES",
+        env = bf_core::env::BLUEFIELD_KERNEL_MODULES,
         value_delimiter = ','
     )]
     pub kernel_modules: Vec<String>,
 
     #[arg(
         long = "bluefield-egress-cidr",
-        env = "OPENSHELL_BLUEFIELD_EGRESS_CIDR"
+        env = bf_core::env::BLUEFIELD_EGRESS_CIDR
     )]
     pub egress_cidr: Option<String>,
 
     #[arg(
         long = "bluefield-egress-cidr-pool",
-        env = "OPENSHELL_BLUEFIELD_EGRESS_CIDR_POOL",
+        env = bf_core::env::BLUEFIELD_EGRESS_CIDR_POOL,
         value_delimiter = ','
     )]
     pub egress_cidr_pool: Vec<String>,
 
     #[arg(
         long = "bluefield-egress-gateway",
-        env = "OPENSHELL_BLUEFIELD_EGRESS_GATEWAY"
+        env = bf_core::env::BLUEFIELD_EGRESS_GATEWAY
     )]
     pub egress_gateway: Option<String>,
 
     #[arg(
         long = "bluefield-egress-dns",
-        env = "OPENSHELL_BLUEFIELD_EGRESS_DNS",
+        env = bf_core::env::BLUEFIELD_EGRESS_DNS,
         value_delimiter = ','
     )]
     pub egress_dns: Vec<String>,
 
     #[arg(
         long = "bluefield-proxy-placement",
-        env = "OPENSHELL_BLUEFIELD_PROXY_PLACEMENT",
+        env = bf_core::env::BLUEFIELD_PROXY_PLACEMENT,
         default_value = "none"
     )]
     pub proxy_placement: String,
 
     #[arg(
         long = "bluefield-explicit-proxy-url",
-        env = "OPENSHELL_BLUEFIELD_EXPLICIT_PROXY_URL"
+        env = bf_core::env::BLUEFIELD_EXPLICIT_PROXY_URL
     )]
     pub explicit_proxy_url: Option<String>,
 }

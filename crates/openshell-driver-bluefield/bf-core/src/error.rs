@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Error surface shared by BlueField driver crates.
 
 pub type Result<T> = std::result::Result<T, BluefieldError>;

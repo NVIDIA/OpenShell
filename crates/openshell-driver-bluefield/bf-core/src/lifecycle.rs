@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! BlueField driver lifecycle extension framework.
 //!
 //! This mirrors the in-tree VM lifecycle extension hook chain, but the hooks

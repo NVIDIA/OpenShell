@@ -216,15 +216,15 @@ Register the gateway:
 /opt/openshell/bin/openshell gateway add \
   http://10.0.110.4:18083 \
   --local \
-  --name worker3-bf
+  --name bf-gateway
 
-/opt/openshell/bin/openshell --gateway worker3-bf status
+/opt/openshell/bin/openshell --gateway bf-gateway status
 ```
 
 Create a sandbox:
 
 ```shell
-/opt/openshell/bin/openshell --gateway worker3-bf sandbox create \
+/opt/openshell/bin/openshell --gateway bf-gateway sandbox create \
   --name bf-vf-egress \
   --from ghcr.io/nvidia/openshell-community/sandboxes/base:latest \
   -- sleep infinity
@@ -233,14 +233,14 @@ Create a sandbox:
 Inspect or connect:
 
 ```shell
-/opt/openshell/bin/openshell --gateway worker3-bf sandbox list
-/opt/openshell/bin/openshell --gateway worker3-bf sandbox connect bf-vf-egress
+/opt/openshell/bin/openshell --gateway bf-gateway sandbox list
+/opt/openshell/bin/openshell --gateway bf-gateway sandbox connect bf-vf-egress
 ```
 
 Delete the sandbox when finished:
 
 ```shell
-/opt/openshell/bin/openshell --gateway worker3-bf sandbox delete bf-vf-egress
+/opt/openshell/bin/openshell --gateway bf-gateway sandbox delete bf-vf-egress
 ```
 
 ## Network Verification
@@ -249,27 +249,27 @@ The sandbox process should see the normal OpenShell sandbox network path, not
 the BlueField VF:
 
 ```shell
-/opt/openshell/bin/openshell --gateway worker3-bf sandbox exec \
+/opt/openshell/bin/openshell --gateway bf-gateway sandbox exec \
   --name bf-vf-egress -- ip link
 ```
 
 Verify internet egress through the policy path:
 
 ```shell
-/opt/openshell/bin/openshell --gateway worker3-bf sandbox exec \
+/opt/openshell/bin/openshell --gateway bf-gateway sandbox exec \
   --name bf-vf-egress -- curl -I https://example.com
 ```
 
 On the host, the selected VF should be bound to `vfio-pci` while the sandbox is
 running and restored when the sandbox is deleted.
 
-## Worker3 Validation Values
+## Validation Values
 
-The worker3 validation used:
+A representative validation run used:
 
 ```text
 gateway: 10.0.110.4:18083
-host: worker3 / 10.0.110.23
+host: compute-host / 10.0.110.23
 PF: enp177s0f0np0 / 0000:b1:00.0
 VF: enp177s0f0v29 / 0000:b1:04.1
 DPU representor: pf0vf29

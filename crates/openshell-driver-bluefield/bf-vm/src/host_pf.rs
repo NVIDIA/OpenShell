@@ -62,17 +62,18 @@ fn auto_discover_host_pf(sysfs_root: &Path) -> Result<ResolvedHostPf, String> {
     let mut candidates = discover_bluefield_pf_candidates(sysfs_root)?;
     candidates.sort();
     match candidates.len() {
-        0 => Err(
-            "no BlueField-capable PF with configured SR-IOV VFs found; set OPENSHELL_BLUEFIELD_HOST_PF to the PF netdev or PCI BDF"
-                .to_string(),
-        ),
+        0 => Err(format!(
+            "no BlueField-capable PF with configured SR-IOV VFs found; set {} to the PF netdev or PCI BDF",
+            bf_core::env::BLUEFIELD_HOST_PF
+        )),
         1 => Ok(ResolvedHostPf {
             bdf: candidates.remove(0),
             source: HostPfSource::AutoDiscovered,
         }),
         _ => Err(format!(
-            "multiple BlueField-capable PFs found: {}; set OPENSHELL_BLUEFIELD_HOST_PF to one PF netdev or PCI BDF",
-            candidates.join(", ")
+            "multiple BlueField-capable PFs found: {}; set {} to one PF netdev or PCI BDF",
+            candidates.join(", "),
+            bf_core::env::BLUEFIELD_HOST_PF
         )),
     }
 }
