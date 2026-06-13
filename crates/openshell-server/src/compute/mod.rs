@@ -16,6 +16,7 @@ use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
+use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
@@ -39,12 +40,16 @@ use openshell_driver_podman::{
 use prost::Message;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::sync::{Mutex, watch};
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
+use tower::service_fn;
 use tracing::{debug, info, warn};
 
 type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
@@ -102,11 +107,11 @@ pub use openshell_core::ComputeDriverError as ComputeError;
 #[derive(Debug)]
 pub struct ManagedDriverProcess {
     child: std::sync::Mutex<Option<tokio::process::Child>>,
-    socket_path: std::path::PathBuf,
+    socket_path: PathBuf,
 }
 
 impl ManagedDriverProcess {
-    pub(crate) fn new(child: tokio::process::Child, socket_path: std::path::PathBuf) -> Self {
+    pub(crate) fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
             socket_path,
@@ -245,7 +250,7 @@ impl fmt::Debug for ComputeRuntime {
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn from_driver(
-        driver_kind: ComputeDriverKind,
+        driver_kind: Option<ComputeDriverKind>,
         driver: SharedComputeDriver,
         shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
         startup_resume: Option<Arc<dyn StartupResume>>,
@@ -258,15 +263,24 @@ impl ComputeRuntime {
         _allows_loopback_endpoints: bool,
         gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
-        let default_image = driver
+        let capabilities = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
             .await
             .map_err(compute_error_from_status)?
-            .into_inner()
-            .default_image;
+            .into_inner();
+        // For out-of-tree drivers (driver_kind = None), log the name the
+        // driver advertises in GetCapabilities so operators can confirm
+        // the gateway is talking to the driver they expect.
+        if driver_kind.is_none() {
+            info!(
+                driver_name = %capabilities.driver_name,
+                "External compute driver connected"
+            );
+        }
+        let default_image = capabilities.default_image;
         Ok(Self {
             driver,
-            driver_kind: Some(driver_kind),
+            driver_kind,
             shutdown_cleanup,
             startup_resume,
             _driver_process: driver_process,
@@ -311,7 +325,7 @@ impl ComputeRuntime {
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
         let driver: SharedComputeDriver = driver;
         Self::from_driver(
-            ComputeDriverKind::Docker,
+            Some(ComputeDriverKind::Docker),
             driver,
             Some(shutdown_cleanup),
             Some(startup_resume),
@@ -340,7 +354,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
         Self::from_driver(
-            ComputeDriverKind::Kubernetes,
+            Some(ComputeDriverKind::Kubernetes),
             driver,
             None,
             None,
@@ -367,11 +381,44 @@ impl ComputeRuntime {
     ) -> Result<Self, ComputeError> {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
         Self::from_driver(
-            ComputeDriverKind::Vm,
+            Some(ComputeDriverKind::Vm),
             driver,
             None,
             None,
             driver_process,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+            true,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Construct a runtime that proxies all sandbox lifecycle to an
+    /// out-of-tree compute driver listening on a pre-existing UDS endpoint.
+    ///
+    /// The driver process is operator-managed (not spawned by the gateway),
+    /// so no [`ManagedDriverProcess`] handle is attached. The advertised
+    /// `driver_name` from `GetCapabilities` is logged for diagnostics by
+    /// [`Self::from_driver`].
+    pub(crate) async fn new_remote_external(
+        channel: Channel,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
+        Self::from_driver(
+            None,
+            driver,
+            None,
+            None,
+            None,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -396,7 +443,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
-            ComputeDriverKind::Podman,
+            Some(ComputeDriverKind::Podman),
             driver,
             None,
             None,
@@ -1369,6 +1416,38 @@ impl ComputeRuntime {
             Err(status) => Err(status.to_string()),
         }
     }
+}
+
+/// Connect to an out-of-tree compute driver that is already listening on
+/// `socket_path` and return a tonic `Channel` speaking `compute_driver.proto`.
+///
+/// The gateway does not spawn or own the driver process — the operator is
+/// responsible for placing the driver alongside the gateway and granting the
+/// gateway uid read/write on the socket. The host portion of the URL is
+/// ignored because the connector resolves to the UDS rather than DNS.
+#[cfg(unix)]
+pub async fn connect_external_compute_driver(socket_path: &Path) -> Result<Channel, ComputeError> {
+    let socket_path: PathBuf = socket_path.to_path_buf();
+    let display_path = socket_path.clone();
+    Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
+            let socket_path = socket_path.clone();
+            async move { UnixStream::connect(socket_path).await.map(TokioIo::new) }
+        }))
+        .await
+        .map_err(|e| {
+            ComputeError::Message(format!(
+                "failed to connect to external compute driver socket '{}': {e}",
+                display_path.display()
+            ))
+        })
+}
+
+#[cfg(not(unix))]
+pub async fn connect_external_compute_driver(_socket_path: &Path) -> Result<Channel, ComputeError> {
+    Err(ComputeError::Message(
+        "the external compute driver requires unix domain socket support".to_string(),
+    ))
 }
 
 fn driver_sandbox_from_public(

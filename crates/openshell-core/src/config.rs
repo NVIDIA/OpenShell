@@ -360,6 +360,12 @@ pub struct Config {
     /// configured driver.
     pub compute_drivers: Vec<ComputeDriverKind>,
 
+    /// When set, the gateway dispatches sandbox lifecycle to an out-of-tree
+    /// compute driver process listening on this Unix domain socket and
+    /// speaking `compute_driver.proto`. Takes precedence over
+    /// `compute_drivers` and the auto-detection probe.
+    pub external_compute_driver_socket: Option<PathBuf>,
+
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
 
@@ -559,6 +565,7 @@ impl Config {
             gateway_jwt: None,
             database_url: String::new(),
             compute_drivers: vec![],
+            external_compute_driver_socket: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
@@ -619,6 +626,13 @@ impl Config {
         I: IntoIterator<Item = ComputeDriverKind>,
     {
         self.compute_drivers = drivers.into_iter().collect();
+        self
+    }
+
+    /// Pin an external compute driver by Unix domain socket path.
+    #[must_use]
+    pub fn with_external_compute_driver_socket(mut self, socket: Option<PathBuf>) -> Self {
+        self.external_compute_driver_socket = socket;
         self
     }
 

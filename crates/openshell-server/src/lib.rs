@@ -709,6 +709,26 @@ async fn build_compute_runtime(
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 ) -> Result<ComputeRuntime> {
+    if let Some(socket_path) = config.external_compute_driver_socket.as_deref() {
+        info!(
+            socket = %socket_path.display(),
+            "Using external compute driver"
+        );
+        let channel = compute::connect_external_compute_driver(socket_path)
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+        return ComputeRuntime::new_remote_external(
+            channel,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+        )
+        .await
+        .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")));
+    }
+
     let driver = configured_compute_driver(config)?;
     info!(driver = %driver, "Using compute driver");
     warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, driver);
