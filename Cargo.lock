@@ -3513,6 +3513,15 @@ version = "0.0.0"
 dependencies = [
  "miette",
  "openshell-core",
+ "openshell-policy-schema",
+ "serde_json",
+]
+
+[[package]]
+name = "openshell-policy-schema"
+version = "0.0.0"
+dependencies = [
+ "miette",
  "serde",
  "serde_json",
  "serde_yml",

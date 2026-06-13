@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "openshell-policy"
-description = "Shared sandbox policy parsing and defaults for OpenShell"
+name = "openshell-policy-schema"
+description = "YAML schema types and pure-Rust parsing for OpenShell sandbox policies"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,9 +11,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-openshell-core = { path = "../openshell-core", default-features = false }
-openshell-policy-schema = { path = "../openshell-policy-schema" }
+serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yml = { workspace = true }
 miette = { workspace = true }
 
 [lints]

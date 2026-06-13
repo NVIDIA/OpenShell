@@ -4,229 +4,29 @@
 //! Shared sandbox policy parsing and defaults for `OpenShell`.
 //!
 //! Provides bidirectional YAML↔proto conversion for sandbox policies.
-//!
-//! The serde types here are the **single canonical representation** of the YAML
-//! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
-//! these types, ensuring round-trip fidelity.
+//! YAML schema types and pure parsing logic live in `openshell-policy-schema`;
+//! this crate adds the proto conversion layer on top.
 
 mod compose;
 mod merge;
 
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
-use std::path::Path;
-
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::Result;
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
     LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
     SandboxPolicy,
 };
-use serde::{Deserialize, Serialize};
+use openshell_policy_schema::{
+    FilesystemDef, GraphqlOperationDef, L7AllowDef, L7DenyRuleDef, L7RuleDef, LandlockDef,
+    NetworkBinaryDef, NetworkEndpointDef, NetworkPolicyRuleDef, PolicyFile, ProcessDef,
+    QueryAnyDef, QueryMatcherDef,
+};
 
 pub use compose::{ProviderPolicyLayer, compose_effective_policy, provider_rule_name};
 pub use merge::{
     PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
     merge_policy, policy_covers_rule,
 };
-
-// ---------------------------------------------------------------------------
-// YAML serde types (canonical — used for both parsing and serialization)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PolicyFile {
-    version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    filesystem_policy: Option<FilesystemDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    landlock: Option<LandlockDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    process: Option<ProcessDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilesystemDef {
-    #[serde(default)]
-    include_workdir: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    read_only: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    read_write: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LandlockDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    compatibility: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProcessDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    run_as_user: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    run_as_group: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkPolicyRuleDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    endpoints: Vec<NetworkEndpointDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    binaries: Vec<NetworkBinaryDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkEndpointDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    host: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    /// Single port (backwards compat). Mutually exclusive with `ports`.
-    /// Uses `u16` to reject invalid values >65535 at parse time.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    port: u16,
-    /// Multiple ports. When non-empty, this endpoint covers all listed ports.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    ports: Vec<u16>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    protocol: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    tls: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    enforcement: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    access: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    rules: Vec<L7RuleDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    allowed_ips: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    deny_rules: Vec<L7DenyRuleDef>,
-    /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
-    /// rather than rejected by the L7 path canonicalizer. Required for
-    /// upstreams like GitLab that embed `%2F` in namespaced resource paths.
-    /// Defaults to false (strict).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    allow_encoded_slash: bool,
-    /// When true, client-to-server WebSocket text messages on this REST
-    /// endpoint rewrite credential placeholders after an allowed 101 upgrade.
-    /// Defaults to false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    websocket_credential_rewrite: bool,
-    /// When true, supported textual REST request bodies rewrite credential
-    /// placeholders before forwarding upstream. Defaults to false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    request_body_credential_rewrite: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    persisted_queries: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    graphql_max_body_bytes: u32,
-}
-
-// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero(v: &u16) -> bool {
-    *v == 0
-}
-
-// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero_u32(v: &u32) -> bool {
-    *v == 0
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GraphqlOperationDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7RuleDef {
-    allow: L7AllowDef,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7AllowDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    command: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query: BTreeMap<String, QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-enum QueryMatcherDef {
-    Glob(String),
-    Any(QueryAnyDef),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QueryAnyDef {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    any: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7DenyRuleDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    command: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query: BTreeMap<String, QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkBinaryDef {
-    path: String,
-    /// Deprecated: ignored. Kept for backward compat with existing YAML files.
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    harness: bool,
-}
 
 // ---------------------------------------------------------------------------
 // YAML → proto conversion
@@ -543,10 +343,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
 
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw: PolicyFile = serde_yml::from_str(yaml)
-        .into_diagnostic()
-        .wrap_err("failed to parse sandbox policy YAML")?;
-    Ok(to_proto(raw))
+    openshell_policy_schema::parse_policy(yaml).map(to_proto)
 }
 
 /// Serialize a proto sandbox policy to a YAML string.
@@ -555,10 +352,7 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
-    let yaml_repr = from_proto(policy);
-    serde_yml::to_string(&yaml_repr)
-        .into_diagnostic()
-        .wrap_err("failed to serialize policy to YAML")
+    openshell_policy_schema::serialize_policy(&from_proto(policy))
 }
 
 /// Convert a proto sandbox policy into the canonical policy JSON representation.
@@ -566,18 +360,12 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
 pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
-    let json_repr = from_proto(policy);
-    serde_json::to_value(&json_repr)
-        .into_diagnostic()
-        .wrap_err("failed to serialize policy to JSON")
+    openshell_policy_schema::policy_to_json_value(&from_proto(policy))
 }
 
 /// Serialize a proto sandbox policy to a pretty-printed JSON string.
 pub fn serialize_sandbox_policy_json(policy: &SandboxPolicy) -> Result<String> {
-    let json_repr = sandbox_policy_to_json_value(policy)?;
-    serde_json::to_string_pretty(&json_repr)
-        .into_diagnostic()
-        .wrap_err("failed to serialize policy to JSON")
+    openshell_policy_schema::serialize_policy_json(&from_proto(policy))
 }
 
 /// Load a sandbox policy from an explicit source.
@@ -590,34 +378,10 @@ pub fn serialize_sandbox_policy_json(policy: &SandboxPolicy) -> Result<String> {
 /// caller to omit the policy and let the server / sandbox apply its own
 /// default.
 pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
-    let contents = if let Some(p) = cli_path {
-        let path = Path::new(p);
-        std::fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
-    } else if let Ok(policy_path) = std::env::var("OPENSHELL_SANDBOX_POLICY") {
-        let path = Path::new(&policy_path);
-        std::fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
-    } else {
-        return Ok(None);
-    };
-    parse_sandbox_policy(&contents).map(Some)
+    Ok(openshell_policy_schema::load_policy(cli_path)?.map(to_proto))
 }
 
-/// Well-known path where a sandbox container image can ship a policy YAML file.
-///
-/// When the gateway provides no policy at sandbox creation time, the sandbox
-/// supervisor probes this path before falling back to the restrictive default.
-pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
-
-/// Legacy path used before the navigator → openshell rename.
-///
-/// Existing community sandbox images still ship their policy at this path.
-/// The sandbox supervisor tries [`CONTAINER_POLICY_PATH`] first, then falls
-/// back to this legacy path for backward compatibility.
-pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
+pub use openshell_policy_schema::{CONTAINER_POLICY_PATH, LEGACY_CONTAINER_POLICY_PATH};
 
 /// Return a restrictive default policy suitable for sandboxes that have no
 /// explicit policy configured.
@@ -626,30 +390,7 @@ pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
 /// `sandbox` user, enables Landlock in best-effort mode, and **blocks all
 /// network access** (no network policies, no inference routing).
 pub fn restrictive_default_policy() -> SandboxPolicy {
-    SandboxPolicy {
-        version: 1,
-        filesystem: Some(FilesystemPolicy {
-            include_workdir: true,
-            read_only: vec![
-                "/usr".into(),
-                "/lib".into(),
-                "/proc".into(),
-                "/dev/urandom".into(),
-                "/app".into(),
-                "/etc".into(),
-                "/var/log".into(),
-            ],
-            read_write: vec!["/sandbox".into(), "/tmp".into(), "/dev/null".into()],
-        }),
-        landlock: Some(LandlockPolicy {
-            compatibility: "best_effort".into(),
-        }),
-        process: Some(ProcessPolicy {
-            run_as_user: "sandbox".into(),
-            run_as_group: "sandbox".into(),
-        }),
-        network_policies: HashMap::new(),
-    }
+    to_proto(openshell_policy_schema::restrictive_default())
 }
 
 /// Ensure the policy has `run_as_user: sandbox` and `run_as_group: sandbox`.
@@ -671,186 +412,16 @@ pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
 // Policy safety validation
 // ---------------------------------------------------------------------------
 
-/// Maximum number of filesystem paths (`read_only` + `read_write` combined).
-const MAX_FILESYSTEM_PATHS: usize = 256;
-
-/// Maximum length of any single filesystem path string.
-const MAX_PATH_LENGTH: usize = 4096;
-
-/// A safety violation found in a sandbox policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PolicyViolation {
-    /// `run_as_user` or `run_as_group` is not "sandbox".
-    InvalidProcessIdentity { field: &'static str, value: String },
-    /// A filesystem path contains `..` components.
-    PathTraversal { path: String },
-    /// A filesystem path is not absolute (does not start with `/`).
-    RelativePath { path: String },
-    /// A read-write filesystem path is overly broad (e.g. `/`).
-    OverlyBroadPath { path: String },
-    /// A filesystem path exceeds the maximum allowed length.
-    FieldTooLong { path: String, length: usize },
-    /// Too many filesystem paths in the policy.
-    TooManyPaths { count: usize },
-    /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
-    TldWildcard { policy_name: String, host: String },
-}
-
-impl fmt::Display for PolicyViolation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidProcessIdentity { field, value } => {
-                write!(f, "{field} must be 'sandbox', got '{value}'")
-            }
-            Self::PathTraversal { path } => {
-                write!(f, "path contains '..' traversal component: {path}")
-            }
-            Self::RelativePath { path } => {
-                write!(f, "path must be absolute (start with '/'): {path}")
-            }
-            Self::OverlyBroadPath { path } => {
-                write!(f, "read-write path is overly broad: {path}")
-            }
-            Self::FieldTooLong { path, length } => {
-                write!(
-                    f,
-                    "path exceeds maximum length ({length} > {MAX_PATH_LENGTH}): {path}"
-                )
-            }
-            Self::TooManyPaths { count } => {
-                write!(
-                    f,
-                    "too many filesystem paths ({count} > {MAX_FILESYSTEM_PATHS})"
-                )
-            }
-            Self::TldWildcard { policy_name, host } => {
-                write!(
-                    f,
-                    "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
-                     use subdomain wildcards like '*.example.com' instead"
-                )
-            }
-        }
-    }
-}
+pub use openshell_policy_schema::PolicyViolation;
 
 /// Validate that a sandbox policy does not contain unsafe content.
 ///
-/// Returns `Ok(())` if the policy is safe, or `Err(violations)` listing all
-/// safety violations found. Callers decide how to handle violations (hard
-/// error vs. logged warning).
-///
-/// Checks performed:
-/// - `run_as_user` / `run_as_group` must be "sandbox"
-/// - Filesystem paths must be absolute (start with `/`)
-/// - Filesystem paths must not contain `..` components
-/// - Read-write paths must not be overly broad (just `/`)
-/// - Individual path lengths must not exceed [`MAX_PATH_LENGTH`]
-/// - Total path count must not exceed [`MAX_FILESYSTEM_PATHS`]
-/// - Network endpoint hosts must not use TLD wildcards (e.g. `*.com`)
+/// Delegates to [`openshell_policy_schema::validate_policy`] via [`from_proto`].
+/// See that function for the full list of checks performed.
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
-    let mut violations = Vec::new();
-
-    // Check process identity — must be "sandbox".
-    // `ensure_sandbox_process_identity` should be called before this to
-    // fill in defaults; anything other than "sandbox" is rejected.
-    if let Some(ref process) = policy.process {
-        if process.run_as_user != "sandbox" {
-            violations.push(PolicyViolation::InvalidProcessIdentity {
-                field: "run_as_user",
-                value: process.run_as_user.clone(),
-            });
-        }
-        if process.run_as_group != "sandbox" {
-            violations.push(PolicyViolation::InvalidProcessIdentity {
-                field: "run_as_group",
-                value: process.run_as_group.clone(),
-            });
-        }
-    }
-
-    // Check filesystem paths
-    if let Some(ref fs) = policy.filesystem {
-        let total_paths = fs.read_only.len() + fs.read_write.len();
-        if total_paths > MAX_FILESYSTEM_PATHS {
-            violations.push(PolicyViolation::TooManyPaths { count: total_paths });
-        }
-
-        for path_str in fs.read_only.iter().chain(fs.read_write.iter()) {
-            if path_str.len() > MAX_PATH_LENGTH {
-                violations.push(PolicyViolation::FieldTooLong {
-                    path: truncate_for_display(path_str),
-                    length: path_str.len(),
-                });
-                continue;
-            }
-
-            let path = Path::new(path_str);
-
-            if !path.has_root() {
-                violations.push(PolicyViolation::RelativePath {
-                    path: path_str.clone(),
-                });
-            }
-
-            if path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                violations.push(PolicyViolation::PathTraversal {
-                    path: path_str.clone(),
-                });
-            }
-        }
-
-        // Only reject "/" as read-write (overly broad)
-        for path_str in &fs.read_write {
-            let normalized = path_str.trim_end_matches('/');
-            if normalized.is_empty() {
-                // Path is "/" or "///" etc.
-                violations.push(PolicyViolation::OverlyBroadPath {
-                    path: path_str.clone(),
-                });
-            }
-        }
-    }
-
-    // Check network policy endpoint hosts for TLD wildcards.
-    for (key, rule) in &policy.network_policies {
-        let name = if rule.name.is_empty() {
-            key.clone()
-        } else {
-            rule.name.clone()
-        };
-        for ep in &rule.endpoints {
-            if ep.host.contains('*') && (ep.host.starts_with("*.") || ep.host.starts_with("**.")) {
-                let label_count = ep.host.split('.').count();
-                if label_count <= 2 {
-                    violations.push(PolicyViolation::TldWildcard {
-                        policy_name: name.clone(),
-                        host: ep.host.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(violations)
-    }
-}
-
-/// Truncate a string for safe inclusion in error messages.
-fn truncate_for_display(s: &str) -> String {
-    if s.len() <= 80 {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..77])
-    }
+    openshell_policy_schema::validate_policy(&from_proto(policy))
 }
 
 /// Normalize a filesystem path by collapsing redundant separators
@@ -859,24 +430,7 @@ fn truncate_for_display(s: &str) -> String {
 /// This is a lexical normalization only — it does NOT resolve symlinks or
 /// check the filesystem.
 pub fn normalize_path(path: &str) -> String {
-    use std::path::Component;
-
-    let p = Path::new(path);
-    let mut normalized = std::path::PathBuf::new();
-    for component in p.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            #[allow(clippy::path_buf_push_overwrite)]
-            Component::RootDir => normalized.push("/"),
-            Component::CurDir => {} // skip "."
-            Component::ParentDir => {
-                // Keep ".." — validation will catch it separately
-                normalized.push("..");
-            }
-            Component::Normal(c) => normalized.push(c),
-        }
-    }
-    normalized.to_string_lossy().to_string()
+    openshell_policy_schema::normalize_path(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,10 +702,14 @@ network_policies:
         assert_eq!(LEGACY_CONTAINER_POLICY_PATH, "/etc/navigator/policy.yaml");
     }
 
-    // ---- Policy validation tests ----
+    // ---- validate_sandbox_policy delegation smoke tests ----
+    //
+    // Full validation logic lives in openshell_policy_schema::validate_policy.
+    // These tests verify that violations survive the from_proto roundtrip for
+    // each of the three field categories the validator inspects.
 
     #[test]
-    fn validate_rejects_root_run_as_user() {
+    fn validate_sandbox_policy_surfaces_process_violation() {
         let mut policy = restrictive_default_policy();
         policy.process = Some(ProcessPolicy {
             run_as_user: "root".into(),
@@ -1168,45 +726,12 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_uid_zero() {
-        let mut policy = restrictive_default_policy();
-        policy.process = Some(ProcessPolicy {
-            run_as_user: "0".into(),
-            run_as_group: "0".into(),
-        });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert_eq!(violations.len(), 2);
-    }
-
-    #[test]
-    fn validate_rejects_non_sandbox_user() {
-        let mut policy = restrictive_default_policy();
-        policy.process = Some(ProcessPolicy {
-            run_as_user: "nobody".into(),
-            run_as_group: "nogroup".into(),
-        });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert_eq!(violations.len(), 2);
-        assert!(
-            violations
-                .iter()
-                .all(|v| matches!(v, PolicyViolation::InvalidProcessIdentity { .. }))
-        );
-    }
-
-    #[test]
-    fn validate_accepts_sandbox_identity() {
-        let policy = restrictive_default_policy();
-        assert!(validate_sandbox_policy(&policy).is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_path_traversal() {
+    fn validate_sandbox_policy_surfaces_filesystem_violation() {
         let mut policy = restrictive_default_policy();
         policy.filesystem = Some(FilesystemPolicy {
             include_workdir: true,
             read_only: vec!["/usr/../etc/shadow".into()],
-            read_write: vec!["/tmp".into()],
+            read_write: vec![],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(
@@ -1217,102 +742,7 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_relative_paths() {
-        let mut policy = restrictive_default_policy();
-        policy.filesystem = Some(FilesystemPolicy {
-            include_workdir: true,
-            read_only: vec!["usr/lib".into()],
-            read_write: vec!["/tmp".into()],
-        });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, PolicyViolation::RelativePath { .. }))
-        );
-    }
-
-    #[test]
-    fn validate_rejects_overly_broad_read_write_path() {
-        let mut policy = restrictive_default_policy();
-        policy.filesystem = Some(FilesystemPolicy {
-            include_workdir: true,
-            read_only: vec!["/usr".into()],
-            read_write: vec!["/".into()],
-        });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. }))
-        );
-    }
-
-    #[test]
-    fn validate_accepts_valid_policy() {
-        let policy = restrictive_default_policy();
-        assert!(validate_sandbox_policy(&policy).is_ok());
-    }
-
-    #[test]
-    fn validate_accepts_empty_process() {
-        let policy = SandboxPolicy {
-            version: 1,
-            process: None,
-            filesystem: None,
-            landlock: None,
-            network_policies: HashMap::new(),
-        };
-        assert!(validate_sandbox_policy(&policy).is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_empty_run_as_user() {
-        let mut policy = restrictive_default_policy();
-        policy.process = Some(ProcessPolicy {
-            run_as_user: String::new(),
-            run_as_group: String::new(),
-        });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert_eq!(violations.len(), 2);
-    }
-
-    #[test]
-    fn validate_rejects_too_many_paths() {
-        let mut policy = restrictive_default_policy();
-        let many_paths: Vec<String> = (0..300).map(|i| format!("/path/{i}")).collect();
-        policy.filesystem = Some(FilesystemPolicy {
-            include_workdir: true,
-            read_only: many_paths,
-            read_write: vec!["/tmp".into()],
-        });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, PolicyViolation::TooManyPaths { .. }))
-        );
-    }
-
-    #[test]
-    fn validate_rejects_path_too_long() {
-        let mut policy = restrictive_default_policy();
-        let long_path = format!("/{}", "a".repeat(5000));
-        policy.filesystem = Some(FilesystemPolicy {
-            include_workdir: true,
-            read_only: vec![long_path],
-            read_write: vec!["/tmp".into()],
-        });
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, PolicyViolation::FieldTooLong { .. }))
-        );
-    }
-
-    #[test]
-    fn validate_rejects_tld_wildcard() {
+    fn validate_sandbox_policy_surfaces_network_violation() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
             "bad".into(),
@@ -1332,65 +762,6 @@ network_policies:
                 .iter()
                 .any(|v| matches!(v, PolicyViolation::TldWildcard { .. }))
         );
-    }
-
-    #[test]
-    fn validate_rejects_double_star_tld_wildcard() {
-        let mut policy = restrictive_default_policy();
-        policy.network_policies.insert(
-            "bad".into(),
-            NetworkPolicyRule {
-                name: "bad-rule".into(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "**.org".into(),
-                    port: 443,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-        );
-        let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, PolicyViolation::TldWildcard { .. }))
-        );
-    }
-
-    #[test]
-    fn validate_accepts_subdomain_wildcard() {
-        let mut policy = restrictive_default_policy();
-        policy.network_policies.insert(
-            "ok".into(),
-            NetworkPolicyRule {
-                name: "ok-rule".into(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "*.example.com".into(),
-                    port: 443,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-        );
-        assert!(validate_sandbox_policy(&policy).is_ok());
-    }
-
-    #[test]
-    fn validate_accepts_explicit_domain() {
-        let mut policy = restrictive_default_policy();
-        policy.network_policies.insert(
-            "ok".into(),
-            NetworkPolicyRule {
-                name: "ok-rule".into(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "example.com".into(),
-                    port: 443,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
-        );
-        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
