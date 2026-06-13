@@ -193,7 +193,7 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx build \
-            --file deploy/docker/Dockerfile.driver-vm-macos \
+            --file deploy/container/Dockerfile.driver-vm-macos \
             --build-arg OPENSHELL_CARGO_VERSION="${{ inputs['cargo-version'] }}" \
             --build-arg OPENSHELL_IMAGE_TAG="${{ inputs['image-tag'] }}" \
             --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \

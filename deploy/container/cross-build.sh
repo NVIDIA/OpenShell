@@ -6,7 +6,7 @@
 # Shared Rust cross-compilation helpers for multi-arch Docker builds.
 #
 # Source this script in Dockerfile RUN layers:
-#   COPY deploy/docker/cross-build.sh /usr/local/bin/
+#   COPY deploy/container/cross-build.sh /usr/local/bin/
 #   RUN . cross-build.sh && install_cross_toolchain && add_rust_target
 #   RUN . cross-build.sh && cargo_cross_build --release -p my-crate
 #
