@@ -1,0 +1,18 @@
+# tavily-profile.yaml
+id: tavily
+display_name: Tavily Search API
+category: knowledge
+credentials:
+  - name: api_key
+    env_vars: [TAVILY_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: api.tavily.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl
