@@ -28,6 +28,55 @@ pub const LABEL_SANDBOX_NAME: &str = "openshell.ai/sandbox-name";
 pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
 
 // ---------------------------------------------------------------------------
+// agent-sandbox CRD identity (group / version / kind / contract labels)
+//
+// These describe the upstream agent-sandbox CRDs the Kubernetes driver creates
+// and that the gateway's `IssueSandboxToken` auth path re-anchors against. They
+// are a cross-crate *security* contract: the ownerReference and claim-UID
+// checks in `openshell-server` must agree byte-for-byte with what
+// `openshell-driver-kubernetes` writes, so they live here as the single source
+// of truth rather than being duplicated per crate.
+// ---------------------------------------------------------------------------
+
+/// API group of the core agent-sandbox `Sandbox` CRD.
+pub const SANDBOX_CRD_GROUP: &str = "agents.x-k8s.io";
+
+/// API version shared by the agent-sandbox CRDs (base and extensions).
+pub const SANDBOX_CRD_VERSION: &str = "v1alpha1";
+
+/// `apiVersion` (`group/version`) of the core `Sandbox` CRD.
+pub const SANDBOX_CRD_API_VERSION: &str = "agents.x-k8s.io/v1alpha1";
+
+/// Kind of the core agent-sandbox `Sandbox` CRD.
+pub const SANDBOX_CRD_KIND: &str = "Sandbox";
+
+/// API group of the warm-pool extension CRDs.
+pub const SANDBOX_EXT_GROUP: &str = "extensions.agents.x-k8s.io";
+
+/// `apiVersion` (`group/version`) of the warm-pool extension CRDs.
+pub const SANDBOX_EXT_API_VERSION: &str = "extensions.agents.x-k8s.io/v1alpha1";
+
+/// Kind of the warm-pool `SandboxClaim` extension CRD.
+pub const SANDBOX_CLAIM_KIND: &str = "SandboxClaim";
+
+/// Kind of the warm-pool `SandboxTemplate` extension CRD.
+pub const SANDBOX_TEMPLATE_KIND: &str = "SandboxTemplate";
+
+/// Kind of the warm-pool `SandboxWarmPool` extension CRD.
+pub const SANDBOX_WARM_POOL_KIND: &str = "SandboxWarmPool";
+
+/// Pod annotation carrying the per-sandbox identity (note the `.io` suffix —
+/// distinct from the `.ai` [`LABEL_SANDBOX_ID`]). The gateway resolves a pod's
+/// ServiceAccount token back to this value during `IssueSandboxToken`.
+pub const SANDBOX_ID_ANNOTATION: &str = "openshell.io/sandbox-id";
+
+/// Label the upstream warm-pool controller stamps onto a bound `Sandbox` CR
+/// (and that the gateway sets on the `SandboxClaim`), carrying the binding
+/// `SandboxClaim`'s apiserver-assigned UID. The auth path cross-checks it
+/// against the controlling `SandboxClaim` ownerReference.
+pub const CLAIM_UID_LABEL: &str = "agents.x-k8s.io/claim-uid";
+
+// ---------------------------------------------------------------------------
 
 /// Path to the sandbox supervisor binary inside the container image.
 ///

@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Overlay that enables warm-pooled sandboxes for the Kubernetes e2e harness
+# (issue #1879). Layer it on top of values-skaffold.yaml, e.g.:
+#
+#   OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-warm-pool.yaml \
+#   OPENSHELL_E2E_WARM_POOL=1 \
+#   mise run e2e:kubernetes
+#
+# Requires the agent-sandbox warm-pool extension CRDs (the kube e2e harness
+# installs them). A single CPU pool of the trusted default image is enough to
+# exercise the claim path and the workspace-isolation assertions.
+server:
+  warmPool:
+    enabled: true
+    pools:
+      - name: default
+        replicas: 2

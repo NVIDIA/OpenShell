@@ -135,6 +135,10 @@ async fn main() -> Result<()> {
         provider_spiffe_workload_api_socket_path: args
             .provider_spiffe_workload_api_socket_path
             .unwrap_or_default(),
+        // Warm pooling is gateway-orchestrated (it needs the shared gateway
+        // Store for the claim mapping); the standalone driver binary keeps it
+        // disabled.
+        warm_pool: openshell_driver_kubernetes::config::KubernetesWarmPoolConfig::default(),
     })
     .await
     .into_diagnostic()?;

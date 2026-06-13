@@ -572,7 +572,7 @@ impl VmDriver {
             task.abort();
         }
 
-        Ok(CreateSandboxResponse {})
+        Ok(CreateSandboxResponse { warm_claim: None })
     }
 
     async fn provision_sandbox(
@@ -4906,6 +4906,8 @@ fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bo
             sandbox_fd: String::new(),
             conditions: vec![condition],
             deleting,
+            // Warm-pool claim fields apply to the Kubernetes driver only.
+            ..Default::default()
         }),
         ..Default::default()
     }
@@ -4923,6 +4925,8 @@ fn status_with_condition(
         sandbox_fd: String::new(),
         conditions: vec![condition],
         deleting,
+        // Warm-pool claim fields apply to the Kubernetes driver only.
+        ..Default::default()
     }
 }
 

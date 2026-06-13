@@ -34,6 +34,11 @@ use crate::grpc_client;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Fixed, short retry cadence used while the supervisor has not yet established
+/// its first session — e.g. a warm-pooled pod whose identity is not assigned
+/// until its pool claim binds. A steady poll (rather than exponential backoff)
+/// keeps the session coming up promptly once the gateway can mint a JWT.
+const BOOTSTRAP_RETRY: Duration = Duration::from_secs(2);
 
 /// Parse a gRPC endpoint URI into an OCSF `Endpoint` (host + port). Falls back
 /// to treating the whole string as a domain if parsing fails.
@@ -232,7 +237,7 @@ fn map_stream_message<T>(
 /// exponential backoff on failures.
 pub fn spawn(
     endpoint: String,
-    sandbox_id: String,
+    sandbox_id: Option<String>,
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
 ) -> tokio::task::JoinHandle<()> {
@@ -246,19 +251,33 @@ pub fn spawn(
 
 async fn run_session_loop(
     endpoint: String,
-    sandbox_id: String,
+    sandbox_id: Option<String>,
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
+    // Tracks whether we have established a session at least once. Until then
+    // (e.g. a warm pod still waiting to be claimed) we retry at a steady short
+    // cadence rather than backing off exponentially, so the session comes up
+    // promptly once the gateway can resolve the pod's identity.
+    let ever_connected = std::sync::atomic::AtomicBool::new(false);
+    let log_id = sandbox_id.as_deref().unwrap_or_default();
 
     loop {
         attempt += 1;
 
-        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path, netns_fd).await {
+        match run_single_session(
+            &endpoint,
+            sandbox_id.as_deref(),
+            &ssh_socket_path,
+            netns_fd,
+            &ever_connected,
+        )
+        .await
+        {
             Ok(()) => {
-                let event = session_closed_event(crate::ocsf_ctx(), &endpoint, &sandbox_id);
+                let event = session_closed_event(crate::ocsf_ctx(), &endpoint, log_id);
                 ocsf_emit!(event);
                 break;
             }
@@ -266,8 +285,12 @@ async fn run_session_loop(
                 let event =
                     session_failed_event(crate::ocsf_ctx(), &endpoint, attempt, &e.to_string());
                 ocsf_emit!(event);
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                if ever_connected.load(std::sync::atomic::Ordering::Relaxed) {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                } else {
+                    tokio::time::sleep(BOOTSTRAP_RETRY).await;
+                }
             }
         }
     }
@@ -275,9 +298,10 @@ async fn run_session_loop(
 
 async fn run_single_session(
     endpoint: &str,
-    sandbox_id: &str,
+    sandbox_id: Option<&str>,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
+    ever_connected: &std::sync::atomic::AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -292,11 +316,14 @@ async fn run_single_session(
     let (tx, rx) = mpsc::channel::<SupervisorMessage>(64);
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
 
-    // Send hello as the first message.
+    // Send hello as the first message. On the warm path the supervisor has no
+    // boot-time identity, so it sends an empty `sandbox_id` and the gateway
+    // derives identity from the authenticated (gateway-minted) JWT. Cold
+    // sandboxes assert their known id, which the gateway cross-checks.
     let instance_id = uuid::Uuid::new_v4().to_string();
     tx.send(SupervisorMessage {
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-            sandbox_id: sandbox_id.to_string(),
+            sandbox_id: sandbox_id.unwrap_or_default().to_string(),
             instance_id: instance_id.clone(),
         })),
     })
@@ -324,6 +351,11 @@ async fn run_single_session(
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
 
+    // We have a live, gateway-accepted session; subsequent reconnects (after a
+    // clean close or transient error) use exponential backoff rather than the
+    // bootstrap poll cadence.
+    ever_connected.store(true, std::sync::atomic::Ordering::Relaxed);
+
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
     let event = session_established_event(
         crate::ocsf_ctx(),
@@ -344,7 +376,7 @@ async fn run_single_session(
                 let msg = map_stream_message(msg, "gateway closed stream")?;
                 handle_gateway_message(
                     &msg,
-                    sandbox_id,
+                    sandbox_id.unwrap_or_default(),
                     ssh_socket_path,
                     netns_fd,
                     &channel,

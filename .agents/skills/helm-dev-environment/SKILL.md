@@ -26,10 +26,12 @@ mise run helm:k3s:create
 ```
 
 Creates a k3d cluster and merges its kubeconfig into the worktree-local `kubeconfig` file.
-Also applies the upstream agent-sandbox CRDs/controller (pinned via `AGENT_SANDBOX_VERSION`
-in `tasks/scripts/helm-k3s-local.sh`, fetched from `github.com/kubernetes-sigs/agent-sandbox`
-releases) and preloads the default community sandbox image into k3d so the first sandbox
-create does not wait on a large registry pull. Traefik is disabled at cluster creation time.
+Also applies the upstream agent-sandbox CRDs/controller plus the warm-pool extensions
+(`SandboxTemplate` / `SandboxWarmPool` / `SandboxClaim`, from `extensions.yaml`) — both
+pinned via `AGENT_SANDBOX_VERSION` in `tasks/scripts/helm-k3s-local.sh`, fetched from
+`github.com/kubernetes-sigs/agent-sandbox` releases — and preloads the default community
+sandbox image into k3d so the first sandbox create does not wait on a large registry pull.
+Traefik is disabled at cluster creation time.
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
 current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster

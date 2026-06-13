@@ -43,6 +43,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             gpu: false,
             sandbox_token: String::new(),
+            disallow_warm_pool: false,
         }),
         status: None,
     }

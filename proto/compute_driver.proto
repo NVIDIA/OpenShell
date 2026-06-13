@@ -94,6 +94,13 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11;
+  // When true, the driver must NOT satisfy this sandbox from a warm pool and
+  // must take the cold create path. Set by the gateway for requests that carry
+  // a custom policy: a warm-pooled pod enforces the pool's baseline policy at
+  // boot and cannot late-bind a per-sandbox policy (Landlock is applied once at
+  // process start), so warm-pooling a custom-policy sandbox would silently
+  // downgrade its policy. Drivers without warm pools ignore this field.
+  bool disallow_warm_pool = 12;
 }
 
 // Driver-owned runtime template consumed by the compute platform.
@@ -162,6 +169,14 @@ message DriverSandboxStatus {
   repeated DriverCondition conditions = 5;
   // True when the compute platform has begun deleting this sandbox.
   bool deleting = 6;
+  // For warm-pooled sandboxes only: the name of the `SandboxClaim` the
+  // gateway created to bind this sandbox. Empty on the cold path. The gateway
+  // uses this (with `claim_uid`) to back-fill or garbage-collect the durable
+  // claim->sandbox-id mapping that anchors identity re-validation.
+  string claim_name = 7;
+  // For warm-pooled sandboxes only: the UID of the binding `SandboxClaim`.
+  // Empty on the cold path.
+  string claim_uid = 8;
 }
 
 // Raw compute-platform condition.
@@ -225,7 +240,25 @@ message CreateSandboxRequest {
   DriverSandbox sandbox = 1;
 }
 
-message CreateSandboxResponse {}
+message CreateSandboxResponse {
+  // Set by drivers that satisfied the create from a warm pool by binding a
+  // pre-warmed `SandboxClaim`. Empty on the cold path. The gateway records a
+  // durable `(namespace, claim_name, claim_uid) -> sandbox_id` mapping from
+  // this binding so the `IssueSandboxToken` bootstrap can re-anchor the
+  // sandbox identity to a value only the gateway wrote.
+  WarmClaimBinding warm_claim = 1;
+}
+
+// Identity of the warm-pool `SandboxClaim` the driver created to satisfy a
+// `CreateSandbox`. Returned only on the warm path.
+message WarmClaimBinding {
+  // Namespace the claim was created in.
+  string namespace = 1;
+  // Name of the created `SandboxClaim`.
+  string claim_name = 2;
+  // UID the apiserver assigned to the created `SandboxClaim`.
+  string claim_uid = 3;
+}
 
 message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.
