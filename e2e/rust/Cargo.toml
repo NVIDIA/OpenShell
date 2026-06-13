@@ -73,6 +73,11 @@ path = "tests/readyz_health.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]
+name = "warm_pool_workspace_isolation"
+path = "tests/warm_pool_workspace_isolation.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
 name = "websocket_conformance"
 path = "tests/websocket_conformance.rs"
 required-features = ["e2e-host-gateway"]
