@@ -1335,3 +1335,141 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         "resource_version should be 2 (initial 1 + 1 successful update)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Warm-pool claim mappings
+// ---------------------------------------------------------------------------
+
+use super::ClaimMapping;
+
+fn claim_mapping(ns: &str, name: &str, uid: &str, sandbox_id: &str) -> ClaimMapping {
+    ClaimMapping {
+        namespace: ns.to_string(),
+        claim_name: name.to_string(),
+        claim_uid: uid.to_string(),
+        sandbox_id: sandbox_id.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn claim_mapping_put_get_round_trip() {
+    let store = test_store().await;
+    let mapping = claim_mapping("openshell", "claim-a", "uid-a", "sandbox-a");
+    store.put_claim_mapping(&mapping).await.unwrap();
+
+    let fetched = store
+        .get_claim_mapping("openshell", "claim-a", "uid-a")
+        .await
+        .unwrap()
+        .expect("mapping should exist");
+    assert_eq!(fetched, mapping);
+}
+
+#[tokio::test]
+async fn claim_mapping_lookup_misses_on_uid_mismatch() {
+    let store = test_store().await;
+    store
+        .put_claim_mapping(&claim_mapping("openshell", "claim-a", "uid-a", "sandbox-a"))
+        .await
+        .unwrap();
+
+    // Same namespace + claim name but a different UID must not resolve: this is
+    // the fail-closed leg of the identity re-anchor chain.
+    let miss = store
+        .get_claim_mapping("openshell", "claim-a", "uid-b")
+        .await
+        .unwrap();
+    assert!(miss.is_none(), "uid mismatch must not resolve a mapping");
+
+    // A different namespace must not resolve either (cross-namespace pinning).
+    let miss_ns = store
+        .get_claim_mapping("other", "claim-a", "uid-a")
+        .await
+        .unwrap();
+    assert!(miss_ns.is_none(), "namespace mismatch must not resolve");
+}
+
+#[tokio::test]
+async fn claim_mapping_put_is_idempotent_for_identical_record() {
+    let store = test_store().await;
+    let mapping = claim_mapping("openshell", "claim-a", "uid-a", "sandbox-a");
+    store.put_claim_mapping(&mapping).await.unwrap();
+    // A re-write of the identical mapping (bootstrap/reconcile retry) succeeds.
+    store
+        .put_claim_mapping(&mapping)
+        .await
+        .expect("identical re-write should be idempotent");
+}
+
+#[tokio::test]
+async fn claim_mapping_put_rejects_rebind_to_other_sandbox() {
+    let store = test_store().await;
+    store
+        .put_claim_mapping(&claim_mapping("openshell", "claim-a", "uid-a", "sandbox-a"))
+        .await
+        .unwrap();
+
+    // The same claim key must never be rebound to a different sandbox-id.
+    let err = store
+        .put_claim_mapping(&claim_mapping("openshell", "claim-a", "uid-a", "sandbox-b"))
+        .await
+        .expect_err("rebind to a different sandbox must be rejected");
+    assert!(matches!(err, PersistenceError::UniqueViolation { .. }));
+
+    // The original binding is unchanged.
+    let fetched = store
+        .get_claim_mapping("openshell", "claim-a", "uid-a")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.sandbox_id, "sandbox-a");
+}
+
+#[tokio::test]
+async fn claim_mapping_delete_by_sandbox_id() {
+    let store = test_store().await;
+    store
+        .put_claim_mapping(&claim_mapping("openshell", "claim-a", "uid-a", "sandbox-a"))
+        .await
+        .unwrap();
+
+    let deleted = store
+        .delete_claim_mapping_for_sandbox("sandbox-a")
+        .await
+        .unwrap();
+    assert!(deleted, "delete should report removal");
+    assert!(
+        store
+            .get_claim_mapping("openshell", "claim-a", "uid-a")
+            .await
+            .unwrap()
+            .is_none(),
+        "mapping must be gone after delete"
+    );
+
+    // Deleting an unknown sandbox-id is a no-op, not an error.
+    let missing = store
+        .delete_claim_mapping_for_sandbox("sandbox-zzz")
+        .await
+        .unwrap();
+    assert!(!missing, "deleting an unknown mapping returns false");
+}
+
+#[tokio::test]
+async fn claim_mapping_list_returns_all() {
+    let store = test_store().await;
+    store
+        .put_claim_mapping(&claim_mapping("openshell", "claim-a", "uid-a", "sandbox-a"))
+        .await
+        .unwrap();
+    store
+        .put_claim_mapping(&claim_mapping("openshell", "claim-b", "uid-b", "sandbox-b"))
+        .await
+        .unwrap();
+
+    let mut mappings = store.list_claim_mappings(100, 0).await.unwrap();
+    mappings.sort_by(|a, b| a.sandbox_id.cmp(&b.sandbox_id));
+    assert_eq!(mappings.len(), 2);
+    assert_eq!(mappings[0].sandbox_id, "sandbox-a");
+    assert_eq!(mappings[1].sandbox_id, "sandbox-b");
+}
