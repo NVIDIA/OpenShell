@@ -131,6 +131,8 @@ async fn handle_create_sandbox_inner(
         crate::grpc::validation::validate_label_key(key)?;
         crate::grpc::validation::validate_label_value(value)?;
     }
+    // Reject reserved identity/platform metadata keys the caller must not set.
+    crate::grpc::validation::validate_reserved_metadata_keys(&request.labels, "labels")?;
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {

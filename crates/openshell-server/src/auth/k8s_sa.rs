@@ -38,14 +38,28 @@ pub const ISSUE_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/IssueSandbox
 /// annotation only after validating the pod's `TokenReview` binding, live UID,
 /// and owning Sandbox CR. The K8s `Role` granted to the gateway must not
 /// include `patch pods` (see plan §11.8).
-pub const SANDBOX_ID_ANNOTATION: &str = "openshell.io/sandbox-id";
-const SANDBOX_API_GROUP: &str = "agents.x-k8s.io";
-const SANDBOX_API_VERSION: &str = "v1alpha1";
-const SANDBOX_API_VERSION_FULL: &str = "agents.x-k8s.io/v1alpha1";
-const SANDBOX_KIND: &str = "Sandbox";
-const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
+// agent-sandbox CRD identity. Single source of truth in `openshell-core`; the
+// re-anchor checks below must stay byte-identical with what the Kubernetes
+// driver writes, so they are derived from the same constants the driver uses.
+pub const SANDBOX_ID_ANNOTATION: &str = openshell_core::driver_utils::SANDBOX_ID_ANNOTATION;
+const SANDBOX_API_GROUP: &str = openshell_core::driver_utils::SANDBOX_CRD_GROUP;
+const SANDBOX_API_VERSION: &str = openshell_core::driver_utils::SANDBOX_CRD_VERSION;
+const SANDBOX_API_VERSION_FULL: &str = openshell_core::driver_utils::SANDBOX_CRD_API_VERSION;
+const SANDBOX_KIND: &str = openshell_core::driver_utils::SANDBOX_CRD_KIND;
+const SANDBOX_ID_LABEL: &str = openshell_core::driver_utils::LABEL_SANDBOX_ID;
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
 const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
+
+// Warm-pool extension CRDs. A warm sandbox's owning `Sandbox` CR is created
+// generically by the pool controller — it carries no `openshell.ai/sandbox-id`
+// label and is instead controlled by a `SandboxClaim` (+ the controller's
+// `agents.x-k8s.io/claim-uid` label). Identity must re-anchor to the
+// gateway-created `SandboxClaim` and the durable claim mapping.
+const SANDBOX_CLAIM_GROUP: &str = openshell_core::driver_utils::SANDBOX_EXT_GROUP;
+const SANDBOX_CLAIM_VERSION: &str = openshell_core::driver_utils::SANDBOX_CRD_VERSION;
+const SANDBOX_CLAIM_API_VERSION_FULL: &str = openshell_core::driver_utils::SANDBOX_EXT_API_VERSION;
+const SANDBOX_CLAIM_KIND: &str = openshell_core::driver_utils::SANDBOX_CLAIM_KIND;
+const CLAIM_UID_LABEL: &str = openshell_core::driver_utils::CLAIM_UID_LABEL;
 
 /// Resolved identity extracted from a validated SA token + pod lookup.
 #[derive(Debug, Clone)]
@@ -53,6 +67,37 @@ pub struct ResolvedK8sIdentity {
     pub sandbox_id: String,
     pub pod_name: String,
     pub pod_uid: String,
+}
+
+/// Looks up the durable warm-pool claim mapping the gateway recorded at
+/// `CreateSandbox` time. Backed by the shared gateway Store (HA-safe: any
+/// replica can serve the bootstrap). Split out so tests can fake it.
+#[async_trait]
+pub trait ClaimMappingLookup: Send + Sync + 'static {
+    /// Resolve the sandbox-id the gateway bound to `(namespace, claim_name,
+    /// claim_uid)`. `Ok(None)` (including a `claim_uid` that matches no record)
+    /// means the caller fails closed.
+    async fn lookup_sandbox_id(
+        &self,
+        namespace: &str,
+        claim_name: &str,
+        claim_uid: &str,
+    ) -> Result<Option<String>, Status>;
+}
+
+#[async_trait]
+impl ClaimMappingLookup for crate::persistence::Store {
+    async fn lookup_sandbox_id(
+        &self,
+        namespace: &str,
+        claim_name: &str,
+        claim_uid: &str,
+    ) -> Result<Option<String>, Status> {
+        self.get_claim_mapping(namespace, claim_name, claim_uid)
+            .await
+            .map(|opt| opt.map(|mapping| mapping.sandbox_id))
+            .map_err(|e| Status::internal(format!("claim mapping lookup failed: {e}")))
+    }
 }
 
 /// Apiserver-facing operations the authenticator depends on. Split out so
@@ -150,6 +195,8 @@ pub struct LiveK8sResolver {
     token_reviews_api: Api<TokenReview>,
     pods_api: Api<Pod>,
     sandboxes_api: Api<DynamicObject>,
+    sandbox_claims_api: Api<DynamicObject>,
+    claim_mapping: Arc<dyn ClaimMappingLookup>,
     expected_audience: String,
     sandbox_namespace: String,
     expected_service_account: String,
@@ -161,6 +208,7 @@ impl LiveK8sResolver {
         namespace: &str,
         expected_audience: String,
         expected_service_account: String,
+        claim_mapping: Arc<dyn ClaimMappingLookup>,
     ) -> Self {
         let token_reviews_api: Api<TokenReview> = Api::all(client.clone());
         let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
@@ -168,11 +216,21 @@ impl LiveK8sResolver {
             GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION, SANDBOX_KIND);
         let sandbox_resource = ApiResource::from_gvk(&sandbox_gvk);
         let sandboxes_api: Api<DynamicObject> =
-            Api::namespaced_with(client, namespace, &sandbox_resource);
+            Api::namespaced_with(client.clone(), namespace, &sandbox_resource);
+        let claim_gvk = GroupVersionKind::gvk(
+            SANDBOX_CLAIM_GROUP,
+            SANDBOX_CLAIM_VERSION,
+            SANDBOX_CLAIM_KIND,
+        );
+        let claim_resource = ApiResource::from_gvk(&claim_gvk);
+        let sandbox_claims_api: Api<DynamicObject> =
+            Api::namespaced_with(client, namespace, &claim_resource);
         Self {
             token_reviews_api,
             pods_api,
             sandboxes_api,
+            sandbox_claims_api,
+            claim_mapping,
             expected_audience,
             sandbox_namespace: namespace.to_string(),
             expected_service_account,
@@ -275,7 +333,53 @@ impl K8sIdentityResolver for LiveK8sResolver {
             );
             return Err(Status::permission_denied("sandbox owner not found"));
         };
-        validate_sandbox_owner_reference(&owner, &sandbox_id, &sandbox_cr)?;
+
+        // Warm vs cold is decided by the owning Sandbox CR's *ownerReference*,
+        // never by a label a cold pod could carry. A warm Sandbox is controlled
+        // by a SandboxClaim; identity then re-anchors to the gateway-created
+        // claim mapping. A cold Sandbox keeps the original label cross-check.
+        match sandbox_claim_owner_reference(&sandbox_cr)? {
+            Some(claim_owner) => {
+                let live_claim = self
+                    .sandbox_claims_api
+                    .get_opt(&claim_owner.name)
+                    .await
+                    .map_err(|e| {
+                        warn!(
+                            pod = %identity.pod_name,
+                            claim = %claim_owner.name,
+                            error = %e,
+                            "failed to fetch SandboxClaim for warm pod identity validation"
+                        );
+                        Status::internal(format!("sandboxclaim GET failed: {e}"))
+                    })?;
+                let Some(live_claim) = live_claim else {
+                    warn!(
+                        pod = %identity.pod_name,
+                        claim = %claim_owner.name,
+                        "owning Sandbox references a SandboxClaim that does not exist"
+                    );
+                    return Err(Status::permission_denied("sandbox claim not found"));
+                };
+                // Cross-namespace pinning: the mapping is keyed and looked up in
+                // the resolver's fixed sandbox namespace only.
+                let store_sandbox_id = self
+                    .claim_mapping
+                    .lookup_sandbox_id(&self.sandbox_namespace, &claim_owner.name, &claim_owner.uid)
+                    .await?;
+                validate_warm_claim(
+                    &owner,
+                    &sandbox_cr,
+                    &claim_owner,
+                    &live_claim,
+                    store_sandbox_id.as_deref(),
+                    &sandbox_id,
+                )?;
+            }
+            None => {
+                validate_sandbox_owner_reference(&owner, &sandbox_id, &sandbox_cr)?;
+            }
+        }
 
         Ok(Some(ResolvedK8sIdentity {
             sandbox_id,
@@ -432,6 +536,178 @@ fn validate_sandbox_owner_reference(
             "pod sandbox annotation does not match owning Sandbox CR label"
         );
         return Err(Status::permission_denied("sandbox owner ID mismatch"));
+    }
+
+    Ok(())
+}
+
+/// Controlling `SandboxClaim` ownerReference extracted from an owning warm
+/// `Sandbox` CR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SandboxClaimOwnerReference {
+    name: String,
+    uid: String,
+}
+
+/// Extract the controlling `SandboxClaim` ownerReference from an owning
+/// `Sandbox` CR, if any.
+///
+/// `Ok(None)` => the owning Sandbox is a cold `OpenShell` Sandbox (no
+/// `SandboxClaim` owner) and the caller uses the original label cross-check.
+/// `Ok(Some(_))` => warm path. `Err` => a malformed/ambiguous claim
+/// ownerReference rejects (fail closed).
+#[allow(clippy::result_large_err)]
+fn sandbox_claim_owner_reference(
+    sandbox_cr: &DynamicObject,
+) -> Result<Option<SandboxClaimOwnerReference>, Status> {
+    let owner_refs = sandbox_cr
+        .metadata
+        .owner_references
+        .as_deref()
+        .unwrap_or_default();
+    let mut claim_refs = owner_refs.iter().filter(|owner| {
+        owner.api_version == SANDBOX_CLAIM_API_VERSION_FULL && owner.kind == SANDBOX_CLAIM_KIND
+    });
+    let Some(owner) = claim_refs.next() else {
+        return Ok(None);
+    };
+    if claim_refs.next().is_some() {
+        return Err(Status::permission_denied(
+            "sandbox has multiple SandboxClaim owners",
+        ));
+    }
+    if owner.controller != Some(true) {
+        return Err(Status::permission_denied(
+            "sandbox SandboxClaim ownerReference is not controlling",
+        ));
+    }
+    if owner.name.is_empty() || owner.uid.is_empty() {
+        return Err(Status::permission_denied(
+            "sandbox SandboxClaim ownerReference is incomplete",
+        ));
+    }
+    Ok(Some(SandboxClaimOwnerReference {
+        name: owner.name.clone(),
+        uid: owner.uid.clone(),
+    }))
+}
+
+/// The bound `Sandbox` name a `SandboxClaim` reports in `status.sandbox.name`,
+/// or empty when the claim is not yet bound.
+fn claim_bound_sandbox_name(claim: &DynamicObject) -> String {
+    claim
+        .data
+        .get("status")
+        .and_then(|status| status.get("sandbox"))
+        .and_then(|sandbox| sandbox.get("name"))
+        .and_then(|name| name.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Fail-closed validation of the warm-pool identity chain. Every leg must
+/// agree or the bootstrap is rejected. This preserves the cold-path invariant —
+/// *the sandbox-id a pod can obtain equals a value only the gateway wrote, on an
+/// object the sandbox workload cannot mutate* — re-anchored to the
+/// gateway-created `SandboxClaim` and the durable claim mapping.
+///
+/// Arguments:
+/// - `sandbox_owner`: the pod's controlling `Sandbox` ownerRef (name + uid).
+/// - `sandbox_cr`: the live owning `Sandbox` CR.
+/// - `claim_owner`: the `SandboxClaim` controlling ownerRef on `sandbox_cr`.
+/// - `live_claim`: the live `SandboxClaim` fetched by name.
+/// - `store_sandbox_id`: the sandbox-id the gateway Store recorded for
+///   `(namespace, claim_owner.name, claim_owner.uid)`, if any.
+/// - `pod_sandbox_id`: the pod's `openshell.io/sandbox-id` annotation.
+#[allow(clippy::result_large_err)]
+fn validate_warm_claim(
+    sandbox_owner: &SandboxOwnerReference,
+    sandbox_cr: &DynamicObject,
+    claim_owner: &SandboxClaimOwnerReference,
+    live_claim: &DynamicObject,
+    store_sandbox_id: Option<&str>,
+    pod_sandbox_id: &str,
+) -> Result<(), Status> {
+    // 1. The owning Sandbox CR's UID matches the pod's ownerReference UID.
+    let cr_uid = sandbox_cr.metadata.uid.as_deref().unwrap_or_default();
+    if cr_uid != sandbox_owner.uid {
+        warn!(
+            sandbox_owner = %sandbox_owner.name,
+            owner_uid = %sandbox_owner.uid,
+            actual_uid = %cr_uid,
+            "warm pod Sandbox ownerReference UID does not match live Sandbox CR"
+        );
+        return Err(Status::permission_denied("sandbox owner UID mismatch"));
+    }
+
+    // 2. The controller's claim-uid label agrees with the SandboxClaim ownerRef.
+    let label_uid = sandbox_cr
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get(CLAIM_UID_LABEL))
+        .map(String::as_str)
+        .unwrap_or_default();
+    if label_uid != claim_owner.uid {
+        warn!(
+            sandbox_owner = %sandbox_owner.name,
+            claim = %claim_owner.name,
+            claim_owner_uid = %claim_owner.uid,
+            label_uid = %label_uid,
+            "warm Sandbox claim-uid label disagrees with SandboxClaim ownerReference"
+        );
+        return Err(Status::permission_denied(
+            "sandbox claim-uid label mismatch",
+        ));
+    }
+
+    // 3. The live SandboxClaim's UID matches the ownerReference UID.
+    let live_uid = live_claim.metadata.uid.as_deref().unwrap_or_default();
+    if live_uid != claim_owner.uid {
+        warn!(
+            claim = %claim_owner.name,
+            claim_owner_uid = %claim_owner.uid,
+            live_uid = %live_uid,
+            "live SandboxClaim UID does not match ownerReference"
+        );
+        return Err(Status::permission_denied("sandbox claim UID mismatch"));
+    }
+
+    // 4. The claim is bound to this exact owning Sandbox.
+    let bound = claim_bound_sandbox_name(live_claim);
+    if bound.is_empty() || bound != sandbox_owner.name {
+        warn!(
+            claim = %claim_owner.name,
+            bound_sandbox = %bound,
+            owning_sandbox = %sandbox_owner.name,
+            "SandboxClaim is not bound to the owning Sandbox"
+        );
+        return Err(Status::permission_denied(
+            "sandbox claim is not bound to the owning sandbox",
+        ));
+    }
+
+    // 5. The gateway-created Store mapping resolves the same sandbox-id as the
+    //    pod annotation. A missing record (never created, or a uid that matches
+    //    no record) fails closed.
+    let Some(store_sandbox_id) = store_sandbox_id else {
+        warn!(
+            claim = %claim_owner.name,
+            claim_owner_uid = %claim_owner.uid,
+            "no gateway claim mapping for SandboxClaim; rejecting"
+        );
+        return Err(Status::permission_denied(
+            "no gateway mapping for sandbox claim",
+        ));
+    };
+    if store_sandbox_id != pod_sandbox_id {
+        warn!(
+            claim = %claim_owner.name,
+            pod_sandbox_id = %pod_sandbox_id,
+            mapped_sandbox_id = %store_sandbox_id,
+            "warm pod sandbox annotation does not match gateway claim mapping"
+        );
+        return Err(Status::permission_denied("sandbox claim mapping mismatch"));
     }
 
     Ok(())
@@ -836,5 +1112,229 @@ mod tests {
             .await
             .expect_err("resolver error must propagate");
         assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+}
+
+#[cfg(test)]
+mod warm_claim_tests {
+    use super::*;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+    use std::collections::BTreeMap;
+
+    fn claim_owner_ref(name: &str, uid: &str, controller: bool) -> OwnerReference {
+        OwnerReference {
+            api_version: SANDBOX_CLAIM_API_VERSION_FULL.to_string(),
+            block_owner_deletion: None,
+            controller: Some(controller),
+            kind: SANDBOX_CLAIM_KIND.to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+
+    /// Owning Sandbox CR for a warm pod: claim-uid label + controlling
+    /// `SandboxClaim` ownerReference.
+    fn warm_sandbox_cr(
+        name: &str,
+        cr_uid: &str,
+        claim_name: &str,
+        claim_uid: &str,
+    ) -> DynamicObject {
+        let gvk = GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION, SANDBOX_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut cr = DynamicObject::new(name, &resource);
+        cr.metadata.uid = Some(cr_uid.to_string());
+        cr.metadata.labels = Some(BTreeMap::from([(
+            CLAIM_UID_LABEL.to_string(),
+            claim_uid.to_string(),
+        )]));
+        cr.metadata.owner_references = Some(vec![claim_owner_ref(claim_name, claim_uid, true)]);
+        cr
+    }
+
+    fn sandbox_claim(name: &str, uid: &str, bound_sandbox: &str) -> DynamicObject {
+        let gvk = GroupVersionKind::gvk(
+            SANDBOX_CLAIM_GROUP,
+            SANDBOX_CLAIM_VERSION,
+            SANDBOX_CLAIM_KIND,
+        );
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut claim = DynamicObject::new(name, &resource);
+        claim.metadata.uid = Some(uid.to_string());
+        if !bound_sandbox.is_empty() {
+            claim.data = serde_json::json!({
+                "status": { "sandbox": { "name": bound_sandbox } }
+            });
+        }
+        claim
+    }
+
+    fn owner(name: &str, uid: &str) -> SandboxOwnerReference {
+        SandboxOwnerReference {
+            name: name.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+
+    fn claim_owner(name: &str, uid: &str) -> SandboxClaimOwnerReference {
+        SandboxClaimOwnerReference {
+            name: name.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+
+    // A fully-consistent warm binding: pod sandbox-id "sb-1", owning Sandbox
+    // "sandbox-a" (cr uid "cr-1"), bound by claim "claim-a" (uid "claim-1"),
+    // store mapping (ns, claim-a, claim-1) -> "sb-1".
+    struct Fixture {
+        owner: SandboxOwnerReference,
+        cr: DynamicObject,
+        claim_owner: SandboxClaimOwnerReference,
+        claim: DynamicObject,
+    }
+
+    fn fixture() -> Fixture {
+        Fixture {
+            owner: owner("sandbox-a", "cr-1"),
+            cr: warm_sandbox_cr("sandbox-a", "cr-1", "claim-a", "claim-1"),
+            claim_owner: claim_owner("claim-a", "claim-1"),
+            claim: sandbox_claim("claim-a", "claim-1", "sandbox-a"),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn validate(f: &Fixture, store: Option<&str>, pod_id: &str) -> Result<(), Status> {
+        validate_warm_claim(&f.owner, &f.cr, &f.claim_owner, &f.claim, store, pod_id)
+    }
+
+    #[test]
+    fn warm_chain_accepts_consistent_binding() {
+        let f = fixture();
+        validate(&f, Some("sb-1"), "sb-1").expect("consistent warm binding is accepted");
+    }
+
+    #[test]
+    fn warm_chain_rejects_cr_uid_mismatch() {
+        let mut f = fixture();
+        f.cr.metadata.uid = Some("cr-other".to_string());
+        let err = validate(&f, Some("sb-1"), "sb-1").expect_err("cr uid mismatch must reject");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn warm_chain_rejects_claim_uid_label_mismatch() {
+        let mut f = fixture();
+        f.cr.metadata.labels = Some(BTreeMap::from([(
+            CLAIM_UID_LABEL.to_string(),
+            "claim-spoof".to_string(),
+        )]));
+        let err = validate(&f, Some("sb-1"), "sb-1").expect_err("claim-uid label mismatch rejects");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn warm_chain_rejects_live_claim_uid_mismatch() {
+        let mut f = fixture();
+        f.claim.metadata.uid = Some("claim-different".to_string());
+        let err = validate(&f, Some("sb-1"), "sb-1").expect_err("live claim uid mismatch rejects");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn warm_chain_rejects_unbound_claim() {
+        let mut f = fixture();
+        f.claim = sandbox_claim("claim-a", "claim-1", "");
+        let err = validate(&f, Some("sb-1"), "sb-1").expect_err("unbound claim rejects");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn warm_chain_rejects_claim_bound_to_other_sandbox() {
+        let mut f = fixture();
+        f.claim = sandbox_claim("claim-a", "claim-1", "some-other-sandbox");
+        let err =
+            validate(&f, Some("sb-1"), "sb-1").expect_err("claim bound elsewhere must reject");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn warm_chain_rejects_missing_store_mapping() {
+        // Claim exists but the gateway never recorded (or a stale record was
+        // deleted) the durable mapping -> fail closed.
+        let f = fixture();
+        let err = validate(&f, None, "sb-1").expect_err("missing store mapping must reject");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn warm_chain_rejects_store_mapping_spoof() {
+        // The pod annotation claims a victim sandbox-id, but the gateway mapping
+        // for this claim resolves a different (correct) id -> reject.
+        let f = fixture();
+        let err = validate(&f, Some("sb-1"), "victim-sandbox")
+            .expect_err("annotation/mapping mismatch must reject");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn claim_owner_reference_detects_warm_sandbox() {
+        let cr = warm_sandbox_cr("sandbox-a", "cr-1", "claim-a", "claim-1");
+        let claim_owner = sandbox_claim_owner_reference(&cr)
+            .expect("well-formed")
+            .expect("warm Sandbox has a SandboxClaim owner");
+        assert_eq!(claim_owner.name, "claim-a");
+        assert_eq!(claim_owner.uid, "claim-1");
+    }
+
+    #[test]
+    fn claim_owner_reference_cold_sandbox_with_spoofed_label_is_not_warm() {
+        // A cold Sandbox CR carrying a user-style claim-uid label but NO
+        // controlling SandboxClaim ownerReference must take the cold path:
+        // detection is ownerReference-based, never label-based.
+        let gvk = GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION, SANDBOX_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut cr = DynamicObject::new("sandbox-a", &resource);
+        cr.metadata.uid = Some("cr-1".to_string());
+        cr.metadata.labels = Some(BTreeMap::from([
+            (CLAIM_UID_LABEL.to_string(), "spoof".to_string()),
+            (SANDBOX_ID_LABEL.to_string(), "sb-1".to_string()),
+        ]));
+        // No owner_references.
+        assert!(
+            sandbox_claim_owner_reference(&cr).unwrap().is_none(),
+            "a label alone must not trigger the warm path"
+        );
+    }
+
+    #[test]
+    fn claim_owner_reference_rejects_non_controlling_owner() {
+        let gvk = GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION, SANDBOX_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut cr = DynamicObject::new("sandbox-a", &resource);
+        cr.metadata.owner_references = Some(vec![claim_owner_ref("claim-a", "claim-1", false)]);
+        let err =
+            sandbox_claim_owner_reference(&cr).expect_err("non-controlling claim owner rejects");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn claim_owner_reference_rejects_multiple_claim_owners() {
+        let gvk = GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION, SANDBOX_KIND);
+        let resource = ApiResource::from_gvk(&gvk);
+        let mut cr = DynamicObject::new("sandbox-a", &resource);
+        cr.metadata.owner_references = Some(vec![
+            claim_owner_ref("claim-a", "claim-1", true),
+            claim_owner_ref("claim-b", "claim-2", true),
+        ]);
+        let err = sandbox_claim_owner_reference(&cr).expect_err("multiple claim owners reject");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn claim_bound_sandbox_name_reads_status() {
+        let claim = sandbox_claim("claim-a", "claim-1", "sandbox-a");
+        assert_eq!(claim_bound_sandbox_name(&claim), "sandbox-a");
+        let unbound = sandbox_claim("claim-a", "claim-1", "");
+        assert_eq!(claim_bound_sandbox_name(&unbound), "");
     }
 }
