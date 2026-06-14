@@ -18,78 +18,31 @@ path = "src/main.rs"
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
-openshell-router = { path = "../openshell-router" }
+openshell-supervisor-network = { path = "../openshell-supervisor-network" }
+openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 # Async runtime
 tokio = { workspace = true }
 
-# gRPC
+# gRPC (tonic::Status downcast in error mapping)
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
-tokio-stream = { workspace = true }
-spiffe = { workspace = true }
 
 # CLI
 clap = { workspace = true }
 
 # Error handling
 miette = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-hmac = "0.12"
-sha2 = { workspace = true }
-hex = "0.4"
-russh = "0.57"
-rand_core = "0.6"
 
-# OPA policy evaluation (no default features — full-opa pulls in opa-runtime which requires git in build)
-regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
-
-# TLS
-tokio-rustls = { workspace = true }
+# TLS crypto provider install (main.rs)
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
-rcgen = { workspace = true }
-webpki-roots = { workspace = true }
 
-# HTTP
-bytes = { workspace = true }
-reqwest = { workspace = true }
-
-# UUID
-uuid = { workspace = true }
-
-# Encoding
-base64 = { workspace = true }
-flate2 = "1"
-sha1 = "0.10"
-
-# IP network / CIDR parsing
-ipnet = "2"
-
-# Serialization
-serde = { workspace = true }
+# Serialization (serde_json::json! for OCSF unmapped fields)
 serde_json = { workspace = true }
-serde_yml = { workspace = true }
-apollo-parser = { workspace = true }
-glob = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
-
-# Unix/Process
-nix = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-rustix = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4"
-seccompiler = "0.5"
-tempfile = "3"
-uuid = { version = "1", features = ["v4"] }
 
 [features]
 default = ["telemetry"]
@@ -99,6 +52,7 @@ default = ["telemetry"]
 telemetry = ["openshell-core/telemetry"]
 
 [dev-dependencies]
+openshell-core = { path = "../openshell-core", features = ["test-helpers"] }
 tempfile = "3"
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }

@@ -14,26 +14,7 @@ use std::future::Future;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-/// A single denial event emitted by the proxy.
-#[derive(Debug, Clone)]
-pub struct DenialEvent {
-    /// Destination host that was denied.
-    pub host: String,
-    /// Destination port that was denied.
-    pub port: u16,
-    /// Binary path that initiated the connection (if resolved).
-    pub binary: String,
-    /// Ancestor binary paths from process tree walk.
-    pub ancestors: Vec<String>,
-    /// Reason for denial (e.g. "no matching policy", "internal address").
-    pub deny_reason: String,
-    /// Denial stage: "connect", "forward", "ssrf", "l7", "bypass".
-    pub denial_stage: String,
-    /// L7 request details (method, path, decision) if this is an L7 denial.
-    pub l7_method: Option<String>,
-    /// L7 target path.
-    pub l7_path: Option<String>,
-}
+use openshell_core::denial::DenialEvent;
 
 /// Aggregated denial summary keyed by `(host, port, binary)`.
 #[derive(Debug, Clone)]

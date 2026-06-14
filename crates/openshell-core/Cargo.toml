@@ -13,14 +13,17 @@ repository.workspace = true
 [dependencies]
 prost = { workspace = true }
 prost-types = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tonic-prost = { workspace = true }
+tokio = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true }
 ipnet = "2"
+base64 = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls-webpki-roots"], optional = true }
 
@@ -34,6 +37,10 @@ telemetry = ["dep:reqwest", "dep:chrono"]
 ## Off by default so production builds have an empty registry.
 ## Enabled by e2e tests and during development.
 dev-settings = []
+## Expose proposals::test_helpers (`ProposalsFlagGuard`) to downstream test
+## code in other crates. Enabled by openshell-sandbox and
+## openshell-supervisor-network dev builds.
+test-helpers = []
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

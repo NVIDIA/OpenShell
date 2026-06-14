@@ -2,23 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Anonymous sandbox network activity counter aggregation.
+//!
+//! Producer-side types (`ActivityEvent`, `ActivitySender`,
+//! `ACTIVITY_EVENT_QUEUE_CAPACITY`, `try_record_activity`) live in
+//! `openshell_core::activity` so the supervisor leaves can emit without
+//! depending on the orchestrator. This module hosts the aggregator that
+//! runs orchestrator-side and flushes summaries to the gateway.
 
 use std::collections::HashMap;
 use std::future::Future;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-pub const ACTIVITY_EVENT_QUEUE_CAPACITY: usize = 1024;
+pub use openshell_core::activity::ActivityEvent;
+
 const ACTIVITY_FLUSH_QUEUE_CAPACITY: usize = 1;
 pub const DEFAULT_ACTIVITY_FLUSH_INTERVAL_SECS: u64 = 10;
-
-#[derive(Debug, Clone)]
-pub struct ActivityEvent {
-    pub denied: bool,
-    pub deny_group: &'static str,
-}
-
-pub type ActivitySender = mpsc::Sender<ActivityEvent>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushableActivitySummary {
@@ -117,10 +116,6 @@ impl ActivityAggregator {
     }
 }
 
-pub fn try_record_activity(tx: &ActivitySender, denied: bool, deny_group: &'static str) -> bool {
-    tx.try_send(ActivityEvent { denied, deny_group }).is_ok()
-}
-
 pub fn activity_flush_interval_secs_from_env(value: Option<&str>) -> u64 {
     value
         .and_then(|value| value.parse::<u64>().ok())
@@ -181,14 +176,6 @@ mod tests {
         assert_float_eq(denial_rate_pct(0, 10), 0.0);
         assert_float_eq(denial_rate_pct(4, 1), 25.0);
         assert_float_eq(denial_rate_pct(4, 10), 100.0);
-    }
-
-    #[test]
-    fn activity_send_drops_when_queue_is_full() {
-        let (tx, _rx) = mpsc::channel(1);
-
-        assert!(try_record_activity(&tx, false, "unknown"));
-        assert!(!try_record_activity(&tx, true, "connect_policy"));
     }
 
     #[test]

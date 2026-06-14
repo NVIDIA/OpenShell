@@ -3375,6 +3375,7 @@ dependencies = [
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "ipnet",
  "miette",
@@ -3386,9 +3387,11 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tracing",
  "url",
 ]
 
@@ -3566,53 +3569,24 @@ dependencies = [
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
- "anyhow",
- "apollo-parser",
- "base64 0.22.1",
- "bytes",
  "clap",
- "flate2",
  "futures",
- "glob",
- "hex",
- "hmac",
- "ipnet",
- "landlock",
- "libc",
  "miette",
- "nix",
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
- "openshell-router",
- "rand_core 0.6.4",
- "rcgen",
- "regorus",
- "reqwest 0.12.28",
- "russh",
- "rustix 1.1.4",
+ "openshell-supervisor-network",
+ "openshell-supervisor-process",
  "rustls",
- "rustls-pemfile",
- "seccompiler",
- "serde",
  "serde_json",
- "serde_yml",
- "sha1 0.10.6",
- "sha2 0.10.9",
- "spiffe",
  "temp-env",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
- "tokio-rustls",
- "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tonic",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "uuid",
- "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -3693,6 +3667,74 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "openshell-supervisor-network"
+version = "0.0.0"
+dependencies = [
+ "apollo-parser",
+ "base64 0.22.1",
+ "bytes",
+ "flate2",
+ "futures",
+ "glob",
+ "hex",
+ "ipnet",
+ "libc",
+ "miette",
+ "openshell-core",
+ "openshell-ocsf",
+ "openshell-policy",
+ "openshell-router",
+ "rcgen",
+ "regorus",
+ "reqwest 0.12.28",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
+ "spiffe",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "uuid",
+ "webpki-roots 1.0.7",
+]
+
+[[package]]
+name = "openshell-supervisor-process"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "hex",
+ "landlock",
+ "libc",
+ "miette",
+ "nix",
+ "openshell-core",
+ "openshell-ocsf",
+ "rand_core 0.6.4",
+ "russh",
+ "rustix 1.1.4",
+ "seccompiler",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

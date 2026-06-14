@@ -858,26 +858,10 @@ fn truncate_for_display(s: &str) -> String {
 ///
 /// This is a lexical normalization only — it does NOT resolve symlinks or
 /// check the filesystem.
-pub fn normalize_path(path: &str) -> String {
-    use std::path::Component;
-
-    let p = Path::new(path);
-    let mut normalized = std::path::PathBuf::new();
-    for component in p.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            #[allow(clippy::path_buf_push_overwrite)]
-            Component::RootDir => normalized.push("/"),
-            Component::CurDir => {} // skip "."
-            Component::ParentDir => {
-                // Keep ".." — validation will catch it separately
-                normalized.push("..");
-            }
-            Component::Normal(c) => normalized.push(c),
-        }
-    }
-    normalized.to_string_lossy().to_string()
-}
+///
+/// Re-exported from `openshell-core` so existing call sites
+/// (`openshell_policy::normalize_path`) keep resolving.
+pub use openshell_core::paths::normalize_path;
 
 // ---------------------------------------------------------------------------
 // Tests
