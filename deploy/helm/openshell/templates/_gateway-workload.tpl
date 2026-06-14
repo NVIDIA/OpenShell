@@ -50,6 +50,36 @@ spec:
         - {{ .Values.server.dbUrl | quote }}
         {{- end }}
       env:
+        - name: OPENSHELL_REPLICA_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: OPENSHELL_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: OPENSHELL_POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        {{- if eq (include "openshell.workloadKind" .) "deployment" }}
+        - name: OPENSHELL_POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: OPENSHELL_PEER_ENDPOINT
+          value: {{ printf "%s://$(OPENSHELL_POD_IP):%d" (ternary "http" "https" (default false .Values.server.disableTls)) (int .Values.service.port) | quote }}
+        {{- end }}
+        - name: OPENSHELL_SERVICE_ACCOUNT_NAME
+          value: {{ include "openshell.serviceAccountName" . | quote }}
+        - name: OPENSHELL_PEER_SERVICE_NAME
+          value: {{ include "openshell.peerServiceName" . | quote }}
+        - name: OPENSHELL_PEER_TOKEN_AUDIENCE
+          value: "openshell-gateway-peer"
+        - name: OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE
+          value: /var/run/secrets/openshell-peer/token
+        - name: OPENSHELL_PEER_POD_LABELS
+          value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s" (include "openshell.name" .) .Release.Name | quote }}
         {{- if .Values.server.externalDbSecret }}
         - name: OPENSHELL_DB_URL
           valueFrom:
@@ -79,6 +109,9 @@ spec:
           readOnly: true
         - name: sandbox-jwt
           mountPath: /etc/openshell-jwt
+          readOnly: true
+        - name: gateway-peer-token
+          mountPath: /var/run/secrets/openshell-peer
           readOnly: true
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
@@ -140,6 +173,14 @@ spec:
       secret:
         secretName: {{ include "openshell.sandboxJwtSecretName" . }}
         defaultMode: {{ .Values.server.sandboxJwt.secretDefaultMode | default 0400 }}
+    - name: gateway-peer-token
+      projected:
+        defaultMode: 0400
+        sources:
+          - serviceAccountToken:
+              path: token
+              audience: openshell-gateway-peer
+              expirationSeconds: 3600
     {{- if not .Values.server.disableTls }}
     - name: tls-cert
       secret:

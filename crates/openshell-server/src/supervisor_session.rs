@@ -8,17 +8,21 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::metadata::{Ascii, MetadataValue};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, Sandbox, SessionAccepted, SshRelayTarget,
-    SupervisorMessage, gateway_message, relay_open, supervisor_message,
+    GatewayMessage, PeerRelayFrame, PeerRelayInit, RelayFrame, RelayInit, RelayOpen, Sandbox,
+    SessionAccepted, SshRelayTarget, SupervisorMessage, gateway_message, open_shell_client,
+    peer_relay_frame, relay_open, supervisor_message,
 };
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
+use crate::supervisor_owner::{OWNER_TTL, OwnerError, OwnerGuard, SupervisorOwnerIndex};
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -266,16 +270,36 @@ impl SupervisorSessionRegistry {
         ),
         Status,
     > {
-        let tx = self
-            .wait_for_session(sandbox_id, session_wait_timeout)
-            .await?;
-
         let channel_id = Uuid::new_v4().to_string();
         let relay_open = RelayOpen {
             channel_id: channel_id.clone(),
             target: Some(target),
             service_id,
         };
+        self.open_relay_with_message(sandbox_id, relay_open, session_wait_timeout)
+            .await
+    }
+
+    pub async fn open_relay_with_message(
+        &self,
+        sandbox_id: &str,
+        relay_open: RelayOpen,
+        session_wait_timeout: Duration,
+    ) -> Result<
+        (
+            String,
+            oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+        ),
+        Status,
+    > {
+        if relay_open.channel_id.is_empty() {
+            return Err(Status::invalid_argument("relay channel_id is required"));
+        }
+        let tx = self
+            .wait_for_session(sandbox_id, session_wait_timeout)
+            .await?;
+
+        let channel_id = relay_open.channel_id.clone();
 
         // Register the pending relay before sending RelayOpen to avoid a race.
         // Both caps are checked and the insert happens under a single lock hold
@@ -434,6 +458,18 @@ pub fn spawn_relay_reaper(state: Arc<ServerState>, interval: Duration) {
     });
 }
 
+fn owner_error_to_status(err: OwnerError) -> Status {
+    match err {
+        OwnerError::AlreadyOwned => {
+            Status::unavailable("supervisor session owned by another gateway replica")
+        }
+        OwnerError::Conflict => Status::aborted("supervisor owner record changed concurrently"),
+        OwnerError::Store(err) => {
+            Status::internal(format!("supervisor owner persistence failed: {err}"))
+        }
+    }
+}
+
 async fn require_persisted_sandbox(
     store: &Arc<crate::persistence::Store>,
     sandbox_id: &str,
@@ -567,6 +603,414 @@ pub async fn handle_relay_stream(
 }
 
 // ---------------------------------------------------------------------------
+// PeerRelay gRPC handler and client-side forwarding
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct PeerAuthInterceptor {
+    bearer: MetadataValue<Ascii>,
+    replica_id: MetadataValue<Ascii>,
+}
+
+impl PeerAuthInterceptor {
+    fn new(token: &str, replica_id: &str) -> Result<Self, Status> {
+        let bearer = MetadataValue::try_from(format!("Bearer {token}"))
+            .map_err(|_| Status::internal("invalid gateway peer SA token header value"))?;
+        let replica_id = MetadataValue::try_from(replica_id.to_string())
+            .map_err(|_| Status::internal("invalid gateway replica id header value"))?;
+        Ok(Self { bearer, replica_id })
+    }
+}
+
+impl tonic::service::Interceptor for PeerAuthInterceptor {
+    fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
+        req.metadata_mut()
+            .insert("authorization", self.bearer.clone());
+        req.metadata_mut()
+            .insert("x-openshell-peer-replica", self.replica_id.clone());
+        Ok(req)
+    }
+}
+
+async fn build_peer_channel(endpoint: &str) -> Result<Channel, Status> {
+    let mut ep = Endpoint::from_shared(endpoint.to_string())
+        .map_err(|err| Status::internal(format!("invalid gateway peer endpoint: {err}")))?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .keep_alive_timeout(Duration::from_secs(20))
+        .http2_adaptive_window(true);
+
+    if endpoint.starts_with("https://") {
+        ep = ep
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(|err| Status::internal(format!("failed to configure peer TLS: {err}")))?;
+    }
+
+    ep.connect()
+        .await
+        .map_err(|err| Status::unavailable(format!("gateway peer connection failed: {err}")))
+}
+
+pub async fn open_routed_relay_with_target(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    target: relay_open::Target,
+    service_id: String,
+    session_wait_timeout: Duration,
+) -> Result<
+    (
+        String,
+        oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+    ),
+    Status,
+> {
+    let channel_id = Uuid::new_v4().to_string();
+    let relay_open = RelayOpen {
+        channel_id: channel_id.clone(),
+        target: Some(target),
+        service_id,
+    };
+    open_routed_relay_with_message(state, sandbox_id, relay_open, session_wait_timeout).await
+}
+
+pub async fn open_routed_relay_with_message(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    relay_open: RelayOpen,
+    session_wait_timeout: Duration,
+) -> Result<
+    (
+        String,
+        oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+    ),
+    Status,
+> {
+    if state.supervisor_sessions.has_session(sandbox_id) {
+        return state
+            .supervisor_sessions
+            .open_relay_with_message(sandbox_id, relay_open, session_wait_timeout)
+            .await;
+    }
+
+    let deadline = Instant::now() + session_wait_timeout;
+    let mut backoff = SESSION_WAIT_INITIAL_BACKOFF;
+    let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+    loop {
+        if state.supervisor_sessions.has_session(sandbox_id) {
+            return state
+                .supervisor_sessions
+                .open_relay_with_message(sandbox_id, relay_open, session_wait_timeout)
+                .await;
+        }
+
+        if let Some(owner) = owner_index
+            .read(sandbox_id)
+            .await
+            .map_err(owner_error_to_status)?
+            && owner_is_fresh(&owner)
+        {
+            if owner.owner_replica_id == state.replica_id {
+                warn!(
+                    sandbox_id,
+                    owner_replica_id = %owner.owner_replica_id,
+                    "supervisor owner record points at this replica but no local session is registered; retrying"
+                );
+                if Instant::now() + backoff > deadline {
+                    return Err(Status::unavailable("supervisor session not connected"));
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
+                continue;
+            }
+            match open_peer_relay(
+                state,
+                owner.owner_peer_endpoint.clone(),
+                sandbox_id,
+                relay_open.clone(),
+            )
+            .await
+            {
+                Ok(relay) => return Ok(relay),
+                Err(status) => {
+                    warn!(
+                        sandbox_id,
+                        owner_replica_id = %owner.owner_replica_id,
+                        owner_peer_endpoint = %owner.owner_peer_endpoint,
+                        error = %status,
+                        "gateway peer owner relay open failed; retrying until session wait timeout"
+                    );
+                }
+            }
+        }
+
+        if Instant::now() + backoff > deadline {
+            return Err(Status::unavailable("supervisor session not connected"));
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(SESSION_WAIT_MAX_BACKOFF);
+    }
+}
+
+fn owner_is_fresh(owner: &crate::supervisor_owner::OwnerRecord) -> bool {
+    let age_ms = openshell_core::time::now_ms() - owner.updated_at_ms;
+    let ttl_ms = i64::try_from(OWNER_TTL.as_millis()).unwrap_or(i64::MAX);
+    age_ms < ttl_ms
+}
+
+async fn open_peer_relay(
+    state: &Arc<ServerState>,
+    owner_peer_endpoint: String,
+    sandbox_id: &str,
+    relay_open: RelayOpen,
+) -> Result<
+    (
+        String,
+        oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+    ),
+    Status,
+> {
+    let channel_id = relay_open.channel_id.clone();
+    let (relay_tx, relay_rx) = oneshot::channel();
+    let stream = connect_peer_relay(state, &owner_peer_endpoint, sandbox_id, relay_open).await?;
+    let _ = relay_tx.send(Ok(stream));
+    Ok((channel_id, relay_rx))
+}
+
+async fn connect_peer_relay(
+    state: &Arc<ServerState>,
+    owner_peer_endpoint: &str,
+    sandbox_id: &str,
+    relay_open: RelayOpen,
+) -> Result<tokio::io::DuplexStream, Status> {
+    let token = crate::auth::peer::load_peer_service_account_token_from_env()
+        .map_err(|err| {
+            Status::failed_precondition(format!("gateway peer token load failed: {err}"))
+        })?
+        .ok_or_else(|| {
+            Status::failed_precondition("gateway peer ServiceAccount token is not configured")
+        })?;
+    let channel = build_peer_channel(owner_peer_endpoint).await?;
+    let interceptor = PeerAuthInterceptor::new(&token, &state.replica_id)?;
+    let mut client = open_shell_client::OpenShellClient::with_interceptor(channel, interceptor);
+
+    let (out_tx, out_rx) = mpsc::channel::<PeerRelayFrame>(16);
+    out_tx
+        .send(PeerRelayFrame {
+            payload: Some(peer_relay_frame::Payload::Init(PeerRelayInit {
+                sandbox_id: sandbox_id.to_string(),
+                relay_open: Some(relay_open),
+                requester_replica_id: state.replica_id.clone(),
+            })),
+        })
+        .await
+        .map_err(|_| Status::internal("failed to initialize peer relay stream"))?;
+
+    let response = client
+        .peer_relay(ReceiverStream::new(out_rx))
+        .await
+        .map_err(|err| Status::unavailable(format!("gateway peer relay RPC failed: {err}")))?;
+    let inbound = response.into_inner();
+    let (gateway_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+    spawn_peer_bridge(bridge_stream, inbound, out_tx, sandbox_id.to_string());
+    Ok(gateway_stream)
+}
+
+pub async fn handle_peer_relay(
+    state: &Arc<ServerState>,
+    request: Request<tonic::Streaming<PeerRelayFrame>>,
+) -> Result<
+    Response<
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send + 'static>>,
+    >,
+    Status,
+> {
+    let peer = match request.extensions().get::<Principal>() {
+        Some(Principal::Peer(peer)) => peer.clone(),
+        _ => {
+            return Err(Status::permission_denied(
+                "gateway peer principal is required",
+            ));
+        }
+    };
+    let mut inbound = request.into_inner();
+
+    let first = inbound
+        .message()
+        .await?
+        .ok_or_else(|| Status::invalid_argument("empty PeerRelay stream"))?;
+    let Some(peer_relay_frame::Payload::Init(init)) = first.payload else {
+        return Err(Status::invalid_argument(
+            "first PeerRelayFrame must be init",
+        ));
+    };
+    if init.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    let relay_open = init
+        .relay_open
+        .ok_or_else(|| Status::invalid_argument("relay_open is required"))?;
+    if relay_open.channel_id.is_empty() {
+        return Err(Status::invalid_argument("relay channel_id is required"));
+    }
+
+    info!(
+        sandbox_id = %init.sandbox_id,
+        channel_id = %relay_open.channel_id,
+        requester = %peer.replica_id,
+        "gateway peer relay: opening local supervisor relay"
+    );
+
+    let (channel_id, relay_rx) = state
+        .supervisor_sessions
+        .open_relay_with_message(&init.sandbox_id, relay_open, Duration::from_secs(5))
+        .await?;
+    let supervisor_stream = match tokio::time::timeout(Duration::from_secs(10), relay_rx).await {
+        Ok(Ok(Ok(stream))) => stream,
+        Ok(Ok(Err(status))) => return Err(status),
+        Ok(Err(_)) => return Err(Status::unavailable("relay channel dropped")),
+        Err(_) => return Err(Status::deadline_exceeded("relay open timed out")),
+    };
+
+    let (out_tx, out_rx) = mpsc::channel::<Result<PeerRelayFrame, Status>>(16);
+    spawn_peer_owner_bridge(
+        supervisor_stream,
+        inbound,
+        out_tx,
+        init.sandbox_id,
+        channel_id,
+    );
+    let stream: Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send + 'static>,
+    > = Box::pin(ReceiverStream::new(out_rx));
+    Ok(Response::new(stream))
+}
+
+fn spawn_peer_bridge(
+    bridge_stream: tokio::io::DuplexStream,
+    mut inbound: tonic::Streaming<PeerRelayFrame>,
+    out_tx: mpsc::Sender<PeerRelayFrame>,
+    sandbox_id: String,
+) {
+    let (mut read_half, mut write_half) = tokio::io::split(bridge_stream);
+    let sandbox_id_in = sandbox_id.clone();
+    tokio::spawn(async move {
+        loop {
+            match inbound.message().await {
+                Ok(Some(frame)) => {
+                    let Some(peer_relay_frame::Payload::Data(data)) = frame.payload else {
+                        warn!(sandbox_id = %sandbox_id_in, "gateway peer relay: non-data frame after init");
+                        break;
+                    };
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if let Err(err) =
+                        tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
+                    {
+                        warn!(sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: write to duplex failed");
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    warn!(sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: inbound errored");
+                    break;
+                }
+            }
+        }
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut write_half).await;
+    });
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; RELAY_STREAM_CHUNK_SIZE];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out_tx
+                        .send(PeerRelayFrame {
+                            payload: Some(peer_relay_frame::Payload::Data(buf[..n].to_vec())),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    warn!(sandbox_id = %sandbox_id, error = %err, "gateway peer relay: read from duplex failed");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_peer_owner_bridge(
+    supervisor_stream: tokio::io::DuplexStream,
+    mut inbound: tonic::Streaming<PeerRelayFrame>,
+    out_tx: mpsc::Sender<Result<PeerRelayFrame, Status>>,
+    sandbox_id: String,
+    channel_id: String,
+) {
+    let (mut read_half, mut write_half) = tokio::io::split(supervisor_stream);
+    let sandbox_id_in = sandbox_id.clone();
+    let channel_id_in = channel_id.clone();
+    tokio::spawn(async move {
+        loop {
+            match inbound.message().await {
+                Ok(Some(frame)) => {
+                    let Some(peer_relay_frame::Payload::Data(data)) = frame.payload else {
+                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, "gateway peer relay owner: non-data frame after init");
+                        break;
+                    };
+                    if data.is_empty() {
+                        continue;
+                    }
+                    if let Err(err) =
+                        tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
+                    {
+                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: write to supervisor relay failed");
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: inbound errored");
+                    break;
+                }
+            }
+        }
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut write_half).await;
+    });
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; RELAY_STREAM_CHUNK_SIZE];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out_tx
+                        .send(Ok(PeerRelayFrame {
+                            payload: Some(peer_relay_frame::Payload::Data(buf[..n].to_vec())),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "gateway peer relay owner: read from supervisor relay failed");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // ConnectSupervisor gRPC handler
 // ---------------------------------------------------------------------------
 
@@ -601,10 +1045,35 @@ pub async fn handle_connect_supervisor(
     require_persisted_sandbox(&state.store, &sandbox_id).await?;
 
     let session_id = Uuid::new_v4().to_string();
+    let owner_peer_endpoint = state.peer_endpoint.clone().unwrap_or_default();
+    if !state.store.is_single_replica() && owner_peer_endpoint.is_empty() {
+        return Err(Status::failed_precondition(
+            "gateway peer endpoint is required for multi-replica supervisor ownership",
+        ));
+    }
+    let owner_peer_endpoint = if owner_peer_endpoint.is_empty() {
+        format!("local://{}", state.replica_id)
+    } else {
+        owner_peer_endpoint
+    };
+    let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+    let owner_guard = owner_index
+        .publish(
+            &sandbox_id,
+            &session_id,
+            &hello.instance_id,
+            hello.connection_epoch,
+            &state.replica_id,
+            &owner_peer_endpoint,
+        )
+        .await
+        .map_err(owner_error_to_status)?;
     info!(
         sandbox_id = %sandbox_id,
         session_id = %session_id,
         instance_id = %hello.instance_id,
+        connection_epoch = hello.connection_epoch,
+        replica_id = %state.replica_id,
         "supervisor session: accepted"
     );
 
@@ -638,6 +1107,9 @@ pub async fn handle_connect_supervisor(
         state
             .supervisor_sessions
             .remove_if_current(&sandbox_id, &session_id);
+        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
+            warn!(sandbox_id = %sandbox_id, session_id = %session_id, error = %err, "supervisor session: failed to release owner after accept send failure");
+        }
         return Err(Status::internal("failed to send session accepted"));
     }
 
@@ -667,6 +1139,7 @@ pub async fn handle_connect_supervisor(
     let state_clone = Arc::clone(state);
     let sandbox_id_clone = sandbox_id.clone();
     tokio::spawn(async move {
+        let mut owner_guard = owner_guard;
         run_session_loop(
             &state_clone,
             &sandbox_id_clone,
@@ -674,11 +1147,16 @@ pub async fn handle_connect_supervisor(
             &tx,
             &mut inbound,
             shutdown_rx,
+            &mut owner_guard,
         )
         .await;
         let still_ours = state_clone
             .supervisor_sessions
             .remove_if_current(&sandbox_id_clone, &session_id);
+        let owner_index = SupervisorOwnerIndex::new(state_clone.store.clone(), OWNER_TTL);
+        if let Err(err) = owner_index.release_if_current(&owner_guard).await {
+            warn!(sandbox_id = %sandbox_id_clone, session_id = %session_id, error = %err, "supervisor session: failed to release owner record");
+        }
         if still_ours {
             info!(sandbox_id = %sandbox_id_clone, session_id = %session_id, "supervisor session: ended");
             state_clone
@@ -717,6 +1195,7 @@ async fn run_session_loop(
     tx: &mpsc::Sender<GatewayMessage>,
     inbound: &mut tonic::Streaming<SupervisorMessage>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    owner_guard: &mut OwnerGuard,
 ) {
     let heartbeat_interval = Duration::from_secs(u64::from(HEARTBEAT_INTERVAL_SECS));
     let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
@@ -732,7 +1211,9 @@ async fn run_session_loop(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(msg)) => {
-                        handle_supervisor_message(state, sandbox_id, session_id, msg);
+                        if !handle_supervisor_message(state, sandbox_id, session_id, msg, owner_guard).await {
+                            break;
+                        }
                     }
                     Ok(None) => {
                         info!(sandbox_id = %sandbox_id, session_id = %session_id, "supervisor session: stream closed by supervisor");
@@ -759,15 +1240,25 @@ async fn run_session_loop(
     }
 }
 
-fn handle_supervisor_message(
+async fn handle_supervisor_message(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     session_id: &str,
     msg: SupervisorMessage,
-) {
+    owner_guard: &mut OwnerGuard,
+) -> bool {
     match msg.payload {
         Some(supervisor_message::Payload::Heartbeat(_)) => {
-            // Heartbeat received — nothing to do for now.
+            let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
+            if let Err(err) = owner_index.renew(owner_guard).await {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    session_id = %session_id,
+                    error = %err,
+                    "supervisor session: owner renewal failed; closing session"
+                );
+                return false;
+            }
         }
         Some(supervisor_message::Payload::RelayOpenResult(result)) => {
             if result.success {
@@ -808,6 +1299,7 @@ fn handle_supervisor_message(
             );
         }
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
