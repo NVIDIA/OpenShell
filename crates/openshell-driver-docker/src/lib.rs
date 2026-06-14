@@ -27,7 +27,9 @@ use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH, supervisor_image_should_refresh,
 };
-use openshell_core::gpu::cdi_gpu_device_ids;
+use openshell_core::gpu::{
+    cdi_gpu_device_ids, driver_gpu_requirements, validate_specific_gpu_device_request,
+};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -36,11 +38,11 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
-    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
-    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event,
+    GetSandboxResponse, GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -461,7 +463,8 @@ impl DockerComputeDriver {
 
         let driver_config =
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
-        Self::validate_gpu_request(spec.gpu, config.supports_gpu, &driver_config)?;
+        let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
+        Self::validate_gpu_request(gpu_requirements, config.supports_gpu, &driver_config)?;
         Ok(())
     }
 
@@ -509,21 +512,29 @@ impl DockerComputeDriver {
     }
 
     fn validate_gpu_request(
-        gpu: bool,
+        gpu_requirements: Option<&GpuResourceRequirements>,
         supports_gpu: bool,
         driver_config: &DockerSandboxDriverConfig,
     ) -> Result<(), Status> {
-        if !gpu && driver_config.cdi_devices.is_some() {
-            return Err(Status::invalid_argument(
-                "driver_config.cdi_devices requires gpu=true",
-            ));
-        }
-
-        if gpu && !supports_gpu {
+        if gpu_requirements.is_some() && !supports_gpu {
             return Err(Status::failed_precondition(
                 "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
             ));
         }
+
+        if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
+            validate_specific_gpu_device_request(
+                gpu_requirements,
+                cdi_devices,
+                "driver_config.cdi_devices",
+            )
+            .map_err(Status::invalid_argument)?;
+        } else if gpu_requirements.and_then(|gpu| gpu.count).is_some() {
+            return Err(Status::invalid_argument(
+                "docker GPU count requests are not supported; use --gpu without a count or driver_config.cdi_devices",
+            ));
+        }
+
         Ok(())
     }
 
@@ -2122,14 +2133,16 @@ fn build_device_requests(sandbox: &DriverSandbox) -> Result<Option<Vec<DeviceReq
         .map_err(Status::invalid_argument)?
         .cdi_devices
         .unwrap_or_default();
-    if !spec.gpu && !cdi_devices.is_empty() {
-        return Err(Status::invalid_argument(
-            "driver_config.cdi_devices requires gpu=true",
-        ));
-    }
+    let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
+    validate_specific_gpu_device_request(
+        gpu_requirements,
+        &cdi_devices,
+        "driver_config.cdi_devices",
+    )
+    .map_err(Status::invalid_argument)?;
 
     Ok(
-        cdi_gpu_device_ids(spec.gpu, &cdi_devices).map(|device_ids| {
+        cdi_gpu_device_ids(gpu_requirements, &cdi_devices).map(|device_ids| {
             vec![DeviceRequest {
                 driver: Some("cdi".to_string()),
                 device_ids: Some(device_ids),

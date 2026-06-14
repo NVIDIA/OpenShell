@@ -53,14 +53,19 @@ openshell sandbox create \
 ```
 
 Driver config is for fields without a stable public flag. Prefer `--cpu`,
-`--memory`, and `--gpu` for portable resource intent.
+`--memory`, and `--gpu` for supported resource intent. Pass a count to `--gpu`
+when the active driver supports counted allocation. Docker and Podman reject
+count-only GPU selection. If `driver_config` lists more than one exact CDI
+device, pass `--gpu COUNT`; the count must match the number of listed devices.
+A single exact CDI device is compatible with the default `--gpu` request.
 
 Exact GPU device selection remains driver-owned and requires `--gpu`. Docker
 and Podman accept `cdi_devices`; replace the top-level `docker` key with
 `podman` when using the Podman driver, for example
 `{"docker":{"cdi_devices":["nvidia.com/gpu=0"]}}`. The VM driver accepts
 `gpu_device_ids`, for example `{"vm":{"gpu_device_ids":["0000:2d:00.0"]}}`;
-the current VM implementation accepts at most one entry.
+the current VM implementation accepts at most one entry and allows either
+`--gpu` or `--gpu 1` when `gpu_device_ids` is set.
 
 For Kubernetes, `pod.runtime_class_name` maps to PodSpec `runtimeClassName`.
 It overrides the gateway's configured default runtime class for that sandbox,

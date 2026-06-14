@@ -69,8 +69,10 @@ tracked separately in issue #1492.
 - Defining the general driver-specific configuration passthrough API. Issue
   #1492 tracks that related API surface.
 - Publishing allocated resource identities in sandbox status.
-- Preserving long-term compatibility for `gpu`, `gpu_device`, or a
-  GPU-specific `gpu_count` request field.
+- Preserving alpha-era compatibility for `gpu`, `gpu_device`, or a
+  GPU-specific `gpu_count` request field. The legacy GPU-specific request
+  fields are intentionally not carried forward into the API shape this RFC
+  aims to stabilize.
 
 ## Proposal
 
@@ -89,12 +91,21 @@ message SandboxSpec {
 
   // Portable resource requirements used by the gateway for driver selection
   // and by drivers for provisioning.
-  SandboxResourceRequirements resource_requirements = 11;
+  SandboxResourceRequirements resource_requirements = 9;
 
-  reserved 9, 10;
-  reserved "gpu", "gpu_device";
+  reserved 10;
+  reserved "gpu_device";
 }
 ```
+
+The public sandbox API is still alpha. This migration intentionally replaces
+the old `bool gpu = 9` field with the typed `resource_requirements = 9` message
+instead of reserving the legacy field number. Old live requests and persisted
+sandbox records that encode GPU intent through the legacy boolean are not
+migrated; callers should use a matching OpenShell CLI/API version and recreate
+GPU sandboxes after upgrade when they need the new typed shape. Avoiding
+alpha-era reserved fields keeps the proto surface closer to the API intended
+for stabilization.
 
 `SandboxTemplate.resources` keeps its existing role as platform-native workload
 configuration. It may contain Kubernetes-style CPU, memory, and extended
@@ -551,16 +562,22 @@ message DriverSandboxSpec {
   string log_level = 1;
   map<string, string> environment = 5;
   DriverSandboxTemplate template = 6;
-  DriverSandboxResourceRequirements resource_requirements = 11;
+  DriverSandboxResourceRequirements resource_requirements = 9;
 
-  reserved 9, 10;
-  reserved "gpu", "gpu_device";
+  reserved 10;
+  reserved "gpu_device";
 }
 ```
 
 Driver-owned resource requirement messages should have the same semantics as
 the public messages, but live in `compute_driver.proto` to keep the public and
 internal contracts separated.
+
+The compute-driver API is version-coupled to the gateway in current deployments:
+local drivers are launched by the gateway at startup, and the driver proto is
+not treated as a public compatibility surface. It follows the same alpha-era
+field replacement as the public API rather than preserving transitional GPU
+fields.
 
 ### Driver capabilities
 
