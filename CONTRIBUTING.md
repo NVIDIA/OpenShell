@@ -69,6 +69,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Getting Started | `debug-openshell-cluster` | Diagnose gateway deployment and health issues                                                       |
 | Getting Started | `debug-inference`         | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
+| Contributing    | `create-rfc`              | Create RFC proposals from the repository template                                                   |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
 | Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
@@ -78,6 +79,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
 | Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
+| Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
 | Documentation   | `update-docs`             | Scan recent commits and draft doc updates for user-facing changes                                   |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
