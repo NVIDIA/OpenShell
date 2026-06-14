@@ -40,6 +40,8 @@ mod ssh_sessions;
 pub mod supervisor_session;
 mod telemetry;
 mod tls;
+#[cfg(test)]
+pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
 mod ws_tunnel;
 
@@ -420,14 +422,23 @@ pub async fn run_server(
         info!("Metrics server disabled");
     }
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
     let tls_acceptor = if let Some(tls) = &config.tls {
-        Some(TlsAcceptor::from_files(
+        let acceptor = TlsAcceptor::from_files(
             &tls.cert_path,
             &tls.key_path,
             tls.client_ca_path.as_deref(),
             tls.require_client_auth,
-        )?)
+        )?;
+
+        // Spawn file-watcher-based TLS certificate reload worker.
+        // Watches parent directories of cert/key/CA files and atomically
+        // reloads when changes are detected.
+        acceptor.spawn_reload_worker(shutdown_rx.clone());
+
+        Some(acceptor)
     } else {
         info!("TLS disabled — accepting plaintext connections");
         None
@@ -621,7 +632,10 @@ fn spawn_gateway_connection(
                     warn!(client = %addr, listen = %listen_addr, "Rejected plaintext HTTP on non-loopback gateway listener");
                 }
                 Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
-                    match acceptor.inner().accept(stream).await {
+                    // acceptor.acceptor() snapshots the current TLS config;
+                    // the returned acceptor owns an Arc that stays alive for
+                    // the full duration of the handshake.
+                    match acceptor.acceptor().accept(stream).await {
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             if let Err(e) = service
@@ -914,8 +928,7 @@ mod tests {
         ComputeDriverKind, Config,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
-    use rcgen::{CertificateParams, IsCa, KeyPair};
-    use std::io::{Error, ErrorKind, Write};
+    use std::io::{Error, ErrorKind};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -924,41 +937,13 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
 
-    fn install_rustls_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
+    use crate::tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider};
 
     fn test_tls_acceptor() -> (TempDir, TlsAcceptor) {
         install_rustls_provider();
 
-        let mut ca_params =
-            CertificateParams::new(Vec::<String>::new()).expect("failed to create CA params");
-        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "test-ca");
-        let ca_key = KeyPair::generate().expect("failed to generate CA key");
-        let ca_cert = ca_params
-            .self_signed(&ca_key)
-            .expect("failed to sign CA cert");
-
-        let server_params = CertificateParams::new(vec!["localhost".to_string()])
-            .expect("failed to create server params");
-        let server_key = KeyPair::generate().expect("failed to generate server key");
-        let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
-            .expect("failed to sign server cert");
-
         let dir = tempdir().expect("failed to create tempdir");
-        let write_file = |name: &str, data: &[u8]| {
-            let path = dir.path().join(name);
-            std::fs::File::create(&path)
-                .and_then(|mut file| file.write_all(data))
-                .expect("failed to write tls test file");
-        };
-        write_file("ca.pem", ca_cert.pem().as_bytes());
-        write_file("server-cert.pem", server_cert.pem().as_bytes());
-        write_file("server-key.pem", server_key.serialize_pem().as_bytes());
+        generate_test_certs_with_ca(dir.path());
 
         let acceptor = TlsAcceptor::from_files(
             &dir.path().join("server-cert.pem"),

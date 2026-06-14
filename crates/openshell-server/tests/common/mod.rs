@@ -566,7 +566,7 @@ pub async fn start_test_server(
             let svc = service.clone();
             let tls = tls_acceptor.clone();
             tokio::spawn(async move {
-                let Ok(tls_stream) = tls.inner().accept(stream).await else {
+                let Ok(tls_stream) = tls.acceptor().accept(stream).await else {
                     return;
                 };
                 let _ = Builder::new(TokioExecutor::new())
