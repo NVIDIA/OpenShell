@@ -95,6 +95,19 @@ fn build_ci_scopes(scopes: Option<&str>) -> Vec<Scope> {
         .collect()
 }
 
+/// Resolve the loopback bind address for the OIDC callback server.
+///
+/// Returns `127.0.0.1:<port>` when `OPENSHELL_OIDC_REDIRECT_PORT` holds a valid
+/// port, otherwise `127.0.0.1:0` (an OS-assigned ephemeral port). An empty or
+/// unparseable value falls back to the ephemeral port so a stray env var never
+/// breaks login.
+fn oidc_redirect_bind_addr(redirect_port: Option<String>) -> String {
+    match redirect_port {
+        Some(p) if p.trim().parse::<u16>().is_ok() => format!("127.0.0.1:{}", p.trim()),
+        _ => "127.0.0.1:0".to_string(),
+    }
+}
+
 /// Run the OIDC Authorization Code + PKCE browser flow.
 ///
 /// Opens the user's browser to the Keycloak login page and waits for
@@ -108,7 +121,13 @@ pub async fn oidc_browser_auth_flow(
 ) -> Result<OidcTokenBundle> {
     let discovery = discover(issuer, insecure).await?;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.into_diagnostic()?;
+    // By default the callback server binds an ephemeral port (127.0.0.1:0).
+    // Some IdPs (e.g. Okta org authorization servers) require an exact redirect
+    // URI match and do not allow a port wildcard, which makes a random port
+    // unusable. OPENSHELL_OIDC_REDIRECT_PORT pins the loopback callback port so
+    // a single `http://127.0.0.1:<port>/callback` can be registered with the IdP.
+    let bind_addr = oidc_redirect_bind_addr(std::env::var("OPENSHELL_OIDC_REDIRECT_PORT").ok());
+    let listener = TcpListener::bind(&bind_addr).await.into_diagnostic()?;
     let port = listener.local_addr().into_diagnostic()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
@@ -502,6 +521,39 @@ mod tests {
 
         let scopes = build_scopes(Some("profile email"));
         assert_eq!(scopes.len(), 3);
+    }
+
+    #[test]
+    fn oidc_redirect_bind_addr_defaults_to_ephemeral() {
+        assert_eq!(oidc_redirect_bind_addr(None), "127.0.0.1:0");
+    }
+
+    #[test]
+    fn oidc_redirect_bind_addr_uses_valid_port() {
+        assert_eq!(
+            oidc_redirect_bind_addr(Some("49200".to_string())),
+            "127.0.0.1:49200"
+        );
+        // Surrounding whitespace is tolerated.
+        assert_eq!(
+            oidc_redirect_bind_addr(Some("  49200  ".to_string())),
+            "127.0.0.1:49200"
+        );
+    }
+
+    #[test]
+    fn oidc_redirect_bind_addr_falls_back_on_invalid() {
+        // Empty, non-numeric, and out-of-range values fall back to ephemeral so
+        // a stray env var never breaks login.
+        assert_eq!(oidc_redirect_bind_addr(Some(String::new())), "127.0.0.1:0");
+        assert_eq!(
+            oidc_redirect_bind_addr(Some("not-a-port".to_string())),
+            "127.0.0.1:0"
+        );
+        assert_eq!(
+            oidc_redirect_bind_addr(Some("70000".to_string())),
+            "127.0.0.1:0"
+        );
     }
 
     #[test]
