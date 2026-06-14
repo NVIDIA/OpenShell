@@ -50,6 +50,7 @@ const ALL_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH",
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PolicyFile {
     #[allow(dead_code)]
     version: Option<u32>,
@@ -67,6 +68,7 @@ struct PolicyFile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FilesystemDef {
     #[serde(default)]
     include_workdir: bool,
@@ -77,6 +79,7 @@ struct FilesystemDef {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NetworkPolicyRuleDef {
     #[serde(default)]
     name: Option<String>,
@@ -87,9 +90,12 @@ struct NetworkPolicyRuleDef {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EndpointDef {
     #[serde(default)]
     host: String,
+    #[serde(default)]
+    path: String,
     #[serde(default)]
     port: u16,
     #[serde(default)]
@@ -106,14 +112,36 @@ struct EndpointDef {
     rules: Vec<L7RuleDef>,
     #[serde(default)]
     allowed_ips: Vec<String>,
+    #[serde(default)]
+    deny_rules: Vec<L7DenyRuleDef>,
+    #[serde(default)]
+    persisted_queries: String,
+    #[serde(default)]
+    graphql_persisted_queries: BTreeMap<String, serde_yml::Value>,
+    #[serde(default)]
+    graphql_max_body_bytes: u32,
+    #[serde(default)]
+    allow_encoded_slash: bool,
+    #[serde(default)]
+    websocket_credential_rewrite: bool,
+    #[serde(default)]
+    request_body_credential_rewrite: bool,
+    #[serde(default)]
+    mcp_server: String,
+    #[serde(default)]
+    mcp_tool: String,
+    #[serde(default)]
+    mcp_resource: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct L7RuleDef {
     allow: L7AllowDef,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct L7AllowDef {
     #[serde(default)]
     method: String,
@@ -121,9 +149,37 @@ struct L7AllowDef {
     path: String,
     #[serde(default)]
     command: String,
+    #[serde(default)]
+    query: BTreeMap<String, serde_yml::Value>,
+    #[serde(default)]
+    operation_type: String,
+    #[serde(default)]
+    operation_name: String,
+    #[serde(default)]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct L7DenyRuleDef {
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    query: BTreeMap<String, serde_yml::Value>,
+    #[serde(default)]
+    operation_type: String,
+    #[serde(default)]
+    operation_name: String,
+    #[serde(default)]
+    fields: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BinaryDef {
     path: String,
 }
@@ -138,12 +194,29 @@ pub struct L7Rule {
     pub method: String,
     pub path: String,
     pub command: String,
+    pub query: BTreeMap<String, serde_yml::Value>,
+    pub operation_type: String,
+    pub operation_name: String,
+    pub fields: Vec<String>,
+}
+
+/// A single L7 deny rule on an endpoint.
+#[derive(Debug, Clone)]
+pub struct L7DenyRule {
+    pub method: String,
+    pub path: String,
+    pub command: String,
+    pub query: BTreeMap<String, serde_yml::Value>,
+    pub operation_type: String,
+    pub operation_name: String,
+    pub fields: Vec<String>,
 }
 
 /// A network endpoint in the policy.
 #[derive(Debug, Clone)]
 pub struct Endpoint {
     pub host: String,
+    pub path: String,
     pub port: u16,
     pub ports: Vec<u16>,
     pub protocol: String,
@@ -152,6 +225,16 @@ pub struct Endpoint {
     pub access: String,
     pub rules: Vec<L7Rule>,
     pub allowed_ips: Vec<String>,
+    pub deny_rules: Vec<L7DenyRule>,
+    pub persisted_queries: String,
+    pub graphql_persisted_queries: BTreeMap<String, serde_yml::Value>,
+    pub graphql_max_body_bytes: u32,
+    pub allow_encoded_slash: bool,
+    pub websocket_credential_rewrite: bool,
+    pub request_body_credential_rewrite: bool,
+    pub mcp_server: String,
+    pub mcp_tool: String,
+    pub mcp_resource: String,
 }
 
 impl Endpoint {
@@ -372,10 +455,28 @@ pub fn parse_policy_str(yaml: &str) -> Result<PolicyModel> {
                             method: r.allow.method,
                             path: r.allow.path,
                             command: r.allow.command,
+                            query: r.allow.query,
+                            operation_type: r.allow.operation_type,
+                            operation_name: r.allow.operation_name,
+                            fields: r.allow.fields,
+                        })
+                        .collect();
+                    let deny_rules = ep_raw
+                        .deny_rules
+                        .into_iter()
+                        .map(|r| L7DenyRule {
+                            method: r.method,
+                            path: r.path,
+                            command: r.command,
+                            query: r.query,
+                            operation_type: r.operation_type,
+                            operation_name: r.operation_name,
+                            fields: r.fields,
                         })
                         .collect();
                     Endpoint {
                         host: ep_raw.host,
+                        path: ep_raw.path,
                         port: ep_raw.port,
                         ports: ep_raw.ports,
                         protocol: ep_raw.protocol,
@@ -384,6 +485,16 @@ pub fn parse_policy_str(yaml: &str) -> Result<PolicyModel> {
                         access: ep_raw.access,
                         rules,
                         allowed_ips: ep_raw.allowed_ips,
+                        deny_rules,
+                        persisted_queries: ep_raw.persisted_queries,
+                        graphql_persisted_queries: ep_raw.graphql_persisted_queries,
+                        graphql_max_body_bytes: ep_raw.graphql_max_body_bytes,
+                        allow_encoded_slash: ep_raw.allow_encoded_slash,
+                        websocket_credential_rewrite: ep_raw.websocket_credential_rewrite,
+                        request_body_credential_rewrite: ep_raw.request_body_credential_rewrite,
+                        mcp_server: ep_raw.mcp_server,
+                        mcp_tool: ep_raw.mcp_tool,
+                        mcp_resource: ep_raw.mcp_resource,
                     }
                 })
                 .collect();

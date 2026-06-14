@@ -9,6 +9,7 @@
 
 pub mod accepted_risks;
 pub mod credentials;
+pub mod envelope;
 pub mod finding;
 pub mod model;
 pub mod policy;
