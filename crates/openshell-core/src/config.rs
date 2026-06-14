@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -91,6 +91,34 @@ impl FromStr for ComputeDriverKind {
     }
 }
 
+/// Result of [`detect_driver`] or an explicitly configured driver, carrying
+/// any driver-specific connection metadata discovered during probing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetectedDriver {
+    Kubernetes,
+    Docker,
+    /// VM is never auto-detected but flows through the same path when
+    /// explicitly configured via `--drivers vm`.
+    Vm,
+    Podman {
+        /// API socket path verified during detection.
+        socket_path: PathBuf,
+    },
+}
+
+impl DetectedDriver {
+    /// The [`ComputeDriverKind`] for logging and match guards.
+    #[must_use]
+    pub fn kind(&self) -> ComputeDriverKind {
+        match self {
+            Self::Kubernetes => ComputeDriverKind::Kubernetes,
+            Self::Docker => ComputeDriverKind::Docker,
+            Self::Vm => ComputeDriverKind::Vm,
+            Self::Podman { .. } => ComputeDriverKind::Podman,
+        }
+    }
+}
+
 /// Auto-detect the appropriate compute driver based on the runtime environment.
 ///
 /// Priority order: Kubernetes → Podman → Docker.
@@ -98,20 +126,21 @@ impl FromStr for ComputeDriverKind {
 ///
 /// Returns the first driver where the environment check passes.
 /// Returns `None` if no compatible driver is found.
-pub fn detect_driver() -> Option<ComputeDriverKind> {
+pub fn detect_driver() -> Option<DetectedDriver> {
     // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
     if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        return Some(ComputeDriverKind::Kubernetes);
+        return Some(DetectedDriver::Kubernetes);
     }
 
-    // Podman: check for a reachable local API socket.
-    if is_podman_available() {
-        return Some(ComputeDriverKind::Podman);
+    // Podman: check for a reachable local API socket, falling back to CLI
+    // discovery which also resolves the host-side socket path.
+    if let Some(socket_path) = detect_podman() {
+        return Some(DetectedDriver::Podman { socket_path });
     }
 
     // Docker: check if the CLI is available or a local Docker socket exists.
     if is_docker_available() {
-        return Some(ComputeDriverKind::Docker);
+        return Some(DetectedDriver::Docker);
     }
 
     None
@@ -125,10 +154,91 @@ fn is_binary_available(name: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-fn is_podman_available() -> bool {
-    podman_socket_candidates()
-        .iter()
-        .any(|path| podman_socket_responds(path))
+/// Detect whether Podman is available and discover the API socket path.
+///
+/// Returns the verified socket path, or `None` when Podman is not
+/// available at all.
+fn detect_podman() -> Option<PathBuf> {
+    // Fast path: one of the well-known socket candidates responds.
+    if let Some(path) = podman_socket_candidates()
+        .into_iter()
+        .find(|path| podman_socket_responds(path))
+    {
+        return Some(path);
+    }
+
+    // Slow path: the socket symlink is missing or at a non-standard
+    // location.  Ask the CLI to discover the host-side socket.
+    discover_podman_socket()
+}
+
+/// Query the Podman CLI to discover the host-side API socket path.
+///
+/// Strategy:
+/// 1. Run `podman info --format json` to check connectivity and whether
+///    the service is remote (macOS/Windows VM) or local (native Linux).
+/// 2. If `serviceIsRemote` is true, run `podman machine inspect` to get
+///    the host-side forwarded socket (the `remoteSocket` from `podman info`
+///    is the VM-internal path, which is not reachable from the host).
+/// 3. If `serviceIsRemote` is false, use `remoteSocket.path` directly
+///    (on native Linux this IS the real local socket).
+fn discover_podman_socket() -> Option<PathBuf> {
+    let output = Command::new("podman")
+        .args(["info", "--format", "json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let is_remote = info["host"]["serviceIsRemote"].as_bool().unwrap_or(false);
+
+    if is_remote {
+        discover_podman_machine_socket()
+    } else {
+        parse_podman_info_socket(&info)
+    }
+}
+
+/// Extract the socket path from `podman info` JSON output.
+/// Used on native Linux where `remoteSocket.path` is the real local socket.
+fn parse_podman_info_socket(info: &serde_json::Value) -> Option<PathBuf> {
+    let path_str = info["host"]["remoteSocket"]["path"].as_str()?;
+    let path = path_str.strip_prefix("unix://").unwrap_or(path_str);
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// Run `podman machine inspect` to discover the host-side forwarded socket.
+/// Used on macOS/Windows where the Podman service runs inside a VM.
+fn discover_podman_machine_socket() -> Option<PathBuf> {
+    let output = Command::new("podman")
+        .args(["machine", "inspect"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+
+    let machines: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    parse_podman_machine_inspect(&machines)
+}
+
+/// Extract the host-side socket path from `podman machine inspect` JSON.
+fn parse_podman_machine_inspect(machines: &serde_json::Value) -> Option<PathBuf> {
+    let path_str = machines
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|m| m["ConnectionInfo"]["PodmanSocket"]["Path"].as_str())?;
+    if path_str.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path_str))
 }
 
 fn podman_socket_candidates() -> Vec<PathBuf> {
@@ -765,8 +875,9 @@ mod tests {
     #[cfg(unix)]
     use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket, podman_socket_candidates_from_env,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, DetectedDriver,
+        GatewayJwtConfig, detect_driver, docker_host_unix_socket_path, is_unix_socket,
+        parse_podman_info_socket, parse_podman_machine_inspect, podman_socket_candidates_from_env,
         podman_socket_responds,
     };
     #[cfg(unix)]
@@ -1018,7 +1129,7 @@ mod tests {
         }
 
         let result = detect_driver();
-        assert_eq!(result, Some(ComputeDriverKind::Kubernetes));
+        assert_eq!(result, Some(DetectedDriver::Kubernetes));
 
         // Restore the original env var
         unsafe {
@@ -1027,5 +1138,99 @@ mod tests {
                 None => std::env::remove_var("KUBERNETES_SERVICE_HOST"),
             }
         }
+    }
+
+    #[test]
+    fn parse_podman_info_socket_extracts_linux_local_socket() {
+        let info: serde_json::Value = serde_json::json!({
+            "host": {
+                "serviceIsRemote": false,
+                "remoteSocket": {
+                    "path": "unix:///run/user/1000/podman/podman.sock",
+                    "exists": true
+                }
+            }
+        });
+        assert_eq!(
+            parse_podman_info_socket(&info),
+            Some(PathBuf::from("/run/user/1000/podman/podman.sock"))
+        );
+    }
+
+    #[test]
+    fn parse_podman_info_socket_handles_path_without_unix_prefix() {
+        let info: serde_json::Value = serde_json::json!({
+            "host": {
+                "remoteSocket": {
+                    "path": "/run/user/1000/podman/podman.sock",
+                    "exists": true
+                }
+            }
+        });
+        assert_eq!(
+            parse_podman_info_socket(&info),
+            Some(PathBuf::from("/run/user/1000/podman/podman.sock"))
+        );
+    }
+
+    #[test]
+    fn parse_podman_info_socket_returns_none_for_missing_path() {
+        let info: serde_json::Value = serde_json::json!({
+            "host": {
+                "remoteSocket": {}
+            }
+        });
+        assert_eq!(parse_podman_info_socket(&info), None);
+    }
+
+    #[test]
+    fn parse_podman_info_socket_returns_none_for_empty_path() {
+        let info: serde_json::Value = serde_json::json!({
+            "host": {
+                "remoteSocket": {
+                    "path": "",
+                    "exists": false
+                }
+            }
+        });
+        assert_eq!(parse_podman_info_socket(&info), None);
+    }
+
+    #[test]
+    fn parse_podman_machine_inspect_extracts_macos_socket() {
+        let machines: serde_json::Value = serde_json::json!([
+            {
+                "ConnectionInfo": {
+                    "PodmanSocket": {
+                        "Path": "/var/folders/1q/jx7s14b928n8zvstgfk98lj00000gn/T/podman/podman-machine-default-api.sock"
+                    },
+                    "PodmanPipe": null
+                },
+                "Name": "podman-machine-default"
+            }
+        ]);
+        assert_eq!(
+            parse_podman_machine_inspect(&machines),
+            Some(PathBuf::from(
+                "/var/folders/1q/jx7s14b928n8zvstgfk98lj00000gn/T/podman/podman-machine-default-api.sock"
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_podman_machine_inspect_returns_none_for_empty_array() {
+        let machines: serde_json::Value = serde_json::json!([]);
+        assert_eq!(parse_podman_machine_inspect(&machines), None);
+    }
+
+    #[test]
+    fn parse_podman_machine_inspect_returns_none_for_missing_socket() {
+        let machines: serde_json::Value = serde_json::json!([
+            {
+                "ConnectionInfo": {},
+                "Name": "podman-machine-default"
+            }
+        ]);
+        assert_eq!(parse_podman_machine_inspect(&machines), None);
     }
 }
