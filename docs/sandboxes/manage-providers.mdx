@@ -85,6 +85,15 @@ List all providers:
 openshell provider list
 ```
 
+Use `-o json` or `-o yaml` for machine-readable output:
+
+```shell
+openshell provider list -o json
+openshell provider list -o yaml
+```
+
+Structured output includes provider metadata (`id`, `name`, `type`), credential key names, config key names, labels, creation timestamp, resource version, and credential expiration times. Only credential and config keys are exposed, never values, preventing accidental credential leakage in logs or output. For details on how credentials are injected into sandboxes, refer to [Credential Injection](#how-credential-injection-works).
+
 Inspect a provider:
 
 ```shell
