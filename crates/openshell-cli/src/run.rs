@@ -4796,9 +4796,10 @@ fn provider_to_json(provider: &Provider) -> serde_json::Value {
         serde_json::json!(credential_keys),
     );
 
-    // Config (non-secret configuration)
+    // Config keys (keys only, not values)
     if !provider.config.is_empty() {
-        obj.insert("config".to_string(), serde_json::json!(provider.config));
+        let config_keys: Vec<String> = provider.config.keys().cloned().collect();
+        obj.insert("config_keys".to_string(), serde_json::json!(config_keys));
     }
 
     // Metadata fields (only if metadata exists)
