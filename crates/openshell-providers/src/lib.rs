@@ -116,6 +116,7 @@ impl ProviderRegistry {
         registry.register(providers::openai::SPEC);
         registry.register(providers::anthropic::SPEC);
         registry.register(providers::nvidia::SPEC);
+        registry.register(providers::deepinfra::SPEC);
         registry.register(providers::gitlab::SPEC);
         registry.register(providers::github::SPEC);
         registry.register(providers::outlook::OutlookProvider);

@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn openai_compatible_profiles_include_embeddings() {
-        for provider_type in ["openai", "nvidia"] {
+        for provider_type in ["openai", "nvidia", "deepinfra"] {
             let profile = profile_for(provider_type).expect("provider profile should exist");
             assert!(
                 profile.protocols.contains(&"openai_embeddings"),

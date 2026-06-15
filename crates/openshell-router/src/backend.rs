@@ -768,11 +768,20 @@ fn build_provider_url(
 
 fn build_backend_url(endpoint: &str, path: &str) -> String {
     let base = endpoint.trim_end_matches('/');
-    // Strip the /v1 prefix from the request path when the base URL already
-    // contains a /v1 segment — either ending with it (e.g. openai, nvidia)
-    // or containing it internally (e.g. deepinfra: /v1/openai).
-    let base_has_v1 = base.ends_with("/v1") || base.contains("/v1/");
-    if base_has_v1 && (path == "/v1" || path.starts_with("/v1/")) {
+    // Strip the /v1 prefix from the request path only when the base URL's
+    // own path component is exactly /v1 (e.g. openai, nvidia: ".../v1") or
+    // starts with /v1/ (e.g. deepinfra: ".../v1/openai"). This avoids
+    // doubling /v1 for those providers while preserving the full path for
+    // proxy endpoints where /v1 appears deeper in the path
+    // (e.g. "https://proxy.example/api/v1/openai").
+    let base_path_is_v1_rooted = base
+        .find("://")
+        .and_then(|i| base[i + 3..].find('/').map(|j| i + 3 + j))
+        .is_some_and(|path_start| {
+            let base_path = &base[path_start..];
+            base_path == "/v1" || base_path.starts_with("/v1/")
+        });
+    if base_path_is_v1_rooted && (path == "/v1" || path.starts_with("/v1/")) {
         return format!("{base}{}", &path[3..]);
     }
 
@@ -845,6 +854,20 @@ mod tests {
                 "/v1/chat/completions"
             ),
             "https://api.deepinfra.com/v1/openai/chat/completions"
+        );
+    }
+
+    #[test]
+    fn build_backend_url_preserves_v1_for_nested_proxy_path() {
+        // A proxy whose base path has /v1 buried deeper (not at the root of
+        // the path) must NOT have /v1 stripped — the full request path must
+        // be appended so the upstream receives the correct API version prefix.
+        assert_eq!(
+            build_backend_url(
+                "https://proxy.example/api/v1/openai",
+                "/v1/chat/completions"
+            ),
+            "https://proxy.example/api/v1/openai/v1/chat/completions"
         );
     }
 
