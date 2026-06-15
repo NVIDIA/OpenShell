@@ -4799,6 +4799,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_config_uses_updated_custom_provider_profile_without_rewriting_provider() {
+        use crate::grpc::provider::handle_update_provider_profiles;
+        use openshell_core::proto::{
+            ProviderProfile, ProviderProfileCategory, ProviderProfileImportItem,
+            StoredProviderProfile, UpdateProviderProfilesRequest,
+        };
+
+        fn stored_profile(host: &str) -> StoredProviderProfile {
+            StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-custom-policy".to_string(),
+                    name: "custom-policy".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                profile: Some(ProviderProfile {
+                    id: "custom-policy".to_string(),
+                    display_name: "Custom Policy".to_string(),
+                    description: String::new(),
+                    category: ProviderProfileCategory::Other as i32,
+                    credentials: Vec::new(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: Vec::new(),
+                    inference_capable: false,
+                    discovery: None,
+                }),
+            }
+        }
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&stored_profile("api.before.example"))
+            .await
+            .unwrap();
+        let provider = test_provider("work-custom", "custom-policy");
+        state.store.put_message(&provider).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-custom-policy-update",
+                "custom-policy-update",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-custom".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let before_policy = get_sandbox_policy(&state, "sb-custom-policy-update").await;
+        assert!(
+            before_policy.network_policies["_provider_work_custom"]
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.before.example")
+        );
+
+        let updated_profile = stored_profile("api.after.example").profile.unwrap();
+        let response = handle_update_provider_profiles(
+            &state,
+            with_user(Request::new(UpdateProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(updated_profile),
+                    source: "custom-policy.yaml".to_string(),
+                }],
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(response.updated);
+
+        let after_policy = get_sandbox_policy(&state, "sb-custom-policy-update").await;
+        let provider_rule = &after_policy.network_policies["_provider_work_custom"];
+        assert!(
+            provider_rule
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.after.example")
+        );
+        assert!(
+            !provider_rule
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.before.example")
+        );
+
+        let persisted_provider: Provider = state
+            .store
+            .get_message_by_name("work-custom")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted_provider.r#type, provider.r#type);
+        assert_eq!(persisted_provider.credentials, provider.credentials);
+
+        let persisted_policy = state
+            .store
+            .get_latest_policy("sb-custom-policy-update")
+            .await
+            .unwrap()
+            .expect("sandbox policy should be lazily backfilled");
+        let persisted_policy =
+            ProtoSandboxPolicy::decode(persisted_policy.policy_payload.as_slice())
+                .expect("persisted sandbox policy should decode");
+        assert!(
+            persisted_policy
+                .network_policies
+                .contains_key("sandbox_only")
+        );
+        assert!(
+            !persisted_policy
+                .network_policies
+                .contains_key("_provider_work_custom")
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_config_preserves_overlapping_user_and_provider_rules() {
         let state = test_server_state().await;
         enable_providers_v2(&state).await;
@@ -4946,9 +5069,11 @@ mod tests {
 
     #[tokio::test]
     async fn provider_env_revision_changes_when_custom_profile_token_grant_changes() {
+        use crate::grpc::provider::handle_update_provider_profiles;
         use openshell_core::proto::{
             ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
-            ProviderProfileCredential, StoredProviderProfile,
+            ProviderProfileCredential, ProviderProfileImportItem, StoredProviderProfile,
+            UpdateProviderProfilesRequest,
         };
         use std::time::Duration;
 
@@ -5007,13 +5132,20 @@ mod tests {
                 .unwrap();
 
         tokio::time::sleep(Duration::from_millis(2)).await;
-        state
-            .store
-            .put_message(&token_grant_profile(
-                "https://auth.example.com/rotated-token",
-            ))
-            .await
+        let rotated_profile = token_grant_profile("https://auth.example.com/rotated-token")
+            .profile
             .unwrap();
+        handle_update_provider_profiles(
+            &state,
+            with_user(Request::new(UpdateProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(rotated_profile),
+                    source: "custom-token.yaml".to_string(),
+                }],
+            })),
+        )
+        .await
+        .unwrap();
 
         let second =
             compute_provider_env_revision(state.store.as_ref(), &["work-custom-token".to_string()])

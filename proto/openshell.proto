@@ -95,6 +95,10 @@ service OpenShell {
   rpc ImportProviderProfiles(ImportProviderProfilesRequest)
       returns (ImportProviderProfilesResponse);
 
+  // Update existing custom provider type profiles.
+  rpc UpdateProviderProfiles(UpdateProviderProfilesRequest)
+      returns (UpdateProviderProfilesResponse);
+
   // Validate provider type profiles without registering them.
   rpc LintProviderProfiles(LintProviderProfilesRequest)
       returns (LintProviderProfilesResponse);
@@ -1103,6 +1107,18 @@ message ImportProviderProfilesResponse {
   repeated ProviderProfileDiagnostic diagnostics = 1;
   repeated ProviderProfile profiles = 2;
   bool imported = 3;
+}
+
+// Update custom provider profiles request.
+message UpdateProviderProfilesRequest {
+  repeated ProviderProfileImportItem profiles = 1;
+}
+
+// Update custom provider profiles response.
+message UpdateProviderProfilesResponse {
+  repeated ProviderProfileDiagnostic diagnostics = 1;
+  repeated ProviderProfile profiles = 2;
+  bool updated = 3;
 }
 
 // Lint provider profiles request.

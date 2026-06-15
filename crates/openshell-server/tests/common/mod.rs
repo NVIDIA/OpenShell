@@ -232,6 +232,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn update_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::UpdateProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn lint_provider_profiles(
         &self,
         _request: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,

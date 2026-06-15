@@ -468,6 +468,49 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn update_provider_profiles(
+        &self,
+        request: tonic::Request<openshell_core::proto::UpdateProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateProviderProfilesResponse>, Status> {
+        let mut profiles = self.state.profiles.lock().await;
+        let updates = request
+            .into_inner()
+            .profiles
+            .into_iter()
+            .filter_map(|item| item.profile)
+            .collect::<Vec<_>>();
+        for profile in &updates {
+            if !profiles.contains_key(&profile.id) {
+                return Ok(Response::new(
+                    openshell_core::proto::UpdateProviderProfilesResponse {
+                        diagnostics: vec![openshell_core::proto::ProviderProfileDiagnostic {
+                            source: profile.id.clone(),
+                            profile_id: profile.id.clone(),
+                            field: "id".to_string(),
+                            message: format!(
+                                "custom provider profile '{}' does not exist",
+                                profile.id
+                            ),
+                            severity: "error".to_string(),
+                        }],
+                        profiles: Vec::new(),
+                        updated: false,
+                    },
+                ));
+            }
+        }
+        for profile in &updates {
+            profiles.insert(profile.id.clone(), profile.clone());
+        }
+        Ok(Response::new(
+            openshell_core::proto::UpdateProviderProfilesResponse {
+                diagnostics: Vec::new(),
+                profiles: updates,
+                updated: true,
+            },
+        ))
+    }
+
     async fn lint_provider_profiles(
         &self,
         _request: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
@@ -1366,6 +1409,39 @@ binaries: [/usr/bin/custom]
     run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, &ts.tls)
         .await
         .expect("profile import");
+    std::fs::write(
+        &profile_path,
+        r"
+id: custom-api
+display_name: Custom API Updated
+category: other
+credentials:
+  - name: api_key
+    env_vars: [CUSTOM_API_KEY]
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.updated.example
+    port: 443
+binaries: [/usr/bin/custom]
+",
+    )
+    .unwrap();
+    run::provider_profile_update(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+        .await
+        .expect("profile update");
+    assert_eq!(
+        ts.state
+            .profiles
+            .lock()
+            .await
+            .get("custom-api")
+            .and_then(|profile| profile.endpoints.first())
+            .map(|endpoint| endpoint.host.as_str()),
+        Some("api.updated.example")
+    );
     run::provider_profile_export(&ts.endpoint, "custom-api", "yaml", &ts.tls)
         .await
         .expect("profile export");

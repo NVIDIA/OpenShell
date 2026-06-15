@@ -40,7 +40,8 @@ use openshell_core::proto::{
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
     SandboxStreamEvent, ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
     SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse, UpdateProviderRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
@@ -402,6 +403,14 @@ impl OpenShell for OpenShellService {
         request: Request<ImportProviderProfilesRequest>,
     ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
         provider::handle_import_provider_profiles(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "provider:write", role = "admin")]
+    async fn update_provider_profiles(
+        &self,
+        request: Request<UpdateProviderProfilesRequest>,
+    ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
+        provider::handle_update_provider_profiles(&self.state, request).await
     }
 
     #[rpc_auth(auth = "bearer", scope = "provider:read", role = "user")]

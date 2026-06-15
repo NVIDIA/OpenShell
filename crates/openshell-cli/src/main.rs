@@ -930,6 +930,18 @@ enum ProviderProfileCommands {
         from: Option<PathBuf>,
     },
 
+    /// Update existing custom provider profiles from a file or directory.
+    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Update {
+        /// Profile file to update.
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Option<PathBuf>,
+
+        /// Directory containing profile files to update.
+        #[arg(long = "from", value_hint = ValueHint::DirPath)]
+        from: Option<PathBuf>,
+    },
+
     /// Validate provider profile files without registering them.
     #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Lint {
@@ -2927,6 +2939,15 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     }
+                    ProviderProfileCommands::Update { file, from } => {
+                        run::provider_profile_update(
+                            endpoint,
+                            file.as_deref(),
+                            from.as_deref(),
+                            &tls,
+                        )
+                        .await?;
+                    }
                     ProviderProfileCommands::Lint { file, from } => {
                         run::provider_profile_lint(
                             endpoint,
@@ -3760,6 +3781,25 @@ mod tests {
             Some(Commands::Provider {
                 command: Some(ProviderCommands::Profile(ProviderProfileCommands::Import {
                     from: Some(_),
+                    ..
+                }))
+            })
+        ));
+
+        let update = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "profile",
+            "update",
+            "-f",
+            "./profiles/custom-api.yaml",
+        ])
+        .expect("provider profile update should parse");
+        assert!(matches!(
+            update.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Profile(ProviderProfileCommands::Update {
+                    file: Some(_),
                     ..
                 }))
             })

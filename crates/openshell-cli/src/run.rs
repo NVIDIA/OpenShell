@@ -51,8 +51,8 @@ use openshell_core::proto::{
     RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
     SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
     SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
+    exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -5017,6 +5017,47 @@ pub async fn provider_profile_import(
 
     print_profile_diagnostics(&diagnostics);
     Err(miette!("provider profile import failed"))
+}
+
+pub async fn provider_profile_update(
+    server: &str,
+    file: Option<&Path>,
+    from: Option<&Path>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
+    if items.is_empty() && diagnostics.is_empty() {
+        return Err(miette!("no provider profile files found"));
+    }
+    if profile_diagnostics_have_errors(&diagnostics) {
+        print_profile_diagnostics(&diagnostics);
+        return Err(miette!("provider profile update failed"));
+    }
+
+    let mut client = grpc_client(server, tls).await?;
+    if !items.is_empty() {
+        let response = client
+            .update_provider_profiles(UpdateProviderProfilesRequest { profiles: items })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+        diagnostics.extend(response.diagnostics);
+        if response.updated {
+            println!(
+                "Updated {} provider profile{}.",
+                response.profiles.len(),
+                if response.profiles.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            return Ok(());
+        }
+    }
+
+    print_profile_diagnostics(&diagnostics);
+    Err(miette!("provider profile update failed"))
 }
 
 pub async fn provider_profile_lint(
