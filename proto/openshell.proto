@@ -95,7 +95,7 @@ service OpenShell {
   rpc ImportProviderProfiles(ImportProviderProfilesRequest)
       returns (ImportProviderProfilesResponse);
 
-  // Update existing custom provider type profiles.
+  // Update an existing custom provider type profile.
   rpc UpdateProviderProfiles(UpdateProviderProfilesRequest)
       returns (UpdateProviderProfilesResponse);
 
@@ -1079,6 +1079,10 @@ message ProviderProfile {
   repeated openshell.sandbox.v1.NetworkBinary binaries = 7;
   bool inference_capable = 8;
   ProviderProfileDiscovery discovery = 9;
+  // Storage resource version for custom profiles. Built-in profiles and new
+  // profile files use 0. Gateway responses set this for stored custom profiles.
+  // Update calls use this for optimistic concurrency.
+  uint64 resource_version = 10;
 }
 
 // Stored custom provider profile object.
@@ -1109,15 +1113,20 @@ message ImportProviderProfilesResponse {
   bool imported = 3;
 }
 
-// Update custom provider profiles request.
+// Update one custom provider profile request.
 message UpdateProviderProfilesRequest {
-  repeated ProviderProfileImportItem profiles = 1;
+  ProviderProfileImportItem profile = 1;
+  // Expected storage resource version for optimistic concurrency control.
+  // If 0, the server uses the resource_version embedded in profile.profile.
+  // Updates without a non-zero version are rejected to prevent stale files from
+  // silently overwriting newer profile definitions.
+  uint64 expected_resource_version = 2;
 }
 
-// Update custom provider profiles response.
+// Update one custom provider profile response.
 message UpdateProviderProfilesResponse {
   repeated ProviderProfileDiagnostic diagnostics = 1;
-  repeated ProviderProfile profiles = 2;
+  ProviderProfile profile = 2;
   bool updated = 3;
 }
 

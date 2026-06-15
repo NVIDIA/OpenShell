@@ -1317,8 +1317,8 @@ pub(super) async fn handle_import_provider_profiles(
 
     let mut imported = Vec::with_capacity(profiles.len());
     for (_, profile) in profiles {
-        let stored = stored_provider_profile(profile.to_proto());
-        state
+        let mut stored = stored_provider_profile(profile.to_proto());
+        let result = state
             .store
             .put_if(
                 StoredProviderProfile::object_type(),
@@ -1330,7 +1330,14 @@ pub(super) async fn handle_import_provider_profiles(
             )
             .await
             .map_err(|e| Status::internal(format!("persist provider profile failed: {e}")))?;
-        imported.push(stored.profile.unwrap_or_default());
+        if let Some(metadata) = stored.metadata.as_mut() {
+            metadata.resource_version = result.resource_version;
+        }
+        let resource_version = stored_profile_resource_version(&stored);
+        imported.push(profile_response_payload(
+            stored.profile.unwrap_or_default(),
+            resource_version,
+        ));
     }
 
     Ok(Response::new(ImportProviderProfilesResponse {
@@ -1345,10 +1352,29 @@ pub(super) async fn handle_update_provider_profiles(
     request: Request<UpdateProviderProfilesRequest>,
 ) -> Result<Response<UpdateProviderProfilesResponse>, Status> {
     let request = request.into_inner();
-    let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
+    let items = request.profile.into_iter().collect::<Vec<_>>();
+    let (profiles, mut diagnostics) = profiles_from_import_items(&items);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     diagnostics.extend(profile_update_target_diagnostics(state.store.as_ref(), &profiles).await?);
     diagnostics.extend(validate_profile_set(&profiles));
+    let expected_resource_version = if request.expected_resource_version != 0 {
+        Some(request.expected_resource_version)
+    } else {
+        profiles
+            .first()
+            .map(|(_, profile)| profile.resource_version)
+            .filter(|version| *version != 0)
+    };
+    if expected_resource_version.is_none() && !profiles.is_empty() {
+        let (source, profile) = &profiles[0];
+        diagnostics.push(ProfileValidationDiagnostic {
+            source: source.clone(),
+            profile_id: profile.id.clone(),
+            field: "resource_version".to_string(),
+            message: "custom provider profile update requires a non-zero resource_version; export the current profile before editing it".to_string(),
+            severity: "error".to_string(),
+        });
+    }
     if !has_errors(&diagnostics) {
         diagnostics.extend(
             profile_attached_sandbox_diagnostics(state.store.as_ref(), &profiles, "update").await?,
@@ -1358,55 +1384,64 @@ pub(super) async fn handle_update_provider_profiles(
     if has_errors(&diagnostics) {
         return Ok(Response::new(UpdateProviderProfilesResponse {
             diagnostics: diagnostics.into_iter().map(proto_diagnostic).collect(),
-            profiles: Vec::new(),
+            profile: None,
             updated: false,
         }));
     }
 
-    let mut updated = Vec::with_capacity(profiles.len());
-    for (_, profile) in profiles {
-        let id = normalize_profile_id(&profile.id)
-            .ok_or_else(|| Status::internal("validated provider profile id is invalid"))?;
-        let mut stored = state
-            .store
-            .get_message_by_name::<StoredProviderProfile>(&id)
-            .await
-            .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
-            .ok_or_else(|| Status::not_found("provider profile not found"))?;
-        let current_version = stored
-            .metadata
-            .as_ref()
-            .map_or(0, |metadata| metadata.resource_version);
-        stored.profile = Some(profile.to_proto());
-        let labels_json = stored
-            .object_labels()
-            .filter(|labels| !labels.is_empty())
-            .map(|labels| {
-                serde_json::to_string(&labels)
-                    .map_err(|e| Status::internal(format!("serialize labels failed: {e}")))
-            })
-            .transpose()?;
-        let result = state
-            .store
-            .put_if(
-                StoredProviderProfile::object_type(),
-                stored.object_id(),
-                stored.object_name(),
-                &stored.encode_to_vec(),
-                labels_json.as_deref(),
-                WriteCondition::MatchResourceVersion(current_version),
-            )
-            .await
-            .map_err(|e| super::persistence_error_to_status(e, "update provider profile"))?;
-        if let Some(metadata) = stored.metadata.as_mut() {
-            metadata.resource_version = result.resource_version;
-        }
-        updated.push(stored.profile.unwrap_or_default());
+    let expected_resource_version = expected_resource_version.unwrap_or_default();
+    let (_, profile) = profiles
+        .into_iter()
+        .next()
+        .ok_or_else(|| Status::internal("validated provider profile update is missing"))?;
+    let id = normalize_profile_id(&profile.id)
+        .ok_or_else(|| Status::internal("validated provider profile id is invalid"))?;
+    let mut stored = state
+        .store
+        .get_message_by_name::<StoredProviderProfile>(&id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
+        .ok_or_else(|| Status::not_found("provider profile not found"))?;
+    let current_version = stored
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+    if current_version != expected_resource_version {
+        return Err(Status::aborted(format!(
+            "provider profile was modified concurrently (current resource_version: {current_version})"
+        )));
     }
+
+    stored.profile = Some(profile_storage_payload(profile.to_proto()));
+    let labels_json = stored
+        .object_labels()
+        .filter(|labels| !labels.is_empty())
+        .map(|labels| {
+            serde_json::to_string(&labels)
+                .map_err(|e| Status::internal(format!("serialize labels failed: {e}")))
+        })
+        .transpose()?;
+    let result = state
+        .store
+        .put_if(
+            StoredProviderProfile::object_type(),
+            stored.object_id(),
+            stored.object_name(),
+            &stored.encode_to_vec(),
+            labels_json.as_deref(),
+            WriteCondition::MatchResourceVersion(expected_resource_version),
+        )
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "update provider profile"))?;
+    if let Some(metadata) = stored.metadata.as_mut() {
+        metadata.resource_version = result.resource_version;
+    }
+    let resource_version = stored_profile_resource_version(&stored);
+    let profile = profile_response_payload(stored.profile.unwrap_or_default(), resource_version);
 
     Ok(Response::new(UpdateProviderProfilesResponse {
         diagnostics: Vec::new(),
-        profiles: updated,
+        profile: Some(profile),
         updated: true,
     }))
 }
@@ -1480,8 +1515,15 @@ pub(super) async fn get_provider_type_profile(
         .get_message_by_name::<StoredProviderProfile>(&id)
         .await
         .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
-        .and_then(|stored| stored.profile)
-        .map(|profile| ProviderTypeProfile::from_proto(&profile));
+        .and_then(|stored| {
+            let resource_version = stored_profile_resource_version(&stored);
+            stored.profile.map(|profile| {
+                ProviderTypeProfile::from_proto(&profile_response_payload(
+                    profile,
+                    resource_version,
+                ))
+            })
+        });
     Ok(profile)
 }
 
@@ -1547,8 +1589,15 @@ async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfi
         custom_provider_profiles(store)
             .await?
             .into_iter()
-            .filter_map(|stored| stored.profile)
-            .map(|profile| ProviderTypeProfile::from_proto(&profile)),
+            .filter_map(|stored| {
+                let resource_version = stored_profile_resource_version(&stored);
+                stored.profile.map(|profile| {
+                    ProviderTypeProfile::from_proto(&profile_response_payload(
+                        profile,
+                        resource_version,
+                    ))
+                })
+            }),
     );
     Ok(profiles)
 }
@@ -1765,6 +1814,7 @@ async fn profile_attached_sandbox_diagnostics(
 fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
     use crate::persistence::current_time_ms;
     let now_ms = current_time_ms();
+    let profile = profile_storage_payload(profile);
     StoredProviderProfile {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1775,6 +1825,26 @@ fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
         }),
         profile: Some(profile),
     }
+}
+
+fn profile_storage_payload(mut profile: ProviderProfile) -> ProviderProfile {
+    profile.resource_version = 0;
+    profile
+}
+
+fn profile_response_payload(
+    mut profile: ProviderProfile,
+    resource_version: u64,
+) -> ProviderProfile {
+    profile.resource_version = resource_version;
+    profile
+}
+
+fn stored_profile_resource_version(stored: &StoredProviderProfile) -> u64 {
+    stored
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version)
 }
 
 fn proto_diagnostic(diagnostic: ProfileValidationDiagnostic) -> ProviderProfileDiagnostic {
@@ -2391,6 +2461,7 @@ mod tests {
         };
         let profile = ProviderProfile {
             id: "keycloak-sso".to_string(),
+            resource_version: 0,
             display_name: "Keycloak SSO".to_string(),
             description: String::new(),
             category: ProviderProfileCategory::Other as i32,
@@ -2601,6 +2672,7 @@ mod tests {
             .unwrap();
 
         let mut updated_profile = custom_profile("custom-api");
+        updated_profile.resource_version = before.metadata.as_ref().unwrap().resource_version;
         updated_profile.display_name = "Updated API".to_string();
         updated_profile.endpoints = vec![NetworkEndpoint {
             host: "api.updated.example".to_string(),
@@ -2610,10 +2682,11 @@ mod tests {
         let response = handle_update_provider_profiles(
             &state,
             Request::new(UpdateProviderProfilesRequest {
-                profiles: vec![ProviderProfileImportItem {
+                profile: Some(ProviderProfileImportItem {
                     profile: Some(updated_profile.clone()),
                     source: "custom-api.yaml".to_string(),
-                }],
+                }),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -2621,7 +2694,11 @@ mod tests {
         .into_inner();
 
         assert!(response.updated);
-        assert_eq!(response.profiles, vec![updated_profile]);
+        assert_eq!(response.profile.as_ref().unwrap().id, updated_profile.id);
+        assert_eq!(
+            response.profile.as_ref().unwrap().display_name,
+            updated_profile.display_name
+        );
         let after: StoredProviderProfile = state
             .store
             .get_message_by_name("custom-api")
@@ -2648,10 +2725,11 @@ mod tests {
         let built_in = handle_update_provider_profiles(
             &state,
             Request::new(UpdateProviderProfilesRequest {
-                profiles: vec![ProviderProfileImportItem {
+                profile: Some(ProviderProfileImportItem {
                     profile: Some(custom_profile("github")),
                     source: "github.yaml".to_string(),
-                }],
+                }),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -2667,10 +2745,11 @@ mod tests {
         let missing = handle_update_provider_profiles(
             &state,
             Request::new(UpdateProviderProfilesRequest {
-                profiles: vec![ProviderProfileImportItem {
+                profile: Some(ProviderProfileImportItem {
                     profile: Some(custom_profile("missing-custom")),
                     source: "missing-custom.yaml".to_string(),
-                }],
+                }),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -2682,6 +2761,52 @@ mod tests {
                 .message
                 .contains("custom provider profile 'missing-custom' does not exist")
         }));
+    }
+
+    #[tokio::test]
+    async fn update_provider_profile_requires_current_resource_version() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&stored_provider_profile(custom_profile("custom-api")))
+            .await
+            .unwrap();
+
+        let missing_version = handle_update_provider_profiles(
+            &state,
+            Request::new(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(custom_profile("custom-api")),
+                    source: "custom-api.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!missing_version.updated);
+        assert!(missing_version.diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "resource_version"
+                && diagnostic.message.contains("non-zero resource_version")
+        }));
+
+        let mut stale_profile = custom_profile("custom-api");
+        stale_profile.resource_version = 99;
+        let stale_error = handle_update_provider_profiles(
+            &state,
+            Request::new(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(stale_profile),
+                    source: "custom-api.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_error.code(), Code::Aborted);
+        assert!(stale_error.message().contains("resource_version"));
     }
 
     #[tokio::test]
@@ -2715,6 +2840,15 @@ mod tests {
             .unwrap();
 
         let mut profile = custom_profile("grant-updated");
+        profile.resource_version = store
+            .get_message_by_name::<StoredProviderProfile>("grant-updated")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .resource_version;
         profile.credentials = vec![token_grant_credential("access_token")];
         profile.endpoints = vec![NetworkEndpoint {
             host: "api.example.com".to_string(),
@@ -2726,10 +2860,11 @@ mod tests {
         let response = handle_update_provider_profiles(
             &state,
             Request::new(UpdateProviderProfilesRequest {
-                profiles: vec![ProviderProfileImportItem {
+                profile: Some(ProviderProfileImportItem {
                     profile: Some(profile),
                     source: "grant-updated.yaml".to_string(),
-                }],
+                }),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -2773,6 +2908,7 @@ mod tests {
     fn custom_profile(id: &str) -> ProviderProfile {
         ProviderProfile {
             id: id.to_string(),
+            resource_version: 0,
             display_name: format!("{id} Profile"),
             description: String::new(),
             category: ProviderProfileCategory::Other as i32,
@@ -3208,6 +3344,7 @@ mod tests {
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ProviderProfile {
                         id: "advanced-api".to_string(),
+                        resource_version: 0,
                         display_name: "Advanced API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Other as i32,
@@ -4285,6 +4422,7 @@ mod tests {
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(ProviderProfile {
                         id: "delegated-refresh-api".to_string(),
+                        resource_version: 0,
                         display_name: "Delegated Refresh API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Messaging as i32,

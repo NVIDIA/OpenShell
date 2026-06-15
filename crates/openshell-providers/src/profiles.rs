@@ -273,6 +273,8 @@ pub struct BinaryProfile {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProviderTypeProfile {
     pub id: String,
+    #[serde(default, skip_serializing_if = "is_u64_zero")]
+    pub resource_version: u64,
     pub display_name: String,
     #[serde(default)]
     pub description: String,
@@ -303,6 +305,7 @@ impl ProviderTypeProfile {
     pub fn from_proto(profile: &ProviderProfile) -> Self {
         Self {
             id: profile.id.clone(),
+            resource_version: profile.resource_version,
             display_name: profile.display_name.clone(),
             description: profile.description.clone(),
             category: ProviderProfileCategory::try_from(profile.category)
@@ -373,6 +376,7 @@ impl ProviderTypeProfile {
     pub fn to_proto(&self) -> ProviderProfile {
         ProviderProfile {
             id: self.id.clone(),
+            resource_version: self.resource_version,
             display_name: self.display_name.clone(),
             description: self.description.clone(),
             category: self.category as i32,
@@ -408,6 +412,11 @@ impl ProviderTypeProfile {
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
     }
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_u64_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl CredentialProfile {
@@ -2395,6 +2404,7 @@ binaries: ["", /usr/bin/broken]
                 "space.yaml".to_string(),
                 ProviderTypeProfile {
                     id: " alex-api ".to_string(),
+                    resource_version: 0,
                     display_name: "Space".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2409,6 +2419,7 @@ binaries: ["", /usr/bin/broken]
                 "underscore.yaml".to_string(),
                 ProviderTypeProfile {
                     id: "alex_api".to_string(),
+                    resource_version: 0,
                     display_name: "Underscore".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2423,6 +2434,7 @@ binaries: ["", /usr/bin/broken]
                 "case.yaml".to_string(),
                 ProviderTypeProfile {
                     id: "Alex-API".to_string(),
+                    resource_version: 0,
                     display_name: "Case".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,

@@ -930,16 +930,12 @@ enum ProviderProfileCommands {
         from: Option<PathBuf>,
     },
 
-    /// Update existing custom provider profiles from a file or directory.
-    #[command(group = clap::ArgGroup::new("source").required(true).args(["file", "from"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    /// Update an existing custom provider profile from a file.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
         /// Profile file to update.
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
-        file: Option<PathBuf>,
-
-        /// Directory containing profile files to update.
-        #[arg(long = "from", value_hint = ValueHint::DirPath)]
-        from: Option<PathBuf>,
+        file: PathBuf,
     },
 
     /// Validate provider profile files without registering them.
@@ -2939,14 +2935,8 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     }
-                    ProviderProfileCommands::Update { file, from } => {
-                        run::provider_profile_update(
-                            endpoint,
-                            file.as_deref(),
-                            from.as_deref(),
-                            &tls,
-                        )
-                        .await?;
+                    ProviderProfileCommands::Update { file } => {
+                        run::provider_profile_update(endpoint, &file, &tls).await?;
                     }
                     ProviderProfileCommands::Lint { file, from } => {
                         run::provider_profile_lint(
@@ -3799,8 +3789,7 @@ mod tests {
             update.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::Profile(ProviderProfileCommands::Update {
-                    file: Some(_),
-                    ..
+                    file: _
                 }))
             })
         ));

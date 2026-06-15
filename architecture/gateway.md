@@ -216,7 +216,8 @@ modes:
   mutation. If they diverge it returns `Conflict` without attempting the
   write. Client-facing operations that carry an `expected_resource_version`
   field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
-  `UpdateProvider`, and `UpdateConfig` (policy backfill path).
+  `UpdateProvider`, `UpdateProviderProfiles`, and `UpdateConfig` (policy
+  backfill path).
 
 **Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
 protobuf payloads from list results and hydrate `resource_version` from the
@@ -235,7 +236,7 @@ coverage:
 |---|---|---|---|
 | Sandbox | `MustCreate` | `update_message_cas` | `list_messages` |
 | Provider | `MustCreate` | `update_message_cas` | `list_messages` |
-| ProviderProfile | `MustCreate` | (immutable) | `list_messages` |
+| ProviderProfile | `MustCreate` | `MatchResourceVersion` | `list_messages` |
 | InferenceRoute | `MustCreate` | `update_message_cas` | `list_messages` |
 | SandboxPolicy | scoped versioning | scoped versioning | scoped query |
 | Settings | `Mutex`-guarded | `Mutex`-guarded | single-row |
@@ -247,7 +248,10 @@ gateways, the Mutex alone would be insufficient. Sandbox-scoped settings
 rely entirely on CAS without a Mutex.
 
 The `resource_version` is surfaced to clients through `ObjectMeta` in proto
-responses. Database migrations backfill existing rows with version 1.
+responses. Provider profiles are the exception: custom profile get/list/export
+responses copy the stored version onto the profile payload so exported YAML can
+carry the expected version for safe single-profile updates. Database migrations
+backfill existing rows with version 1.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The

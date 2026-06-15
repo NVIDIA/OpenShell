@@ -455,6 +455,10 @@ impl OpenShell for TestOpenShell {
             .profiles
             .into_iter()
             .filter_map(|item| item.profile)
+            .map(|mut profile| {
+                profile.resource_version = 1;
+                profile
+            })
             .inspect(|profile| {
                 profiles.insert(profile.id.clone(), profile.clone());
             })
@@ -473,39 +477,43 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<openshell_core::proto::UpdateProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::UpdateProviderProfilesResponse>, Status> {
         let mut profiles = self.state.profiles.lock().await;
-        let updates = request
-            .into_inner()
-            .profiles
-            .into_iter()
-            .filter_map(|item| item.profile)
-            .collect::<Vec<_>>();
-        for profile in &updates {
-            if !profiles.contains_key(&profile.id) {
-                return Ok(Response::new(
-                    openshell_core::proto::UpdateProviderProfilesResponse {
-                        diagnostics: vec![openshell_core::proto::ProviderProfileDiagnostic {
-                            source: profile.id.clone(),
-                            profile_id: profile.id.clone(),
-                            field: "id".to_string(),
-                            message: format!(
-                                "custom provider profile '{}' does not exist",
-                                profile.id
-                            ),
-                            severity: "error".to_string(),
-                        }],
-                        profiles: Vec::new(),
-                        updated: false,
-                    },
-                ));
-            }
+        let request = request.into_inner();
+        let mut profile = request
+            .profile
+            .and_then(|item| item.profile)
+            .ok_or_else(|| Status::invalid_argument("provider profile is required"))?;
+        let Some(current) = profiles.get(&profile.id) else {
+            return Ok(Response::new(
+                openshell_core::proto::UpdateProviderProfilesResponse {
+                    diagnostics: vec![openshell_core::proto::ProviderProfileDiagnostic {
+                        source: profile.id.clone(),
+                        profile_id: profile.id.clone(),
+                        field: "id".to_string(),
+                        message: format!("custom provider profile '{}' does not exist", profile.id),
+                        severity: "error".to_string(),
+                    }],
+                    profile: None,
+                    updated: false,
+                },
+            ));
+        };
+        let expected_resource_version = if request.expected_resource_version != 0 {
+            request.expected_resource_version
+        } else {
+            profile.resource_version
+        };
+        if expected_resource_version == 0 || expected_resource_version != current.resource_version {
+            return Err(Status::aborted(format!(
+                "provider profile was modified concurrently (current resource_version: {})",
+                current.resource_version
+            )));
         }
-        for profile in &updates {
-            profiles.insert(profile.id.clone(), profile.clone());
-        }
+        profile.resource_version = current.resource_version + 1;
+        profiles.insert(profile.id.clone(), profile.clone());
         Ok(Response::new(
             openshell_core::proto::UpdateProviderProfilesResponse {
                 diagnostics: Vec::new(),
-                profiles: updates,
+                profile: Some(profile),
                 updated: true,
             },
         ))
@@ -1409,10 +1417,20 @@ binaries: [/usr/bin/custom]
     run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, &ts.tls)
         .await
         .expect("profile import");
+    let resource_version = ts
+        .state
+        .profiles
+        .lock()
+        .await
+        .get("custom-api")
+        .expect("custom profile")
+        .resource_version;
     std::fs::write(
         &profile_path,
-        r"
+        format!(
+            r"
 id: custom-api
+resource_version: {resource_version}
 display_name: Custom API Updated
 category: other
 credentials:
@@ -1426,10 +1444,11 @@ endpoints:
   - host: api.updated.example
     port: 443
 binaries: [/usr/bin/custom]
-",
+"
+        ),
     )
     .unwrap();
-    run::provider_profile_update(&ts.endpoint, Some(&profile_path), None, &ts.tls)
+    run::provider_profile_update(&ts.endpoint, &profile_path, &ts.tls)
         .await
         .expect("profile update");
     assert_eq!(

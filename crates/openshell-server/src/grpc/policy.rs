@@ -4445,6 +4445,7 @@ mod tests {
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "generic".to_string(),
+                    resource_version: 0,
                     display_name: "Generic Override".to_string(),
                     description: String::new(),
                     category: openshell_core::proto::ProviderProfileCategory::Other as i32,
@@ -4488,6 +4489,7 @@ mod tests {
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
+                    resource_version: 0,
                     display_name: "Custom API".to_string(),
                     description: String::new(),
                     category: openshell_core::proto::ProviderProfileCategory::Other as i32,
@@ -4552,6 +4554,7 @@ mod tests {
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
+                    resource_version: 0,
                     display_name: "Custom API".to_string(),
                     description: String::new(),
                     category: openshell_core::proto::ProviderProfileCategory::Other as i32,
@@ -4817,6 +4820,7 @@ mod tests {
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-policy".to_string(),
+                    resource_version: 0,
                     display_name: "Custom Policy".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other as i32,
@@ -4861,14 +4865,25 @@ mod tests {
                 .any(|endpoint| endpoint.host == "api.before.example")
         );
 
-        let updated_profile = stored_profile("api.after.example").profile.unwrap();
+        let mut updated_profile = stored_profile("api.after.example").profile.unwrap();
+        updated_profile.resource_version = state
+            .store
+            .get_message_by_name::<StoredProviderProfile>("custom-policy")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .resource_version;
         let response = handle_update_provider_profiles(
             &state,
             with_user(Request::new(UpdateProviderProfilesRequest {
-                profiles: vec![ProviderProfileImportItem {
+                profile: Some(ProviderProfileImportItem {
                     profile: Some(updated_profile),
                     source: "custom-policy.yaml".to_string(),
-                }],
+                }),
+                expected_resource_version: 0,
             })),
         )
         .await
@@ -5088,6 +5103,7 @@ mod tests {
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-token".to_string(),
+                    resource_version: 0,
                     display_name: "Custom Token".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other as i32,
@@ -5132,16 +5148,27 @@ mod tests {
                 .unwrap();
 
         tokio::time::sleep(Duration::from_millis(2)).await;
-        let rotated_profile = token_grant_profile("https://auth.example.com/rotated-token")
+        let mut rotated_profile = token_grant_profile("https://auth.example.com/rotated-token")
             .profile
             .unwrap();
+        rotated_profile.resource_version = state
+            .store
+            .get_message_by_name::<StoredProviderProfile>("custom-token")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .resource_version;
         handle_update_provider_profiles(
             &state,
             with_user(Request::new(UpdateProviderProfilesRequest {
-                profiles: vec![ProviderProfileImportItem {
+                profile: Some(ProviderProfileImportItem {
                     profile: Some(rotated_profile),
                     source: "custom-token.yaml".to_string(),
-                }],
+                }),
+                expected_resource_version: 0,
             })),
         )
         .await
@@ -5295,6 +5322,7 @@ mod tests {
                     source: "custom-api.yaml".to_string(),
                     profile: Some(ProviderProfile {
                         id: "custom-api".to_string(),
+                        resource_version: 0,
                         display_name: "Custom API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Other as i32,
@@ -7304,6 +7332,7 @@ mod tests {
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-api".to_string(),
+                    resource_version: 0,
                     display_name: "Custom API".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other as i32,

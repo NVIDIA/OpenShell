@@ -5019,13 +5019,8 @@ pub async fn provider_profile_import(
     Err(miette!("provider profile import failed"))
 }
 
-pub async fn provider_profile_update(
-    server: &str,
-    file: Option<&Path>,
-    from: Option<&Path>,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
+pub async fn provider_profile_update(server: &str, file: &Path, tls: &TlsOptions) -> Result<()> {
+    let (mut items, mut diagnostics) = load_profile_import_items(Some(file), None)?;
     if items.is_empty() && diagnostics.is_empty() {
         return Err(miette!("no provider profile files found"));
     }
@@ -5035,23 +5030,22 @@ pub async fn provider_profile_update(
     }
 
     let mut client = grpc_client(server, tls).await?;
-    if !items.is_empty() {
+    if let Some(item) = items.pop() {
+        let expected_resource_version = item
+            .profile
+            .as_ref()
+            .map_or(0, |profile| profile.resource_version);
         let response = client
-            .update_provider_profiles(UpdateProviderProfilesRequest { profiles: items })
+            .update_provider_profiles(UpdateProviderProfilesRequest {
+                profile: Some(item),
+                expected_resource_version,
+            })
             .await
             .into_diagnostic()?
             .into_inner();
         diagnostics.extend(response.diagnostics);
         if response.updated {
-            println!(
-                "Updated {} provider profile{}.",
-                response.profiles.len(),
-                if response.profiles.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            );
+            println!("Updated provider profile.");
             return Ok(());
         }
     }

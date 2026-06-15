@@ -128,19 +128,14 @@ openshell provider profile import --from ./provider-profiles
 
 Import is create-only. It fails if a custom profile with the same ID already exists.
 
-Update an existing custom profile:
+Update an existing custom profile by exporting the current custom profile, editing the file, and submitting the edited file back:
 
 ```shell
+openshell provider profile export github-profile -o yaml > github-profile.yaml
 openshell provider profile update -f github-profile.yaml
 ```
 
-Update all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory:
-
-```shell
-openshell provider profile update --from ./provider-profiles
-```
-
-OpenShell validates every file in an update batch before writing profiles. If an update would make dynamic token grants ambiguous for an attached sandbox, OpenShell rejects the batch before changing any profile. If a concurrent write or storage error interrupts a valid batch, retry the command after reviewing which profiles were updated.
+Exported custom profiles include `resource_version`. OpenShell requires that version during update so stale files cannot silently overwrite newer profile definitions. Update accepts one file at a time. If an update would make dynamic token grants ambiguous for an attached sandbox, OpenShell rejects it before changing the profile.
 
 Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in profiles are read-only, and OpenShell rejects updating or deleting a built-in profile. OpenShell also rejects deleting a custom profile while a sandbox-attached provider uses it.
 
@@ -164,6 +159,8 @@ Provider profile YAML and JSON use this shape. Treat this as a field map, not a 
 
 ```yaml wordWrap showLineNumbers={false}
 id: custom-api
+# Present on exported custom profiles; preserve it when updating.
+resource_version: 1
 display_name: Custom API
 description: Custom API access for sandbox agents
 category: data

@@ -75,17 +75,19 @@ have a built-in or imported provider profile with a `discovery` section. If no
 matching profile exists, the CLI returns an error instead of falling back to
 legacy discovery.
 
-Update a custom provider profile after editing its endpoints, binaries, or
-credential metadata:
+Update a custom provider profile after exporting it, editing its endpoints,
+binaries, or credential metadata, and preserving the exported `resource_version`:
 
 ```shell
+openshell provider profile export my-api -o yaml > my-api-profile.yaml
 openshell provider profile update -f my-api-profile.yaml
 ```
 
 Import remains create-only and fails if the profile ID already exists. Use
 `provider profile update` for existing custom profiles. Built-in profiles are
-read-only. When `providers_v2_enabled=true`, updated profile policy applies to
-all provider instances of that type on the next sandbox config sync.
+read-only. Update accepts one file at a time and rejects stale resource versions.
+When `providers_v2_enabled=true`, updated profile policy applies to all provider
+instances of that type on the next sandbox config sync.
 
 ## Manage Providers
 
