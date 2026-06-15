@@ -545,6 +545,7 @@ fn inspect_websocket_text_message(
         target: inspector.target.clone(),
         query_params: inspector.query_params.clone(),
         graphql: None,
+        jsonrpc: None,
     };
     let (allowed, reason) = evaluate_l7_request(inspector.engine, inspector.ctx, &request_info)?;
     let decision = match (allowed, inspector.enforcement) {
@@ -581,6 +582,7 @@ fn inspect_graphql_websocket_message(
                 target: inspector.target.clone(),
                 query_params: inspector.query_params.clone(),
                 graphql: None,
+                jsonrpc: None,
             };
             emit_websocket_l7_event(
                 host,
@@ -602,6 +604,7 @@ fn inspect_graphql_websocket_message(
                 target: inspector.target.clone(),
                 query_params: inspector.query_params.clone(),
                 graphql: Some(graphql.clone()),
+                jsonrpc: None,
             };
             let parse_error_reason = graphql
                 .error

@@ -88,7 +88,7 @@ jobs:
       - name: Run MCP conformance through OpenShell
         run: |
           set -euo pipefail
-          for scenario in initialize tools_call; do
+          for scenario in initialize tools-call; do
             echo "::group::MCP conformance: ${scenario}"
             node .cache/mcp-conformance/dist/index.js client \
               --command "bash e2e/mcp-conformance/client-through-openshell.sh" \

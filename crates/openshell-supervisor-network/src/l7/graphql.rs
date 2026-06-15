@@ -810,6 +810,7 @@ network_policies:
             target: req.target,
             query_params: req.query_params,
             graphql: Some(info),
+            jsonrpc: None,
         };
 
         let tunnel_engine = engine
