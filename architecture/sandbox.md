@@ -76,8 +76,10 @@ live under a dedicated directory. Children also enter a private mount namespace
 where that socket directory is hidden before privilege drop.
 
 Credential placeholders in proxied HTTP requests can be resolved by the proxy
-when policy allows the target endpoint. Secrets must not be logged in OCSF or
-plain tracing output.
+when policy allows the target endpoint. For GCP providers, a loopback metadata
+server inside the network namespace serves placeholders to SDKs that bypass the
+proxy (e.g. Go's `cloud.google.com/go/compute/metadata`). Secrets must not be
+logged in OCSF or plain tracing output.
 
 Provider profiles can also declare dynamic token grants. For matching HTTP
 endpoints, the supervisor obtains a SPIFFE JWT-SVID from the local Workload API,

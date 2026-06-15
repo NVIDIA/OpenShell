@@ -4347,7 +4347,7 @@ fn read_gcloud_adc() -> Result<(String, String, String)> {
     Ok((client_id, client_secret, refresh_token))
 }
 
-async fn rollback_provider_create_after_vertex_adc_failure(
+async fn rollback_provider_create_after_gcloud_adc_failure(
     client: &mut crate::tls::GrpcClient,
     provider_name: &str,
     stage: &str,
@@ -4360,7 +4360,7 @@ async fn rollback_provider_create_after_vertex_adc_failure(
         .await
     {
         Ok(_) => Err(miette!(
-            "failed to {stage} Vertex AI credentials from gcloud ADC for provider '{provider_name}': {source}. \
+            "failed to {stage} credentials from gcloud ADC for provider '{provider_name}': {source}. \
              The provider was rolled back successfully."
         )),
         Err(cleanup_err) => {
@@ -4374,7 +4374,7 @@ async fn rollback_provider_create_after_vertex_adc_failure(
                 provider_name
             );
             Err(miette!(
-                "failed to {stage} Vertex AI credentials from gcloud ADC for provider '{provider_name}': {source}. \
+                "failed to {stage} credentials from gcloud ADC for provider '{provider_name}': {source}. \
                  Cleanup also failed, so the provider may still exist. \
                  Run 'openshell provider delete {provider_name}' to remove it manually."
             ))
@@ -4483,12 +4483,23 @@ async fn discover_existing_provider_data(
 /// Canonical provider type string for Google Vertex AI.
 const VERTEX_AI_PROVIDER_TYPE: &str = "google-vertex-ai";
 
+/// Canonical provider type string for Google Cloud (GCP APIs).
+const GOOGLE_CLOUD_PROVIDER_TYPE: &str = "google-cloud";
+
 fn missing_credentials_error(provider_type: &str) -> miette::Report {
     if provider_type == VERTEX_AI_PROVIDER_TYPE {
         return miette::miette!(
             "no credentials resolved for provider type '{provider_type}'. \
              Set GOOGLE_VERTEX_AI_TOKEN, VERTEX_AI_TOKEN, \
              GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN, or VERTEX_AI_SERVICE_ACCOUNT_TOKEN; \
+             or use --from-gcloud-adc / --from-existing with those env vars set."
+        );
+    }
+
+    if provider_type == GOOGLE_CLOUD_PROVIDER_TYPE {
+        return miette::miette!(
+            "no credentials resolved for provider type '{provider_type}'. \
+             Set GCP_ADC_ACCESS_TOKEN or GCP_SA_ACCESS_TOKEN; \
              or use --from-gcloud-adc / --from-existing with those env vars set."
         );
     }
@@ -4583,11 +4594,34 @@ pub async fn provider_create_with_options(
         }
     };
 
-    if from_gcloud_adc && provider_type != VERTEX_AI_PROVIDER_TYPE {
-        return Err(miette::miette!(
-            "--from-gcloud-adc is only valid for google-vertex-ai providers"
-        ));
-    }
+    let adc_credential_key = if from_gcloud_adc {
+        let profile =
+            openshell_providers::get_default_profile(&provider_type).ok_or_else(|| {
+                miette::miette!(
+                    "--from-gcloud-adc requires a built-in provider profile, \
+                 but '{provider_type}' has none"
+                )
+            })?;
+        let adc_cred = profile.adc_credential().ok_or_else(|| {
+            miette::miette!(
+                "--from-gcloud-adc is not supported for '{provider_type}' providers \
+                 (no ADC-compatible credential in the provider profile)"
+            )
+        })?;
+        Some(
+            adc_cred
+                .env_vars
+                .first()
+                .ok_or_else(|| {
+                    miette::miette!(
+                        "ADC credential in '{provider_type}' profile has no env_vars declared"
+                    )
+                })?
+                .clone(),
+        )
+    } else {
+        None
+    };
 
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
@@ -4636,10 +4670,12 @@ pub async fn provider_create_with_options(
     }
 
     // Validate and read the ADC file BEFORE creating the provider so that
-    // a bad/missing ADC does not leave an orphan provider behind.
-    let gcloud_adc_material = if from_gcloud_adc {
+    // a bad/missing ADC does not leave an orphan provider behind. Bundle the
+    // credential key with the material so they stay coupled.
+    let gcloud_adc_bootstrap = if from_gcloud_adc {
         let (client_id, client_secret, refresh_token) = read_gcloud_adc()?;
-        Some((client_id, client_secret, refresh_token))
+        let key = adc_credential_key.expect("set when from_gcloud_adc is true");
+        Some((key, client_id, client_secret, refresh_token))
     } else {
         None
     };
@@ -4669,7 +4705,9 @@ pub async fn provider_create_with_options(
         .ok_or_else(|| miette::miette!("provider missing from response"))?;
     let provider_name = provider.object_name().to_string();
 
-    if let Some((client_id, client_secret, refresh_token)) = gcloud_adc_material {
+    if let Some((adc_credential_key, client_id, client_secret, refresh_token)) =
+        gcloud_adc_bootstrap
+    {
         let mut material = HashMap::new();
         material.insert("client_id".to_string(), client_id);
         material.insert("client_secret".to_string(), client_secret);
@@ -4678,7 +4716,7 @@ pub async fn provider_create_with_options(
         if let Err(configure_err) = client
             .configure_provider_refresh(ConfigureProviderRefreshRequest {
                 provider: provider_name.clone(),
-                credential_key: openshell_core::inference::VERTEX_AI_ADC_TOKEN_KEY.to_string(),
+                credential_key: adc_credential_key.clone(),
                 strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
                 material,
                 secret_material_keys: vec![
@@ -4689,7 +4727,7 @@ pub async fn provider_create_with_options(
             })
             .await
         {
-            return rollback_provider_create_after_vertex_adc_failure(
+            return rollback_provider_create_after_gcloud_adc_failure(
                 &mut client,
                 &provider_name,
                 "configure",
@@ -4701,11 +4739,11 @@ pub async fn provider_create_with_options(
         if let Err(rotate_err) = client
             .rotate_provider_credential(RotateProviderCredentialRequest {
                 provider: provider_name.clone(),
-                credential_key: openshell_core::inference::VERTEX_AI_ADC_TOKEN_KEY.to_string(),
+                credential_key: adc_credential_key,
             })
             .await
         {
-            return rollback_provider_create_after_vertex_adc_failure(
+            return rollback_provider_create_after_gcloud_adc_failure(
                 &mut client,
                 &provider_name,
                 "mint the initial access token for",
@@ -4715,9 +4753,7 @@ pub async fn provider_create_with_options(
         }
 
         println!("{} Created provider {}", "✓".green().bold(), provider_name);
-        println!(
-            "Configured Vertex AI credentials from gcloud ADC and minted the initial access token"
-        );
+        println!("Configured GCP credentials from gcloud ADC and minted the initial access token");
         return Ok(());
     }
 
