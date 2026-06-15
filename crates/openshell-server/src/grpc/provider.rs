@@ -1375,6 +1375,11 @@ pub(super) async fn handle_update_provider_profiles(
             severity: "error".to_string(),
         });
     }
+    let _sandbox_sync_guard = if has_errors(&diagnostics) {
+        None
+    } else {
+        Some(state.compute.sandbox_sync_guard().await)
+    };
     if !has_errors(&diagnostics) {
         diagnostics.extend(
             profile_attached_sandbox_diagnostics(state.store.as_ref(), &profiles, "update").await?,

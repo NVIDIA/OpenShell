@@ -1417,37 +1417,18 @@ binaries: [/usr/bin/custom]
     run::provider_profile_import(&ts.endpoint, Some(&profile_path), None, &ts.tls)
         .await
         .expect("profile import");
-    let resource_version = ts
-        .state
-        .profiles
-        .lock()
-        .await
-        .get("custom-api")
-        .expect("custom profile")
-        .resource_version;
-    std::fs::write(
-        &profile_path,
-        format!(
-            r"
-id: custom-api
-resource_version: {resource_version}
-display_name: Custom API Updated
-category: other
-credentials:
-  - name: api_key
-    env_vars: [CUSTOM_API_KEY]
-    auth_style: bearer
-    header_name: authorization
-discovery:
-  credentials: [api_key]
-endpoints:
-  - host: api.updated.example
-    port: 443
-binaries: [/usr/bin/custom]
-"
-        ),
-    )
-    .unwrap();
+    let exported_yaml =
+        run::provider_profile_export_text(&ts.endpoint, "custom-api", "yaml", &ts.tls)
+            .await
+            .expect("profile export text");
+    assert!(exported_yaml.contains("resource_version: 1"));
+    let updated_yaml = exported_yaml
+        .replace(
+            "display_name: Custom API",
+            "display_name: Custom API Updated",
+        )
+        .replace("host: api.custom.example", "host: api.updated.example");
+    std::fs::write(&profile_path, updated_yaml).unwrap();
     run::provider_profile_update(&ts.endpoint, &profile_path, &ts.tls)
         .await
         .expect("profile update");

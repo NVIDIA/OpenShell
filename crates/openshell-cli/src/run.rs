@@ -4955,6 +4955,21 @@ pub async fn provider_profile_export(
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let rendered = provider_profile_export_text(server, id, output, tls).await?;
+    if output == "json" {
+        println!("{rendered}");
+    } else {
+        print!("{rendered}");
+    }
+    Ok(())
+}
+
+pub async fn provider_profile_export_text(
+    server: &str,
+    id: &str,
+    output: &str,
+    tls: &TlsOptions,
+) -> Result<String> {
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .get_provider_profile(GetProviderProfileRequest { id: id.to_string() })
@@ -4966,16 +4981,14 @@ pub async fn provider_profile_export(
         .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
     let profile = ProviderTypeProfile::from_proto(&profile);
 
-    if !crate::output::print_output_direct(
-        output,
-        || profile_to_json(&profile).into_diagnostic(),
-        || profile_to_yaml(&profile).into_diagnostic(),
-    )? {
-        return Err(miette!(
+    match output {
+        "json" => profile_to_json(&profile).into_diagnostic(),
+        "yaml" => profile_to_yaml(&profile).into_diagnostic(),
+        "table" => Err(miette!(
             "profile export supports '-o yaml' and '-o json'; table output is not supported"
-        ));
+        )),
+        _ => Err(miette!("unsupported output format: {output}")),
     }
-    Ok(())
 }
 
 pub async fn provider_profile_import(
