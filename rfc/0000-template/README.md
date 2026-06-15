@@ -1,7 +1,7 @@
 ---
 authors:
   - "@your-github-username"
-state: draft
+state: accepted
 links:
   - (originating GitHub issue where maintainers assigned this RFC number)
 ---
