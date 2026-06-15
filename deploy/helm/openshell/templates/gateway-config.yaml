@@ -32,6 +32,9 @@ data:
     metrics_bind_address  = "0.0.0.0:{{ .Values.service.metricsPort }}"
     {{- end }}
     log_level             = {{ .Values.server.logLevel | quote }}
+    {{- if eq (include "openshell.runtimeConfigEnabled" .) "true" }}
+    runtime_config_path   = {{ include "openshell.runtimeConfigPath" . | quote }}
+    {{- end }}
     sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
     default_image         = {{ .Values.server.sandboxImage | quote }}
     supervisor_image      = {{ include "openshell.supervisorImage" . | quote }}

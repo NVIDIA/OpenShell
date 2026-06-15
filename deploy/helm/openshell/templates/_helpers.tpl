@@ -110,6 +110,34 @@ Name of the Secret holding gateway-minted sandbox JWT signing material.
 {{- end }}
 
 {{/*
+Whether the gateway runtime settings ConfigMap mount is enabled.
+*/}}
+{{- define "openshell.runtimeConfigEnabled" -}}
+{{- $runtime := .Values.server.runtimeConfig | default dict -}}
+{{- if (get $runtime "enabled" | default false) -}}true{{- else -}}false{{- end -}}
+{{- end }}
+
+{{/*
+Runtime settings ConfigMap name.
+*/}}
+{{- define "openshell.runtimeConfigMapName" -}}
+{{- $runtime := .Values.server.runtimeConfig | default dict -}}
+{{- get $runtime "existingConfigMap" | default (printf "%s-runtime-config" (include "openshell.fullname" .)) -}}
+{{- end }}
+
+{{/*
+Runtime settings filename and mount path.
+*/}}
+{{- define "openshell.runtimeConfigFilename" -}}
+{{- $runtime := .Values.server.runtimeConfig | default dict -}}
+{{- get $runtime "filename" | default "runtime.toml" -}}
+{{- end }}
+
+{{- define "openshell.runtimeConfigPath" -}}
+{{- printf "/etc/openshell-runtime/%s" (include "openshell.runtimeConfigFilename" .) -}}
+{{- end }}
+
+{{/*
 gRPC endpoint sandbox pods use to call back into the gateway. An explicit
 .Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
 the in-cluster Service DNS, release namespace, service port, and disableTls
@@ -177,5 +205,12 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
+{{- end -}}
+{{- $runtime := .Values.server.runtimeConfig | default dict -}}
+{{- if (get $runtime "enabled" | default false) -}}
+{{- $filename := get $runtime "filename" | default "runtime.toml" -}}
+{{- if or (eq $filename "") (contains "/" $filename) -}}
+{{- fail "server.runtimeConfig.filename must be a non-empty filename, not a path." -}}
+{{- end -}}
 {{- end -}}
 {{- end }}

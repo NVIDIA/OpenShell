@@ -213,6 +213,10 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants. |
 | server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into sandbox pods. |
+| server.runtimeConfig.enabled | bool | `false` | Mount a runtime settings file and configure the gateway to watch it. |
+| server.runtimeConfig.existingConfigMap | string | `""` | Existing ConfigMap containing the runtime settings file. When empty and runtimeConfig.enabled=true, the chart renders one from settings. |
+| server.runtimeConfig.filename | string | `"runtime.toml"` | Runtime settings filename inside the ConfigMap. |
+| server.runtimeConfig.settings | object | `{}` | Gateway runtime settings rendered under [openshell.runtime.settings]. Values must match registered runtime setting types. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
 | server.sandboxImagePullSecrets | list | `[]` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |

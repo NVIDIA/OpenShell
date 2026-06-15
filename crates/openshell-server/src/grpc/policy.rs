@@ -1605,6 +1605,11 @@ async fn handle_update_config_inner(
         if key != POLICY_SETTING_KEY {
             validate_registered_setting_key(key)?;
         }
+        if state.runtime_settings.is_managed_key(key) {
+            return Err(Status::failed_precondition(format!(
+                "setting '{key}' is managed by the gateway runtime config file; update that file instead"
+            )));
+        }
 
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let changed = if req.delete_setting {
@@ -3698,14 +3703,11 @@ fn upsert_setting_value(
     }
 }
 
-pub(super) async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
+pub async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
     load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, GLOBAL_SETTINGS_NAME).await
 }
 
-pub(super) async fn save_global_settings(
-    store: &Store,
-    settings: &StoredSettings,
-) -> Result<(), Status> {
+pub async fn save_global_settings(store: &Store, settings: &StoredSettings) -> Result<(), Status> {
     save_settings_record(
         store,
         GLOBAL_SETTINGS_OBJECT_TYPE,
@@ -8986,6 +8988,51 @@ mod tests {
             "expected rejection message to echo the bad value and list allowed values; got: {}",
             err.message()
         );
+    }
+
+    #[tokio::test]
+    async fn update_config_global_rejects_set_for_runtime_managed_key() {
+        let state = test_server_state().await;
+        state
+            .runtime_settings
+            .set_managed_keys([settings::PROVIDERS_V2_ENABLED_KEY.to_string()]);
+
+        let req = with_user(Request::new(UpdateConfigRequest {
+            global: true,
+            setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::BoolValue(false)),
+            }),
+            ..Default::default()
+        }));
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("runtime-managed setting must reject global set");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("runtime config file"),
+            "expected runtime config file guidance; got: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_global_rejects_delete_for_runtime_managed_key() {
+        let state = test_server_state().await;
+        state
+            .runtime_settings
+            .set_managed_keys([settings::PROVIDERS_V2_ENABLED_KEY.to_string()]);
+
+        let req = with_user(Request::new(UpdateConfigRequest {
+            global: true,
+            setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            delete_setting: true,
+            ..Default::default()
+        }));
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("runtime-managed setting must reject global delete");
+        assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
     #[cfg(feature = "dev-settings")]

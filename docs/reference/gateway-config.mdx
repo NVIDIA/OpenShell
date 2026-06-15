@@ -8,7 +8,9 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Gateway, Configu
 position: 5
 ---
 
-The OpenShell gateway reads its configuration from a TOML file when `--config` or `OPENSHELL_GATEWAY_CONFIG` is set. When neither is set, the gateway reads `$XDG_CONFIG_HOME/openshell/gateway.toml` if that file exists. If no config file exists, the gateway starts from built-in defaults. Gateway process flags and gateway `OPENSHELL_*` environment variables override the file. Compute driver settings live in the driver TOML tables. See [RFC 0003](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0003-gateway-configuration/README.md) for the full schema.
+The OpenShell gateway reads its startup configuration from a TOML file when `--config` or `OPENSHELL_GATEWAY_CONFIG` is set. When neither is set, the gateway reads `$XDG_CONFIG_HOME/openshell/gateway.toml` if that file exists. If no config file exists, the gateway starts from built-in defaults. Gateway process flags and gateway `OPENSHELL_*` environment variables override the file. Compute driver settings live in the driver TOML tables. See [RFC 0003](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0003-gateway-configuration/README.md) for the full schema.
+
+Startup configuration is distinct from runtime settings such as `providers_v2_enabled` and `ocsf_json_enabled`. Manage runtime settings with `openshell settings set --global`, or point `runtime_config_path` at a runtime settings file that the gateway loads and watches.
 
 ## Source Precedence
 
@@ -39,6 +41,8 @@ version = 1
 
 [openshell.gateway]
 # ... gateway-wide settings ...
+# Optional watched runtime settings file.
+runtime_config_path = "/etc/openshell/runtime.toml"
 
 [openshell.gateway.tls]
 # ... gateway listener TLS ...
@@ -103,6 +107,10 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 grpc_rate_limit_requests       = 120
 grpc_rate_limit_window_seconds = 60
 
+# Optional runtime settings file. The gateway loads this file at startup and
+# watches it for updates.
+runtime_config_path = "/etc/openshell/runtime.toml"
+
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
@@ -141,6 +149,23 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
+
+## Runtime Settings File
+
+`runtime_config_path` points at a separate TOML file for gateway-global runtime settings. The runtime settings file is not Kubernetes-specific; any gateway deployment can use it. Kubernetes deployments typically mount it from a ConfigMap so operators can enable settings such as providers v2 during Helm install or upgrade.
+
+```toml
+[openshell.runtime.settings]
+providers_v2_enabled = true
+ocsf_json_enabled = true
+proposal_approval_mode = "manual"
+```
+
+Only registered runtime setting keys are accepted. The gateway rejects unknown keys, the reserved `policy` key, values with the wrong TOML type, and invalid enum strings.
+
+When a runtime settings file is configured, keys present in that file are file-managed. `openshell settings set --global` and `openshell settings delete --global` reject changes to those keys; update the file instead. Keys omitted from the file remain managed through the normal global settings API. Removing a key from the file stops file-managing that key but does not delete the last persisted global value.
+
+The gateway fails startup if the configured runtime settings file cannot be read or parsed. After startup, invalid reloads are logged and ignored; the gateway keeps the last valid persisted settings.
 
 ## Driver References
 
