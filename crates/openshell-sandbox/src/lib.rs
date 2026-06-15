@@ -1453,6 +1453,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     // Initialize revision from the first poll.
     match client.poll_settings(&ctx.sandbox_id).await {
         Ok(result) => {
+            apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
             current_config_revision = result.config_revision;
             current_policy_hash = result.policy_hash.clone();
             current_settings = result.settings;
@@ -1629,11 +1630,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         }
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
-        let new_ocsf = extract_bool_setting(&result.settings, "ocsf_json_enabled").unwrap_or(false);
-        let prev_ocsf = ctx.ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
-        if new_ocsf != prev_ocsf {
-            info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
-        }
+        apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
 
         // Apply the agent-proposals feature toggle. On a false→true transition
         // we lazily install the skill so a sandbox that started with the flag
@@ -1672,6 +1669,19 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         current_config_revision = result.config_revision;
         current_policy_hash = result.policy_hash;
         current_settings = result.settings;
+    }
+}
+
+fn apply_ocsf_json_setting(
+    enabled: &std::sync::atomic::AtomicBool,
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    use std::sync::atomic::Ordering;
+
+    let new_ocsf = extract_bool_setting(settings, "ocsf_json_enabled").unwrap_or(false);
+    let prev_ocsf = enabled.swap(new_ocsf, Ordering::Relaxed);
+    if new_ocsf != prev_ocsf {
+        info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
     }
 }
 
@@ -1769,6 +1779,40 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 )]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn effective_bool(value: bool) -> openshell_core::proto::EffectiveSetting {
+        openshell_core::proto::EffectiveSetting {
+            value: Some(openshell_core::proto::SettingValue {
+                value: Some(openshell_core::proto::setting_value::Value::BoolValue(
+                    value,
+                )),
+            }),
+            scope: openshell_core::proto::SettingScope::Global.into(),
+        }
+    }
+
+    #[test]
+    fn apply_ocsf_json_setting_enables_from_initial_settings_snapshot() {
+        let enabled = AtomicBool::new(false);
+        let mut settings = std::collections::HashMap::new();
+        settings.insert("ocsf_json_enabled".to_string(), effective_bool(true));
+
+        apply_ocsf_json_setting(&enabled, &settings);
+
+        assert!(enabled.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn apply_ocsf_json_setting_disables_when_setting_is_unset() {
+        let enabled = AtomicBool::new(true);
+        let settings = std::collections::HashMap::new();
+
+        apply_ocsf_json_setting(&enabled, &settings);
+
+        assert!(!enabled.load(Ordering::Relaxed));
+    }
+
     // ---- Policy disk discovery tests ----
 
     #[test]
