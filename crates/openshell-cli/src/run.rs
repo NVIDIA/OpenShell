@@ -4815,8 +4815,8 @@ fn provider_to_json(provider: &Provider) -> serde_json::Value {
         }
         if meta.created_at_ms != 0 {
             obj.insert(
-                "created_at_ms".to_string(),
-                serde_json::json!(meta.created_at_ms),
+                "created_at".to_string(),
+                serde_json::json!(format_epoch_ms(meta.created_at_ms)),
             );
         }
     }
@@ -9414,7 +9414,7 @@ mod tests {
             id: "prov-123".to_string(),
             name: "test-provider".to_string(),
             resource_version: 42,
-            created_at_ms: 1_234_567_890,
+            created_at_ms: 1_234_567_890_000,
             labels,
         };
 
@@ -9429,7 +9429,7 @@ mod tests {
         let json = super::provider_to_json(&provider);
 
         assert_eq!(json["resource_version"], 42);
-        assert_eq!(json["created_at_ms"], 1_234_567_890);
+        assert_eq!(json["created_at"], "2009-02-13 23:31:30");
         assert_eq!(json["labels"]["env"], "prod");
     }
 
@@ -9458,8 +9458,8 @@ mod tests {
             "zero resource_version should be omitted"
         );
         assert!(
-            json.get("created_at_ms").is_none(),
-            "zero created_at_ms should be omitted"
+            json.get("created_at").is_none(),
+            "zero created_at should be omitted"
         );
         assert!(
             json.get("labels").is_none(),
@@ -9485,6 +9485,33 @@ mod tests {
         assert_eq!(
             json["credential_expires_at_ms"]["ACCESS_TOKEN"],
             1_234_567_890
+        );
+    }
+
+    #[test]
+    fn provider_to_json_formats_created_at_as_human_readable() {
+        let metadata = ObjectMeta {
+            id: "prov-123".to_string(),
+            name: "test-provider".to_string(),
+            created_at_ms: 1_609_459_200_000, // 2021-01-01 00:00:00
+            ..Default::default()
+        };
+
+        let provider = Provider {
+            metadata: Some(metadata),
+            r#type: "anthropic".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        // Should format as human-readable datetime, not raw milliseconds
+        assert_eq!(json["created_at"], "2021-01-01 00:00:00");
+        assert!(
+            json.get("created_at_ms").is_none(),
+            "raw milliseconds field should not exist"
         );
     }
 }
