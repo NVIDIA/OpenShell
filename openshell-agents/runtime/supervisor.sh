@@ -133,20 +133,24 @@ active_cycle_heartbeat() {
 
 retry_watch_cycle() {
     local reason="$1"
+    local retry_seconds="${2:-$transient_backoff_seconds}"
+    local advance_backoff="${3:-true}"
     transient_failures=$((transient_failures + 1))
 
     if [[ "$MAX_TRANSIENT_FAILURES" -gt 0 ]]; then
         if [[ $((transient_failures % MAX_TRANSIENT_FAILURES)) -eq 0 ]]; then
-            echo "openshell-agent: transient watch failure $transient_failures ($reason); still retrying in ${transient_backoff_seconds}s" >&2
+            echo "openshell-agent: transient watch failure $transient_failures ($reason); still retrying in ${retry_seconds}s" >&2
         else
-            echo "openshell-agent: transient watch failure $transient_failures ($reason); retrying in ${transient_backoff_seconds}s" >&2
+            echo "openshell-agent: transient watch failure $transient_failures ($reason); retrying in ${retry_seconds}s" >&2
         fi
     else
-        echo "openshell-agent: transient watch failure $transient_failures ($reason); retrying in ${transient_backoff_seconds}s" >&2
+        echo "openshell-agent: transient watch failure $transient_failures ($reason); retrying in ${retry_seconds}s" >&2
     fi
-    sleep_with_heartbeat "$transient_backoff_seconds" "$reason"
-    transient_backoff_seconds=$((transient_backoff_seconds * 2))
-    cap_transient_backoff
+    sleep_with_heartbeat "$retry_seconds" "$reason"
+    if [[ "$advance_backoff" == "true" ]]; then
+        transient_backoff_seconds=$((transient_backoff_seconds * 2))
+        cap_transient_backoff
+    fi
 }
 
 cap_transient_backoff() {
@@ -254,7 +258,7 @@ while true; do
                 echo "openshell-agent: transient failure ($reason)" >&2
                 exit 1
             fi
-            retry_watch_cycle "$reason"
+            retry_watch_cycle "$reason" "$next_poll_seconds" false
             ;;
         terminal_failure)
             echo "openshell-agent: terminal failure ($reason)" >&2

@@ -46,7 +46,7 @@ run_supervisor() {
     set +e
     OPENSHELL_AGENT_HARNESS=test \
         OPENSHELL_AGENT_RUN_MODE="$mode" \
-        OPENSHELL_AGENT_POLL_INTERVAL_SECONDS=1 \
+        OPENSHELL_AGENT_POLL_INTERVAL_SECONDS="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-1}" \
         OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES=2 \
         OPENSHELL_AGENT_HEARTBEAT_SECONDS="${OPENSHELL_AGENT_HEARTBEAT_SECONDS:-0}" \
         OPENSHELL_AGENT_TEST_STATE="${OPENSHELL_AGENT_TEST_STATE:-}" \
@@ -176,6 +176,32 @@ test_watch_terminal_failure_exits() {
     printf 'ok - watch terminal failure exits\n'
 }
 
+test_watch_transient_failure_honors_next_poll_seconds() {
+    local tmp
+    tmp="$(mktemp -d)"
+    make_payload "$tmp/payload" '
+state_file="${OPENSHELL_AGENT_TEST_STATE:?}"
+count=0
+if [[ -f "$state_file" ]]; then
+    count="$(cat "$state_file")"
+fi
+count=$((count + 1))
+printf "%s\n" "$count" > "$state_file"
+if [[ "$count" -lt 2 ]]; then
+    printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"transient_failure\",\"reason\":\"github_transport_eof\",\"next_poll_seconds\":1}"
+    exit 0
+fi
+printf "%s\n" "OPENSHELL_AGENT_RESULT {\"status\":\"complete\",\"reason\":\"done\"}"
+'
+
+    OPENSHELL_AGENT_TEST_STATE="$tmp/state" \
+        OPENSHELL_AGENT_POLL_INTERVAL_SECONDS=10 \
+        run_supervisor "$tmp/payload" watch "$tmp/output"
+    assert_contains "$tmp/output" "transient watch failure 1 (github_transport_eof); retrying in 1s"
+    assert_contains "$tmp/output" "openshell-agent: complete (done)"
+    printf 'ok - watch transient failure honors next_poll_seconds\n'
+}
+
 test_watch_prints_active_cycle_heartbeat() {
     local tmp
     tmp="$(mktemp -d)"
@@ -196,4 +222,5 @@ test_watch_retries_invalid_status_until_complete
 test_watch_retries_malformed_terminal_json_until_complete
 test_watch_retries_failed_alias_until_complete
 test_watch_terminal_failure_exits
+test_watch_transient_failure_honors_next_poll_seconds
 test_watch_prints_active_cycle_heartbeat

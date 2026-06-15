@@ -695,11 +695,6 @@ for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); d
     PROVIDER_ARGS+=(--provider "$provider_name")
 done
 
-KEEP_ARGS=()
-if [[ "$KEEP_SANDBOX" != "1" ]]; then
-    KEEP_ARGS+=(--no-keep)
-fi
-
 HARNESS_ENV_ARGS=(
     "OPENSHELL_AGENT_ID=$AGENT_ID"
     "OPENSHELL_AGENT_HARNESS=$HARNESS"
@@ -727,9 +722,11 @@ SANDBOX_CMD=(
     --no-git-ignore
     --no-auto-providers
     --no-tty
-    "${KEEP_ARGS[@]}"
-    -- env "${HARNESS_ENV_ARGS[@]}" bash "$PAYLOAD_IMAGE_DIR/runtime/entrypoint.sh"
 )
+if [[ "$KEEP_SANDBOX" != "1" ]]; then
+    SANDBOX_CMD+=(--no-keep)
+fi
+SANDBOX_CMD+=(-- env "${HARNESS_ENV_ARGS[@]}" bash "$PAYLOAD_IMAGE_DIR/runtime/entrypoint.sh")
 
 log "Launching $AGENT_DISPLAY_NAME sandbox '$SANDBOX_NAME' on gateway '$GATEWAY'."
 if [[ "$BACKGROUND" == "1" ]]; then

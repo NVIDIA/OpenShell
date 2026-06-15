@@ -30,6 +30,8 @@ gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/labels -f labels[]="
 gh api --method DELETE repos/NVIDIA/OpenShell/issues/<number>/labels/gator%3Ablocked --silent || true
 ```
 
+If a required GitHub REST read or write fails with `EOF`, `Empty reply from server`, or a sandbox `NET:FAIL` after the current policy shows the endpoint was allowed, treat it as a transient transport or provider failure. Do not convert the PR or issue to `gator:blocked`, do not report it as a rate-limit/auth failure, and do not keep probing optional endpoints such as `/rate_limit`. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"github_transport_eof"}` so the supervisor retries soon.
+
 ## Authority Rules
 
 - Do not push commits to a contributor's PR branch by default.
