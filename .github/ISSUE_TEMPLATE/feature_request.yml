@@ -7,7 +7,9 @@ body:
       value: |
         ## Design-First Feature Proposals
 
-        OpenShell feature requests must include a design proposal — describe the system behavior you want, not just the outcome. If your agent explored the codebase to assess feasibility (e.g., using the `create-spike` skill), include its findings.
+        OpenShell feature requests must include a design proposal — describe the system behavior you want, not just the outcome. New features start here, not as RFC pull requests. If maintainers decide an RFC is necessary, they will request one from this issue and assign the RFC number.
+
+        If your agent explored the codebase to assess feasibility (e.g., using the `create-spike` skill), include its findings.
 
   - type: textarea
     id: problem

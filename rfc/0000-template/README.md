@@ -3,13 +3,15 @@ authors:
   - "@your-github-username"
 state: draft
 links:
-  - (related PRs or issues)
+  - (originating GitHub issue where maintainers assigned this RFC number)
 ---
 
 # RFC NNNN - Your Title Here
 
 <!--
-See rfc/README.md for the full RFC process and state definitions.
+See rfc/README.md for the full RFC process and state definitions. Do not
+create an RFC until a GitHub issue exists and maintainers have assigned the
+RFC number from that issue.
 -->
 
 ## Summary

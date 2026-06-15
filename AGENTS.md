@@ -62,6 +62,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 
 - **Bug reports** must include an agent diagnostic section — proof that the reporter's agent investigated the issue before filing. See the issue template.
 - **Feature requests** must include a design proposal, not just a "please build this" request. See the issue template.
+- **New features** must start as GitHub issues using the feature request template. Open an RFC only after an issue exists; maintainers decide when one is needed and assign RFC numbers from the issue.
 - **PRs** must follow the PR template structure: Summary, Related Issue, Changes, Testing, Checklist.
 - **PRs from unvouched external contributors** are automatically closed. See the Vouch System section above.
 - **Security vulnerabilities** must NOT be filed as GitHub issues. Follow [SECURITY.md](SECURITY.md).

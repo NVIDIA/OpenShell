@@ -169,8 +169,8 @@ that crate's `README.md`.
 
 ## `rfc/` vs `architecture/`
 
-For broad design proposals, use `rfc/`. Once an RFC is adopted, appropriate details should be written back to architecture docs.
+Broad design proposals start as GitHub issues. If maintainers decide a proposal needs broad consensus, they assign an RFC number from the issue and the RFC lives in `rfc/`. Once an RFC is adopted, appropriate details should be written back to architecture docs.
 
 `architecture/` serves as the canonical reference for OpenShell's design and architecture.
 
-`rfc` serves to help facilitate discussion and ensure features are appropriately designed. These are useful for understanding the context in which certain architecture designs were made.
+`rfc` serves to help facilitate discussion and ensure the few changes that need that level of review are appropriately designed. These are useful for understanding the context in which certain architecture designs were made.
