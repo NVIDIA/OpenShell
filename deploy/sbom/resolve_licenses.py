@@ -344,6 +344,10 @@ def needs_fix(comp: dict) -> bool:
     if not licenses:
         return True
     for entry in licenses:
+        if "expression" in entry:
+            if entry["expression"].startswith("sha256:"):
+                return True
+            continue
         lic = entry.get("license", {})
         lid = lic.get("id", "")
         lname = lic.get("name", "")
