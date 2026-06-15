@@ -318,7 +318,7 @@ class SandboxClient:
         gateway_dir = _xdg_config_home() / "openshell" / "gateways" / cluster_name
         metadata_path = gateway_dir / "metadata.json"
         try:
-            metadata = json.loads(metadata_path.read_text())
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             raise SandboxError(f"gateway '{cluster_name}' not found") from None
         if "gateway_endpoint" not in metadata:
@@ -846,7 +846,7 @@ def _read_oidc_token_bundle(gateway_dir: pathlib.Path) -> dict | None:
     """
     token_path = gateway_dir / "oidc_token.json"
     try:
-        return json.loads(token_path.read_text())
+        return json.loads(token_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, json.JSONDecodeError):
@@ -1299,7 +1299,7 @@ class _OidcRefresher:
         )
         tmp_path = pathlib.Path(tmp_name)
         try:
-            with os.fdopen(fd, "w") as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
             with contextlib.suppress(OSError):
                 tmp_path.chmod(0o600)
@@ -1374,7 +1374,7 @@ def _resolve_active_cluster() -> str:
         return env_gateway
     active_file = _xdg_config_home() / "openshell" / "active_gateway"
     try:
-        value = active_file.read_text().strip()
+        value = active_file.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
         raise SandboxError("no active gateway configured") from None
     if value == "":
