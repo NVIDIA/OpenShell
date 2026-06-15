@@ -1,0 +1,99 @@
+name: MCP Conformance Test
+
+on:
+  workflow_call:
+    inputs:
+      image-tag:
+        description: "Image tag to test (typically the commit SHA)"
+        required: true
+        type: string
+      runner:
+        description: "GitHub Actions runner label"
+        required: false
+        type: string
+        default: "linux-amd64-cpu8"
+      checkout-ref:
+        description: "Git ref to check out for test inputs (defaults to the workflow SHA)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  mcp-conformance:
+    name: MCP Conformance
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+        - /home/runner/_work:/home/runner/_work
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      IMAGE_TAG: ${{ inputs.image-tag }}
+      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+      OPENSHELL_REGISTRY_HOST: ghcr.io
+      OPENSHELL_REGISTRY_NAMESPACE: nvidia/openshell
+      OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
+      OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
+      OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE: openshell-mcp-conformance-client:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
+      - name: Check out MCP conformance tests
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: modelcontextprotocol/conformance
+          ref: v0.1.16
+          path: .cache/mcp-conformance
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: .cache/mcp-conformance/package-lock.json
+
+      - name: Build MCP conformance runner
+        working-directory: .cache/mcp-conformance
+        run: |
+          npm ci
+          npm run build
+
+      - name: Log in to GHCR with Docker
+        run: echo "${OPENSHELL_REGISTRY_PASSWORD}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build OpenShell e2e binaries
+        run: |
+          cargo build -p openshell-server --bin openshell-gateway --features openshell-core/dev-settings
+          cargo build -p openshell-cli --bin openshell --features openshell-core/dev-settings
+
+      - name: Build MCP conformance client image
+        run: docker build --pull -f e2e/mcp-conformance/Dockerfile.client -t "${OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE}" .cache/mcp-conformance
+
+      - name: Run MCP conformance through OpenShell
+        run: |
+          set -euo pipefail
+          for scenario in initialize tools_call; do
+            echo "::group::MCP conformance: ${scenario}"
+            node .cache/mcp-conformance/dist/index.js client \
+              --command "bash e2e/mcp-conformance/client-through-openshell.sh" \
+              --scenario "${scenario}" \
+              --expected-failures e2e/mcp-conformance/expected-failures.yml \
+              --timeout 900000
+            echo "::endgroup::"
+          done

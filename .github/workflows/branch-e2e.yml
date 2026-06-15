@@ -122,6 +122,16 @@ jobs:
     with:
       image-tag: ${{ github.sha }}
 
+  mcp-conformance:
+    needs: [pr_metadata, build-gateway, build-supervisor]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/mcp-conformance.yml
+    with:
+      image-tag: ${{ github.sha }}
+
   kubernetes-ha-e2e:
     needs: [pr_metadata, build-gateway, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
@@ -137,7 +147,7 @@ jobs:
 
   core-e2e-result:
     name: Core E2E result
-    needs: [pr_metadata, build-gateway, build-supervisor, e2e, kubernetes-e2e]
+    needs: [pr_metadata, build-gateway, build-supervisor, e2e, kubernetes-e2e, mcp-conformance]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -147,6 +157,7 @@ jobs:
           BUILD_SUPERVISOR_RESULT: ${{ needs.build-supervisor.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
           KUBERNETES_E2E_RESULT: ${{ needs.kubernetes-e2e.result }}
+          MCP_CONFORMANCE_RESULT: ${{ needs.mcp-conformance.result }}
         run: |
           set -euo pipefail
           failed=0
@@ -154,7 +165,8 @@ jobs:
             "build-gateway:$BUILD_GATEWAY_RESULT" \
             "build-supervisor:$BUILD_SUPERVISOR_RESULT" \
             "e2e:$E2E_RESULT" \
-            "kubernetes-e2e:$KUBERNETES_E2E_RESULT"; do
+            "kubernetes-e2e:$KUBERNETES_E2E_RESULT" \
+            "mcp-conformance:$MCP_CONFORMANCE_RESULT"; do
             name="${item%%:*}"
             result="${item#*:}"
             if [ "$result" != "success" ]; then

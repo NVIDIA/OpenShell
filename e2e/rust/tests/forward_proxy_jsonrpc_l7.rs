@@ -102,8 +102,6 @@ network_policies:
           - "fc00::/7"
         json_rpc:
           max_body_bytes: 65536
-          on_parse_error: deny
-          batch_policy: deny_if_any_denied
         rules:
           - allow:
               rpc_method: initialize
@@ -318,7 +316,7 @@ results = {{
         {{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {{"name": "blocked_action"}}}},
     ]),
 
-    # forward proxy — invalid JSON body denied by on_parse_error: deny
+    # forward proxy — invalid JSON body fails closed before generic rules apply
     "forward_invalid_json_denied": post_invalid_json(),
 
     # CONNECT path — representative allowed and denied cases

@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+FROM public.ecr.aws/docker/library/node:22-bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG SANDBOX_UID=1000660000
+ARG SANDBOX_GID=1000660000
+
+# Match the sandbox user expected by OpenShell policies and supervisor setup.
+# The UID/GID are intentionally outside Debian's default login.defs range.
+RUN groupadd -K "GID_MAX=${SANDBOX_GID}" -g "${SANDBOX_GID}" sandbox \
+    && useradd -K "UID_MAX=${SANDBOX_UID}" --no-log-init -m -u "${SANDBOX_UID}" -g sandbox sandbox
+
+WORKDIR /opt/mcp-conformance
+
+COPY . .
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
+RUN npm run build
+RUN chown -R sandbox:sandbox /opt/mcp-conformance /home/sandbox
+
+USER sandbox
+CMD ["sleep", "infinity"]
