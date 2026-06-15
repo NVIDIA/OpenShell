@@ -345,6 +345,21 @@ fn emit_forward_success_activity(tx: Option<&ActivitySender>, l7_activity_pendin
     );
 }
 
+fn l7_parse_error_reason(request_info: &crate::l7::L7RequestInfo) -> Option<String> {
+    request_info
+        .graphql
+        .as_ref()
+        .and_then(|info| info.error.as_deref())
+        .map(|error| format!("GraphQL request rejected: {error}"))
+        .or_else(|| {
+            request_info
+                .jsonrpc
+                .as_ref()
+                .and_then(|info| info.error.as_deref())
+                .map(|error| format!("JSON-RPC request rejected: {error}"))
+        })
+}
+
 /// Emit a denial event to the aggregator channel (if configured).
 /// Used by `handle_tcp_connection` which owns `Option<Sender>`.
 fn emit_denial(
@@ -3453,11 +3468,7 @@ async fn handle_forward_proxy(
             jsonrpc,
         };
 
-        let parse_error_reason = request_info
-            .graphql
-            .as_ref()
-            .and_then(|info| info.error.as_deref())
-            .map(|error| format!("GraphQL request rejected: {error}"));
+        let parse_error_reason = l7_parse_error_reason(&request_info);
         let force_deny = parse_error_reason.is_some();
         let (allowed, reason) = parse_error_reason.map_or_else(
             || {
@@ -3498,16 +3509,39 @@ async fn handle_forward_proxy(
                     SeverityId::Informational,
                 ),
             };
-            let engine_type = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
-                "l7-graphql"
-            } else {
-                "l7"
+            let engine_type = match l7_config.config.protocol {
+                crate::l7::L7Protocol::Graphql => "l7-graphql",
+                crate::l7::L7Protocol::JsonRpc => "l7-jsonrpc",
+                _ => "l7",
             };
-            let message_prefix = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
-                "FORWARD_GRAPHQL_L7"
-            } else {
-                "FORWARD_L7"
-            };
+            let log_message = request_info.jsonrpc.as_ref().map_or_else(
+                || {
+                    let message_prefix =
+                        if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
+                            "FORWARD_GRAPHQL_L7"
+                        } else {
+                            "FORWARD_L7"
+                        };
+                    format!(
+                        "{message_prefix} {decision_str} {method} {host_lc}:{port}{path} reason={reason}"
+                    )
+                },
+                |jsonrpc_info| {
+                    let endpoint = format!("{host_lc}:{port}{path}");
+                    let params_sha256 = jsonrpc_info
+                        .params_sha256()
+                        .unwrap_or_else(|| "<empty>".to_string());
+                    crate::l7::relay::jsonrpc_log_message(
+                        decision_str,
+                        method,
+                        &endpoint,
+                        jsonrpc_info,
+                        &params_sha256,
+                        tunnel_engine.captured_generation(),
+                        &reason,
+                    )
+                },
+            );
             let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
@@ -3524,9 +3558,7 @@ async fn handle_forward_proxy(
                         .with_cmd_line(&cmdline_str),
                 )
                 .firewall_rule(policy_str, engine_type)
-                .message(format!(
-                    "{message_prefix} {decision_str} {method} {host_lc}:{port}{path} reason={reason}"
-                ))
+                .message(log_message)
                 .build();
             ocsf_emit!(event);
         }
@@ -4182,6 +4214,28 @@ mod tests {
             .expect("CONNECT without an L7 route should emit activity");
         assert!(!event.denied);
         assert_eq!(event.deny_group, "unknown");
+    }
+
+    #[test]
+    fn l7_parse_error_reason_includes_jsonrpc_errors() {
+        let request_info = crate::l7::L7RequestInfo {
+            action: "POST".to_string(),
+            target: "/mcp".to_string(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+            jsonrpc: Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
+                calls: Vec::new(),
+                is_batch: false,
+                error: Some("ambiguous dotted params key 'arguments.scope'".to_string()),
+            }),
+        };
+
+        let reason = l7_parse_error_reason(&request_info).expect("JSON-RPC parse error");
+
+        assert_eq!(
+            reason,
+            "JSON-RPC request rejected: ambiguous dotted params key 'arguments.scope'"
+        );
     }
 
     #[test]

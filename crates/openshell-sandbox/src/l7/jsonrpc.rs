@@ -90,12 +90,15 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
         }
         let mut calls = Vec::new();
         for item in &items {
-            let Some(call) = parse_jsonrpc_call(item) else {
-                return JsonRpcRequestInfo {
-                    calls: Vec::new(),
-                    is_batch: true,
-                    error: Some("batch item missing or non-string 'method' field".to_string()),
-                };
+            let call = match parse_jsonrpc_call(item) {
+                Ok(call) => call,
+                Err(error) => {
+                    return JsonRpcRequestInfo {
+                        calls: Vec::new(),
+                        is_batch: true,
+                        error: Some(format!("batch item invalid: {error}")),
+                    };
+                }
             };
             calls.push(call);
         }
@@ -106,12 +109,15 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
         };
     }
 
-    let Some(call) = parse_jsonrpc_call(&value) else {
-        return JsonRpcRequestInfo {
-            calls: Vec::new(),
-            is_batch: false,
-            error: Some("missing or non-string 'method' field".to_string()),
-        };
+    let call = match parse_jsonrpc_call(&value) {
+        Ok(call) => call,
+        Err(error) => {
+            return JsonRpcRequestInfo {
+                calls: Vec::new(),
+                is_batch: false,
+                error: Some(error),
+            };
+        }
     };
     JsonRpcRequestInfo {
         calls: vec![call],
@@ -120,20 +126,33 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
     }
 }
 
-fn parse_jsonrpc_call(value: &serde_json::Value) -> Option<JsonRpcCallInfo> {
-    let method = value.get("method").and_then(|m| m.as_str())?;
-    Some(JsonRpcCallInfo {
+fn parse_jsonrpc_call(value: &serde_json::Value) -> std::result::Result<JsonRpcCallInfo, String> {
+    let version = value
+        .get("jsonrpc")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing or non-string 'jsonrpc' field".to_string())?;
+    if version != "2.0" {
+        return Err(format!("unsupported JSON-RPC version '{version}'"));
+    }
+    let method = value
+        .get("method")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| "missing or non-string 'method' field".to_string())?;
+    let params = value
+        .get("params")
+        .map_or_else(|| Ok(HashMap::new()), flatten_jsonrpc_params)?;
+    Ok(JsonRpcCallInfo {
         method: method.to_string(),
-        params: value
-            .get("params")
-            .map_or_else(HashMap::new, flatten_jsonrpc_params),
+        params,
     })
 }
 
-fn flatten_jsonrpc_params(value: &serde_json::Value) -> HashMap<String, String> {
+fn flatten_jsonrpc_params(
+    value: &serde_json::Value,
+) -> std::result::Result<HashMap<String, String>, String> {
     let mut params = HashMap::new();
-    flatten_json_value("", value, &mut params);
-    params
+    flatten_json_value("", value, &mut params)?;
+    Ok(params)
 }
 
 fn canonical_params_map(params: &HashMap<String, String>) -> BTreeMap<String, String> {
@@ -148,29 +167,50 @@ fn sha256_json(value: &impl serde::Serialize) -> String {
     hex::encode(Sha256::digest(&encoded))
 }
 
-fn flatten_json_value(prefix: &str, value: &serde_json::Value, out: &mut HashMap<String, String>) {
+fn flatten_json_value(
+    prefix: &str,
+    value: &serde_json::Value,
+    out: &mut HashMap<String, String>,
+) -> std::result::Result<(), String> {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map {
+                if key.contains('.') {
+                    return Err(format!(
+                        "ambiguous dotted params key '{key}' is not allowed"
+                    ));
+                }
                 let next = if prefix.is_empty() {
                     key.clone()
                 } else {
                     format!("{prefix}.{key}")
                 };
-                flatten_json_value(&next, child, out);
+                flatten_json_value(&next, child, out)?;
             }
         }
         serde_json::Value::String(s) if !prefix.is_empty() => {
-            out.insert(prefix.to_string(), s.clone());
+            insert_flattened_param(out, prefix, s.clone())?;
         }
         serde_json::Value::Number(n) if !prefix.is_empty() => {
-            out.insert(prefix.to_string(), n.to_string());
+            insert_flattened_param(out, prefix, n.to_string())?;
         }
         serde_json::Value::Bool(b) if !prefix.is_empty() => {
-            out.insert(prefix.to_string(), b.to_string());
+            insert_flattened_param(out, prefix, b.to_string())?;
         }
         _ => {}
     }
+    Ok(())
+}
+
+fn insert_flattened_param(
+    out: &mut HashMap<String, String>,
+    key: &str,
+    value: String,
+) -> std::result::Result<(), String> {
+    if out.insert(key.to_string(), value).is_some() {
+        return Err(format!("ambiguous params key collision at '{key}'"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -203,6 +243,70 @@ mod tests {
             params.get("arguments.scope").map(String::as_str),
             Some("workspace/main")
         );
+    }
+
+    #[test]
+    fn rejects_literal_dotted_param_keys() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments.scope":"workspace/other","arguments":{"scope":"workspace/main"}}}"#;
+        let info = parse_jsonrpc_body(body);
+
+        assert!(info.calls.is_empty());
+        assert!(
+            info.error
+                .as_deref()
+                .is_some_and(|error| error.contains("ambiguous dotted params key")),
+            "expected dotted params key error, got {info:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_requests_missing_jsonrpc_version() {
+        let body = br#"{"id":1,"method":"tools/list"}"#;
+        let info = parse_jsonrpc_body(body);
+
+        assert!(info.calls.is_empty());
+        assert_eq!(
+            info.error.as_deref(),
+            Some("missing or non-string 'jsonrpc' field")
+        );
+    }
+
+    #[test]
+    fn rejects_batch_items_missing_jsonrpc_version() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"id":2,"method":"tools/call","params":{"name":"read_status"}}
+        ]"#;
+        let info = parse_jsonrpc_body(body);
+
+        assert!(info.calls.is_empty());
+        assert!(info.is_batch);
+        assert_eq!(
+            info.error.as_deref(),
+            Some("batch item invalid: missing or non-string 'jsonrpc' field")
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_jsonrpc_version() {
+        let body = br#"{"jsonrpc":"1.0","id":1,"method":"tools/list"}"#;
+        let info = parse_jsonrpc_body(body);
+
+        assert!(info.calls.is_empty());
+        assert_eq!(
+            info.error.as_deref(),
+            Some("unsupported JSON-RPC version '1.0'")
+        );
+    }
+
+    #[test]
+    fn detects_flattened_param_collisions() {
+        let mut params = HashMap::from([("arguments.scope".to_string(), "first".to_string())]);
+
+        let error = insert_flattened_param(&mut params, "arguments.scope", "second".to_string())
+            .expect_err("duplicate flattened key should be ambiguous");
+
+        assert!(error.contains("ambiguous params key collision"));
     }
 
     #[test]

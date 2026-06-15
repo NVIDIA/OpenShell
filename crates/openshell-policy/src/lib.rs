@@ -156,18 +156,10 @@ fn is_zero_u32(v: &u32) -> bool {
 struct JsonRpcConfigDef {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     max_body_bytes: u32,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    on_parse_error: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    batch_policy: String,
 }
 
 fn json_rpc_config_from_proto(max_body_bytes: u32) -> Option<JsonRpcConfigDef> {
-    (max_body_bytes > 0).then_some(JsonRpcConfigDef {
-        max_body_bytes,
-        on_parse_error: String::new(),
-        batch_policy: String::new(),
-    })
+    (max_body_bytes > 0).then_some(JsonRpcConfigDef { max_body_bytes })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1775,6 +1767,31 @@ network_policies:
         let ep = &proto2.network_policies["mcp"].endpoints[0];
         assert_eq!(ep.protocol, "json-rpc");
         assert_eq!(ep.json_rpc_max_body_bytes, 131_072);
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_json_rpc_config_fields() {
+        let yaml = r"
+version: 1
+network_policies:
+  mcp:
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: json-rpc
+        json_rpc:
+          max_body_bytes: 131072
+          on_parse_error: deny
+          batch_policy: all
+        access: full
+    binaries:
+      - path: /usr/bin/curl
+";
+
+        assert!(
+            parse_sandbox_policy(yaml).is_err(),
+            "unsupported json_rpc fields must not be silently accepted"
+        );
     }
 
     #[test]

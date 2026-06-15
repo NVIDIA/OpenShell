@@ -1281,7 +1281,7 @@ fn graphql_log_summary(info: &crate::l7::graphql::GraphqlRequestInfo) -> String 
     format!("graphql_ops={}", ops.join(";"))
 }
 
-fn jsonrpc_log_message(
+pub(crate) fn jsonrpc_log_message(
     decision: &str,
     http_method: &str,
     endpoint: &str,
@@ -1296,7 +1296,7 @@ fn jsonrpc_log_message(
     )
 }
 
-fn jsonrpc_methods_for_log(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> String {
+pub(crate) fn jsonrpc_methods_for_log(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> String {
     if info.calls.is_empty() {
         return "-".to_string();
     }
