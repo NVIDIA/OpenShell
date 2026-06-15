@@ -1,7 +1,7 @@
 ---
 authors:
   - "@drew"
-state: review
+state: accepted
 ---
 
 # RFC 0001 - Core Architecture

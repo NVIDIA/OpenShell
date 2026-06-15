@@ -1,7 +1,7 @@
 ---
 authors:
   - "@TaylorMutch"
-state: review
+state: implemented
 ---
 
 # RFC 0003 - Gateway Configuration File

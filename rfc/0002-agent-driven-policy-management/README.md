@@ -1,7 +1,7 @@
 ---
 authors:
   - "@alwatson"
-state: draft
+state: accepted
 links:
   - https://github.com/NVIDIA/OpenShell/issues/1062
   - https://github.com/NVIDIA/OpenShell/blob/main/architecture/policy-advisor.md
