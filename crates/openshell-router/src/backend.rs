@@ -864,10 +864,7 @@ mod tests {
         // below a non-root prefix (e.g. /openai/v1). The /v1 in the request
         // path must still be stripped so it is not doubled.
         assert_eq!(
-            build_backend_url(
-                "https://api.groq.com/openai/v1",
-                "/v1/chat/completions"
-            ),
+            build_backend_url("https://api.groq.com/openai/v1", "/v1/chat/completions"),
             "https://api.groq.com/openai/v1/chat/completions"
         );
     }
