@@ -54,6 +54,8 @@ dev = [
     "setuptools-scm>=8",
     "grpcio-tools>=1.60",
     "pyelftools>=0.30",
+    "pyyaml==6.0.2",
+    "types-pyyaml>=6.0.12.20260518",
 ]
 
 [tool.uv]

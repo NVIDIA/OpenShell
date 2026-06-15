@@ -11,7 +11,7 @@ sibling script imports directly as `sync_docs_website`.
 from __future__ import annotations
 
 from argparse import Namespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 import sync_docs_website as sdw
@@ -66,7 +66,7 @@ def test_ordered_entries_pins_latest_then_dev() -> None:
 
 
 def test_prefix_navigation_paths() -> None:
-    nav = {
+    nav: dict[str, object] = {
         "navigation": [
             {"page": "Intro", "path": "intro.mdx"},
             {
@@ -78,11 +78,14 @@ def test_prefix_navigation_paths() -> None:
         ]
     }
     sdw.prefix_navigation_paths(nav, "pages-dev")
-    assert nav["navigation"][0]["path"] == "../pages-dev/intro.mdx"
-    assert nav["navigation"][1]["folder"] == "../pages-dev/guide"
-    assert nav["navigation"][1]["contents"][0]["path"] == "../pages-dev/guide/a.mdx"
+    navigation = cast("list[dict[str, object]]", nav["navigation"])
+    guide = navigation[1]
+    contents = cast("list[dict[str, object]]", guide["contents"])
+    assert navigation[0]["path"] == "../pages-dev/intro.mdx"
+    assert guide["folder"] == "../pages-dev/guide"
+    assert contents[0]["path"] == "../pages-dev/guide/a.mdx"
     # Absolute URLs are left untouched.
-    assert nav["navigation"][2]["path"] == "https://example.com"
+    assert navigation[2]["path"] == "https://example.com"
 
 
 def _make_source_tree(root: Path) -> None:

@@ -160,8 +160,14 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen
 
+      - name: Format
+        run: mise run python:format:check
+
       - name: Lint
         run: mise run python:lint
+
+      - name: Typecheck
+        run: mise run python:typecheck
 
       - name: Test
         run: mise run test:python
