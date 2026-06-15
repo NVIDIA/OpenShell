@@ -158,7 +158,7 @@ fn is_binary_available(name: &str) -> bool {
 ///
 /// Returns the verified socket path, or `None` when Podman is not
 /// available at all.
-fn detect_podman() -> Option<PathBuf> {
+pub fn detect_podman() -> Option<PathBuf> {
     // Fast path: one of the well-known socket candidates responds.
     if let Some(path) = podman_socket_candidates()
         .into_iter()
