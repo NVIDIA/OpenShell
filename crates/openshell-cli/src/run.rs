@@ -9292,4 +9292,199 @@ mod tests {
             assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
         });
     }
+
+    #[test]
+    fn provider_to_json_includes_core_fields() {
+        let metadata = ObjectMeta {
+            id: "prov-123".to_string(),
+            name: "test-provider".to_string(),
+            ..Default::default()
+        };
+
+        let provider = Provider {
+            metadata: Some(metadata),
+            r#type: "anthropic".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        assert_eq!(json["id"], "prov-123");
+        assert_eq!(json["name"], "test-provider");
+        assert_eq!(json["type"], "anthropic");
+    }
+
+    #[test]
+    fn provider_to_json_exposes_credential_keys_not_values() {
+        let mut credentials = std::collections::HashMap::new();
+        credentials.insert("ANTHROPIC_API_KEY".to_string(), "secret-value".to_string());
+        credentials.insert("OTHER_KEY".to_string(), "other-secret".to_string());
+
+        let provider = Provider {
+            metadata: Some(ObjectMeta::default()),
+            r#type: "anthropic".to_string(),
+            credentials,
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+        let json_str = json.to_string();
+
+        // Assert credential keys are present
+        let keys = json["credential_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().any(|k| k.as_str() == Some("ANTHROPIC_API_KEY")));
+        assert!(keys.iter().any(|k| k.as_str() == Some("OTHER_KEY")));
+
+        // Assert credential values are NOT in the output (SECURITY)
+        assert!(
+            !json_str.contains("secret-value"),
+            "credential values must not be exposed"
+        );
+        assert!(
+            !json_str.contains("other-secret"),
+            "credential values must not be exposed"
+        );
+    }
+
+    #[test]
+    fn provider_to_json_exposes_config_keys_not_values() {
+        let mut config = std::collections::HashMap::new();
+        config.insert("region".to_string(), "us-west".to_string());
+        config.insert(
+            "endpoint".to_string(),
+            "https://api.example.com".to_string(),
+        );
+
+        let provider = Provider {
+            metadata: Some(ObjectMeta::default()),
+            r#type: "custom".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config,
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+        let json_str = json.to_string();
+
+        // Assert config keys are present
+        let keys = json["config_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().any(|k| k.as_str() == Some("region")));
+        assert!(keys.iter().any(|k| k.as_str() == Some("endpoint")));
+
+        // Assert config values are NOT in the output (SECURITY)
+        assert!(
+            !json_str.contains("us-west"),
+            "config values must not be exposed"
+        );
+        assert!(
+            !json_str.contains("https://api.example.com"),
+            "config values must not be exposed"
+        );
+    }
+
+    #[test]
+    fn provider_to_json_omits_empty_config() {
+        let provider = Provider {
+            metadata: Some(ObjectMeta::default()),
+            r#type: "anthropic".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(), // Empty config
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        assert!(
+            json.get("config_keys").is_none(),
+            "empty config_keys should be omitted"
+        );
+    }
+
+    #[test]
+    fn provider_to_json_includes_metadata_fields_when_present() {
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("env".to_string(), "prod".to_string());
+
+        let metadata = ObjectMeta {
+            id: "prov-123".to_string(),
+            name: "test-provider".to_string(),
+            resource_version: 42,
+            created_at_ms: 1_234_567_890,
+            labels,
+        };
+
+        let provider = Provider {
+            metadata: Some(metadata),
+            r#type: "anthropic".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        assert_eq!(json["resource_version"], 42);
+        assert_eq!(json["created_at_ms"], 1_234_567_890);
+        assert_eq!(json["labels"]["env"], "prod");
+    }
+
+    #[test]
+    fn provider_to_json_omits_zero_metadata_fields() {
+        let metadata = ObjectMeta {
+            id: "prov-123".to_string(),
+            name: "test-provider".to_string(),
+            // resource_version and created_at_ms are 0
+            // labels is empty
+            ..Default::default()
+        };
+
+        let provider = Provider {
+            metadata: Some(metadata),
+            r#type: "anthropic".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        assert!(
+            json.get("resource_version").is_none(),
+            "zero resource_version should be omitted"
+        );
+        assert!(
+            json.get("created_at_ms").is_none(),
+            "zero created_at_ms should be omitted"
+        );
+        assert!(
+            json.get("labels").is_none(),
+            "empty labels should be omitted"
+        );
+    }
+
+    #[test]
+    fn provider_to_json_includes_credential_expiration() {
+        let mut credential_expires_at_ms = std::collections::HashMap::new();
+        credential_expires_at_ms.insert("ACCESS_TOKEN".to_string(), 1_234_567_890);
+
+        let provider = Provider {
+            metadata: Some(ObjectMeta::default()),
+            r#type: "oauth".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms,
+        };
+
+        let json = super::provider_to_json(&provider);
+
+        assert_eq!(
+            json["credential_expires_at_ms"]["ACCESS_TOKEN"],
+            1_234_567_890
+        );
+    }
 }

@@ -1028,6 +1028,72 @@ async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
 }
 
 #[tokio::test]
+async fn provider_list_json_output() {
+    let ts = run_server().await;
+
+    // Create a provider with credentials and config
+    run::provider_create(
+        &ts.endpoint,
+        "test-provider",
+        "anthropic",
+        false,
+        &["ANTHROPIC_API_KEY=test-key".to_string()],
+        false,
+        &["region=us-west".to_string()],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    // Test JSON output (verifies it doesn't error)
+    run::provider_list(&ts.endpoint, 100, 0, false, "json", &ts.tls)
+        .await
+        .expect("provider list json should succeed");
+
+    run::provider_delete(&ts.endpoint, &["test-provider".to_string()], &ts.tls)
+        .await
+        .expect("provider delete");
+}
+
+#[tokio::test]
+async fn provider_list_yaml_output() {
+    let ts = run_server().await;
+
+    // Create a provider with credentials and config
+    run::provider_create(
+        &ts.endpoint,
+        "test-provider",
+        "anthropic",
+        false,
+        &["ANTHROPIC_API_KEY=test-key".to_string()],
+        false,
+        &["region=us-west".to_string()],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    // Test YAML output (verifies it doesn't error)
+    run::provider_list(&ts.endpoint, 100, 0, false, "yaml", &ts.tls)
+        .await
+        .expect("provider list yaml should succeed");
+
+    run::provider_delete(&ts.endpoint, &["test-provider".to_string()], &ts.tls)
+        .await
+        .expect("provider delete");
+}
+
+#[tokio::test]
+async fn provider_list_json_empty() {
+    let ts = run_server().await;
+
+    // Test JSON output with no providers (verifies it doesn't error on empty list)
+    run::provider_list(&ts.endpoint, 100, 0, false, "json", &ts.tls)
+        .await
+        .expect("provider list json empty should succeed");
+}
+
+#[tokio::test]
 async fn provider_refresh_cli_run_functions_wire_requests() {
     let ts = run_server().await;
 
