@@ -51,6 +51,7 @@ Controls filesystem access inside the sandbox. Paths not listed in either `read_
 | `include_workdir` | bool | No | When `true`, automatically adds the agent's working directory to `read_write`. |
 | `read_only` | list of strings | No | Paths the agent can read but not modify. Typically system directories like `/usr`, `/lib`, `/etc`. |
 | `read_write` | list of strings | No | Paths the agent can read and write. Typically `/sandbox` (working directory) and `/tmp`. |
+| `runtime_baseline_conflicts` | object | No | Controls how OpenShell resolves conflicts between runtime baseline requirements and the effective filesystem policy. |
 
 **Validation constraints:**
 
@@ -59,6 +60,7 @@ Controls filesystem access inside the sandbox. Paths not listed in either `read_
 - Read-write paths must not be overly broad (for example, `/` alone is rejected).
 - Each individual path must not exceed 4096 characters.
 - The combined total of `read_only` and `read_write` paths must not exceed 256.
+- Runtime baseline promotion patterns must be absolute full-path globs and must not contain `..` components.
 
 Policies that violate these constraints are rejected with `INVALID_ARGUMENT` at creation or update time. Disk-loaded YAML policies that fail validation fall back to a restrictive default.
 
@@ -77,7 +79,27 @@ filesystem_policy:
     - /sandbox
     - /tmp
     - /dev/null
+  runtime_baseline_conflicts:
+    read_only_to_read_write:
+      mode: reject_unlisted
+      allow_promotion:
+        - /proc
 ```
+
+### Runtime Baseline Conflicts
+
+OpenShell adds runtime baseline paths at sandbox startup for controls such as proxy mode and GPU support. Some runtime features require filesystem access that can conflict with a user or gateway policy.
+
+The current conflict policy is `runtime_baseline_conflicts.read_only_to_read_write`, which controls whether OpenShell may promote runtime-required paths that are already listed as read-only:
+
+| Field | Type | Required | Values | Description |
+|---|---|---|---|---|
+| `mode` | string | No | `reject_unlisted`, `promote_all`, `reject_all` | Conflict handling mode. Defaults to `reject_unlisted`. |
+| `allow_promotion` | list of strings | No | Absolute full-path globs | Paths that may be promoted when `mode` is `reject_unlisted`. An explicit empty list allows no listed promotions. |
+
+The allow list does not grant arbitrary filesystem access. It only permits promotion when the path is already part of OpenShell's active runtime baseline and would otherwise conflict with `read_only`.
+
+When `runtime_baseline_conflicts` is omitted, OpenShell behaves as if `mode: reject_unlisted` and `allow_promotion: [/proc]` were configured. This allows `/proc` promotion because GPU runtimes may need write access to selected `/proc` entries. Device-node conflicts such as `/dev/nvidia0` are rejected unless the policy explicitly allows them with a matching pattern or uses `promote_all`.
 
 ## Landlock
 

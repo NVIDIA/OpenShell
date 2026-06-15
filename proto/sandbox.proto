@@ -35,6 +35,24 @@ message FilesystemPolicy {
   repeated string read_only = 2;
   // Read-write directory allow list.
   repeated string read_write = 3;
+  // Controls how runtime baseline enrichment handles paths that must become
+  // read-write but are already listed as read-only by the effective policy.
+  RuntimeBaselineConflicts runtime_baseline_conflicts = 4;
+}
+
+// Filesystem conflict controls for runtime baseline enrichment.
+message RuntimeBaselineConflicts {
+  // Policy for read-only to read-write baseline conflicts.
+  ReadOnlyToReadWriteConflictPolicy read_only_to_read_write = 1;
+}
+
+// Controls whether OpenShell may promote baseline-required read-write paths
+// that are already listed in read_only.
+message ReadOnlyToReadWriteConflictPolicy {
+  // Conflict mode: "reject_unlisted", "promote_all", or "reject_all".
+  string mode = 1;
+  // Full-path glob patterns that may be promoted when mode is "reject_unlisted".
+  repeated string allow_promotion = 2;
 }
 
 // Landlock policy configuration.
