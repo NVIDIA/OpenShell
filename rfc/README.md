@@ -94,7 +94,7 @@ Start with a GitHub issue. New features must use the feature request template an
 
 ### 2. Get maintainer confirmation
 
-Maintainers decide from the issue whether an RFC is necessary. If it is, they assign the RFC number in the issue before anyone creates the RFC branch or folder. Authors should use the assigned number instead of choosing one locally.
+Maintainers decide from the issue whether an RFC is necessary. If it is, they assign the RFC number in the issue before anyone creates the RFC branch or folder, and add the `rfc` label to the originating issue so RFC work is searchable. Authors should use the assigned number instead of choosing one locally.
 
 ### 3. Create your RFC
 
