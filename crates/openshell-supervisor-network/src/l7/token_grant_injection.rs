@@ -735,6 +735,7 @@ mod tests {
             activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            request_inspector: None,
         };
         let req = L7Request {
             action: "GET".to_string(),
@@ -772,6 +773,7 @@ mod tests {
             activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            request_inspector: None,
         };
         let req = L7Request {
             action: "GET".to_string(),

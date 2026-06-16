@@ -11,6 +11,7 @@ use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::{inspection, inspection::HttpInspectionOutcome};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::secrets::{self, SecretResolver};
@@ -51,6 +52,9 @@ pub struct L7EvalContext {
     /// Dynamic token grant resolver for endpoint-bound credentials.
     pub(crate) token_grant_resolver:
         Option<Arc<dyn crate::l7::token_grant_injection::TokenGrantResolver>>,
+    /// Optional request inspector invoked on parsed HTTP requests before
+    /// credential or token-grant injection.
+    pub request_inspector: Option<Arc<dyn inspection::Inspector>>,
 }
 
 #[derive(Default)]
@@ -356,6 +360,28 @@ where
         let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+            match inspection::inspect_http_request(&mut req, ctx)? {
+                HttpInspectionOutcome::Allow => {}
+                HttpInspectionOutcome::Mutate { .. } => {}
+                HttpInspectionOutcome::Deny { reason, .. } => {
+                    crate::l7::rest::RestProvider::default()
+                        .deny_with_redacted_target(
+                            &req,
+                            &ctx.policy_name,
+                            &reason,
+                            client,
+                            Some(&redacted_target),
+                            Some(crate::l7::rest::DenyResponseContext {
+                                host: Some(&ctx.host),
+                                port: Some(ctx.port),
+                                binary: Some(&ctx.binary_path),
+                            }),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
+
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
@@ -780,6 +806,29 @@ where
         let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
+            let mut req = req;
+            match inspection::inspect_http_request(&mut req, ctx)? {
+                HttpInspectionOutcome::Allow => {}
+                HttpInspectionOutcome::Mutate { .. } => {}
+                HttpInspectionOutcome::Deny { reason, .. } => {
+                    provider
+                        .deny_with_redacted_target(
+                            &req,
+                            &ctx.policy_name,
+                            &reason,
+                            client,
+                            Some(&redacted_target),
+                            Some(crate::l7::rest::DenyResponseContext {
+                                host: Some(&ctx.host),
+                                port: Some(ctx.port),
+                                binary: Some(&ctx.binary_path),
+                            }),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
+
             let req_with_auth =
                 match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
                     Ok(req) => req,
@@ -1221,7 +1270,7 @@ where
         }
 
         // Read next request from client.
-        let req = match provider.parse_request(client).await {
+        let mut req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
             Ok(None) => break, // Client closed connection.
             Err(e) => {
@@ -1282,6 +1331,17 @@ where
                 ))
                 .build();
             ocsf_emit!(event);
+        }
+
+        match inspection::inspect_http_request(&mut req, ctx)? {
+            HttpInspectionOutcome::Allow => {}
+            HttpInspectionOutcome::Mutate { .. } => {}
+            HttpInspectionOutcome::Deny { reason, .. } => {
+                provider
+                    .deny(&req, &ctx.policy_name, &reason, client)
+                    .await?;
+                return Ok(());
+            }
         }
 
         let req_with_auth = match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await
@@ -1354,8 +1414,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inspection::{
+        Finding, InspectionContext, InspectionDecision, InspectionTarget, Inspector,
+    };
     use crate::opa::{NetworkInput, OpaEngine};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
@@ -1424,6 +1488,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            request_inspector: None,
         };
 
         (config, tunnel_engine, ctx, fixture)
@@ -1467,6 +1532,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            request_inspector: None,
         };
 
         (generation_guard, ctx, fixture)
@@ -1480,6 +1546,61 @@ network_policies:
                     .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
             })
             .count()
+    }
+
+    struct HeaderMutationInspector;
+
+    impl Inspector for HeaderMutationInspector {
+        fn inspect(
+            &self,
+            target: InspectionTarget,
+            _ctx: &InspectionContext,
+        ) -> Result<InspectionDecision> {
+            match target {
+                InspectionTarget::HttpRequest {
+                    method,
+                    path,
+                    mut headers,
+                    body,
+                } => {
+                    headers.push(("X-Inspected".to_string(), "true".to_string()));
+                    Ok(InspectionDecision::Mutate {
+                        target: InspectionTarget::HttpRequest {
+                            method,
+                            path,
+                            headers,
+                            body,
+                        },
+                        findings: vec![Finding {
+                            code: "header_added".to_string(),
+                            message: "inspector added header".to_string(),
+                        }],
+                    })
+                }
+                other => Err(miette!("unexpected inspection target: {other:?}")),
+            }
+        }
+    }
+
+    struct DenyInspector;
+
+    impl Inspector for DenyInspector {
+        fn inspect(
+            &self,
+            target: InspectionTarget,
+            _ctx: &InspectionContext,
+        ) -> Result<InspectionDecision> {
+            match target {
+                InspectionTarget::HttpRequest { .. } => Ok(InspectionDecision::Deny {
+                    reason: "blocked by test inspector".to_string(),
+                    findings: vec![Finding {
+                        code: "blocked".to_string(),
+                        message: "inspector denied request".to_string(),
+                    }],
+                }),
+                other => Err(miette!("unexpected inspection target: {other:?}")),
+            }
+        }
     }
 
     #[test]
@@ -1743,6 +1864,106 @@ network_policies:
         fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
     }
 
+    #[tokio::test]
+    async fn passthrough_relay_inspector_denies_before_upstream_forward() {
+        let (generation_guard, mut ctx, _fixture) =
+            passthrough_token_grant_relay_context(Ok("grant-token"));
+        ctx.request_inspector = Some(Arc::new(DenyInspector));
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /v1/projects HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("deny response should reach client")
+        .unwrap();
+        let client_response = String::from_utf8_lossy(&client_response[..n]);
+        assert!(client_response.contains("403 Forbidden"));
+        assert!(client_response.contains("blocked by test inspector"));
+
+        let mut upstream_request = [0u8; 128];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("upstream should close without forwarded data")
+        .unwrap();
+        assert_eq!(n, 0, "denied request must not reach upstream");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn l7_rest_relay_inspector_mutates_headers_before_forwarding() {
+        let (config, tunnel_engine, mut ctx, _fixture) =
+            rest_token_grant_relay_context(Ok("grant-token"));
+        ctx.request_inspector = Some(Arc::new(HeaderMutationInspector));
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /v1/projects HTTP/1.1\r\nHost: api.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut upstream_request = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("request should reach upstream")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_request[..n]);
+        assert!(upstream_request.contains("X-Inspected: true\r\n"));
+        assert!(upstream_request.contains("Authorization: Bearer grant-token\r\n"));
+
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn websocket_text_policy_requires_explicit_message_rule() {
         let data = r#"
@@ -1786,6 +2007,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            request_inspector: None,
         };
         let request = L7RequestInfo {
             action: "WEBSOCKET_TEXT".into(),
@@ -1844,6 +2066,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            request_inspector: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1951,6 +2174,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            request_inspector: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -2071,6 +2295,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            request_inspector: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -2244,6 +2469,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            request_inspector: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -2334,6 +2560,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            request_inspector: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
