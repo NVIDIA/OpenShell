@@ -265,7 +265,7 @@ Cluster inference routes store only `provider_name`, `model_id`, and optional
 timeout. The gateway resolves endpoint URLs, protocols, credentials, auth
 style, and route-shaping metadata from the provider record when supervisors call
 `GetInferenceBundle`. Supported provider types for cluster inference are
-`openai`, `anthropic`, `nvidia`, and `google-vertex-ai`.
+`openai`, `anthropic`, `anthropic-oauth`, `nvidia`, and `google-vertex-ai`.
 
 The bundle carries enough information for sandbox-local routers to construct
 upstream URLs without re-deriving provider-specific routing logic. Each resolved
@@ -322,6 +322,20 @@ successful create therefore yields an immediately usable provider; failures roll
 back the provider record. Service-account JSON and private keys are gateway-side
 refresh bootstrap material only; sandbox runtime inference receives minted
 access tokens, not raw service-account material.
+
+The `anthropic-oauth` provider type (alias `claude-plan`) routes the direct
+Anthropic API with a subscription OAuth token instead of an API key. Its
+inference profile uses `Authorization: Bearer` plus a mandatory
+`anthropic-beta: oauth-2025-04-20` default header; the sandbox router merges that
+flag with any client-sent `anthropic-beta` value so the sandbox cannot drop it.
+The CLI `--from-claude-login` harvests the local Claude Code login (macOS
+Keychain `Claude Code-credentials` or `~/.claude/.credentials.json`) on the host,
+stores the access token under the non-injectable `ANTHROPIC_OAUTH_TOKEN`
+credential, and calls `ConfigureProviderRefresh` with the subscription's refresh
+token (Anthropic public `client_id` only, no secret). The background refresh
+worker rotates the access token ahead of expiry and persists Anthropic's rotated
+refresh token. The access token is never exported into sandbox environments; it
+rides the inference route bundle and is injected only at the egress boundary.
 
 ## Supervisor Relay
 

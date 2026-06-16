@@ -1140,9 +1140,16 @@ fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<Stri
 }
 
 fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
-    openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
-        == Some("google-vertex-ai")
-        && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
+    match openshell_core::inference::normalize_inference_provider_type(&provider.r#type) {
+        // The Vertex service-account key is used by the gateway to mint tokens; it
+        // must never be exported into the sandbox environment.
+        Some("google-vertex-ai") => key == "GOOGLE_SERVICE_ACCOUNT_KEY",
+        // The Anthropic subscription OAuth access token is injected as a Bearer
+        // header at the egress boundary only. It must never reach the sandbox
+        // environment, so the user never authenticates inside the sandbox.
+        Some("anthropic-oauth") => key == openshell_core::inference::ANTHROPIC_OAUTH_TOKEN_KEY,
+        _ => false,
+    }
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -2642,6 +2649,7 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "anthropic-oauth",
                 "claude-code",
                 "codex",
                 "copilot",
@@ -4803,6 +4811,64 @@ mod tests {
             result.get("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
             Some(&"ya29.short-lived".to_string())
         );
+    }
+
+    #[test]
+    fn anthropic_oauth_access_token_is_non_injectable() {
+        let provider = Provider {
+            r#type: "anthropic-oauth".to_string(),
+            ..Default::default()
+        };
+        assert!(is_non_injectable_provider_credential(
+            &provider,
+            openshell_core::inference::ANTHROPIC_OAUTH_TOKEN_KEY
+        ));
+        // The alias resolves to the same provider type and stays non-injectable.
+        let aliased = Provider {
+            r#type: "claude-plan".to_string(),
+            ..Default::default()
+        };
+        assert!(is_non_injectable_provider_credential(
+            &aliased,
+            openshell_core::inference::ANTHROPIC_OAUTH_TOKEN_KEY
+        ));
+        // An unrelated key on the same provider is still injectable.
+        assert!(!is_non_injectable_provider_credential(
+            &provider,
+            "SOME_OTHER_KEY"
+        ));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_anthropic_oauth_never_injects_access_token() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "anthropic-plan".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "anthropic-oauth".to_string(),
+                credentials: HashMap::from([(
+                    openshell_core::inference::ANTHROPIC_OAUTH_TOKEN_KEY.to_string(),
+                    "sk-ant-oat-secret".to_string(),
+                )]),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["anthropic-plan".to_string()])
+            .await
+            .unwrap();
+
+        assert!(!result.contains_key(openshell_core::inference::ANTHROPIC_OAUTH_TOKEN_KEY));
     }
 
     #[tokio::test]

@@ -1,0 +1,100 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Anthropic Subscription"
+sidebar-title: "Anthropic Subscription"
+description: "Run Claude Code in a sandbox on an Anthropic Pro or Max subscription, with the OAuth token acquired and refreshed outside the sandbox."
+keywords: "Generative AI, AI Agents, Sandboxing, Anthropic, Claude, OAuth, Subscription, Inference Routing"
+---
+
+The `anthropic-oauth` provider routes `inference.local` traffic to the Anthropic API using a subscription ("plan") OAuth token instead of an API key. You authenticate once on the host with your Anthropic Pro or Max plan, and the gateway refreshes the token and injects it only at the egress boundary. The token is never written into the sandbox environment, filesystem, or logs.
+
+Use this provider when you want sandboxed agents to consume your Claude subscription rather than a metered API key. For API-key access, use a standard `anthropic` provider instead.
+
+## Prerequisites
+
+- A local Claude Code login on an Anthropic Pro or Max plan. Run `claude login` (or `/login` inside Claude Code) on the host before creating the provider.
+- The host running `openshell provider create` must be able to read the local login: the macOS Keychain item `Claude Code-credentials`, or `~/.claude/.credentials.json` on Linux.
+- A gateway and sandbox supervisor image new enough to support the `anthropic-oauth` provider type. The supervisor applies the `Authorization: Bearer` and `anthropic-beta` headers inside the sandbox boundary, so a stale supervisor image silently drops them and Anthropic rejects the request. Keep the gateway and supervisor images on the same build.
+
+## Authentication
+
+Create the provider with `--from-claude-login`:
+
+```shell
+openshell provider create \
+  --name claude-plan \
+  --type anthropic-oauth \
+  --from-claude-login
+```
+
+`--from-claude-login` reads the local Claude Code login, stores the access token as the gateway-side `ANTHROPIC_OAUTH_TOKEN` credential, and configures an OAuth2 refresh-token flow using your subscription's refresh token. The gateway refreshes the access token ahead of expiry and updates running sandboxes without a restart.
+
+The CLI reads the macOS Keychain first, then falls back to `~/.claude/.credentials.json`. If neither contains a login, the command fails and directs you to run `claude login`.
+
+<Note>
+`--from-claude-login` is only valid for `anthropic-oauth` providers. It cannot be combined with `--from-existing`, `--credential`, or `--runtime-credentials`.
+</Note>
+
+<Warning>
+The access token is marked non-injectable: it is stored only as gateway refresh state and is never exported into sandboxes. Sandboxes reach the model through `inference.local`, where the gateway adds the `Authorization: Bearer` header and the required `anthropic-beta: oauth-2025-04-20` flag at the egress boundary.
+</Warning>
+
+## Token Lifecycle
+
+The subscription OAuth token represents your whole plan, so it is shared across every sandbox bound to the provider, and revoking it is provider-wide. Anthropic rotates the refresh token on each refresh; the gateway persists the rotated token so refresh keeps working. The long-lived refresh material lives only in gateway state, never in a sandbox.
+
+To rotate or revoke, delete and recreate the provider, or rotate the credential through `openshell provider refresh`.
+
+## Configure Inference Routing
+
+Enable provider endpoint injection so the Anthropic network endpoint is added to sandbox policies automatically:
+
+```shell
+openshell settings set --global --key providers_v2_enabled --value true --yes
+```
+
+Then point `inference.local` at the provider:
+
+```shell
+openshell inference set \
+  --provider claude-plan \
+  --model claude-sonnet-4-6
+```
+
+Sandboxes on that gateway reach the model at `https://inference.local`. For full details, refer to [Inference Routing](/sandboxes/inference-routing).
+
+## Use from a Sandbox
+
+Agents inside sandboxes reach Anthropic through `inference.local`, not by connecting to the API directly. The gateway holds the subscription token and injects it on egress; the agent only points its SDK at the local endpoint.
+
+The complete setup from scratch:
+
+```shell
+# 1. Enable provider endpoint injection
+openshell settings set --global --key providers_v2_enabled --value true --yes
+
+# 2. Authenticate on the host, then create the provider
+claude login
+openshell provider create --name claude-plan --type anthropic-oauth --from-claude-login
+
+# 3. Configure inference routing
+openshell inference set --provider claude-plan --model claude-sonnet-4-6
+
+# 4. Create a sandbox with the provider attached
+openshell sandbox create --name my-sandbox --provider claude-plan
+```
+
+Then inside the sandbox, launch Claude Code against the local endpoint:
+
+```shell
+ANTHROPIC_BASE_URL="https://inference.local" ANTHROPIC_API_KEY=unused claude -p "Reply with exactly: pong"
+```
+
+Setting `ANTHROPIC_API_KEY` to any placeholder makes Claude Code talk to the gateway endpoint directly instead of starting its own OAuth login flow inside the sandbox. The placeholder key never reaches Anthropic — `inference.local` strips it and injects the real subscription token before forwarding. Drop the `-p "…"` to launch the interactive TUI instead.
+
+## Next Steps
+
+- To configure `inference.local` routing, refer to [Inference Routing](/sandboxes/inference-routing).
+- To manage provider credentials and refresh, refer to [Providers](/sandboxes/manage-providers).
+- To apply network policies to sandboxes using this provider, refer to [Policies](/sandboxes/policies).

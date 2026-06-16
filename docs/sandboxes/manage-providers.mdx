@@ -284,6 +284,7 @@ The following providers have been tested with `inference.local`. Any provider th
 |---|---|---|---|---|
 | NVIDIA API Catalog | `nvidia-prod` | `nvidia` | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` |
 | Anthropic | `anthropic-prod` | `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
+| Anthropic (subscription) | `claude-plan` | `anthropic-oauth` | `https://api.anthropic.com` | OAuth — use `--from-claude-login` |
 | Google Vertex AI | `vertex-prod` | `google-vertex-ai` | Regional, global, or multi-region Vertex endpoint | `GOOGLE_VERTEX_AI_TOKEN` or `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN` |
 | Baseten | `baseten` | `openai` | `https://inference.baseten.co/v1` | `OPENAI_API_KEY` |
 | Bitdeer AI | `bitdeer` | `openai` | `https://api-inference.bitdeer.ai/v1` | `OPENAI_API_KEY` |
@@ -292,7 +293,7 @@ The following providers have been tested with `inference.local`. Any provider th
 | Ollama (local) | `ollama` | `openai` | `http://host.openshell.internal:11434/v1` | `OPENAI_API_KEY` |
 | LM Studio (local) | `lmstudio` | `openai` | `http://host.openshell.internal:1234/v1` | `OPENAI_API_KEY` |
 
-Refer to your provider's documentation for the correct base URL, available models, and API key setup. For the Vertex-specific auth flows and config keys, refer to [Google Vertex AI](/providers/google-vertex-ai). To configure inference routing, refer to [Inference Routing](/sandboxes/inference-routing).
+Refer to your provider's documentation for the correct base URL, available models, and API key setup. For the Vertex-specific auth flows and config keys, refer to [Google Vertex AI](/providers/google-vertex-ai). To run Claude Code on an Anthropic Pro or Max subscription with the token acquired outside the sandbox, refer to [Anthropic Subscription](/providers/anthropic-subscription). To configure inference routing, refer to [Inference Routing](/sandboxes/inference-routing).
 
 ## Next Steps
 

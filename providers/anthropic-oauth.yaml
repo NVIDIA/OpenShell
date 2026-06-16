@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: anthropic-oauth
+display_name: Anthropic (Subscription OAuth)
+description: Anthropic Claude inference using a subscription ("plan") OAuth token. The token is refreshed by the gateway and injected only at the egress boundary, never inside the sandbox.
+category: inference
+inference_capable: true
+credentials:
+  - name: oauth_token
+    description: Anthropic subscription OAuth access token; injected as an Authorization Bearer header at the egress boundary and never exported into sandboxes
+    env_vars: [ANTHROPIC_OAUTH_TOKEN]
+    required: false
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: oauth2_refresh_token
+      token_url: https://console.anthropic.com/v1/oauth/token
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 28800
+      material:
+        - name: client_id
+          description: Anthropic public OAuth client ID
+          required: true
+        - name: refresh_token
+          description: Anthropic OAuth refresh token harvested from the local Claude Code login
+          required: true
+          secret: true
+discovery:
+  credentials: [oauth_token]
+endpoints:
+  - host: api.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce

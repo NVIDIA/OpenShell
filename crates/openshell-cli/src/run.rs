@@ -4347,6 +4347,178 @@ fn read_gcloud_adc() -> Result<(String, String, String)> {
     Ok((client_id, client_secret, refresh_token))
 }
 
+/// Canonical provider type string for the Anthropic subscription OAuth flow.
+const ANTHROPIC_OAUTH_PROVIDER_TYPE: &str = "anthropic-oauth";
+
+/// Anthropic's public OAuth client ID used by Claude Code. The refresh grant
+/// requires only this client ID (no client secret).
+const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/// OAuth credentials harvested from a local Claude Code subscription login.
+struct ClaudeOauthCredentials {
+    access_token: String,
+    refresh_token: String,
+    /// Access-token expiry in epoch milliseconds (0 if unknown).
+    expires_at_ms: i64,
+}
+
+/// Read the Anthropic subscription OAuth credentials from the local Claude Code
+/// login. Prefers the macOS Keychain item, falling back to
+/// `~/.claude/.credentials.json`.
+fn read_claude_oauth() -> Result<ClaudeOauthCredentials> {
+    if let Some(raw) = read_claude_credentials_keychain()? {
+        return parse_claude_oauth_json(&raw);
+    }
+    if let Some(raw) = read_claude_credentials_file()? {
+        return parse_claude_oauth_json(&raw);
+    }
+    Err(miette::miette!(
+        "no local Claude Code subscription login found. \
+         Run `claude login` (or `claude /login`) on this host first, then retry. \
+         Looked in the macOS Keychain item 'Claude Code-credentials' and \
+         ~/.claude/.credentials.json"
+    ))
+}
+
+/// Read the raw credentials JSON from `~/.claude/.credentials.json`, if present.
+fn read_claude_credentials_file() -> Result<Option<String>> {
+    let home = std::env::var("HOME")
+        .map_err(|_| miette::miette!("HOME is not set; cannot locate the Claude Code login"))?;
+    let path = PathBuf::from(home)
+        .join(".claude")
+        .join(".credentials.json");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => Ok(Some(content)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(miette::miette!(
+            "failed to read Claude Code credentials file at {}: {err}",
+            path.display()
+        )),
+    }
+}
+
+/// Read the raw credentials JSON from the macOS Keychain. Returns `None` on
+/// non-macOS hosts or when the item is absent.
+#[cfg(target_os = "macos")]
+fn read_claude_credentials_keychain() -> Result<Option<String>> {
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if raw.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(raw))
+            }
+        }
+        // Non-zero exit means the item was not found; fall through to the file.
+        Ok(_) => Ok(None),
+        Err(err) => Err(miette::miette!(
+            "failed to query the macOS Keychain for the Claude Code login: {err}"
+        )),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_claude_credentials_keychain() -> Result<Option<String>> {
+    Ok(None)
+}
+
+/// Parse the Claude Code credentials JSON, extracting the access token, refresh
+/// token, and normalized access-token expiry.
+fn parse_claude_oauth_json(raw: &str) -> Result<ClaudeOauthCredentials> {
+    let json: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| miette::miette!("failed to parse Claude Code credentials: {err}"))?;
+
+    let oauth = json.get("claudeAiOauth").ok_or_else(|| {
+        miette::miette!(
+            "Claude Code credentials are missing the 'claudeAiOauth' object; \
+             the local login may be from an incompatible Claude Code version"
+        )
+    })?;
+
+    let access_token = oauth
+        .get("accessToken")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| miette::miette!("Claude Code login is missing 'accessToken'"))?
+        .to_string();
+
+    let refresh_token = oauth
+        .get("refreshToken")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            miette::miette!(
+                "Claude Code login is missing 'refreshToken'; \
+                 gateway-managed refresh requires it"
+            )
+        })?
+        .to_string();
+
+    let expires_at_ms = oauth
+        .get("expiresAt")
+        .and_then(serde_json::Value::as_i64)
+        .map_or(0, normalize_expires_at_ms);
+
+    Ok(ClaudeOauthCredentials {
+        access_token,
+        refresh_token,
+        expires_at_ms,
+    })
+}
+
+/// Normalize an `expiresAt` value to epoch milliseconds. Claude Code stores
+/// milliseconds, but tolerate a seconds-valued timestamp by scaling it up.
+fn normalize_expires_at_ms(value: i64) -> i64 {
+    if value > 0 && value < 1_000_000_000_000 {
+        value * 1000
+    } else {
+        value
+    }
+}
+
+async fn rollback_provider_create_after_claude_login_failure(
+    client: &mut crate::tls::GrpcClient,
+    provider_name: &str,
+    source: &Status,
+) -> Result<()> {
+    match client
+        .delete_provider(DeleteProviderRequest {
+            name: provider_name.to_string(),
+        })
+        .await
+    {
+        Ok(_) => Err(miette!(
+            "failed to configure Anthropic subscription refresh from the local Claude Code login \
+             for provider '{provider_name}': {source}. The provider was rolled back successfully."
+        )),
+        Err(cleanup_err) => {
+            eprintln!(
+                "{} Failed to clean up provider '{}' after configuring refresh failed: {}. \
+                 Run 'openshell provider delete {}' to remove it manually.",
+                "⚠".yellow(),
+                provider_name,
+                cleanup_err,
+                provider_name
+            );
+            Err(miette!(
+                "failed to configure Anthropic subscription refresh from the local Claude Code login \
+                 for provider '{provider_name}': {source}. \
+                 Cleanup also failed, so the provider may still exist. \
+                 Run 'openshell provider delete {provider_name}' to remove it manually."
+            ))
+        }
+    }
+}
+
 async fn rollback_provider_create_after_vertex_adc_failure(
     client: &mut crate::tls::GrpcClient,
     provider_name: &str,
@@ -4519,6 +4691,7 @@ pub async fn provider_create(
         credentials,
         from_gcloud_adc,
         false,
+        false,
         config,
         tls,
     )
@@ -4526,6 +4699,7 @@ pub async fn provider_create(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::fn_params_excessive_bools)]
 pub async fn provider_create_with_options(
     server: &str,
     name: &str,
@@ -4533,6 +4707,7 @@ pub async fn provider_create_with_options(
     from_existing: bool,
     credentials: &[String],
     from_gcloud_adc: bool,
+    from_claude_login: bool,
     runtime_credentials: bool,
     config: &[String],
     tls: &TlsOptions,
@@ -4540,6 +4715,11 @@ pub async fn provider_create_with_options(
     if from_gcloud_adc && (from_existing || !credentials.is_empty() || runtime_credentials) {
         return Err(miette::miette!(
             "--from-gcloud-adc cannot be combined with --from-existing or --credential; it also cannot be combined with --runtime-credentials"
+        ));
+    }
+    if from_claude_login && (from_existing || !credentials.is_empty() || runtime_credentials) {
+        return Err(miette::miette!(
+            "--from-claude-login cannot be combined with --from-existing, --credential, or --runtime-credentials"
         ));
     }
     if from_existing && (!credentials.is_empty() || runtime_credentials) {
@@ -4589,6 +4769,12 @@ pub async fn provider_create_with_options(
         ));
     }
 
+    if from_claude_login && provider_type != ANTHROPIC_OAUTH_PROVIDER_TYPE {
+        return Err(miette::miette!(
+            "--from-claude-login is only valid for anthropic-oauth providers"
+        ));
+    }
+
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
@@ -4607,6 +4793,22 @@ pub async fn provider_create_with_options(
             config_map.entry(key).or_insert(value);
         }
     }
+
+    // Read the local Claude Code login BEFORE creating the provider so a missing
+    // or malformed credential does not leave an orphan provider behind. The
+    // access token is stored as the provider credential; it is marked
+    // non-injectable server-side, so it is only ever injected at the egress
+    // boundary and never inside the sandbox.
+    let claude_login_material = if from_claude_login {
+        let creds = read_claude_oauth()?;
+        credential_map.insert(
+            openshell_core::inference::ANTHROPIC_OAUTH_TOKEN_KEY.to_string(),
+            creds.access_token.clone(),
+        );
+        Some(creds)
+    } else {
+        None
+    };
 
     if credential_map.is_empty() {
         if from_existing {
@@ -4644,6 +4846,19 @@ pub async fn provider_create_with_options(
         None
     };
 
+    // Seed the initial access-token expiry so the gateway's background refresh
+    // worker knows when to mint a fresh token. Sourced from the local Claude
+    // Code login's `expiresAt`.
+    let mut credential_expires_at_ms = HashMap::new();
+    if let Some(creds) = &claude_login_material
+        && creds.expires_at_ms > 0
+    {
+        credential_expires_at_ms.insert(
+            openshell_core::inference::ANTHROPIC_OAUTH_TOKEN_KEY.to_string(),
+            creds.expires_at_ms,
+        );
+    }
+
     let response = client
         .create_provider(CreateProviderRequest {
             provider: Some(Provider {
@@ -4657,7 +4872,7 @@ pub async fn provider_create_with_options(
                 r#type: provider_type.clone(),
                 credentials: credential_map,
                 config: config_map,
-                credential_expires_at_ms: HashMap::new(),
+                credential_expires_at_ms,
             }),
         })
         .await
@@ -4718,6 +4933,42 @@ pub async fn provider_create_with_options(
         println!(
             "Configured Vertex AI credentials from gcloud ADC and minted the initial access token"
         );
+        return Ok(());
+    }
+
+    if let Some(creds) = claude_login_material {
+        let mut material = HashMap::new();
+        material.insert(
+            "client_id".to_string(),
+            ANTHROPIC_OAUTH_CLIENT_ID.to_string(),
+        );
+        material.insert("refresh_token".to_string(), creds.refresh_token);
+
+        // No initial rotate: the access token harvested from the local login is
+        // already valid, and rotating now would invalidate the user's local
+        // Claude Code refresh token (Anthropic rotates refresh tokens on use).
+        // The background worker refreshes only as the token nears expiry.
+        if let Err(configure_err) = client
+            .configure_provider_refresh(ConfigureProviderRefreshRequest {
+                provider: provider_name.clone(),
+                credential_key: openshell_core::inference::ANTHROPIC_OAUTH_TOKEN_KEY.to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                material,
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: (creds.expires_at_ms > 0).then_some(creds.expires_at_ms),
+            })
+            .await
+        {
+            return rollback_provider_create_after_claude_login_failure(
+                &mut client,
+                &provider_name,
+                &configure_err,
+            )
+            .await;
+        }
+
+        println!("{} Created provider {}", "✓".green().bold(), provider_name);
+        println!("Configured Anthropic subscription credentials from the local Claude Code login");
         return Ok(());
     }
 
@@ -9066,6 +9317,80 @@ mod tests {
                 || msg.contains("invalid")
                 || msg.contains("failed"),
             "error message should mention parse/JSON failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_claude_oauth_json_extracts_fields() {
+        let raw = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat-test",
+                "refreshToken": "sk-ant-ort-test",
+                "expiresAt": 1_750_000_000_000_i64,
+                "scopes": ["user:inference"],
+                "subscriptionType": "pro"
+            }
+        })
+        .to_string();
+        let creds = super::parse_claude_oauth_json(&raw).expect("valid login should parse");
+        assert_eq!(creds.access_token, "sk-ant-oat-test");
+        assert_eq!(creds.refresh_token, "sk-ant-ort-test");
+        assert_eq!(creds.expires_at_ms, 1_750_000_000_000_i64);
+    }
+
+    #[test]
+    fn parse_claude_oauth_json_normalizes_seconds_expiry() {
+        let raw = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat-test",
+                "refreshToken": "sk-ant-ort-test",
+                "expiresAt": 1_750_000_000_i64
+            }
+        })
+        .to_string();
+        let creds = super::parse_claude_oauth_json(&raw).expect("valid login should parse");
+        assert_eq!(creds.expires_at_ms, 1_750_000_000_000_i64);
+    }
+
+    #[test]
+    fn parse_claude_oauth_json_missing_refresh_token_errors() {
+        let raw = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat-test"
+            }
+        })
+        .to_string();
+        let err = super::parse_claude_oauth_json(&raw)
+            .err()
+            .expect("missing refresh token errors");
+        assert!(
+            err.to_string().contains("refreshToken"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_claude_oauth_json_missing_oauth_object_errors() {
+        let raw = serde_json::json!({ "somethingElse": {} }).to_string();
+        let err = super::parse_claude_oauth_json(&raw)
+            .err()
+            .expect("missing oauth object should error");
+        assert!(
+            err.to_string().contains("claudeAiOauth"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn normalize_expires_at_ms_scales_seconds_only() {
+        assert_eq!(super::normalize_expires_at_ms(0), 0);
+        assert_eq!(
+            super::normalize_expires_at_ms(1_700_000_000),
+            1_700_000_000_000
+        );
+        assert_eq!(
+            super::normalize_expires_at_ms(1_700_000_000_000),
+            1_700_000_000_000
         );
     }
 

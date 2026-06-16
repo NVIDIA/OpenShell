@@ -1192,6 +1192,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         false,
         &[],
         false,
+        false,
         true,
         &[],
         &ts.tls,

@@ -716,7 +716,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "from_claude_login", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -727,25 +727,31 @@ enum ProviderCommands {
         provider_type: String,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials"])]
+        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "from_claude_login", "runtime_credentials"])]
         from_existing: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
             long = "credential",
             value_name = "KEY[=VALUE]",
-            conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"]
+            conflicts_with_all = ["from_existing", "from_gcloud_adc", "from_claude_login", "runtime_credentials"]
         )]
         credentials: Vec<String>,
 
         /// Configure credentials from gcloud Application Default Credentials
         /// (`~/.config/gcloud/application_default_credentials.json`).
         /// Only valid for google-vertex-ai providers.
-        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials"])]
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "from_claude_login", "runtime_credentials"])]
         from_gcloud_adc: bool,
 
+        /// Configure credentials from the local Claude Code subscription login
+        /// (macOS Keychain or `~/.claude/.credentials.json`).
+        /// Only valid for anthropic-oauth providers.
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"])]
+        from_claude_login: bool,
+
         /// Create a provider whose required credentials are resolved at runtime by the gateway/sandbox.
-        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc"])]
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc", "from_claude_login"])]
         runtime_credentials: bool,
 
         /// Provider config key/value pair.
@@ -2834,6 +2840,7 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     from_gcloud_adc,
+                    from_claude_login,
                     runtime_credentials,
                     config,
                 } => {
@@ -2844,6 +2851,7 @@ async fn main() -> Result<()> {
                         from_existing,
                         &credentials,
                         from_gcloud_adc,
+                        from_claude_login,
                         runtime_credentials,
                         &config,
                         &tls,

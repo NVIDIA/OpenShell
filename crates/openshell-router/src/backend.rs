@@ -82,6 +82,23 @@ const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 const COMMON_INFERENCE_REQUEST_HEADERS: [&str; 4] =
     ["content-type", "accept", "accept-encoding", "user-agent"];
 
+/// The Anthropic beta-flags header. Its value is a comma-separated token list,
+/// so route-forced flags must be merged with client-supplied ones rather than
+/// overwriting them.
+const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
+
+/// Merge a comma-separated `anthropic-beta` value into `tokens`, preserving
+/// order and dropping case-insensitive duplicates and empty entries.
+fn merge_beta_tokens(tokens: &mut Vec<String>, raw: &str) {
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() || tokens.iter().any(|t| t.eq_ignore_ascii_case(token)) {
+            continue;
+        }
+        tokens.push(token.to_string());
+    }
+}
+
 impl StreamingProxyResponse {
     /// Create from a fully-buffered [`ProxyResponse`] (for mock routes).
     pub fn from_buffered(resp: ProxyResponse) -> Self {
@@ -217,17 +234,36 @@ fn prepare_backend_request(
             builder = builder.header(*header_name, &route.api_key);
         }
     }
+    // `anthropic-beta` is handled separately below: a route may both forward a
+    // client-supplied value and force its own (e.g. the Anthropic OAuth profile
+    // must always send `oauth-2025-04-20`). Applying it in this loop would emit a
+    // duplicate header, so collect its tokens instead of forwarding here.
+    let mut beta_tokens: Vec<String> = Vec::new();
     for (name, value) in &headers {
-        builder = builder.header(name.as_str(), value.as_str());
+        if name.eq_ignore_ascii_case(ANTHROPIC_BETA_HEADER) {
+            merge_beta_tokens(&mut beta_tokens, value);
+        } else {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
     }
 
     // Apply route-level default headers (e.g. anthropic-version) unless
-    // the client already sent them.
+    // the client already sent them. `anthropic-beta` defaults are merged into
+    // the client's value rather than skipped, so a forced beta flag survives
+    // alongside any betas the client requested.
     for (name, value) in &route.default_headers {
+        if name.eq_ignore_ascii_case(ANTHROPIC_BETA_HEADER) {
+            merge_beta_tokens(&mut beta_tokens, value);
+            continue;
+        }
         let already_sent = headers.iter().any(|(h, _)| h.eq_ignore_ascii_case(name));
         if !already_sent {
             builder = builder.header(name.as_str(), value.as_str());
         }
+    }
+
+    if !beta_tokens.is_empty() {
+        builder = builder.header(ANTHROPIC_BETA_HEADER, beta_tokens.join(","));
     }
 
     // Rewrite the JSON body for backend compatibility:
@@ -1694,6 +1730,97 @@ mod tests {
             !received_body.as_object().unwrap().contains_key("model"),
             "Vertex Anthropic route must not inject model into the body, got: {received_body}"
         );
+    }
+
+    /// The anthropic-oauth route carries `anthropic-beta: oauth-2025-04-20` as a
+    /// mandatory default header. A client that also sends `anthropic-beta` must
+    /// not be able to drop it: the route default and the client value are merged
+    /// into a single comma-separated header.
+    #[tokio::test]
+    async fn anthropic_oauth_route_merges_mandatory_beta_with_client_betas() {
+        let mock_server = MockServer::start().await;
+
+        let route = ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint: mock_server.uri(),
+            model: "claude-sonnet-4-20250514".to_string(),
+            api_key: "sk-ant-oat-test".to_string(),
+            protocols: vec!["anthropic_messages".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: vec![
+                ("anthropic-version".to_string(), "2023-06-01".to_string()),
+                ("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()),
+            ],
+            passthrough_headers: vec![
+                "anthropic-version".to_string(),
+                "anthropic-beta".to_string(),
+            ],
+            timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
+        };
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "m"})))
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let body = bytes::Bytes::from_static(b"{}");
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "anthropic-beta".to_string(),
+                "tool-use-2024-10-22".to_string(),
+            ),
+        ];
+
+        let (builder, _url) = super::prepare_backend_request(
+            &client,
+            &route,
+            "POST",
+            "/v1/messages",
+            &headers,
+            body,
+            false,
+        )
+        .unwrap();
+
+        let response = builder.send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+
+        let received = mock_server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        // The outgoing request must carry a single merged anthropic-beta header
+        // containing both the mandatory OAuth flag and the client's beta.
+        let beta_values: Vec<&str> = received[0]
+            .headers
+            .get_all("anthropic-beta")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            beta_values.len(),
+            1,
+            "anthropic-beta must be emitted exactly once, got: {beta_values:?}"
+        );
+        let merged = beta_values[0];
+        assert!(
+            merged.contains("oauth-2025-04-20"),
+            "mandatory OAuth beta must survive, got: {merged}"
+        );
+        assert!(
+            merged.contains("tool-use-2024-10-22"),
+            "client beta must be preserved, got: {merged}"
+        );
+
+        // The Bearer token must be injected at the boundary as Authorization.
+        let auth = received[0]
+            .headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap());
+        assert_eq!(auth, Some("Bearer sk-ant-oat-test"));
     }
 
     /// Claude Code and other Anthropic SDK clients always send "model" in the
