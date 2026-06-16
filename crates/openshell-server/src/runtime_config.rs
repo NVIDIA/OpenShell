@@ -118,6 +118,8 @@ struct RawOpenShellRuntimeRoot {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRuntimeSection {
+    // Keep this as a key/value map so runtime config files use the same
+    // openshell_core::settings registry as CLI and gRPC settings writes.
     #[serde(default)]
     settings: BTreeMap<String, toml::Value>,
 }

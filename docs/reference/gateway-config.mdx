@@ -161,7 +161,7 @@ ocsf_json_enabled = true
 proposal_approval_mode = "manual"
 ```
 
-Only registered runtime setting keys are accepted. The gateway rejects unknown keys, the reserved `policy` key, values with the wrong TOML type, and invalid enum strings.
+Only registered runtime setting keys are accepted. The runtime file accepts the same key names and value types as the global settings API. The gateway rejects unknown keys, the reserved `policy` key, values with the wrong TOML type, and invalid enum strings.
 
 When a runtime settings file is configured, keys present in that file are file-managed. `openshell settings set --global` and `openshell settings delete --global` reject changes to those keys; update the file instead. Keys omitted from the file remain managed through the normal global settings API. Removing a key from the file stops file-managing that key but does not delete the last persisted global value.
 
