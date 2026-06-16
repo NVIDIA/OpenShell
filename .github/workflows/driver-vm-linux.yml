@@ -81,13 +81,13 @@ jobs:
           - arch: arm64
             runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
-            zig_target: aarch64-unknown-linux-gnu.2.31
+            zig_target: aarch64-unknown-linux-gnu.2.28
             platform: linux-aarch64
             guest_arch: aarch64
           - arch: amd64
             runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
-            zig_target: x86_64-unknown-linux-gnu.2.31
+            zig_target: x86_64-unknown-linux-gnu.2.28
             platform: linux-x86_64
             guest_arch: x86_64
     runs-on: ${{ matrix.runner }}
@@ -165,7 +165,7 @@ jobs:
           set -euo pipefail
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ inputs['cargo-version'] }}"'"/}' Cargo.toml
 
-      - name: Build openshell-driver-vm with glibc 2.31 floor
+      - name: Build openshell-driver-vm with glibc 2.28 floor
         run: |
           set -euo pipefail
           mise x -- rustup target add ${{ matrix.target }}
@@ -182,7 +182,7 @@ jobs:
           grep -q '^openshell-driver-vm ' <<<"$OUTPUT"
 
       - name: Verify glibc symbol floor
-        run: tasks/scripts/verify-glibc-symbols.sh 2.31 artifacts/bin/openshell-driver-vm
+        run: tasks/scripts/verify-glibc-symbols.sh 2.28 artifacts/bin/openshell-driver-vm
 
       - name: sccache stats
         if: always()

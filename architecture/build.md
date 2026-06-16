@@ -45,8 +45,7 @@ OpenShell uses different Linux libc environments for different host artifacts.
 The standalone `openshell` CLI is built as a static musl binary so it can run on
 a wide range of Linux distributions without depending on the host's glibc. Host
 runtime binaries that use the GNU/Linux runtime environment are GNU-linked.
-`openshell-gateway` is built with a glibc 2.28 floor. `openshell-driver-vm`
-continues to use a glibc 2.31 floor.
+`openshell-gateway` and `openshell-driver-vm` are built with a glibc 2.28 floor.
 
 ## Container Builds
 
@@ -60,7 +59,9 @@ Dockerfile compiles Rust — both copy a staged binary out of
 Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
 binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.28, including
 native-architecture builds, so the gateway image, standalone tarballs, and Linux
-packages share the same host portability floor. Supervisor binaries remain
+packages share the same host portability floor. Linux VM driver release
+artifacts use the same glibc floor so package-managed VM support does not raise
+the package runtime requirement. Supervisor binaries remain
 static musl and use `cargo zigbuild` when available, including native CPU
 architectures, so C dependencies are compiled for the musl target instead of the
 host GNU libc target. Local Docker image tasks infer the target architecture from
@@ -78,6 +79,11 @@ Runtime layout:
   `/usr/local/bin/openshell-gateway`, runs as UID/GID `1000:1000`. Linux GNU
   gateway binaries must not reference `GLIBC_*` symbols newer than
   `GLIBC_2.28`; release workflows verify this before publishing artifacts.
+- **VM driver**: host GNU-linked binary installed at
+  `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
+  as a release artifact. Linux GNU VM driver binaries must not reference
+  `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
+  before publishing artifacts.
 - **Supervisor**: `scratch` base, static musl binary at `/openshell-sandbox`.
   Static linkage is required because the image is mounted/extracted into
   sandbox environments (Docker extraction, Podman image volumes, Kubernetes
