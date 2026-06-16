@@ -161,7 +161,16 @@ ocsf_json_enabled = true
 proposal_approval_mode = "manual"
 ```
 
-Only registered runtime setting keys are accepted. The runtime file accepts the same key names and value types as the global settings API. The gateway rejects unknown keys, the reserved `policy` key, values with the wrong TOML type, and invalid enum strings.
+Only [supported runtime setting keys](#supported-runtime-settings) are accepted. The runtime file accepts the same key names and value types as the global settings API. The gateway rejects unknown keys, the reserved `policy` key, values with the wrong TOML type, and invalid enum strings.
+
+### Supported Runtime Settings
+
+| Key | Type | Values | Controls |
+|---|---|---|---|
+| `providers_v2_enabled` | Boolean | `true`, `false` | [Provider profile policy composition](/sandboxes/providers-v2) |
+| `ocsf_json_enabled` | Boolean | `true`, `false` | [OCSF JSON log export](/observability/ocsf-json-export) |
+| `agent_policy_proposals_enabled` | Boolean | `true`, `false` | [Policy advisor proposal surface](/sandboxes/policy-advisor) |
+| `proposal_approval_mode` | String | `manual`, `auto` | [Policy advisor approval mode](/sandboxes/policy-advisor#approval-modes) |
 
 When a runtime settings file is configured, keys present in that file are file-managed. `openshell settings set --global` and `openshell settings delete --global` reject changes to those keys; update the file instead. Keys omitted from the file remain managed through the normal global settings API. Removing a key from the file stops file-managing that key but does not delete the last persisted global value.
 
