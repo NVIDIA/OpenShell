@@ -21,7 +21,7 @@
 # The default community sandbox image uses :latest. This wrapper refreshes it
 # before starting the gateway, while the Docker driver defaults to IfNotPresent
 # so local Dockerfile-built images remain usable.
-
+#
 set -euo pipefail
 
 if [ "$#" -eq 0 ]; then

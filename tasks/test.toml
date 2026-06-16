@@ -29,8 +29,8 @@ run = "tasks/scripts/test-packaging-assets.sh"
 hide = true
 
 [e2e]
-description = "Run all end-to-end tests (Rust + Python)"
-depends = ["e2e:rust", "e2e:python"]
+description = "Run all end-to-end tests (Rust + Python + MCP)"
+depends = ["e2e:rust", "e2e:python", "e2e:mcp"]
 
 ["e2e:gpu"]
 description = "Run Docker GPU end-to-end tests"
@@ -70,6 +70,14 @@ run = [
   "cargo build -p openshell-cli",
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test websocket_conformance",
 ]
+
+["e2e:mcp"]
+description = "Run MCP conformance e2e scenarios against one Docker-backed gateway (static defaults for spec 2025-11-25; set OPENSHELL_MCP_CONFORMANCE_SCENARIOS for a focused subset)"
+run = "bash e2e/mcp-conformance.sh"
+
+["e2e:nodejs"]
+description = "Alias for e2e:mcp"
+depends = ["e2e:mcp"]
 
 ["e2e:python"]
 description = "Run Python e2e tests against a Docker-backed gateway (E2E_PARALLEL=N or 'auto'; default 5)"

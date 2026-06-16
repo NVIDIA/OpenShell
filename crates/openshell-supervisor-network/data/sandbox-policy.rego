@@ -257,6 +257,7 @@ deny_request if {
 # --- L7 deny rule matching: REST method + path + query ---
 
 request_denied_for_endpoint(request, endpoint) if {
+	not jsonrpc_family_endpoint(endpoint)
 	some deny_rule
 	deny_rule := endpoint.deny_rules[_]
 	deny_rule.method
@@ -272,6 +273,23 @@ request_denied_for_endpoint(request, endpoint) if {
 	deny_rule := endpoint.deny_rules[_]
 	deny_rule.command
 	command_matches(request.command, deny_rule.command)
+}
+
+# --- L7 deny rule matching: JSON-RPC method ---
+
+request_denied_for_endpoint(request, endpoint) if {
+	jsonrpc_family_endpoint(endpoint)
+	request.method == "POST"
+	some deny_rule
+	deny_rule := endpoint.deny_rules[_]
+	deny_rule.method
+	jsonrpc_rule_matches(request, endpoint, deny_rule)
+}
+
+request_denied_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "json-rpc"
+	request.method == "POST"
+	jsonrpc_response_frame_present(request)
 }
 
 # --- L7 deny rule matching: GraphQL operation ---
@@ -384,8 +402,16 @@ request_deny_reason := reason if {
 
 request_deny_reason := reason if {
 	input.request
+	jsonrpc_response_frame_present(input.request)
+	matched_endpoint_config.protocol == "json-rpc"
+	reason := "JSON-RPC response frames are not permitted from client to server"
+}
+
+request_deny_reason := reason if {
+	input.request
 	deny_request
 	not graphql_request_has_operations(input.request)
+	not jsonrpc_response_frame_present(input.request)
 	reason := sprintf("%s %s blocked by deny rule", [input.request.method, input.request.path])
 }
 
@@ -394,12 +420,14 @@ request_deny_reason := reason if {
 	not deny_request
 	not allow_request
 	not graphql_request_has_operations(input.request)
+	not jsonrpc_response_frame_present(input.request)
 	reason := sprintf("%s %s not permitted by policy", [input.request.method, input.request.path])
 }
 
 # --- L7 rule matching: REST method + path ---
 
 request_allowed_for_endpoint(request, endpoint) if {
+	not jsonrpc_family_endpoint(endpoint)
 	some rule
 	rule := endpoint.rules[_]
 	rule.allow.method
@@ -415,6 +443,82 @@ request_allowed_for_endpoint(request, endpoint) if {
 	rule := endpoint.rules[_]
 	rule.allow.command
 	command_matches(request.command, rule.allow.command)
+}
+
+# --- L7 rule matching: JSON-RPC method ---
+
+request_allowed_for_endpoint(request, endpoint) if {
+	jsonrpc_family_endpoint(endpoint)
+	request.method == "POST"
+	some rule
+	rule := endpoint.rules[_]
+	rule.allow.method
+	not jsonrpc_response_frame_present(request)
+	jsonrpc_rule_matches(request, endpoint, rule.allow)
+}
+
+# MCP can allow the method layer by endpoint option while still using
+# tool-specific rules to narrow tools/call params.name.
+request_allowed_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "mcp"
+	mcp_allow_all_known_mcp_methods(endpoint)
+	request.method == "POST"
+	not jsonrpc_response_frame_present(request)
+	jsonrpc := object.get(request, "jsonrpc", null)
+	is_object(jsonrpc)
+	jsonrpc_no_parse_error(jsonrpc)
+	method := object.get(jsonrpc, "method", "")
+	is_string(method)
+	method != ""
+	not mcp_tool_call_narrowed_by_policy(endpoint, method)
+}
+
+# MCP Streamable HTTP allows client-to-server JSON-RPC response frames for
+# server-originated requests such as elicitation/create. Generic JSON-RPC keeps
+# response frames denied because it has no MCP request-correlation semantics.
+request_allowed_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "mcp"
+	request.method == "POST"
+	jsonrpc_response_frame_present(request)
+	jsonrpc := object.get(request, "jsonrpc", null)
+	is_object(jsonrpc)
+	jsonrpc_no_parse_error(jsonrpc)
+}
+
+jsonrpc_family_endpoint(endpoint) if {
+	endpoint.protocol == "json-rpc"
+}
+
+jsonrpc_family_endpoint(endpoint) if {
+	endpoint.protocol == "mcp"
+}
+
+mcp_allow_all_known_mcp_methods(endpoint) if {
+	object.get(endpoint, "mcp_allow_all_known_mcp_methods", false)
+}
+
+mcp_tool_call_narrowed_by_policy(endpoint, method) if {
+	method == "tools/call"
+	some rule
+	rule := endpoint.rules[_]
+	params := object.get(rule.allow, "params", {})
+	is_object(params)
+	params.name
+}
+
+# MCP Streamable HTTP uses GET on the JSON-RPC-family endpoint as a receive
+# stream for server-to-client messages. The stream itself has no
+# client-to-server JSON-RPC request body to inspect; allow it once the endpoint
+# path and binary matched.
+request_allowed_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "mcp"
+	request.method == "GET"
+	jsonrpc := object.get(request, "jsonrpc", null)
+	is_object(jsonrpc)
+	object.get(jsonrpc, "receive_stream", false)
+	jsonrpc_no_parse_error(jsonrpc)
+	object.get(jsonrpc, "method", null) == null
+	not object.get(jsonrpc, "has_response", false)
 }
 
 # --- L7 rule matching: GraphQL operation ---
@@ -636,6 +740,85 @@ query_value_matches(value, matcher) if {
 	count(any_patterns) > 0
 	some i
 	glob.match(any_patterns[i], [], value)
+}
+
+# JSON-RPC-family method matching. Generic JSON-RPC policies match only method.
+# MCP policies may also match params.name from tool aliases.
+jsonrpc_rule_matches(request, endpoint, rule) if {
+	jsonrpc := object.get(request, "jsonrpc", null)
+	is_object(jsonrpc)
+	method := object.get(jsonrpc, "method", "")
+	is_string(method)
+	method != ""
+	rule_method := object.get(rule, "method", "")
+	is_string(rule_method)
+	rule_method != ""
+	jsonrpc_rule_method_matches(endpoint, method, rule_method)
+	jsonrpc_rule_params_match_for_protocol(jsonrpc, endpoint, rule)
+}
+
+jsonrpc_rule_method_matches(endpoint, _, rule_method) if {
+	endpoint.protocol == "json-rpc"
+	rule_method == "*"
+}
+
+jsonrpc_rule_method_matches(endpoint, method, rule_method) if {
+	endpoint.protocol == "json-rpc"
+	rule_method != "*"
+	rule_method == method
+}
+
+jsonrpc_rule_method_matches(endpoint, method, rule_method) if {
+	endpoint.protocol == "mcp"
+	glob.match(rule_method, [], method)
+}
+
+jsonrpc_rule_params_match_for_protocol(_, endpoint, _) if {
+	endpoint.protocol == "json-rpc"
+}
+
+jsonrpc_rule_params_match_for_protocol(jsonrpc, endpoint, rule) if {
+	endpoint.protocol == "mcp"
+	jsonrpc_params_match(jsonrpc, rule)
+}
+
+jsonrpc_response_frame_present(request) if {
+	jsonrpc := object.get(request, "jsonrpc", null)
+	is_object(jsonrpc)
+	object.get(jsonrpc, "has_response", false)
+}
+
+jsonrpc_no_parse_error(jsonrpc) if {
+	is_object(jsonrpc)
+	object.get(jsonrpc, "error", null) == null
+}
+
+jsonrpc_no_parse_error(jsonrpc) if {
+	is_object(jsonrpc)
+	object.get(jsonrpc, "error", "") == ""
+}
+
+jsonrpc_params_match(jsonrpc, rule) if {
+	is_object(jsonrpc)
+	param_rules := object.get(rule, "params", {})
+	is_object(param_rules)
+	not jsonrpc_param_mismatch(jsonrpc, param_rules)
+}
+
+jsonrpc_param_mismatch(jsonrpc, param_rules) if {
+	some key
+	matcher := param_rules[key]
+	not jsonrpc_param_key_matches(jsonrpc, key, matcher)
+}
+
+jsonrpc_param_key_matches(jsonrpc, key, matcher) if {
+	is_object(jsonrpc)
+	params := object.get(jsonrpc, "params", {})
+	is_object(params)
+	value := object.get(params, key, null)
+	value != null
+	is_string(value)
+	query_value_matches(value, matcher)
 }
 
 # SQL command matching: "*" matches any; otherwise case-insensitive.

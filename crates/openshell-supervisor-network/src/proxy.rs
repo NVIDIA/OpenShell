@@ -13,7 +13,7 @@ use openshell_core::denial::DenialEvent;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip, is_link_local_ip};
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_core::secrets::{SecretResolver, rewrite_header_line_checked};
+use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
@@ -185,7 +185,7 @@ impl ProxyHandle {
     /// The proxy uses OPA for network decisions with process-identity binding
     /// via `/proc/net/tcp`. All connections are evaluated through OPA policy.
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_with_bind_addr(
+    pub(crate) async fn start_with_bind_addr(
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
         opa_engine: Arc<OpaEngine>,
@@ -454,6 +454,27 @@ fn emit_forward_success_activity(tx: Option<&ActivitySender>, l7_activity_pendin
     );
 }
 
+fn forward_l7_hard_deny_reason(
+    protocol: crate::l7::L7Protocol,
+    request_info: &crate::l7::L7RequestInfo,
+) -> Option<String> {
+    request_info
+        .graphql
+        .as_ref()
+        .and_then(|info| info.error.as_deref())
+        .map(|error| format!("GraphQL request rejected: {error}"))
+        .or_else(|| {
+            request_info.jsonrpc.as_ref().and_then(|info| {
+                info.error
+                    .as_deref()
+                    .map(|error| format!("JSON-RPC request rejected: {error}"))
+                    .or_else(|| {
+                        crate::l7::relay::jsonrpc_response_frame_hard_deny_reason(protocol, info)
+                    })
+            })
+        })
+}
+
 /// Emit a denial event to the aggregator channel (if configured).
 /// Used by `handle_tcp_connection` which owns `Option<Sender>`.
 fn emit_denial(
@@ -601,6 +622,7 @@ async fn handle_tcp_connection(
         )
         .await?;
         if let InferenceOutcome::Denied { reason } = outcome {
+            emit_activity(&activity_tx, true, "forward_policy");
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Open)
                 .action(ActionId::Denied)
@@ -2918,16 +2940,14 @@ fn rewrite_forward_request(
     path: &str,
     secret_resolver: Option<&SecretResolver>,
     request_body_credential_rewrite: bool,
-) -> Result<Vec<u8>, openshell_core::secrets::UnresolvedPlaceholderError> {
+) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(used, |p| p + 4);
     let websocket_upgrade = crate::l7::rest::request_is_websocket_upgrade(&raw[..header_end]);
     let upstream_path = match secret_resolver {
-        Some(resolver) => {
-            openshell_core::secrets::rewrite_target_for_eval(path, resolver)?.resolved
-        }
+        Some(resolver) => secrets::rewrite_target_for_eval(path, resolver)?.resolved,
         None => path.to_string(),
     };
 
@@ -3020,10 +3040,10 @@ fn rewrite_forward_request(
             output.len()
         };
         let output_str = String::from_utf8_lossy(&output[..scan_end]);
-        if output_str.contains(openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC)
-            || output_str.contains(openshell_core::secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
+        if output_str.contains(secrets::PLACEHOLDER_PREFIX_PUBLIC)
+            || output_str.contains(secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
         {
-            return Err(openshell_core::secrets::UnresolvedPlaceholderError { location: "header" });
+            return Err(secrets::UnresolvedPlaceholderError { location: "header" });
         }
     }
 
@@ -3597,18 +3617,75 @@ async fn handle_forward_proxy(
         } else {
             None
         };
+        let jsonrpc = if l7_config.config.protocol.is_jsonrpc_family() {
+            let header_end = forward_request_bytes
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(forward_request_bytes.len(), |p| p + 4);
+            let header_str = std::str::from_utf8(&forward_request_bytes[..header_end])
+                .map_err(|_| miette::miette!("Forward JSON-RPC headers contain invalid UTF-8"))?;
+            let body_length = crate::l7::rest::parse_body_length(header_str)?;
+            let mut jsonrpc_request = crate::l7::provider::L7Request {
+                action: method.to_string(),
+                target: path.clone(),
+                query_params: query_params.clone(),
+                raw_header: forward_request_bytes,
+                body_length,
+            };
+            if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&jsonrpc_request) {
+                forward_request_bytes = jsonrpc_request.raw_header;
+                Some(crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream())
+            } else {
+                let body = match crate::l7::http::read_body_for_inspection(
+                    client,
+                    &mut jsonrpc_request,
+                    l7_config.config.json_rpc_max_body_bytes,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(e) => {
+                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                            .message(format!("FORWARD_JSONRPC_L7 request rejected: {e}"))
+                            .build();
+                        ocsf_emit!(event);
+                        emit_activity_simple(activity_tx, true, "l7_parse_rejection");
+                        respond(
+                            client,
+                            &build_json_error_response(
+                                400,
+                                "Bad Request",
+                                "invalid_jsonrpc_request",
+                                &format!("JSON-RPC request rejected before policy evaluation: {e}"),
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                forward_request_bytes = jsonrpc_request.raw_header;
+                Some(crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
+                    &body,
+                    crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(&l7_config.config),
+                ))
+            }
+        } else {
+            None
+        };
         let request_info = crate::l7::L7RequestInfo {
             action: method.to_string(),
             target: path.clone(),
             query_params,
             graphql,
+            jsonrpc,
         };
 
-        let parse_error_reason = request_info
-            .graphql
-            .as_ref()
-            .and_then(|info| info.error.as_deref())
-            .map(|error| format!("GraphQL request rejected: {error}"));
+        let parse_error_reason =
+            forward_l7_hard_deny_reason(l7_config.config.protocol, &request_info);
         let force_deny = parse_error_reason.is_some();
         let (allowed, reason) = parse_error_reason.map_or_else(
             || {
@@ -3649,16 +3726,36 @@ async fn handle_forward_proxy(
                     SeverityId::Informational,
                 ),
             };
-            let engine_type = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
-                "l7-graphql"
-            } else {
-                "l7"
+            let engine_type = match l7_config.config.protocol {
+                crate::l7::L7Protocol::Graphql => "l7-graphql",
+                crate::l7::L7Protocol::JsonRpc => "l7-jsonrpc",
+                crate::l7::L7Protocol::Mcp => "l7-mcp",
+                _ => "l7",
             };
-            let message_prefix = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
-                "FORWARD_GRAPHQL_L7"
-            } else {
-                "FORWARD_L7"
-            };
+            let log_message = request_info.jsonrpc.as_ref().map_or_else(
+                || {
+                    let message_prefix =
+                        if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
+                            "FORWARD_GRAPHQL_L7"
+                        } else {
+                            "FORWARD_L7"
+                        };
+                    format!(
+                        "{message_prefix} {decision_str} {method} {host_lc}:{port}{path} reason={reason}"
+                    )
+                },
+                |jsonrpc_info| {
+                    let endpoint = format!("{host_lc}:{port}{path}");
+                    crate::l7::relay::jsonrpc_log_message(
+                        decision_str,
+                        method,
+                        &endpoint,
+                        jsonrpc_info,
+                        tunnel_engine.captured_generation(),
+                        &reason,
+                    )
+                },
+            );
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
@@ -3675,9 +3772,7 @@ async fn handle_forward_proxy(
                         .with_cmd_line(&cmdline_str),
                 )
                 .firewall_rule(policy_str, engine_type)
-                .message(format!(
-                    "{message_prefix} {decision_str} {method} {host_lc}:{port}{path} reason={reason}"
-                ))
+                .message(log_message)
                 .build();
             ocsf_emit!(event);
         }
@@ -4294,6 +4389,8 @@ mod tests {
             tls: crate::l7::TlsMode::Auto,
             enforcement: crate::l7::EnforcementMode::Enforce,
             graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+            json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+            mcp_strict_tool_names: true,
             allow_encoded_slash: false,
             websocket_credential_rewrite,
             request_body_credential_rewrite: false,
@@ -4453,6 +4550,57 @@ network_policies:
             .expect("CONNECT without an L7 route should emit activity");
         assert!(!event.denied);
         assert_eq!(event.deny_group, "unknown");
+    }
+
+    #[test]
+    fn forward_l7_hard_deny_reason_includes_jsonrpc_errors() {
+        let request_info = crate::l7::L7RequestInfo {
+            action: "POST".to_string(),
+            target: "/rpc".to_string(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+            jsonrpc: Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
+                calls: Vec::new(),
+                is_batch: false,
+                receive_stream: false,
+                has_response: false,
+                error: Some("missing or non-string 'jsonrpc' field".to_string()),
+            }),
+        };
+
+        let reason = forward_l7_hard_deny_reason(crate::l7::L7Protocol::JsonRpc, &request_info)
+            .expect("JSON-RPC parse error");
+
+        assert_eq!(
+            reason,
+            "JSON-RPC request rejected: missing or non-string 'jsonrpc' field"
+        );
+    }
+
+    #[test]
+    fn forward_l7_hard_deny_reason_includes_jsonrpc_response_frames() {
+        let request_info = crate::l7::L7RequestInfo {
+            action: "POST".to_string(),
+            target: "/rpc".to_string(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+            jsonrpc: Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
+                calls: Vec::new(),
+                is_batch: false,
+                receive_stream: false,
+                has_response: true,
+                error: None,
+            }),
+        };
+
+        let reason = forward_l7_hard_deny_reason(crate::l7::L7Protocol::JsonRpc, &request_info)
+            .expect("JSON-RPC response hard deny");
+
+        assert_eq!(reason, crate::l7::relay::JSONRPC_RESPONSE_FRAME_DENY_REASON);
+        assert!(
+            forward_l7_hard_deny_reason(crate::l7::L7Protocol::Mcp, &request_info).is_none(),
+            "MCP response frames are evaluated by policy instead of hard-denied"
+        );
     }
 
     #[test]
@@ -5013,6 +5161,8 @@ network_policies:
                     tls: crate::l7::TlsMode::Auto,
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+                    json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+                    mcp_strict_tool_names: true,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
@@ -5029,6 +5179,8 @@ network_policies:
                     tls: crate::l7::TlsMode::Auto,
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+                    json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+                    mcp_strict_tool_names: true,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,

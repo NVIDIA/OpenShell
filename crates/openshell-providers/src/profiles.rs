@@ -6,10 +6,10 @@
 #![allow(deprecated)] // NetworkBinary::harness remains in the public proto for compatibility.
 
 use openshell_core::proto::{
-    GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, NetworkBinary, NetworkEndpoint,
-    NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCategory,
-    ProviderProfileCredential, ProviderProfileDiscovery,
+    GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
+    NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
+    ProviderCredentialRefreshMaterial, ProviderCredentialRefreshStrategy, ProviderProfile,
+    ProviderProfileCategory, ProviderProfileCredential, ProviderProfileDiscovery,
 };
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -203,6 +203,10 @@ pub struct EndpointProfile {
     pub graphql_persisted_queries: HashMap<String, GraphqlOperationProfile>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub graphql_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub json_rpc_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpOptionsProfile>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -211,6 +215,14 @@ pub struct EndpointProfile {
     pub signing_service: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signing_region: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct McpOptionsProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_tool_names: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_all_known_mcp_methods: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -780,6 +792,8 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
             .map(|(name, operation)| (name.clone(), graphql_operation_to_proto(operation)))
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
+        json_rpc_max_body_bytes: endpoint.json_rpc_max_body_bytes,
+        mcp: endpoint.mcp.as_ref().map(mcp_options_to_proto),
         path: endpoint.path.clone(),
         credential_signing: endpoint.credential_signing.clone(),
         signing_service: endpoint.signing_service.clone(),
@@ -813,10 +827,26 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
             .map(|(name, operation)| (name.clone(), graphql_operation_from_proto(operation)))
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
+        json_rpc_max_body_bytes: endpoint.json_rpc_max_body_bytes,
+        mcp: endpoint.mcp.map(mcp_options_from_proto),
         path: endpoint.path.clone(),
         credential_signing: endpoint.credential_signing.clone(),
         signing_service: endpoint.signing_service.clone(),
         signing_region: endpoint.signing_region.clone(),
+    }
+}
+
+fn mcp_options_to_proto(options: &McpOptionsProfile) -> McpOptions {
+    McpOptions {
+        strict_tool_names: options.strict_tool_names,
+        allow_all_known_mcp_methods: options.allow_all_known_mcp_methods,
+    }
+}
+
+fn mcp_options_from_proto(options: McpOptions) -> McpOptionsProfile {
+    McpOptionsProfile {
+        strict_tool_names: options.strict_tool_names,
+        allow_all_known_mcp_methods: options.allow_all_known_mcp_methods,
     }
 }
 
@@ -859,6 +889,7 @@ fn allow_to_proto(allow: &L7AllowProfile) -> L7Allow {
         operation_type: allow.operation_type.clone(),
         operation_name: allow.operation_name.clone(),
         fields: allow.fields.clone(),
+        params: HashMap::new(),
     }
 }
 
@@ -891,6 +922,7 @@ fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
         operation_type: rule.operation_type.clone(),
         operation_name: rule.operation_name.clone(),
         fields: rule.fields.clone(),
+        params: HashMap::new(),
     }
 }
 
@@ -1937,6 +1969,46 @@ discovery:
         let exported = profile_to_yaml(&from_proto).expect("yaml");
         assert!(exported.contains("discovery:"));
         assert!(exported.contains("api_key"));
+    }
+
+    #[test]
+    fn mcp_endpoint_strict_tool_names_round_trips_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: mcp-example
+display_name: MCP Example
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    path: /mcp
+    protocol: mcp
+    mcp:
+      strict_tool_names: false
+binaries:
+  - /usr/bin/example-agent
+",
+        )
+        .expect("profile should parse");
+
+        assert_eq!(
+            profile.endpoints[0]
+                .mcp
+                .as_ref()
+                .and_then(|options| options.strict_tool_names),
+            Some(false)
+        );
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        assert_eq!(
+            from_proto.endpoints[0]
+                .mcp
+                .as_ref()
+                .and_then(|options| options.strict_tool_names),
+            Some(false)
+        );
+
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        assert!(exported.contains("mcp:"));
+        assert!(exported.contains("strict_tool_names: false"));
     }
 
     #[test]

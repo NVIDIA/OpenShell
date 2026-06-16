@@ -138,6 +138,43 @@ message NetworkEndpoint {
   // AWS region override for SigV4 signing. When set, takes precedence over
   // hostname-based region extraction. Required for non-standard endpoints.
   string signing_region = 21;
+  // Maximum JSON-RPC-over-HTTP request body bytes to buffer for inspection.
+  // Defaults to 65536 when unset.
+  uint32 json_rpc_max_body_bytes = 22;
+  // MCP-only policy and inspection options. Only used when protocol is "mcp".
+  McpOptions mcp = 23;
+}
+
+// MCP options are grouped so MCP-specific policy can grow without adding more
+// top-level NetworkEndpoint fields. Current enforcement targets the active
+// 2025-11-25 Streamable HTTP/tools behavior, while preserving space for
+// version-profile policy if OpenShell adopts 2026-07-28 draft behavior later.
+//
+// Planned policy extensions should use OpenShell-owned static definitions for
+// MCP method/version profiles rather than treating dependency enums as the
+// policy contract. Candidate profile checks include request metadata/header
+// validation, response/SSE introspection, trusted annotation handling,
+// resultType/cache metadata validation, x-mcp-header tool-definition checks,
+// and subscriptions/listen handling.
+//
+// Sources:
+// - https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+// - https://modelcontextprotocol.io/specification/draft/changelog
+// - https://modelcontextprotocol.io/specification/draft/basic/transports/streamable-http
+// - https://modelcontextprotocol.io/specification/draft/server/tools
+message McpOptions {
+  // Hardening boundary for tools/call params.name. When unset or true, the
+  // supervisor enforces the MCP recommended tool-name syntax
+  // ^[A-Za-z0-9_.-]{1,128}$ before policy evaluation. Set false only for
+  // compatibility with servers that intentionally use non-recommended names.
+  //
+  // Source:
+  // - https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool-names
+  optional bool strict_tool_names = 1;
+  // Method-layer default for MCP endpoints. When true, OpenShell allows parsed
+  // MCP-family methods at the method layer unless a tool-name policy narrows
+  // tools/call. When unset or false, explicit method rules are required.
+  optional bool allow_all_known_mcp_methods = 2;
 }
 
 // Trusted GraphQL operation classification.
@@ -154,7 +191,8 @@ message GraphqlOperation {
 // Mirrors L7Allow — same fields, same matching semantics, inverted effect.
 // Deny rules are evaluated after allow rules and take precedence.
 message L7DenyRule {
-  // HTTP method (REST): GET, POST, etc. or "*" for any.
+  // Protocol method: HTTP method (REST/WebSocket), JSON-RPC method name, or
+  // "*" for any when supported by the protocol.
   string method = 1;
   // URL path glob pattern (REST): "/repos/*/pulls/*/reviews", "**" for any.
   string path = 2;
@@ -170,6 +208,10 @@ message L7DenyRule {
   // GraphQL root field globs. Deny rules match when any selected root field
   // matches any configured glob.
   repeated string fields = 7;
+  reserved 8;
+  // MCP params matcher map. Currently only params.name is supported for
+  // tools/call filtering. Generic protocol "json-rpc" rejects params matchers.
+  map<string, L7QueryMatcher> params = 9;
 }
 
 // An L7 policy rule (allow-only).
@@ -179,7 +221,8 @@ message L7Rule {
 
 // Allowed action definition for L7 rules.
 message L7Allow {
-  // HTTP method (REST): GET, POST, etc. or "*" for any.
+  // Protocol method: HTTP method (REST/WebSocket), JSON-RPC method name, or
+  // "*" for any when supported by the protocol.
   string method = 1;
   // URL path glob pattern (REST): "/repos/**", "**" for any.
   string path = 2;
@@ -196,6 +239,10 @@ message L7Allow {
   // GraphQL root field globs. Allow rules match only when every selected root
   // field matches one of the configured globs. Omit to match all fields.
   repeated string fields = 7;
+  reserved 8;
+  // MCP params matcher map. Currently only params.name is supported for
+  // tools/call filtering. Generic protocol "json-rpc" rejects params matchers.
+  map<string, L7QueryMatcher> params = 9;
 }
 
 // Query value matcher for one query parameter key.

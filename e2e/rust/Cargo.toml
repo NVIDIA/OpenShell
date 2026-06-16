@@ -98,6 +98,11 @@ path = "tests/forward_proxy_graphql_l7.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
+name = "forward_proxy_jsonrpc_l7"
+path = "tests/forward_proxy_jsonrpc_l7.rs"
+required-features = ["e2e-host-gateway"]
+
+[[test]]
 name = "gpu_device_selection"
 path = "tests/gpu_device_selection.rs"
 required-features = ["e2e-gpu"]

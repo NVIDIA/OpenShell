@@ -65,7 +65,7 @@ DOCKER_BUILDKIT = "1"
 
 [vars]
 # Python paths to include in formatting/linting
-python_paths = "python/ tasks/scripts/*.py deploy/sbom/*.py"
+python_paths = "python/ tasks/scripts/*.py e2e/mcp-conformance/*.py deploy/sbom/*.py"
 
 [task_config]
 includes = ["tasks/*.toml"]
