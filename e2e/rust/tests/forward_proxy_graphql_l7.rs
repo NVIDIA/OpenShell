@@ -218,6 +218,19 @@ def forward_persisted_get_status(hash_value):
         error.read()
         return error.code
 
+# The sandbox may resolve policy binary symlinks shortly after the entrypoint
+# starts, bumping the policy generation during the first forward request.
+# Retry expected-allowed forward requests so the test still targets L7 behavior.
+def retry_forward_allowed(label, request_fn):
+    last_status = None
+    for attempt in range(6):
+        last_status = request_fn()
+        if last_status != 403:
+            return last_status
+        DETAILS[f"{{label}}_transient_403_attempts"] = attempt + 1
+        time.sleep(0.3)
+    return last_status
+
 def proxy_parts(*names):
     proxy_url = next((os.environ.get(name) for name in names if os.environ.get(name)), None)
     parsed = urllib.parse.urlparse(proxy_url)
@@ -379,14 +392,14 @@ def connect_chunked_status(query):
     return connect_http_status("connect_chunked_query_allowed", request)
 
 results = {{
-    "forward_query_allowed": forward_status(QUERY_VIEWER),
-    "forward_get_query_allowed": forward_get_status(QUERY_VIEWER),
+    "forward_query_allowed": retry_forward_allowed("forward_query_allowed", lambda: forward_status(QUERY_VIEWER)),
+    "forward_get_query_allowed": retry_forward_allowed("forward_get_query_allowed", lambda: forward_get_status(QUERY_VIEWER)),
     "forward_duplicate_get_denied": forward_duplicate_get_status(),
-    "forward_persisted_get_allowed": forward_persisted_get_status("abc123"),
+    "forward_persisted_get_allowed": retry_forward_allowed("forward_persisted_get_allowed", lambda: forward_persisted_get_status("abc123")),
     "forward_unregistered_persisted_get_denied": forward_persisted_get_status("missing"),
-    "forward_chunked_query_allowed": forward_chunked_status(QUERY_VIEWER),
+    "forward_chunked_query_allowed": retry_forward_allowed("forward_chunked_query_allowed", lambda: forward_chunked_status(QUERY_VIEWER)),
     "forward_unlisted_field_denied": forward_status(QUERY_REPOSITORY),
-    "forward_mutation_allowed": forward_status(MUTATION_CREATE),
+    "forward_mutation_allowed": retry_forward_allowed("forward_mutation_allowed", lambda: forward_status(MUTATION_CREATE)),
     "forward_deny_rule_denied": forward_status(MUTATION_DELETE),
     "connect_query_allowed": connect_status(QUERY_VIEWER, "connect_query_allowed"),
     "connect_get_query_allowed": connect_get_status(QUERY_VIEWER, "connect_get_query_allowed"),
