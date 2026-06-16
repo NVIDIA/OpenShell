@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI/dev overlay for exercising the gateway runtime settings file. Add this file
+# to the openshell release valuesFiles to mount a runtime ConfigMap and configure
+# the gateway to watch it.
+server:
+  runtimeConfig:
+    enabled: true
+    settings:
+      providers_v2_enabled: true
