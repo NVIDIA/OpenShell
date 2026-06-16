@@ -44,9 +44,9 @@ assert_glibc_preflight_fails() {
   fi
 }
 
-setup_glibc_228() {
+setup_glibc_227() {
   export OPENSHELL_TEST_GETCONF_UNAVAILABLE=1
-  export OPENSHELL_TEST_LDD_OUTPUT="ldd (GNU libc) 2.28"
+  export OPENSHELL_TEST_LDD_OUTPUT="ldd (GNU libc) 2.27"
 }
 
 setup_missing_glibc() {
@@ -64,6 +64,7 @@ setup_ldd_musl() {
   export OPENSHELL_TEST_LDD_OUTPUT="musl libc (x86_64)"
 }
 
+assert_glibc_preflight_passes "glibc 2.28 passes" "glibc 2.28"
 assert_glibc_preflight_passes "glibc 2.31 passes" "glibc 2.31"
 assert_glibc_preflight_passes "glibc 2.35 passes" "ldd (GNU libc) 2.35"
 
@@ -80,23 +81,23 @@ if ! (export OPENSHELL_TEST_LDD_OUTPUT="not ldd" OPENSHELL_TEST_GETCONF_OUTPUT="
 fi
 
 assert_glibc_preflight_fails \
-  "glibc 2.28 fails" \
-  "OpenShell Linux packages require glibc >= 2.31; detected glibc 2.28." \
-  setup_glibc_228
+  "glibc 2.27 fails" \
+  "OpenShell Linux packages require glibc >= 2.28; detected glibc 2.27." \
+  setup_glibc_227
 
 assert_glibc_preflight_fails \
   "missing glibc detection fails" \
-  "OpenShell Linux packages require glibc >= 2.31; could not detect glibc." \
+  "OpenShell Linux packages require glibc >= 2.28; could not detect glibc." \
   setup_missing_glibc
 
 assert_glibc_preflight_fails \
   "musl detection fails" \
-  "OpenShell Linux packages require glibc >= 2.31; detected musl or unsupported libc." \
+  "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_getconf_musl
 
 assert_glibc_preflight_fails \
   "ldd musl fallback fails" \
-  "OpenShell Linux packages require glibc >= 2.31; detected musl or unsupported libc." \
+  "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_ldd_musl
 
 echo "install.sh libc preflight tests passed"

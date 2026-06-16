@@ -44,9 +44,9 @@ disable telemetry in a default (telemetry-enabled) build.
 OpenShell uses different Linux libc environments for different host artifacts.
 The standalone `openshell` CLI is built as a static musl binary so it can run on
 a wide range of Linux distributions without depending on the host's glibc. Host
-runtime binaries that use the GNU/Linux runtime environment, including
-`openshell-gateway` and `openshell-driver-vm`, are GNU-linked and built with a
-glibc 2.31 floor.
+runtime binaries that use the GNU/Linux runtime environment are GNU-linked.
+`openshell-gateway` is built with a glibc 2.28 floor. `openshell-driver-vm`
+continues to use a glibc 2.31 floor.
 
 ## Container Builds
 
@@ -58,7 +58,7 @@ Dockerfile compiles Rust — both copy a staged binary out of
 `deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
 
 Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
-binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.31, including
+binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.28, including
 native-architecture builds, so the gateway image, standalone tarballs, and Linux
 packages share the same host portability floor. Supervisor binaries remain
 static musl and use `cargo zigbuild` when available, including native CPU
@@ -76,8 +76,8 @@ Runtime layout:
 
 - **Gateway**: `gcr.io/distroless/cc-debian13:nonroot` base, GNU-linked binary at
   `/usr/local/bin/openshell-gateway`, runs as UID/GID `1000:1000`. Linux GNU
-  gateway and VM driver binaries must not reference `GLIBC_*` symbols newer than
-  `GLIBC_2.31`; release workflows verify this before publishing artifacts.
+  gateway binaries must not reference `GLIBC_*` symbols newer than
+  `GLIBC_2.28`; release workflows verify this before publishing artifacts.
 - **Supervisor**: `scratch` base, static musl binary at `/openshell-sandbox`.
   Static linkage is required because the image is mounted/extracted into
   sandbox environments (Docker extraction, Podman image volumes, Kubernetes

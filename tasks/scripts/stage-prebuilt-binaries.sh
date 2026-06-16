@@ -165,9 +165,9 @@ build_component_for_arch() {
   if [[ "$component" == "gateway" ]]; then
     if has_cargo_zigbuild; then
       cargo_subcommand=(cargo zigbuild)
-      build_target="${target}.2.31"
+      build_target="${target}.2.28"
     else
-      echo "Error: cargo-zigbuild + zig are required to build ${binary} with the glibc 2.31 floor." >&2
+      echo "Error: cargo-zigbuild + zig are required to build ${binary} with the glibc 2.28 floor." >&2
       exit 1
     fi
   elif [[ "$target_libc" == "musl" ]] && has_cargo_zigbuild; then
