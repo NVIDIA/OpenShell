@@ -7,8 +7,9 @@ name: Rust Image Binary Build (openshell-gateway / openshell-sandbox / openshell
 # consumes them as prebuilt artifacts. Gateway images use GNU-linked binaries
 # for the NVIDIA distroless C/C++ runtime; supervisor and cli images use musl/static
 # binaries so the final image can remain scratch. Gateway GNU binaries are
-# built with an explicit glibc 2.28 floor so image, package, and tarball
-# artifacts share the same host portability contract.
+# built with cargo-zigbuild and the repo-pinned Zig default glibc 2.28 floor
+# so image, package, and tarball artifacts share the same host portability
+# contract.
 
 on:
   workflow_call:
@@ -139,7 +140,7 @@ jobs:
                 zig_target=x86_64-linux-musl
               else
                 target=x86_64-unknown-linux-gnu
-                zig_target=x86_64-unknown-linux-gnu.2.28
+                zig_target=x86_64-unknown-linux-gnu
               fi
               ;;
             arm64)
@@ -148,7 +149,7 @@ jobs:
                 zig_target=aarch64-linux-musl
               else
                 target=aarch64-unknown-linux-gnu
-                zig_target=aarch64-unknown-linux-gnu.2.28
+                zig_target=aarch64-unknown-linux-gnu
               fi
               ;;
             *)

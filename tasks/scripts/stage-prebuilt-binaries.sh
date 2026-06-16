@@ -165,7 +165,10 @@ build_component_for_arch() {
   if [[ "$component" == "gateway" ]]; then
     if has_cargo_zigbuild; then
       cargo_subcommand=(cargo zigbuild)
-      build_target="${target}.2.28"
+      # The repo-pinned Zig 0.14.1 defaults GNU targets to glibc 2.28. The
+      # explicit .2.28 suffix is invalid for Zig's C/C++ wrapper path, so keep
+      # the Rust target bare and rely on verify-glibc-symbols.sh as the guard.
+      build_target="${target}"
     else
       echo "Error: cargo-zigbuild + zig are required to build ${binary} with the glibc 2.28 floor." >&2
       exit 1

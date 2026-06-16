@@ -57,21 +57,22 @@ Dockerfile compiles Rust — both copy a staged binary out of
 `deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
 
 Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
-binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.28, including
-native-architecture builds, so the gateway image, standalone tarballs, and Linux
-packages share the same host portability floor. Linux VM driver release
-artifacts use the same glibc floor so package-managed VM support does not raise
-the package runtime requirement. Supervisor binaries remain
-static musl and use `cargo zigbuild` when available, including native CPU
-architectures, so C dependencies are compiled for the musl target instead of the
-host GNU libc target. Local Docker image tasks infer the target architecture from
-`DOCKER_PLATFORM` when set. Otherwise, they require valid container engine host
-metadata and fail when the engine query is unavailable or reports an unsupported
-architecture, avoiding host-kernel fallbacks that can target the wrong
-architecture. CI invokes the same staging step via the `rust-native-build.yml`
-workflow (per-architecture, per-component) and uploads the result as an artifact
-that the image build job downloads back into the staging directory before running
-Buildx.
+binaries use `cargo zigbuild` with bare GNU targets. The repo-pinned Zig 0.14.1
+default for GNU targets is glibc 2.28, so the gateway image, standalone
+tarballs, and Linux packages share the same host portability floor. Linux VM
+driver release artifacts use the same glibc floor so package-managed VM support
+does not raise the package runtime requirement. Release workflows verify the
+maximum referenced `GLIBC_*` symbol version before publishing artifacts.
+Supervisor binaries remain static musl and use `cargo zigbuild` when available,
+including native CPU architectures, so C dependencies are compiled for the musl
+target instead of the host GNU libc target. Local Docker image tasks infer the
+target architecture from `DOCKER_PLATFORM` when set. Otherwise, they require
+valid container engine host metadata and fail when the engine query is
+unavailable or reports an unsupported architecture, avoiding host-kernel
+fallbacks that can target the wrong architecture. CI invokes the same staging
+step via the `rust-native-build.yml` workflow (per-architecture, per-component)
+and uploads the result as an artifact that the image build job downloads back
+into the staging directory before running Buildx.
 
 Runtime layout:
 
