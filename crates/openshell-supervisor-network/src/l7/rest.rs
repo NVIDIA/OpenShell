@@ -1646,6 +1646,7 @@ where
     let header_str = String::from_utf8_lossy(&buf[..header_end]);
     let status_code = parse_status_code(&header_str).unwrap_or(200);
     let server_wants_close = parse_connection_close(&header_str);
+    let event_stream = response_is_event_stream(&header_str);
     let body_length = parse_body_length(&header_str)?;
 
     debug!(
@@ -1705,17 +1706,23 @@ where
     // No explicit framing (no Content-Length, no Transfer-Encoding).
     // Per RFC 7230 §3.3.3 the body is delimited by connection close.
     if matches!(body_length, BodyLength::None) {
-        if server_wants_close {
-            // Server indicated it will close — read until EOF.
+        if server_wants_close || event_stream {
+            // Server indicated it will close, or this is a streaming response
+            // such as SSE where the body is intentionally delimited by EOF.
             let before_end = &buf[..header_end - 2];
             client.write_all(before_end).await.into_diagnostic()?;
-            client
-                .write_all(b"Connection: close\r\n\r\n")
-                .await
-                .into_diagnostic()?;
+            if server_wants_close {
+                client
+                    .write_all(b"Connection: close\r\n\r\n")
+                    .await
+                    .into_diagnostic()?;
+            } else {
+                client.write_all(b"\r\n").await.into_diagnostic()?;
+            }
             let overflow = &buf[header_end..];
             if !overflow.is_empty() {
                 client.write_all(overflow).await.into_diagnostic()?;
+                client.flush().await.into_diagnostic()?;
             }
             relay_until_eof(upstream, client).await?;
             client.flush().await.into_diagnostic()?;
@@ -1785,6 +1792,19 @@ fn parse_connection_close(headers: &str) -> bool {
         }
     }
     false
+}
+
+fn response_is_event_stream(headers: &str) -> bool {
+    headers.lines().skip(1).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        let Some(value) = lower.strip_prefix("content-type:") else {
+            return false;
+        };
+        value
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim() == "text/event-stream")
+    })
 }
 
 fn validate_websocket_response(
@@ -1991,7 +2011,10 @@ where
     loop {
         match tokio::time::timeout(RELAY_EOF_IDLE_TIMEOUT, reader.read(&mut buf)).await {
             Ok(Ok(0)) => return Ok(()),
-            Ok(Ok(n)) => writer.write_all(&buf[..n]).await.into_diagnostic()?,
+            Ok(Ok(n)) => {
+                writer.write_all(&buf[..n]).await.into_diagnostic()?;
+                writer.flush().await.into_diagnostic()?;
+            }
             Ok(Err(e)) => return Err(miette::miette!("{e}")),
             Err(_) => {
                 debug!(
@@ -3029,6 +3052,19 @@ mod tests {
     }
 
     #[test]
+    fn test_response_is_event_stream() {
+        assert!(response_is_event_stream(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+        ));
+        assert!(response_is_event_stream(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\n\r\n"
+        ));
+        assert!(!response_is_event_stream(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+        ));
+    }
+
+    #[test]
     fn test_is_bodiless_response() {
         assert!(is_bodiless_response("HEAD", 200));
         assert!(is_bodiless_response("GET", 100));
@@ -3083,6 +3119,45 @@ mod tests {
             received_str.contains("hello world"),
             "body should be forwarded"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_response_no_framing_event_stream_reads_until_eof() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: message\ndata: {}\r\n\r\n";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+            upstream_write.shutdown().await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
+        )
+        .await
+        .expect("relay_response should not deadlock");
+
+        let outcome = result.expect("relay_response should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Consumed),
+            "event stream is consumed by read-until-EOF"
+        );
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received_str = String::from_utf8_lossy(&received);
+        assert!(received_str.contains("Content-Type: text/event-stream"));
+        assert!(received_str.contains("event: message"));
     }
 
     #[tokio::test]
