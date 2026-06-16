@@ -132,10 +132,10 @@ Update an existing custom profile by exporting the current custom profile, editi
 
 ```shell
 openshell provider profile export github-profile -o yaml > github-profile.yaml
-openshell provider profile update -f github-profile.yaml
+openshell provider profile update github-profile -f github-profile.yaml
 ```
 
-Exported custom profiles include `resource_version`. OpenShell requires that version during update so stale files cannot silently overwrite newer profile definitions. Update accepts one file at a time. If an update would make dynamic token grants ambiguous for an attached sandbox, OpenShell rejects it before changing the profile.
+Exported custom profiles include `resource_version`. OpenShell requires that version during update so stale files cannot silently overwrite newer profile definitions. The target ID in the command must match the profile ID in the file. Update accepts one file at a time. If an update would make dynamic token grants ambiguous for an attached sandbox, OpenShell rejects it before changing the profile.
 
 Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in profiles are read-only, and OpenShell rejects updating or deleting a built-in profile. OpenShell also rejects deleting a custom profile while a sandbox-attached provider uses it.
 

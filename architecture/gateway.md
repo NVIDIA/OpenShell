@@ -250,15 +250,18 @@ rely entirely on CAS without a Mutex.
 The `resource_version` is surfaced to clients through `ObjectMeta` in proto
 responses. Provider profiles are the exception: custom profile get/list/export
 responses copy the stored version onto the profile payload so exported YAML can
-carry the expected version for safe single-profile updates. Database migrations
-backfill existing rows with version 1.
+carry the expected version for safe single-profile updates. Profile update
+requests also carry an explicit target profile ID; the payload ID must match the
+target so an edited export cannot overwrite a different profile. Database
+migrations backfill existing rows with version 1.
 
-Provider profile imports and updates hold the sandbox synchronization guard while
-checking attached-sandbox dynamic token grant ambiguity and writing the profile.
-Sandbox creation with initial providers and sandbox provider attach/detach use
-the same guard, so one gateway process cannot interleave a profile mutation with
-a sandbox provider-set mutation that would leave an ambiguous final dynamic-token
-state.
+Provider profile imports, updates, and deletes hold the sandbox synchronization
+guard while checking attached-sandbox dynamic token grant ambiguity or in-use
+state and writing the profile record. Sandbox creation with initial providers and
+sandbox provider attach/detach use the same guard, so one gateway process cannot
+interleave a profile mutation with a sandbox provider-set mutation that would
+leave an ambiguous final dynamic-token state or a deleted custom profile that is
+still referenced by a sandbox.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The

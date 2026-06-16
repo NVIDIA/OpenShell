@@ -933,6 +933,9 @@ enum ProviderProfileCommands {
     /// Update an existing custom provider profile from a file.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
+        /// Existing provider profile id to update.
+        id: String,
+
         /// Profile file to update.
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
         file: PathBuf,
@@ -2935,8 +2938,8 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     }
-                    ProviderProfileCommands::Update { file } => {
-                        run::provider_profile_update(endpoint, &file, &tls).await?;
+                    ProviderProfileCommands::Update { id, file } => {
+                        run::provider_profile_update(endpoint, &id, &file, &tls).await?;
                     }
                     ProviderProfileCommands::Lint { file, from } => {
                         run::provider_profile_lint(
@@ -3781,6 +3784,7 @@ mod tests {
             "provider",
             "profile",
             "update",
+            "custom-api",
             "-f",
             "./profiles/custom-api.yaml",
         ])
@@ -3789,9 +3793,10 @@ mod tests {
             update.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::Profile(ProviderProfileCommands::Update {
+                    id,
                     file: _
                 }))
-            })
+            }) if id == "custom-api"
         ));
 
         let delete =

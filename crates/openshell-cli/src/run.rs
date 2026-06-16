@@ -5032,7 +5032,12 @@ pub async fn provider_profile_import(
     Err(miette!("provider profile import failed"))
 }
 
-pub async fn provider_profile_update(server: &str, file: &Path, tls: &TlsOptions) -> Result<()> {
+pub async fn provider_profile_update(
+    server: &str,
+    id: &str,
+    file: &Path,
+    tls: &TlsOptions,
+) -> Result<()> {
     let (mut items, mut diagnostics) = load_profile_import_items(Some(file), None)?;
     if items.is_empty() && diagnostics.is_empty() {
         return Err(miette!("no provider profile files found"));
@@ -5052,6 +5057,7 @@ pub async fn provider_profile_update(server: &str, file: &Path, tls: &TlsOptions
             .update_provider_profiles(UpdateProviderProfilesRequest {
                 profile: Some(item),
                 expected_resource_version,
+                id: id.to_string(),
             })
             .await
             .into_diagnostic()?

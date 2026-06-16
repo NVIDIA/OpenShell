@@ -80,13 +80,14 @@ binaries, or credential metadata, and preserving the exported `resource_version`
 
 ```shell
 openshell provider profile export my-api -o yaml > my-api-profile.yaml
-openshell provider profile update -f my-api-profile.yaml
+openshell provider profile update my-api -f my-api-profile.yaml
 ```
 
 Import remains create-only and fails if the profile ID already exists. Use
-`provider profile update` for existing custom profiles. Built-in profiles are
-read-only. Update accepts one file at a time and rejects stale resource versions.
-When `providers_v2_enabled=true`, updated profile policy applies to all provider
+`provider profile update <id>` for existing custom profiles. Built-in profiles are
+read-only. The target ID must match the profile ID in the file. Update accepts
+one file at a time and rejects stale resource versions. When
+`providers_v2_enabled=true`, updated profile policy applies to all provider
 instances of that type on the next sandbox config sync.
 
 ## Manage Providers

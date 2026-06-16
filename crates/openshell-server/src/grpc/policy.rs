@@ -4884,6 +4884,7 @@ mod tests {
                     source: "custom-policy.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
+                id: "custom-policy".to_string(),
             })),
         )
         .await
@@ -5169,6 +5170,7 @@ mod tests {
                     source: "custom-token.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
+                id: "custom-token".to_string(),
             })),
         )
         .await

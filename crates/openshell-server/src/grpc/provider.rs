@@ -1356,7 +1356,10 @@ pub(super) async fn handle_update_provider_profiles(
     let items = request.profile.into_iter().collect::<Vec<_>>();
     let (profiles, mut diagnostics) = profiles_from_import_items(&items);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
-    diagnostics.extend(profile_update_target_diagnostics(state.store.as_ref(), &profiles).await?);
+    let target_id = normalize_profile_id_request(&request.id)?;
+    diagnostics.extend(
+        profile_update_target_diagnostics(state.store.as_ref(), &profiles, &target_id).await?,
+    );
     diagnostics.extend(validate_profile_set(&profiles));
     let expected_resource_version = if request.expected_resource_version != 0 {
         Some(request.expected_resource_version)
@@ -1400,11 +1403,9 @@ pub(super) async fn handle_update_provider_profiles(
         .into_iter()
         .next()
         .ok_or_else(|| Status::internal("validated provider profile update is missing"))?;
-    let id = normalize_profile_id(&profile.id)
-        .ok_or_else(|| Status::internal("validated provider profile id is invalid"))?;
     let mut stored = state
         .store
-        .get_message_by_name::<StoredProviderProfile>(&id)
+        .get_message_by_name::<StoredProviderProfile>(&target_id)
         .await
         .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider profile not found"))?;
@@ -1481,6 +1482,7 @@ pub(super) async fn handle_delete_provider_profile(
         ));
     }
 
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let existing = state
         .store
         .get_message_by_name::<StoredProviderProfile>(&id)
@@ -1705,8 +1707,49 @@ async fn profile_conflict_diagnostics(
 async fn profile_update_target_diagnostics(
     store: &Store,
     profiles: &[(String, ProviderTypeProfile)],
+    target_id: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
     let mut diagnostics = Vec::new();
+    if profiles.len() == 1 {
+        let (source, profile) = &profiles[0];
+        if let Some(payload_id) = normalize_profile_id(&profile.id)
+            && payload_id != target_id
+        {
+            diagnostics.push(ProfileValidationDiagnostic {
+                source: source.clone(),
+                profile_id: profile.id.clone(),
+                field: "id".to_string(),
+                message: format!(
+                    "provider profile update target '{target_id}' does not match payload id '{payload_id}'"
+                ),
+                severity: "error".to_string(),
+            });
+        }
+    }
+    if get_default_profile(target_id).is_some() {
+        diagnostics.push(ProfileValidationDiagnostic {
+            source: target_id.to_string(),
+            profile_id: target_id.to_string(),
+            field: "id".to_string(),
+            message: format!("provider profile '{target_id}' is built-in and cannot be updated"),
+            severity: "error".to_string(),
+        });
+        return Ok(diagnostics);
+    }
+    if store
+        .get_message_by_name::<StoredProviderProfile>(target_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
+        .is_none()
+    {
+        diagnostics.push(ProfileValidationDiagnostic {
+            source: target_id.to_string(),
+            profile_id: target_id.to_string(),
+            field: "id".to_string(),
+            message: format!("custom provider profile '{target_id}' does not exist"),
+            severity: "error".to_string(),
+        });
+    }
     for (source, profile) in profiles {
         let Some(id) = normalize_profile_id(&profile.id) else {
             continue;
@@ -1717,21 +1760,6 @@ async fn profile_update_target_diagnostics(
                 profile_id: id.clone(),
                 field: "id".to_string(),
                 message: format!("provider profile '{id}' is built-in and cannot be updated"),
-                severity: "error".to_string(),
-            });
-            continue;
-        }
-        if store
-            .get_message_by_name::<StoredProviderProfile>(&id)
-            .await
-            .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
-            .is_none()
-        {
-            diagnostics.push(ProfileValidationDiagnostic {
-                source: source.clone(),
-                profile_id: id.clone(),
-                field: "id".to_string(),
-                message: format!("custom provider profile '{id}' does not exist"),
                 severity: "error".to_string(),
             });
         }
@@ -2727,6 +2755,7 @@ mod tests {
                     source: "custom-api.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
+                id: "custom-api".to_string(),
             }),
         )
         .await
@@ -2770,6 +2799,7 @@ mod tests {
                     source: "github.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
+                id: "github".to_string(),
             }),
         )
         .await
@@ -2790,6 +2820,7 @@ mod tests {
                     source: "missing-custom.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
+                id: "missing-custom".to_string(),
             }),
         )
         .await
@@ -2820,6 +2851,7 @@ mod tests {
                     source: "custom-api.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
+                id: "custom-api".to_string(),
             }),
         )
         .await
@@ -2841,12 +2873,75 @@ mod tests {
                     source: "custom-api.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
+                id: "custom-api".to_string(),
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(stale_error.code(), Code::Aborted);
         assert!(stale_error.message().contains("resource_version"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_profile_rejects_payload_id_change() {
+        let state = test_server_state().await;
+        let mut profile_a = custom_profile("profile-a");
+        profile_a.display_name = "Profile A".to_string();
+        let mut profile_b = custom_profile("profile-b");
+        profile_b.display_name = "Profile B".to_string();
+        state
+            .store
+            .put_message(&stored_provider_profile(profile_a))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&stored_provider_profile(profile_b))
+            .await
+            .unwrap();
+        let profile_a_version = state
+            .store
+            .get_message_by_name::<StoredProviderProfile>("profile-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .resource_version;
+
+        let mut edited_payload = custom_profile("profile-b");
+        edited_payload.resource_version = profile_a_version;
+        edited_payload.display_name = "Wrong overwrite".to_string();
+        let response = handle_update_provider_profiles(
+            &state,
+            Request::new(UpdateProviderProfilesRequest {
+                profile: Some(ProviderProfileImportItem {
+                    profile: Some(edited_payload),
+                    source: "profile-a.yaml".to_string(),
+                }),
+                expected_resource_version: 0,
+                id: "profile-a".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.updated);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "id"
+                && diagnostic
+                    .message
+                    .contains("does not match payload id 'profile-b'")
+        }));
+        let stored_b: StoredProviderProfile = state
+            .store
+            .get_message_by_name("profile-b")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_b.profile.unwrap().display_name, "Profile B");
     }
 
     #[tokio::test]
@@ -2905,6 +3000,7 @@ mod tests {
                     source: "grant-updated.yaml".to_string(),
                 }),
                 expected_resource_version: 0,
+                id: "grant-updated".to_string(),
             }),
         )
         .await
@@ -4162,6 +4258,43 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(missing.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn delete_provider_profile_waits_for_sandbox_sync_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&stored_provider_profile(custom_profile("guarded-delete")))
+            .await
+            .unwrap();
+
+        let guard = state.compute.sandbox_sync_guard().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            handle_delete_provider_profile(
+                &task_state,
+                Request::new(DeleteProviderProfileRequest {
+                    id: "guarded-delete".to_string(),
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "profile delete should wait for sandbox sync guard"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("delete should finish after guard release")
+            .expect("join delete task")
+            .expect("delete should succeed")
+            .into_inner();
+        assert!(response.deleted);
     }
 
     #[tokio::test]

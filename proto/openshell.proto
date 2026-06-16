@@ -1121,6 +1121,8 @@ message UpdateProviderProfilesRequest {
   // Updates without a non-zero version are rejected to prevent stale files from
   // silently overwriting newer profile definitions.
   uint64 expected_resource_version = 2;
+  // Existing custom provider profile ID to update. The payload ID must match.
+  string id = 3;
 }
 
 // Update one custom provider profile response.

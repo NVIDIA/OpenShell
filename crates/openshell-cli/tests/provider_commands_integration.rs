@@ -482,14 +482,33 @@ impl OpenShell for TestOpenShell {
             .profile
             .and_then(|item| item.profile)
             .ok_or_else(|| Status::invalid_argument("provider profile is required"))?;
-        let Some(current) = profiles.get(&profile.id) else {
+        let target_id = request.id;
+        if target_id != profile.id {
             return Ok(Response::new(
                 openshell_core::proto::UpdateProviderProfilesResponse {
                     diagnostics: vec![openshell_core::proto::ProviderProfileDiagnostic {
-                        source: profile.id.clone(),
+                        source: target_id.clone(),
                         profile_id: profile.id.clone(),
                         field: "id".to_string(),
-                        message: format!("custom provider profile '{}' does not exist", profile.id),
+                        message: format!(
+                            "provider profile update target '{}' does not match payload id '{}'",
+                            target_id, profile.id
+                        ),
+                        severity: "error".to_string(),
+                    }],
+                    profile: None,
+                    updated: false,
+                },
+            ));
+        }
+        let Some(current) = profiles.get(&target_id) else {
+            return Ok(Response::new(
+                openshell_core::proto::UpdateProviderProfilesResponse {
+                    diagnostics: vec![openshell_core::proto::ProviderProfileDiagnostic {
+                        source: target_id.clone(),
+                        profile_id: target_id.clone(),
+                        field: "id".to_string(),
+                        message: format!("custom provider profile '{target_id}' does not exist"),
                         severity: "error".to_string(),
                     }],
                     profile: None,
@@ -1429,7 +1448,7 @@ binaries: [/usr/bin/custom]
         )
         .replace("host: api.custom.example", "host: api.updated.example");
     std::fs::write(&profile_path, updated_yaml).unwrap();
-    run::provider_profile_update(&ts.endpoint, &profile_path, &ts.tls)
+    run::provider_profile_update(&ts.endpoint, "custom-api", &profile_path, &ts.tls)
         .await
         .expect("profile update");
     assert_eq!(
