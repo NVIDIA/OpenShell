@@ -526,6 +526,57 @@ providers_v2_enabled = true
     }
 
     #[tokio::test]
+    async fn apply_file_overrides_only_keys_defined_in_runtime_config() {
+        let mut tmp = tempfile::Builder::new()
+            .suffix(".toml")
+            .tempfile()
+            .expect("tempfile");
+        tmp.write_all(
+            br"
+[openshell.runtime.settings]
+providers_v2_enabled = true
+",
+        )
+        .expect("write runtime config");
+
+        let store = test_store().await;
+        let settings_mutex = Mutex::new(());
+        let runtime_state = RuntimeSettingsState::default();
+
+        let mut existing = StoredSettings::default();
+        existing.settings.insert(
+            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            StoredSettingValue::Bool(false),
+        );
+        existing.settings.insert(
+            "ocsf_json_enabled".to_string(),
+            StoredSettingValue::Bool(true),
+        );
+        existing.revision = 3;
+        save_global_settings(&store, &existing).await.unwrap();
+
+        let outcome = apply_file(tmp.path(), &store, &settings_mutex, &runtime_state)
+            .await
+            .expect("apply runtime config");
+        assert!(outcome.changed);
+        assert_eq!(outcome.revision, 4);
+        assert!(runtime_state.is_managed_key(settings::PROVIDERS_V2_ENABLED_KEY));
+        assert!(!runtime_state.is_managed_key("ocsf_json_enabled"));
+
+        let loaded = load_global_settings(&store).await.unwrap();
+        assert_eq!(
+            loaded.settings.get(settings::PROVIDERS_V2_ENABLED_KEY),
+            Some(&StoredSettingValue::Bool(true)),
+            "key defined in runtime config must override the stored global value"
+        );
+        assert_eq!(
+            loaded.settings.get("ocsf_json_enabled"),
+            Some(&StoredSettingValue::Bool(true)),
+            "key omitted from runtime config must keep its stored global value"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_file_updates_managed_keys_when_file_removes_a_key() {
         let store = test_store().await;
         let settings_mutex = Mutex::new(());
@@ -563,6 +614,56 @@ providers_v2_enabled = true
             loaded.settings.get("ocsf_json_enabled"),
             Some(&StoredSettingValue::Bool(true)),
             "removing a key from the file must not delete the last persisted global value"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_file_propagates_added_runtime_key_as_authoritative() {
+        let store = test_store().await;
+        let settings_mutex = Mutex::new(());
+        let runtime_state = RuntimeSettingsState::default();
+
+        let mut existing = StoredSettings::default();
+        existing.settings.insert(
+            "ocsf_json_enabled".to_string(),
+            StoredSettingValue::Bool(false),
+        );
+        existing.revision = 9;
+        save_global_settings(&store, &existing).await.unwrap();
+
+        let path = Path::new("/runtime.toml");
+        let first = parse_test(
+            r"
+[openshell.runtime.settings]
+providers_v2_enabled = true
+",
+        )
+        .unwrap();
+        apply_document(path, first, &store, &settings_mutex, &runtime_state)
+            .await
+            .unwrap();
+        assert!(!runtime_state.is_managed_key("ocsf_json_enabled"));
+
+        let second = parse_test(
+            r"
+[openshell.runtime.settings]
+providers_v2_enabled = true
+ocsf_json_enabled = true
+",
+        )
+        .unwrap();
+        let outcome = apply_document(path, second, &store, &settings_mutex, &runtime_state)
+            .await
+            .unwrap();
+        assert!(outcome.changed);
+        assert_eq!(outcome.revision, 11);
+        assert!(runtime_state.is_managed_key("ocsf_json_enabled"));
+
+        let loaded = load_global_settings(&store).await.unwrap();
+        assert_eq!(
+            loaded.settings.get("ocsf_json_enabled"),
+            Some(&StoredSettingValue::Bool(true)),
+            "adding a key to the runtime config file must persist and publish that file value"
         );
     }
 
