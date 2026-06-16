@@ -237,6 +237,7 @@ All implementation work is human-gated — agents propose plans, humans approve,
 - [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
 - [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
 - [Roadmap](https://github.com/orgs/NVIDIA/projects/233) — planned work and project priorities
+- [RFC Board](https://github.com/orgs/NVIDIA/projects/233/views/6) — accepted RFCs tracked on the OpenShell Roadmap with the `rfc` label
 - [Support Matrix](https://docs.nvidia.com/openshell/latest/reference/support-matrix) — platforms, versions, and kernel requirements
 - [Brev Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg) — try OpenShell on cloud compute without local setup
 - [Agent Instructions](AGENTS.md) — system prompt and workflow documentation for agent contributors

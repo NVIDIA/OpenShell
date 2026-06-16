@@ -132,6 +132,8 @@ RFCs rarely go through this process unchanged. Make edits as new commits to the 
 
 After there has been time for folks to comment, the RFC author requests merge and a maintainer approves and merges. The state should be updated from `review` to `accepted`. If the proposal is declined, the state should be set to `rejected`. The timing is left to the author's discretion. As a guideline, a few business days seems reasonable, but circumstances may dictate a different timeline.
 
+When an RFC is accepted, maintainers track it in the OpenShell Roadmap GitHub project and add the `rfc` label so it appears on the [RFC board](https://github.com/orgs/NVIDIA/projects/233/views/6).
+
 In general, RFCs shouldn't be merged if no one else has read or commented on it. If no one is reading your RFC, it's time to explicitly ask someone to give it a read!
 
 ### 7. Implementation
