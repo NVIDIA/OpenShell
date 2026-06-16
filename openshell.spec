@@ -68,6 +68,7 @@ LLM inference routing.
 Summary:        OpenShell gateway server with Podman sandbox driver
 Requires:       podman
 Requires:       openssl
+Requires:       z3-libs
 Requires:       %{name} = %{version}-%{release}
 
 %description gateway

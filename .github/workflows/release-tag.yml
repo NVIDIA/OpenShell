@@ -420,11 +420,11 @@ jobs:
           - arch: amd64
             runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
-            zig_target: x86_64-unknown-linux-gnu
+            zig_target: x86_64-unknown-linux-gnu.2.28
           - arch: arm64
             runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
-            zig_target: aarch64-unknown-linux-gnu
+            zig_target: aarch64-unknown-linux-gnu.2.28
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     container:
@@ -469,7 +469,7 @@ jobs:
         run: |
           set -euo pipefail
           mise x -- rustup target add ${{ matrix.target }}
-          mise x -- cargo zigbuild --release --target ${{ matrix.zig_target }} -p openshell-server --bin openshell-gateway --features bundled-z3
+          mise x -- cargo zigbuild --release --target ${{ matrix.zig_target }} -p openshell-server --bin openshell-gateway
           mkdir -p artifacts/bin
           install -m 0755 target/${{ matrix.target }}/release/openshell-gateway artifacts/bin/openshell-gateway
 
@@ -480,8 +480,8 @@ jobs:
           echo "$OUTPUT"
           grep -q '^openshell-gateway ' <<<"$OUTPUT"
           ldd artifacts/bin/openshell-gateway || true
-          if ldd artifacts/bin/openshell-gateway | grep -q 'libz3'; then
-            echo "gateway binary must not depend on shared libz3; build with bundled-z3" >&2
+          if ! ldd artifacts/bin/openshell-gateway | grep -q 'libz3'; then
+            echo "gateway binary must link shared libz3; do not build with bundled-z3" >&2
             exit 1
           fi
 
@@ -782,10 +782,12 @@ jobs:
         if: matrix.kind == 'binary'
         run: |
           set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends libz3-4
           mkdir -p smoke-bin
           tar -xzf smoke-input/openshell-gateway-${{ matrix.target }}.tar.gz -C smoke-bin
           tar -xzf smoke-input/openshell-driver-vm-${{ matrix.target }}.tar.gz -C smoke-bin
-          smoke-bin/openshell-gateway --version
+          LD_BIND_NOW=1 smoke-bin/openshell-gateway --version
           smoke-bin/openshell-driver-vm --version
 
       - name: Download Debian package artifact
@@ -801,7 +803,7 @@ jobs:
           set -euo pipefail
           apt-get update
           apt-get install -y --no-install-recommends ./package-input/*.deb
-          openshell-gateway --version
+          LD_BIND_NOW=1 openshell-gateway --version
           /usr/libexec/openshell/openshell-driver-vm --version
 
       - name: Download RPM package artifacts
@@ -816,7 +818,7 @@ jobs:
         run: |
           set -euo pipefail
           dnf install -y ./package-input/openshell-[0-9]*.rpm ./package-input/openshell-gateway-*.rpm
-          openshell-gateway --version
+          LD_BIND_NOW=1 openshell-gateway --version
 
   # ---------------------------------------------------------------------------
   # Create a tagged GitHub Release with CLI, gateway, driver, and wheels

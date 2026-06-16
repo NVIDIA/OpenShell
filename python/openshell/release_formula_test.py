@@ -51,6 +51,7 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
         "v0.0.10/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
     ) in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
+    assert 'depends_on "z3"' in formula
     assert "OPENSHELL_DRIVERS: " not in formula
     assert 'OPENSHELL_GATEWAY_CONFIG: "#{var}/openshell/gateway.toml"' not in formula
     assert "init-gateway-config.sh" not in formula

@@ -153,9 +153,6 @@ build_component_for_arch() {
   target="$(target_triple "$arch" "$target_libc")"
   stage="${ROOT}/deploy/docker/.build/prebuilt-binaries/${arch}"
   features="${EXTRA_CARGO_FEATURES:-openshell-core/dev-settings}"
-  if [[ "$component" == "gateway" && " ${features} " != *" bundled-z3 "* ]]; then
-    features="${features} bundled-z3"
-  fi
   current_host_os="$(host_os)"
   current_host_arch="$(host_arch)"
 
@@ -165,10 +162,7 @@ build_component_for_arch() {
   if [[ "$component" == "gateway" ]]; then
     if has_cargo_zigbuild; then
       cargo_subcommand=(cargo zigbuild)
-      # The repo-pinned Zig 0.14.1 defaults GNU targets to glibc 2.28. The
-      # explicit .2.28 suffix is invalid for Zig's C/C++ wrapper path, so keep
-      # the Rust target bare and rely on verify-glibc-symbols.sh as the guard.
-      build_target="${target}"
+      build_target="${target}.2.28"
     else
       echo "Error: cargo-zigbuild + zig are required to build ${binary} with the glibc 2.28 floor." >&2
       exit 1
