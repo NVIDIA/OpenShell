@@ -58,12 +58,24 @@ trap 'rm -f "${POLICY_FILE}"' EXIT
 CLIENT_SERVER_URL="$(python3 "${ROOT}/e2e/mcp-conformance/render-policy.py" "${SERVER_URL}" "${POLICY_FILE}" "${POLICY_TEMPLATE}")"
 
 ENV_ARGS=()
+CLIENT_SCENARIO="${MCP_CONFORMANCE_SCENARIO:-}"
+case "${CLIENT_SCENARIO}" in
+  elicitation-sep1034-client-defaults)
+    CLIENT_SCENARIO="elicitation-defaults"
+    ;;
+  sse-retry)
+    CLIENT_SCENARIO="tools_call"
+    ;;
+esac
+
 # These environment variables are set by the upstream conformance test runner
 # before it invokes the configured client command. Forward them into the
 # sandbox because the sandboxed TypeScript client depends on them to select the
 # scenario and read scenario-specific context.
 for NAME in MCP_CONFORMANCE_SCENARIO MCP_CONFORMANCE_CONTEXT MCP_CONFORMANCE_PROTOCOL_VERSION; do
-  if [ -n "${!NAME+x}" ]; then
+  if [ "${NAME}" = "MCP_CONFORMANCE_SCENARIO" ] && [ -n "${CLIENT_SCENARIO}" ]; then
+    ENV_ARGS+=(--env "MCP_CONFORMANCE_SCENARIO=${CLIENT_SCENARIO}")
+  elif [ -n "${!NAME+x}" ]; then
     ENV_ARGS+=(--env "${NAME}=${!NAME}")
   fi
 done

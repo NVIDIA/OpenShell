@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Add client scenarios here when enabling broader MCP conformance suites that
-# exercise features OpenShell does not yet support through the JSON-RPC proxy.
-client: []
+# currently fail in the pinned upstream example client or through OpenShell.
+client:
+  - elicitation-sep1034-client-defaults
+  - sse-retry
 server: []

@@ -2003,6 +2003,28 @@ process:
         })
     }
 
+    fn l7_jsonrpc_response_input(host: &str, port: u16, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "network": { "host": host, "port": port },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "POST",
+                "path": path,
+                "query_params": {},
+                "jsonrpc": {
+                    "method": null,
+                    "params": {},
+                    "has_response": true,
+                    "error": null
+                }
+            }
+        })
+    }
+
     fn l7_graphql_input(host: &str, operations: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "network": { "host": host, "port": 443 },
@@ -2674,6 +2696,92 @@ network_policies:
         assert!(eval_l7(&engine, &allow_input));
 
         let deny_input = l7_jsonrpc_input("mcp.proto.com", 8000, "/mcp", "tools/list");
+        assert!(!eval_l7(&engine, &deny_input));
+    }
+
+    #[test]
+    fn l7_jsonrpc_receive_stream_get_is_allowed_for_matching_endpoint() {
+        let data = r#"
+network_policies:
+  jsonrpc_stream:
+    name: jsonrpc_stream
+    endpoints:
+      - host: mcp.stream.test
+        port: 8000
+        path: /mcp
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow:
+              rpc_method: initialize
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+        let allow_input = serde_json::json!({
+            "network": { "host": "mcp.stream.test", "port": 8000 },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "GET",
+                "path": "/mcp",
+                "query_params": {},
+                "jsonrpc": {
+                    "method": null,
+                    "params": {},
+                    "error": null
+                }
+            }
+        });
+        assert!(eval_l7(&engine, &allow_input));
+
+        let deny_input = serde_json::json!({
+            "network": { "host": "mcp.stream.test", "port": 8000 },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "GET",
+                "path": "/other",
+                "query_params": {},
+                "jsonrpc": {
+                    "method": null,
+                    "params": {},
+                    "error": null
+                }
+            }
+        });
+        assert!(!eval_l7(&engine, &deny_input));
+    }
+
+    #[test]
+    fn l7_jsonrpc_response_post_is_allowed_for_matching_endpoint() {
+        let data = r#"
+network_policies:
+  jsonrpc_response:
+    name: jsonrpc_response
+    endpoints:
+      - host: mcp.response.test
+        port: 8000
+        path: /mcp
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow:
+              rpc_method: initialize
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+        let allow_input = l7_jsonrpc_response_input("mcp.response.test", 8000, "/mcp");
+        assert!(eval_l7(&engine, &allow_input));
+
+        let deny_input = l7_jsonrpc_response_input("mcp.response.test", 8000, "/other");
         assert!(!eval_l7(&engine, &deny_input));
     }
 

@@ -33,6 +33,11 @@ boundary while allowing the upstream scenarios to exercise MCP behavior. The
 policy body lives in `policy-template.yaml`; the wrapper renders its host, port,
 and path placeholders from the upstream server URL.
 
+The upstream `everything-client` has a few handler names that do not line up
+with released-spec scenario names. The wrapper maps those names when forwarding
+`MCP_CONFORMANCE_SCENARIO` into the sandbox, but it does not patch the upstream
+checkout.
+
 When enabling broader upstream suites, add scenarios that OpenShell does not yet
 support through the JSON-RPC proxy to `expected-failures.yml`. The upstream
 runner treats listed failures as allowed and treats stale entries as failures.

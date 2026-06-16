@@ -3595,39 +3595,44 @@ async fn handle_forward_proxy(
                 raw_header: forward_request_bytes,
                 body_length,
             };
-            let body = match crate::l7::http::read_body_for_inspection(
-                client,
-                &mut jsonrpc_request,
-                l7_config.config.json_rpc_max_body_bytes,
-            )
-            .await
-            {
-                Ok(body) => body,
-                Err(e) => {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .message(format!("FORWARD_JSONRPC_L7 request rejected: {e}"))
-                        .build();
-                    ocsf_emit!(event);
-                    emit_activity_simple(activity_tx, true, "l7_parse_rejection");
-                    respond(
-                        client,
-                        &build_json_error_response(
-                            400,
-                            "Bad Request",
-                            "invalid_jsonrpc_request",
-                            &format!("JSON-RPC request rejected before policy evaluation: {e}"),
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
-            forward_request_bytes = jsonrpc_request.raw_header;
-            Some(crate::l7::jsonrpc::parse_jsonrpc_body(&body))
+            if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&jsonrpc_request) {
+                forward_request_bytes = jsonrpc_request.raw_header;
+                Some(crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream())
+            } else {
+                let body = match crate::l7::http::read_body_for_inspection(
+                    client,
+                    &mut jsonrpc_request,
+                    l7_config.config.json_rpc_max_body_bytes,
+                )
+                .await
+                {
+                    Ok(body) => body,
+                    Err(e) => {
+                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                            .message(format!("FORWARD_JSONRPC_L7 request rejected: {e}"))
+                            .build();
+                        ocsf_emit!(event);
+                        emit_activity_simple(activity_tx, true, "l7_parse_rejection");
+                        respond(
+                            client,
+                            &build_json_error_response(
+                                400,
+                                "Bad Request",
+                                "invalid_jsonrpc_request",
+                                &format!("JSON-RPC request rejected before policy evaluation: {e}"),
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                forward_request_bytes = jsonrpc_request.raw_header;
+                Some(crate::l7::jsonrpc::parse_jsonrpc_body(&body))
+            }
         } else {
             None
         };
@@ -4514,6 +4519,7 @@ network_policies:
             jsonrpc: Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
                 calls: Vec::new(),
                 is_batch: false,
+                has_response: false,
                 error: Some("ambiguous dotted params key 'arguments.scope'".to_string()),
             }),
         };

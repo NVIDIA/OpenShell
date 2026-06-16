@@ -435,6 +435,28 @@ request_allowed_for_endpoint(request, endpoint) if {
 	jsonrpc_rule_matches(request, rule.allow)
 }
 
+# MCP Streamable HTTP uses GET on the JSON-RPC endpoint as a receive stream for
+# server-to-client messages. The stream itself has no client-to-server JSON-RPC
+# request body to inspect; allow it once the endpoint path and binary matched.
+request_allowed_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "json-rpc"
+	request.method == "GET"
+	is_object(request.jsonrpc)
+	jsonrpc_no_parse_error(request.jsonrpc)
+}
+
+# MCP clients send JSON-RPC responses (for example elicitation replies) back to
+# the server without a method. Allow response-only POSTs once endpoint path and
+# binary matching has already selected this JSON-RPC endpoint.
+request_allowed_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "json-rpc"
+	request.method == "POST"
+	is_object(request.jsonrpc)
+	jsonrpc_no_parse_error(request.jsonrpc)
+	object.get(request.jsonrpc, "has_response", false)
+	object.get(request.jsonrpc, "method", null) == null
+}
+
 # --- L7 rule matching: GraphQL operation ---
 
 request_allowed_for_endpoint(request, endpoint) if {
@@ -665,6 +687,14 @@ jsonrpc_rule_matches(request, rule) if {
 	method != null
 	glob.match(rule.rpc_method, [], method)
 	jsonrpc_params_match(jsonrpc, rule)
+}
+
+jsonrpc_no_parse_error(jsonrpc) if {
+	object.get(jsonrpc, "error", null) == null
+}
+
+jsonrpc_no_parse_error(jsonrpc) if {
+	object.get(jsonrpc, "error", "") == ""
 }
 
 jsonrpc_params_match(jsonrpc, rule) if {

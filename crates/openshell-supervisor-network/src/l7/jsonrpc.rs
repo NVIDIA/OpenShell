@@ -27,6 +27,12 @@ pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin
     let Some(mut request) = provider.parse_request(client).await? else {
         return Ok(None);
     };
+    if jsonrpc_receive_stream_request(&request) {
+        return Ok(Some(JsonRpcHttpRequest {
+            request,
+            info: JsonRpcRequestInfo::receive_stream(),
+        }));
+    }
     let body =
         crate::l7::http::read_body_for_inspection(client, &mut request, max_body_bytes).await?;
     let info = parse_jsonrpc_body(&body);
@@ -37,6 +43,7 @@ pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin
 pub struct JsonRpcRequestInfo {
     pub calls: Vec<JsonRpcCallInfo>,
     pub is_batch: bool,
+    pub has_response: bool,
     pub error: Option<String>,
 }
 
@@ -47,6 +54,15 @@ pub struct JsonRpcCallInfo {
 }
 
 impl JsonRpcRequestInfo {
+    pub(crate) fn receive_stream() -> Self {
+        Self {
+            calls: Vec::new(),
+            is_batch: false,
+            has_response: false,
+            error: None,
+        }
+    }
+
     pub(crate) fn params_sha256(&self) -> Option<String> {
         if self.is_batch {
             if self.calls.is_empty() || self.calls.iter().all(|call| call.params.is_empty()) {
@@ -67,6 +83,15 @@ impl JsonRpcRequestInfo {
         Some(sha256_json(&canonical_params_map(&call.params)))
     }
 }
+
+pub(crate) fn jsonrpc_receive_stream_request(request: &L7Request) -> bool {
+    request.action.eq_ignore_ascii_case("GET")
+        && matches!(
+            request.body_length,
+            crate::l7::provider::BodyLength::None
+                | crate::l7::provider::BodyLength::ContentLength(0)
+        )
+}
 /// Parse a JSON-RPC 2.0 request body and extract the `method` field.
 ///
 /// Returns an info struct with `method` set on success, or `error` set if the
@@ -76,6 +101,7 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
         return JsonRpcRequestInfo {
             calls: Vec::new(),
             is_batch: false,
+            has_response: false,
             error: Some("invalid JSON".to_string()),
         };
     };
@@ -85,48 +111,64 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
             return JsonRpcRequestInfo {
                 calls: Vec::new(),
                 is_batch: true,
+                has_response: false,
                 error: Some("empty batch".to_string()),
             };
         }
         let mut calls = Vec::new();
+        let mut has_response = false;
         for item in &items {
-            let call = match parse_jsonrpc_call(item) {
-                Ok(call) => call,
+            match parse_jsonrpc_message(item) {
+                Ok(JsonRpcMessageInfo::Call(call)) => calls.push(call),
+                Ok(JsonRpcMessageInfo::Response) => has_response = true,
                 Err(error) => {
                     return JsonRpcRequestInfo {
                         calls: Vec::new(),
                         is_batch: true,
+                        has_response: false,
                         error: Some(format!("batch item invalid: {error}")),
                     };
                 }
-            };
-            calls.push(call);
+            }
         }
         return JsonRpcRequestInfo {
             calls,
             is_batch: true,
+            has_response,
             error: None,
         };
     }
 
-    let call = match parse_jsonrpc_call(&value) {
-        Ok(call) => call,
-        Err(error) => {
-            return JsonRpcRequestInfo {
-                calls: Vec::new(),
-                is_batch: false,
-                error: Some(error),
-            };
-        }
-    };
-    JsonRpcRequestInfo {
-        calls: vec![call],
-        is_batch: false,
-        error: None,
+    match parse_jsonrpc_message(&value) {
+        Ok(JsonRpcMessageInfo::Call(call)) => JsonRpcRequestInfo {
+            calls: vec![call],
+            is_batch: false,
+            has_response: false,
+            error: None,
+        },
+        Ok(JsonRpcMessageInfo::Response) => JsonRpcRequestInfo {
+            calls: Vec::new(),
+            is_batch: false,
+            has_response: true,
+            error: None,
+        },
+        Err(error) => JsonRpcRequestInfo {
+            calls: Vec::new(),
+            is_batch: false,
+            has_response: false,
+            error: Some(error),
+        },
     }
 }
 
-fn parse_jsonrpc_call(value: &serde_json::Value) -> std::result::Result<JsonRpcCallInfo, String> {
+enum JsonRpcMessageInfo {
+    Call(JsonRpcCallInfo),
+    Response,
+}
+
+fn parse_jsonrpc_message(
+    value: &serde_json::Value,
+) -> std::result::Result<JsonRpcMessageInfo, String> {
     let version = value
         .get("jsonrpc")
         .and_then(|v| v.as_str())
@@ -134,6 +176,20 @@ fn parse_jsonrpc_call(value: &serde_json::Value) -> std::result::Result<JsonRpcC
     if version != "2.0" {
         return Err(format!("unsupported JSON-RPC version '{version}'"));
     }
+
+    if value.get("method").is_some() {
+        return parse_jsonrpc_call(value).map(JsonRpcMessageInfo::Call);
+    }
+
+    if jsonrpc_response_payload_present(value) {
+        parse_jsonrpc_response(value)?;
+        return Ok(JsonRpcMessageInfo::Response);
+    }
+
+    Err("missing or non-string 'method' field".to_string())
+}
+
+fn parse_jsonrpc_call(value: &serde_json::Value) -> std::result::Result<JsonRpcCallInfo, String> {
     let method = value
         .get("method")
         .and_then(|m| m.as_str())
@@ -145,6 +201,35 @@ fn parse_jsonrpc_call(value: &serde_json::Value) -> std::result::Result<JsonRpcC
         method: method.to_string(),
         params,
     })
+}
+
+fn jsonrpc_response_payload_present(value: &serde_json::Value) -> bool {
+    value.get("result").is_some() || value.get("error").is_some()
+}
+
+fn parse_jsonrpc_response(value: &serde_json::Value) -> std::result::Result<(), String> {
+    let has_result = value.get("result").is_some();
+    let has_error = value.get("error").is_some();
+    match (has_result, has_error) {
+        (true, true) => return Err("JSON-RPC response includes both result and error".to_string()),
+        (false, false) => return Err("JSON-RPC response missing result or error".to_string()),
+        _ => {}
+    }
+
+    let id = value
+        .get("id")
+        .ok_or_else(|| "JSON-RPC response missing id".to_string())?;
+    if !(id.is_string() || id.is_number() || id.is_null()) {
+        return Err("JSON-RPC response id must be string, number, or null".to_string());
+    }
+
+    if let Some(error) = value.get("error")
+        && !error.is_object()
+    {
+        return Err("JSON-RPC response error must be an object".to_string());
+    }
+
+    Ok(())
 }
 
 fn flatten_jsonrpc_params(
@@ -227,6 +312,30 @@ mod tests {
         );
         assert_eq!(info.calls.len(), 1);
         assert!(!info.is_batch);
+        assert!(!info.has_response);
+        assert!(info.error.is_none());
+    }
+
+    #[test]
+    fn parses_jsonrpc_response_body_without_method() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":{"action":"accept","content":{}}}"#;
+        let info = parse_jsonrpc_body(body);
+
+        assert!(info.calls.is_empty());
+        assert!(!info.is_batch);
+        assert!(info.has_response);
+        assert!(info.error.is_none());
+        assert!(info.params_sha256().is_none());
+    }
+
+    #[test]
+    fn parses_jsonrpc_error_response_body_without_method() {
+        let body =
+            br#"{"jsonrpc":"2.0","id":"request-1","error":{"code":-32603,"message":"failed"}}"#;
+        let info = parse_jsonrpc_body(body);
+
+        assert!(info.calls.is_empty());
+        assert!(info.has_response);
         assert!(info.error.is_none());
     }
 
@@ -257,6 +366,24 @@ mod tests {
                 .is_some_and(|error| error.contains("ambiguous dotted params key")),
             "expected dotted params key error, got {info:?}"
         );
+    }
+
+    #[test]
+    fn recognizes_streamable_http_get_receive_streams() {
+        let request = L7Request {
+            action: "GET".to_string(),
+            target: "/mcp".to_string(),
+            query_params: HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+
+        assert!(jsonrpc_receive_stream_request(&request));
+
+        let info = JsonRpcRequestInfo::receive_stream();
+        assert!(info.error.is_none());
+        assert!(info.calls.is_empty());
+        assert!(info.params_sha256().is_none());
     }
 
     #[test]
@@ -318,12 +445,42 @@ mod tests {
         let info = parse_jsonrpc_body(body);
         assert!(info.error.is_none());
         assert!(info.is_batch);
+        assert!(!info.has_response);
         assert_eq!(info.calls.len(), 2);
         assert_eq!(info.calls[0].method, "tools/list");
         assert_eq!(info.calls[1].method, "tools/call");
         assert_eq!(
             info.calls[1].params.get("name").map(String::as_str),
             Some("read_status")
+        );
+    }
+
+    #[test]
+    fn parses_batch_with_calls_and_responses() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":2,"result":{"ok":true}}
+        ]"#;
+        let info = parse_jsonrpc_body(body);
+
+        assert!(info.error.is_none());
+        assert!(info.is_batch);
+        assert!(info.has_response);
+        assert_eq!(info.calls.len(), 1);
+        assert_eq!(info.calls[0].method, "tools/list");
+    }
+
+    #[test]
+    fn rejects_invalid_jsonrpc_response_body() {
+        let body =
+            br#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-32603,"message":"failed"}}"#;
+        let info = parse_jsonrpc_body(body);
+
+        assert!(info.calls.is_empty());
+        assert!(!info.has_response);
+        assert_eq!(
+            info.error.as_deref(),
+            Some("JSON-RPC response includes both result and error")
         );
     }
 
