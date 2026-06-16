@@ -223,7 +223,7 @@ These are the primary `mise` tasks for day-to-day development:
 
 ## RFCs
 
-New features always start as GitHub issues using the feature request template. For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, maintainers may ask for an RFC from the issue and assign an RFC number there. RFCs live in `rfc/`, but they should be uncommon. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines on when an issue should become an RFC versus a spike issue or architecture doc.
+New features always start as GitHub issues using the feature request template. For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, maintainers may ask for an RFC from the issue and assign an RFC number there. RFCs live in `rfc/`. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines.
 
 ## Documentation
 

@@ -13,7 +13,7 @@ Before writing an RFC, you must open a [GitHub issue](https://github.com/NVIDIA/
 - Build consensus before investing in a detailed proposal
 - Identify the right reviewers and stakeholders
 
-If the ticket shows sufficient interest and maintainers decide the idea needs broad design review, they will ask for an RFC from that issue. Maintainers assign the RFC number in the issue before the RFC is created, preventing number clashes across branches.
+If the ticket shows sufficient interest and maintainers decide the idea needs broad design review, they will ask for an RFC from that issue. Maintainers assign the RFC number and add the `needs-rfc` label in the issue before the RFC is created, preventing number clashes across branches and making pending RFC work searchable.
 
 ## RFCs vs other artifacts
 
@@ -94,7 +94,7 @@ Start with a GitHub issue. New features must use the feature request template an
 
 ### 2. Get maintainer confirmation
 
-Maintainers decide from the issue whether an RFC is necessary. If it is, they assign the RFC number in the issue before anyone creates the RFC branch or folder, and add the `rfc` label to the originating issue so RFC work appears on the [RFC board](https://github.com/orgs/NVIDIA/projects/233/views/6). Authors should use the assigned number instead of choosing one locally.
+Maintainers decide from the issue whether an RFC is necessary. If it is, they assign the RFC number in the issue before anyone creates the RFC branch or folder, and add the `needs-rfc` label to the originating issue so pending RFC work is searchable. Authors should use the assigned number instead of choosing one locally.
 
 ### 3. Create your RFC
 
@@ -118,7 +118,7 @@ Fill in the metadata, include the originating issue in `links`, and start writin
 
 ### 4. Open a pull request
 
-When you're ready for feedback, update the state to `review` and open a pull request. Add the PR link to `links` in the metadata.
+When you're ready for feedback, update the state to `review` and open a pull request. Add the PR link to `links` in the metadata. Maintainers should add the `rfc` label to the PR and add it to the [RFC board](https://github.com/orgs/NVIDIA/projects/233/views/6).
 
 The PR is where discussion happens. Anyone subscribed to the repo will get a notification and can read your RFC and provide feedback.
 
@@ -132,7 +132,7 @@ RFCs rarely go through this process unchanged. Make edits as new commits to the 
 
 After there has been time for folks to comment, the RFC author requests merge and a maintainer approves and merges. The state should be updated from `review` to `accepted`. If the proposal is declined, the state should be set to `rejected`. The timing is left to the author's discretion. As a guideline, a few business days seems reasonable, but circumstances may dictate a different timeline.
 
-When an RFC is accepted, maintainers track it in the OpenShell Roadmap GitHub project and add the `rfc` label so it appears on the [RFC board](https://github.com/orgs/NVIDIA/projects/233/views/6).
+When an RFC is accepted, maintainers should update any RFC board fields that track review state.
 
 In general, RFCs shouldn't be merged if no one else has read or commented on it. If no one is reading your RFC, it's time to explicitly ask someone to give it a read!
 
