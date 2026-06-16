@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
+    include_str!("../../../providers/anthropic-oauth.yaml"),
     include_str!("../../../providers/aws.yaml"),
     include_str!("../../../providers/aws-bedrock.yaml"),
     include_str!("../../../providers/aws-s3.yaml"),
