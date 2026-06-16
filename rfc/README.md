@@ -1,6 +1,6 @@
 # OpenShell RFCs
 
-Substantial changes to OpenShell should be proposed in writing before implementation begins. New features always start as a GitHub issue using the [feature request template](https://github.com/NVIDIA/OpenShell/issues/new/choose), not as an RFC pull request. Most proposals should stay in the issue, spike, and pull request workflow. RFCs are intentionally rare and are reserved for changes that are cross-cutting, potentially controversial, or significant enough that stakeholders should weigh in before code is written.
+Substantial changes to OpenShell should be proposed in writing before implementation begins. New features always start as a GitHub issue using the [feature request template](https://github.com/NVIDIA/OpenShell/issues/new/choose), not as an RFC pull request. RFCs are intentionally rare and are reserved for changes that are cross-cutting, potentially controversial, or significant enough that stakeholders should weigh in before code is written.
 
 An RFC provides a consistent way to collect broad feedback, build consensus, and document the decision for future contributors. An RFC is created only when maintainers decide the originating issue needs that level of design review.
 
