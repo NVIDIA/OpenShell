@@ -218,6 +218,7 @@ sandbox_namespace  = "docker-dev"
 grpc_endpoint      = "https://host.openshell.internal:17670"
 # Skip the image-pull-and-extract step by pointing at a locally built binary.
 supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
+# When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
 supervisor_image   = "ghcr.io/nvidia/openshell/supervisor:latest"
 guest_tls_ca       = "/etc/openshell/certs/ca.pem"
 guest_tls_cert     = "/etc/openshell/certs/client.pem"

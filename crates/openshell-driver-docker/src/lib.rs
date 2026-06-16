@@ -79,7 +79,8 @@ const DOCKER_NETWORK_DRIVER: &str = "bridge";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
-/// explicit `supervisor_bin` override or local build is available.
+/// explicit `supervisor_bin`, configured `supervisor_image`, sibling binary,
+/// or local build is available.
 const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
 /// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
@@ -155,10 +156,9 @@ pub struct DockerComputeConfig {
     /// Optional override for the Linux `openshell-sandbox` binary mounted into containers.
     pub supervisor_bin: Option<PathBuf>,
 
-    /// Optional override for the image the gateway pulls to extract the
-    /// Linux `openshell-sandbox` binary when no explicit binary path or
-    /// local build is available. Defaults to
-    /// `ghcr.io/nvidia/openshell/supervisor:<gateway-image-tag>`.
+    /// Optional image used to extract the Linux `openshell-sandbox` binary.
+    /// Ignored when `supervisor_bin` is set. See `resolve_supervisor_bin` for
+    /// the full resolution order.
     pub supervisor_image: Option<String>,
 
     /// Host-side CA certificate for Docker sandbox mTLS.
@@ -2948,56 +2948,89 @@ fn normalize_docker_arch(arch: &str) -> String {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum SupervisorBinSource {
+    Binary(PathBuf),
+    Image(String),
+}
+
+fn resolve_supervisor_bin_source(
+    docker_config: &DockerComputeConfig,
+    current_exe: Option<&Path>,
+    target_candidates: &[PathBuf],
+) -> CoreResult<SupervisorBinSource> {
+    // Tier 1: explicit supervisor_bin in [openshell.drivers.docker].
+    if let Some(path) = docker_config.supervisor_bin.clone() {
+        let path = canonicalize_existing_file(&path, "docker supervisor binary")?;
+        validate_linux_elf_binary(&path)?;
+        return Ok(SupervisorBinSource::Binary(path));
+    }
+
+    // Tier 2: explicit supervisor_image in [openshell.drivers.docker].
+    // A configured image should be the source of truth even when a local
+    // developer build is present under target/.
+    if let Some(image) = docker_config.supervisor_image.clone() {
+        return Ok(SupervisorBinSource::Image(image));
+    }
+
+    // Tier 3: sibling `openshell-sandbox` next to the running gateway
+    // (release artifact layout). Linux-only because the sibling must be a
+    // Linux ELF to bind-mount into a Linux container.
+    if cfg!(target_os = "linux")
+        && let Some(current_exe) = current_exe
+        && let Some(parent) = current_exe.parent()
+    {
+        let sibling = parent.join("openshell-sandbox");
+        if sibling.is_file() {
+            let path = canonicalize_existing_file(&sibling, "docker supervisor binary")?;
+            if validate_linux_elf_binary(&path).is_ok() {
+                return Ok(SupervisorBinSource::Binary(path));
+            }
+        }
+    }
+
+    // Tier 4: local cargo target build (developer workflow). Preferred
+    // over the default registry image when available because it matches
+    // whatever the developer just built.
+    for candidate in target_candidates {
+        if candidate.is_file() {
+            let path = canonicalize_existing_file(candidate, "docker supervisor binary")?;
+            if validate_linux_elf_binary(&path).is_ok() {
+                return Ok(SupervisorBinSource::Binary(path));
+            }
+        }
+    }
+
+    // Tier 5: pull the release-matched default supervisor image and extract
+    // the binary to a host-side cache keyed by image content digest.
+    Ok(SupervisorBinSource::Image(default_docker_supervisor_image()))
+}
+
 pub(crate) async fn resolve_supervisor_bin(
     docker: &Docker,
     docker_config: &DockerComputeConfig,
     daemon_arch: &str,
 ) -> CoreResult<PathBuf> {
-    // Tier 1: explicit supervisor_bin in [openshell.drivers.docker].
-    if let Some(path) = docker_config.supervisor_bin.clone() {
-        let path = canonicalize_existing_file(&path, "docker supervisor binary")?;
-        validate_linux_elf_binary(&path)?;
-        return Ok(path);
-    }
-
-    // Tier 2: sibling `openshell-sandbox` next to the running gateway
-    // (release artifact layout). Linux-only because the sibling must be a
-    // Linux ELF to bind-mount into a Linux container.
-    if cfg!(target_os = "linux") {
-        let current_exe = std::env::current_exe()
-            .map_err(|err| Error::config(format!("failed to resolve current executable: {err}")))?;
-        if let Some(parent) = current_exe.parent() {
-            let sibling = parent.join("openshell-sandbox");
-            if sibling.is_file() {
-                let path = canonicalize_existing_file(&sibling, "docker supervisor binary")?;
-                if validate_linux_elf_binary(&path).is_ok() {
-                    return Ok(path);
-                }
-            }
-        }
-    }
-
-    // Tier 3: local cargo target build (developer workflow). Preferred
-    // over a registry pull when available because it matches whatever the
-    // developer just built.
+    let current_exe =
+        if cfg!(target_os = "linux")
+            && docker_config.supervisor_bin.is_none()
+            && docker_config.supervisor_image.is_none()
+        {
+            Some(std::env::current_exe().map_err(|err| {
+                Error::config(format!("failed to resolve current executable: {err}"))
+            })?)
+        } else {
+            None
+        };
     let target_candidates = linux_supervisor_candidates(daemon_arch);
-    for candidate in &target_candidates {
-        if candidate.is_file() {
-            let path = canonicalize_existing_file(candidate, "docker supervisor binary")?;
-            if validate_linux_elf_binary(&path).is_ok() {
-                return Ok(path);
-            }
+
+    match resolve_supervisor_bin_source(docker_config, current_exe.as_deref(), &target_candidates)?
+    {
+        SupervisorBinSource::Binary(path) => Ok(path),
+        SupervisorBinSource::Image(image) => {
+            extract_supervisor_bin_from_image(docker, &image).await
         }
     }
-
-    // Tier 4: pull the supervisor image from a registry and extract the
-    // binary to a host-side cache keyed by image content digest. This is
-    // the default path for released gateway binaries.
-    let image = docker_config
-        .supervisor_image
-        .clone()
-        .unwrap_or_else(default_docker_supervisor_image);
-    extract_supervisor_bin_from_image(docker, &image).await
 }
 
 fn linux_supervisor_candidates(daemon_arch: &str) -> Vec<PathBuf> {

@@ -1712,6 +1712,36 @@ fn default_docker_supervisor_image_uses_nvidia_ghcr_repo() {
 }
 
 #[test]
+fn configured_supervisor_image_takes_precedence_over_local_binaries() {
+    let tempdir = TempDir::new().unwrap();
+    let bin_dir = tempdir.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let current_exe = bin_dir.join("openshell-gateway");
+    let sibling = bin_dir.join("openshell-sandbox");
+    fs::write(&current_exe, b"gateway").unwrap();
+    fs::write(&sibling, b"\x7fELFsibling").unwrap();
+
+    let local_build = tempdir.path().join("target/openshell-sandbox");
+    fs::create_dir_all(local_build.parent().unwrap()).unwrap();
+    fs::write(&local_build, b"\x7fELFlocal").unwrap();
+
+    let source = resolve_supervisor_bin_source(
+        &DockerComputeConfig {
+            supervisor_image: Some("example.com/openshell/supervisor:test".to_string()),
+            ..Default::default()
+        },
+        Some(&current_exe),
+        &[local_build],
+    )
+    .unwrap();
+
+    assert_eq!(
+        source,
+        SupervisorBinSource::Image("example.com/openshell/supervisor:test".to_string())
+    );
+}
+
+#[test]
 fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
     assert_eq!(
         resolve_default_docker_supervisor_image_tag(Some("1.2.3"), Some("sha"), "0.0.0"),
