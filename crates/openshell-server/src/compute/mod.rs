@@ -282,10 +282,10 @@ impl ComputeRuntime {
         })
     }
 
-    /// Serializes sandbox object read-modify-write operations within this
-    /// gateway process.
+    /// Serializes sandbox/provider-profile invariant checks and object writes
+    /// within this gateway process.
     ///
-    /// This is a temporary single-gateway guard for full-object sandbox writes.
+    /// This is a temporary single-gateway guard for cross-object invariants.
     /// It is not HA-safe; replace it with DB-backed CAS/resource-version writes
     /// tracked by #1255 before enabling multiple gateway writers.
     pub(crate) async fn sandbox_sync_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {

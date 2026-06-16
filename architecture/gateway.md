@@ -253,11 +253,12 @@ responses copy the stored version onto the profile payload so exported YAML can
 carry the expected version for safe single-profile updates. Database migrations
 backfill existing rows with version 1.
 
-Provider profile updates also hold the sandbox synchronization guard while
-checking attached-sandbox dynamic token grant ambiguity and writing the updated
-profile. Sandbox provider attach/detach uses the same guard, so one gateway
-process cannot interleave an attach with a profile update that would leave an
-ambiguous final dynamic-token state.
+Provider profile imports and updates hold the sandbox synchronization guard while
+checking attached-sandbox dynamic token grant ambiguity and writing the profile.
+Sandbox creation with initial providers and sandbox provider attach/detach use
+the same guard, so one gateway process cannot interleave a profile mutation with
+a sandbox provider-set mutation that would leave an ambiguous final dynamic-token
+state.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The

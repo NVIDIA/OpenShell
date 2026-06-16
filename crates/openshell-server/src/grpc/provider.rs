@@ -1299,6 +1299,7 @@ pub(super) async fn handle_import_provider_profiles(
     let request = request.into_inner();
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
     diagnostics.extend(validate_profile_set(&profiles));
     if !has_errors(&diagnostics) {
@@ -2658,6 +2659,40 @@ mod tests {
                 .message
                 .contains("import would create ambiguous dynamic token grants")
         }));
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_waits_for_sandbox_sync_guard() {
+        let state = test_server_state().await;
+        let guard = state.compute.sandbox_sync_guard().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            handle_import_provider_profiles(
+                &task_state,
+                Request::new(ImportProviderProfilesRequest {
+                    profiles: vec![ProviderProfileImportItem {
+                        profile: Some(custom_profile("guarded-import")),
+                        source: "guarded-import.yaml".to_string(),
+                    }],
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "profile import should wait for sandbox sync guard"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("import should finish after guard release")
+            .expect("join import task")
+            .expect("import should succeed")
+            .into_inner();
+        assert!(response.imported);
     }
 
     #[tokio::test]

@@ -132,6 +132,12 @@ async fn handle_create_sandbox_inner(
         crate::grpc::validation::validate_label_value(value)?;
     }
 
+    let _sandbox_sync_guard = if spec.providers.is_empty() {
+        None
+    } else {
+        Some(state.compute.sandbox_sync_guard().await)
+    };
+
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
         state
@@ -2586,6 +2592,51 @@ mod tests {
         assert!(err.message().contains("TOKEN"));
         assert!(err.message().contains("provider-a"));
         assert!(err.message().contains("provider-b"));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_with_providers_waits_for_sandbox_sync_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+
+        let guard = state.compute.sandbox_sync_guard().await;
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            handle_create_sandbox(
+                &task_state,
+                Request::new(CreateSandboxRequest {
+                    name: "guarded-create".to_string(),
+                    spec: Some(openshell_core::proto::SandboxSpec {
+                        providers: vec!["work-github".to_string()],
+                        ..Default::default()
+                    }),
+                    labels: HashMap::new(),
+                }),
+            )
+            .await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "sandbox create with initial providers should wait for sandbox sync guard"
+        );
+        drop(guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("create should finish after guard release")
+            .expect("join create task")
+            .expect("create should succeed")
+            .into_inner();
+        assert_eq!(
+            response.sandbox.unwrap().spec.unwrap().providers,
+            vec!["work-github".to_string()]
+        );
     }
 
     #[tokio::test]
