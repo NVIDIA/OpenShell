@@ -118,6 +118,8 @@ def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     spec = (repo_root / "openshell.spec").read_text(encoding="utf-8")
 
+    assert "BuildRequires:  z3-libs" in spec
+    assert "Requires:       z3-libs" in spec
     assert "init-gateway-config.sh" not in spec
     assert "init-pki.sh" not in spec
     assert "Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls" in spec
