@@ -13,6 +13,13 @@
 #
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
 # gateway config when mTLS materials are needed.
+#
+# Sandbox image overrides:
+#   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=...
+#   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=Always|IfNotPresent|Never
+#
+# The default community sandbox image uses :latest and is pulled with Always so
+# local e2e runs do not reuse stale images that drift from the repo toolchain.
 
 set -euo pipefail
 
@@ -342,6 +349,34 @@ ensure_docker_supervisor_image() {
   exit 2
 }
 
+image_uses_latest_tag() {
+  local image=$1
+  local last_component
+
+  # Digest references are immutable even if the tag portion says latest.
+  if [[ "${image}" == *@* ]]; then
+    return 1
+  fi
+
+  last_component="${image##*/}"
+  # Docker treats an omitted tag as :latest.
+  if [[ "${last_component}" != *:* ]]; then
+    return 0
+  fi
+
+  [[ "${last_component}" == *:latest ]]
+}
+
+default_sandbox_pull_policy() {
+  local image=$1
+
+  if image_uses_latest_tag "${image}"; then
+    printf '%s\n' "Always"
+  else
+    printf '%s\n' "IfNotPresent"
+  fi
+}
+
 DAEMON_ARCH="$(normalize_arch "$(docker info --format '{{.Architecture}}' 2>/dev/null || true)")"
 SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
 HOST_OS="$(uname -s)"
@@ -386,6 +421,10 @@ fi
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
+SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-}}"
+if [ -z "${SANDBOX_IMAGE_PULL_POLICY}" ]; then
+  SANDBOX_IMAGE_PULL_POLICY="$(default_sandbox_pull_policy "${SANDBOX_IMAGE}")"
+fi
 if ! docker image inspect "${SANDBOX_IMAGE}" >/dev/null 2>&1; then
   echo "Pulling ${SANDBOX_IMAGE}..."
   if ! docker_pull_with_retry "${SANDBOX_IMAGE}"; then
@@ -420,6 +459,7 @@ else
 fi
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
 e2e_generate_gateway_jwt "${JWT_DIR}"
 
 # Driver-specific options moved from CLI flags into a TOML config table
@@ -446,7 +486,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
   printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
   printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
-  printf 'image_pull_policy = "IfNotPresent"\n'
+  printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
   printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
   printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
   printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
