@@ -422,8 +422,6 @@ pub async fn run_server(
         info!("Metrics server disabled");
     }
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
     let tls_acceptor = if let Some(tls) = &config.tls {
         let acceptor = TlsAcceptor::from_files(
