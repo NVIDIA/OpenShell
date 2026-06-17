@@ -4,12 +4,6 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      package-smoke-only:
-        description: "Temporary PR probe: build Linux packages and run install smoke tests without publishing release artifacts"
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -60,7 +54,6 @@ jobs:
           echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)" >> "$GITHUB_OUTPUT"
 
   build-gateway:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [compute-versions]
     uses: ./.github/workflows/docker-build.yml
     with:
@@ -68,7 +61,6 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
   build-supervisor:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [compute-versions]
     uses: ./.github/workflows/docker-build.yml
     with:
@@ -76,7 +68,6 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
   e2e:
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [build-gateway, build-supervisor]
     uses: ./.github/workflows/e2e-test.yml
     with:
@@ -85,7 +76,6 @@ jobs:
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [build-gateway, build-supervisor, release-dev]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
@@ -107,7 +97,6 @@ jobs:
 
   build-python-wheels-linux:
     name: Build Python Wheels (Linux ${{ matrix.arch }})
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [compute-versions]
     strategy:
       matrix:
@@ -166,7 +155,6 @@ jobs:
 
   build-python-wheel-macos:
     name: Build Python Wheel (macOS)
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [compute-versions]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 120
@@ -330,7 +318,6 @@ jobs:
   # ---------------------------------------------------------------------------
   build-cli-macos:
     name: Build CLI (macOS)
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [compute-versions]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 60
@@ -494,7 +481,6 @@ jobs:
   # ---------------------------------------------------------------------------
   build-gateway-binary-macos:
     name: Build Gateway Binary (macOS)
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [compute-versions]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 60
@@ -652,7 +638,6 @@ jobs:
 
   build-driver-vm-macos:
     name: Build Driver VM macOS
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [compute-versions]
     uses: ./.github/workflows/driver-vm-macos.yml
     with:
@@ -678,7 +663,6 @@ jobs:
       checkout-ref: ${{ github.sha }}
       upload-channel: latest/edge
       github-environment: latest/edge
-      publish: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     secrets:
       publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
@@ -759,41 +743,11 @@ jobs:
           dnf install -y ./package-input/openshell-[0-9]*.rpm ./package-input/openshell-gateway-*.rpm
           LD_BIND_NOW=1 openshell-gateway --version
 
-  smoke-snap-dev-artifact:
-    name: Smoke Snap Dev Artifact (amd64)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs['package-smoke-only'] == true }}
-    needs: [build-snap]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Install snapd
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y snapd
-          sudo systemctl enable --now snapd.socket
-          sudo systemctl start snapd
-          sudo snap wait system seed.loaded
-
-      - name: Download snap artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: snap-linux-amd64
-          path: snap-input/
-
-      - name: Smoke snap install
-        run: |
-          set -euo pipefail
-          sudo snap install ./snap-input/*.snap --dangerous
-          openshell --version
-          sudo snap run openshell.gateway --version
-
   # ---------------------------------------------------------------------------
   # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels
   # ---------------------------------------------------------------------------
   release-dev:
     name: Release Dev
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, e2e, build-driver-vm-linux, build-driver-vm-macos, build-deb, build-rpm, build-snap, smoke-linux-dev-artifacts]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
@@ -1052,7 +1006,6 @@ jobs:
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs['package-smoke-only'] != true }}
     needs: [compute-versions, release-dev]
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
