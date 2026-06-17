@@ -463,6 +463,9 @@ jobs:
           set -euo pipefail
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
 
+      - name: Set up Zig C/C++ wrappers
+        run: tasks/scripts/setup-zig-cc-wrapper.sh ${{ matrix.zig_target }} ${{ matrix.zig_target }} /tmp/zig-gnu
+
       - name: Build ${{ matrix.zig_target }}
         env:
           OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.source_sha }}

@@ -211,6 +211,10 @@ jobs:
           echo "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_${TARGET_ENV_UPPER}_RUSTFLAGS=-Clink-self-contained=no" >> "$GITHUB_ENV"
 
+      - name: Set up zig glibc wrappers
+        if: inputs.component == 'gateway'
+        run: tasks/scripts/setup-zig-cc-wrapper.sh "${{ steps.target.outputs.zig_target }}" "${{ steps.target.outputs.zig_target }}" /tmp/zig-gnu
+
       - name: Build ${{ steps.target.outputs.binary }} (${{ steps.target.outputs.zig_target || steps.target.outputs.target }})
         env:
           # Preserve the release-codegen setting used by the old Dockerfile
