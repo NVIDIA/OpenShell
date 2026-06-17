@@ -238,6 +238,9 @@ jobs:
             -p "${{ steps.target.outputs.crate }}"
             --bin "${{ steps.target.outputs.binary }}"
           )
+          if [[ "${{ inputs.component }}" == "gateway" ]]; then
+            args+=(--features bundled-z3)
+          fi
           if [[ -n "$FEATURES" ]]; then
             args+=(--features "$FEATURES")
           fi
@@ -257,8 +260,8 @@ jobs:
           ldd --version
           ldd "$BIN" || true
           if [[ "${{ inputs.component }}" == "gateway" ]]; then
-            if ! ldd "$BIN" | grep -q 'libz3'; then
-              echo "gateway binary must link shared libz3; do not enable bundled-z3 for image artifacts" >&2
+            if ldd "$BIN" | grep -q 'libz3'; then
+              echo "gateway binary must not require shared libz3; keep z3 bundled for image artifacts" >&2
               exit 1
             fi
           fi

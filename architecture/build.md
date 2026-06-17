@@ -46,9 +46,9 @@ The standalone `openshell` CLI is built as a static musl binary so it can run on
 a wide range of Linux distributions without depending on the host's glibc. Host
 runtime binaries that use the GNU/Linux runtime environment are GNU-linked.
 `openshell-gateway` and `openshell-driver-vm` are built with a glibc 2.28 floor.
-The gateway links against system `libz3` at runtime; Debian and RPM packages
-declare that dependency, and the gateway container image copies the matching
-runtime library into the distroless image.
+The gateway bundles z3 into the release binary so Linux packages, standalone
+tarballs, and gateway images do not depend on distro-specific z3 shared-library
+SONAMEs.
 
 ## Container Builds
 
@@ -62,9 +62,9 @@ Dockerfile compiles Rust — both copy a staged binary out of
 Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
 binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.28, including
 native-architecture builds, so the gateway image, standalone tarballs, and Linux
-packages share the same host portability floor. The gateway build uses system Z3
-instead of the `bundled-z3` feature so cargo-zigbuild does not compile the Z3
-C/C++ sources. Linux VM driver release artifacts use the same glibc floor so
+packages share the same host portability floor. The gateway build enables
+`bundled-z3` and release workflows verify that no dynamic `libz3` dependency is
+introduced. Linux VM driver release artifacts use the same glibc floor so
 package-managed VM support does not raise the package runtime requirement.
 Release workflows verify the maximum referenced `GLIBC_*` symbol version before
 publishing artifacts.
@@ -85,8 +85,7 @@ Runtime layout:
   `/usr/local/bin/openshell-gateway`, runs as UID/GID `1000:1000`. Linux GNU
   gateway binaries must not reference `GLIBC_*` symbols newer than
   `GLIBC_2.28`; release workflows verify this before publishing artifacts. The
-  image includes `libz3.so.4` copied from Debian so the dynamic gateway binary
-  does not depend on bundled Z3.
+  gateway bundles z3, so the image does not need a distro-provided z3 runtime.
 - **VM driver**: host GNU-linked binary installed at
   `/usr/libexec/openshell/openshell-driver-vm` in Linux packages and published
   as a release artifact. Linux GNU VM driver binaries must not reference

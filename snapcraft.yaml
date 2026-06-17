@@ -103,8 +103,6 @@ parts:
   openshell:
     plugin: nil
     source: ./snap/prebuilt
-    stage-packages:
-      - libz3-4
     override-pull: |
       craftctl default
       craftctl set version="$(cat "$CRAFT_PART_SRC/version")"

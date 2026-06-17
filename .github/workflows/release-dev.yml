@@ -448,7 +448,7 @@ jobs:
         run: |
           set -euo pipefail
           mise x -- rustup target add ${{ matrix.target }}
-          mise x -- cargo zigbuild --release --target ${{ matrix.zig_target }} -p openshell-server --bin openshell-gateway
+          mise x -- cargo zigbuild --release --target ${{ matrix.zig_target }} -p openshell-server --bin openshell-gateway --features bundled-z3
           mkdir -p artifacts/bin
           install -m 0755 target/${{ matrix.target }}/release/openshell-gateway artifacts/bin/openshell-gateway
 
@@ -459,8 +459,8 @@ jobs:
           echo "$OUTPUT"
           grep -q '^openshell-gateway ' <<<"$OUTPUT"
           ldd artifacts/bin/openshell-gateway || true
-          if ! ldd artifacts/bin/openshell-gateway | grep -q 'libz3'; then
-            echo "gateway binary must link shared libz3; do not build with bundled-z3" >&2
+          if ldd artifacts/bin/openshell-gateway | grep -q 'libz3'; then
+            echo "gateway binary must not require shared libz3; keep z3 bundled for portable release artifacts" >&2
             exit 1
           fi
 

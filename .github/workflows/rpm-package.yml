@@ -56,7 +56,7 @@ jobs:
           dnf install -y \
             packit rpm-build \
             rust cargo gcc gcc-c++ make cmake pkg-config \
-            clang-devel z3-libs z3-devel systemd-rpm-macros \
+            clang-devel systemd-rpm-macros \
             pandoc python3-devel git-core \
             cargo-rpm-macros
 

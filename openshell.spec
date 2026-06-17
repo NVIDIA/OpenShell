@@ -44,8 +44,6 @@ BuildRequires:  make
 BuildRequires:  cmake
 BuildRequires:  pkg-config
 BuildRequires:  clang-devel
-BuildRequires:  z3-libs
-BuildRequires:  z3-devel
 BuildRequires:  systemd-rpm-macros
 
 # Man page generation
@@ -69,7 +67,6 @@ LLM inference routing.
 Summary:        OpenShell gateway server with Podman sandbox driver
 Requires:       podman
 Requires:       openssl
-Requires:       z3-libs
 Requires:       %{name} = %{version}-%{release}
 
 %description gateway

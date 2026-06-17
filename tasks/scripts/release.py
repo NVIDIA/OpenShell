@@ -250,8 +250,6 @@ class Openshell < Formula
 
   depends_on macos: :big_sur
   depends_on arch: :arm64
-  depends_on "z3"
-
   resource "openshell-gateway" do
     url "{_asset_url(release_tag, HOMEBREW_GATEWAY_ASSET)}"
     sha256 "{gateway_sha256}"
