@@ -35,6 +35,36 @@ source "${ROOT}/e2e/support/gateway-common.sh"
 
 e2e_preserve_mise_dirs
 
+require_container_engine_lane() {
+  local lane=$1
+  local label=$2
+  local selected_engine selected_driver
+
+  if [ -n "${OPENSHELL_E2E_CONTAINER_ENGINE:-}" ]; then
+    echo "ERROR: OPENSHELL_E2E_CONTAINER_ENGINE is no longer supported." >&2
+    echo "       Set CONTAINER_ENGINE=${lane} for the ${label} e2e lane, or unset it." >&2
+    exit 2
+  fi
+  selected_engine="$(printf '%s' "${CONTAINER_ENGINE:-}" | tr '[:upper:]' '[:lower:]')"
+  selected_driver="$(printf '%s' "${OPENSHELL_E2E_DRIVER:-}" | tr '[:upper:]' '[:lower:]')"
+
+  if [ -n "${selected_engine}" ] && [ "${selected_engine}" != "${lane}" ]; then
+    echo "ERROR: CONTAINER_ENGINE=${CONTAINER_ENGINE} conflicts with the ${label} e2e lane." >&2
+    echo "       Set CONTAINER_ENGINE=${lane} or unset CONTAINER_ENGINE." >&2
+    exit 2
+  fi
+  if [ -n "${selected_driver}" ] && [ "${selected_driver}" != "${lane}" ]; then
+    echo "ERROR: OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER} conflicts with the ${label} e2e lane." >&2
+    echo "       Set OPENSHELL_E2E_DRIVER=${lane} or unset OPENSHELL_E2E_DRIVER." >&2
+    exit 2
+  fi
+
+  export CONTAINER_ENGINE="${lane}"
+  export OPENSHELL_E2E_DRIVER="${lane}"
+}
+
+require_container_engine_lane docker Docker
+
 github_actions_host_docker_tmpdir() {
   if [ "${GITHUB_ACTIONS:-}" != "true" ] \
      || [ ! -S /var/run/docker.sock ] \
@@ -234,8 +264,7 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
     "$(e2e_endpoint_port "${OPENSHELL_GATEWAY_ENDPOINT}")"
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-180}"
-  export OPENSHELL_E2E_DRIVER="${OPENSHELL_E2E_DRIVER:-docker}"
-  export OPENSHELL_E2E_CONTAINER_ENGINE="${OPENSHELL_E2E_CONTAINER_ENGINE:-docker}"
+  export OPENSHELL_E2E_DRIVER="docker"
 
   echo "Using existing e2e gateway endpoint: ${OPENSHELL_GATEWAY_ENDPOINT}"
   "$@"
@@ -453,7 +482,6 @@ export OPENSHELL_E2E_DOCKER_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_NETWORK_NAME="${DOCKER_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 export OPENSHELL_E2E_DRIVER="docker"
-export OPENSHELL_E2E_CONTAINER_ENGINE="docker"
 if connect_current_container_to_docker_network "${DOCKER_NETWORK_NAME}"; then
   echo "Connected CI job container to Docker network ${DOCKER_NETWORK_NAME} (${GATEWAY_HOST_ALIAS_IP})."
 else

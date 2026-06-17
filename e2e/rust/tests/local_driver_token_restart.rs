@@ -292,10 +292,7 @@ async fn restart_vm_sandbox(gateway: &ManagedGateway, sandbox_name: &str) -> Res
     wait_for_healthy(Duration::from_secs(120)).await
 }
 
-async fn wait_for_driver_reconnect(
-    driver: LocalDriver,
-    sandbox_name: &str,
-) -> Result<(), String> {
+async fn wait_for_driver_reconnect(driver: LocalDriver, sandbox_name: &str) -> Result<(), String> {
     match driver {
         LocalDriver::Docker | LocalDriver::Podman => {
             wait_for_sandbox_exec_contains(
@@ -321,7 +318,9 @@ async fn wait_for_driver_reconnect(
 #[tokio::test]
 async fn local_driver_sandbox_restarts_with_non_expiring_bootstrap_jwt() {
     let Some(driver) = LocalDriver::from_env() else {
-        eprintln!("Skipping local-driver token restart test: e2e driver is not Docker, Podman, or VM");
+        eprintln!(
+            "Skipping local-driver token restart test: e2e driver is not Docker, Podman, or VM"
+        );
         return;
     };
     let namespace = if driver.is_container() {
@@ -338,7 +337,14 @@ async fn local_driver_sandbox_restarts_with_non_expiring_bootstrap_jwt() {
     } else {
         None
     };
-    let engine = driver.is_container().then(ContainerEngine::from_env);
+    let engine = if driver.is_container() {
+        Some(
+            ContainerEngine::from_env()
+                .unwrap_or_else(|err| panic!("resolve e2e container engine: {err}")),
+        )
+    } else {
+        None
+    };
     let gateway = if driver == LocalDriver::Vm {
         let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
         else {

@@ -167,8 +167,12 @@ fn docker_info_reports_wsl2(info: &Value) -> bool {
     .any(text_reports_wsl2)
 }
 
+fn container_engine() -> ContainerEngine {
+    ContainerEngine::from_env().unwrap_or_else(|err| panic!("resolve e2e container engine: {err}"))
+}
+
 fn all_gpu_default_allowed() -> bool {
-    let engine = ContainerEngine::from_env();
+    let engine = container_engine();
     if uses_local_podman_inventory(&engine) {
         return local_podman_all_gpu_default_supported();
     }
@@ -177,7 +181,7 @@ fn all_gpu_default_allowed() -> bool {
 }
 
 fn discovered_cdi_gpu_device_ids() -> Vec<String> {
-    let engine = ContainerEngine::from_env();
+    let engine = container_engine();
     if uses_local_podman_inventory(&engine) {
         let device_ids = local_podman_cdi_gpu_device_ids();
         assert!(
@@ -216,8 +220,7 @@ fn default_cdi_gpu_device_id(device_ids: &[String], allow_all_devices: bool) -> 
     let mut named = device_ids
         .iter()
         .filter(|device_id| {
-            device_id.starts_with(CDI_GPU_DEVICE_PREFIX)
-                && device_id.as_str() != CDI_GPU_DEVICE_ALL
+            device_id.starts_with(CDI_GPU_DEVICE_PREFIX) && device_id.as_str() != CDI_GPU_DEVICE_ALL
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -256,7 +259,7 @@ fn cdi_devices_driver_config_json(device_ids: &[&str]) -> String {
 }
 
 fn runtime_gpu_lines(gpu_device: &str) -> Vec<String> {
-    let engine = ContainerEngine::from_env();
+    let engine = container_engine();
     let image = gpu_probe_image();
     let output = engine
         .command()
@@ -339,7 +342,8 @@ async fn sandbox_create_output(args: &[&str]) -> String {
 #[tokio::test]
 async fn gpu_request_without_device_matches_plain_default_gpu_container() {
     let device_ids = discovered_cdi_gpu_device_ids();
-    let Some(default_gpu_device) = default_cdi_gpu_device_id(&device_ids, all_gpu_default_allowed())
+    let Some(default_gpu_device) =
+        default_cdi_gpu_device_id(&device_ids, all_gpu_default_allowed())
     else {
         eprintln!("skipping default GPU request test because no selectable GPU ID was discovered");
         return;

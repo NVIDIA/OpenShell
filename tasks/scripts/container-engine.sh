@@ -20,7 +20,10 @@
 #   ce_build_multiarch               — multi-arch build + push workflow
 #
 # Override the auto-detected engine by setting CONTAINER_ENGINE=docker or
-# CONTAINER_ENGINE=podman before sourcing.
+# CONTAINER_ENGINE=podman before sourcing. Scripts that build images directly
+# into a local Kubernetes cluster can also set
+# CONTAINER_ENGINE_TARGET=local-k8s-cluster so the helper validates the active
+# k3d/kind context before choosing an engine.
 # Suppress the detection log line with CONTAINER_ENGINE_QUIET=1 (useful in
 # CI pipelines or scripts that source this file multiple times in a pipeline).
 
@@ -34,37 +37,184 @@ _CONTAINER_ENGINE_LOADED=1
 # Detection
 # ---------------------------------------------------------------------------
 
-_detect_container_engine() {
-  # Honour explicit override.
-  if [[ -n "${CONTAINER_ENGINE:-}" ]]; then
-    if ! command -v "${CONTAINER_ENGINE}" >/dev/null 2>&1; then
-      echo "Error: CONTAINER_ENGINE=${CONTAINER_ENGINE} is not installed or not in PATH" >&2
-      exit 1
-    fi
-    _CE_EXPLICIT_OVERRIDE=1
-    return
-  fi
+_ce_lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
 
+_ce_error() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+_ce_validate_engine_value() {
+  local name=$1
+  local value=$2
+
+  case "${value}" in
+    docker|podman)
+      ;;
+    *)
+      _ce_error "${name}=${value} is invalid; expected docker or podman"
+      ;;
+  esac
+}
+
+_ce_docker_is_podman_shim() {
+  command -v docker >/dev/null 2>&1 && docker --version 2>/dev/null | grep -qi podman
+}
+
+_ce_require_engine_available() {
+  local engine=$1
+
+  case "${engine}" in
+    docker)
+      if ! command -v docker >/dev/null 2>&1; then
+        _ce_error "CONTAINER_ENGINE=docker requires the docker CLI to be installed and in PATH"
+      fi
+      if _ce_docker_is_podman_shim; then
+        _ce_error "CONTAINER_ENGINE=docker was requested, but docker appears to be a Podman compatibility shim"
+      fi
+      ;;
+    podman)
+      if command -v podman >/dev/null 2>&1 || _ce_docker_is_podman_shim; then
+        return
+      fi
+      _ce_error "CONTAINER_ENGINE=podman requires the podman CLI or a docker-compatible Podman shim to be installed and in PATH"
+      ;;
+  esac
+}
+
+_ce_auto_detect_engine() {
   # Prefer podman when available.
   if command -v podman >/dev/null 2>&1; then
-    CONTAINER_ENGINE=podman
+    echo "podman"
     return
   fi
 
   # Fall back to docker — but detect the podman-masquerading-as-docker shim
   # shipped by some distros (e.g. Fedora, RHEL).
   if command -v docker >/dev/null 2>&1; then
-    if docker --version 2>/dev/null | grep -qi podman; then
-      CONTAINER_ENGINE=podman
+    if _ce_docker_is_podman_shim; then
+      echo "podman"
     else
-      CONTAINER_ENGINE=docker
+      echo "docker"
     fi
     return
   fi
 
   echo "Error: neither podman nor docker is installed." >&2
-  echo "       Install one of them and try again." >&2
+  echo "       Install one of them, or set CONTAINER_ENGINE=docker|podman." >&2
   exit 1
+}
+
+_ce_required_engine_from_e2e_driver() {
+  local driver
+  driver="$(_ce_lower "${OPENSHELL_E2E_DRIVER:-}")"
+
+  case "${driver}" in
+    docker|podman)
+      echo "${driver}"
+      ;;
+  esac
+}
+
+_ce_required_engine_from_local_cluster() {
+  local explicit_engine=$1
+
+  if [[ "${CONTAINER_ENGINE_TARGET:-}" != "local-k8s-cluster" ]]; then
+    return
+  fi
+
+  local context=""
+  if command -v kubectl >/dev/null 2>&1; then
+    context="$(kubectl config current-context 2>/dev/null || true)"
+  fi
+
+  case "${context}" in
+    k3d-*)
+      echo "docker"
+      ;;
+    kind-*)
+      case "$(_ce_lower "${KIND_EXPERIMENTAL_PROVIDER:-}")" in
+        docker|podman)
+          _ce_lower "${KIND_EXPERIMENTAL_PROVIDER}"
+          ;;
+        *)
+          if [[ -z "${explicit_engine}" ]]; then
+            _ce_error "CONTAINER_ENGINE_TARGET=local-k8s-cluster cannot infer the container engine for kind context '${context}'; set CONTAINER_ENGINE=docker or CONTAINER_ENGINE=podman"
+          fi
+          ;;
+      esac
+      ;;
+    "")
+      if [[ -z "${explicit_engine}" ]]; then
+        _ce_error "CONTAINER_ENGINE_TARGET=local-k8s-cluster requires an active k3d/kind Kubernetes context, or an explicit CONTAINER_ENGINE=docker|podman"
+      fi
+      ;;
+    *)
+      if [[ -z "${explicit_engine}" ]]; then
+        _ce_error "cannot infer container engine for Kubernetes context '${context}'; set CONTAINER_ENGINE=docker|podman"
+      fi
+      ;;
+  esac
+}
+
+_detect_container_engine() {
+  if [[ -n "${OPENSHELL_E2E_CONTAINER_ENGINE:-}" ]]; then
+    _ce_error "OPENSHELL_E2E_CONTAINER_ENGINE is no longer supported; set CONTAINER_ENGINE=docker|podman instead"
+  fi
+
+  case "${CONTAINER_ENGINE_TARGET:-}" in
+    ""|local-k8s-cluster)
+      ;;
+    *)
+      _ce_error "CONTAINER_ENGINE_TARGET=${CONTAINER_ENGINE_TARGET} is invalid; expected local-k8s-cluster"
+      ;;
+  esac
+
+  local explicit_engine=""
+  if [[ -n "${CONTAINER_ENGINE:-}" ]]; then
+    explicit_engine="$(_ce_lower "${CONTAINER_ENGINE}")"
+    _ce_validate_engine_value "CONTAINER_ENGINE" "${explicit_engine}"
+  fi
+
+  local e2e_required=""
+  if ! e2e_required="$(_ce_required_engine_from_e2e_driver)"; then
+    exit 1
+  fi
+
+  local local_cluster_required=""
+  if ! local_cluster_required="$(_ce_required_engine_from_local_cluster "${explicit_engine}")"; then
+    exit 1
+  fi
+
+  if [[ -n "${e2e_required}" && -n "${local_cluster_required}" && "${e2e_required}" != "${local_cluster_required}" ]]; then
+    _ce_error "OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER} requires ${e2e_required}, but CONTAINER_ENGINE_TARGET=local-k8s-cluster requires ${local_cluster_required}"
+  fi
+
+  if [[ -n "${explicit_engine}" ]]; then
+    if [[ -n "${e2e_required}" && "${explicit_engine}" != "${e2e_required}" ]]; then
+      _ce_error "CONTAINER_ENGINE=${explicit_engine} conflicts with OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER}; use CONTAINER_ENGINE=${e2e_required} or unset CONTAINER_ENGINE"
+    fi
+    if [[ -n "${local_cluster_required}" && "${explicit_engine}" != "${local_cluster_required}" ]]; then
+      _ce_error "CONTAINER_ENGINE=${explicit_engine} conflicts with CONTAINER_ENGINE_TARGET=local-k8s-cluster; active local cluster requires ${local_cluster_required}"
+    fi
+    CONTAINER_ENGINE="${explicit_engine}"
+    _CE_SELECTION_REASON=explicit
+  elif [[ -n "${e2e_required}" ]]; then
+    CONTAINER_ENGINE="${e2e_required}"
+    _CE_SELECTION_REASON=e2e-driver
+  elif [[ -n "${local_cluster_required}" ]]; then
+    CONTAINER_ENGINE="${local_cluster_required}"
+    _CE_SELECTION_REASON=local-k8s-cluster
+  else
+    if ! CONTAINER_ENGINE="$(_ce_auto_detect_engine)"; then
+      exit 1
+    fi
+    _CE_SELECTION_REASON=auto
+  fi
+
+  _ce_require_engine_available "${CONTAINER_ENGINE}"
 }
 
 _detect_container_engine
@@ -193,22 +343,45 @@ ce_host_arch() {
 #
 # Docker: docker info --format '{{.Architecture}}'
 # Podman: podman info --format '{{.Host.Arch}}'
-# Falls back to the kernel architecture when the daemon query is unavailable so
-# local builds do not accidentally target amd64 on arm64 hosts.
+# Fails directly when the engine query is unavailable or returns malformed
+# metadata. Silently falling back to the host architecture can make cross-VM
+# builds use the wrong target.
 # ---------------------------------------------------------------------------
 ce_info_arch() {
-  local arch=""
+  local info_output info_error_file arch normalized format
+
   if ce_is_docker; then
-    arch=$("${_CE_BIN}" info --format '{{.Architecture}}' 2>/dev/null || true)
+    format='{{.Architecture}}'
   else
-    arch=$("${_CE_BIN}" info --format '{{.Host.Arch}}' 2>/dev/null || true)
+    format='{{.Host.Arch}}'
   fi
 
-  if [[ -n "${arch}" ]]; then
-    ce_normalize_arch "${arch}"
-  else
-    ce_host_arch
+  info_error_file="$(mktemp "${TMPDIR:-/tmp}/openshell-ce-info.XXXXXX")"
+  if ! info_output=$("${_CE_BIN}" info --format "${format}" 2>"${info_error_file}"); then
+    echo "Error: failed to query ${CONTAINER_ENGINE} architecture with '${_CE_BIN} info':" >&2
+    if [[ -n "${info_output}" ]]; then
+      printf '%s\n' "${info_output}" >&2
+    fi
+    cat "${info_error_file}" >&2 || true
+    rm -f "${info_error_file}"
+    exit 1
   fi
+  rm -f "${info_error_file}"
+
+  arch="$(printf '%s\n' "${info_output}" | awk 'NF { print; exit }')"
+  if [[ -z "${arch}" ]]; then
+    _ce_error "${CONTAINER_ENGINE} info did not report a host architecture"
+  fi
+
+  normalized="$(ce_normalize_arch "${arch}")"
+  case "${normalized}" in
+    amd64|arm64)
+      echo "${normalized}"
+      ;;
+    *)
+      _ce_error "unsupported ${CONTAINER_ENGINE} architecture '${arch}' reported by '${_CE_BIN} info'"
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -345,10 +518,19 @@ _ce_log_detected() {
   if [[ "${CONTAINER_ENGINE_QUIET:-}" == "1" ]]; then
     return
   fi
-  if [[ -n "${_CE_EXPLICIT_OVERRIDE:-}" ]]; then
-    echo "[container-engine] using ${CONTAINER_ENGINE} (set via CONTAINER_ENGINE env)" >&2
-  else
-    echo "[container-engine] auto-detected: ${CONTAINER_ENGINE} (override with CONTAINER_ENGINE=docker|podman)" >&2
-  fi
+  case "${_CE_SELECTION_REASON:-auto}" in
+    explicit)
+      echo "[container-engine] using ${CONTAINER_ENGINE} (set via CONTAINER_ENGINE env)" >&2
+      ;;
+    e2e-driver)
+      echo "[container-engine] using ${CONTAINER_ENGINE} (required by OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER})" >&2
+      ;;
+    local-k8s-cluster)
+      echo "[container-engine] using ${CONTAINER_ENGINE} (required by CONTAINER_ENGINE_TARGET=local-k8s-cluster)" >&2
+      ;;
+    *)
+      echo "[container-engine] auto-detected: ${CONTAINER_ENGINE} (override with CONTAINER_ENGINE=docker|podman)" >&2
+      ;;
+  esac
 }
 _ce_log_detected

@@ -26,7 +26,7 @@ build:
       context: ../../..
       custom:
         buildCommand: |
-          CONTAINER_ENGINE=docker \
+          CONTAINER_ENGINE_TARGET=local-k8s-cluster \
           IMAGE_NAME="${IMAGE%:*}" \
           IMAGE_TAG="${IMAGE##*:}" \
           tasks/scripts/docker-build-image.sh gateway
@@ -43,7 +43,7 @@ build:
       context: ../../..
       custom:
         buildCommand: |
-          CONTAINER_ENGINE=docker \
+          CONTAINER_ENGINE_TARGET=local-k8s-cluster \
           IMAGE_NAME="${IMAGE%:*}" \
           IMAGE_TAG="${IMAGE##*:}" \
           tasks/scripts/docker-build-image.sh supervisor

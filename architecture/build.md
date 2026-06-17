@@ -64,11 +64,13 @@ packages share the same host portability floor. Supervisor binaries remain
 static musl and use `cargo zigbuild` when available, including native CPU
 architectures, so C dependencies are compiled for the musl target instead of the
 host GNU libc target. Local Docker image tasks infer the target architecture from
-`DOCKER_PLATFORM` when set, otherwise from the container engine host metadata
-with the kernel architecture as the fallback. CI invokes the same staging step
-via the `rust-native-build.yml` workflow (per-architecture, per-component) and
-uploads the result as an artifact that the image build job downloads back into
-the staging directory before running Buildx.
+`DOCKER_PLATFORM` when set. Otherwise, they require valid container engine host
+metadata and fail when the engine query is unavailable or reports an unsupported
+architecture, avoiding host-kernel fallbacks that can target the wrong
+architecture. CI invokes the same staging step via the `rust-native-build.yml`
+workflow (per-architecture, per-component) and uploads the result as an artifact
+that the image build job downloads back into the staging directory before running
+Buildx.
 
 Runtime layout:
 
@@ -93,6 +95,23 @@ the macOS user's shared home directory.
 
 Local image work should use `mise` tasks rather than direct Docker commands so
 the same staging and tagging assumptions are used locally and in CI.
+
+Container-engine selection is centralized in `tasks/scripts/container-engine.sh`.
+`CONTAINER_ENGINE=docker|podman` is the only explicit override. Docker- and
+Podman-backed e2e wrappers validate that override against their lane, set
+`OPENSHELL_E2E_DRIVER`, and reject the removed
+`OPENSHELL_E2E_CONTAINER_ENGINE` selector so build helpers and Rust e2e support
+containers use the same engine. When no explicit override is present, an e2e
+driver requirement wins, then a local-cluster requirement, then host
+auto-detection.
+
+Local Kubernetes image workflows opt into cluster-aware selection with
+`CONTAINER_ENGINE_TARGET=local-k8s-cluster`. The hint is intentionally scoped to
+Skaffold-style `push: false` builds where the image must land in the engine
+backing the active local cluster: `k3d-*` contexts require Docker, `kind-*`
+contexts use `KIND_EXPERIMENTAL_PROVIDER=docker|podman` when set, and ambiguous
+or unknown contexts require an explicit `CONTAINER_ENGINE`. Other image builds
+do not infer from kube context.
 
 ## CI and E2E
 

@@ -25,6 +25,36 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh
 source "${ROOT}/e2e/support/gateway-common.sh"
 
+require_container_engine_lane() {
+  local lane=$1
+  local label=$2
+  local selected_engine selected_driver
+
+  if [ -n "${OPENSHELL_E2E_CONTAINER_ENGINE:-}" ]; then
+    echo "ERROR: OPENSHELL_E2E_CONTAINER_ENGINE is no longer supported." >&2
+    echo "       Set CONTAINER_ENGINE=${lane} for the ${label} e2e lane, or unset it." >&2
+    exit 2
+  fi
+  selected_engine="$(printf '%s' "${CONTAINER_ENGINE:-}" | tr '[:upper:]' '[:lower:]')"
+  selected_driver="$(printf '%s' "${OPENSHELL_E2E_DRIVER:-}" | tr '[:upper:]' '[:lower:]')"
+
+  if [ -n "${selected_engine}" ] && [ "${selected_engine}" != "${lane}" ]; then
+    echo "ERROR: CONTAINER_ENGINE=${CONTAINER_ENGINE} conflicts with the ${label} e2e lane." >&2
+    echo "       Set CONTAINER_ENGINE=${lane} or unset CONTAINER_ENGINE." >&2
+    exit 2
+  fi
+  if [ -n "${selected_driver}" ] && [ "${selected_driver}" != "${lane}" ]; then
+    echo "ERROR: OPENSHELL_E2E_DRIVER=${OPENSHELL_E2E_DRIVER} conflicts with the ${label} e2e lane." >&2
+    echo "       Set OPENSHELL_E2E_DRIVER=${lane} or unset OPENSHELL_E2E_DRIVER." >&2
+    exit 2
+  fi
+
+  export CONTAINER_ENGINE="${lane}"
+  export OPENSHELL_E2E_DRIVER="${lane}"
+}
+
+require_container_engine_lane podman Podman
+
 PODMAN_XDG_CONFIG_HOME_WAS_SET=0
 PODMAN_XDG_CONFIG_HOME=""
 if [ "${XDG_CONFIG_HOME+x}" = x ]; then
@@ -302,8 +332,7 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
     "$(e2e_endpoint_port "${OPENSHELL_GATEWAY_ENDPOINT}")"
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
-  export OPENSHELL_E2E_DRIVER="${OPENSHELL_E2E_DRIVER:-podman}"
-  export OPENSHELL_E2E_CONTAINER_ENGINE="${OPENSHELL_E2E_CONTAINER_ENGINE:-podman}"
+  export OPENSHELL_E2E_DRIVER="podman"
 
   echo "Using existing Podman e2e gateway endpoint: ${OPENSHELL_GATEWAY_ENDPOINT}"
   "$@"
@@ -350,7 +379,6 @@ PODMAN_NETWORK_NAME="${E2E_NAMESPACE}"
 ensure_e2e_podman_network "${PODMAN_NETWORK_NAME}"
 
 export OPENSHELL_E2E_DRIVER="podman"
-export OPENSHELL_E2E_CONTAINER_ENGINE="podman"
 export OPENSHELL_E2E_NETWORK_NAME="${PODMAN_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 
