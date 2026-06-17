@@ -17,6 +17,11 @@ cargo_target=$1
 zig_target=$2
 wrapper_dir=$3
 
+bare_cargo_target=$cargo_target
+if [[ $bare_cargo_target =~ ^(.+)\.[0-9]+\.[0-9]+$ ]]; then
+  bare_cargo_target=${BASH_REMATCH[1]}
+fi
+
 # cargo-zigbuild accepts Rust target triples with glibc suffixes, for example
 # x86_64-unknown-linux-gnu.2.28. Zig's C/C++ driver expects the vendorless form.
 zig_cc_target=${zig_target/-unknown-linux-/-linux-}
@@ -71,10 +76,14 @@ set(CMAKE_CXX_COMPILER "$wrapper_dir/c++")
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 EOF
 
-bare_cargo_target=$cargo_target
-if [[ $bare_cargo_target =~ ^(.+)\.[0-9]+\.[0-9]+$ ]]; then
-  bare_cargo_target=${BASH_REMATCH[1]}
-fi
+for profile in release debug; do
+  z3_build_root="target/$bare_cargo_target/$profile/build"
+  if [[ -d $z3_build_root ]]; then
+    while IFS= read -r stale_build_dir; do
+      rm -rf "$stale_build_dir"
+    done < <(find "$z3_build_root" -mindepth 3 -maxdepth 3 -type d -path "*/z3-sys-*/out/build")
+  fi
+done
 
 target_env=${cargo_target//[-.]/_}
 bare_target_env=${bare_cargo_target//[-.]/_}
