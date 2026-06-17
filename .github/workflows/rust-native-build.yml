@@ -230,14 +230,17 @@ jobs:
           fi
 
           mise x -- rustup target add "${{ steps.target.outputs.target }}"
+          
           cargo_cmd=(cargo build)
           build_target="${{ steps.target.outputs.target }}"
+          args=()
+          
           if [[ "${{ inputs.component }}" == "gateway" ]]; then
             cargo_cmd=(cargo zigbuild)
             build_target="${{ steps.target.outputs.zig_target }}"
             args+=(--features bundled-z3)
           fi
-          args=(
+          args+=(
             --release
             --target "$build_target"
             -p "${{ steps.target.outputs.crate }}"
