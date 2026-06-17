@@ -76,11 +76,22 @@ set(CMAKE_CXX_COMPILER "$wrapper_dir/c++")
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 EOF
 
+is_stale_z3_build_dir() {
+  local build_dir=$1
+
+  grep -R -q -E \
+    'cargo-zigbuild|zigc(c|xx)-.*unknown-linux-gnu\.[0-9]+\.[0-9]+' \
+    "$build_dir/CMakeCache.txt" "$build_dir/CMakeFiles" 2>/dev/null
+}
+
 for profile in release debug; do
   z3_build_root="target/$bare_cargo_target/$profile/build"
   if [[ -d $z3_build_root ]]; then
-    while IFS= read -r stale_build_dir; do
-      rm -rf "$stale_build_dir"
+    while IFS= read -r z3_build_dir; do
+      if is_stale_z3_build_dir "$z3_build_dir"; then
+        echo "Removing stale z3-sys CMake cache: $z3_build_dir" >&2
+        rm -rf "$z3_build_dir"
+      fi
     done < <(find "$z3_build_root" -mindepth 3 -maxdepth 3 -type d -path "*/z3-sys-*/out/build")
   fi
 done
