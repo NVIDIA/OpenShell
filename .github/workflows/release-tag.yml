@@ -454,6 +454,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
           shared-key: gateway-binary-gnu-${{ matrix.arch }}
+          key: zig-wrapper-${{ hashFiles('tasks/scripts/setup-zig-cc-wrapper.sh') }}
           cache-directories: .cache/sccache
           cache-targets: "true"
 
