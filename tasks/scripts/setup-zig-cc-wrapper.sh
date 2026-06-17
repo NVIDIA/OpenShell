@@ -61,14 +61,42 @@ EOF
   chmod +x "$wrapper_dir/$tool"
 done
 
+processor=${cargo_target%%-*}
+toolchain_file="$wrapper_dir/toolchain.cmake"
+cat >"$toolchain_file" <<EOF
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR "$processor")
+set(CMAKE_C_COMPILER "$wrapper_dir/cc")
+set(CMAKE_CXX_COMPILER "$wrapper_dir/c++")
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+EOF
+
+bare_cargo_target=$cargo_target
+if [[ $bare_cargo_target =~ ^(.+)\.[0-9]+\.[0-9]+$ ]]; then
+  bare_cargo_target=${BASH_REMATCH[1]}
+fi
+
 target_env=${cargo_target//[-.]/_}
+bare_target_env=${bare_cargo_target//[-.]/_}
 
 if [[ -n ${GITHUB_ENV:-} ]]; then
   {
     echo "CC_${target_env}=$wrapper_dir/cc"
     echo "CXX_${target_env}=$wrapper_dir/c++"
+    echo "CMAKE_TOOLCHAIN_FILE_${target_env}=$toolchain_file"
+    if [[ $bare_target_env != "$target_env" ]]; then
+      echo "CC_${bare_target_env}=$wrapper_dir/cc"
+      echo "CXX_${bare_target_env}=$wrapper_dir/c++"
+      echo "CMAKE_TOOLCHAIN_FILE_${bare_target_env}=$toolchain_file"
+    fi
   } >>"$GITHUB_ENV"
 else
   echo "export CC_${target_env}=$wrapper_dir/cc"
   echo "export CXX_${target_env}=$wrapper_dir/c++"
+  echo "export CMAKE_TOOLCHAIN_FILE_${target_env}=$toolchain_file"
+  if [[ $bare_target_env != "$target_env" ]]; then
+    echo "export CC_${bare_target_env}=$wrapper_dir/cc"
+    echo "export CXX_${bare_target_env}=$wrapper_dir/c++"
+    echo "export CMAKE_TOOLCHAIN_FILE_${bare_target_env}=$toolchain_file"
+  fi
 fi
