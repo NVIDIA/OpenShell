@@ -1088,8 +1088,8 @@ fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
 
-fn gpu_requirements() -> GpuResourceRequirements {
-    GpuResourceRequirements {}
+fn gpu_requirements(count: Option<u32>) -> GpuResourceRequirements {
+    GpuResourceRequirements { count }
 }
 
 #[tokio::test]
@@ -1301,7 +1301,7 @@ async fn sandbox_create_sends_gpu_default_request() {
         "openshell",
         &[],
         true,
-        Some(gpu_requirements()),
+        Some(gpu_requirements(None)),
         None,
         None,
         None,
@@ -1328,11 +1328,53 @@ async fn sandbox_create_sends_gpu_default_request() {
         .and_then(|requirements| requirements.gpu.as_ref())
         .expect("GPU requirement should be sent");
 
-    assert!(requests[0]
+    assert_eq!(gpu.count, None);
+}
+
+#[tokio::test]
+async fn sandbox_create_sends_gpu_count_request() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("gpu-two"),
+        None,
+        "openshell",
+        &[],
+        true,
+        Some(gpu_requirements(Some(2))),
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &HashMap::new(),
+        "manual",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let gpu = requests[0]
         .spec
         .as_ref()
         .and_then(|spec| spec.resource_requirements.as_ref())
-        .is_some_and(|requirements| requirements.gpu.is_some()));
+        .and_then(|requirements| requirements.gpu.as_ref())
+        .expect("GPU requirement should be sent");
+
+    assert_eq!(gpu.count, Some(2));
 }
 
 #[tokio::test]

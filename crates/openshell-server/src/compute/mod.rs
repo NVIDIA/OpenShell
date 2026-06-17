@@ -1506,7 +1506,7 @@ fn driver_sandbox_spec_from_public(
                 gpu: requirements
                     .gpu
                     .as_ref()
-                    .map(|_| DriverGpuResourceRequirements {}),
+                    .map(|gpu| DriverGpuResourceRequirements { count: gpu.count }),
             }
         }),
         sandbox_token: String::new(),
@@ -2092,7 +2092,7 @@ mod tests {
     fn driver_sandbox_spec_from_public_preserves_gpu_requirement() {
         let public = SandboxSpec {
             resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                gpu: Some(openshell_core::proto::GpuResourceRequirements {}),
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
             }),
             ..Default::default()
         };
@@ -2105,7 +2105,7 @@ mod tests {
             .as_ref()
             .and_then(|requirements| requirements.gpu.as_ref())
             .expect("driver GPU requirement should be set");
-        assert_eq!(gpu, &DriverGpuResourceRequirements {});
+        assert_eq!(gpu.count, Some(2));
     }
 
     #[test]
@@ -2615,7 +2615,7 @@ mod tests {
             &mut status,
             Some(&SandboxSpec {
                 resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                    gpu: Some(openshell_core::proto::GpuResourceRequirements {}),
+                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
                 }),
                 ..Default::default()
             }),
@@ -2976,7 +2976,7 @@ mod tests {
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
                 resource_requirements: Some(openshell_core::proto::ResourceRequirements {
-                    gpu: Some(openshell_core::proto::GpuResourceRequirements {}),
+                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
                 }),
                 ..Default::default()
             }),

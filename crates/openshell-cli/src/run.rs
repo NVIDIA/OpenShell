@@ -8395,7 +8395,7 @@ mod tests {
     #[test]
     fn provisioning_timeout_message_includes_condition_and_gpu_hint() {
         let resource_requirements = ResourceRequirements {
-            gpu: Some(GpuResourceRequirements {}),
+            gpu: Some(GpuResourceRequirements { count: None }),
         };
         let message = provisioning_timeout_message(
             120,

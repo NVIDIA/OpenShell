@@ -336,7 +336,11 @@ message ResourceRequirements {
 }
 
 // Public GPU resource requirements.
-message GpuResourceRequirements {}
+message GpuResourceRequirements {
+  // Optional number of GPUs requested. When omitted, the request is for one
+  // GPU using the selected driver's default assignment behavior.
+  optional uint32 count = 1;
+}
 
 // Public sandbox template mapped onto compute-driver template inputs.
 message SandboxTemplate {

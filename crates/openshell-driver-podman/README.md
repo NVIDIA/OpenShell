@@ -46,7 +46,7 @@ The container spec in `container.rs` sets these security-critical fields:
 | `no_new_privileges` | `true` | Prevents privilege escalation after exec. |
 | `seccomp_profile_path` | `unconfined` | The supervisor installs its own policy-aware BPF filter. A container-level profile can block Landlock/seccomp syscalls during setup. |
 | `mounts` | Private tmpfs at `/run/netns` | Lets the supervisor create named network namespaces in rootless Podman. |
-| CDI GPU devices | `driver_config.cdi_devices` when set, otherwise one concrete NVIDIA CDI GPU. Local `/dev/dxg` permits `nvidia.com/gpu=all` as a WSL2 all-only compatibility fallback. | Exposes requested GPUs to GPU-enabled sandbox containers. Counted GPU requests are rejected. |
+| CDI GPU devices | Opaque `driver_config.cdi_devices` values when set, otherwise the requested count of NVIDIA CDI GPUs selected in round-robin order. Local `/dev/dxg` permits `nvidia.com/gpu=all` as a WSL2 all-only compatibility fallback, where it counts as one selectable device. | Exposes requested GPUs to GPU-enabled sandbox containers. Exact CDI device lists must not contain duplicates and must match the effective GPU count. |
 
 The restricted agent child does not retain these supervisor privileges.
 
