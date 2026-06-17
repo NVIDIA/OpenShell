@@ -4,6 +4,7 @@
 //! Configuration management for `OpenShell` components.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -67,6 +68,27 @@ impl ComputeDriverKind {
             Self::Podman => "podman",
         }
     }
+}
+
+/// Normalize a configured compute driver name.
+///
+/// Built-in driver names and custom remote driver names share the same
+/// selection namespace. The normalized value is lowercase ASCII and may contain
+/// letters, digits, `-`, and `_`.
+pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("compute driver name cannot be empty".to_string());
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(format!(
+            "invalid compute driver name '{value}'. use ASCII letters, digits, '-' or '_'"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
 }
 
 impl fmt::Display for ComputeDriverKind {
@@ -358,7 +380,14 @@ pub struct Config {
     /// The config shape allows multiple drivers so the gateway can evolve
     /// toward multi-backend routing. Current releases require exactly one
     /// configured driver.
-    pub compute_drivers: Vec<ComputeDriverKind>,
+    pub compute_drivers: Vec<String>,
+
+    /// Operator-provided endpoints for named remote compute drivers.
+    ///
+    /// This is populated by CLI/env inputs such as `--compute-driver-socket`.
+    /// TOML-authored endpoints live under `[openshell.drivers.<name>]` and are
+    /// resolved by the gateway config loader.
+    pub compute_driver_endpoints: BTreeMap<String, PathBuf>,
 
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
@@ -559,6 +588,7 @@ impl Config {
             gateway_jwt: None,
             database_url: String::new(),
             compute_drivers: vec![],
+            compute_driver_endpoints: BTreeMap::new(),
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
@@ -614,11 +644,27 @@ impl Config {
 
     /// Create a new configuration with the configured compute drivers.
     #[must_use]
-    pub fn with_compute_drivers<I>(mut self, drivers: I) -> Self
+    pub fn with_compute_drivers<I, D>(mut self, drivers: I) -> Self
     where
-        I: IntoIterator<Item = ComputeDriverKind>,
+        I: IntoIterator<Item = D>,
+        D: ToString,
     {
-        self.compute_drivers = drivers.into_iter().collect();
+        self.compute_drivers = drivers
+            .into_iter()
+            .map(|driver| driver.to_string())
+            .collect();
+        self
+    }
+
+    /// Register a Unix domain socket endpoint for a named remote driver.
+    #[must_use]
+    pub fn with_compute_driver_endpoint(
+        mut self,
+        name: impl Into<String>,
+        socket: impl Into<PathBuf>,
+    ) -> Self {
+        self.compute_driver_endpoints
+            .insert(name.into(), socket.into());
         self
     }
 
@@ -766,8 +812,8 @@ mod tests {
     use super::is_reachable_unix_socket;
     use super::{
         ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket, podman_socket_candidates_from_env,
-        podman_socket_responds,
+        docker_host_unix_socket_path, is_unix_socket, normalize_compute_driver_name,
+        podman_socket_candidates_from_env, podman_socket_responds,
     };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
@@ -801,6 +847,18 @@ mod tests {
     fn compute_driver_kind_rejects_unknown_values() {
         let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
         assert!(err.contains("unsupported compute driver 'firecracker'"));
+    }
+
+    #[test]
+    fn compute_driver_name_normalization_accepts_builtin_and_custom_names() {
+        assert_eq!(normalize_compute_driver_name(" VM ").unwrap(), "vm");
+        assert_eq!(
+            normalize_compute_driver_name("Kyma_GPU-1").unwrap(),
+            "kyma_gpu-1"
+        );
+
+        let err = normalize_compute_driver_name("kyma/gpu").unwrap_err();
+        assert!(err.contains("invalid compute driver name"));
     }
 
     #[test]

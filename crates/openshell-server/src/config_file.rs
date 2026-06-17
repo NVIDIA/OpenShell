@@ -87,7 +87,7 @@ pub struct GatewayFileSection {
 
     // ── Drivers ──────────────────────────────────────────────────────────
     #[serde(default)]
-    pub compute_drivers: Option<Vec<ComputeDriverKind>>,
+    pub compute_drivers: Option<Vec<String>>,
 
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
@@ -631,7 +631,7 @@ version = 2
             .expect("compute_drivers must be explicitly set in the RPM default config");
         assert_eq!(
             drivers,
-            &[ComputeDriverKind::Podman],
+            &["podman".to_string()],
             "RPM default must pin compute_drivers to [podman] to prevent unexpected \
              driver selection when Docker is also installed"
         );

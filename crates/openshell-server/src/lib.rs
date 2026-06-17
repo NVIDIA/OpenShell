@@ -10,14 +10,18 @@
 //! - mTLS support
 //!
 //! TODO(driver-abstraction): `build_compute_runtime` still switches on
-//! [`ComputeDriverKind`] and calls driver-specific constructors
-//! ([`ComputeRuntime::new_kubernetes`], [`compute::vm::spawn`] +
-//! [`ComputeRuntime::new_remote_vm`]). Once we have a generalized compute
-//! driver interface, the per-arm wiring here should collapse to a single
-//! driver-agnostic path that asks each registered driver to produce a
-//! [`Channel`](tonic::transport::Channel) and hands the rest of the gateway a
-//! uniform [`ComputeRuntime`]. The remaining VM plumbing now lives in
-//! [`compute::vm`]; keep this file driver-agnostic going forward.
+//! built-in driver names and calls driver-specific constructors
+//! ([`ComputeRuntime::new_kubernetes`], [`ComputeRuntime::new_docker`],
+//! [`compute::vm::spawn`] + [`ComputeRuntime::new_remote_driver`],
+//! [`ComputeRuntime::new_podman`]). Endpoint-backed drivers now share the
+//! remote `compute_driver.proto` path, so new remote drivers should enter
+//! through named endpoint acquisition rather than gateway-wide socket side
+//! channels. Once we have a generalized compute-driver registry, the remaining
+//! per-arm wiring here should collapse to driver construction records that
+//! produce either an in-process `SharedComputeDriver` or an acquired remote
+//! endpoint, then hand the rest of the gateway a uniform [`ComputeRuntime`].
+//! The VM launch plumbing now lives in [`compute::vm`]; keep this file limited
+//! to selecting and acquiring drivers.
 
 mod auth;
 pub mod certgen;
@@ -47,6 +51,7 @@ mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -721,12 +726,14 @@ async fn build_compute_runtime(
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 ) -> Result<ComputeRuntime> {
-    let driver = configured_compute_driver(config)?;
-    info!(driver = %driver, "Using compute driver");
-    warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, driver);
+    let driver = configured_compute_driver(config, file)?;
+    info!(driver = %driver.name(), "Using compute driver");
+    if let ConfiguredComputeDriver::Builtin(kind) = &driver {
+        warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, *kind);
+    }
 
     match driver {
-        ComputeDriverKind::Kubernetes => {
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes) => {
             let mut k8s = kubernetes_config_from_file(file)?;
             if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
                 k8s.workspace_default_storage_size = size;
@@ -742,7 +749,7 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ComputeDriverKind::Docker => ComputeRuntime::new_docker(
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => ComputeRuntime::new_docker(
             config.clone(),
             docker_config.clone(),
             store,
@@ -753,21 +760,7 @@ async fn build_compute_runtime(
         )
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
-        ComputeDriverKind::Vm => {
-            let (channel, driver_process) = compute::vm::spawn(config, vm_config).await?;
-            ComputeRuntime::new_remote_vm(
-                channel,
-                Some(driver_process),
-                store,
-                sandbox_index,
-                sandbox_watch_bus,
-                tracing_log_bus,
-                supervisor_sessions,
-            )
-            .await
-            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
-        }
-        ComputeDriverKind::Podman => {
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
             let mut podman = podman_config_from_file(file)?;
             podman.gateway_port = config.bind_address.port();
             if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
@@ -780,6 +773,40 @@ async fn build_compute_runtime(
 
             ComputeRuntime::new_podman(
                 podman,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm) => {
+            let endpoint = compute::vm::spawn(config, vm_config).await?;
+            ComputeRuntime::new_remote_driver(
+                endpoint,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
+        ConfiguredComputeDriver::Remote(remote) => {
+            let RemoteComputeDriverSelection { name, socket_path } = remote;
+            info!(
+                driver = %name,
+                socket = %socket_path.display(),
+                "Using remote compute driver endpoint"
+            );
+            let endpoint = compute::connect_remote_compute_driver(name, &socket_path)
+                .await
+                .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))?;
+            ComputeRuntime::new_remote_driver(
+                endpoint,
                 store,
                 sandbox_index,
                 sandbox_watch_bus,
@@ -868,33 +895,115 @@ fn apply_podman_local_tls_defaults(
     Ok(())
 }
 
-fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
+#[derive(Debug, Clone)]
+enum ConfiguredComputeDriver {
+    Builtin(ComputeDriverKind),
+    Remote(RemoteComputeDriverSelection),
+}
+
+impl ConfiguredComputeDriver {
+    fn name(&self) -> &str {
+        match self {
+            Self::Builtin(kind) => kind.as_str(),
+            Self::Remote(remote) => &remote.name,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RemoteComputeDriverSelection {
+    name: String,
+    socket_path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteComputeDriverConfig {
+    socket_path: PathBuf,
+}
+
+fn configured_compute_driver(
+    config: &Config,
+    file: Option<&config_file::ConfigFile>,
+) -> Result<ConfiguredComputeDriver> {
     match config.compute_drivers.as_slice() {
         [] => match openshell_core::config::detect_driver() {
             Some(ComputeDriverKind::Vm) => Err(Error::config(
                 "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
             )),
-            Some(driver) => Ok(driver),
+            Some(driver) => Ok(ConfiguredComputeDriver::Builtin(driver)),
             None => Err(Error::config(
                 "no compute driver configured and auto-detection found no suitable driver; \
                 set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
             )),
         },
-        [
-            driver @ (ComputeDriverKind::Kubernetes
-            | ComputeDriverKind::Vm
-            | ComputeDriverKind::Docker
-            | ComputeDriverKind::Podman),
-        ] => Ok(*driver),
+        [driver] => resolve_configured_compute_driver(driver, config, file),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
-            drivers
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
+            drivers.join(",")
         ))),
     }
+}
+
+fn resolve_configured_compute_driver(
+    driver_name: &str,
+    config: &Config,
+    file: Option<&config_file::ConfigFile>,
+) -> Result<ConfiguredComputeDriver> {
+    let name = openshell_core::config::normalize_compute_driver_name(driver_name)
+        .map_err(Error::config)?;
+    let driver_kind = builtin_compute_driver(&name);
+    if let Some(socket_path) = config.compute_driver_endpoints.get(&name) {
+        if driver_kind.is_some() {
+            return Err(Error::config(format!(
+                "compute driver '{name}' is a reserved built-in driver and cannot be selected with a socket endpoint"
+            )));
+        }
+        return Ok(ConfiguredComputeDriver::Remote(
+            RemoteComputeDriverSelection {
+                name,
+                socket_path: socket_path.clone(),
+            },
+        ));
+    }
+
+    if let Some(kind) = driver_kind {
+        return Ok(ConfiguredComputeDriver::Builtin(kind));
+    }
+
+    let socket_path = remote_driver_socket_from_file(&name, file)?;
+    Ok(ConfiguredComputeDriver::Remote(
+        RemoteComputeDriverSelection { name, socket_path },
+    ))
+}
+
+fn builtin_compute_driver(name: &str) -> Option<ComputeDriverKind> {
+    name.parse().ok()
+}
+
+fn remote_driver_socket_from_file(
+    name: &str,
+    file: Option<&config_file::ConfigFile>,
+) -> Result<PathBuf> {
+    let Some(file) = file else {
+        return Err(Error::config(format!(
+            "compute driver '{name}' is not a built-in driver; configure [openshell.drivers.{name}].socket_path or pass --drivers {name} with --compute-driver-socket"
+        )));
+    };
+    let Some(raw) = file.openshell.drivers.get(name) else {
+        return Err(Error::config(format!(
+            "compute driver '{name}' is not a built-in driver; configure [openshell.drivers.{name}].socket_path"
+        )));
+    };
+    let config = raw
+        .clone()
+        .try_into::<RemoteComputeDriverConfig>()
+        .map_err(|err| {
+            Error::config(format!(
+                "invalid [openshell.drivers.{name}] table for remote compute driver: {err}"
+            ))
+        })?;
+    Ok(config.socket_path)
 }
 
 fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config, driver: ComputeDriverKind) -> bool {
@@ -916,7 +1025,7 @@ fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config, driver: Compu
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
+        ConfiguredComputeDriver, ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
         gateway_listener_addresses, is_benign_tls_handshake_failure,
         kubernetes_config_for_k8s_sa_bootstrap, kubernetes_sandbox_jwt_expiry_disabled,
@@ -928,6 +1037,7 @@ mod tests {
     };
     use std::io::{Error, ErrorKind};
     use std::net::SocketAddr;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
@@ -1228,14 +1338,14 @@ mod tests {
 
     #[test]
     fn configured_compute_driver_triggers_auto_detection_when_empty() {
-        let config = Config::new(None).with_compute_drivers([]);
+        let config = Config::new(None).with_compute_drivers(std::iter::empty::<String>());
         // Empty drivers triggers auto-detection, which may return Some or None
         // depending on the environment. This test verifies the auto-detection path
         // is taken rather than immediately returning an error.
-        let result = configured_compute_driver(&config);
+        let result = configured_compute_driver(&config, None);
         // Either we get a detected driver or an error about none being detected.
         match result {
-            Ok(driver) => {
+            Ok(ConfiguredComputeDriver::Builtin(driver)) => {
                 assert!(
                     matches!(
                         driver,
@@ -1245,6 +1355,9 @@ mod tests {
                     ),
                     "auto-detected unexpected driver: {driver:?}"
                 );
+            }
+            Ok(ConfiguredComputeDriver::Remote(remote)) => {
+                panic!("auto-detection returned remote driver: {remote:?}");
             }
             Err(e) => {
                 assert!(
@@ -1260,7 +1373,7 @@ mod tests {
     fn configured_compute_driver_rejects_multiple_entries() {
         let config = Config::new(None)
             .with_compute_drivers([ComputeDriverKind::Kubernetes, ComputeDriverKind::Podman]);
-        let err = configured_compute_driver(&config).unwrap_err();
+        let err = configured_compute_driver(&config, None).unwrap_err();
         assert!(
             err.to_string()
                 .contains("multiple compute drivers are not supported yet")
@@ -1271,27 +1384,90 @@ mod tests {
     #[test]
     fn configured_compute_driver_accepts_podman() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
-        assert_eq!(
-            configured_compute_driver(&config).unwrap(),
-            ComputeDriverKind::Podman
-        );
+        let driver = configured_compute_driver(&config, None).unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman)
+        ));
     }
 
     #[test]
     fn configured_compute_driver_accepts_vm() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
-        assert_eq!(
-            configured_compute_driver(&config).unwrap(),
-            ComputeDriverKind::Vm
-        );
+        let driver = configured_compute_driver(&config, None).unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm)
+        ));
     }
 
     #[test]
     fn configured_compute_driver_accepts_docker() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
-        assert_eq!(
-            configured_compute_driver(&config).unwrap(),
-            ComputeDriverKind::Docker
+        let driver = configured_compute_driver(&config, None).unwrap();
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker)
+        ));
+    }
+
+    #[test]
+    fn configured_compute_driver_resolves_named_remote_from_file() {
+        let file: super::config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+compute_drivers = ["kyma"]
+
+[openshell.drivers.kyma]
+socket_path = "/run/openshell/kyma.sock"
+"#,
+        )
+        .unwrap();
+        let config = Config::new(None).with_compute_drivers(["kyma"]);
+
+        let driver = configured_compute_driver(&config, Some(&file)).unwrap();
+
+        match driver {
+            ConfiguredComputeDriver::Remote(remote) => {
+                assert_eq!(remote.name, "kyma");
+                assert_eq!(
+                    remote.socket_path,
+                    PathBuf::from("/run/openshell/kyma.sock")
+                );
+            }
+            ConfiguredComputeDriver::Builtin(other) => {
+                panic!("expected remote driver, got builtin driver {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn configured_compute_driver_rejects_vm_endpoint_from_config() {
+        let config = Config::new(None)
+            .with_compute_drivers([ComputeDriverKind::Vm])
+            .with_compute_driver_endpoint("vm", "/run/openshell/vm.sock");
+
+        let err = configured_compute_driver(&config, None).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("reserved built-in driver and cannot be selected with a socket endpoint"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn configured_compute_driver_rejects_builtin_endpoint() {
+        let config = Config::new(None)
+            .with_compute_drivers([ComputeDriverKind::Docker])
+            .with_compute_driver_endpoint("docker", "/run/openshell/docker.sock");
+
+        let err = configured_compute_driver(&config, None).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("cannot be selected with a socket endpoint"),
+            "unexpected error: {err}"
         );
     }
 

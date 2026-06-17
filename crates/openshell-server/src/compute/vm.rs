@@ -29,6 +29,7 @@
 //! trait implementation registering the VM driver against the generic
 //! interface.
 
+use super::AcquiredRemoteDriverEndpoint;
 #[cfg(unix)]
 use super::ManagedDriverProcess;
 #[cfg(unix)]
@@ -37,7 +38,7 @@ use hyper_util::rt::TokioIo;
 use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
 };
-use openshell_core::{Config, Error, Result};
+use openshell_core::{ComputeDriverKind, Config, Error, Result};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
@@ -451,7 +452,7 @@ pub fn compute_driver_guest_tls_paths(
 pub async fn spawn(
     config: &Config,
     vm_config: &VmComputeConfig,
-) -> Result<(Channel, Arc<ManagedDriverProcess>)> {
+) -> Result<AcquiredRemoteDriverEndpoint> {
     if vm_config.grpc_endpoint.trim().is_empty() {
         return Err(Error::config(
             "grpc_endpoint is required when using the vm compute driver",
@@ -507,14 +508,18 @@ pub async fn spawn(
     })?;
     let channel = wait_for_compute_driver(&socket_path, &mut child).await?;
     let process = Arc::new(ManagedDriverProcess::new(child, socket_path));
-    Ok((channel, process))
+    Ok(AcquiredRemoteDriverEndpoint::managed_builtin(
+        ComputeDriverKind::Vm,
+        channel,
+        process,
+    ))
 }
 
 #[cfg(not(unix))]
 pub async fn spawn(
     _config: &Config,
     _vm_config: &VmComputeConfig,
-) -> Result<(Channel, std::sync::Arc<super::ManagedDriverProcess>)> {
+) -> Result<AcquiredRemoteDriverEndpoint> {
     Err(Error::config(
         "the vm compute driver requires unix domain socket support",
     ))

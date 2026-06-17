@@ -306,3 +306,24 @@ guest_tls_ca     = "/var/lib/openshell/guest-tls/ca.pem"
 guest_tls_cert   = "/var/lib/openshell/guest-tls/client.pem"
 guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 ```
+
+### Extension Driver
+
+Extension drivers run outside the gateway and expose the
+`compute_driver.proto` gRPC service on a Unix socket. Use a non-reserved driver
+name; built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot
+be selected through unmanaged socket endpoints. The selected driver name is the
+key used for driver-owned sandbox config such as `template.driver_config.<name>`.
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:17670"
+log_level       = "info"
+compute_drivers = ["kyma"]
+
+[openshell.drivers.kyma]
+socket_path = "/run/openshell/kyma-compute-driver.sock"
+```
