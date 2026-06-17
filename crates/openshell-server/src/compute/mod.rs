@@ -3422,6 +3422,103 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
+    async fn remote_compute_driver_forwards_lifecycle_calls_over_uds() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("compute-driver.sock");
+        let driver = FakeComputeDriver::new()
+            .with_driver_name("fake-remote-driver")
+            .with_default_image("openshell/sandbox:remote");
+        let _server = driver.serve_uds(&socket_path).unwrap();
+
+        let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+            .await
+            .unwrap();
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let runtime = ComputeRuntime::new_remote_driver(
+            endpoint,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+        )
+        .await
+        .unwrap();
+
+        let mut sandbox = sandbox_record("sb-uds", "uds-sandbox", SandboxPhase::Provisioning);
+        sandbox.spec = Some(SandboxSpec {
+            log_level: "debug".to_string(),
+            template: Some(SandboxTemplate {
+                image: "ghcr.io/nvidia/openshell/sandbox:test".to_string(),
+                driver_config: Some(prost_types::Struct {
+                    fields: [
+                        (
+                            "external-test".to_string(),
+                            struct_value([("pool", string_value("ci"))]),
+                        ),
+                        (
+                            "docker".to_string(),
+                            struct_value([("network_mode", string_value("bridge"))]),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        runtime.validate_sandbox_create(&sandbox).await.unwrap();
+        runtime.create_sandbox(sandbox, None).await.unwrap();
+        assert!(runtime.delete_sandbox("uds-sandbox").await.unwrap());
+
+        let calls = driver.calls();
+        assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");
+        assert!(matches!(calls[0], FakeComputeDriverCall::GetCapabilities));
+
+        let validated = match &calls[1] {
+            FakeComputeDriverCall::ValidateSandboxCreate {
+                sandbox: Some(sandbox),
+            } => sandbox,
+            other => panic!("expected ValidateSandboxCreate call, got {other:?}"),
+        };
+        assert_eq!(validated.id, "sb-uds");
+        assert_eq!(validated.name, "uds-sandbox");
+        let driver_config = validated
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .and_then(|template| template.driver_config.as_ref())
+            .expect("selected driver_config should be forwarded");
+        assert!(driver_config.fields.contains_key("pool"));
+        assert!(!driver_config.fields.contains_key("network_mode"));
+
+        let created = match &calls[2] {
+            FakeComputeDriverCall::CreateSandbox {
+                sandbox: Some(sandbox),
+            } => sandbox,
+            other => panic!("expected CreateSandbox call, got {other:?}"),
+        };
+        assert_eq!(created.id, "sb-uds");
+        assert_eq!(created.name, "uds-sandbox");
+
+        match &calls[3] {
+            FakeComputeDriverCall::DeleteSandbox {
+                sandbox_id,
+                sandbox_name,
+            } => {
+                assert_eq!(sandbox_id, "sb-uds");
+                assert_eq!(sandbox_name, "uds-sandbox");
+            }
+            other => panic!("expected DeleteSandbox call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn create_sandbox_returns_resource_version_one() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
 

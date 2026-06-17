@@ -43,6 +43,8 @@ mod service_routing;
 mod ssh_sessions;
 pub mod supervisor_session;
 mod telemetry;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod tls;
 #[cfg(test)]
 pub(crate) mod tls_test_utils;
