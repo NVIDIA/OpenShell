@@ -450,7 +450,7 @@ jobs:
           grep -q '^openshell-gateway ' <<<"$OUTPUT"
           ldd artifacts/bin/openshell-gateway || true
           if ldd artifacts/bin/openshell-gateway | grep -q 'libz3'; then
-            echo "gateway binary must not require shared libz3; keep z3 bundled for portable release artifacts" >&2
+            echo "gateway binary must not depend on shared libz3; build with bundled-z3" >&2
             exit 1
           fi
 

@@ -51,9 +51,9 @@ brew services restart openshell
 
 ## Linux
 
-On Fedora and RHEL, the install script uses RPM packages. The RPM installs the `openshell` CLI, the `openshell-gateway` daemon, the Z3 runtime library dependency, and a systemd user service.
+On Fedora and RHEL, the install script uses RPM packages. The RPM installs the `openshell` CLI, the `openshell-gateway` daemon, and a systemd user service.
 
-On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, the `openshell-gateway` daemon, VM sandbox support, the Z3 runtime library dependency, and a systemd user service.
+On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
 
 Linux packages require glibc 2.28 or newer. The installer checks libc before downloading packages and exits with an error on older glibc versions, Alpine, musl-based distributions, or unknown libc environments.
 

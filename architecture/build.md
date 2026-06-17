@@ -63,8 +63,7 @@ Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
 binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.28, including
 native-architecture builds, so the gateway image, standalone tarballs, and Linux
 packages share the same host portability floor. The gateway build enables
-`bundled-z3` and release workflows verify that no dynamic `libz3` dependency is
-introduced. Linux VM driver release artifacts use the same glibc floor so
+`bundled-z3`. Linux VM driver release artifacts use the same glibc floor so
 package-managed VM support does not raise the package runtime requirement.
 Release workflows verify the maximum referenced `GLIBC_*` symbol version before
 publishing artifacts.

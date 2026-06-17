@@ -17,15 +17,10 @@ on:
         required: true
         type: string
         description: "GitHub deployment environment for approval gates (e.g., latest/edge, latest/stable)"
-      publish:
-        required: false
-        type: boolean
-        default: true
-        description: "Upload the built snap to the Snap Store"
 
     secrets:
       publish-credentials:
-        required: false
+        required: true
         description: "Snap Store credentials (SNAPCRAFT_STORE_CREDENTIALS)"
 
 permissions:
@@ -47,7 +42,7 @@ jobs:
             runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    environment: ${{ inputs.publish && inputs.github-environment || 'package-smoke' }}
+    environment: ${{ inputs.github-environment }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -172,7 +167,6 @@ jobs:
           retention-days: 5
 
       - name: Upload snap to Snap Store
-        if: inputs.publish
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.publish-credentials }}
         run: |

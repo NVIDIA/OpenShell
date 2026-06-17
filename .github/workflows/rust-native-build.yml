@@ -235,6 +235,7 @@ jobs:
           if [[ "${{ inputs.component }}" == "gateway" ]]; then
             cargo_cmd=(cargo zigbuild)
             build_target="${{ steps.target.outputs.zig_target }}"
+            args+=(--features bundled-z3)
           fi
           args=(
             --release
@@ -242,9 +243,6 @@ jobs:
             -p "${{ steps.target.outputs.crate }}"
             --bin "${{ steps.target.outputs.binary }}"
           )
-          if [[ "${{ inputs.component }}" == "gateway" ]]; then
-            args+=(--features bundled-z3)
-          fi
           if [[ -n "$FEATURES" ]]; then
             args+=(--features "$FEATURES")
           fi
@@ -263,11 +261,9 @@ jobs:
           # Record linkage so image runtime drift is visible in logs.
           ldd --version
           ldd "$BIN" || true
-          if [[ "${{ inputs.component }}" == "gateway" ]]; then
-            if ldd "$BIN" | grep -q 'libz3'; then
-              echo "gateway binary must not require shared libz3; keep z3 bundled for image artifacts" >&2
-              exit 1
-            fi
+          if [[ "${{ inputs.component }}" == "gateway" ]] && ldd "$BIN" | grep -q 'libz3'; then
+            echo "gateway binary must not depend on shared libz3; enable bundled-z3 for image artifacts" >&2
+            exit 1
           fi
 
       - name: Verify glibc symbol floor

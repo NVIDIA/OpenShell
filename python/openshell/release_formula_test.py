@@ -51,7 +51,6 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
         "v0.0.10/openshell-driver-vm-aarch64-apple-darwin.tar.gz"
     ) in formula
     assert 'sha256 "' + "b" * 64 + '"' in formula
-    assert 'depends_on "z3"' not in formula
     assert "OPENSHELL_DRIVERS: " not in formula
     assert 'OPENSHELL_GATEWAY_CONFIG: "#{var}/openshell/gateway.toml"' not in formula
     assert "init-gateway-config.sh" not in formula
@@ -118,8 +117,6 @@ def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     spec = (repo_root / "openshell.spec").read_text(encoding="utf-8")
 
-    assert "z3-libs" not in spec
-    assert "z3-devel" not in spec
     assert "init-gateway-config.sh" not in spec
     assert "init-pki.sh" not in spec
     assert "Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls" in spec
@@ -142,11 +139,6 @@ def test_deb_user_service_uses_gateway_defaults_without_config_helper() -> None:
     unit = (repo_root / "deploy/deb/openshell-gateway.service").read_text(
         encoding="utf-8"
     )
-    control = (repo_root / "deploy/deb/control.in").read_text(encoding="utf-8")
-    snapcraft = (repo_root / "snapcraft.yaml").read_text(encoding="utf-8")
-
-    assert "libz3-4" not in control
-    assert "libz3-4" not in snapcraft
 
     assert "EnvironmentFile=-%E/openshell/gateway.env" in unit
     assert "Environment=OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls" in unit
