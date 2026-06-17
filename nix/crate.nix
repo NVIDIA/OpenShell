@@ -53,9 +53,9 @@
     ];
     assets = [
       (root + "/proto")
-      (root + "/crates/openshell-sandbox/data")
-      (root + "/crates/openshell-sandbox/src/skills")
-      (root + "/crates/openshell-sandbox/testdata")
+      (root + "/crates/openshell-supervisor-network/data")
+      (root + "/crates/openshell-supervisor-network/testdata")
+      (root + "/crates/openshell-supervisor-process/src/skills")
     ];
   };
   openshell-driver-vm = {

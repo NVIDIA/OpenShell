@@ -10,6 +10,9 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 openshell-ocsf = { path = "../openshell-ocsf" }
