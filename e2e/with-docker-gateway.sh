@@ -18,8 +18,9 @@
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE=...
 #   OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY=Always|IfNotPresent|Never
 #
-# The default community sandbox image uses :latest and is pulled with Always so
-# local e2e runs do not reuse stale images that drift from the repo toolchain.
+# The default community sandbox image uses :latest. This wrapper refreshes it
+# before starting the gateway, while the Docker driver defaults to IfNotPresent
+# so local Dockerfile-built images remain usable.
 
 set -euo pipefail
 
@@ -367,14 +368,21 @@ image_uses_latest_tag() {
   [[ "${last_component}" == *:latest ]]
 }
 
-default_sandbox_pull_policy() {
+ensure_sandbox_image_available() {
   local image=$1
 
   if image_uses_latest_tag "${image}"; then
-    printf '%s\n' "Always"
-  else
-    printf '%s\n' "IfNotPresent"
+    echo "Refreshing latest sandbox image ${image}..."
+    docker_pull_with_retry "${image}"
+    return
   fi
+
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "Pulling ${image}..."
+  docker_pull_with_retry "${image}"
 }
 
 DAEMON_ARCH="$(normalize_arch "$(docker info --format '{{.Architecture}}' 2>/dev/null || true)")"
@@ -421,16 +429,10 @@ fi
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 SANDBOX_IMAGE="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
-SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-}}"
-if [ -z "${SANDBOX_IMAGE_PULL_POLICY}" ]; then
-  SANDBOX_IMAGE_PULL_POLICY="$(default_sandbox_pull_policy "${SANDBOX_IMAGE}")"
-fi
-if ! docker image inspect "${SANDBOX_IMAGE}" >/dev/null 2>&1; then
-  echo "Pulling ${SANDBOX_IMAGE}..."
-  if ! docker_pull_with_retry "${SANDBOX_IMAGE}"; then
-    echo "ERROR: sandbox image '${SANDBOX_IMAGE}' is not available." >&2
-    exit 2
-  fi
+SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY:-${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}}"
+if ! ensure_sandbox_image_available "${SANDBOX_IMAGE}"; then
+  echo "ERROR: sandbox image '${SANDBOX_IMAGE}' is not available." >&2
+  exit 2
 fi
 
 PKI_DIR="${WORKDIR}/pki"
