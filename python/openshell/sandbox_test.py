@@ -1390,20 +1390,16 @@ def test_from_active_cluster_reads_utf8_bytes_from_active_gateway_and_metadata(
     tmp_path: Path,
     monkeypatch: Any,
 ) -> None:
-    gateway_name = "gw-utf8"
+    gateway_name = "gw-é"
     gateway_dir = tmp_path / "openshell" / "gateways" / gateway_name
-    mtls_dir = gateway_dir / "mtls"
-    mtls_dir.mkdir(parents=True)
+    gateway_dir.mkdir(parents=True)
     (tmp_path / "openshell" / "active_gateway").write_bytes(
         gateway_name.encode("utf-8")
     )
-    meta = {"gateway_endpoint": "https://127.0.0.1:8443", "note": "café"}
+    meta = {"gateway_endpoint": "http://tést.example:8080"}
     (gateway_dir / "metadata.json").write_bytes(
         json.dumps(meta, ensure_ascii=False).encode("utf-8")
     )
-    (mtls_dir / "ca.crt").write_bytes(b"ca")
-    (mtls_dir / "tls.crt").write_bytes(b"cert")
-    (mtls_dir / "tls.key").write_bytes(b"key")
 
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.delenv("OPENSHELL_GATEWAY", raising=False)
@@ -1411,5 +1407,6 @@ def test_from_active_cluster_reads_utf8_bytes_from_active_gateway_and_metadata(
     client = SandboxClient.from_active_cluster()
     try:
         assert client._cluster_name == gateway_name
+        assert client._endpoint == "tést.example:8080"
     finally:
         client.close()
