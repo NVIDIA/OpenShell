@@ -849,7 +849,7 @@ def _read_oidc_token_bundle(gateway_dir: pathlib.Path) -> dict | None:
         return json.loads(token_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
 
 

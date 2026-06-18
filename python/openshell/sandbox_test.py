@@ -24,6 +24,7 @@ from openshell.sandbox import (
     _make_cluster_bearer_provider,
     _normalize_bearer,
     _OidcRefresher,
+    _read_oidc_token_bundle,
 )
 
 
@@ -1345,3 +1346,41 @@ def test_inference_set_cluster_forwards_no_verify_flag() -> None:
 
     assert stub.request is not None
     assert stub.request.no_verify is True
+
+
+# ---------------------------------------------------------------------------
+# Encoding regression tests (utf-8 explicit on all config file reads/writes)
+# ---------------------------------------------------------------------------
+
+def test_read_oidc_token_bundle_parses_non_ascii_utf8(tmp_path: Path) -> None:
+    gateway_dir = tmp_path / "gw"
+    gateway_dir.mkdir()
+    payload = {"refresh_token": "tok", "issuer": "https://example.com/é"}
+    (gateway_dir / "oidc_token.json").write_bytes(
+        json.dumps(payload).encode("utf-8")
+    )
+    result = _read_oidc_token_bundle(gateway_dir)
+    assert result == payload
+
+
+def test_read_oidc_token_bundle_returns_none_on_corrupt_bytes(tmp_path: Path) -> None:
+    gateway_dir = tmp_path / "gw"
+    gateway_dir.mkdir()
+    (gateway_dir / "oidc_token.json").write_bytes(b"\xff\xfe not utf-8")
+    assert _read_oidc_token_bundle(gateway_dir) is None
+
+
+def test_load_cluster_bearer_token_handles_non_ascii_utf8_oidc(tmp_path: Path) -> None:
+    gateway_dir = tmp_path / "gw"
+    gateway_dir.mkdir()
+    bundle = {
+        "access_token": "accéss",
+        "refresh_token": "ref",
+        "expiry": "2099-01-01T00:00:00Z",
+        "issuer": "https://example.com",
+        "client_id": "c",
+        "client_secret": "s",
+    }
+    (gateway_dir / "oidc_token.json").write_bytes(json.dumps(bundle).encode("utf-8"))
+    token = _load_cluster_bearer_token(gateway_dir)
+    assert token == "accéss"
