@@ -1,9 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from resolve_licenses import _rate_limit, _last_request, _rate_lock
+from resolve_licenses import _last_request, _rate_limit, _rate_lock
 
 
 def test_same_domain_requests_are_spaced() -> None:
@@ -27,18 +31,33 @@ def test_same_domain_requests_are_spaced() -> None:
 
 
 def test_different_domains_do_not_block_each_other() -> None:
-    domains = ["alpha.example", "beta.example"]
+    alpha = "alpha2.example"
+    beta = "beta2.example"
     interval = 0.1
-    for d in domains:
-        with _rate_lock:
-            _last_request.pop(d, None)
 
-    start = time.monotonic()
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        list(pool.map(lambda d: _rate_limit(d, interval=interval), domains))
-    elapsed = time.monotonic() - start
+    now = time.monotonic()
+    with _rate_lock:
+        _last_request[alpha] = now  # alpha must sleep for ~interval
+        _last_request.pop(beta, None)  # beta is free
 
-    assert elapsed < interval * 1.5, f"different-domain calls blocked: {elapsed:.3f}s"
+    ready = threading.Event()
+
+    def call_alpha() -> None:
+        ready.set()
+        _rate_limit(alpha, interval=interval)
+
+    t = threading.Thread(target=call_alpha)
+    t.start()
+    ready.wait()
+    time.sleep(0.01)  # let alpha enter its sleep
+
+    beta_start = time.monotonic()
+    _rate_limit(beta, interval=interval)
+    beta_elapsed = time.monotonic() - beta_start
+
+    t.join()
+
+    assert beta_elapsed < interval * 0.5, f"beta blocked for {beta_elapsed:.3f}s"
 
 
 if __name__ == "__main__":
