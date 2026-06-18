@@ -449,9 +449,7 @@ fn credential_auth_header(
         "header" => {
             let header_name = credential.header_name.trim();
             if header_name.is_empty() {
-                return Err(miette!(
-                    "credential auth_style header requires header_name"
-                ));
+                return Err(miette!("credential auth_style header requires header_name"));
             }
             validate_header_name(header_name)?;
             Ok((header_name.to_string(), access_token.to_string()))
