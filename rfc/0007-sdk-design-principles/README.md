@@ -12,7 +12,7 @@ links:
   - "Issue #1044 (SDK roadmap)"
 ---
 
-# RFC 0006 - SDK Consumption Entrypoints and File Transfer
+# RFC 0007 - SDK Consumption Entrypoints and File Transfer
 
 ## Summary
 
