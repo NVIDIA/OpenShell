@@ -208,10 +208,11 @@ _rate_lock = threading.Lock()
 
 def _rate_limit(domain: str, interval: float = 0.15) -> None:
     with _rate_lock:
-        now = time.time()
-        last = _last_request.get(domain, 0)
-        wait = interval - (now - last)
-        _last_request[domain] = now
+        now = time.monotonic()
+        last = _last_request.get(domain, 0.0)
+        next_req = max(now, last + interval)
+        _last_request[domain] = next_req
+        wait = next_req - now
     if wait > 0:
         time.sleep(wait)
 
