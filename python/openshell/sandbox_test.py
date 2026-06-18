@@ -1352,6 +1352,7 @@ def test_inference_set_cluster_forwards_no_verify_flag() -> None:
 # Encoding regression tests (utf-8 explicit on all config file reads/writes)
 # ---------------------------------------------------------------------------
 
+
 def test_read_oidc_token_bundle_parses_non_ascii_utf8(tmp_path: Path) -> None:
     gateway_dir = tmp_path / "gw"
     gateway_dir.mkdir()
