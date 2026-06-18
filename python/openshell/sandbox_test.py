@@ -1381,7 +1381,9 @@ def test_load_cluster_bearer_token_handles_non_ascii_utf8_oidc(tmp_path: Path) -
         "client_id": "c",
         "client_secret": "s",
     }
-    (gateway_dir / "oidc_token.json").write_bytes(json.dumps(bundle, ensure_ascii=False).encode("utf-8"))
+    (gateway_dir / "oidc_token.json").write_bytes(
+        json.dumps(bundle, ensure_ascii=False).encode("utf-8")
+    )
     token = _load_cluster_bearer_token(gateway_dir)
     assert token == "accéss"
 
