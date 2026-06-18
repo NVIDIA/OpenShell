@@ -39,6 +39,7 @@
   openshell-core = {
     dir = "openshell-core";
     nativeBuildInputs = [ pkgs.protobuf ];
+    nativeCheckInputs = [ pkgs.lsof ];
     assets = [ (root + "/proto") ];
   };
   openshell-driver-docker = {

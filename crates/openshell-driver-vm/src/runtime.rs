@@ -1247,17 +1247,7 @@ fn hash_path_id(path: &Path) -> String {
 }
 
 fn secure_socket_base(subdir: &str) -> Result<PathBuf, String> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
-        || {
-            let fallback = PathBuf::from("/tmp");
-            if fallback.is_dir() {
-                fallback
-            } else {
-                std::env::temp_dir()
-            }
-        },
-        PathBuf::from,
-    );
+    let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(socket_fallback_base, PathBuf::from);
     let dir = base.join(subdir);
 
     if dir.exists() {
@@ -1294,6 +1284,27 @@ fn secure_socket_base(subdir: &str) -> Result<PathBuf, String> {
     }
 
     Ok(dir)
+}
+
+fn socket_fallback_base() -> PathBuf {
+    let temp_dir = {
+        let fallback = PathBuf::from("/tmp");
+        if fallback.is_dir() {
+            fallback
+        } else {
+            std::env::temp_dir()
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        temp_dir.join(format!("openshell-{}", unsafe { libc::getuid() }))
+    }
+
+    #[cfg(not(unix))]
+    {
+        temp_dir.join("openshell")
+    }
 }
 
 fn gvproxy_socket_base(overlay_disk: &Path) -> Result<PathBuf, String> {
