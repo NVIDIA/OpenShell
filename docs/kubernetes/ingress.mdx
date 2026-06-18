@@ -14,15 +14,30 @@ OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for
 
 ## Install Envoy Gateway
 
-Envoy Gateway installs the Gateway API CRDs and registers the `eg` GatewayClass:
+Envoy Gateway installs the Gateway API CRDs and controller:
 
 ```shell
 helm install eg \
   oci://docker.io/envoyproxy/gateway-helm \
-  --version v1.7.2 \
+  --version v1.8.1 \
   --namespace envoy-gateway-system \
   --create-namespace \
   --wait
+```
+
+## Create the GatewayClass
+
+Create the `eg` GatewayClass that the OpenShell chart references:
+
+```shell
+kubectl apply -f - <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+EOF
 ```
 
 Verify the GatewayClass is accepted:
