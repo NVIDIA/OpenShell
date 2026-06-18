@@ -5,13 +5,17 @@
 
 [test]
 description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python", "test:install-sh", "test:packaging-assets", "test:docs-website"]
+depends = ["test:rust", "test:python", "test:sbom", "test:install-sh", "test:packaging-assets", "test:docs-website"]
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"
 # --no-project skips the workspace (maturin) build; --with supplies pytest and
 # the script's runtime dep (PyYAML), which live outside the project env.
 run = "uv run --no-project --with pytest --with pyyaml pytest tasks/scripts/sync_docs_website_test.py"
+
+["test:sbom"]
+description = "Run SBOM tooling tests"
+run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" deploy/sbom/"
 hide = true
 
 ["test:install-sh"]
