@@ -1357,7 +1357,7 @@ def test_read_oidc_token_bundle_parses_non_ascii_utf8(tmp_path: Path) -> None:
     gateway_dir.mkdir()
     payload = {"refresh_token": "tok", "issuer": "https://example.com/é"}
     (gateway_dir / "oidc_token.json").write_bytes(
-        json.dumps(payload).encode("utf-8")
+        json.dumps(payload, ensure_ascii=False).encode("utf-8")
     )
     result = _read_oidc_token_bundle(gateway_dir)
     assert result == payload
@@ -1381,6 +1381,35 @@ def test_load_cluster_bearer_token_handles_non_ascii_utf8_oidc(tmp_path: Path) -
         "client_id": "c",
         "client_secret": "s",
     }
-    (gateway_dir / "oidc_token.json").write_bytes(json.dumps(bundle).encode("utf-8"))
+    (gateway_dir / "oidc_token.json").write_bytes(json.dumps(bundle, ensure_ascii=False).encode("utf-8"))
     token = _load_cluster_bearer_token(gateway_dir)
     assert token == "accéss"
+
+
+def test_from_active_cluster_reads_utf8_bytes_from_active_gateway_and_metadata(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    gateway_name = "gw-utf8"
+    gateway_dir = tmp_path / "openshell" / "gateways" / gateway_name
+    mtls_dir = gateway_dir / "mtls"
+    mtls_dir.mkdir(parents=True)
+    (tmp_path / "openshell" / "active_gateway").write_bytes(
+        gateway_name.encode("utf-8")
+    )
+    meta = {"gateway_endpoint": "https://127.0.0.1:8443", "note": "café"}
+    (gateway_dir / "metadata.json").write_bytes(
+        json.dumps(meta, ensure_ascii=False).encode("utf-8")
+    )
+    (mtls_dir / "ca.crt").write_bytes(b"ca")
+    (mtls_dir / "tls.crt").write_bytes(b"cert")
+    (mtls_dir / "tls.key").write_bytes(b"key")
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("OPENSHELL_GATEWAY", raising=False)
+
+    client = SandboxClient.from_active_cluster()
+    try:
+        assert client._cluster_name == gateway_name
+    finally:
+        client.close()
