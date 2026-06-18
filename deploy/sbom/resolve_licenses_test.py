@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import itertools
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -26,7 +27,7 @@ def test_same_domain_requests_are_spaced() -> None:
         list(pool.map(lambda _: call(), range(3)))
 
     times.sort()
-    for a, b in zip(times, times[1:]):
+    for a, b in itertools.pairwise(times):
         assert b - a >= interval * 0.9, f"gap {b - a:.4f}s < interval {interval}s"
 
 
