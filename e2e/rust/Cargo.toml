@@ -111,13 +111,18 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.13"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
 tokio = { version = "1.43", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tempfile = "3"
 sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.9"
 serde_json = "1"
+tonic = { version = "0.14", features = ["transport"] }
+openshell-core = { path = "../../crates/openshell-core" }
 
 [lints.rust]
 unsafe_code = "warn"
