@@ -100,6 +100,7 @@ uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }
+spiffe = { workspace = true }
 async-trait = "0.1"
 url = { workspace = true }
 glob = { workspace = true }

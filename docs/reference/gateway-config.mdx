@@ -553,6 +553,14 @@ In managed workspace mode, the Kubernetes driver copies each explicitly named
 namespace on sandbox creation. Shared and operator modes require the Secret to
 already exist in the sandbox namespace.
 
+For token-exchange provider profiles, the gateway also needs access to its own
+SPIFFE Workload API socket. In Helm deployments, set
+`server.providerTokenGrants.spiffe.enabled=true`; the chart mounts the socket
+into the gateway pod and sets `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`.
+The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
+SPIFFE Workload API, so this validation path does not require gateway access to
+the SPIRE OIDC discovery endpoint or its TLS CA.
+
 ### Docker
 
 Sandboxes run as containers on a local bridge network. The supervisor binary is bind-mounted from the host (no in-cluster image pull required); guest mTLS material is supplied as host paths.

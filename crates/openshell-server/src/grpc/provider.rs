@@ -28,6 +28,7 @@ use openshell_policy::ProviderPolicyLayer;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
 use tonic::Status;
 use tracing::warn;
 
@@ -35,6 +36,8 @@ use super::validation::{validate_provider_fields, validate_provider_mutable_fiel
 use super::{
     MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_PAGE_SIZE, MAX_PROVIDER_CONFIG_ENTRIES, clamp_limit,
 };
+
+const GATEWAY_SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET";
 
 // ---------------------------------------------------------------------------
 // CRUD helpers
@@ -2152,25 +2155,130 @@ use openshell_core::proto::{
     ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse, CreateProviderRequest,
     DeleteProviderProfileRequest, DeleteProviderProfileResponse, DeleteProviderRefreshRequest,
     DeleteProviderRefreshResponse, DeleteProviderRequest, DeleteProviderResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse,
     GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
     GetProviderRequest, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
     LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
     ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, ProviderProfileResponse,
-    ProviderResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
-    StoredProviderProfile, UpdateProviderProfilesRequest, UpdateProviderProfilesResponse,
-    UpdateProviderRequest,
+    ProviderCredentialTokenGrantType, ProviderProfileDiagnostic, ProviderProfileImportItem,
+    ProviderProfileResponse, ProviderResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, StoredProviderProfile, UpdateProviderProfilesRequest,
+    UpdateProviderProfilesResponse, UpdateProviderRequest,
+};
+use openshell_core::spiffe::{
+    JwtSvidParseError, SpiffeJwtClaims, parse_unverified_jwt_svid_claims,
+    trust_domain as spiffe_trust_domain, workload_api_endpoint,
 };
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
     normalize_profile_id, normalize_provider_type, strategy_output_env_key, strategy_output_spec,
     strategy_primary_env_key, validate_profile_set,
 };
-use std::sync::Arc;
+use serde::Deserialize;
+use std::sync::{Arc, LazyLock, RwLock};
 use tonic::{Request, Response};
 
 use crate::auth::principal::Principal;
 use crate::auth::workspace_authz::{MinWorkspaceRole, authorize_workspace, require_platform_admin};
+
+const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const DEFAULT_CLIENT_ASSERTION_TYPE: &str =
+    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+const DEFAULT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+const MAX_OAUTH_ERROR_FIELD_LEN: usize = 256;
+const DEFAULT_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
+const MAX_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 3600;
+const INTERMEDIATE_TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
+const MAX_INTERMEDIATE_TOKEN_CACHE_ENTRIES: usize = 1024;
+
+static TOKEN_EXCHANGE_HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> =
+    LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| {
+                format!("provider token exchange HTTP client configuration failed: {err}")
+            })
+    });
+static INTERMEDIATE_TOKEN_CACHE: LazyLock<IntermediateTokenCache> =
+    LazyLock::new(IntermediateTokenCache::new);
+
+fn token_exchange_http_client() -> Result<&'static reqwest::Client, Status> {
+    TOKEN_EXCHANGE_HTTP_CLIENT
+        .as_ref()
+        .map_err(|err| Status::internal(err.clone()))
+}
+
+#[derive(Clone)]
+struct CachedIntermediateToken {
+    access_token: String,
+    token_type: String,
+    expires_at_ms: i64,
+}
+
+struct IntermediateTokenCache {
+    tokens: Arc<RwLock<HashMap<String, CachedIntermediateToken>>>,
+}
+
+impl IntermediateTokenCache {
+    fn new() -> Self {
+        Self {
+            tokens: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<TokenExchangeResponseBody> {
+        let now_ms = crate::persistence::current_time_ms();
+        let tokens = self.tokens.read().ok()?;
+        let cached = tokens.get(key)?;
+        if cached.expires_at_ms <= now_ms {
+            return None;
+        }
+        Some(TokenExchangeResponseBody {
+            access_token: cached.access_token.clone(),
+            expires_in: cached.expires_at_ms.saturating_sub(now_ms) / 1000,
+            token_type: cached.token_type.clone(),
+        })
+    }
+
+    fn set(&self, key: String, token: &TokenExchangeResponseBody, expires_at_ms: i64) {
+        if let Ok(mut tokens) = self.tokens.write() {
+            let now_ms = crate::persistence::current_time_ms();
+            tokens.retain(|_, cached| cached.expires_at_ms > now_ms);
+            if tokens.len() >= MAX_INTERMEDIATE_TOKEN_CACHE_ENTRIES
+                && let Some(evict_key) = tokens.keys().next().cloned()
+            {
+                tokens.remove(&evict_key);
+            }
+            tokens.insert(
+                key,
+                CachedIntermediateToken {
+                    access_token: token.access_token.clone(),
+                    token_type: token.token_type.clone(),
+                    expires_at_ms,
+                },
+            );
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenExchangeResponseBody {
+    access_token: String,
+    #[serde(default)]
+    expires_in: i64,
+    #[serde(default)]
+    token_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthErrorResponse {
+    error: Option<String>,
+    error_description: Option<String>,
+}
 
 async fn authorize_and_resolve_profile_workspace(
     state: &Arc<ServerState>,
@@ -2196,7 +2304,6 @@ async fn authorize_and_resolve_profile_workspace(
         super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace).await
     }
 }
-
 pub(super) async fn handle_create_provider(
     state: &Arc<ServerState>,
     request: Request<CreateProviderRequest>,
@@ -3421,6 +3528,640 @@ pub(super) async fn handle_update_provider(
     }
 }
 
+pub(super) async fn handle_exchange_provider_subject_token(
+    state: &Arc<ServerState>,
+    request: Request<ExchangeProviderSubjectTokenRequest>,
+) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+    let req = request.get_ref().clone();
+    let principal = crate::auth::guard::enforce_sandbox_scope(&request, &req.sandbox_id)?;
+    crate::auth::guard::ensure_sandbox_principal_scope(&principal, &req.sandbox_id)?;
+    drop(request);
+
+    if req.provider.trim().is_empty() {
+        return Err(Status::invalid_argument("provider is required"));
+    }
+    if req.credential_key.trim().is_empty() {
+        return Err(Status::invalid_argument("credential_key is required"));
+    }
+    if req.supervisor_jwt_svid.trim().is_empty() {
+        return Err(Status::invalid_argument("supervisor_jwt_svid is required"));
+    }
+
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&req.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let workspace = sandbox.object_workspace().to_string();
+    let spec = sandbox
+        .spec
+        .as_ref()
+        .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+    if !spec
+        .providers
+        .iter()
+        .any(|provider| provider == &req.provider)
+    {
+        return Err(Status::permission_denied(
+            "provider is not attached to this sandbox",
+        ));
+    }
+
+    let provider = state
+        .store
+        .get_message_by_name::<Provider>(&workspace, &req.provider)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+        .ok_or_else(|| Status::not_found("provider not found"))?;
+    let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), &workspace)
+        .await?;
+    let profile =
+        get_provider_type_profile_for_scope(&catalog, profile_id, &provider.profile_workspace)
+            .ok_or_else(|| Status::failed_precondition("provider profile not found"))?;
+    let profile_proto = profile.to_proto();
+    let credential = profile_proto
+        .credentials
+        .iter()
+        .find(|credential| credential.name == req.credential_key)
+        .ok_or_else(|| {
+            Status::failed_precondition("credential not declared by provider profile")
+        })?;
+    let token_grant = credential
+        .token_grant
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("credential does not declare token_grant"))?;
+    let grant_type = ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
+        .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials);
+    if grant_type != ProviderCredentialTokenGrantType::TokenExchange {
+        return Err(Status::failed_precondition(
+            "credential token_grant is not token_exchange",
+        ));
+    }
+    let subject_token = token_grant
+        .subject_token
+        .as_ref()
+        .ok_or_else(|| Status::failed_precondition("token_exchange subject_token is missing"))?;
+    if subject_token.source != "provider_credential" {
+        return Err(Status::failed_precondition(
+            "unsupported subject_token source",
+        ));
+    }
+    if !profile_proto
+        .credentials
+        .iter()
+        .any(|credential| credential.name == subject_token.credential)
+    {
+        return Err(Status::failed_precondition(
+            "subject token credential not declared by provider profile",
+        ));
+    }
+    let stored_subject_token =
+        resolve_subject_token_credential(&state.credentials, &provider, &subject_token.credential)
+            .await?;
+
+    let jwt_svid_audience =
+        effective_jwt_svid_audience(&token_grant.token_endpoint, &token_grant.jwt_svid_audience);
+    let gateway_jwt_svid = fetch_gateway_jwt_svid(&jwt_svid_audience).await?;
+    let gateway_claims = parse_unverified_spiffe_claims(&gateway_jwt_svid)?;
+    validate_gateway_jwt_svid_claims(&gateway_claims, &jwt_svid_audience)?;
+    let supervisor_claims = validate_supervisor_jwt_svid(
+        &req.supervisor_jwt_svid,
+        &gateway_claims,
+        &jwt_svid_audience,
+    )
+    .await?;
+
+    let intermediate_cache_key = intermediate_token_cache_key(IntermediateTokenCacheKeyInput {
+        provider: &provider,
+        dynamic_credential: &req.credential_key,
+        subject_credential: &subject_token.credential,
+        token_endpoint: &token_grant.token_endpoint,
+        client_assertion_type: effective_client_assertion_type(&token_grant.client_assertion_type),
+        subject_token_type: effective_token_type(&subject_token.subject_token_type),
+        audience: &supervisor_claims.sub,
+        requested_token_type: effective_token_type(&token_grant.requested_token_type),
+        supervisor_subject: &supervisor_claims.sub,
+        gateway_subject: &gateway_claims.sub,
+    });
+    if let Some(cached) = INTERMEDIATE_TOKEN_CACHE.get(&intermediate_cache_key) {
+        return Ok(Response::new(ExchangeProviderSubjectTokenResponse {
+            access_token: cached.access_token,
+            expires_in: cached.expires_in,
+            token_type: cached.token_type,
+        }));
+    }
+
+    let token_response = perform_intermediate_token_exchange(
+        &token_grant.token_endpoint,
+        &gateway_jwt_svid,
+        &token_grant.client_assertion_type,
+        &stored_subject_token,
+        &subject_token.subject_token_type,
+        &supervisor_claims.sub,
+        &token_grant.requested_token_type,
+    )
+    .await
+    .inspect_err(|status| {
+        warn!(
+            sandbox_id = %req.sandbox_id,
+            provider = %req.provider,
+            credential_key = %req.credential_key,
+            subject_credential = %subject_token.credential,
+            client_assertion_type = %effective_client_assertion_type(&token_grant.client_assertion_type),
+            gateway_svid_issuer = %gateway_claims.iss,
+            gateway_svid_subject = %gateway_claims.sub,
+            gateway_svid_audience = ?gateway_claims.aud,
+            supervisor_svid_issuer = %supervisor_claims.iss,
+            supervisor_svid_subject = %supervisor_claims.sub,
+            supervisor_svid_audience = ?supervisor_claims.aud,
+            status = ?status.code(),
+            error = %status.message(),
+            "intermediate provider token exchange failed"
+        );
+    })?;
+    let cache_expires_at_ms = intermediate_token_cache_expires_at_ms(
+        &token_response,
+        token_grant.cache_ttl_seconds,
+        provider_credential_expires_at_ms(&provider, &subject_token.credential),
+        supervisor_claims.exp,
+    );
+    if cache_expires_at_ms > crate::persistence::current_time_ms() {
+        INTERMEDIATE_TOKEN_CACHE.set(intermediate_cache_key, &token_response, cache_expires_at_ms);
+    }
+
+    Ok(Response::new(ExchangeProviderSubjectTokenResponse {
+        access_token: token_response.access_token,
+        expires_in: token_response.expires_in,
+        token_type: token_response.token_type,
+    }))
+}
+
+async fn resolve_subject_token_credential(
+    credentials: &crate::credentials::CredentialRuntime,
+    provider: &Provider,
+    credential_key: &str,
+) -> Result<String, Status> {
+    if let Some(value) = provider
+        .credentials
+        .get(credential_key)
+        .filter(|value| !value.is_empty())
+    {
+        ensure_subject_token_credential_not_expired(provider, credential_key)?;
+        return Ok(value.clone());
+    }
+
+    if provider.credential_handles.contains_key(credential_key) {
+        let resolved = credentials
+            .resolve_provider_handles(provider, crate::persistence::current_time_ms())
+            .await?;
+        if let Some(value) = resolved
+            .values
+            .get(credential_key)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(value.clone());
+        }
+    }
+
+    Err(Status::failed_precondition(
+        "subject token credential is not configured",
+    ))
+}
+
+fn ensure_subject_token_credential_not_expired(
+    provider: &Provider,
+    credential_key: &str,
+) -> Result<(), Status> {
+    let expires_at_ms = provider_credential_expires_at_ms(provider, credential_key);
+    if expires_at_ms > 0 && expires_at_ms <= crate::persistence::current_time_ms() {
+        return Err(Status::failed_precondition(
+            "subject token credential has expired",
+        ));
+    }
+    Ok(())
+}
+
+fn provider_credential_expires_at_ms(provider: &Provider, credential_key: &str) -> i64 {
+    provider
+        .credential_expires_at_ms
+        .get(credential_key)
+        .copied()
+        .unwrap_or_default()
+}
+
+struct IntermediateTokenCacheKeyInput<'a> {
+    provider: &'a Provider,
+    dynamic_credential: &'a str,
+    subject_credential: &'a str,
+    token_endpoint: &'a str,
+    client_assertion_type: &'a str,
+    subject_token_type: &'a str,
+    audience: &'a str,
+    requested_token_type: &'a str,
+    supervisor_subject: &'a str,
+    gateway_subject: &'a str,
+}
+
+fn intermediate_token_cache_key(input: IntermediateTokenCacheKeyInput<'_>) -> String {
+    let provider_id = input
+        .provider
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.id.as_str())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| input.provider.object_name());
+    let provider_resource_version = input
+        .provider
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        provider_id,
+        provider_resource_version,
+        input.dynamic_credential,
+        input.subject_credential,
+        input.token_endpoint,
+        input.client_assertion_type,
+        input.subject_token_type,
+        input.audience,
+        input.requested_token_type,
+        input.supervisor_subject,
+        input.gateway_subject
+    )
+}
+
+fn intermediate_token_cache_expires_at_ms(
+    token: &TokenExchangeResponseBody,
+    cache_ttl_seconds: i64,
+    subject_token_expires_at_ms: i64,
+    supervisor_svid_exp_seconds: i64,
+) -> i64 {
+    let now_ms = crate::persistence::current_time_ms();
+    let mut ttl_seconds = if token.expires_in > 0 {
+        token
+            .expires_in
+            .min(MAX_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS)
+    } else {
+        DEFAULT_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS
+    };
+    if cache_ttl_seconds > 0 {
+        ttl_seconds = ttl_seconds.min(cache_ttl_seconds);
+    }
+    ttl_seconds = ttl_seconds
+        .saturating_sub(INTERMEDIATE_TOKEN_CACHE_EXPIRY_SKEW_SECONDS)
+        .max(1);
+    let mut expires_at_ms = now_ms.saturating_add(ttl_seconds.saturating_mul(1000));
+    expires_at_ms = cap_cache_expiry_ms(expires_at_ms, jwt_exp_ms(&token.access_token));
+    expires_at_ms = cap_cache_expiry_ms(expires_at_ms, Some(subject_token_expires_at_ms));
+    expires_at_ms = cap_cache_expiry_ms(
+        expires_at_ms,
+        (supervisor_svid_exp_seconds > 0).then(|| supervisor_svid_exp_seconds.saturating_mul(1000)),
+    );
+    expires_at_ms
+}
+
+fn cap_cache_expiry_ms(current_expires_at_ms: i64, cap_expires_at_ms: Option<i64>) -> i64 {
+    let Some(cap_expires_at_ms) = cap_expires_at_ms.filter(|value| *value > 0) else {
+        return current_expires_at_ms;
+    };
+    current_expires_at_ms.min(
+        cap_expires_at_ms
+            .saturating_sub(INTERMEDIATE_TOKEN_CACHE_EXPIRY_SKEW_SECONDS.saturating_mul(1000)),
+    )
+}
+
+fn jwt_exp_ms(token: &str) -> Option<i64> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims = serde_json::from_slice::<serde_json::Value>(&decoded).ok()?;
+    claims
+        .get("exp")?
+        .as_i64()
+        .map(|exp| exp.saturating_mul(1000))
+}
+
+async fn fetch_gateway_jwt_svid(audience: &str) -> Result<String, Status> {
+    let socket_path = std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "{GATEWAY_SPIFFE_WORKLOAD_API_SOCKET} is required for provider token exchange"
+            ))
+        })?;
+    let endpoint = workload_api_endpoint(std::path::Path::new(&socket_path));
+    let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
+        .await
+        .map_err(|e| {
+            Status::failed_precondition(format!("SPIFFE Workload API unavailable: {e}"))
+        })?;
+    client
+        .fetch_jwt_token([audience], None)
+        .await
+        .map_err(|e| Status::failed_precondition(format!("failed to fetch gateway JWT-SVID: {e}")))
+}
+
+fn validate_gateway_jwt_svid_claims(
+    claims: &SpiffeJwtClaims,
+    expected_audience: &str,
+) -> Result<(), Status> {
+    if !claims.aud.contains(expected_audience) {
+        return Err(Status::failed_precondition(
+            "gateway SVID audience does not match token grant audience",
+        ));
+    }
+    if spiffe_trust_domain(&claims.sub).is_none() {
+        return Err(Status::failed_precondition(
+            "gateway SVID subject is not a SPIFFE ID",
+        ));
+    }
+    if claims.exp > 0 && claims.exp.saturating_mul(1000) <= crate::persistence::current_time_ms() {
+        return Err(Status::failed_precondition("gateway SVID has expired"));
+    }
+    Ok(())
+}
+
+async fn validate_supervisor_jwt_svid(
+    token: &str,
+    gateway_claims: &SpiffeJwtClaims,
+    expected_audience: &str,
+) -> Result<SpiffeJwtClaims, Status> {
+    let unverified = parse_unverified_spiffe_claims(token)?;
+    if unverified.iss != gateway_claims.iss {
+        return Err(Status::permission_denied(
+            "supervisor SVID issuer does not match gateway SVID issuer",
+        ));
+    }
+    if !unverified.aud.contains(expected_audience) {
+        return Err(Status::permission_denied(
+            "supervisor SVID audience does not match token grant audience",
+        ));
+    }
+    let supervisor_trust_domain = spiffe_trust_domain(&unverified.sub)
+        .ok_or_else(|| Status::permission_denied("supervisor SVID subject is not a SPIFFE ID"))?;
+    let gateway_trust_domain = spiffe_trust_domain(&gateway_claims.sub)
+        .ok_or_else(|| Status::failed_precondition("gateway SVID subject is not a SPIFFE ID"))?;
+    if supervisor_trust_domain != gateway_trust_domain {
+        return Err(Status::permission_denied(
+            "supervisor SVID trust domain does not match gateway SVID trust domain",
+        ));
+    }
+
+    let socket_path = std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "{GATEWAY_SPIFFE_WORKLOAD_API_SOCKET} is required for supervisor JWT-SVID validation"
+            ))
+        })?;
+    let endpoint = workload_api_endpoint(std::path::Path::new(&socket_path));
+    let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
+        .await
+        .map_err(|e| {
+            Status::failed_precondition(format!("SPIFFE Workload API unavailable: {e}"))
+        })?;
+    let bundles = client
+        .fetch_jwt_bundles()
+        .await
+        .map_err(|e| Status::internal(format!("SPIFFE JWT bundle fetch failed: {e}")))?;
+    spiffe::JwtSvid::parse_and_validate(token, &bundles, &[expected_audience])
+        .map_err(|e| Status::permission_denied(format!("invalid supervisor JWT-SVID: {e}")))?;
+    Ok(unverified)
+}
+
+fn format_error_chain(prefix: &str, error: &dyn StdError) -> String {
+    let mut message = format!("{prefix}: {error}");
+    let mut source = error.source();
+    while let Some(err) = source {
+        message.push_str(": ");
+        message.push_str(&err.to_string());
+        source = err.source();
+    }
+    message
+}
+
+fn parse_unverified_spiffe_claims(token: &str) -> Result<SpiffeJwtClaims, Status> {
+    parse_unverified_jwt_svid_claims(token).map_err(jwt_svid_parse_error_status)
+}
+
+fn jwt_svid_parse_error_status(error: JwtSvidParseError) -> Status {
+    Status::permission_denied(error.to_string())
+}
+
+async fn perform_intermediate_token_exchange(
+    token_endpoint: &str,
+    gateway_jwt_svid: &str,
+    client_assertion_type: &str,
+    subject_token: &str,
+    subject_token_type: &str,
+    audience: &str,
+    requested_token_type: &str,
+) -> Result<TokenExchangeResponseBody, Status> {
+    let token_endpoint_url = parse_token_endpoint_url(token_endpoint)?;
+    let client_assertion_type = effective_client_assertion_type(client_assertion_type);
+    let subject_token_type = effective_token_type(subject_token_type);
+    let requested_token_type = effective_token_type(requested_token_type);
+    let form_params = [
+        ("grant_type", TOKEN_EXCHANGE_GRANT_TYPE),
+        ("client_assertion_type", client_assertion_type),
+        ("client_assertion", gateway_jwt_svid),
+        ("subject_token", subject_token),
+        ("subject_token_type", subject_token_type),
+        ("audience", audience),
+        ("requested_token_type", requested_token_type),
+    ];
+
+    let response = token_exchange_http_client()?
+        .post(token_endpoint_url)
+        .form(&form_params)
+        .send()
+        .await
+        .map_err(|e| {
+            Status::internal(format_error_chain(
+                "provider token exchange request failed",
+                &e,
+            ))
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read response body>".to_string());
+        return Err(Status::failed_precondition(token_exchange_failure_message(
+            status, &body,
+        )));
+    }
+    let body = response
+        .json::<TokenExchangeResponseBody>()
+        .await
+        .map_err(|e| {
+            Status::internal(format!(
+                "provider token exchange response parse failed: {e}"
+            ))
+        })?;
+    validate_oauth_access_token(&body.access_token)?;
+    Ok(body)
+}
+
+fn parse_token_endpoint_url(token_endpoint: &str) -> Result<reqwest::Url, Status> {
+    let url = reqwest::Url::parse(token_endpoint)
+        .map_err(|_| Status::invalid_argument("token_endpoint must be an absolute URL"))?;
+    if token_endpoint_transport_allowed(&url) {
+        return Ok(url);
+    }
+    Err(Status::invalid_argument(
+        "token_endpoint must use https, except http for loopback or in-cluster service hosts",
+    ))
+}
+
+fn token_endpoint_transport_allowed(url: &reqwest::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => url
+            .host_str()
+            .is_some_and(|host| is_loopback_host(host) || is_kubernetes_service_host(host)),
+        _ => false,
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+fn is_kubernetes_service_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels = host.split('.').collect::<Vec<_>>();
+    let is_service_name = labels.len() == 3 && labels[2] == "svc";
+    let is_cluster_local_service =
+        labels.len() == 5 && labels[2] == "svc" && labels[3] == "cluster" && labels[4] == "local";
+    (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
+}
+
+fn effective_client_assertion_type(client_assertion_type: &str) -> &str {
+    if client_assertion_type.trim().is_empty() {
+        DEFAULT_CLIENT_ASSERTION_TYPE
+    } else {
+        client_assertion_type
+    }
+}
+
+fn effective_token_type(token_type: &str) -> &str {
+    if token_type.trim().is_empty() {
+        DEFAULT_TOKEN_TYPE
+    } else {
+        token_type
+    }
+}
+
+fn effective_jwt_svid_audience(token_endpoint: &str, jwt_svid_audience: &str) -> String {
+    if !jwt_svid_audience.trim().is_empty() {
+        return jwt_svid_audience.to_string();
+    }
+    derive_issuer_from_token_endpoint(token_endpoint)
+}
+
+fn derive_issuer_from_token_endpoint(token_endpoint: &str) -> String {
+    if let Some(realms_idx) = token_endpoint.find("/realms/") {
+        let after_realms = &token_endpoint[realms_idx + "/realms/".len()..];
+        if let Some(slash_idx) = after_realms.find('/') {
+            let realm_end = realms_idx + "/realms/".len() + slash_idx;
+            return token_endpoint[..realm_end].to_string();
+        }
+    }
+    token_endpoint.to_string()
+}
+
+fn validate_oauth_access_token(token: &str) -> Result<(), Status> {
+    if token.is_empty() || !is_token68(token) {
+        return Err(Status::internal(
+            "provider token exchange returned a malformed access token",
+        ));
+    }
+    Ok(())
+}
+
+fn is_token68(token: &str) -> bool {
+    let mut padding_started = false;
+    let mut saw_value = false;
+    for byte in token.bytes() {
+        if byte == b'=' {
+            padding_started = true;
+            continue;
+        }
+        if padding_started || !is_token68_value_byte(byte) {
+            return false;
+        }
+        saw_value = true;
+    }
+    saw_value
+}
+
+fn is_token68_value_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
+fn token_exchange_failure_message(status: reqwest::StatusCode, body: &str) -> String {
+    let Ok(error_response) = serde_json::from_str::<OAuthErrorResponse>(body) else {
+        return format!("provider token exchange failed with status {status}");
+    };
+    let error = error_response
+        .error
+        .as_deref()
+        .map(sanitize_oauth_error_field)
+        .filter(|value| !value.is_empty());
+    let description = error_response
+        .error_description
+        .as_deref()
+        .map(sanitize_oauth_error_field)
+        .filter(|value| !value.is_empty());
+    match (error, description) {
+        (Some(error), Some(description)) => {
+            format!(
+                "provider token exchange failed with status {status}: error={error}; error_description={description}"
+            )
+        }
+        (Some(error), None) => {
+            format!("provider token exchange failed with status {status}: error={error}")
+        }
+        (None, Some(description)) => {
+            format!(
+                "provider token exchange failed with status {status}: error_description={description}"
+            )
+        }
+        (None, None) => format!("provider token exchange failed with status {status}"),
+    }
+}
+
+fn sanitize_oauth_error_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(MAX_OAUTH_ERROR_FIELD_LEN)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 pub(super) async fn handle_get_provider_refresh_status(
     state: &Arc<ServerState>,
     request: Request<GetProviderRefreshStatusRequest>,
@@ -4228,13 +4969,16 @@ mod tests {
             refresh: None,
             path_template: String::new(),
             token_grant: Some(ProviderCredentialTokenGrant {
+                grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
                 token_endpoint: "http://keycloak.default.svc.cluster.local/realms/openshell/protocol/openid-connect/token".to_string(),
                 audience: "api://default".to_string(),
                 jwt_svid_audience: "http://keycloak.default.svc.cluster.local/realms/openshell"
                     .to_string(),
                 client_assertion_type:
                     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
+                subject_token: None,
                 scopes: vec!["openid".to_string()],
+                requested_token_type: String::new(),
                 cache_ttl_seconds: 300,
                 audience_overrides: service_audiences
                     .iter()
@@ -5004,12 +5748,15 @@ mod tests {
             refresh: None,
             path_template: String::new(),
             token_grant: Some(ProviderCredentialTokenGrant {
+                grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
                 token_endpoint: "https://auth.example.com/token".to_string(),
                 audience: "api://default".to_string(),
                 jwt_svid_audience: "https://auth.example.com".to_string(),
                 client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
                     .to_string(),
+                subject_token: None,
                 scopes: vec!["read".to_string()],
+                requested_token_type: String::new(),
                 cache_ttl_seconds: 300,
                 audience_overrides: Vec::new(),
             }),
@@ -7234,6 +7981,33 @@ mod tests {
                 .map(|handle| handle.driver.as_str()),
             Some("test-static")
         );
+    }
+
+    #[tokio::test]
+    async fn token_exchange_subject_token_resolves_credential_handle() {
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let mut provider = provider_with_values("exchange-local", "custom");
+        provider.credentials.clear();
+        provider.metadata.as_mut().expect("provider metadata").id = "provider-id".to_string();
+        let handles = credentials
+            .store_provider_credentials(
+                provider.object_name(),
+                provider.object_workspace(),
+                provider.object_id(),
+                &HashMap::from([("subject_token".to_string(), "user-token".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        provider.credential_handles = handles;
+
+        let subject_token =
+            resolve_subject_token_credential(&credentials, &provider, "subject_token")
+                .await
+                .unwrap();
+
+        assert_eq!(subject_token, "user-token");
     }
 
     #[tokio::test]
