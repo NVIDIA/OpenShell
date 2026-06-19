@@ -211,6 +211,12 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::RevokeSshSessionResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn exchange_provider_subject_token(
+        &self,
+        _: tonic::Request<openshell_core::proto::ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn create_provider(
         &self,
         _: tonic::Request<openshell_core::proto::CreateProviderRequest>,

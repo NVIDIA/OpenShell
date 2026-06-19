@@ -16,5 +16,4 @@ pub mod policy_local;
 pub mod procfs;
 pub mod proxy;
 pub mod run;
-mod spiffe_endpoint;
 mod token_grant;

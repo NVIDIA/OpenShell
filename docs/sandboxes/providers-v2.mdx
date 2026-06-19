@@ -168,6 +168,12 @@ category: data
 inference_capable: false
 
 credentials:
+  - name: user_oidc_token
+    description: User OIDC token used as a token-exchange subject token
+    env_vars: [CUSTOM_API_USER_OIDC_TOKEN]
+    required: true
+    auth_style: bearer
+
   - name: api_token
     description: API access token
     env_vars: [CUSTOM_API_TOKEN]
@@ -200,17 +206,23 @@ credentials:
           required: true
           secret: true
 
-    # Optional dynamic credential. The sandbox supervisor requests a
-    # SPIFFE JWT-SVID, exchanges it at token_endpoint, caches the returned
-    # access token, and injects it according to auth_style/header_name for
-    # matching endpoint traffic.
+    # Optional dynamic credential. The sandbox supervisor resolves this on
+    # demand for matching endpoint traffic, caches the returned access token,
+    # and injects it according to auth_style/header_name.
     token_grant:
+      # Accepted values: client_credentials, token_exchange.
+      grant_type: token_exchange
       token_endpoint: https://login.example.com/realms/custom/protocol/openid-connect/token
       audience: api://custom-api
       jwt_svid_audience: https://login.example.com/realms/custom
-      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
       scopes: [api.read, api.write]
       cache_ttl_seconds: 300
+      requested_token_type: urn:ietf:params:oauth:token-type:access_token
+      subject_token:
+        source: provider_credential
+        credential: user_oidc_token
+        subject_token_type: urn:ietf:params:oauth:token-type:access_token
       audience_overrides:
         - host: api.example.com
           port: 443
@@ -315,7 +327,14 @@ OpenShell keeps token endpoints profile-owned. Refresh material cannot override 
 
 ### Dynamic Token Grants
 
-`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor requests a SPIFFE JWT-SVID from the local Workload API, exchanges it at `token_endpoint`, caches the returned access token, and injects it before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
+`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor resolves the dynamic credential, caches the returned access token, and injects it before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
+
+OpenShell supports two dynamic grant types:
+
+| Grant type | Behavior |
+|---|---|
+| `client_credentials` | The supervisor requests a SPIFFE JWT-SVID from the local Workload API and sends it directly to `token_endpoint` as the OAuth2 client assertion. This is the default when `grant_type` is omitted. |
+| `token_exchange` | The supervisor first asks the gateway for an intermediate token. The request includes the supervisor JWT-SVID; the gateway verifies it, uses the SVID subject as the intermediate token audience, and exchanges the stored subject credential at the same `token_endpoint` using the gateway's own JWT-SVID as the client assertion. The supervisor then exchanges that intermediate token for the final upstream token using its own JWT-SVID as the client assertion. |
 
 Create provider instances for token-grant-only profiles with `--runtime-credentials`. This records an empty provider instance and makes the runtime-resolved credential source explicit:
 
@@ -326,19 +345,39 @@ openshell provider create \
   --runtime-credentials
 ```
 
+For `token_exchange` profiles, the provider also stores the user subject token referenced by `token_grant.subject_token.credential`. Create or update that provider credential from the current gateway OIDC login with `--from-oidc-token`. This requires an active named gateway that was registered for OIDC. The CLI copies the current OIDC access token and its expiry into the provider. If the stored gateway access token is expired and a refresh token is available, the CLI refreshes it first. OpenShell does not store the OIDC refresh token in the provider. When the stored subject-token credential expires, the gateway rejects intermediate token exchange until the provider is updated with a fresh token.
+
+```shell
+openshell provider create \
+  --name custom-api \
+  --type custom-api \
+  --from-oidc-token
+
+openshell provider update custom-api \
+  --from-oidc-token
+```
+
+OpenShell infers the destination credential when the provider profile has exactly one `token_grant.subject_token.credential`. If a profile declares more than one token-exchange subject credential, pass `--credential <key>` to choose one.
+
 Token grant fields:
 
 | Field | Required | Behavior |
 |---|---|---|
+| `grant_type` | No | `client_credentials` or `token_exchange`. Defaults to `client_credentials` for backward compatibility. |
 | `token_endpoint` | Yes | OAuth2 token endpoint that accepts a SPIFFE JWT-SVID client assertion. Use `https://` unless the endpoint is loopback or a Kubernetes service DNS name such as `token-issuer.default.svc.cluster.local`. |
-| `audience` | No | Resource audience requested from the token service. |
+| `audience` | No | Resource audience requested from the token service. For `token_exchange`, this is the final exchange audience; the gateway intermediate exchange always uses the verified supervisor SVID subject as its audience. |
 | `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
-| `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set a provider-specific value, such as `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe`, only when the token issuer explicitly requires it. |
+| `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe` when the token issuer expects the SPIFFE assertion type. |
 | `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
 | `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in` with a 30-second safety margin and one-hour cap, or five minutes minus the margin if the response does not include an expiry. |
-| `audience_overrides` | No | Endpoint-specific `audience` and `scopes` overrides selected by host, port, and path. |
+| `requested_token_type` | No | RFC 8693 `requested_token_type` sent during token exchange. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
+| `subject_token` | Required for `token_exchange` | Subject-token source used for the gateway-brokered intermediate exchange. Phase one supports `source: provider_credential`, where `credential` names another credential declared in the same profile. |
+| `subject_token.subject_token_type` | No | RFC 8693 `subject_token_type` for the stored subject token. Defaults to `urn:ietf:params:oauth:token-type:access_token`. |
+| `audience_overrides` | No | Endpoint-specific final-exchange `audience` and `scopes` overrides selected by host, port, and path. These overrides do not affect the gateway intermediate exchange. |
 
-Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. They apply to HTTP traffic that the proxy can inspect. Endpoints with `tls: skip` bypass TLS termination and cannot receive dynamic token grant injection for HTTPS traffic. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
+Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. `token_exchange` also requires the gateway to have its own Workload API socket so it can present a gateway JWT-SVID during the intermediate exchange. They apply to HTTP traffic that the proxy can inspect. Endpoints with `tls: skip` bypass TLS termination and cannot receive dynamic token grant injection for HTTPS traffic. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
+
+The gateway only brokers an intermediate token for a sandbox principal, and only when the requested provider is attached to that sandbox. It verifies the supervisor JWT-SVID issuer, audience, signature, and SPIFFE trust domain against the gateway's own JWT-SVID, then uses the verified supervisor SVID subject as the intermediate-token audience.
 
 ## Provider Instances
 

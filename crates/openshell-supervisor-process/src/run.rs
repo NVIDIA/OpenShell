@@ -85,10 +85,18 @@ pub async fn run_process(
     // the flag stays at its default (false) and no skill is installed.
     install_initial_agent_skill(sandbox_id, openshell_endpoint).await;
 
+    // Provider token grants may mount supervisor-only identity sockets such as
+    // the SPIFFE Workload API. Prepare the child mount namespace that hides
+    // those mounts before supervisor seccomp hardening removes the needed
+    // namespace syscalls.
+    #[cfg(target_os = "linux")]
+    crate::process::prepare_supervisor_identity_mount_namespace_from_env()?;
+
     // Install the supervisor seccomp prelude before spawning any workload-side
     // tasks. By this point the orchestrator has finished privileged startup
-    // helpers (network namespace setup, nftables probes via run_networking),
-    // and the SSH listener and entrypoint child have not been exposed yet.
+    // helpers (network namespace setup, identity mount namespace setup,
+    // nftables probes via run_networking), and the SSH listener and entrypoint
+    // child have not been exposed yet.
     crate::sandbox::apply_supervisor_startup_hardening()?;
 
     // Spawn the bypass detection monitor. It tails dmesg for nftables LOG

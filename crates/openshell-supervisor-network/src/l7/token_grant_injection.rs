@@ -26,6 +26,9 @@ pub struct TokenGrantRequest<'a> {
     pub audience: &'a str,
     pub scopes: &'a [String],
     pub cache_ttl_seconds: i64,
+    pub grant_type: i32,
+    pub subject_token_type: &'a str,
+    pub requested_token_type: &'a str,
 }
 
 pub trait TokenGrantResolver: Send + Sync {
@@ -45,13 +48,18 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
             crate::token_grant::obtain_provider_token(
-                request.provider_key,
-                request.token_endpoint,
-                request.jwt_svid_audience,
-                request.client_assertion_type,
-                request.audience,
-                request.scopes,
-                request.cache_ttl_seconds,
+                crate::token_grant::ObtainProviderTokenRequest {
+                    provider_name: request.provider_key,
+                    token_endpoint: request.token_endpoint,
+                    jwt_svid_audience: request.jwt_svid_audience,
+                    client_assertion_type: request.client_assertion_type,
+                    audience: request.audience,
+                    scopes: request.scopes,
+                    cache_ttl_override: request.cache_ttl_seconds,
+                    grant_type: request.grant_type,
+                    subject_token_type: request.subject_token_type,
+                    requested_token_type: request.requested_token_type,
+                },
             )
             .await
         })
@@ -127,7 +135,7 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
                     port = ctx.port,
                     provider = %provider_key,
                     error = %e,
-                    "Token grant failed"
+                    "Token grant failed: {e}"
                 );
                 let provider_key = ocsf_message_field(&provider_key);
                 ocsf_emit!(
@@ -175,6 +183,12 @@ fn token_grant_request<'a>(
         audience: &token_grant.audience,
         scopes: &token_grant.scopes,
         cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        grant_type: token_grant.grant_type,
+        subject_token_type: token_grant
+            .subject_token
+            .as_ref()
+            .map_or("", |subject| subject.subject_token_type.as_str()),
+        requested_token_type: &token_grant.requested_token_type,
     }
 }
 
@@ -377,7 +391,9 @@ fn inject_header(raw_header: &[u8], header_name: &str, header_value: &str) -> Re
 #[cfg(test)]
 pub mod test_support {
     use super::*;
-    use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
+    use openshell_core::proto::{
+        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType, ProviderProfileCredential,
+    };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -395,6 +411,9 @@ pub mod test_support {
         audience: String,
         scopes: Vec<String>,
         cache_ttl_seconds: i64,
+        grant_type: i32,
+        subject_token_type: String,
+        requested_token_type: String,
     }
 
     pub struct TokenGrantTestFixture {
@@ -466,6 +485,12 @@ pub mod test_support {
             assert_eq!(request.audience, "api://example");
             assert_eq!(request.scopes, ["read"]);
             assert_eq!(request.cache_ttl_seconds, 300);
+            assert_eq!(
+                request.grant_type,
+                ProviderCredentialTokenGrantType::ClientCredentials as i32
+            );
+            assert!(request.subject_token_type.is_empty());
+            assert!(request.requested_token_type.is_empty());
         }
     }
 
@@ -479,6 +504,9 @@ pub mod test_support {
             scopes: vec!["read".to_string()],
             cache_ttl_seconds: 300,
             audience_overrides: Vec::new(),
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
+            subject_token: None,
+            requested_token_type: String::new(),
         }
     }
 
@@ -495,6 +523,9 @@ pub mod test_support {
                 audience: request.audience.to_string(),
                 scopes: request.scopes.to_vec(),
                 cache_ttl_seconds: request.cache_ttl_seconds,
+                grant_type: request.grant_type,
+                subject_token_type: request.subject_token_type.to_string(),
+                requested_token_type: request.requested_token_type.to_string(),
             };
             Box::pin(async move {
                 self.requests
@@ -527,6 +558,12 @@ mod tests {
 
         assert!(dynamic_credential_key_matches(
             key,
+            "api.example.com",
+            443,
+            "/repos/owner/repo"
+        ));
+        assert!(dynamic_credential_key_matches(
+            "api.example.com\t443\t/repos/**\trev:42\tgithub:access_token",
             "api.example.com",
             443,
             "/repos/owner/repo"

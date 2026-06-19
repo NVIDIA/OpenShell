@@ -399,11 +399,39 @@ tests:
           path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.spiffe\]'
 
-  - it: keeps the gateway sandbox JWT secret mounted when provider SPIFFE grants are enabled
+  - it: mounts the gateway SPIFFE socket while keeping sandbox JWT auth
     set:
       server.providerTokenGrants.spiffe.enabled: true
     template: templates/statefulset.yaml
     asserts:
-      - matchRegex:
-          path: spec.template.spec.volumes[1].name
-          pattern: '^sandbox-jwt$'
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET
+            value: /spiffe-workload-api/spire-agent.sock
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: sandbox-jwt
+            mountPath: /etc/openshell-jwt
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: spiffe-workload-api
+            mountPath: /spiffe-workload-api
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: sandbox-jwt
+            secret:
+              defaultMode: 256
+              secretName: openshell-jwt-keys
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spiffe-workload-api
+            csi:
+              driver: csi.spiffe.io
+              readOnly: true

@@ -196,6 +196,14 @@ sa_token_ttl_secs              = 3600
 provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
 ```
 
+For token-exchange provider profiles, the gateway also needs access to its own
+SPIFFE Workload API socket. In Helm deployments, set
+`server.providerTokenGrants.spiffe.enabled=true`; the chart mounts the socket
+into the gateway pod and sets `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`.
+The gateway verifies supervisor JWT-SVIDs with JWT bundles fetched from the
+SPIFFE Workload API, so this validation path does not require gateway access to
+the SPIRE OIDC discovery endpoint or its TLS CA.
+
 ### Docker
 
 Sandboxes run as containers on a local bridge network. The supervisor binary is bind-mounted from the host (no in-cluster image pull required); guest mTLS material is supplied as host paths.

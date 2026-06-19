@@ -12,7 +12,7 @@ use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::denial::DenialEvent;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip, is_link_local_ip};
 use openshell_core::policy::ProxyPolicy;
-use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_core::provider_credentials::{ProviderCredentialSnapshot, ProviderCredentialState};
 use openshell_core::secrets::{SecretResolver, rewrite_header_line_checked};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
@@ -52,6 +52,27 @@ const HOST_GATEWAY_ALIASES: &[&str] = &[
     "host.containers.internal",
     "host.docker.internal",
 ];
+
+fn revision_scoped_dynamic_credentials(
+    snapshot: &ProviderCredentialSnapshot,
+) -> std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential> {
+    snapshot
+        .dynamic_credentials
+        .iter()
+        .map(|(key, credential)| {
+            let scoped_key = key.rsplit_once('\t').map_or_else(
+                || format!("rev:{}\t{key}", snapshot.revision),
+                |(endpoint_selector, provider_credential)| {
+                    format!(
+                        "{endpoint_selector}\trev:{}\t{provider_credential}",
+                        snapshot.revision
+                    )
+                },
+            );
+            (scoped_key, credential.clone())
+        })
+        .collect()
+}
 
 /// Cloud instance metadata IPs that are NEVER exempted from SSRF blocking,
 /// even when they coincidentally match a host-gateway alias resolution.
@@ -252,9 +273,9 @@ impl ProxyHandle {
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
                         let dynamic_credentials = provider_credentials.as_ref().map(|state| {
-                            Arc::new(std::sync::RwLock::new(
-                                state.snapshot().dynamic_credentials.clone(),
-                            ))
+                            Arc::new(std::sync::RwLock::new(revision_scoped_dynamic_credentials(
+                                &state.snapshot(),
+                            )))
                         });
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
@@ -4383,6 +4404,29 @@ network_policies:
         assert!(
             leaked.is_empty(),
             "h2c upgrade request must not be written to upstream"
+        );
+    }
+
+    #[test]
+    fn revision_scoped_dynamic_credentials_preserves_endpoint_selector_and_adds_revision() {
+        let mut dynamic_credentials = std::collections::HashMap::new();
+        dynamic_credentials.insert(
+            "api.example.test\t443\t/v1/**\tprovider:access_token".to_string(),
+            openshell_core::proto::ProviderProfileCredential {
+                name: "access_token".to_string(),
+                ..Default::default()
+            },
+        );
+        let snapshot = ProviderCredentialSnapshot {
+            revision: 42,
+            child_env: std::collections::HashMap::new(),
+            dynamic_credentials,
+        };
+
+        let scoped = revision_scoped_dynamic_credentials(&snapshot);
+
+        assert!(
+            scoped.contains_key("api.example.test\t443\t/v1/**\trev:42\tprovider:access_token")
         );
     }
 

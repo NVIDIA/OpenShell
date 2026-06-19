@@ -747,7 +747,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).multiple(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -775,8 +775,12 @@ enum ProviderCommands {
         #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials"])]
         from_gcloud_adc: bool,
 
+        /// Store the active gateway OIDC access token as the named provider credential.
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"])]
+        from_oidc_token: bool,
+
         /// Create a provider whose required credentials are resolved at runtime by the gateway/sandbox.
-        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc"])]
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc", "from_oidc_token"])]
         runtime_credentials: bool,
 
         /// Provider config key/value pair.
@@ -836,8 +840,12 @@ enum ProviderCommands {
         name: String,
 
         /// Re-discover credentials from existing local state (e.g. env vars, config files).
-        #[arg(long, conflicts_with = "credentials")]
+        #[arg(long, conflicts_with_all = ["credentials", "from_oidc_token"])]
         from_existing: bool,
+
+        /// Store the active gateway OIDC access token as the named provider credential.
+        #[arg(long, conflicts_with = "from_existing")]
+        from_oidc_token: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
@@ -2880,20 +2888,44 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     from_gcloud_adc,
+                    from_oidc_token,
                     runtime_credentials,
                     config,
                 } => {
-                    run::provider_create_with_options(
-                        endpoint,
-                        &name,
-                        provider_type.as_str(),
+                    let selected_sources = [
                         from_existing,
-                        &credentials,
                         from_gcloud_adc,
+                        from_oidc_token,
                         runtime_credentials,
-                        &config,
-                        &tls,
-                    )
+                    ]
+                    .into_iter()
+                    .filter(|selected| *selected)
+                    .count();
+                    if selected_sources > 1 {
+                        return Err(miette::miette!(
+                            "--from-existing, --from-gcloud-adc, --from-oidc-token, and --runtime-credentials are mutually exclusive"
+                        ));
+                    }
+                    let credential_source = if from_existing {
+                        run::ProviderCreateCredentialSource::Existing
+                    } else if from_gcloud_adc {
+                        run::ProviderCreateCredentialSource::GcloudAdc
+                    } else if from_oidc_token {
+                        run::ProviderCreateCredentialSource::OidcToken
+                    } else if runtime_credentials {
+                        run::ProviderCreateCredentialSource::Runtime
+                    } else {
+                        run::ProviderCreateCredentialSource::ExplicitCredentials
+                    };
+                    run::provider_create_with_options(run::ProviderCreateOptions {
+                        server: endpoint,
+                        name: &name,
+                        provider_type: provider_type.as_str(),
+                        credentials: &credentials,
+                        credential_source,
+                        config: &config,
+                        tls: &tls,
+                    })
                     .await?;
                 }
                 ProviderCommands::Refresh(command) => match command {
@@ -2992,19 +3024,21 @@ async fn main() -> Result<()> {
                 ProviderCommands::Update {
                     name,
                     from_existing,
+                    from_oidc_token,
                     credentials,
                     config,
                     credential_expires_at,
                 } => {
-                    run::provider_update(
-                        endpoint,
-                        &name,
+                    run::provider_update(run::ProviderUpdateOptions {
+                        server: endpoint,
+                        name: &name,
                         from_existing,
-                        &credentials,
-                        &config,
-                        &credential_expires_at,
-                        &tls,
-                    )
+                        from_oidc_token,
+                        credentials: &credentials,
+                        config: &config,
+                        credential_expires_at: &credential_expires_at,
+                        tls: &tls,
+                    })
                     .await?;
                 }
                 ProviderCommands::Delete { names } => {
@@ -4107,6 +4141,68 @@ mod tests {
     }
 
     #[test]
+    fn provider_create_accepts_from_oidc_token_destination_credential() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "custom-api",
+            "--type",
+            "custom-api",
+            "--from-oidc-token",
+            "--credential",
+            "user_oidc_token",
+        ])
+        .expect("provider create should parse from oidc token");
+
+        match cli.command {
+            Some(Commands::Provider {
+                command:
+                    Some(ProviderCommands::Create {
+                        name,
+                        provider_type,
+                        from_oidc_token,
+                        credentials,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name, "custom-api");
+                assert_eq!(provider_type, "custom-api");
+                assert!(from_oidc_token);
+                assert_eq!(credentials, vec!["user_oidc_token"]);
+            }
+            other => panic!("expected provider create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_create_accepts_from_oidc_token_without_credential() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "custom-api",
+            "--type",
+            "custom-api",
+            "--from-oidc-token",
+        ])
+        .expect("provider create should parse inferred oidc token destination");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Create {
+                    from_oidc_token: true,
+                    credentials,
+                    ..
+                })
+            }) if credentials.is_empty()
+        ));
+    }
+
+    #[test]
     fn provider_create_rejects_from_gcloud_adc_with_from_existing() {
         let err = Cli::try_parse_from([
             "openshell",
@@ -4263,6 +4359,56 @@ mod tests {
                     ..
                 })
             }) if credential_expires_at == vec!["MS_GRAPH_ACCESS_TOKEN=1767225600000"]
+        ));
+    }
+
+    #[test]
+    fn provider_update_accepts_from_oidc_token_destination_credential() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "update",
+            "custom-api",
+            "--from-oidc-token",
+            "--credential",
+            "user_oidc_token",
+        ])
+        .expect("provider update should parse from oidc token");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Update {
+                    name,
+                    from_oidc_token: true,
+                    credentials,
+                    ..
+                })
+            }) if name == "custom-api" && credentials == vec!["user_oidc_token"]
+        ));
+    }
+
+    #[test]
+    fn provider_update_accepts_from_oidc_token_without_credential() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "update",
+            "custom-api",
+            "--from-oidc-token",
+        ])
+        .expect("provider update should parse inferred oidc token destination");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Update {
+                    name,
+                    from_oidc_token: true,
+                    credentials,
+                    ..
+                })
+            }) if name == "custom-api" && credentials.is_empty()
         ));
     }
 

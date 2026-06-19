@@ -34,6 +34,7 @@ pub mod provider_credentials;
 pub mod sandbox_env;
 pub mod secrets;
 pub mod settings;
+pub mod spiffe;
 pub mod telemetry;
 pub mod time;
 
