@@ -2064,7 +2064,25 @@ mod tests {
             workdir: "/tmp\nmalicious".to_string(),
             ..Default::default()
         };
-        assert!(build_remote_exec_command(&req).is_err());
+        // Validation layer rejects newlines in workdir
+        assert!(validate_exec_request_fields(&req).is_err());
+    }
+
+    #[test]
+    fn build_remote_exec_command_accepts_multiline_script() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "def f():\n    return 1\nprint(f())".to_string(),
+            ],
+            ..Default::default()
+        };
+        let cmd = build_remote_exec_command(&req).unwrap();
+        assert!(cmd.starts_with("python3 -c "));
+        assert!(cmd.contains("'def f():\n    return 1\nprint(f())'"));
     }
 
     #[test]
