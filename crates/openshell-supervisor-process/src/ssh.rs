@@ -661,12 +661,20 @@ impl Default for PtyRequest {
 
 /// Derive the session USER and HOME from the policy's `run_as_user`.
 ///
-/// Falls back to `("sandbox", "/sandbox")` when the policy has no explicit user,
-/// preserving backward compatibility with images that use the default layout.
+/// For name-based identities, looks up the home directory via `/etc/passwd`
+/// (or defaults to `/home/{user}`).
+///
+/// For numeric UIDs, there is no passwd entry — falls back to
+/// `("{uid}", "/sandbox")` so the agent session still has a meaningful
+/// USER identifier.
 fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
     match policy.process.run_as_user.as_deref() {
         Some(user) if !user.is_empty() => {
-            // Look up the user's home directory from /etc/passwd.
+            // Numeric UID — no passwd entry expected; use default HOME.
+            if user.parse::<u32>().is_ok() {
+                return (user.to_string(), "/sandbox".to_string());
+            }
+            // Name-based identity — look up home from /etc/passwd.
             let home = nix::unistd::User::from_name(user)
                 .ok()
                 .flatten()
@@ -1525,6 +1533,112 @@ mod tests {
             .send(b"still-alive".to_vec())
             .unwrap();
         assert_eq!(rx_b.recv().unwrap(), b"still-alive");
+    }
+
+    // -----------------------------------------------------------------------
+    // session_user_and_home tests (Phase 2: numeric UID support)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn session_user_and_home_returns_numeric_uid_as_user() {
+        use openshell_core::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
+        };
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: Some("1000".into()),
+                run_as_group: None,
+            },
+        };
+        let (user, home) = session_user_and_home(&policy);
+        assert_eq!(user, "1000");
+        // Numeric UID has no passwd entry — defaults to /sandbox.
+        assert_eq!(home, "/sandbox");
+    }
+
+    #[test]
+    fn session_user_and_home_returns_name_from_passwd() {
+        use openshell_core::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
+        };
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: Some("sandbox".into()),
+                run_as_group: None,
+            },
+        };
+        let (user, home) = session_user_and_home(&policy);
+        assert_eq!(user, "sandbox");
+        // Name-based — should resolve via passwd (or /home/{user}).
+        assert!(!home.is_empty());
+    }
+
+    #[test]
+    fn session_user_and_home_defaults_to_sandbox_when_empty() {
+        use openshell_core::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
+        };
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: Some(String::new()),
+                run_as_group: None,
+            },
+        };
+        let (user, home) = session_user_and_home(&policy);
+        assert_eq!(user, "sandbox");
+        assert_eq!(home, "/sandbox");
+    }
+
+    #[test]
+    fn session_user_and_home_defaults_to_sandbox_when_none() {
+        use openshell_core::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
+        };
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: None,
+                run_as_group: None,
+            },
+        };
+        let (user, home) = session_user_and_home(&policy);
+        assert_eq!(user, "sandbox");
+        assert_eq!(home, "/sandbox");
+    }
+
+    #[test]
+    fn session_user_and_home_handles_large_numeric_uid() {
+        use openshell_core::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
+        };
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: Some("1000660000".into()),
+                run_as_group: None,
+            },
+        };
+        let (user, home) = session_user_and_home(&policy);
+        assert_eq!(user, "1000660000");
+        assert_eq!(home, "/sandbox");
     }
 
     /// `install_pre_exec_no_pty` runs drop_privileges and succeeds when the
