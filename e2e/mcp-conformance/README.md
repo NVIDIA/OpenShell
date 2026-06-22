@@ -32,7 +32,7 @@ attaches to the CI job container on the e2e network), at `host.docker.internal`
 on local Docker Desktop, or via `--add-host ...:host-gateway` on local Linux.
 
 The generated policy allows valid JSON-RPC requests to the conformance server
-with `rpc_method: "*"`. That keeps OpenShell deny-by-default at the network
+with `method: "*"`. That keeps OpenShell deny-by-default at the network
 boundary while allowing the upstream scenarios to exercise MCP behavior. The
 policy body lives in `policy-template.yaml`; the wrapper renders its host, port,
 and path placeholders from the upstream server URL.

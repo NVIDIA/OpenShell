@@ -591,26 +591,19 @@ fn json_rule_has_transport_fields(rule: &serde_json::Value) -> bool {
     rule.get("method").is_some() || rule.get("path").is_some() || rule.get("query").is_some()
 }
 
-fn json_rule_has_non_empty_transport_fields(rule: &serde_json::Value) -> bool {
-    rule.get("method")
+fn json_rule_has_non_empty_jsonrpc_params(rule: &serde_json::Value) -> bool {
+    rule.get("params")
+        .is_some_and(|v| !v.is_null() && !v.as_object().is_some_and(serde_json::Map::is_empty))
+}
+
+fn json_rule_has_non_empty_path_or_query(rule: &serde_json::Value) -> bool {
+    rule.get("path")
         .and_then(|v| v.as_str())
         .is_some_and(|v| !v.is_empty())
-        || rule
-            .get("path")
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| !v.is_empty())
         || rule
             .get("query")
             .and_then(|v| v.as_object())
             .is_some_and(|v| !v.is_empty())
-}
-
-fn json_rule_has_non_empty_jsonrpc_fields(rule: &serde_json::Value) -> bool {
-    rule.get("rpc_method")
-        .is_some_and(|v| !v.is_null() && !v.as_str().is_some_and(str::is_empty))
-        || rule
-            .get("params")
-            .is_some_and(|v| !v.is_null() && !v.as_object().is_some_and(serde_json::Map::is_empty))
 }
 
 fn validate_jsonrpc_rule(
@@ -620,21 +613,18 @@ fn validate_jsonrpc_rule(
     rule: &serde_json::Value,
     kind: &str,
 ) {
-    let rpc_method = rule
-        .get("rpc_method")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if rpc_method.is_empty() {
+    let method = rule.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if method.is_empty() {
         errors.push(format!(
-            "{loc}: JSON-RPC {kind} rules must specify rpc_method, for example \"*\""
+            "{loc}: JSON-RPC {kind} rules must specify method, for example \"*\""
         ));
-    } else if let Some(warning) = check_glob_syntax(rpc_method) {
-        warnings.push(format!("{loc}.rpc_method: {warning}"));
+    } else if let Some(warning) = check_glob_syntax(method) {
+        warnings.push(format!("{loc}.method: {warning}"));
     }
 
-    if json_rule_has_non_empty_transport_fields(rule) {
+    if json_rule_has_non_empty_path_or_query(rule) {
         errors.push(format!(
-            "{loc}: JSON-RPC {kind} rules must use rpc_method/params, not method/path/query"
+            "{loc}: JSON-RPC {kind} rules must use method/params, not path/query"
         ));
     }
 
@@ -749,13 +739,13 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
 
             if protocol == "json-rpc" && !access.is_empty() {
                 errors.push(format!(
-                    "{loc}: protocol json-rpc does not support access presets; use explicit rules with allow.rpc_method such as \"*\""
+                    "{loc}: protocol json-rpc does not support access presets; use explicit rules with allow.method such as \"*\""
                 ));
             }
 
             if protocol == "json-rpc" && !has_rules {
                 errors.push(format!(
-                    "{loc}: protocol json-rpc requires explicit rules with allow.rpc_method"
+                    "{loc}: protocol json-rpc requires explicit rules with allow.method"
                 ));
             }
 
@@ -992,9 +982,9 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                                 deny_rule,
                                 "deny",
                             );
-                        } else if json_rule_has_non_empty_jsonrpc_fields(deny_rule) {
+                        } else if json_rule_has_non_empty_jsonrpc_params(deny_rule) {
                             errors.push(format!(
-                                "{deny_loc}: rpc_method/params are only valid on protocol json-rpc endpoints"
+                                "{deny_loc}: params are only valid on protocol json-rpc endpoints"
                             ));
                         }
                     }
@@ -1062,9 +1052,9 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                             allow,
                             "allow",
                         );
-                    } else if json_rule_has_non_empty_jsonrpc_fields(allow) {
+                    } else if json_rule_has_non_empty_jsonrpc_params(allow) {
                         errors.push(format!(
-                            "{rule_loc}: rpc_method/params are only valid on protocol json-rpc endpoints"
+                            "{rule_loc}: params are only valid on protocol json-rpc endpoints"
                         ));
                     }
                     if websocket_has_graphql_policy
@@ -1560,14 +1550,14 @@ mod tests {
             errors.iter().any(|e| {
                 e.contains("json-rpc")
                     && e.contains("does not support access presets")
-                    && e.contains("rpc_method")
+                    && e.contains("method")
             }),
             "JSON-RPC access presets should be rejected: {errors:?}"
         );
     }
 
     #[test]
-    fn validate_jsonrpc_requires_rpc_method_rules() {
+    fn validate_jsonrpc_requires_method_rules() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
@@ -1578,7 +1568,6 @@ mod tests {
                         "protocol": "json-rpc",
                         "rules": [{
                             "allow": {
-                                "method": "POST",
                                 "path": "/mcp"
                             }
                         }]
@@ -1591,14 +1580,14 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| { e.contains("JSON-RPC allow rules must specify rpc_method") }),
-            "JSON-RPC allow rules without rpc_method should be rejected: {errors:?}"
+                .any(|e| { e.contains("JSON-RPC allow rules must specify method") }),
+            "JSON-RPC allow rules without method should be rejected: {errors:?}"
         );
         assert!(
             errors
                 .iter()
-                .any(|e| { e.contains("must use rpc_method/params, not method/path/query") }),
-            "JSON-RPC REST-shaped allow rules should be rejected: {errors:?}"
+                .any(|e| { e.contains("must use method/params, not path/query") }),
+            "JSON-RPC allow rules with path/query should be rejected: {errors:?}"
         );
     }
 
@@ -1615,14 +1604,12 @@ mod tests {
                             "allow": {
                                 "method": "GET",
                                 "path": "/v1/**",
-                                "rpc_method": "tools/list",
                                 "params": { "name": "read_status" }
                             }
                         }],
                         "deny_rules": [{
                             "method": "POST",
                             "path": "/v1/**",
-                            "rpc_method": "tools/delete",
                             "params": { "name": "purge_cache" }
                         }]
                     }],
@@ -1632,21 +1619,21 @@ mod tests {
         });
         let (errors, _warnings) = validate_l7_policies(&data);
         assert!(
-            errors.iter().any(|e| {
-                e.contains("rules[0].allow") && e.contains("rpc_method/params are only valid")
-            }),
+            errors
+                .iter()
+                .any(|e| { e.contains("rules[0].allow") && e.contains("params are only valid") }),
             "REST allow rules with JSON-RPC fields should be rejected: {errors:?}"
         );
         assert!(
-            errors.iter().any(|e| {
-                e.contains("deny_rules[0]") && e.contains("rpc_method/params are only valid")
-            }),
+            errors
+                .iter()
+                .any(|e| { e.contains("deny_rules[0]") && e.contains("params are only valid") }),
             "REST deny rules with JSON-RPC fields should be rejected: {errors:?}"
         );
     }
 
     #[test]
-    fn validate_jsonrpc_deny_rules_require_rpc_method() {
+    fn validate_jsonrpc_deny_rules_require_method() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
@@ -1657,7 +1644,7 @@ mod tests {
                         "protocol": "json-rpc",
                         "rules": [{
                             "allow": {
-                                "rpc_method": "*"
+                                "method": "*"
                             }
                         }],
                         "deny_rules": [{
@@ -1672,8 +1659,8 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("JSON-RPC deny rules must specify rpc_method")),
-            "JSON-RPC deny rules without rpc_method should be rejected: {errors:?}"
+                .any(|e| e.contains("JSON-RPC deny rules must specify method")),
+            "JSON-RPC deny rules without method should be rejected: {errors:?}"
         );
     }
 
@@ -1689,7 +1676,7 @@ mod tests {
                         "protocol": "json-rpc",
                         "rules": [{
                             "allow": {
-                                "rpc_method": "tools/call",
+                                "method": "tools/call",
                                 "params": {
                                     "name": { "mode": "read-*" },
                                     "scope": { "any": [] },
@@ -1698,7 +1685,7 @@ mod tests {
                             }
                         }],
                         "deny_rules": [{
-                            "rpc_method": "tools/delete",
+                            "method": "tools/delete",
                             "params": {
                                 "name": { "glob": "delete_*", "any": ["purge_*"] }
                             }
@@ -1736,7 +1723,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_jsonrpc_rpc_method_and_params_warn_on_malformed_globs() {
+    fn validate_method_and_params_warn_on_malformed_globs() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
@@ -1747,7 +1734,7 @@ mod tests {
                         "protocol": "json-rpc",
                         "rules": [{
                             "allow": {
-                                "rpc_method": "tools/[call",
+                                "method": "tools/[call",
                                 "params": {
                                     "name": "[bad"
                                 }
@@ -1766,8 +1753,8 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("allow.rpc_method") && w.contains("unclosed '['")),
-            "expected rpc_method glob warning, got: {warnings:?}"
+                .any(|w| w.contains("allow.method") && w.contains("unclosed '['")),
+            "expected method glob warning, got: {warnings:?}"
         );
         assert!(
             warnings

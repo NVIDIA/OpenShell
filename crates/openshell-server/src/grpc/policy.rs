@@ -8050,7 +8050,6 @@ mod tests {
                     operation_name: String::new(),
                     fields: Vec::new(),
                     params: HashMap::default(),
-                    rpc_method: String::new(),
                 }),
             }],
         };
@@ -8447,7 +8446,6 @@ mod tests {
                     operation_name: String::new(),
                     fields: Vec::new(),
                     params: HashMap::default(),
-                    rpc_method: String::new(),
                 }),
             }],
         }];
@@ -8595,7 +8593,6 @@ mod tests {
                     operation_name: String::new(),
                     fields: Vec::new(),
                     params: HashMap::default(),
-                    rpc_method: String::new(),
                 }),
             }],
         };

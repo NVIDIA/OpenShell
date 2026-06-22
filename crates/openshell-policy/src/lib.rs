@@ -196,8 +196,6 @@ struct L7AllowDef {
     operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fields: Vec<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    rpc_method: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     params: BTreeMap<String, QueryMatcherDef>,
 }
@@ -233,8 +231,6 @@ struct L7DenyRuleDef {
     operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fields: Vec<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    rpc_method: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     params: BTreeMap<String, QueryMatcherDef>,
 }
@@ -315,7 +311,6 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                         operation_type: r.allow.operation_type,
                                         operation_name: r.allow.operation_name,
                                         fields: r.allow.fields,
-                                        rpc_method: r.allow.rpc_method,
                                         query: r
                                             .allow
                                             .query
@@ -346,7 +341,6 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                     operation_type: d.operation_type,
                                     operation_name: d.operation_name,
                                     fields: d.fields,
-                                    rpc_method: d.rpc_method,
                                     query: d
                                         .query
                                         .into_iter()
@@ -486,7 +480,6 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                             operation_type: a.operation_type,
                                             operation_name: a.operation_name,
                                             fields: a.fields,
-                                            rpc_method: a.rpc_method,
                                             query: a
                                                 .query
                                                 .into_iter()
@@ -516,7 +509,6 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                     operation_type: d.operation_type.clone(),
                                     operation_name: d.operation_name.clone(),
                                     fields: d.fields.clone(),
-                                    rpc_method: d.rpc_method.clone(),
                                     query: d
                                         .query
                                         .iter()
@@ -1756,7 +1748,7 @@ network_policies:
           max_body_bytes: 131072
         rules:
           - allow:
-              rpc_method: initialize
+              method: initialize
     binaries:
       - path: /usr/bin/curl
 ";

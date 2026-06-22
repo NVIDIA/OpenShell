@@ -104,20 +104,20 @@ network_policies:
           max_body_bytes: 65536
         rules:
           - allow:
-              rpc_method: initialize
+              method: initialize
           - allow:
-              rpc_method: tools/list
+              method: tools/list
           - allow:
-              rpc_method: tools/call
+              method: tools/call
               params:
                 name: read_status
           - allow:
-              rpc_method: tools/call
+              method: tools/call
               params:
                 name: submit_report
                 arguments.scope: workspace/main
         deny_rules:
-          - rpc_method: tools/call
+          - method: tools/call
             params:
               name: blocked_action
     binaries:

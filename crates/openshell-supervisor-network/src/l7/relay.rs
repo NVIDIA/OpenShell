@@ -1345,13 +1345,13 @@ pub(crate) fn jsonrpc_log_message(
     policy_version: u64,
     reason: &str,
 ) -> String {
-    let rpc_methods = jsonrpc_methods_for_log(info);
+    let rule_methods = rule_method_names_for_log(info);
     format!(
-        "JSONRPC_L7_REQUEST decision={decision} http_method={http_method} endpoint={endpoint} rpc_methods={rpc_methods} params_sha256={params_sha256} policy_version={policy_version} reason={reason}"
+        "JSONRPC_L7_REQUEST decision={decision} http_method={http_method} endpoint={endpoint} rule_methods={rule_methods} params_sha256={params_sha256} policy_version={policy_version} reason={reason}"
     )
 }
 
-pub(crate) fn jsonrpc_methods_for_log(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> String {
+pub(crate) fn rule_method_names_for_log(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> String {
     if info.calls.is_empty() {
         return "-".to_string();
     }
@@ -1853,7 +1853,7 @@ network_policies:
         enforcement: enforce
         rules:
           - allow:
-              rpc_method: initialize
+              method: initialize
     binaries:
       - { path: /usr/bin/python3 }
 ";
@@ -2228,16 +2228,16 @@ network_policies:
         enforcement: enforce
         rules:
           - allow:
-              rpc_method: "tools/list"
+              method: "tools/list"
           - allow:
-              rpc_method: "tools/call"
+              method: "tools/call"
               params:
                 name: read_status
         deny_rules:
-          - rpc_method: "tools/call"
+          - method: "tools/call"
             params:
               name: blocked_action
-          - rpc_method: "tools/delete"
+          - method: "tools/delete"
     binaries:
       - { path: /usr/bin/node }
 "#;
@@ -2288,7 +2288,10 @@ network_policies:
             evaluate_jsonrpc_l7_request_for_log(&tunnel_engine, &ctx, &request, jsonrpc).unwrap();
         assert!(!evaluation.allowed);
         assert!(evaluation.log_info.has_response);
-        assert_eq!(jsonrpc_methods_for_log(&evaluation.log_info), "tools/list");
+        assert_eq!(
+            rule_method_names_for_log(&evaluation.log_info),
+            "tools/list"
+        );
 
         request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#,
@@ -2302,7 +2305,7 @@ network_policies:
             evaluate_jsonrpc_l7_request_for_log(&tunnel_engine, &ctx, &request, jsonrpc).unwrap();
         assert!(!evaluation.allowed);
         assert!(evaluation.log_info.has_response);
-        assert_eq!(jsonrpc_methods_for_log(&evaluation.log_info), "-");
+        assert_eq!(rule_method_names_for_log(&evaluation.log_info), "-");
 
         request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"[
@@ -2320,7 +2323,7 @@ network_policies:
         assert!(!evaluation.allowed);
         assert!(evaluation.log_info.is_batch);
         assert_eq!(
-            jsonrpc_methods_for_log(&evaluation.log_info),
+            rule_method_names_for_log(&evaluation.log_info),
             "tools/call,tools/delete"
         );
 
@@ -2339,7 +2342,7 @@ network_policies:
             42,
             &evaluation.reason,
         );
-        assert!(message.contains("rpc_methods=tools/call,tools/delete"));
+        assert!(message.contains("rule_methods=tools/call,tools/delete"));
         assert!(message.contains("params_sha256="));
         assert!(!message.contains("params_sha256=sha256:"));
         assert!(message.contains("policy_version=42"));
@@ -2365,7 +2368,7 @@ network_policies:
         );
 
         assert!(message.contains("endpoint=mcp.example.com:443/mcp"));
-        assert!(message.contains("rpc_methods=tools/call"));
+        assert!(message.contains("rule_methods=tools/call"));
         assert!(message.contains("params_sha256="));
         assert!(!message.contains("params_sha256=sha256:"));
         assert!(message.contains("policy_version=42"));
@@ -2390,11 +2393,10 @@ network_policies:
         );
 
         assert!(batch_message.starts_with("JSONRPC_L7_REQUEST "));
-        assert!(batch_message.contains("rpc_methods=tools/list,tools/call"));
+        assert!(batch_message.contains("rule_methods=tools/list,tools/call"));
         assert!(batch_message.contains("params_sha256="));
         assert!(!batch_message.contains("params_sha256=sha256:"));
         assert!(batch_message.contains("policy_version=43"));
-        assert!(!batch_message.contains("rpc_method="));
         assert!(!batch_message.contains("delete_resource"));
 
         let no_params = crate::l7::jsonrpc::parse_jsonrpc_body(
@@ -2412,7 +2414,7 @@ network_policies:
             44,
             "",
         );
-        assert!(no_params_message.contains("rpc_methods=initialize"));
+        assert!(no_params_message.contains("rule_methods=initialize"));
         assert!(no_params_message.contains("params_sha256=<empty>"));
     }
 

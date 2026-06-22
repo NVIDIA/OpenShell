@@ -47,7 +47,7 @@ ${port_spec}
           max_body_bytes: 131072
         rules:
           - allow:
-              rpc_method: "*"
+              method: "*"
     binaries:
       - path: /bin/sh
       - path: /usr/bin/env

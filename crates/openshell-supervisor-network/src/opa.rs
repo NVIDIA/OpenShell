@@ -1061,7 +1061,6 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                     "command": a.map_or("", |a| &a.command),
                                     "operation_type": a.map_or("", |a| &a.operation_type),
                                     "operation_name": a.map_or("", |a| &a.operation_name),
-                                    "rpc_method": a.map_or("", |a| &a.rpc_method),
                                 });
                                 if let Some(a) = a
                                     && !a.fields.is_empty()
@@ -1114,9 +1113,6 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                 }
                                 if !d.fields.is_empty() {
                                     deny["fields"] = d.fields.clone().into();
-                                }
-                                if !d.rpc_method.is_empty() {
-                                    deny["rpc_method"] = d.rpc_method.clone().into();
                                 }
                                 let query = l7_matchers_to_json(&d.query);
                                 if !query.is_empty() {
@@ -1973,15 +1969,15 @@ process:
         })
     }
 
-    fn l7_jsonrpc_input(host: &str, port: u16, path: &str, rpc_method: &str) -> serde_json::Value {
-        l7_jsonrpc_input_with_params(host, port, path, rpc_method, serde_json::json!({}))
+    fn l7_jsonrpc_input(host: &str, port: u16, path: &str, method: &str) -> serde_json::Value {
+        l7_jsonrpc_input_with_params(host, port, path, method, serde_json::json!({}))
     }
 
     fn l7_jsonrpc_input_with_params(
         host: &str,
         port: u16,
         path: &str,
-        rpc_method: &str,
+        method: &str,
         params: serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
@@ -1996,7 +1992,7 @@ process:
                 "path": path,
                 "query_params": {},
                 "jsonrpc": {
-                    "method": rpc_method,
+                    "method": method,
                     "params": params
                 }
             }
@@ -2604,7 +2600,6 @@ network_policies:
                             operation_type: String::new(),
                             operation_name: String::new(),
                             fields: Vec::new(),
-                            rpc_method: String::new(),
                             params: std::collections::HashMap::new(),
                         }),
                     }],
@@ -2655,7 +2650,7 @@ network_policies:
     }
 
     #[test]
-    fn l7_jsonrpc_rpc_method_from_proto_is_enforced() {
+    fn l7_method_from_proto_is_enforced() {
         let mut network_policies = std::collections::HashMap::new();
         network_policies.insert(
             "jsonrpc_proto".to_string(),
@@ -2669,14 +2664,13 @@ network_policies:
                     enforcement: "enforce".to_string(),
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
-                            method: String::new(),
+                            method: "initialize".to_string(),
                             path: String::new(),
                             command: String::new(),
                             query: std::collections::HashMap::new(),
                             operation_type: String::new(),
                             operation_name: String::new(),
                             fields: Vec::new(),
-                            rpc_method: "initialize".to_string(),
                             params: std::collections::HashMap::new(),
                         }),
                     }],
@@ -2757,7 +2751,7 @@ network_policies:
         enforcement: enforce
         rules:
           - allow:
-              rpc_method: initialize
+              method: initialize
     binaries:
       - { path: /usr/bin/curl }
 "#;
@@ -2817,7 +2811,7 @@ network_policies:
         enforcement: enforce
         rules:
           - allow:
-              rpc_method: initialize
+              method: initialize
     binaries:
       - { path: /usr/bin/curl }
 "#;
@@ -2853,7 +2847,7 @@ network_policies:
         enforcement: enforce
         rules:
           - allow:
-              rpc_method: initialize
+              method: initialize
     binaries:
       - { path: /usr/bin/curl }
 "#;
@@ -2873,7 +2867,7 @@ network_policies:
     }
 
     #[test]
-    fn l7_jsonrpc_method_rules_require_post() {
+    fn l7_method_rules_require_post() {
         let data = r#"
 network_policies:
   jsonrpc_post:
@@ -2886,9 +2880,9 @@ network_policies:
         enforcement: enforce
         rules:
           - allow:
-              rpc_method: initialize
+              method: initialize
         deny_rules:
-          - rpc_method: tools/delete
+          - method: tools/delete
     binaries:
       - { path: /usr/bin/curl }
 "#;
@@ -2931,16 +2925,16 @@ network_policies:
         enforcement: enforce
         rules:
           - allow:
-              rpc_method: tools/call
+              method: tools/call
               params:
                 name: read_status
           - allow:
-              rpc_method: tools/call
+              method: tools/call
               params:
                 name: submit_report
                 arguments.scope: workspace/main
         deny_rules:
-          - rpc_method: tools/call
+          - method: tools/call
             params:
               name: blocked_action
     binaries:

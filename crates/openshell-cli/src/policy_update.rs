@@ -205,7 +205,6 @@ fn group_allow_rules(specs: &[String]) -> Result<BTreeMap<(String, u32), Vec<L7R
                     operation_type: String::new(),
                     operation_name: String::new(),
                     fields: Vec::new(),
-                    rpc_method: String::new(),
                     params: HashMap::default(),
                 }),
             });
@@ -228,7 +227,6 @@ fn group_deny_rules(specs: &[String]) -> Result<BTreeMap<(String, u32), Vec<L7De
                 operation_type: String::new(),
                 operation_name: String::new(),
                 fields: Vec::new(),
-                rpc_method: String::new(),
                 params: HashMap::default(),
             });
     }
