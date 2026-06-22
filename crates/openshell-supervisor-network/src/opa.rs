@@ -2804,7 +2804,7 @@ network_policies:
     }
 
     #[test]
-    fn l7_jsonrpc_response_post_is_allowed_for_matching_endpoint() {
+    fn l7_jsonrpc_response_post_is_denied_for_matching_endpoint() {
         let data = r#"
 network_policies:
   jsonrpc_response:
@@ -2822,8 +2822,18 @@ network_policies:
       - { path: /usr/bin/curl }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
-        let allow_input = l7_jsonrpc_response_input("mcp.response.test", 8000, "/mcp");
-        assert!(eval_l7(&engine, &allow_input));
+        let response_input = l7_jsonrpc_response_input("mcp.response.test", 8000, "/mcp");
+        assert!(!eval_l7(&engine, &response_input));
+
+        let mut mixed_input = l7_jsonrpc_input_with_params(
+            "mcp.response.test",
+            8000,
+            "/mcp",
+            "initialize",
+            serde_json::json!({}),
+        );
+        mixed_input["request"]["jsonrpc"]["has_response"] = serde_json::json!(true);
+        assert!(!eval_l7(&engine, &mixed_input));
 
         let deny_input = l7_jsonrpc_response_input("mcp.response.test", 8000, "/other");
         assert!(!eval_l7(&engine, &deny_input));

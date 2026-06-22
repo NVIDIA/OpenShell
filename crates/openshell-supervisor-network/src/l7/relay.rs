@@ -1000,8 +1000,13 @@ where
             .error
             .as_deref()
             .map(|e| format!("JSON-RPC request rejected: {e}"));
-        let force_deny = parse_error_reason.is_some();
+        let response_frame_reason = jsonrpc_info
+            .has_response
+            .then(|| JSONRPC_RESPONSE_FRAME_DENY_REASON.to_string());
+        let force_deny = parse_error_reason.is_some() || response_frame_reason.is_some();
         let (allowed, reason, jsonrpc_log_info) = if let Some(reason) = parse_error_reason {
+            (false, reason, jsonrpc_info.clone())
+        } else if let Some(reason) = response_frame_reason {
             (false, reason, jsonrpc_info.clone())
         } else {
             let evaluation =
@@ -1363,6 +1368,9 @@ struct JsonRpcEvaluation {
     log_info: crate::l7::jsonrpc::JsonRpcRequestInfo,
 }
 
+const JSONRPC_RESPONSE_FRAME_DENY_REASON: &str =
+    "JSON-RPC response frames are not permitted from client to server";
+
 /// Check if a miette error represents a benign connection close.
 ///
 /// TLS handshake EOF, missing `close_notify`, connection resets, and broken
@@ -1390,6 +1398,12 @@ pub fn evaluate_l7_request(
     request: &L7RequestInfo,
 ) -> Result<(bool, String)> {
     if let Some(jsonrpc) = &request.jsonrpc
+        && jsonrpc.has_response
+    {
+        return Ok((false, JSONRPC_RESPONSE_FRAME_DENY_REASON.to_string()));
+    }
+
+    if let Some(jsonrpc) = &request.jsonrpc
         && jsonrpc.is_batch
         && !jsonrpc.calls.is_empty()
     {
@@ -1412,6 +1426,14 @@ fn evaluate_jsonrpc_l7_request_for_log(
     request: &L7RequestInfo,
     jsonrpc: &crate::l7::jsonrpc::JsonRpcRequestInfo,
 ) -> Result<JsonRpcEvaluation> {
+    if jsonrpc.has_response {
+        return Ok(JsonRpcEvaluation {
+            allowed: false,
+            reason: JSONRPC_RESPONSE_FRAME_DENY_REASON.to_string(),
+            log_info: jsonrpc.clone(),
+        });
+    }
+
     if jsonrpc.is_batch && !jsonrpc.calls.is_empty() {
         let mut denied_calls = Vec::new();
         let mut first_denied_reason = None;
@@ -2204,6 +2226,37 @@ network_policies:
 
         let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
         assert!(allowed, "{reason}");
+
+        request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"[
+                {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+                {"jsonrpc":"2.0","id":2,"result":{"ok":true}}
+            ]"#,
+        ));
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        assert!(!allowed);
+        assert!(reason.contains("response frames"));
+
+        let jsonrpc = request.jsonrpc.as_ref().expect("jsonrpc request");
+        let evaluation =
+            evaluate_jsonrpc_l7_request_for_log(&tunnel_engine, &ctx, &request, jsonrpc).unwrap();
+        assert!(!evaluation.allowed);
+        assert!(evaluation.log_info.has_response);
+        assert_eq!(jsonrpc_methods_for_log(&evaluation.log_info), "tools/list");
+
+        request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#,
+        ));
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        assert!(!allowed);
+        assert!(reason.contains("response frames"));
+
+        let jsonrpc = request.jsonrpc.as_ref().expect("jsonrpc response");
+        let evaluation =
+            evaluate_jsonrpc_l7_request_for_log(&tunnel_engine, &ctx, &request, jsonrpc).unwrap();
+        assert!(!evaluation.allowed);
+        assert!(evaluation.log_info.has_response);
+        assert_eq!(jsonrpc_methods_for_log(&evaluation.log_info), "-");
 
         request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"[

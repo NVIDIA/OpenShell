@@ -284,6 +284,12 @@ request_denied_for_endpoint(request, endpoint) if {
 	jsonrpc_rule_matches(request, deny_rule)
 }
 
+request_denied_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "json-rpc"
+	request.method == "POST"
+	jsonrpc_response_frame_present(request)
+}
+
 # --- L7 deny rule matching: GraphQL operation ---
 
 request_denied_for_endpoint(request, endpoint) if {
@@ -394,8 +400,15 @@ request_deny_reason := reason if {
 
 request_deny_reason := reason if {
 	input.request
+	jsonrpc_response_frame_present(input.request)
+	reason := "JSON-RPC response frames are not permitted from client to server"
+}
+
+request_deny_reason := reason if {
+	input.request
 	deny_request
 	not graphql_request_has_operations(input.request)
+	not jsonrpc_response_frame_present(input.request)
 	reason := sprintf("%s %s blocked by deny rule", [input.request.method, input.request.path])
 }
 
@@ -404,6 +417,7 @@ request_deny_reason := reason if {
 	not deny_request
 	not allow_request
 	not graphql_request_has_operations(input.request)
+	not jsonrpc_response_frame_present(input.request)
 	reason := sprintf("%s %s not permitted by policy", [input.request.method, input.request.path])
 }
 
@@ -434,6 +448,7 @@ request_allowed_for_endpoint(request, endpoint) if {
 	some rule
 	rule := endpoint.rules[_]
 	rule.allow.rpc_method
+	not jsonrpc_response_frame_present(request)
 	jsonrpc_rule_matches(request, rule.allow)
 }
 
@@ -445,18 +460,6 @@ request_allowed_for_endpoint(request, endpoint) if {
 	request.method == "GET"
 	is_object(request.jsonrpc)
 	jsonrpc_no_parse_error(request.jsonrpc)
-}
-
-# MCP clients send JSON-RPC responses (for example elicitation replies) back to
-# the server without a method. Allow response-only POSTs once endpoint path and
-# binary matching has already selected this JSON-RPC endpoint.
-request_allowed_for_endpoint(request, endpoint) if {
-	endpoint.protocol == "json-rpc"
-	request.method == "POST"
-	is_object(request.jsonrpc)
-	jsonrpc_no_parse_error(request.jsonrpc)
-	object.get(request.jsonrpc, "has_response", false)
-	object.get(request.jsonrpc, "method", null) == null
 }
 
 # --- L7 rule matching: GraphQL operation ---
@@ -689,6 +692,12 @@ jsonrpc_rule_matches(request, rule) if {
 	method != null
 	glob.match(rule.rpc_method, [], method)
 	jsonrpc_params_match(jsonrpc, rule)
+}
+
+jsonrpc_response_frame_present(request) if {
+	jsonrpc := object.get(request, "jsonrpc", {})
+	is_object(jsonrpc)
+	object.get(jsonrpc, "has_response", false)
 }
 
 jsonrpc_no_parse_error(jsonrpc) if {
