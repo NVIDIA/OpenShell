@@ -113,6 +113,15 @@ def test_snap_wrapper_uses_optional_gateway_config_without_generating_toml() -> 
     assert 'exec "${SNAP}/bin/openshell-gateway" "$@"' in wrapper
 
 
+def test_snap_cli_uses_snap_owned_xdg_dirs() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    snapcraft = (repo_root / "snapcraft.yaml").read_text(encoding="utf-8")
+
+    assert snapcraft.count('XDG_CONFIG_HOME: "$SNAP_USER_COMMON/.config"') == 2
+    assert snapcraft.count('XDG_DATA_HOME: "$SNAP_USER_COMMON/.local/share"') == 2
+    assert snapcraft.count('XDG_STATE_HOME: "$SNAP_USER_COMMON/.local/state"') == 2
+
+
 def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     spec = (repo_root / "openshell.spec").read_text(encoding="utf-8")

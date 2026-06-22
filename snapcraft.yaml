@@ -62,6 +62,10 @@ platforms:
 apps:
   openshell:
     command: bin/openshell
+    environment:
+      XDG_CONFIG_HOME: "$SNAP_USER_COMMON/.config"
+      XDG_DATA_HOME: "$SNAP_USER_COMMON/.local/share"
+      XDG_STATE_HOME: "$SNAP_USER_COMMON/.local/state"
     plugs:
       - home
       - network
@@ -70,6 +74,10 @@ apps:
   term:
     command: bin/openshell term
     desktop: meta/gui/term.desktop
+    environment:
+      XDG_CONFIG_HOME: "$SNAP_USER_COMMON/.config"
+      XDG_DATA_HOME: "$SNAP_USER_COMMON/.local/share"
+      XDG_STATE_HOME: "$SNAP_USER_COMMON/.local/state"
     plugs:
       - home
       - network
