@@ -970,7 +970,7 @@ async fn handle_tcp_connection(
         token_grant_resolver: dynamic_credentials
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
-        request_inspector: None,
+        request_inspector: crate::inspection::request_inspector_from_env(),
     };
 
     if effective_tls_skip {
@@ -3216,7 +3216,7 @@ async fn handle_forward_proxy(
         token_grant_resolver: dynamic_credentials
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
-        request_inspector: None,
+        request_inspector: crate::inspection::request_inspector_from_env(),
     };
     let mut l7_activity_pending = false;
 

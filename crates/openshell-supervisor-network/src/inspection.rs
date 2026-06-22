@@ -10,9 +10,19 @@
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
 use miette::{Result, miette};
+use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
+use std::sync::{Arc, LazyLock};
 
-#[derive(Debug, Clone, PartialEq)]
+static REQUEST_INSPECTOR: LazyLock<Option<Arc<dyn Inspector>>> = LazyLock::new(|| {
+    DemoInspectorClient::from_env().map(|client| {
+        let inspector: Arc<dyn Inspector> = Arc::new(client);
+        inspector
+    })
+});
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InspectionTarget {
     LlmRequest {
         provider: String,
@@ -30,20 +40,21 @@ pub enum InspectionTarget {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectionContext {
     pub sandbox_id: Option<String>,
     pub scope_id: Option<String>,
     pub provider: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
     pub code: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InspectionDecision {
     Allow,
     Deny {
@@ -62,6 +73,63 @@ pub trait Inspector: Send + Sync {
         target: InspectionTarget,
         ctx: &InspectionContext,
     ) -> Result<InspectionDecision>;
+}
+
+#[derive(Debug, Serialize)]
+struct InspectionRequestEnvelope<'a> {
+    target: &'a InspectionTarget,
+    context: &'a InspectionContext,
+}
+
+#[derive(Clone)]
+pub struct DemoInspectorClient {
+    endpoint: String,
+    client: reqwest::blocking::Client,
+}
+
+impl DemoInspectorClient {
+    fn from_env() -> Option<Self> {
+        let endpoint = std::env::var("OPENSHELL_REQUEST_INSPECTOR_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("request inspector client configuration should be valid");
+        Some(Self { endpoint, client })
+    }
+}
+
+impl Inspector for DemoInspectorClient {
+    fn inspect(
+        &self,
+        target: InspectionTarget,
+        ctx: &InspectionContext,
+    ) -> Result<InspectionDecision> {
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .json(&InspectionRequestEnvelope {
+                target: &target,
+                context: ctx,
+            })
+            .send()
+            .map_err(|error| miette!("request inspector call failed: {error}"))?;
+        if !response.status().is_success() {
+            return Err(miette!(
+                "request inspector returned non-success status {}",
+                response.status()
+            ));
+        }
+        response
+            .json::<InspectionDecision>()
+            .map_err(|error| miette!("request inspector response decode failed: {error}"))
+    }
+}
+
+pub fn request_inspector_from_env() -> Option<Arc<dyn Inspector>> {
+    REQUEST_INSPECTOR.clone()
 }
 
 #[allow(dead_code)]
