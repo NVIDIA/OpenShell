@@ -97,6 +97,13 @@ pub async fn run_networking(
             .or_else(|| sandbox_id.map(str::to_string)),
     ));
 
+    // Readiness signal for the proxy accept loop: the proxy binds the TCP
+    // listener immediately (so the OS backlog queues early SYN packets) but
+    // defers `accept()` until symlink resolution completes. This eliminates
+    // the race where an in-flight request observes a generation transition
+    // during the OPA engine reload.
+    let (engine_ready_tx, engine_ready_rx) = tokio::sync::watch::channel(false);
+
     // Spawn a task to resolve policy binary symlinks once the workload's mount
     // namespace becomes accessible via /proc/<pid>/root/. The task starts
     // before run_process spawns the child, so first wait for the orchestrator
@@ -125,6 +132,7 @@ pub async fn run_networking(
                     "Entrypoint PID never published; binary symlink resolution skipped. \
                      Policy binary paths will be matched literally."
                 );
+                let _ = engine_ready_tx.send(true);
                 return;
             }
 
@@ -155,6 +163,7 @@ pub async fn run_networking(
                             );
                         }
                     }
+                    let _ = engine_ready_tx.send(true);
                     return;
                 }
                 debug!(
@@ -170,7 +179,11 @@ pub async fn run_networking(
                  If binaries are symlinks, use canonical paths in your policy \
                  (run 'readlink -f <path>' inside the sandbox)"
             );
+            let _ = engine_ready_tx.send(true);
         });
+    } else {
+        // No symlink resolution needed — unblock the proxy immediately.
+        let _ = engine_ready_tx.send(true);
     }
 
     // Identity cache for SHA256 TOFU when OPA is active. Only consumed by
@@ -279,6 +292,7 @@ pub async fn run_networking(
             Some(policy_local_ctx.clone()),
             denial_tx,
             activity_tx,
+            engine_ready_rx,
         )
         .await?;
         Some(proxy_handle)

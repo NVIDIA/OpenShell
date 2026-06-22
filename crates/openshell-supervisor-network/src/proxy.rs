@@ -188,6 +188,7 @@ impl ProxyHandle {
         policy_local_ctx: Option<Arc<PolicyLocalContext>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
         activity_tx: Option<ActivitySender>,
+        engine_ready: tokio::sync::watch::Receiver<bool>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -229,6 +230,30 @@ impl ProxyHandle {
         }
 
         let join = tokio::spawn(async move {
+            // Wait for the OPA engine's symlink resolution reload to complete
+            // before accepting connections. This prevents requests from
+            // observing a generation transition mid-flight, which would cause
+            // the generation guard to reject them with a 403.
+            //
+            // The TCP listener is already bound, so the OS backlog queues
+            // incoming SYN packets during this wait. Once we start accepting,
+            // queued connections drain immediately.
+            let mut engine_ready = engine_ready;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                engine_ready.wait_for(|v| *v),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(_) => {
+                    warn!(
+                        "Engine readiness signal not received within 15s; \
+                         proceeding with proxy accept loop"
+                    );
+                }
+            }
+
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
