@@ -1368,7 +1368,7 @@ struct JsonRpcEvaluation {
     log_info: crate::l7::jsonrpc::JsonRpcRequestInfo,
 }
 
-const JSONRPC_RESPONSE_FRAME_DENY_REASON: &str =
+pub(crate) const JSONRPC_RESPONSE_FRAME_DENY_REASON: &str =
     "JSON-RPC response frames are not permitted from client to server";
 
 /// Check if a miette error represents a benign connection close.

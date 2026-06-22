@@ -133,6 +133,66 @@ network_policies:
     Ok(file)
 }
 
+fn write_jsonrpc_default_audit_policy(host: &str, port: u16) -> Result<NamedTempFile, String> {
+    let mut file = NamedTempFile::new().map_err(|e| format!("create temp policy file: {e}"))?;
+    let policy = format!(
+        r#"version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /app
+    - /etc
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  test_jsonrpc_l7_audit:
+    name: test_jsonrpc_l7_audit
+    endpoints:
+      - host: {host}
+        port: {port}
+        path: /mcp
+        protocol: json-rpc
+        allowed_ips:
+          - "10.0.0.0/8"
+          - "100.64.0.0/10"
+          - "172.0.0.0/8"
+          - "198.18.0.0/15"
+          - "192.168.0.0/16"
+          - "fc00::/7"
+        json_rpc:
+          max_body_bytes: 65536
+        rules:
+          - allow:
+              method: initialize
+    binaries:
+      - path: /usr/bin/python*
+      - path: /usr/local/bin/python*
+      - path: /sandbox/.uv/python/*/bin/python*
+"#
+    );
+    file.write_all(policy.as_bytes())
+        .map_err(|e| format!("write temp policy file: {e}"))?;
+    file.flush()
+        .map_err(|e| format!("flush temp policy file: {e}"))?;
+    Ok(file)
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn jsonrpc_l7_enforces_method_and_params_rules_on_forward_and_connect_paths() {
@@ -360,6 +420,69 @@ print(json.dumps(results, sort_keys=True))
         // CONNECT path — params denied
         ("connect_tools_call_params_name_no_args_denied", 403),
         ("connect_tools_call_params_name_with_args_denied", 403),
+    ] {
+        let expected_fragment = format!(r#""{key}": {expected}"#);
+        assert!(
+            guard.create_output.contains(&expected_fragment),
+            "expected {key}={expected}, got:\n{}",
+            guard.create_output
+        );
+    }
+}
+
+#[tokio::test]
+async fn jsonrpc_forward_proxy_hard_denies_response_frames_in_default_audit_mode() {
+    let server = start_test_server().await.expect("start test server");
+    let policy =
+        write_jsonrpc_default_audit_policy(&server.host, server.port).expect("write custom policy");
+    let policy_path = policy
+        .path()
+        .to_str()
+        .expect("temp policy path should be utf-8")
+        .to_string();
+
+    let script = format!(
+        r#"
+import json
+import urllib.error
+import urllib.request
+
+HOST = {host:?}
+PORT = {port}
+
+def post_jsonrpc(body):
+    encoded = json.dumps(body).encode()
+    request = urllib.request.Request(
+        f"http://{{HOST}}:{{PORT}}/mcp",
+        data=encoded,
+        headers={{"Content-Type": "application/json"}},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response.read()
+            return response.status
+    except urllib.error.HTTPError as error:
+        error.read()
+        return error.code
+
+results = {{
+    "forward_unknown_method_audited": post_jsonrpc({{"jsonrpc": "2.0", "id": 1, "method": "unknown/method"}}),
+    "forward_response_frame_hard_denied": post_jsonrpc({{"jsonrpc": "2.0", "id": 1, "result": {{}}}}),
+}}
+print(json.dumps(results, sort_keys=True))
+"#,
+        host = server.host,
+        port = server.port,
+    );
+
+    let guard = SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+        .await
+        .expect("sandbox create");
+
+    for (key, expected) in [
+        ("forward_unknown_method_audited", 200),
+        ("forward_response_frame_hard_denied", 403),
     ] {
         let expected_fragment = format!(r#""{key}": {expected}"#);
         assert!(

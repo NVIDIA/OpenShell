@@ -428,18 +428,23 @@ fn emit_forward_success_activity(tx: Option<&ActivitySender>, l7_activity_pendin
     );
 }
 
-fn l7_parse_error_reason(request_info: &crate::l7::L7RequestInfo) -> Option<String> {
+fn forward_l7_hard_deny_reason(request_info: &crate::l7::L7RequestInfo) -> Option<String> {
     request_info
         .graphql
         .as_ref()
         .and_then(|info| info.error.as_deref())
         .map(|error| format!("GraphQL request rejected: {error}"))
         .or_else(|| {
-            request_info
-                .jsonrpc
-                .as_ref()
-                .and_then(|info| info.error.as_deref())
-                .map(|error| format!("JSON-RPC request rejected: {error}"))
+            request_info.jsonrpc.as_ref().and_then(|info| {
+                info.error
+                    .as_deref()
+                    .map(|error| format!("JSON-RPC request rejected: {error}"))
+                    .or_else(|| {
+                        info.has_response.then(|| {
+                            crate::l7::relay::JSONRPC_RESPONSE_FRAME_DENY_REASON.to_string()
+                        })
+                    })
+            })
         })
 }
 
@@ -3644,7 +3649,7 @@ async fn handle_forward_proxy(
             jsonrpc,
         };
 
-        let parse_error_reason = l7_parse_error_reason(&request_info);
+        let parse_error_reason = forward_l7_hard_deny_reason(&request_info);
         let force_deny = parse_error_reason.is_some();
         let (allowed, reason) = parse_error_reason.map_or_else(
             || {
@@ -4510,7 +4515,7 @@ network_policies:
     }
 
     #[test]
-    fn l7_parse_error_reason_includes_jsonrpc_errors() {
+    fn forward_l7_hard_deny_reason_includes_jsonrpc_errors() {
         let request_info = crate::l7::L7RequestInfo {
             action: "POST".to_string(),
             target: "/mcp".to_string(),
@@ -4524,12 +4529,33 @@ network_policies:
             }),
         };
 
-        let reason = l7_parse_error_reason(&request_info).expect("JSON-RPC parse error");
+        let reason = forward_l7_hard_deny_reason(&request_info).expect("JSON-RPC parse error");
 
         assert_eq!(
             reason,
             "JSON-RPC request rejected: ambiguous dotted params key 'arguments.scope'"
         );
+    }
+
+    #[test]
+    fn forward_l7_hard_deny_reason_includes_jsonrpc_response_frames() {
+        let request_info = crate::l7::L7RequestInfo {
+            action: "POST".to_string(),
+            target: "/mcp".to_string(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+            jsonrpc: Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
+                calls: Vec::new(),
+                is_batch: false,
+                has_response: true,
+                error: None,
+            }),
+        };
+
+        let reason =
+            forward_l7_hard_deny_reason(&request_info).expect("JSON-RPC response hard deny");
+
+        assert_eq!(reason, crate::l7::relay::JSONRPC_RESPONSE_FRAME_DENY_REASON);
     }
 
     #[test]
