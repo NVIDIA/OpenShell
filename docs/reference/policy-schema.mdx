@@ -158,7 +158,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `protocol` | string | No | Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, `graphql` for GraphQL-over-HTTP operation inspection, or `json-rpc` for sandbox-to-server JSON-RPC-over-HTTP method and params inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Omit for TCP passthrough. |
 | `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
-| `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
+| `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. Not valid on `protocol: json-rpc`; JSON-RPC endpoints must use explicit `rules` with `rpc_method`. |
 | `rules` | list of rule objects | No | Fine-grained protocol-specific allow rules. Mutually exclusive with `access`. |
 | `deny_rules` | list of deny rule objects | No | L7 deny rules that block specific requests even when allowed by `access` or `rules`. Deny rules take precedence over allow rules. |
 | `allowed_ips` | list of string | No | CIDR or IP allowlist for SSRF override. Exact user-declared hostname endpoints may resolve to RFC 1918 private addresses without this field, but wildcard, hostless, and policy-advisor-proposed endpoints still require `allowed_ips` for private resolved IPs. Entries overlapping loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) are rejected at load time. |
@@ -174,15 +174,15 @@ Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placehol
 
 #### Access Levels
 
-The `access` field accepts one of the following values:
+The `access` field accepts one of the following values on REST, WebSocket, and GraphQL endpoints. JSON-RPC endpoints reject `access` because HTTP method/path presets cannot authorize JSON-RPC safely; use explicit `rules` with `rpc_method` instead.
 
 | Value | REST expansion | WebSocket expansion | GraphQL expansion | JSON-RPC behavior |
 |---|---|---|---|---|
-| `full` | All methods and paths. | WebSocket upgrade and all inspected client text-message paths. | All operation types. | Allows matching HTTP requests without constraining JSON-RPC methods. |
-| `read-only` | `GET`, `HEAD`, `OPTIONS`. | WebSocket upgrade handshake only. | `query` operations. | Expands to HTTP read methods and does not allow typical JSON-RPC `POST` calls. |
-| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. | WebSocket upgrade handshake and client text messages. | `query` and `mutation` operations. | Allows matching HTTP write requests without constraining JSON-RPC methods. |
+| `full` | All methods and paths. | WebSocket upgrade and all inspected client text-message paths. | All operation types. | Rejected. |
+| `read-only` | `GET`, `HEAD`, `OPTIONS`. | WebSocket upgrade handshake only. | `query` operations. | Rejected. |
+| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. | WebSocket upgrade handshake and client text messages. | `query` and `mutation` operations. | Rejected. |
 
-For JSON-RPC endpoints, prefer explicit `rules` with `rpc_method` and optional `params` when you need method-level control.
+For JSON-RPC endpoints, configure explicit `rules` with `rpc_method` and optional `params`.
 
 #### Allow Rule Objects
 
@@ -279,11 +279,11 @@ Do not combine `method`, `path`, or `query` with `operation_type`, `operation_na
 
 ##### JSON-RPC Allow Rule (`protocol: json-rpc`)
 
-JSON-RPC allow rules match sandbox-to-server JSON-RPC-over-HTTP request objects by RPC method and optional params. They apply to single JSON-RPC requests and batch requests. For a batch, OpenShell evaluates each call independently. JSON-RPC responses and server-to-client messages on response bodies or MCP SSE streams are relayed but are not currently parsed for policy enforcement.
+JSON-RPC allow rules match sandbox-to-server JSON-RPC-over-HTTP request objects by RPC method and optional params. They apply to single JSON-RPC requests and batch requests. For a batch, OpenShell evaluates each call independently. Client-to-server JSON-RPC response frames in POST bodies are denied. Server-to-client messages on HTTP response bodies or MCP SSE streams are relayed but are not currently parsed for policy enforcement.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `rpc_method` | string | Yes | JSON-RPC method name or glob, such as `initialize`, `tools/list`, or `tools/*`. |
+| `rpc_method` | string | Yes | JSON-RPC method name such as `initialize`, `tools/list`, `tools/*`, or glob, `*`, which matches any JSON-RPC method. |
 | `params` | map | No | Params matchers keyed by flattened object-param path. Use dot-separated keys for nested object params, such as `arguments.scope`. Matcher value can be a glob string or an object with `any`. Strings, numbers, and booleans are converted to strings; arrays, `null`, and non-object top-level params do not produce matcher keys. Requests with literal `.` characters in params object keys are rejected before policy evaluation because they are ambiguous with flattened nested paths. |
 
 Example JSON-RPC allow rules:
@@ -401,7 +401,7 @@ JSON-RPC deny rules use the same field names as JSON-RPC allow rules, but they a
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `rpc_method` | string | Yes | JSON-RPC method name or glob to deny. |
+| `rpc_method` | string | Yes | JSON-RPC method name or glob to deny. A value without glob metacharacters matches that exact method name. In glob patterns, `*` matches any character sequence, so `rpc_method: "*"` denies any JSON-RPC method rather than a literal method named `*`. To deny a literal method named `*`, escape the glob character as `rpc_method: "\\*"`. |
 | `params` | map | No | Params matchers keyed by flattened object-param path. Omit to deny every call matching `rpc_method`. Strings, numbers, and booleans are converted to strings; arrays, `null`, and non-object top-level params do not produce matcher keys. |
 
 Example JSON-RPC deny rules:
