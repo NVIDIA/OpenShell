@@ -498,6 +498,38 @@ fn json_rule_has_transport_fields(rule: &serde_json::Value) -> bool {
     rule.get("method").is_some() || rule.get("path").is_some() || rule.get("query").is_some()
 }
 
+fn json_rule_has_non_empty_transport_fields(rule: &serde_json::Value) -> bool {
+    rule.get("method")
+        .and_then(|v| v.as_str())
+        .is_some_and(|v| !v.is_empty())
+        || rule
+            .get("path")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty())
+        || rule
+            .get("query")
+            .and_then(|v| v.as_object())
+            .is_some_and(|v| !v.is_empty())
+}
+
+fn validate_jsonrpc_allow_rule(errors: &mut Vec<String>, loc: &str, rule: &serde_json::Value) {
+    let rpc_method = rule
+        .get("rpc_method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if rpc_method.is_empty() {
+        errors.push(format!(
+            "{loc}: JSON-RPC allow rules must specify rpc_method, for example \"*\""
+        ));
+    }
+
+    if json_rule_has_non_empty_transport_fields(rule) {
+        errors.push(format!(
+            "{loc}: JSON-RPC allow rules must use rpc_method/params, not method/path/query"
+        ));
+    }
+}
+
 fn json_endpoint_has_graphql_policy(ep: &serde_json::Value) -> bool {
     ep.get("graphql_persisted_queries")
         .and_then(|v| v.as_object())
@@ -600,6 +632,18 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             // rules + access mutual exclusion
             if has_rules && !access.is_empty() {
                 errors.push(format!("{loc}: rules and access are mutually exclusive"));
+            }
+
+            if protocol == "json-rpc" && !access.is_empty() {
+                errors.push(format!(
+                    "{loc}: protocol json-rpc does not support access presets; use explicit rules with allow.rpc_method such as \"*\""
+                ));
+            }
+
+            if protocol == "json-rpc" && !has_rules {
+                errors.push(format!(
+                    "{loc}: protocol json-rpc requires explicit rules with allow.rpc_method"
+                ));
             }
 
             // protocol requires rules or access
@@ -1059,6 +1103,9 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     let allow = rule.get("allow").unwrap_or(rule);
                     let rule_loc = format!("{loc}.rules[{rule_idx}].allow");
                     let allow_has_graphql = json_rule_has_graphql_fields(allow);
+                    if protocol == "json-rpc" {
+                        validate_jsonrpc_allow_rule(&mut errors, &rule_loc, allow);
+                    }
                     if websocket_has_graphql_policy
                         && allow
                             .get("method")
@@ -1529,6 +1576,69 @@ mod tests {
         });
         let (errors, _warnings) = validate_l7_policies(&data);
         assert!(errors.iter().any(|e| e.contains("mutually exclusive")));
+    }
+
+    #[test]
+    fn validate_jsonrpc_rejects_access_presets() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "json-rpc",
+                        "access": "full"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("json-rpc")
+                    && e.contains("does not support access presets")
+                    && e.contains("rpc_method")
+            }),
+            "JSON-RPC access presets should be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_jsonrpc_requires_rpc_method_rules() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "json-rpc",
+                        "rules": [{
+                            "allow": {
+                                "method": "POST",
+                                "path": "/mcp"
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| { e.contains("JSON-RPC allow rules must specify rpc_method") }),
+            "JSON-RPC allow rules without rpc_method should be rejected: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| { e.contains("must use rpc_method/params, not method/path/query") }),
+            "JSON-RPC REST-shaped allow rules should be rejected: {errors:?}"
+        );
     }
 
     #[test]

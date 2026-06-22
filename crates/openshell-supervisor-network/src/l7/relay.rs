@@ -2160,12 +2160,8 @@ network_policies:
         enforcement: enforce
         rules:
           - allow:
-              method: POST
-              path: "/mcp"
               rpc_method: "tools/list"
           - allow:
-              method: POST
-              path: "/mcp"
               rpc_method: "tools/call"
               params:
                 name: read_status

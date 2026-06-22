@@ -2092,6 +2092,21 @@ process:
         val == regorus::Value::from(true)
     }
 
+    fn eval_l7_raw_data(data: serde_json::Value, input: serde_json::Value) -> bool {
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy("policy.rego".into(), TEST_POLICY.into())
+            .unwrap();
+        engine
+            .add_data_json(&data.to_string())
+            .expect("add raw data json");
+        engine.set_input_json(&input.to_string()).unwrap();
+        let val = engine
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        val == regorus::Value::from(true)
+    }
+
     #[test]
     fn l7_get_allowed_by_rules() {
         let engine = l7_engine();
@@ -2697,6 +2712,35 @@ network_policies:
 
         let deny_input = l7_jsonrpc_input("mcp.proto.com", 8000, "/mcp", "tools/list");
         assert!(!eval_l7(&engine, &deny_input));
+    }
+
+    #[test]
+    fn l7_jsonrpc_endpoint_ignores_rest_shaped_allow_rules() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "jsonrpc_rest_bypass": {
+                    "name": "jsonrpc_rest_bypass",
+                    "endpoints": [{
+                        "host": "mcp.rest-bypass.test",
+                        "ports": [8000],
+                        "path": "/mcp",
+                        "protocol": "json-rpc",
+                        "rules": [{
+                            "allow": {
+                                "method": "POST",
+                                "path": "**"
+                            }
+                        }]
+                    }],
+                    "binaries": [{ "path": "/usr/bin/curl" }]
+                }
+            }
+        });
+        let input = l7_jsonrpc_input("mcp.rest-bypass.test", 8000, "/mcp", "tools/list");
+        assert!(
+            !eval_l7_raw_data(data, input),
+            "REST-shaped method/path rules must not authorize JSON-RPC endpoints"
+        );
     }
 
     #[test]

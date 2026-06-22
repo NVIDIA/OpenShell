@@ -257,6 +257,7 @@ deny_request if {
 # --- L7 deny rule matching: REST method + path + query ---
 
 request_denied_for_endpoint(request, endpoint) if {
+	object.get(endpoint, "protocol", "") != "json-rpc"
 	some deny_rule
 	deny_rule := endpoint.deny_rules[_]
 	deny_rule.method
@@ -409,6 +410,7 @@ request_deny_reason := reason if {
 # --- L7 rule matching: REST method + path ---
 
 request_allowed_for_endpoint(request, endpoint) if {
+	object.get(endpoint, "protocol", "") != "json-rpc"
 	some rule
 	rule := endpoint.rules[_]
 	rule.allow.method
