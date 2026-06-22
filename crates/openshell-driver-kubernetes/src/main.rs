@@ -143,6 +143,8 @@ async fn main() -> Result<()> {
         provider_spiffe_workload_api_socket_path: args
             .provider_spiffe_workload_api_socket_path
             .unwrap_or_default(),
+        sandbox_uid: None,
+        sandbox_gid: None,
     })
     .await
     .into_diagnostic()?;

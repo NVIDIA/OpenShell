@@ -3,12 +3,13 @@
 
 //! Kubernetes compute driver.
 
+use super::AppArmorProfile;
 use crate::config::{
-    AppArmorProfile, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
+    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID, DEFAULT_WORKSPACE_STORAGE_SIZE,
     KubernetesComputeConfig, SupervisorSideloadMethod,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
+use k8s_openapi::api::core::v1::{Event as KubeEventObj, Namespace, Node};
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
@@ -330,6 +331,52 @@ impl KubernetesComputeDriver {
         ))
     }
 
+    /// Resolve sandbox UID/GID from config or OpenShift SCC namespace annotations.
+    ///
+    /// Returns `(uid, gid, ns_annotations_map)`:
+    /// - If `sandbox_uid` is set in config, returns that (with fallback GID)
+    /// - Otherwise fetches the target namespace and checks for
+    ///   `openshift.io/sa.scc.uid-range` / `openshift.io/sa.scc.supplemental-groups`
+    ///   annotations.
+    /// - If neither config nor OpenShift is found, returns `(1000, 1000, {})` as defaults.
+    async fn resolve_sandbox_identity(&self) -> (u32, u32, BTreeMap<String, String>) {
+        // Explicit config takes priority — skip namespace lookup entirely.
+        if self.config.sandbox_uid.is_some() {
+            let uid = self.config.resolve_sandbox_uid(None);
+            let gid = self.config.resolve_sandbox_gid(uid, None);
+            return (uid, gid, BTreeMap::new());
+        }
+
+        // Try to read namespace annotations for OpenShift SCC.
+        // Namespace is namespaced so Api::all works (it's cluster-scoped but
+        // can list all namespaces) and we filter by name, or use Api::namespaced.
+        let ns_api: Api<Namespace> = Api::all(self.client.clone());
+        match tokio::time::timeout(KUBE_API_TIMEOUT, ns_api.get(self.config.namespace.as_str()))
+            .await
+        {
+            Ok(Ok(ns)) => {
+                let anns = ns.metadata.annotations.unwrap_or_default();
+                let uid = self.config.resolve_sandbox_uid(Some(&anns));
+                // Collect supplemental groups annotation for sandbox init containers.
+                let gid = if let Some(sup_range) =
+                    anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS)
+                {
+                    KubernetesComputeConfig::from_open_shift_supplemental_groups(sup_range)
+                        .unwrap_or(uid)
+                } else {
+                    uid
+                };
+                (uid, gid, anns)
+            }
+            Ok(Err(_)) | Err(_) => {
+                // Namespace fetch failed or timed out — fall back to defaults.
+                let uid = DEFAULT_SANDBOX_UID;
+                let gid = uid;
+                (uid, gid, BTreeMap::new())
+            }
+        }
+    }
+
     async fn has_gpu_capacity(&self) -> Result<bool, KubeError> {
         let nodes: Api<Node> = Api::all(self.client.clone());
         let node_list = nodes.list(&ListParams::default()).await?;
@@ -471,11 +518,20 @@ impl KubernetesComputeDriver {
             .supported_agent_sandbox_api(self.client.clone())
             .await
             .map_err(KubernetesDriverError::Message)?;
+
+        // Resolve sandbox UID/GID from config or OpenShift SCC namespace annotations.
+        let (resolved_uid, resolved_gid, ns_annotations) = self.resolve_sandbox_identity().await;
+
         let mut obj = DynamicObject::new(name, &agent_sandbox_api.resource);
         obj.metadata = ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(self.config.namespace.clone()),
             labels: Some(sandbox_labels(sandbox)),
+            annotations: if ns_annotations.is_empty() {
+                None
+            } else {
+                Some(ns_annotations)
+            },
             ..Default::default()
         };
         let params = SandboxPodParams {
@@ -501,7 +557,10 @@ impl KubernetesComputeDriver {
             provider_spiffe_workload_api_socket_path: &self
                 .config
                 .provider_spiffe_workload_api_socket_path,
+            sandbox_uid: resolved_uid,
+            sandbox_gid: resolved_gid,
         };
+
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
@@ -1022,6 +1081,8 @@ fn apply_supervisor_sideload(
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
     method: SupervisorSideloadMethod,
+    sandbox_uid: u32,
+    sandbox_gid: u32,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -1101,6 +1162,23 @@ fn apply_supervisor_sideload(
         if let Some(volume_mounts) = volume_mounts {
             volume_mounts.push(supervisor_volume_mount());
         }
+
+        // Inject resolved sandbox UID/GID as environment variables so the
+        // supervisor can use them directly without /etc/passwd lookups.
+        let env = container
+            .entry("env")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(env) = env {
+            env.push(serde_json::json!({
+                "name": openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+                "value": sandbox_uid.to_string(),
+            }));
+            env.push(serde_json::json!({
+                "name": openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+                "value": sandbox_gid.to_string(),
+            }));
+        }
     }
 }
 
@@ -1123,6 +1201,8 @@ fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
     image_pull_policy: &str,
+    sandbox_uid: u32,
+    sandbox_gid: u32,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -1185,7 +1265,11 @@ fn apply_workspace_persistence(
             "name": WORKSPACE_INIT_CONTAINER_NAME,
             "image": image,
             "command": ["sh", "-c", copy_cmd],
-            "securityContext": { "runAsUser": 0 },
+            "securityContext": {
+                "runAsUser": sandbox_uid,
+                "runAsGroup": sandbox_gid,
+                "fsGroup": sandbox_gid,
+            },
             "volumeMounts": [{
                 "name": WORKSPACE_VOLUME_NAME,
                 "mountPath": WORKSPACE_INIT_MOUNT_PATH
@@ -1247,6 +1331,10 @@ struct SandboxPodParams<'a> {
     sa_token_ttl_secs: i64,
     provider_spiffe_enabled: bool,
     provider_spiffe_workload_api_socket_path: &'a str,
+    /// Resolved sandbox UID for supervisor `runAsUser` and env var.
+    sandbox_uid: u32,
+    /// Resolved sandbox GID for PVC init container operations.
+    sandbox_gid: u32,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -1272,6 +1360,8 @@ impl Default for SandboxPodParams<'_> {
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
             provider_spiffe_workload_api_socket_path: "",
+            sandbox_uid: DEFAULT_SANDBOX_UID,
+            sandbox_gid: DEFAULT_SANDBOX_UID,
         }
     }
 }
@@ -1647,13 +1737,21 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         params.supervisor_image,
         params.supervisor_image_pull_policy,
         params.supervisor_sideload_method,
+        params.sandbox_uid,
+        params.sandbox_gid,
     );
 
     // Inject workspace persistence (init container + PVC volume mount) so
     // that /sandbox data survives pod rescheduling.  Skipped when the user
     // provides custom volumeClaimTemplates to avoid conflicts.
     if inject_workspace {
-        apply_workspace_persistence(&mut result, image, params.image_pull_policy);
+        apply_workspace_persistence(
+            &mut result,
+            image,
+            params.image_pull_policy,
+            params.sandbox_uid,
+            params.sandbox_gid,
+        );
     }
 
     result
@@ -2271,6 +2369,8 @@ mod tests {
             "custom-image:latest",
             "IfNotPresent",
             SupervisorSideloadMethod::InitContainer,
+            1500, // sandbox_uid
+            1500, // sandbox_gid
         );
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
@@ -2300,6 +2400,8 @@ mod tests {
             "supervisor-image:latest",
             "IfNotPresent",
             SupervisorSideloadMethod::InitContainer,
+            1000, // sandbox_uid
+            1000, // sandbox_gid
         );
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
@@ -2325,6 +2427,8 @@ mod tests {
             "supervisor-image:latest",
             "IfNotPresent",
             SupervisorSideloadMethod::InitContainer,
+            1000, // sandbox_uid
+            1000, // sandbox_gid
         );
 
         // Volume should be an emptyDir
@@ -2399,6 +2503,8 @@ mod tests {
             "supervisor-image:latest",
             "IfNotPresent",
             SupervisorSideloadMethod::ImageVolume,
+            1000, // sandbox_uid
+            1000, // sandbox_gid
         );
 
         let volumes = pod_template["spec"]["volumes"]
@@ -2453,6 +2559,8 @@ mod tests {
             "supervisor-image:latest",
             "",
             SupervisorSideloadMethod::ImageVolume,
+            1000, // sandbox_uid
+            1000, // sandbox_gid
         );
 
         let volume = &pod_template["spec"]["volumes"][0];
@@ -2945,6 +3053,8 @@ mod tests {
             &mut pod_template,
             "openshell/sandbox:latest",
             "IfNotPresent",
+            1000, // sandbox_uid
+            1000, // sandbox_gid
         );
 
         // Init container
@@ -2955,7 +3065,8 @@ mod tests {
         assert_eq!(init_containers[0]["name"], WORKSPACE_INIT_CONTAINER_NAME);
         assert_eq!(init_containers[0]["image"], "openshell/sandbox:latest");
         assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
-        assert_eq!(init_containers[0]["securityContext"]["runAsUser"], 0);
+        // init container runs as the resolved sandbox UID (not root)
+        assert_eq!(init_containers[0]["securityContext"]["runAsUser"], 1000);
 
         // Init container mounts PVC at temp path, not /sandbox
         let init_mounts = init_containers[0]["volumeMounts"]
@@ -2998,7 +3109,13 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "my-custom-image:v2", "IfNotPresent");
+        apply_workspace_persistence(
+            &mut pod_template,
+            "my-custom-image:v2",
+            "IfNotPresent",
+            1000,
+            1000,
+        );
 
         let init_image = pod_template["spec"]["initContainers"][0]["image"]
             .as_str()
@@ -3020,7 +3137,7 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always");
+        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000, 1000);
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()

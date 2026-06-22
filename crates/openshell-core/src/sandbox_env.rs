@@ -71,3 +71,18 @@ pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
 /// exchanges without using SPIFFE for gateway authentication.
 pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET: &str =
     "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET";
+
+/// Resolved sandbox UID used to override `run_as_user` when the policy
+/// specifies a numeric value instead of the hardcoded "sandbox" user name.
+///
+/// Set by compute drivers (Kubernetes, Docker, VM) from resolved config or
+/// cluster autodetection. The supervisor reads this at startup and uses it
+/// directly with `setuid()` / `chown()` without requiring an `/etc/passwd`
+/// entry in the sandbox image.
+pub const SANDBOX_UID: &str = "OPENSHELL_SANDBOX_UID";
+
+/// Resolved sandbox GID paired with [`SANDBOX_UID`].
+///
+/// Used alongside UID for PVC init container `chown` operations and when the
+/// supervisor drops privileges to a group other than the UID's primary group.
+pub const SANDBOX_GID: &str = "OPENSHELL_SANDBOX_GID";

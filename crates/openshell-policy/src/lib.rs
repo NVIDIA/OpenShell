@@ -947,9 +947,9 @@ pub fn is_valid_sandbox_identity(value: &str) -> bool {
     if value == SANDBOX_NAME {
         return true;
     }
-    value.parse::<u32>().is_ok_and(|uid| {
-        (MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&uid)
-    })
+    value
+        .parse::<u32>()
+        .is_ok_and(|uid| (MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&uid))
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,7 +2104,9 @@ network_policies:
 
     #[test]
     fn valid_identity_rejects_uid_above_max() {
-        assert!(!is_valid_sandbox_identity(&MAX_SANDBOX_UID.saturating_add(1).to_string()));
+        assert!(!is_valid_sandbox_identity(
+            &MAX_SANDBOX_UID.saturating_add(1).to_string()
+        ));
     }
 
     #[test]
@@ -2161,7 +2163,10 @@ network_policies:
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(violations.iter().any(|v| matches!(
             v,
-            PolicyViolation::InvalidProcessIdentity { field: "run_as_user", .. }
+            PolicyViolation::InvalidProcessIdentity {
+                field: "run_as_user",
+                ..
+            }
         )));
     }
 
@@ -2175,7 +2180,10 @@ network_policies:
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(violations.iter().any(|v| matches!(
             v,
-            PolicyViolation::InvalidProcessIdentity { field: "run_as_user", .. }
+            PolicyViolation::InvalidProcessIdentity {
+                field: "run_as_user",
+                ..
+            }
         )));
     }
 
@@ -2189,7 +2197,10 @@ network_policies:
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(violations.iter().any(|v| matches!(
             v,
-            PolicyViolation::InvalidProcessIdentity { field: "run_as_user", .. }
+            PolicyViolation::InvalidProcessIdentity {
+                field: "run_as_user",
+                ..
+            }
         )));
     }
 
