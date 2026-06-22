@@ -1840,6 +1840,52 @@ network_policies:
         (generation_guard, ctx, fixture)
     }
 
+    fn jsonrpc_test_relay_context() -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        let data = r"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow:
+              rpc_method: initialize
+    binaries:
+      - { path: /usr/bin/python3 }
+";
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "mcp.example.test".into(),
+            port: 8000,
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "mcp.example.test".into(),
+            port: 8000,
+            policy_name: "mcp_api".into(),
+            binary_path: "/usr/bin/python3".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        (config, tunnel_engine, ctx)
+    }
+
     fn authorization_header_count(headers: &str) -> usize {
         headers
             .lines()
@@ -2982,50 +3028,66 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn jsonrpc_relay_denies_method_not_in_allow_list() {
-        let data = r"
-network_policies:
-  mcp_api:
-    name: mcp_api
-    endpoints:
-      - host: mcp.example.test
-        port: 8000
-        path: /mcp
-        protocol: json-rpc
-        enforcement: enforce
-        rules:
-          - allow:
-              rpc_method: initialize
-    binaries:
-      - { path: /usr/bin/python3 }
-";
-        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
-        let input = NetworkInput {
-            host: "mcp.example.test".into(),
-            port: 8000,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let (endpoint_config, generation) = engine
-            .query_endpoint_config_with_generation(&input)
-            .unwrap();
-        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
-        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
-        let ctx = L7EvalContext {
-            host: "mcp.example.test".into(),
-            port: 8000,
-            policy_name: "mcp_api".into(),
-            binary_path: "/usr/bin/python3".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-            secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
-        };
+    async fn jsonrpc_relay_forwards_allowed_method() {
+        let (config, tunnel_engine, ctx) = jsonrpc_test_relay_context();
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
 
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.write_all(body).await.unwrap();
+
+        let mut upstream_buf = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_buf),
+        )
+        .await
+        .expect("allowed JSON-RPC request should reach upstream")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_buf[..n]);
+        assert!(upstream_request.starts_with("POST /mcp HTTP/1.1"));
+        assert!(upstream_request.contains(r#""method":"initialize""#));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            )
+            .await
+            .unwrap();
+
+        let mut response = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("upstream response should reach client")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).contains("200 OK"));
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should complete")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_relay_denies_method_not_in_allow_list() {
+        let (config, tunnel_engine, ctx) = jsonrpc_test_relay_context();
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {

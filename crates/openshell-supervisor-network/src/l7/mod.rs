@@ -483,6 +483,99 @@ fn validate_graphql_rule(
     validate_graphql_fields(errors, warnings, loc, rule.get("fields"));
 }
 
+fn validate_l7_matcher_map(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    value: &serde_json::Value,
+    label: &str,
+) {
+    let Some(matchers) = value.as_object() else {
+        errors.push(format!("{loc}: expected map of {label} matchers"));
+        return;
+    };
+
+    for (param, matcher) in matchers {
+        validate_l7_matcher(errors, warnings, &format!("{loc}.{param}"), matcher);
+    }
+}
+
+fn validate_l7_matcher(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    matcher: &serde_json::Value,
+) {
+    if let Some(glob_str) = matcher.as_str() {
+        if let Some(warning) = check_glob_syntax(glob_str) {
+            warnings.push(format!("{loc}: {warning}"));
+        }
+        return;
+    }
+
+    let Some(matcher_obj) = matcher.as_object() else {
+        errors.push(format!("{loc}: expected string glob or object with `any`"));
+        return;
+    };
+
+    let has_any = matcher_obj.get("any").is_some();
+    let has_glob = matcher_obj.get("glob").is_some();
+    let has_unknown = matcher_obj.keys().any(|k| k != "any" && k != "glob");
+    if has_unknown {
+        errors.push(format!(
+            "{loc}: unknown matcher keys; only `glob` or `any` are supported"
+        ));
+        return;
+    }
+
+    if has_glob && has_any {
+        errors.push(format!(
+            "{loc}: matcher cannot specify both `glob` and `any`"
+        ));
+        return;
+    }
+
+    if !has_glob && !has_any {
+        errors.push(format!(
+            "{loc}: object matcher requires `glob` string or non-empty `any` list"
+        ));
+        return;
+    }
+
+    if has_glob {
+        match matcher_obj.get("glob").and_then(|v| v.as_str()) {
+            None => errors.push(format!("{loc}.glob: expected glob string")),
+            Some(g) => {
+                if let Some(warning) = check_glob_syntax(g) {
+                    warnings.push(format!("{loc}.glob: {warning}"));
+                }
+            }
+        }
+        return;
+    }
+
+    let any = matcher_obj.get("any").and_then(|v| v.as_array());
+    let Some(any) = any else {
+        errors.push(format!("{loc}.any: expected array of glob strings"));
+        return;
+    };
+
+    if any.is_empty() {
+        errors.push(format!("{loc}.any: list must not be empty"));
+        return;
+    }
+
+    if any.iter().any(|v| v.as_str().is_none()) {
+        errors.push(format!("{loc}.any: all values must be strings"));
+    }
+
+    for item in any.iter().filter_map(|v| v.as_str()) {
+        if let Some(warning) = check_glob_syntax(item) {
+            warnings.push(format!("{loc}.any: {warning}"));
+        }
+    }
+}
+
 fn json_rule_has_graphql_fields(rule: &serde_json::Value) -> bool {
     rule.get("operation_type")
         .and_then(|v| v.as_str())
@@ -512,21 +605,41 @@ fn json_rule_has_non_empty_transport_fields(rule: &serde_json::Value) -> bool {
             .is_some_and(|v| !v.is_empty())
 }
 
-fn validate_jsonrpc_allow_rule(errors: &mut Vec<String>, loc: &str, rule: &serde_json::Value) {
+fn json_rule_has_non_empty_jsonrpc_fields(rule: &serde_json::Value) -> bool {
+    rule.get("rpc_method")
+        .is_some_and(|v| !v.is_null() && !v.as_str().is_some_and(str::is_empty))
+        || rule
+            .get("params")
+            .is_some_and(|v| !v.is_null() && !v.as_object().is_some_and(serde_json::Map::is_empty))
+}
+
+fn validate_jsonrpc_rule(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    rule: &serde_json::Value,
+    kind: &str,
+) {
     let rpc_method = rule
         .get("rpc_method")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if rpc_method.is_empty() {
         errors.push(format!(
-            "{loc}: JSON-RPC allow rules must specify rpc_method, for example \"*\""
+            "{loc}: JSON-RPC {kind} rules must specify rpc_method, for example \"*\""
         ));
+    } else if let Some(warning) = check_glob_syntax(rpc_method) {
+        warnings.push(format!("{loc}.rpc_method: {warning}"));
     }
 
     if json_rule_has_non_empty_transport_fields(rule) {
         errors.push(format!(
-            "{loc}: JSON-RPC allow rules must use rpc_method/params, not method/path/query"
+            "{loc}: JSON-RPC {kind} rules must use rpc_method/params, not method/path/query"
         ));
+    }
+
+    if let Some(params) = rule.get("params").filter(|v| !v.is_null()) {
+        validate_l7_matcher_map(errors, warnings, &format!("{loc}.params"), params, "params");
     }
 }
 
@@ -829,101 +942,13 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
 
                         // Validate query matchers — mirrors allow-side validation exactly
                         if let Some(query) = deny_rule.get("query").filter(|v| !v.is_null()) {
-                            let Some(query_obj) = query.as_object() else {
-                                errors.push(format!(
-                                    "{deny_loc}.query: expected map of query matchers"
-                                ));
-                                continue;
-                            };
-
-                            for (param, matcher) in query_obj {
-                                if let Some(glob_str) = matcher.as_str() {
-                                    if let Some(warning) = check_glob_syntax(glob_str) {
-                                        warnings
-                                            .push(format!("{deny_loc}.query.{param}: {warning}"));
-                                    }
-                                    continue;
-                                }
-
-                                let Some(matcher_obj) = matcher.as_object() else {
-                                    errors.push(format!(
-                                        "{deny_loc}.query.{param}: expected string glob or object with `any`"
-                                    ));
-                                    continue;
-                                };
-
-                                let has_any = matcher_obj.get("any").is_some();
-                                let has_glob = matcher_obj.get("glob").is_some();
-                                let has_unknown =
-                                    matcher_obj.keys().any(|k| k != "any" && k != "glob");
-                                if has_unknown {
-                                    errors.push(format!(
-                                        "{deny_loc}.query.{param}: unknown matcher keys; only `glob` or `any` are supported"
-                                    ));
-                                    continue;
-                                }
-
-                                if has_glob && has_any {
-                                    errors.push(format!(
-                                        "{deny_loc}.query.{param}: matcher cannot specify both `glob` and `any`"
-                                    ));
-                                    continue;
-                                }
-
-                                if !has_glob && !has_any {
-                                    errors.push(format!(
-                                        "{deny_loc}.query.{param}: object matcher requires `glob` string or non-empty `any` list"
-                                    ));
-                                    continue;
-                                }
-
-                                if has_glob {
-                                    match matcher_obj.get("glob").and_then(|v| v.as_str()) {
-                                        None => {
-                                            errors.push(format!(
-                                                "{deny_loc}.query.{param}.glob: expected glob string"
-                                            ));
-                                        }
-                                        Some(g) => {
-                                            if let Some(warning) = check_glob_syntax(g) {
-                                                warnings.push(format!(
-                                                    "{deny_loc}.query.{param}.glob: {warning}"
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    continue;
-                                }
-
-                                let any = matcher_obj.get("any").and_then(|v| v.as_array());
-                                let Some(any) = any else {
-                                    errors.push(format!(
-                                        "{deny_loc}.query.{param}.any: expected array of glob strings"
-                                    ));
-                                    continue;
-                                };
-
-                                if any.is_empty() {
-                                    errors.push(format!(
-                                        "{deny_loc}.query.{param}.any: list must not be empty"
-                                    ));
-                                    continue;
-                                }
-
-                                if any.iter().any(|v| v.as_str().is_none()) {
-                                    errors.push(format!(
-                                        "{deny_loc}.query.{param}.any: all values must be strings"
-                                    ));
-                                }
-
-                                for item in any.iter().filter_map(|v| v.as_str()) {
-                                    if let Some(warning) = check_glob_syntax(item) {
-                                        warnings.push(format!(
-                                            "{deny_loc}.query.{param}.any: {warning}"
-                                        ));
-                                    }
-                                }
-                            }
+                            validate_l7_matcher_map(
+                                &mut errors,
+                                &mut warnings,
+                                &format!("{deny_loc}.query"),
+                                query,
+                                "query",
+                            );
                         }
 
                         // SQL command validation
@@ -956,6 +981,20 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                         } else if deny_has_graphql {
                             warnings.push(format!(
                                 "{deny_loc}: GraphQL rule fields are ignored unless protocol is graphql or websocket"
+                            ));
+                        }
+
+                        if protocol == "json-rpc" {
+                            validate_jsonrpc_rule(
+                                &mut errors,
+                                &mut warnings,
+                                &deny_loc,
+                                deny_rule,
+                                "deny",
+                            );
+                        } else if json_rule_has_non_empty_jsonrpc_fields(deny_rule) {
+                            errors.push(format!(
+                                "{deny_loc}: rpc_method/params are only valid on protocol json-rpc endpoints"
                             ));
                         }
                     }
@@ -999,101 +1038,13 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                             continue;
                         };
 
-                        let Some(query_obj) = query.as_object() else {
-                            errors.push(format!(
-                                "{loc}.rules[{rule_idx}].allow.query: expected map of query matchers"
-                            ));
-                            continue;
-                        };
-
-                        for (param, matcher) in query_obj {
-                            if let Some(glob_str) = matcher.as_str() {
-                                if let Some(warning) = check_glob_syntax(glob_str) {
-                                    warnings.push(format!(
-                                        "{loc}.rules[{rule_idx}].allow.query.{param}: {warning}"
-                                    ));
-                                }
-                                continue;
-                            }
-
-                            let Some(matcher_obj) = matcher.as_object() else {
-                                errors.push(format!(
-                                    "{loc}.rules[{rule_idx}].allow.query.{param}: expected string glob or object with `any`"
-                                ));
-                                continue;
-                            };
-
-                            let has_any = matcher_obj.get("any").is_some();
-                            let has_glob = matcher_obj.get("glob").is_some();
-                            let has_unknown = matcher_obj.keys().any(|k| k != "any" && k != "glob");
-                            if has_unknown {
-                                errors.push(format!(
-                                    "{loc}.rules[{rule_idx}].allow.query.{param}: unknown matcher keys; only `glob` or `any` are supported"
-                                ));
-                                continue;
-                            }
-
-                            if has_glob && has_any {
-                                errors.push(format!(
-                                    "{loc}.rules[{rule_idx}].allow.query.{param}: matcher cannot specify both `glob` and `any`"
-                                ));
-                                continue;
-                            }
-
-                            if !has_glob && !has_any {
-                                errors.push(format!(
-                                    "{loc}.rules[{rule_idx}].allow.query.{param}: object matcher requires `glob` string or non-empty `any` list"
-                                ));
-                                continue;
-                            }
-
-                            if has_glob {
-                                match matcher_obj.get("glob").and_then(|v| v.as_str()) {
-                                    None => {
-                                        errors.push(format!(
-                                            "{loc}.rules[{rule_idx}].allow.query.{param}.glob: expected glob string"
-                                        ));
-                                    }
-                                    Some(g) => {
-                                        if let Some(warning) = check_glob_syntax(g) {
-                                            warnings.push(format!(
-                                                "{loc}.rules[{rule_idx}].allow.query.{param}.glob: {warning}"
-                                            ));
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-
-                            let any = matcher_obj.get("any").and_then(|v| v.as_array());
-                            let Some(any) = any else {
-                                errors.push(format!(
-                                    "{loc}.rules[{rule_idx}].allow.query.{param}.any: expected array of glob strings"
-                                ));
-                                continue;
-                            };
-
-                            if any.is_empty() {
-                                errors.push(format!(
-                                    "{loc}.rules[{rule_idx}].allow.query.{param}.any: list must not be empty"
-                                ));
-                                continue;
-                            }
-
-                            if any.iter().any(|v| v.as_str().is_none()) {
-                                errors.push(format!(
-                                    "{loc}.rules[{rule_idx}].allow.query.{param}.any: all values must be strings"
-                                ));
-                            }
-
-                            for item in any.iter().filter_map(|v| v.as_str()) {
-                                if let Some(warning) = check_glob_syntax(item) {
-                                    warnings.push(format!(
-                                        "{loc}.rules[{rule_idx}].allow.query.{param}.any: {warning}"
-                                    ));
-                                }
-                            }
-                        }
+                        validate_l7_matcher_map(
+                            &mut errors,
+                            &mut warnings,
+                            &format!("{loc}.rules[{rule_idx}].allow.query"),
+                            query,
+                            "query",
+                        );
                     }
                 }
             }
@@ -1104,7 +1055,17 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     let rule_loc = format!("{loc}.rules[{rule_idx}].allow");
                     let allow_has_graphql = json_rule_has_graphql_fields(allow);
                     if protocol == "json-rpc" {
-                        validate_jsonrpc_allow_rule(&mut errors, &rule_loc, allow);
+                        validate_jsonrpc_rule(
+                            &mut errors,
+                            &mut warnings,
+                            &rule_loc,
+                            allow,
+                            "allow",
+                        );
+                    } else if json_rule_has_non_empty_jsonrpc_fields(allow) {
+                        errors.push(format!(
+                            "{rule_loc}: rpc_method/params are only valid on protocol json-rpc endpoints"
+                        ));
                     }
                     if websocket_has_graphql_policy
                         && allow
@@ -1638,6 +1599,181 @@ mod tests {
                 .iter()
                 .any(|e| { e.contains("must use rpc_method/params, not method/path/query") }),
             "JSON-RPC REST-shaped allow rules should be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_jsonrpc_fields_rejected_on_non_jsonrpc_endpoints() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "rules": [{
+                            "allow": {
+                                "method": "GET",
+                                "path": "/v1/**",
+                                "rpc_method": "tools/list",
+                                "params": { "name": "read_status" }
+                            }
+                        }],
+                        "deny_rules": [{
+                            "method": "POST",
+                            "path": "/v1/**",
+                            "rpc_method": "tools/delete",
+                            "params": { "name": "purge_cache" }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[0].allow") && e.contains("rpc_method/params are only valid")
+            }),
+            "REST allow rules with JSON-RPC fields should be rejected: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("deny_rules[0]") && e.contains("rpc_method/params are only valid")
+            }),
+            "REST deny rules with JSON-RPC fields should be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_jsonrpc_deny_rules_require_rpc_method() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "json-rpc",
+                        "rules": [{
+                            "allow": {
+                                "rpc_method": "*"
+                            }
+                        }],
+                        "deny_rules": [{
+                            "params": { "name": "delete_resource" }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("JSON-RPC deny rules must specify rpc_method")),
+            "JSON-RPC deny rules without rpc_method should be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_jsonrpc_params_reuse_query_matcher_validation() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "json-rpc",
+                        "rules": [{
+                            "allow": {
+                                "rpc_method": "tools/call",
+                                "params": {
+                                    "name": { "mode": "read-*" },
+                                    "scope": { "any": [] },
+                                    "count": 1
+                                }
+                            }
+                        }],
+                        "deny_rules": [{
+                            "rpc_method": "tools/delete",
+                            "params": {
+                                "name": { "glob": "delete_*", "any": ["purge_*"] }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("allow.params.name") && e.contains("unknown matcher keys")),
+            "JSON-RPC params should reject unknown matcher keys: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("allow.params.scope.any") && e.contains("must not be empty")),
+            "JSON-RPC params should reject empty any lists: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("allow.params.count") && e.contains("expected string glob or object")
+            }),
+            "JSON-RPC params should reject non-string/non-object matchers: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("deny_rules[0].params.name") && e.contains("matcher cannot specify both")
+            }),
+            "JSON-RPC deny params should reject conflicting matcher forms: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_jsonrpc_rpc_method_and_params_warn_on_malformed_globs() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "json-rpc",
+                        "rules": [{
+                            "allow": {
+                                "rpc_method": "tools/[call",
+                                "params": {
+                                    "name": "[bad"
+                                }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "malformed globs should warn, not error: {errors:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("allow.rpc_method") && w.contains("unclosed '['")),
+            "expected rpc_method glob warning, got: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("allow.params.name") && w.contains("unclosed '['")),
+            "expected params glob warning, got: {warnings:?}"
         );
     }
 

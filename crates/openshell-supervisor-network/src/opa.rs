@@ -2840,6 +2840,39 @@ network_policies:
     }
 
     #[test]
+    fn l7_jsonrpc_orphaned_progress_notification_is_denied() {
+        let data = r#"
+network_policies:
+  jsonrpc_progress:
+    name: jsonrpc_progress
+    endpoints:
+      - host: mcp.progress.test
+        port: 8000
+        path: /mcp
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow:
+              rpc_method: initialize
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+        let progress_input = l7_jsonrpc_input_with_params(
+            "mcp.progress.test",
+            8000,
+            "/mcp",
+            "notifications/progress",
+            serde_json::json!({
+                "progressToken": "orphaned",
+                "progress": 0.5
+            }),
+        );
+
+        assert!(!eval_l7(&engine, &progress_input));
+    }
+
+    #[test]
     fn l7_jsonrpc_params_rules_filter_tools_call() {
         let data = r#"
 network_policies:
