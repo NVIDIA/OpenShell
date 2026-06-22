@@ -3983,6 +3983,7 @@ dependencies = [
  "nix",
  "openshell-core",
  "openshell-ocsf",
+ "openshell-policy",
  "rand_core 0.6.4",
  "russh",
  "rustix 1.1.4",
