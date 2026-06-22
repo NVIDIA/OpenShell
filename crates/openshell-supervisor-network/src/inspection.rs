@@ -259,3 +259,78 @@ fn rewrite_headers(req: &mut L7Request, headers: &[(String, String)]) -> Result<
     req.raw_header = raw;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn spawn_demo_server(response_body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind demo listener");
+        let addr = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept inspector client");
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn demo_inspector_client_round_trips_mutation() {
+        let endpoint = spawn_demo_server(
+            r#"{"kind":"mutate","target":{"kind":"http_request","method":"GET","path":"/demo","headers":[["x-inspected","true"]],"body":[]},"findings":[{"code":"header_injected","message":"added demo header"}]}"#,
+        );
+        let client = DemoInspectorClient {
+            endpoint,
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .expect("client"),
+        };
+
+        let decision = client
+            .inspect(
+                InspectionTarget::HttpRequest {
+                    method: "GET".to_string(),
+                    path: "/demo".to_string(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+                &InspectionContext::default(),
+            )
+            .expect("inspection should succeed");
+
+        match decision {
+            InspectionDecision::Mutate { target, findings } => {
+                assert_eq!(
+                    findings,
+                    vec![Finding {
+                        code: "header_injected".to_string(),
+                        message: "added demo header".to_string(),
+                    }]
+                );
+                assert_eq!(
+                    target,
+                    InspectionTarget::HttpRequest {
+                        method: "GET".to_string(),
+                        path: "/demo".to_string(),
+                        headers: vec![("x-inspected".to_string(), "true".to_string())],
+                        body: Vec::new(),
+                    }
+                );
+            }
+            other => panic!("expected mutation decision, got {other:?}"),
+        }
+    }
+}
