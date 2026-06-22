@@ -109,10 +109,16 @@ openshell_bin() {
 
 start_host_bridge() {
   local port=$1
+  local runner_ip
   HOST_BRIDGE_LOG="${ROOT}/.cache/mcp-conformance/host-bridge.log"
   mkdir -p "$(dirname "${HOST_BRIDGE_LOG}")"
 
-  python3 "${ROOT}/e2e/mcp-conformance/host-bridge.py" \
+  if ! runner_ip="$(runner_container_ip)"; then
+    return 1
+  fi
+
+  OPENSHELL_MCP_CONFORMANCE_RUNNER_IP="${runner_ip}" \
+    python3 "${ROOT}/e2e/mcp-conformance/host-bridge.py" \
     "${port}" "${ROOT}" "${HOST_BRIDGE_LOG}" &
   HOST_BRIDGE_PID=$!
 
@@ -159,6 +165,29 @@ host_bridge_hostname() {
   else
     printf '%s\n' "host.openshell.internal"
   fi
+}
+
+runner_container_ip() {
+  local network ip
+
+  network="${OPENSHELL_E2E_DOCKER_NETWORK_NAME:-${OPENSHELL_E2E_NETWORK_NAME:-}}"
+  if [ -z "${network}" ]; then
+    echo "ERROR: no e2e Docker network resolved for the MCP conformance runner container." >&2
+    return 1
+  fi
+  if [ -z "${RUNNER_CONTAINER}" ]; then
+    echo "ERROR: MCP conformance runner container has not been started." >&2
+    return 1
+  fi
+
+  ip="$(docker inspect \
+    --format "{{with index .NetworkSettings.Networks \"${network}\"}}{{.IPAddress}}{{end}}" \
+    "${RUNNER_CONTAINER}")"
+  if [ -z "${ip}" ]; then
+    echo "ERROR: failed to resolve MCP conformance runner IP on Docker network ${network}." >&2
+    return 1
+  fi
+  printf '%s\n' "${ip}"
 }
 
 stop_host_bridge() {
@@ -320,17 +349,26 @@ run_scenarios_in_runner_container() {
   scenario_list="$(scenario_list_for_args "$@")"
   if [ -z "${scenario_list}" ]; then
     echo "ERROR: no MCP conformance scenarios resolved." >&2
-    exit 2
+    return 2
   fi
+
+  bridge_port="$(e2e_pick_port)"
+  create_client_sandbox || return 1
+  create_runner_container || return 1
+  start_host_bridge "${bridge_port}" || return 1
+
+  bridge_host="$(host_bridge_hostname)"
+  echo "MCP conformance host bridge callback: http://${bridge_host}:${bridge_port}/run" >&2
 
   for scenario in ${scenario_list}; do
     echo "=== MCP conformance: ${scenario} ==="
-    if node "${CONFORMANCE_DIR}/dist/index.js" client \
-      --command "bash e2e/mcp-conformance/client-through-openshell.sh" \
-      --scenario "${scenario}" \
-      --spec-version "${SPEC_VERSION}" \
-      --expected-failures "${ROOT}/e2e/mcp-conformance/expected-failures.yml" \
-      --timeout "${TIMEOUT_MS}"; then
+    # shellcheck disable=SC2016
+    if docker exec \
+      --env "MCP_CONFORMANCE_HOST_BRIDGE_URL=http://${bridge_host}:${bridge_port}/run" \
+      "${RUNNER_CONTAINER}" \
+      sh -c 'cd /opt/mcp-conformance && exec node dist/index.js client --command "node /tmp/openshell-mcp-runner-shim.mjs" --scenario "$1" --spec-version "$2" --expected-failures "$3" --timeout "$4"' \
+      sh "${scenario}" "${SPEC_VERSION}" "/tmp/expected-failures.yml" "${TIMEOUT_MS}" \
+      </dev/null; then
       passed+=("${scenario}")
     else
       failed+=("${scenario}")

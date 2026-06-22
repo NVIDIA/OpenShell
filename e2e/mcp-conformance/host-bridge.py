@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Host bridge for the MCP conformance runner.
+
+The conformance runner runs in an isolated container and posts the URL of its
+MCP test server to this bridge. The bridge runs the real MCP client inside an
+OpenShell sandbox (via client-through-openshell.sh) and returns its result, so
+the untrusted runner never needs gateway credentials.
+
+Usage: host-bridge.py <port> <repo-root> <log-path>
+"""
+
+import json
+import os
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
+from pathlib import Path
+from urllib.parse import urlparse
+
+PORT = int(sys.argv[1])
+ROOT = Path(sys.argv[2])
+LOG_PATH = Path(sys.argv[3])
+TIMEOUT = (
+    int(os.environ.get("OPENSHELL_MCP_CONFORMANCE_CLIENT_TIMEOUT_SECONDS", "120")) + 30
+)
+ALLOWED_CONFORMANCE_ENV = frozenset(
+    {
+        "MCP_CONFORMANCE_SCENARIO",
+        "MCP_CONFORMANCE_CONTEXT",
+        "MCP_CONFORMANCE_PROTOCOL_VERSION",
+    }
+)
+HOST_ENV_ALLOWLIST = frozenset(
+    {
+        "CARGO_HOME",
+        "CARGO_TARGET_DIR",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "MISE_CACHE_DIR",
+        "MISE_CONFIG_DIR",
+        "MISE_DATA_DIR",
+        "MISE_STATE_DIR",
+        "OPENSHELL_BIN",
+        "OPENSHELL_GATEWAY",
+        "OPENSHELL_MCP_CONFORMANCE_CLIENT_SANDBOX",
+        "OPENSHELL_MCP_CONFORMANCE_CLIENT_TIMEOUT_SECONDS",
+        "OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT",
+        "OPENSHELL_MCP_CONFORMANCE_POLICY_WAIT_TIMEOUT",
+        "OPENSHELL_PROVISION_TIMEOUT",
+        "PATH",
+        "RUSTUP_HOME",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+    }
+)
+
+
+def log(message: str) -> None:
+    with LOG_PATH.open("a", encoding="utf-8") as fh:
+        fh.write(message + "\n")
+
+
+def canonical_ip(value: str):
+    parsed = ip_address(value)
+    return getattr(parsed, "ipv4_mapped", None) or parsed
+
+
+def subprocess_env(
+    payload_env: dict[str, str], expected_server_host: str
+) -> dict[str, str]:
+    env = {name: os.environ[name] for name in HOST_ENV_ALLOWLIST if name in os.environ}
+    env.update(payload_env)
+    env["OPENSHELL_MCP_CONFORMANCE_EXPECTED_SERVER_HOST"] = expected_server_host
+    return env
+
+
+class Handler(BaseHTTPRequestHandler):
+    def send_json(self, status: int, body: dict[str, object]) -> None:
+        encoded = json.dumps(body).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def reject(self, status: int, detail: str) -> None:
+        log(f"rejecting bridge request from {self.client_address[0]}: {detail}")
+        self.send_json(status, {"error": "invalid_bridge_request", "detail": detail})
+
+    def do_POST(self) -> None:
+        if self.path != "/run":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        try:
+            length = int(self.headers.get("content-length", "0"))
+            payload = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, ValueError) as err:
+            self.reject(400, str(err))
+            return
+
+        if not isinstance(payload, dict):
+            self.reject(400, "request body must be a JSON object")
+            return
+
+        server_url = payload.get("server_url")
+        if not isinstance(server_url, str):
+            self.reject(400, "server_url must be a string")
+            return
+
+        parsed = urlparse(server_url)
+        expected_host = os.environ.get(
+            "OPENSHELL_MCP_CONFORMANCE_RUNNER_IP", self.client_address[0]
+        )
+        try:
+            target_ip = canonical_ip(parsed.hostname or "")
+            expected_ip = canonical_ip(expected_host)
+        except ValueError:
+            self.reject(403, "server_url host must match the runner container IP")
+            return
+
+        if parsed.scheme not in {"http", "https"} or target_ip != expected_ip:
+            self.reject(403, "server_url host must match the runner container IP")
+            return
+
+        payload_env = payload.get("env", {})
+        if not isinstance(payload_env, dict):
+            self.reject(400, "env must be an object")
+            return
+        if any(name not in ALLOWED_CONFORMANCE_ENV for name in payload_env):
+            self.reject(403, "env contains unsupported keys")
+            return
+        if any(not isinstance(value, str) for value in payload_env.values()):
+            self.reject(400, "env values must be strings")
+            return
+
+        env = subprocess_env(payload_env, str(expected_ip))
+        log(f"running client for {server_url}")
+        try:
+            result = subprocess.run(
+                ["bash", "e2e/mcp-conformance/client-through-openshell.sh", server_url],
+                cwd=ROOT,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT,
+            )
+            log(f"client exited {result.returncode} for {server_url}")
+            body = {
+                "exit_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        except subprocess.TimeoutExpired as err:
+            body = {
+                "exit_code": 124,
+                "stdout": err.stdout or "",
+                "stderr": (err.stderr or "")
+                + f"\nhost bridge timed out after {TIMEOUT}s\n",
+            }
+        self.send_json(200, body)
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        log(fmt % args)
+
+
+def main() -> None:
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    log(f"host bridge listening on {PORT}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
