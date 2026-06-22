@@ -2873,6 +2873,51 @@ network_policies:
     }
 
     #[test]
+    fn l7_jsonrpc_method_rules_require_post() {
+        let data = r#"
+network_policies:
+  jsonrpc_post:
+    name: jsonrpc_post
+    endpoints:
+      - host: mcp.post.test
+        port: 8000
+        path: /mcp
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow:
+              rpc_method: initialize
+        deny_rules:
+          - rpc_method: tools/delete
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        let mut post_input = l7_jsonrpc_input_with_params(
+            "mcp.post.test",
+            8000,
+            "/mcp",
+            "initialize",
+            serde_json::json!({}),
+        );
+        assert!(eval_l7(&engine, &post_input));
+
+        post_input["request"]["method"] = serde_json::json!("PUT");
+        assert!(!eval_l7(&engine, &post_input));
+
+        let mut get_with_method = l7_jsonrpc_input_with_params(
+            "mcp.post.test",
+            8000,
+            "/mcp",
+            "initialize",
+            serde_json::json!({}),
+        );
+        get_with_method["request"]["method"] = serde_json::json!("GET");
+        assert!(!eval_l7(&engine, &get_with_method));
+    }
+
+    #[test]
     fn l7_jsonrpc_params_rules_filter_tools_call() {
         let data = r#"
 network_policies:

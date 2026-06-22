@@ -177,13 +177,19 @@ fn parse_jsonrpc_message(
         return Err(format!("unsupported JSON-RPC version '{version}'"));
     }
 
-    if value.get("method").is_some() {
-        return parse_jsonrpc_call(value).map(JsonRpcMessageInfo::Call);
+    let has_method = value.get("method").is_some();
+    let has_response_payload = jsonrpc_response_payload_present(value);
+    if has_method && has_response_payload {
+        return Err("JSON-RPC message includes both method and result/error".to_string());
     }
 
-    if jsonrpc_response_payload_present(value) {
+    if has_response_payload {
         parse_jsonrpc_response(value)?;
         return Ok(JsonRpcMessageInfo::Response);
+    }
+
+    if has_method {
+        return parse_jsonrpc_call(value).map(JsonRpcMessageInfo::Call);
     }
 
     Err("missing or non-string 'method' field".to_string())
@@ -481,6 +487,41 @@ mod tests {
         assert_eq!(
             info.error.as_deref(),
             Some("JSON-RPC response includes both result and error")
+        );
+    }
+
+    #[test]
+    fn rejects_message_with_method_and_result_or_error() {
+        let result_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","result":{}}"#;
+        let result_info = parse_jsonrpc_body(result_body);
+        assert!(result_info.calls.is_empty());
+        assert_eq!(
+            result_info.error.as_deref(),
+            Some("JSON-RPC message includes both method and result/error")
+        );
+
+        let error_body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","error":{"code":-32603,"message":"failed"}}"#;
+        let error_info = parse_jsonrpc_body(error_body);
+        assert!(error_info.calls.is_empty());
+        assert_eq!(
+            error_info.error.as_deref(),
+            Some("JSON-RPC message includes both method and result/error")
+        );
+    }
+
+    #[test]
+    fn rejects_batch_item_with_method_and_result() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":2,"method":"initialize","result":{}}
+        ]"#;
+        let info = parse_jsonrpc_body(body);
+
+        assert!(info.calls.is_empty());
+        assert!(info.is_batch);
+        assert_eq!(
+            info.error.as_deref(),
+            Some("batch item invalid: JSON-RPC message includes both method and result/error")
         );
     }
 

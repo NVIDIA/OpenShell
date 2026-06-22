@@ -278,6 +278,8 @@ request_denied_for_endpoint(request, endpoint) if {
 # --- L7 deny rule matching: JSON-RPC method + params ---
 
 request_denied_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "json-rpc"
+	request.method == "POST"
 	some deny_rule
 	deny_rule := endpoint.deny_rules[_]
 	deny_rule.rpc_method
@@ -445,6 +447,8 @@ request_allowed_for_endpoint(request, endpoint) if {
 # --- L7 rule matching: JSON-RPC method ---
 
 request_allowed_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "json-rpc"
+	request.method == "POST"
 	some rule
 	rule := endpoint.rules[_]
 	rule.allow.rpc_method
@@ -460,6 +464,8 @@ request_allowed_for_endpoint(request, endpoint) if {
 	request.method == "GET"
 	is_object(request.jsonrpc)
 	jsonrpc_no_parse_error(request.jsonrpc)
+	object.get(request.jsonrpc, "method", null) == null
+	not object.get(request.jsonrpc, "has_response", false)
 }
 
 # --- L7 rule matching: GraphQL operation ---
