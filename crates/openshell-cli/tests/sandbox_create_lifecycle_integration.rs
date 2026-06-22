@@ -727,6 +727,130 @@ fn install_fake_pgrep_no_match(dir: &TempDir) -> std::path::PathBuf {
     install_executable_script(dir, "pgrep", "#!/bin/sh\nexit 1\n")
 }
 
+fn install_fake_forward_process_helper(dir: &TempDir) -> std::path::PathBuf {
+    // Linux validation reads exact `/proc` argv, so the fake child must look
+    // like `ssh`, not Python or shell with appended tokens.
+    let source_path = dir.path().join("fake-forward-process.rs");
+    let binary_path = dir.path().join("fake-forward-process");
+    fs::write(
+        &source_path,
+        r#"
+use std::net::TcpListener;
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    match std::env::var("OPENSHELL_FAKE_FORWARD_MODE").as_deref() {
+        Ok("listen") => run_listener(),
+        Ok("sleep") => loop {
+            thread::sleep(Duration::from_secs(60));
+        },
+        _ => std::process::exit(2),
+    }
+}
+
+fn run_listener() {
+    let port = forward_port().expect("fake forward must receive an SSH -L argument");
+    let listener = TcpListener::bind(("127.0.0.1", port)).expect("fake forward must bind");
+    for stream in listener.incoming() {
+        let _ = stream;
+    }
+}
+
+fn forward_port() -> Option<u16> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "-L" {
+            return args.get(index + 1).and_then(|value| local_port(value));
+        }
+        if let Some(value) = arg.strip_prefix("-L").filter(|value| !value.is_empty()) {
+            return local_port(value);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn local_port(forward: &str) -> Option<u16> {
+    let (first, rest) = forward.split_once(':')?;
+    if first.bytes().all(|byte| byte.is_ascii_digit()) {
+        return first.parse().ok();
+    }
+    rest.split_once(':')?.0.parse().ok()
+}
+"#,
+    )
+    .unwrap();
+    let status = std::process::Command::new("rustc")
+        .arg("--edition=2021")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&binary_path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "failed to compile fake forward process");
+    binary_path
+}
+
+fn install_fake_ps_for_pid_revalidation(
+    dir: &TempDir,
+    pid_path: &std::path::Path,
+    command_path: &std::path::Path,
+) {
+    install_executable_script(
+        dir,
+        "ps",
+        format!(
+            r#"#!/bin/sh
+set -eu
+
+command_mode=0
+requested_pid=""
+previous=""
+
+for arg in "$@"; do
+  if [ "$previous" = "-o" ]; then
+    if [ "$arg" = "command=" ]; then
+      command_mode=1
+    fi
+    previous=""
+    continue
+  fi
+
+  if [ "$previous" = "-p" ]; then
+    requested_pid="$arg"
+    previous=""
+    continue
+  fi
+
+  case "$arg" in
+    -o|-p)
+      previous="$arg"
+      ;;
+  esac
+done
+
+expected_pid=""
+if [ -s '{pid_path}' ]; then
+  expected_pid="$(cat '{pid_path}')"
+fi
+
+if [ "$command_mode" = "1" ] && [ -n "$expected_pid" ] && [ "$requested_pid" = "$expected_pid" ] && [ -s '{command_path}' ]; then
+  cat '{command_path}'
+  printf '\n'
+  exit 0
+fi
+
+exec /bin/ps "$@"
+"#,
+            pid_path = pid_path.display(),
+            command_path = command_path.display(),
+        ),
+    );
+}
+
 async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
@@ -759,6 +883,8 @@ async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
 
 fn install_fake_forwarding_ssh(dir: &TempDir) -> std::path::PathBuf {
     let pid_path = dir.path().join("fake-forward.pid");
+    let command_path = dir.path().join("fake-forward.command");
+    let helper_path = install_fake_forward_process_helper(dir);
     let ssh_path = install_executable_script(
         dir,
         "ssh",
@@ -767,12 +893,15 @@ set -eu
 
 forward=""
 sandbox_id=""
+saw_no_command=0
+last_arg=""
 previous=""
 
 for arg in "$@"; do
   if [ "$previous" = "-L" ]; then
     forward="$arg"
     previous=""
+    last_arg="$arg"
     continue
   fi
 
@@ -783,18 +912,27 @@ for arg in "$@"; do
         ;;
     esac
     previous=""
+    last_arg="$arg"
     continue
   fi
 
   case "$arg" in
+    -N)
+      saw_no_command=1
+      ;;
     -L|-o)
       previous="$arg"
       ;;
   esac
+  last_arg="$arg"
 done
 
 if [ -z "$forward" ]; then
   exit 0
+fi
+
+if [ "$saw_no_command" != "1" ] || [ "$last_arg" != "sandbox" ]; then
+  exit 1
 fi
 
 first="${forward%%:*}"
@@ -812,51 +950,17 @@ if [ -z "$port" ] || [ -z "$sandbox_id" ]; then
   exit 1
 fi
 
-nohup python3 -c '
-import signal
-import socket
-import sys
-
-port = int(sys.argv[1])
-sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-sock.bind(("127.0.0.1", port))
-sock.listen(16)
-
-def stop(_signum, _frame):
-    sock.close()
-    raise SystemExit(0)
-
-signal.signal(signal.SIGTERM, stop)
-signal.signal(signal.SIGINT, stop)
-signal.signal(signal.SIGHUP, signal.SIG_IGN)
-
-while True:
-    conn, _addr = sock.accept()
-    conn.close()
-' "$port" ssh ssh-proxy --sandbox-id "$sandbox_id" -L "$forward" >/dev/null 2>&1 &
-echo $! > '@PID_PATH@'
-
-exit 0
+helper='@HELPER_PATH@'
+echo "$$" > '@PID_PATH@'
+printf '%s\n' "ssh -N -o ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway -o ExitOnForwardFailure=yes -L $forward sandbox" > '@COMMAND_PATH@'
+exec env OPENSHELL_FAKE_FORWARD_MODE=listen /bin/bash -c 'exec -a ssh "$0" "$@"' "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox
 "#
-        .replace("@PID_PATH@", &pid_path.display().to_string()),
+        .replace("@PID_PATH@", &pid_path.display().to_string())
+        .replace("@COMMAND_PATH@", &command_path.display().to_string())
+        .replace("@HELPER_PATH@", &helper_path.display().to_string()),
     );
 
-    install_executable_script(
-        dir,
-        "pgrep",
-        format!(
-            r"#!/bin/sh
-if [ -s '{}' ]; then
-  cat '{}'
-  exit 0
-fi
-exit 1
-",
-            pid_path.display(),
-            pid_path.display()
-        ),
-    );
+    install_fake_ps_for_pid_revalidation(dir, &pid_path, &command_path);
 
     ssh_path
 }
@@ -869,7 +973,7 @@ struct FakeUnreachableForward {
 fn install_fake_unreachable_forwarding_ssh(dir: &TempDir) -> FakeUnreachableForward {
     let log_path = dir.path().join("fake-forward.log");
     let pid_path = dir.path().join("fake-forward.pid");
-    let ready_path = dir.path().join("fake-forward.ready");
+    let helper_path = install_fake_forward_process_helper(dir);
     install_executable_script(
         dir,
         "ssh",
@@ -878,12 +982,15 @@ set -eu
 
 forward=""
 sandbox_id=""
+saw_no_command=0
+last_arg=""
 previous=""
 
 for arg in "$@"; do
   if [ "$previous" = "-L" ]; then
     forward="$arg"
     previous=""
+    last_arg="$arg"
     continue
   fi
 
@@ -894,71 +1001,36 @@ for arg in "$@"; do
         ;;
     esac
     previous=""
+    last_arg="$arg"
     continue
   fi
 
   case "$arg" in
+    -N)
+      saw_no_command=1
+      ;;
     -L|-o)
       previous="$arg"
       ;;
   esac
+  last_arg="$arg"
 done
 
 if [ -z "$forward" ] || [ -z "$sandbox_id" ]; then
   exit 1
 fi
 
-trap '' HUP
-python3 -c '
-import pathlib
-import signal
-import sys
-import time
-
-ready_path = pathlib.Path(sys.argv[1])
-
-signal.signal(signal.SIGHUP, signal.SIG_IGN)
-
-ready_path.write_text("ready")
-
-while True:
-    time.sleep(1)
-' '@READY_PATH@' ssh ssh-proxy --sandbox-id "$sandbox_id" -L "$forward" >'@LOG_PATH@' 2>&1 &
-pid="$!"
-i=0
-while [ "$i" -lt 100 ]; do
-  if [ -e '@READY_PATH@' ]; then
-    break
-  fi
-  i=$((i + 1))
-  sleep 0.05
-done
-if [ ! -e '@READY_PATH@' ]; then
+if [ "$saw_no_command" != "1" ] || [ "$last_arg" != "sandbox" ]; then
   exit 1
 fi
-echo "$pid" > '@PID_PATH@'
 
-exit 0
+helper='@HELPER_PATH@'
+echo "$$" > '@PID_PATH@'
+exec env OPENSHELL_FAKE_FORWARD_MODE=sleep /bin/bash -c 'exec -a ssh "$0" "$@"' "$helper" -N -o "ProxyCommand=/tmp/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id $sandbox_id --token test-token --gateway-name test-gateway" -o ExitOnForwardFailure=yes -L "$forward" sandbox >'@LOG_PATH@' 2>&1
 "#
         .replace("@LOG_PATH@", &log_path.display().to_string())
-        .replace("@READY_PATH@", &ready_path.display().to_string())
-        .replace("@PID_PATH@", &pid_path.display().to_string()),
-    );
-
-    install_executable_script(
-        dir,
-        "pgrep",
-        format!(
-            r"#!/bin/sh
-if [ -s '{}' ]; then
-  cat '{}'
-  exit 0
-fi
-exit 1
-",
-            pid_path.display(),
-            pid_path.display()
-        ),
+        .replace("@PID_PATH@", &pid_path.display().to_string())
+        .replace("@HELPER_PATH@", &helper_path.display().to_string()),
     );
 
     FakeUnreachableForward { log_path, pid_path }
@@ -1591,30 +1663,33 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
 }
 
 #[tokio::test]
-async fn sandbox_forward_background_fails_when_pid_is_not_discoverable() {
+async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
     let _env = test_env(&fake_ssh_dir, &xdg_dir);
     let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    install_fake_forwarding_ssh(&fake_ssh_dir);
     install_fake_pgrep_no_match(&fake_ssh_dir);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let forward_port = listener.local_addr().unwrap().port();
     drop(listener);
 
     let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    let err = run::sandbox_forward(&server.endpoint, "untracked-forward", &spec, true, &tls)
+    run::sandbox_forward(&server.endpoint, "owned-forward", &spec, true, &tls)
         .await
-        .expect_err("background forward should fail without a discoverable SSH PID");
-    let msg = format!("{err}");
+        .expect("background forward should track the owned SSH child without PID discovery");
+    let record = openshell_core::forward::read_forward_pid("owned-forward", forward_port)
+        .expect("owned background forward should write a PID file");
+
     assert!(
-        msg.contains("could not discover backgrounded SSH process"),
-        "error should explain the missing tracked SSH process, got: {msg}",
+        openshell_core::forward::stop_forward("owned-forward", forward_port)
+            .expect("tracked fake forward should stop"),
+        "tracked fake forward should be recognized as alive and stopped",
     );
     assert!(
-        openshell_core::forward::read_forward_pid("untracked-forward", forward_port).is_none(),
-        "untracked background forwards must not write a PID file",
+        wait_for_process_exit(record.pid, Duration::from_secs(2)).await,
+        "tracked fake forward process should exit after stop"
     );
 }
 
@@ -1642,7 +1717,7 @@ async fn sandbox_forward_foreground_fails_when_ssh_exits_before_listener_opens()
 }
 
 #[tokio::test]
-async fn sandbox_forward_background_terminates_discovered_pid_when_listener_never_opens() {
+async fn sandbox_forward_background_terminates_owned_child_when_listener_never_opens() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
@@ -1684,7 +1759,7 @@ async fn sandbox_forward_background_terminates_discovered_pid_when_listener_neve
             .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
             .unwrap_or_default();
         panic!(
-            "discovered background SSH process should exit after listener failure cleanup; pid={}, command={}, log={}",
+            "owned background SSH child should exit after listener failure cleanup; pid={}, command={}, log={}",
             pid,
             command.trim(),
             log.trim(),

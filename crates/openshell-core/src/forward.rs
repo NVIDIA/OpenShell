@@ -49,22 +49,19 @@ pub fn write_forward_pid(
 /// SSH process.  Falls back to `pgrep` since SSH `-f` forks a new process
 /// whose PID we cannot capture directly.
 pub fn find_ssh_forward_pid(sandbox_id: &str, port: u16) -> Option<u32> {
-    // Match the ProxyCommand argument which contains the sandbox ID, plus
-    // the -L port forwarding spec. The ProxyCommand (with --sandbox-id)
-    // appears before -L in the SSH command line.
-    let pattern = format!("ssh.*sandbox-id.*{sandbox_id}.*-L.*{port}:127.0.0.1:{port}");
-    let output = Command::new("pgrep")
-        .arg("-f")
-        .arg(&pattern)
-        .output()
-        .ok()?;
+    // Use pgrep only as a broad process source. The command line still needs a
+    // second exact check before the PID can be tracked or signaled, otherwise a
+    // requested port such as 80 can substring-match an existing 8080 forward.
+    let pattern = "ssh-proxy";
+    let output = Command::new("pgrep").arg("-f").arg(pattern).output().ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // pgrep may return multiple PIDs (e.g., parent + child). Take the last
-    // one, which is typically the backgrounded SSH process.
+    // pgrep may return multiple PIDs; scan from newest to oldest and return
+    // the first one that still passes the exact command-line validation.
     stdout
         .lines()
         .rev()
-        .find_map(|l| l.trim().parse::<u32>().ok())
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .find(|pid| pid_matches_openshell_ssh_forward(*pid, port, Some(sandbox_id)))
 }
 
 /// Record read from a forward PID file.
@@ -104,51 +101,305 @@ pub fn pid_is_alive(pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Validate that a PID belongs to an SSH forward process matching the expected
-/// port and optional sandbox ID.
-pub fn pid_matches_forward(pid: u32, port: u16, sandbox_id: Option<&str>) -> bool {
-    let output = match Command::new("ps")
+/// Validate that a PID belongs to the expected `OpenShell` SSH forward.
+pub fn pid_matches_openshell_ssh_forward(pid: u32, port: u16, sandbox_id: Option<&str>) -> bool {
+    let Some(argv) = process_forward_match_tokens(pid) else {
+        return false;
+    };
+    let tokens: Vec<&str> = argv.iter().map(String::as_str).collect();
+    args_match_ssh_forward(&tokens, port, sandbox_id)
+}
+
+/// Read a process command line as matcher tokens.
+///
+/// Linux exposes exact argv from `/proc/<pid>/cmdline`; embedded
+/// `ProxyCommand=` values are split so the matcher sees a flat token sequence.
+#[cfg(target_os = "linux")]
+fn process_forward_match_tokens(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let argv: Vec<String> = raw
+        .split(|byte| *byte == 0)
+        .filter(|segment| !segment.is_empty())
+        .flat_map(|segment| expand_proxy_command_arg(&String::from_utf8_lossy(segment)))
+        .collect();
+    (!argv.is_empty()).then_some(argv)
+}
+
+/// Non-Linux fallback. `ps` flattens argv, so paths with spaces fail closed.
+#[cfg(not(target_os = "linux"))]
+fn process_forward_match_tokens(pid: u32) -> Option<Vec<String>> {
+    let output = Command::new("ps")
         .arg("-ww")
         .arg("-o")
         .arg("command=")
         .arg("-p")
         .arg(pid.to_string())
         .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return false,
-    };
-
-    let cmd = String::from_utf8_lossy(&output.stdout);
-    let forward_spec = format!("{port}:127.0.0.1:{port}");
-    if !cmd.contains("ssh") || !cmd.contains("ssh-proxy") || !cmd.contains(&forward_spec) {
-        return false;
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-
-    sandbox_id.is_none_or(|id| cmd.contains(id))
+    let cmd = String::from_utf8_lossy(&output.stdout);
+    let argv: Vec<String> = cmd.split_whitespace().map(str::to_string).collect();
+    (!argv.is_empty()).then_some(argv)
 }
 
-/// Find the sandbox name that owns a forward on the given port.
-///
-/// Scans all PID files in the forwards directory for a file matching
-/// `*-<port>.pid`.  Ports are unique across sandboxes so at most one
-/// match is expected.
-pub fn find_forward_by_port(port: u16) -> Result<Option<String>> {
-    let dir = forward_pid_dir()?;
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(None);
+/// Expand a `ProxyCommand=<value>` element into matcher tokens.
+#[cfg(any(target_os = "linux", test))]
+fn expand_proxy_command_arg(arg: &str) -> Vec<String> {
+    let Some(value) = arg.strip_prefix("ProxyCommand=") else {
+        return vec![arg.to_string()];
     };
-    let suffix = format!("-{port}.pid");
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        if let Some(name) = file_name.strip_suffix(&suffix)
-            && !name.is_empty()
-        {
-            return Ok(Some(name.to_string()));
+    let mut words = split_proxy_command_words(value);
+    if words.is_empty() {
+        return vec![arg.to_string()];
+    }
+    words[0] = format!("ProxyCommand={}", words[0]);
+    words
+}
+
+/// Split shell words well enough to round-trip values emitted by [`shell_escape`].
+#[cfg(any(target_os = "linux", test))]
+fn split_proxy_command_words(input: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current: Option<String> = None;
+    let mut chars = input.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if let Some(word) = current.take() {
+                    words.push(word);
+                }
+            }
+            '\'' => {
+                let buf = current.get_or_insert_with(String::new);
+                for q in chars.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                    buf.push(q);
+                }
+            }
+            '"' => {
+                let buf = current.get_or_insert_with(String::new);
+                for q in chars.by_ref() {
+                    if q == '"' {
+                        break;
+                    }
+                    buf.push(q);
+                }
+            }
+            other => current.get_or_insert_with(String::new).push(other),
         }
     }
-    Ok(None)
+    if let Some(word) = current.take() {
+        words.push(word);
+    }
+    words
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProxyCommandMatch {
+    outer_ssh_args_start: usize,
+    sandbox_id_requirement_met: bool,
+    prefix_has_no_command: bool,
+}
+
+/// Match an `OpenShell` SSH forward by proxy ownership and outer SSH args.
+fn args_match_ssh_forward(args: &[&str], port: u16, sandbox_id: Option<&str>) -> bool {
+    if args.first().and_then(|arg| arg.rsplit('/').next()) != Some("ssh") {
+        return false;
+    }
+    let Some(proxy) = find_proxy_command_match(args, sandbox_id) else {
+        return false;
+    };
+    if sandbox_id.is_some() && !proxy.sandbox_id_requirement_met {
+        return false;
+    }
+    outer_ssh_forward_matches(
+        &args[proxy.outer_ssh_args_start..],
+        port,
+        proxy.prefix_has_no_command,
+    )
+}
+
+/// Test-only wrapper for flat command lines.
+#[cfg(test)]
+fn command_matches_ssh_forward(command: &str, port: u16, sandbox_id: Option<&str>) -> bool {
+    let args = command.split_whitespace().collect::<Vec<_>>();
+    args_match_ssh_forward(&args, port, sandbox_id)
+}
+
+fn find_proxy_command_match(args: &[&str], sandbox_id: Option<&str>) -> Option<ProxyCommandMatch> {
+    for (index, arg) in args.iter().enumerate().skip(1) {
+        let Some(prefix_has_no_command) = parse_ssh_prefix_before_proxy(args, index) else {
+            continue;
+        };
+        if !is_ssh_proxy_arg(arg) || !proxy_command_option_present(args, index) {
+            continue;
+        }
+
+        let mut current = index + 1;
+        let mut sandbox_id_requirement_met = sandbox_id.is_none();
+        while current < args.len() {
+            let arg = args[current];
+            if is_outer_ssh_option_start(arg) || arg == "sandbox" {
+                return Some(ProxyCommandMatch {
+                    outer_ssh_args_start: current,
+                    sandbox_id_requirement_met,
+                    prefix_has_no_command,
+                });
+            }
+
+            if let Some(value) = arg.strip_prefix("--sandbox-id=") {
+                sandbox_id_requirement_met |= sandbox_id == Some(value);
+                current += 1;
+                continue;
+            }
+            if arg == "--sandbox-id" {
+                let value = args.get(current + 1)?;
+                sandbox_id_requirement_met |= sandbox_id == Some(*value);
+                current += 2;
+                continue;
+            }
+            if proxy_option_takes_value(arg) {
+                current += 2;
+                continue;
+            }
+            if proxy_option_has_inline_value(arg) {
+                current += 1;
+                continue;
+            }
+
+            return None;
+        }
+    }
+    None
+}
+
+fn is_ssh_proxy_arg(arg: &str) -> bool {
+    arg == "ssh-proxy" || arg.rsplit('/').next() == Some("ssh-proxy")
+}
+
+fn proxy_command_option_present(args: &[&str], proxy_index: usize) -> bool {
+    args.iter()
+        .take(proxy_index + 1)
+        .any(|arg| arg.starts_with("ProxyCommand="))
+}
+
+fn proxy_option_takes_value(arg: &str) -> bool {
+    matches!(arg, "--gateway" | "--token" | "--gateway-name")
+}
+
+fn proxy_option_has_inline_value(arg: &str) -> bool {
+    ["--gateway=", "--token=", "--gateway-name="]
+        .iter()
+        .any(|prefix| arg.starts_with(prefix))
+}
+
+fn is_outer_ssh_option_start(arg: &str) -> bool {
+    matches!(arg, "-N" | "-f" | "-o" | "-L" | "-T" | "-tt")
+        || arg.starts_with("-L")
+        || arg.starts_with("-o")
+        || arg.starts_with("-v")
+}
+
+fn parse_ssh_prefix_before_proxy(args: &[&str], proxy_index: usize) -> Option<bool> {
+    let mut current = 1;
+    let mut saw_no_command = false;
+    while current < proxy_index {
+        let arg = args[current];
+        if arg == "-o" {
+            current += 2;
+            continue;
+        }
+        if arg == "-N" {
+            saw_no_command = true;
+            current += 1;
+            continue;
+        }
+        if arg.starts_with("-o") || matches!(arg, "-f" | "-T" | "-tt") {
+            current += 1;
+            continue;
+        }
+        if arg.starts_with("-v") {
+            current += 1;
+            continue;
+        }
+        return None;
+    }
+    Some(saw_no_command)
+}
+
+fn outer_ssh_forward_matches(args: &[&str], port: u16, prefix_has_no_command: bool) -> bool {
+    let Some(forward_args) = args.strip_suffix(&["sandbox"]) else {
+        return false;
+    };
+    let mut saw_no_command = prefix_has_no_command;
+    let mut saw_forward = false;
+    let mut current = 0;
+
+    while current < forward_args.len() {
+        let arg = forward_args[current];
+        match arg {
+            "-N" => {
+                saw_no_command = true;
+                current += 1;
+            }
+            "-f" | "-T" | "-tt" => {
+                current += 1;
+            }
+            "-o" => {
+                if current + 1 >= forward_args.len() {
+                    return false;
+                }
+                current += 2;
+            }
+            "-L" => {
+                let Some(candidate) = forward_args.get(current + 1) else {
+                    return false;
+                };
+                saw_forward |= ssh_forward_arg_matches_openshell_loopback_port(candidate, port);
+                current += 2;
+            }
+            _ if arg.starts_with("-L") => {
+                let Some(candidate) = arg.strip_prefix("-L").filter(|value| !value.is_empty())
+                else {
+                    return false;
+                };
+                saw_forward |= ssh_forward_arg_matches_openshell_loopback_port(candidate, port);
+                current += 1;
+            }
+            _ if arg.starts_with("-o") || arg.starts_with("-v") => {
+                current += 1;
+            }
+            _ => return false,
+        }
+    }
+
+    saw_no_command && saw_forward
+}
+
+fn expected_sandbox_id_from_record(record: &ForwardPidRecord) -> Option<&str> {
+    // Legacy one-field PID files are cleanup records, not signal authority.
+    record.sandbox_id.as_deref().filter(|id| !id.is_empty())
+}
+
+fn ssh_forward_arg_matches_openshell_loopback_port(arg: &str, port: u16) -> bool {
+    let unbound = format!("{port}:127.0.0.1:{port}");
+    let bind_prefixed_suffix = format!(":{unbound}");
+    arg == unbound || arg.ends_with(&bind_prefixed_suffix)
+}
+
+/// Find the live, validated forward owner for a local port.
+pub fn find_forward_by_port(port: u16) -> Result<Option<String>> {
+    Ok(list_forwards()?
+        .into_iter()
+        .find(|forward| forward.port == port && forward.validated_alive)
+        .map(|forward| forward.sandbox_name))
 }
 
 /// Stop a background port forward.
@@ -158,9 +409,14 @@ pub fn stop_forward(name: &str, port: u16) -> Result<bool> {
         return Ok(false);
     };
     let pid = record.pid;
+    let Some(sandbox_id) = expected_sandbox_id_from_record(&record) else {
+        // Legacy PID records do not prove process ownership.
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(false);
+    };
 
     if pid_is_alive(pid) {
-        if !pid_matches_forward(pid, port, record.sandbox_id.as_deref()) {
+        if !pid_matches_openshell_ssh_forward(pid, port, Some(sandbox_id)) {
             let _ = std::fs::remove_file(&pid_path);
             return Ok(false);
         }
@@ -206,10 +462,14 @@ pub fn stop_forwards_for_sandbox(name: &str) -> Result<Vec<u16>> {
 
 /// Information about a tracked forward.
 pub struct ForwardInfo {
-    pub sandbox: String,
+    /// User-facing sandbox name from the PID file path.
+    pub sandbox_name: String,
+    /// Local port bound by the SSH forward.
     pub port: u16,
+    /// PID recorded for the background SSH process.
     pub pid: u32,
-    pub alive: bool,
+    /// PID is alive and validates as this `OpenShell` forward.
+    pub validated_alive: bool,
     /// Bind address (defaults to `127.0.0.1` for old PID files).
     pub bind_addr: String,
 }
@@ -234,11 +494,17 @@ pub fn list_forwards() -> Result<Vec<ForwardInfo>> {
             && let Ok(port) = stem[dash_pos + 1..].parse::<u16>()
             && let Some(record) = read_forward_pid(&stem[..dash_pos], port)
         {
+            // Revalidate ownership so PID reuse does not look like a live forward.
+            let validated_alive =
+                expected_sandbox_id_from_record(&record).is_some_and(|sandbox_id| {
+                    pid_is_alive(record.pid)
+                        && pid_matches_openshell_ssh_forward(record.pid, port, Some(sandbox_id))
+                });
             forwards.push(ForwardInfo {
-                sandbox: stem[..dash_pos].to_string(),
+                sandbox_name: stem[..dash_pos].to_string(),
                 port,
                 pid: record.pid,
-                alive: pid_is_alive(record.pid),
+                validated_alive,
                 bind_addr: record
                     .bind_addr
                     .unwrap_or_else(|| ForwardSpec::DEFAULT_BIND_ADDR.to_string()),
@@ -246,7 +512,11 @@ pub fn list_forwards() -> Result<Vec<ForwardInfo>> {
         }
     }
 
-    forwards.sort_by(|a, b| a.sandbox.cmp(&b.sandbox).then(a.port.cmp(&b.port)));
+    forwards.sort_by(|a, b| {
+        a.sandbox_name
+            .cmp(&b.sandbox_name)
+            .then(a.port.cmp(&b.port))
+    });
     Ok(forwards)
 }
 
@@ -372,13 +642,15 @@ pub fn check_port_available(spec: &ForwardSpec) -> Result<()> {
 
     // Port is occupied.  Check if it belongs to a tracked openshell forward.
     if let Ok(forwards) = list_forwards()
-        && let Some(fwd) = forwards.iter().find(|f| f.port == port && f.alive)
+        && let Some(fwd) = forwards
+            .iter()
+            .find(|f| f.port == port && f.validated_alive)
     {
         return Err(miette::miette!(
             "Port {port} is already forwarded to sandbox '{}'.\n\
              Stop it with: openshell forward stop {port} {}",
-            fwd.sandbox,
-            fwd.sandbox,
+            fwd.sandbox_name,
+            fwd.sandbox_name,
         ));
     }
 
@@ -646,7 +918,7 @@ fn validate_field(
 pub fn build_sandbox_notes(sandbox_name: &str, forwards: &[ForwardInfo]) -> String {
     let ports: Vec<String> = forwards
         .iter()
-        .filter(|f| f.sandbox == sandbox_name && f.alive)
+        .filter(|f| f.sandbox_name == sandbox_name && f.validated_alive)
         .map(|f| f.port.to_string())
         .collect();
     if ports.is_empty() {
@@ -663,6 +935,37 @@ pub fn build_sandbox_notes(sandbox_name: &str, forwards: &[ForwardInfo]) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)] // Tests serialize process-wide environment changes with ENV_LOCK.
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    #[allow(unsafe_code)] // Tests serialize process-wide environment changes with ENV_LOCK.
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn resolve_ssh_gateway_keeps_non_loopback() {
@@ -930,24 +1233,24 @@ mod tests {
     fn build_sandbox_notes_with_forwards() {
         let forwards = vec![
             ForwardInfo {
-                sandbox: "mybox".to_string(),
+                sandbox_name: "mybox".to_string(),
                 port: 8080,
                 pid: 123,
-                alive: true,
+                validated_alive: true,
                 bind_addr: "127.0.0.1".to_string(),
             },
             ForwardInfo {
-                sandbox: "mybox".to_string(),
+                sandbox_name: "mybox".to_string(),
                 port: 3000,
                 pid: 456,
-                alive: true,
+                validated_alive: true,
                 bind_addr: "127.0.0.1".to_string(),
             },
             ForwardInfo {
-                sandbox: "other".to_string(),
+                sandbox_name: "other".to_string(),
                 port: 9090,
                 pid: 789,
-                alive: true,
+                validated_alive: true,
                 bind_addr: "0.0.0.0".to_string(),
             },
         ];
@@ -959,10 +1262,10 @@ mod tests {
     #[test]
     fn build_sandbox_notes_dead_forwards_excluded() {
         let forwards = vec![ForwardInfo {
-            sandbox: "mybox".to_string(),
+            sandbox_name: "mybox".to_string(),
             port: 8080,
             pid: 123,
-            alive: false,
+            validated_alive: false,
             bind_addr: "127.0.0.1".to_string(),
         }];
         assert_eq!(build_sandbox_notes("mybox", &forwards), "");
@@ -1108,6 +1411,247 @@ mod tests {
 
         let spec = ForwardSpec::parse("8080").unwrap();
         assert_eq!(spec.ssh_forward_arg(), "127.0.0.1:8080:127.0.0.1:8080");
+    }
+
+    #[test]
+    fn ssh_forward_command_matches_exact_l_argument() {
+        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+        let compact = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L80:127.0.0.1:80 sandbox";
+
+        assert!(command_matches_ssh_forward(command, 80, Some("sbx-1")));
+        assert!(command_matches_ssh_forward(compact, 80, Some("sbx-1")));
+    }
+
+    #[test]
+    fn ssh_forward_command_matches_bind_prefixed_l_argument() {
+        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 127.0.0.1:80:127.0.0.1:80 sandbox";
+        let compact = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L[::1]:80:127.0.0.1:80 sandbox";
+
+        assert!(command_matches_ssh_forward(command, 80, Some("sbx-1")));
+        assert!(command_matches_ssh_forward(compact, 80, Some("sbx-1")));
+    }
+
+    #[test]
+    fn ssh_forward_command_rejects_substring_port_collision() {
+        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 127.0.0.1:8080:127.0.0.1:8080 sandbox";
+
+        assert!(!command_matches_ssh_forward(command, 80, Some("sbx-1")));
+    }
+
+    #[test]
+    fn ssh_forward_command_requires_matching_sandbox_id() {
+        let command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-2 -N -L 80:127.0.0.1:80 sandbox";
+        let equals = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id=sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+
+        assert!(!command_matches_ssh_forward(command, 80, Some("sbx-1")));
+        assert!(command_matches_ssh_forward(equals, 80, Some("sbx-1")));
+        assert!(command_matches_ssh_forward(command, 80, None));
+    }
+
+    #[test]
+    fn ssh_forward_command_rejects_sandbox_id_prefix_collision() {
+        let split = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-10 -N -L 80:127.0.0.1:80 sandbox";
+        let equals = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id=sbx-10 -N -L 80:127.0.0.1:80 sandbox";
+
+        assert!(!command_matches_ssh_forward(split, 80, Some("sbx-1")));
+        assert!(!command_matches_ssh_forward(equals, 80, Some("sbx-1")));
+    }
+
+    #[test]
+    fn ssh_forward_command_rejects_host_port_ambiguity() {
+        let wrong_remote_port = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 80:127.0.0.1:8080 sandbox";
+        let wrong_local_port = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 127.0.0.1:8080:127.0.0.1:80 sandbox";
+        let wrong_remote_host = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N -L 80:localhost:80 sandbox";
+
+        assert!(!command_matches_ssh_forward(
+            wrong_remote_port,
+            80,
+            Some("sbx-1")
+        ));
+        assert!(!command_matches_ssh_forward(
+            wrong_local_port,
+            80,
+            Some("sbx-1")
+        ));
+        assert!(!command_matches_ssh_forward(
+            wrong_remote_host,
+            80,
+            Some("sbx-1")
+        ));
+    }
+
+    #[test]
+    fn ssh_forward_command_matches_path_basenames_and_bind_variants() {
+        let command = "/usr/bin/ssh -o ProxyCommand=/usr/local/bin/ssh-proxy --sandbox-id=sbx-1 -N -L localhost:80:127.0.0.1:80 sandbox";
+
+        assert!(command_matches_ssh_forward(command, 80, Some("sbx-1")));
+    }
+
+    #[test]
+    fn ssh_forward_command_matches_generated_forward_shape() {
+        let command = "/usr/bin/ssh -N -o ProxyCommand=/path/openshell ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id sbx-1 --token tok_123 --gateway-name local -o ExitOnForwardFailure=yes -L 127.0.0.1:80:127.0.0.1:80 -f sandbox";
+
+        assert!(command_matches_ssh_forward(command, 80, Some("sbx-1")));
+    }
+
+    #[test]
+    fn split_proxy_command_words_round_trips_shell_escape() {
+        assert_eq!(split_proxy_command_words("a b c"), vec!["a", "b", "c"]);
+        // A quoted executable path with whitespace stays a single word.
+        assert_eq!(
+            split_proxy_command_words("'/Application Support/openshell' ssh-proxy"),
+            vec!["/Application Support/openshell", "ssh-proxy"]
+        );
+        // The `'\"'\"'` idiom shell_escape emits for an embedded single quote.
+        assert_eq!(split_proxy_command_words("'it'\"'\"'s'"), vec!["it's"]);
+        // An explicitly empty argument survives as an empty word.
+        assert_eq!(split_proxy_command_words("''"), vec![String::new()]);
+    }
+
+    #[test]
+    fn expand_proxy_command_arg_splits_value_and_keeps_prefix() {
+        let exe = "/Application Support/openshell";
+        let arg = format!(
+            "ProxyCommand={} ssh-proxy --sandbox-id sbx-1",
+            shell_escape(exe)
+        );
+        assert_eq!(
+            expand_proxy_command_arg(&arg),
+            vec![
+                format!("ProxyCommand={exe}"),
+                "ssh-proxy".to_string(),
+                "--sandbox-id".to_string(),
+                "sbx-1".to_string(),
+            ]
+        );
+        // Non-proxy arguments pass through untouched.
+        assert_eq!(expand_proxy_command_arg("-N"), vec!["-N".to_string()]);
+    }
+
+    #[test]
+    fn args_match_ssh_forward_handles_expanded_proxy_command_with_whitespace_in_exe_path() {
+        // Exact argv as recovered from /proc/<pid>/cmdline: the ProxyCommand
+        // value is one element whose executable path contains spaces. The flat
+        // `ps` parse cannot represent this, but the exact-argv path expands the
+        // ProxyCommand element and matches correctly.
+        let exe = "/Application Support/openshell";
+        let proxy_arg = format!(
+            "ProxyCommand={} ssh-proxy --gateway https://127.0.0.1:9443 --sandbox-id sbx-1 --token tok_123 --gateway-name local",
+            shell_escape(exe)
+        );
+        // Mirror process_forward_match_tokens: the ProxyCommand element is expanded.
+        let mut argv = vec![
+            "/usr/bin/ssh".to_string(),
+            "-N".to_string(),
+            "-o".to_string(),
+        ];
+        argv.extend(expand_proxy_command_arg(&proxy_arg));
+        argv.extend([
+            "-o".to_string(),
+            "ExitOnForwardFailure=yes".to_string(),
+            "-L".to_string(),
+            "127.0.0.1:80:127.0.0.1:80".to_string(),
+            "-f".to_string(),
+            "sandbox".to_string(),
+        ]);
+        let tokens: Vec<&str> = argv.iter().map(String::as_str).collect();
+
+        assert!(args_match_ssh_forward(&tokens, 80, Some("sbx-1")));
+        // Port and sandbox-id discrimination still holds on the exact path.
+        assert!(!args_match_ssh_forward(&tokens, 8080, Some("sbx-1")));
+        assert!(!args_match_ssh_forward(&tokens, 80, Some("sbx-2")));
+    }
+
+    #[test]
+    fn ssh_forward_command_rejects_proxy_name_collisions() {
+        let wrong_ssh = "notssh ssh-proxy --sandbox-id sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+        let wrong_proxy = "ssh -o ProxyCommand=/usr/local/bin/not-ssh-proxy --sandbox-id=sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+
+        assert!(!command_matches_ssh_forward(wrong_ssh, 80, Some("sbx-1")));
+        assert!(!command_matches_ssh_forward(wrong_proxy, 80, Some("sbx-1")));
+    }
+
+    #[test]
+    fn ssh_forward_command_rejects_non_ssh_process_with_matching_tokens() {
+        let command = "python3 /tmp/ssh ssh-proxy --sandbox-id sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+
+        assert!(!command_matches_ssh_forward(command, 80, Some("sbx-1")));
+    }
+
+    #[test]
+    fn ssh_forward_command_rejects_bare_ssh_proxy_destination() {
+        let command = "ssh ssh-proxy --sandbox-id sbx-1 -N -L80:127.0.0.1:80 sandbox";
+
+        assert!(!command_matches_ssh_forward(command, 80, Some("sbx-1")));
+    }
+
+    #[test]
+    fn ssh_forward_command_rejects_remote_command_l_argument() {
+        let remote_arg = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 -N sandbox -L 80:127.0.0.1:80";
+        let missing_no_command = "ssh ssh-proxy --sandbox-id sbx-1 -L 80:127.0.0.1:80 sandbox";
+        let remote_command_lookalike = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-1 real-host echo -N -L 80:127.0.0.1:80 sandbox";
+        let sandbox_id_in_remote_command = "ssh -o ProxyCommand=openshell ssh-proxy --sandbox-id sbx-2 real-host --sandbox-id sbx-1 -N -L 80:127.0.0.1:80 sandbox";
+
+        assert!(!command_matches_ssh_forward(remote_arg, 80, Some("sbx-1")));
+        assert!(!command_matches_ssh_forward(
+            missing_no_command,
+            80,
+            Some("sbx-1")
+        ));
+        assert!(!command_matches_ssh_forward(
+            remote_command_lookalike,
+            80,
+            Some("sbx-1")
+        ));
+        assert!(!command_matches_ssh_forward(
+            sandbox_id_in_remote_command,
+            80,
+            Some("sbx-1")
+        ));
+    }
+
+    #[test]
+    fn stop_forward_removes_legacy_pid_file_without_signaling() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+
+        let pid_path = forward_pid_path("sbx-1", 80).unwrap();
+        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        std::fs::write(&pid_path, "12345").unwrap();
+
+        assert!(!stop_forward("sbx-1", 80).unwrap());
+        assert!(!pid_path.exists());
+    }
+
+    #[test]
+    fn list_forwards_marks_legacy_pid_records_not_alive() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+
+        let pid_path = forward_pid_path("sbx-1", 80).unwrap();
+        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        std::fs::write(&pid_path, "12345").unwrap();
+
+        let forwards = list_forwards().unwrap();
+        assert_eq!(forwards.len(), 1);
+        assert_eq!(forwards[0].sandbox_name, "sbx-1");
+        assert_eq!(forwards[0].port, 80);
+        assert!(!forwards[0].validated_alive);
+    }
+
+    #[test]
+    fn find_forward_by_port_ignores_legacy_pid_records() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+
+        let pid_path = forward_pid_path("old", 80).unwrap();
+        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+
+        assert_eq!(find_forward_by_port(80).unwrap(), None);
     }
 
     #[test]

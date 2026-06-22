@@ -7,14 +7,10 @@ use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
-#[cfg(unix)]
-use nix::unistd::Pid;
 use openshell_core::ObjectId;
-#[cfg(unix)]
-use openshell_core::forward::pid_matches_forward;
 use openshell_core::forward::{
-    ForwardSpec, build_proxy_command, find_ssh_forward_pid, format_gateway_url,
-    resolve_ssh_gateway, shell_escape, validate_ssh_session_response, write_forward_pid,
+    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
@@ -33,10 +29,6 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_stream::wrappers::ReceiverStream;
 
-/// Time budget for finding the OpenSSH background process after `ssh -f`
-/// returns. PID discovery is separate from listener readiness so missing
-/// process tracking still fails quickly.
-const FORWARD_PID_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Time budget for the local listener to become reachable after `ssh` starts.
 /// This is a user-visible readiness deadline for both foreground and background
 /// forwards, not a soft cleanup grace period.
@@ -331,9 +323,8 @@ pub async fn sandbox_connect_editor(
 
 /// Forward a local port to a sandbox via SSH.
 ///
-/// When `background` is `true` the SSH process is forked into the background
-/// (using `-f`) and its PID is written to a state file so it can be managed
-/// later via [`stop_forward`] or [`list_forwards`].
+/// Background mode keeps the spawned `ssh -N` child alive and records that PID
+/// for later management via [`stop_forward`] or [`list_forwards`].
 pub async fn sandbox_forward(
     server: &str,
     name: &str,
@@ -353,52 +344,51 @@ pub async fn sandbox_forward(
         .arg("-L")
         .arg(spec.ssh_forward_arg());
 
-    if background {
-        // SSH -f: fork to background after authentication.
-        command.arg("-f");
-    }
+    command.arg("sandbox");
 
-    command
-        .arg("sandbox")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    if background {
+        command
+            .kill_on_drop(false)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    } else {
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    }
 
     let port = spec.port;
 
     if background {
-        let status = command.status().await.into_diagnostic()?;
-        if !status.success() {
-            return Err(miette::miette!("ssh exited with status {status}"));
-        }
+        let mut child = command.spawn().into_diagnostic()?;
+        let pid = child.id().ok_or_else(|| {
+            miette::miette!("ssh process did not expose a PID for background tracking")
+        })?;
 
-        // Background forwards must be both reachable and tracked. Without a PID
-        // file, `openshell forward stop/list` cannot manage the tunnel, so this
-        // path fails closed instead of printing a URL for an orphaned process.
-        let pid = wait_for_ssh_forward_pid(&session.sandbox_id, port)
-            .await
-            .ok_or_else(|| {
-                miette::miette!(
-                    "could not discover backgrounded SSH process for sandbox {name} port {port}; \
-                 refusing to report an untracked forward"
-                )
-            })?;
-
-        if let Err(err) = wait_for_forward_listener(spec, FORWARD_LISTENER_READINESS_TIMEOUT)
+        if let Err(err) = wait_for_forward_start(&mut child, spec)
             .await
             .wrap_err("ssh process started but local forward listener was not reachable")
         {
-            terminate_forward_pid(pid, port, &session.sandbox_id);
+            terminate_owned_forward_child(&mut child);
             return Err(err);
         }
 
-        write_forward_pid(name, port, pid, &session.sandbox_id, &spec.bind_addr)?;
+        track_background_forward_or_cleanup(
+            name,
+            port,
+            pid,
+            &session.sandbox_id,
+            &spec.bind_addr,
+            || terminate_owned_forward_child(&mut child),
+        )?;
         return Ok(());
     }
 
     let status = {
         let mut child = command.spawn().into_diagnostic()?;
-        if let Err(err) = wait_for_foreground_forward_start(&mut child, spec).await {
+        if let Err(err) = wait_for_forward_start(&mut child, spec).await {
             let _ = child.kill().await;
             return Err(err);
         }
@@ -417,7 +407,7 @@ pub async fn sandbox_forward(
 /// exiting. An early exit (e.g. `ExitOnForwardFailure=yes` tearing down the
 /// session) means forwarding never came up, so it errors instead of waiting
 /// out the grace period.
-async fn wait_for_foreground_forward_start(child: &mut Child, spec: &ForwardSpec) -> Result<()> {
+async fn wait_for_forward_start(child: &mut Child, spec: &ForwardSpec) -> Result<()> {
     let listener = wait_for_forward_listener(spec, FORWARD_LISTENER_READINESS_TIMEOUT);
     tokio::pin!(listener);
     tokio::select! {
@@ -438,22 +428,6 @@ async fn wait_for_foreground_forward_start(child: &mut Child, spec: &ForwardSpec
                 ))
             }
         }
-    }
-}
-
-/// Poll for the backgrounded (`ssh -f`) forward's PID. `-f` forks after auth,
-/// so the PID is unknown when `command.status()` returns and must be discovered
-/// afterward. Returns `None` if it never appears within the grace period.
-async fn wait_for_ssh_forward_pid(sandbox_id: &str, port: u16) -> Option<u32> {
-    let deadline = tokio::time::Instant::now() + FORWARD_PID_DISCOVERY_TIMEOUT;
-    loop {
-        if let Some(pid) = find_ssh_forward_pid(sandbox_id, port) {
-            return Some(pid);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(FORWARD_LISTENER_PROBE_INTERVAL).await;
     }
 }
 
@@ -515,30 +489,27 @@ fn forward_probe_host(spec: &ForwardSpec) -> &str {
     }
 }
 
-/// Best-effort termination of a forward whose listener never came up. Failures
-/// are ignored: the process may already be exiting, and the caller surfaces the
-/// original listener error regardless.
-#[cfg(unix)]
-fn terminate_forward_pid(pid: u32, port: u16, sandbox_id: &str) {
-    let Ok(raw_pid) = i32::try_from(pid) else {
-        return;
-    };
-    if raw_pid <= 0 {
-        return;
-    }
-    if !pid_matches_forward(pid, port, Some(sandbox_id)) {
-        // The PID came from a process-table scan, not a file we own. Re-check
-        // immediately before signaling so a stale or spoofed match is left
-        // untouched instead of terminating an unrelated process.
-        return;
-    }
-
-    let _ = nix::sys::signal::kill(Pid::from_raw(raw_pid), Signal::SIGTERM);
+/// Best-effort cleanup for the SSH child this process spawned.
+fn terminate_owned_forward_child(child: &mut Child) {
+    let _ = child.start_kill();
 }
 
-/// Non-Unix builds cannot manage OpenSSH process IDs with Unix signals.
-#[cfg(not(unix))]
-fn terminate_forward_pid(_pid: u32, _port: u16, _sandbox_id: &str) {}
+/// Track a verified background forward, cleaning it up if PID-file persistence fails.
+fn track_background_forward_or_cleanup(
+    name: &str,
+    port: u16,
+    pid: u32,
+    sandbox_id: &str,
+    bind_addr: &str,
+    cleanup: impl FnOnce(),
+) -> Result<()> {
+    if let Err(err) = write_forward_pid(name, port, pid, sandbox_id, bind_addr) {
+        cleanup();
+        return Err(err)
+            .wrap_err("local forward listener was reachable but tracking the SSH process failed");
+    }
+    Ok(())
+}
 
 fn foreground_forward_started_message(name: &str, spec: &ForwardSpec) -> String {
     format!(
@@ -1805,46 +1776,84 @@ mod tests {
         assert!(text.contains("local forward listener did not open"));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn terminate_forward_pid_skips_process_that_no_longer_matches_forward() {
-        let dir = tempfile::tempdir().unwrap();
-        let terminated_path = dir.path().join("terminated");
-        let mut child = Command::new("python3")
-            .arg("-c")
-            .arg(
-                r#"
-import pathlib
-import signal
-import sys
-import time
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn track_background_forward_or_cleanup_runs_cleanup_when_pidfile_write_fails() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        // Make forward PID-file writes fail with ENOTDIR after listener readiness.
+        let blocking_file = tmp.path().join("not-a-dir");
+        fs::write(&blocking_file, b"x").unwrap();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &blocking_file);
+        }
 
-terminated_path = pathlib.Path(sys.argv[1])
+        let mut cleaned_up = false;
+        let result =
+            track_background_forward_or_cleanup("demo", 8080, 4242, "sbx-1", "127.0.0.1", || {
+                cleaned_up = true;
+            });
 
-def stop(_signum, _frame):
-    terminated_path.write_text("terminated")
-    raise SystemExit(0)
-
-signal.signal(signal.SIGTERM, stop)
-
-while True:
-    time.sleep(1)
-"#,
-            )
-            .arg(&terminated_path)
-            .spawn()
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-
-        terminate_forward_pid(child.id(), 43210, "id-spoofed-forward");
-        std::thread::sleep(Duration::from_millis(200));
+        unsafe {
+            match old_xdg {
+                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
 
         assert!(
-            !terminated_path.exists(),
-            "mismatched process should not receive SIGTERM"
+            result.is_err(),
+            "PID-file write failure must surface as an error"
         );
-        let _ = child.kill();
-        let _ = child.wait();
+        assert!(
+            cleaned_up,
+            "the owned SSH child must be cleaned up when tracking fails so no \
+             reachable-but-untracked forward is left running"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
+    fn track_background_forward_or_cleanup_tracks_pid_without_cleanup_on_success() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+
+        let mut cleaned_up = false;
+        let result =
+            track_background_forward_or_cleanup("demo", 8080, 4242, "sbx-1", "127.0.0.1", || {
+                cleaned_up = true;
+            });
+        let pid_file_exists =
+            openshell_core::forward::forward_pid_path("demo", 8080).is_ok_and(|path| path.exists());
+
+        unsafe {
+            match old_xdg {
+                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        assert!(
+            result.is_ok(),
+            "a writable PID directory must track successfully"
+        );
+        assert!(
+            pid_file_exists,
+            "successful tracking must persist a PID file"
+        );
+        assert!(
+            !cleaned_up,
+            "successful tracking must not terminate the forward process"
+        );
     }
 
     #[test]

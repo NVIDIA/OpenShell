@@ -2089,7 +2089,7 @@ async fn main() -> Result<()> {
                 } else {
                     let name_width = forwards
                         .iter()
-                        .map(|f| f.sandbox.len())
+                        .map(|f| f.sandbox_name.len())
                         .max()
                         .unwrap_or(7)
                         .max(7);
@@ -2109,14 +2109,14 @@ async fn main() -> Result<()> {
                         bw = bind_width,
                     );
                     for f in &forwards {
-                        let status = if f.alive {
+                        let status = if f.validated_alive {
                             "running".green().to_string()
                         } else {
                             "dead".red().to_string()
                         };
                         println!(
                             "{:<nw$} {:<bw$} {:<8} {:<10} {}",
-                            f.sandbox,
+                            f.sandbox_name,
                             f.bind_addr,
                             f.port,
                             f.pid,
