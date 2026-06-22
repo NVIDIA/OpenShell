@@ -22,6 +22,22 @@ use tracing::debug;
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
 const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 const RELAY_BUF_SIZE: usize = 8192;
+const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
+    b"GET ",
+    b"HEAD ",
+    b"POST ",
+    b"PUT ",
+    b"DELETE ",
+    b"PATCH ",
+    b"OPTIONS ",
+    b"CONNECT ",
+    b"TRACE ",
+];
+pub(crate) const HTTP2_PRIOR_KNOWLEDGE_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub(crate) const UNSUPPORTED_H2C_UPGRADE_DETAIL: &str =
+    "HTTP/2 cleartext upgrade (h2c) is not supported for L7-inspected endpoints";
+const MIN_HTTP2_PREFACE_DETECTION_BYTES: usize = 8;
+
 /// Idle timeout for `relay_until_eof`.  If no data arrives within this window
 /// the body is considered complete.  Prevents blocking on servers that keep
 /// the TCP connection alive after the response body (common with CDN keep-alive).
@@ -911,6 +927,36 @@ pub(crate) fn request_is_websocket_upgrade(raw_header: &[u8]) -> bool {
         .position(|w| w == b"\r\n\r\n")
         .map_or(raw_header.len(), |p| p + 4);
     validate_websocket_upgrade_request(&raw_header[..header_end]).unwrap_or(false)
+}
+
+pub(crate) fn request_is_h2c_upgrade(raw_header: &[u8]) -> bool {
+    let header_end = raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(raw_header.len(), |p| p + 4);
+    let Ok(header_str) = std::str::from_utf8(&raw_header[..header_end]) else {
+        return false;
+    };
+
+    let mut upgrade_h2c = false;
+    let mut connection_upgrade = false;
+
+    for line in header_str.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("upgrade") && header_value_contains_token(value, "h2c") {
+            upgrade_h2c = true;
+        }
+        if name.eq_ignore_ascii_case("connection") && header_value_contains_token(value, "upgrade")
+        {
+            connection_upgrade = true;
+        }
+    }
+
+    upgrade_h2c && connection_upgrade
 }
 
 fn rewrite_websocket_extensions_for_mode(
@@ -1962,18 +2008,27 @@ where
 ///
 /// Checks for common HTTP methods at the start of the stream.
 pub fn looks_like_http(peek: &[u8]) -> bool {
-    const METHODS: &[&[u8]] = &[
-        b"GET ",
-        b"HEAD ",
-        b"POST ",
-        b"PUT ",
-        b"DELETE ",
-        b"PATCH ",
-        b"OPTIONS ",
-        b"CONNECT ",
-        b"TRACE ",
-    ];
-    METHODS.iter().any(|m| peek.starts_with(m))
+    HTTP_METHOD_PREFIXES
+        .iter()
+        .any(|method| peek.starts_with(method))
+}
+
+pub(crate) fn could_be_http_request_prefix(peek: &[u8]) -> bool {
+    !peek.is_empty()
+        && HTTP_METHOD_PREFIXES
+            .iter()
+            .any(|method| peek.len() < method.len() && method.starts_with(peek))
+}
+
+pub fn looks_like_http2_prior_knowledge(peek: &[u8]) -> bool {
+    peek.len() >= MIN_HTTP2_PREFACE_DETECTION_BYTES
+        && HTTP2_PRIOR_KNOWLEDGE_PREFACE.starts_with(peek)
+}
+
+pub(crate) fn could_be_http2_prior_knowledge_prefix(peek: &[u8]) -> bool {
+    !peek.is_empty()
+        && peek.len() < MIN_HTTP2_PREFACE_DETECTION_BYTES
+        && HTTP2_PRIOR_KNOWLEDGE_PREFACE.starts_with(peek)
 }
 
 /// Check if an IO error represents a benign connection close.
@@ -2919,8 +2974,24 @@ mod tests {
         assert!(looks_like_http(b"GET / HTTP/1.1\r\n"));
         assert!(looks_like_http(b"POST /api HTTP/1.1\r\n"));
         assert!(looks_like_http(b"DELETE /foo HTTP/1.1\r\n"));
+        assert!(could_be_http_request_prefix(b"GE"));
+        assert!(!could_be_http_request_prefix(b"GET "));
         assert!(!looks_like_http(b"\x00\x00\x00\x08")); // Postgres
+        assert!(!looks_like_http(HTTP2_PRIOR_KNOWLEDGE_PREFACE));
         assert!(!looks_like_http(b"HELLO")); // Unknown
+    }
+
+    #[test]
+    fn http2_prior_knowledge_detection() {
+        assert!(looks_like_http2_prior_knowledge(
+            HTTP2_PRIOR_KNOWLEDGE_PREFACE
+        ));
+        assert!(looks_like_http2_prior_knowledge(
+            &HTTP2_PRIOR_KNOWLEDGE_PREFACE[..8]
+        ));
+        assert!(could_be_http2_prior_knowledge_prefix(b"PRI * H"));
+        assert!(!looks_like_http2_prior_knowledge(b"PRI * H"));
+        assert!(!looks_like_http2_prior_knowledge(b"PRI / HTTP/1.1\r\n"));
     }
 
     #[test]
@@ -4158,6 +4229,20 @@ mod tests {
         let raw = b"GET /h2c HTTP/1.1\r\nHost: example.com\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n";
         assert!(!request_is_websocket_upgrade(raw));
         assert!(!validate_websocket_upgrade_request(raw).expect("h2c request should parse"));
+    }
+
+    #[test]
+    fn h2c_upgrade_detection_requires_upgrade_token_and_connection_upgrade() {
+        let raw = b"GET /h2c HTTP/1.1\r\nHost: example.com\r\nUpgrade: h2c\r\nConnection: keep-alive, Upgrade\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n";
+        assert!(request_is_h2c_upgrade(raw));
+
+        let missing_connection = b"GET /h2c HTTP/1.1\r\nHost: example.com\r\nUpgrade: h2c\r\n\r\n";
+        assert!(!request_is_h2c_upgrade(missing_connection));
+
+        let websocket = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        assert!(!request_is_h2c_upgrade(websocket.as_bytes()));
     }
 
     #[test]

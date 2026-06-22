@@ -136,6 +136,43 @@ fn emit_parse_rejection(ctx: &L7EvalContext, detail: &str, engine_type: &str) {
     emit_activity(ctx, true, "l7_parse_rejection");
 }
 
+fn engine_type_for_protocol(protocol: L7Protocol) -> &'static str {
+    match protocol {
+        L7Protocol::Graphql => "l7-graphql",
+        L7Protocol::Websocket => "l7-websocket",
+        L7Protocol::Rest | L7Protocol::Sql => "l7",
+    }
+}
+
+async fn deny_h2c_upgrade_if_requested<C>(
+    req: &crate::l7::provider::L7Request,
+    config: &L7EndpointConfig,
+    ctx: &L7EvalContext,
+    client: &mut C,
+) -> Result<bool>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    if !crate::l7::rest::request_is_h2c_upgrade(&req.raw_header) {
+        return Ok(false);
+    }
+
+    emit_parse_rejection(
+        ctx,
+        crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL,
+        engine_type_for_protocol(config.protocol),
+    );
+    crate::l7::rest::RestProvider::default()
+        .deny(
+            req,
+            &ctx.policy_name,
+            crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL,
+            client,
+        )
+        .await?;
+    Ok(true)
+}
+
 /// Run protocol-aware L7 inspection on a tunnel.
 ///
 /// This replaces `copy_bidirectional` for L7-enabled endpoints.
@@ -238,6 +275,10 @@ where
                 .await?;
             return Ok(());
         };
+
+        if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
+            return Ok(());
+        }
 
         let graphql_info = if config.protocol == L7Protocol::Graphql {
             match crate::l7::graphql::inspect_graphql_request(
@@ -662,6 +703,10 @@ where
             }
         };
 
+        if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
+            return Ok(());
+        }
+
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
@@ -932,6 +977,10 @@ where
 
         let req = parsed.request;
         let graphql_info = parsed.info;
+
+        if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
+            return Ok(());
+        }
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
