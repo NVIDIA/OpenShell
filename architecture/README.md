@@ -167,6 +167,7 @@ that crate's `README.md`.
 | [Compute Runtimes](compute-runtimes.md) | Docker, Podman, Kubernetes, VM, sandbox images, and runtime-specific responsibilities. |
 | [Build](build.md) | Build artifacts, CI/E2E, docs site validation, and release packaging. |
 | [Google Vertex AI Provider](google-vertex-ai-provider.md) | Implementation reference for the `google-vertex-ai` provider, from CLI through gateway to sandbox. |
+| [Windows MSVC Build](windows-msvc-build.md) | Build-only native Windows MSVC lane (x64/ARM64) and unsupported-runtime behavior on Windows. |
 
 ## `rfc/` vs `architecture/`
 

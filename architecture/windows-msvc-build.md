@@ -1,12 +1,4 @@
----
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-title: "Windows MSVC Build Design"
-sidebar-title: "Windows MSVC Build"
-description: "Design notes for the build-only native Windows MSVC lane."
-keywords: "Windows, MSVC, OpenShell, mise, Rust, build"
-position: 6
----
+# Windows MSVC Build Design
 
 This page records the design decisions for the native Windows MSVC build lane.
 It is intentionally build-only. It does not make Windows a Docker, Kubernetes,
