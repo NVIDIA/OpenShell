@@ -65,8 +65,9 @@ native-architecture builds, so the gateway image, standalone tarballs, and Linux
 packages share the same host portability floor. The gateway build enables
 `bundled-z3`. Linux VM driver release artifacts use the same glibc floor so
 package-managed VM support does not raise the package runtime requirement.
-Release workflows verify the maximum referenced `GLIBC_*` symbol version before
-publishing artifacts.
+Gateway staging and release workflows set up the Zig C/C++ wrapper before
+bundled Z3 builds and verify the maximum referenced `GLIBC_*` symbol version
+before publishing or copying artifacts.
 Supervisor binaries remain static musl and use `cargo zigbuild` when available,
 including native CPU architectures, so C dependencies are compiled for the musl
 target instead of the host GNU libc target. Local Docker image tasks infer the
