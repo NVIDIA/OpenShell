@@ -1633,6 +1633,9 @@ fn validate_token_grant_header_name(credential: &CredentialProfile) -> Result<()
 fn validate_static_credential_header_name(credential: &CredentialProfile) -> Result<(), String> {
     let header_name = match credential.auth_style.trim().to_ascii_lowercase().as_str() {
         "bearer" if credential.header_name.trim().is_empty() => "Authorization",
+        "header" if credential.header_name.trim().is_empty() => {
+            return Err("credential auth_style header requires header_name".to_string());
+        }
         "bearer" | "header" => credential.header_name.trim(),
         _ => return Ok(()),
     };
@@ -2456,6 +2459,33 @@ endpoints:
         assert!(
             diagnostics.is_empty(),
             "valid static credential header should produce no diagnostics, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_static_credential_header_style_missing_header_name() {
+        let profile = parse_profile_yaml(
+            r"
+id: header-style-no-name
+display_name: Header Style No Name
+credentials:
+  - name: api_token
+    env_vars: [API_TOKEN]
+    auth_style: header
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("header-no-name.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| {
+                d.field == "credentials.header_name" && d.message.contains("requires header_name")
+            })
+            .expect("empty header_name with auth_style header should be rejected");
+        assert_eq!(
+            diagnostic.message,
+            "credential auth_style header requires header_name"
         );
     }
 

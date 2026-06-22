@@ -259,6 +259,10 @@ fn inject_static_credential(
 /// Fail-closed check: reject injection if the request already has a
 /// placeholder-based value for the header this credential targets.
 /// Applies to both token grant and static credential paths.
+///
+/// This function operates byte-wise so that non-UTF-8 obs-text bytes
+/// elsewhere in the header block do not cause the check to be silently
+/// skipped.
 fn check_placeholder_collision(
     raw_header: &[u8],
     cred: &ProviderProfileCredential,
@@ -280,26 +284,59 @@ fn check_placeholder_collision(
     if header_name.is_empty() {
         return Ok(());
     }
-    if let Ok(header_block) = std::str::from_utf8(raw_header) {
-        let end = header_block.find("\r\n\r\n").unwrap_or(header_block.len());
-        for line in header_block[..end].split("\r\n").skip(1) {
-            if let Some((name, val)) = line.split_once(':')
-                && name.trim().eq_ignore_ascii_case(header_name)
-                && openshell_core::secrets::contains_reserved_credential_marker(val)
-            {
-                return Err(miette!(
-                    "credential injection rejected: header '{}' on {}:{} already \
-                     contains a placeholder-based value from provider {}; remove \
-                     the placeholder or the profile credential to resolve the conflict",
-                    header_name,
-                    host,
-                    port,
-                    provider_key,
-                ));
-            }
+    let header_name_bytes = header_name.as_bytes();
+    let placeholder_marker = openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC.as_bytes();
+    let alias_marker = openshell_core::secrets::PROVIDER_ALIAS_MARKER_PUBLIC.as_bytes();
+
+    // Find the end of the header block (\r\n\r\n) so we don't scan the body.
+    let header_end = raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(raw_header.len());
+
+    // Split header block into lines (skip the request line).
+    for line in raw_header[..header_end].split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(colon_pos) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = trim_ascii(&line[..colon_pos]);
+        if !name.eq_ignore_ascii_case(header_name_bytes) {
+            continue;
+        }
+        let value = &line[colon_pos + 1..];
+        if contains_bytes(value, placeholder_marker) || contains_bytes(value, alias_marker) {
+            return Err(miette!(
+                "credential injection rejected: header '{}' on {}:{} already \
+                 contains a placeholder-based value from provider {}; remove \
+                 the placeholder or the profile credential to resolve the conflict",
+                header_name,
+                host,
+                port,
+                provider_key,
+            ));
         }
     }
     Ok(())
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |p| p + 1);
+    &bytes[start..end]
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn ocsf_message_field(value: &str) -> String {
@@ -1268,5 +1305,119 @@ mod tests {
             .expect("unmatched request should pass through");
         let raw = String::from_utf8(result.raw_header).expect("UTF-8");
         assert!(!raw.contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn inject_static_credential_rejects_placeholder_collision_with_non_utf8_obs_text() {
+        // A request with non-UTF-8 obs-text in another header must NOT cause
+        // check_placeholder_collision to skip the scan.  The Authorization
+        // header itself carries a placeholder, so the check must reject it
+        // even though the overall header block is not valid UTF-8.
+        let (ctx, _) =
+            static_credential_ctx("GITHUB_TOKEN", "ghp_secret123", "bearer", "Authorization");
+        let mut raw = b"GET /repos/owner/repo HTTP/1.1\r\nHost: api.example.com\r\n".to_vec();
+        raw.extend_from_slice(b"Authorization: Bearer openshell:resolve:env:GITHUB_TOKEN\r\n");
+        // obs-text byte (0x80) in a different header — valid HTTP but not valid UTF-8.
+        raw.extend_from_slice(b"X-Custom: value\x80rest\r\n");
+        raw.extend_from_slice(b"\r\n");
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/repos/owner/repo".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: raw,
+            body_length: BodyLength::None,
+        };
+
+        let err = inject_if_needed(req, &ctx)
+            .await
+            .expect_err("placeholder collision must be detected despite non-UTF-8 elsewhere");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("placeholder"),
+            "error should mention placeholder conflict, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_if_needed_passthrough_preserves_graphql_body_in_raw_header() {
+        // GraphQL inspection appends the full request body to raw_header.
+        // inject_if_needed must pass this through unchanged when no credentials
+        // are configured, so the relay function receives the body intact.
+        let body = b"{\"query\":\"query Viewer { viewer { login } }\"}";
+        let mut raw = b"POST /graphql HTTP/1.1\r\nHost: graphql.example.com\r\nContent-Type: application/json\r\nContent-Length: 46\r\n\r\n".to_vec();
+        raw.extend_from_slice(body);
+        let raw_clone = raw.clone();
+        let ctx = L7EvalContext {
+            host: "graphql.example.com".into(),
+            port: 443,
+            policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/graphql".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: raw,
+            body_length: BodyLength::ContentLength(body.len() as u64),
+        };
+
+        let result = inject_if_needed(req, &ctx)
+            .await
+            .expect("no-credential passthrough should succeed");
+        assert_eq!(
+            result.raw_header, raw_clone,
+            "raw_header (including body) must be preserved exactly"
+        );
+        assert!(
+            matches!(result.body_length, BodyLength::ContentLength(n) if n == body.len() as u64),
+            "body_length must be preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_static_credential_works_with_graphql_body_in_raw_header() {
+        // When a credential IS injected on a GraphQL-style request (body in
+        // raw_header), the body must be preserved after the rewritten headers.
+        let body = b"{\"query\":\"query Viewer { viewer { login } }\"}";
+        let mut raw = b"POST /graphql HTTP/1.1\r\nHost: api.example.com\r\nContent-Type: application/json\r\nContent-Length: 46\r\n\r\n".to_vec();
+        raw.extend_from_slice(body);
+        let (ctx, _) = static_credential_ctx("API_KEY", "sk-secret", "header", "x-api-key");
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/graphql".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: raw,
+            body_length: BodyLength::ContentLength(body.len() as u64),
+        };
+
+        let result = inject_if_needed(req, &ctx)
+            .await
+            .expect("credential injection on GraphQL body-in-raw-header should succeed");
+        let raw_str = String::from_utf8(result.raw_header.clone()).expect("UTF-8");
+        assert!(
+            raw_str.contains("x-api-key: sk-secret\r\n"),
+            "injected header must be present"
+        );
+        // Body must appear after \r\n\r\n
+        let header_end = result
+            .raw_header
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("must have header terminator");
+        let body_after = &result.raw_header[header_end + 4..];
+        assert_eq!(
+            body_after, body,
+            "body must be preserved after header injection"
+        );
+        assert!(
+            matches!(result.body_length, BodyLength::ContentLength(n) if n == body.len() as u64),
+            "body_length must be preserved"
+        );
     }
 }
