@@ -315,3 +315,29 @@ If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the c
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
 </Note>
+
+## Sandbox User Identity
+
+OpenShell accepts both the hardcoded username `"sandbox"` and numeric UIDs in `[1000, 2_000_000_000]` for the supervisor's process identity (the policy's `run_as_user` field). The driver resolves the UID at sandbox creation time and passes it to the supervisor via environment variables.
+
+### Kubernetes / OpenShift
+
+The Kubernetes driver auto-detects the sandbox UID from OpenShift SCC namespace annotations:
+
+- `openshift.io/sa.scc.uid-range` (format: `<start>/<size>`, e.g. `1000000000/10000`) provides the UID.
+- `openshift.io/sa.scc.supplemental-groups` provides the GID when present; otherwise the resolved UID is used as the GID.
+- On non-OpenShift clusters, or when annotations are absent, the driver falls back to `1000`.
+
+You can override autodetection with explicit `sandbox_uid` / `sandbox_gid` config in `[openshell.drivers.kubernetes]`. When set, the driver skips namespace annotation lookup entirely.
+
+The resolved UID/GID appear in:
+- Supervisor container environment variables (`OPENSHELL_SANDBOX_UID`, `OPENSHELL_SANDBOX_GID`) for direct kernel-level privilege dropping without `/etc/passwd` lookups.
+- PVC init container `securityContext.runAsUser/runAsGroup/fsGroup` for workspace ownership operations.
+
+### VM Driver
+
+The VM driver injects the sandbox UID into the rootfs guest's `/etc/passwd`, `/etc/group`, and `/etc/gshadow` during rootfs preparation. Default UID is `10001`; configure `sandbox_uid` in `[openshell.drivers.vm]` to use a different value.
+
+### Custom Images
+
+Custom sandbox images no longer need a baked-in `"sandbox"` user. If your image requires a passwd entry for tools like `sudo` or `ssh`, add one manually (e.g. `RUN useradd -m -u 1500 deploy`). The supervisor resolves the numeric UID directly via `setuid()` without needing `/etc/passwd`.

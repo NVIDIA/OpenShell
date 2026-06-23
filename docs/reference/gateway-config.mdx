@@ -197,6 +197,12 @@ sa_token_ttl_secs              = 3600
 # shared roots such as /run, /var, /tmp, and /etc are rejected.
 # Supervisor-to-gateway auth still uses gateway JWTs.
 provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
+# Explicit sandbox UID/GID for the supervisor container securityContext and
+# PVC init container. When unset, the driver auto-detects from OpenShift SCC
+# namespace annotations (openshift.io/sa.scc.uid-range) if present, falling
+# back to 1000 on non-OpenShift clusters.
+# sandbox_uid = 1500
+# sandbox_gid = 1500
 ```
 
 ### Docker
@@ -309,6 +315,9 @@ overlay_disk_mib = 4096
 guest_tls_ca     = "/var/lib/openshell/guest-tls/ca.pem"
 guest_tls_cert   = "/var/lib/openshell/guest-tls/client.pem"
 guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
+# Resolved sandbox UID/GID for the rootfs /etc/passwd entry.
+# Defaults to 10001 when unset; matching GID is used if sandbox_gid is empty.
+# sandbox_uid = 20001
 ```
 
 ### Extension Driver
