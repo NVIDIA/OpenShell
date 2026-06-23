@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: spiffe-token-exchange-demo
+display_name: SPIFFE token exchange demo
+description: Dynamic token exchange for alpha/beta demo services using stored user subject tokens and SPIFFE JWT-SVID authentication
+category: other
+credentials:
+  - name: subject_token
+    description: Demo user subject token stored on the provider for token exchange
+    required: true
+  - name: access_token
+    description: Access token obtained via RFC 8693 token exchange
+    required: false
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      grant_type: token_exchange
+      token_endpoint: http://token-exchange-issuer.default.svc.cluster.local/token
+      audience: demo-default
+      jwt_svid_audience: http://token-exchange-issuer.default.svc.cluster.local
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
+      scopes: [demo]
+      cache_ttl_seconds: 60
+      subject_token:
+        source: provider_credential
+        credential: subject_token
+        subject_token_type: urn:ietf:params:oauth:token-type:access_token
+      audience_overrides:
+        - host: alpha-exchange.default.svc.cluster.local
+          port: 80
+          audience: alpha
+          scopes: [alpha]
+        - host: beta-exchange.default.svc.cluster.local
+          port: 80
+          audience: beta
+          scopes: [beta]
+endpoints:
+  - host: alpha-exchange.default.svc.cluster.local
+    port: 80
+    protocol: rest
+    tls: none
+    access: read-write
+    enforcement: enforce
+  - host: beta-exchange.default.svc.cluster.local
+    port: 80
+    protocol: rest
+    tls: none
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl
