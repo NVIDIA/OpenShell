@@ -57,10 +57,13 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
         - /home/runner/_work:/home/runner/_work
     env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       IMAGE_TAG: ${{ inputs.image-tag }}
       OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
       OPENSHELL_REGISTRY_HOST: ghcr.io
       OPENSHELL_REGISTRY_NAMESPACE: nvidia/openshell
+      OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
+      OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -84,17 +87,11 @@ jobs:
         run: apt-get update && apt-get install -y ${APT_PACKAGES} && rm -rf /var/lib/apt/lists/*
 
       - name: Log in to GHCR with Docker
-        env:
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "${GHCR_PASSWORD}" | docker login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Log in to GHCR with Podman
         if: startsWith(matrix.suite, 'rust-podman')
-        env:
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "${GHCR_PASSWORD}" | podman login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Set up rootless Podman user
         if: matrix.rootless
@@ -122,7 +119,6 @@ jobs:
         env:
           OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
           OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE: ${{ format('openshell-mcp-conformance-client:{0}', inputs.image-tag) }}
-          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           E2E_CMD: ${{ matrix.cmd }}
         run: |
           if [ "${{ matrix.rootless }}" = "true" ]; then
@@ -139,6 +135,8 @@ jobs:
               OPENSHELL_SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE}" \
               OPENSHELL_REGISTRY="${OPENSHELL_REGISTRY}" \
               OPENSHELL_REGISTRY_HOST="${OPENSHELL_REGISTRY_HOST}" \
+              OPENSHELL_REGISTRY_USERNAME="${OPENSHELL_REGISTRY_USERNAME}" \
+              OPENSHELL_REGISTRY_PASSWORD="${OPENSHELL_REGISTRY_PASSWORD}" \
               IMAGE_TAG="${IMAGE_TAG}" \
               MISE_GITHUB_TOKEN="${MISE_GITHUB_TOKEN}" \
               bash -c "${E2E_CMD}"
