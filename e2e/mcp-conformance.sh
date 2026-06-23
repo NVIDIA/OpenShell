@@ -27,6 +27,7 @@ CLIENT_SANDBOX_MANAGED=0
 HOST_BRIDGE_PID=""
 HOST_BRIDGE_LOG=""
 HOST_BRIDGE_TOKEN=""
+RUNNER_CONTAINER_IP=""
 RUNNER_CONTAINER=""
 
 # Static default scenarios for the pinned CONFORMANCE_REF and default
@@ -118,6 +119,7 @@ start_host_bridge() {
     return 1
   fi
 
+  RUNNER_CONTAINER_IP="${runner_ip}"
   HOST_BRIDGE_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
   OPENSHELL_MCP_CONFORMANCE_RUNNER_IP="${runner_ip}" \
     OPENSHELL_MCP_CONFORMANCE_BRIDGE_TOKEN="${HOST_BRIDGE_TOKEN}" \
@@ -200,6 +202,7 @@ stop_host_bridge() {
   fi
   HOST_BRIDGE_PID=""
   HOST_BRIDGE_TOKEN=""
+  RUNNER_CONTAINER_IP=""
 }
 
 build_client_image() {
@@ -370,6 +373,7 @@ run_scenarios_in_runner_container() {
     if docker exec \
       --env "MCP_CONFORMANCE_HOST_BRIDGE_URL=http://${bridge_host}:${bridge_port}/run" \
       --env "MCP_CONFORMANCE_HOST_BRIDGE_TOKEN=${HOST_BRIDGE_TOKEN}" \
+      --env "MCP_CONFORMANCE_RUNNER_IP=${RUNNER_CONTAINER_IP}" \
       "${RUNNER_CONTAINER}" \
       sh -c 'cd /opt/mcp-conformance && exec node dist/index.js client --command "node /tmp/openshell-mcp-runner-shim.mjs" --scenario "$1" --spec-version "$2" --expected-failures "$3" --timeout "$4"' \
       sh "${scenario}" "${SPEC_VERSION}" "/tmp/expected-failures.yml" "${TIMEOUT_MS}" \

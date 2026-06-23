@@ -24,6 +24,9 @@ import process from 'node:process';
 // client sandbox connects from a different container, so localhost must be
 // rewritten to this container's network address.
 function runnerAddress() {
+  if (process.env.MCP_CONFORMANCE_RUNNER_IP) {
+    return process.env.MCP_CONFORMANCE_RUNNER_IP;
+  }
   for (const addrs of Object.values(os.networkInterfaces())) {
     for (const addr of addrs ?? []) {
       if (addr.family === 'IPv4' && !addr.internal) {

@@ -134,19 +134,18 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         parsed = urlparse(server_url)
+        if parsed.scheme not in {"http", "https"}:
+            self.reject(403, "server_url scheme must be http or https")
+            return
+
         try:
             target_ip = canonical_ip(parsed.hostname or "")
             expected_ip = canonical_ip(RUNNER_IP)
-            peer_ip = canonical_ip(self.client_address[0])
         except ValueError:
             self.reject(403, "server_url host must match the runner container IP")
             return
 
-        if (
-            parsed.scheme not in {"http", "https"}
-            or target_ip != expected_ip
-            or peer_ip != expected_ip
-        ):
+        if target_ip != expected_ip:
             self.reject(403, "server_url host must match the runner container IP")
             return
 
