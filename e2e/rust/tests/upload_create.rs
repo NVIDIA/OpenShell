@@ -35,13 +35,10 @@ async fn create_with_upload_directory_preserves_source_basename() {
 
     // The command reads the marker file — if upload worked, its content
     // appears in the output.
-    let mut guard = SandboxGuard::create_with_upload(
-        upload_str,
-        "/sandbox/data",
-        &["cat", remote_marker],
-    )
-    .await
-    .expect("sandbox create --upload");
+    let mut guard =
+        SandboxGuard::create_with_upload(upload_str, "/sandbox/data", &["cat", remote_marker])
+            .await
+            .expect("sandbox create --upload");
 
     let clean = strip_ansi(&guard.create_output);
     assert!(
@@ -70,7 +67,11 @@ async fn create_with_multiple_uploads() {
 
     let mut guard = SandboxGuard::create_with_uploads(
         &[(spec_a, "/sandbox/alpha"), (spec_b, "/sandbox/beta")],
-        &["sh", "-c", "cat /sandbox/alpha/alpha/a.txt /sandbox/beta/beta/b.txt"],
+        &[
+            "sh",
+            "-c",
+            "cat /sandbox/alpha/alpha/a.txt /sandbox/beta/beta/b.txt",
+        ],
     )
     .await
     .expect("sandbox create with multiple --upload flags");
@@ -97,13 +98,10 @@ async fn create_with_upload_single_file() {
 
     let file_str = file_path.to_str().expect("file path is UTF-8");
 
-    let mut guard = SandboxGuard::create_with_upload(
-        file_str,
-        "/sandbox",
-        &["cat", "/sandbox/config.txt"],
-    )
-    .await
-    .expect("sandbox create --upload single file");
+    let mut guard =
+        SandboxGuard::create_with_upload(file_str, "/sandbox", &["cat", "/sandbox/config.txt"])
+            .await
+            .expect("sandbox create --upload single file");
 
     let clean = strip_ansi(&guard.create_output);
     assert!(

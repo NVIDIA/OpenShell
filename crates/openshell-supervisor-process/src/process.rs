@@ -9,14 +9,14 @@ use crate::managed_children;
 #[cfg(target_os = "linux")]
 use crate::netns::NetworkNamespace;
 use crate::sandbox;
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Group, Pid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::RawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(any(test, unix))]
@@ -25,6 +25,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
 use tokio::process::{Child, Command};
 use tracing::debug;
 
@@ -155,19 +157,22 @@ fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
     }
 }
 
-// Pins the pre-seccomp child mount namespace where supervisor identity sockets
-// are shadowed. Children enter it with setns before dropping privileges.
+// Pins the mount target used to hide supervisor identity sockets from child
+// processes. Each child creates a private mount namespace and shadows the
+// target before dropping privileges.
 #[cfg(target_os = "linux")]
 static SUPERVISOR_IDENTITY_MOUNT_NS: OnceLock<Option<SupervisorIdentityMountNamespace>> =
     OnceLock::new();
 
 #[cfg(target_os = "linux")]
 pub struct SupervisorIdentityMountNamespace {
-    fd: OwnedFd,
+    spawn_tx: mpsc::Sender<SupervisorIdentitySpawnJob>,
 }
 
 #[cfg(target_os = "linux")]
 type SupervisorIdentityNsRef = &'static SupervisorIdentityMountNamespace;
+#[cfg(target_os = "linux")]
+type SupervisorIdentitySpawnJob = Box<dyn FnOnce() + Send + 'static>;
 
 #[cfg(target_os = "linux")]
 impl SupervisorIdentityMountNamespace {
@@ -176,12 +181,8 @@ impl SupervisorIdentityMountNamespace {
             return Ok(None);
         };
         Ok(Some(Self {
-            fd: create_supervisor_identity_mount_namespace(&target)?,
+            spawn_tx: start_supervisor_identity_spawn_worker(target)?,
         }))
-    }
-
-    pub fn enter_for_child(&self) -> std::io::Result<()> {
-        set_mount_namespace(self.fd.as_raw_fd())
     }
 }
 
@@ -214,6 +215,100 @@ pub fn supervisor_identity_mount_from_env() -> Result<Option<SupervisorIdentityN
 }
 
 #[cfg(target_os = "linux")]
+pub fn spawn_command_with_supervisor_identity_namespace(
+    mut cmd: Command,
+) -> std::io::Result<Child> {
+    let namespace = supervisor_identity_mount_from_env()
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    let Some(namespace) = namespace else {
+        return cmd.spawn();
+    };
+    namespace.spawn_tokio_command(cmd)
+}
+
+#[cfg(target_os = "linux")]
+pub fn spawn_std_command_with_supervisor_identity_namespace(
+    mut cmd: std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    let namespace = supervisor_identity_mount_from_env()
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    let Some(namespace) = namespace else {
+        return cmd.spawn();
+    };
+    namespace.spawn_std_command(cmd)
+}
+
+#[cfg(target_os = "linux")]
+impl SupervisorIdentityMountNamespace {
+    fn spawn_tokio_command(&self, mut cmd: Command) -> std::io::Result<Child> {
+        let (result_tx, result_rx) = mpsc::channel();
+        let handle = tokio::runtime::Handle::current();
+        self.spawn_tx
+            .send(Box::new(move || {
+                let _guard = handle.enter();
+                let _ = result_tx.send(cmd.spawn());
+            }))
+            .map_err(|_| std::io::Error::other("supervisor identity spawn worker stopped"))?;
+        result_rx
+            .recv()
+            .map_err(|_| std::io::Error::other("supervisor identity spawn worker dropped result"))?
+    }
+
+    fn spawn_std_command(
+        &self,
+        mut cmd: std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        let (result_tx, result_rx) = mpsc::channel();
+        self.spawn_tx
+            .send(Box::new(move || {
+                let _ = result_tx.send(cmd.spawn());
+            }))
+            .map_err(|_| std::io::Error::other("supervisor identity spawn worker stopped"))?;
+        result_rx
+            .recv()
+            .map_err(|_| std::io::Error::other("supervisor identity spawn worker dropped result"))?
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn start_supervisor_identity_spawn_worker(
+    target: PathBuf,
+) -> Result<mpsc::Sender<SupervisorIdentitySpawnJob>> {
+    let (spawn_tx, spawn_rx) = mpsc::channel::<SupervisorIdentitySpawnJob>();
+    let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
+    std::thread::Builder::new()
+        .name("openshell-identity-spawn".into())
+        .spawn(move || {
+            let setup = (|| -> std::io::Result<()> {
+                private_mount_namespace()?;
+                let target =
+                    cstring_path(&target).map_err(|err| std::io::Error::other(err.to_string()))?;
+                mount_empty_tmpfs(&target)
+            })();
+            let ready = match &setup {
+                Ok(()) => Ok(()),
+                Err(err) => Err(std::io::Error::new(
+                    err.kind(),
+                    format!("supervisor identity setup failed: {err}"),
+                )),
+            };
+            let _ = ready_tx.send(ready);
+            if setup.is_err() {
+                return;
+            }
+            while let Ok(job) = spawn_rx.recv() {
+                job();
+            }
+        })
+        .map_err(|err| miette::miette!("failed to spawn supervisor identity worker: {err}"))?;
+    ready_rx
+        .recv()
+        .map_err(|err| miette::miette!("supervisor identity worker did not start: {err}"))?
+        .map_err(|err| miette::miette!("{err}"))?;
+    Ok(spawn_tx)
+}
+
+#[cfg(target_os = "linux")]
 fn supervisor_identity_socket_path_from_env() -> Option<(&'static str, String)> {
     std::env::var(openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET)
         .ok()
@@ -233,10 +328,7 @@ fn supervisor_identity_mount_target(socket_path: &str) -> Result<Option<PathBuf>
         return Ok(None);
     }
     if trimmed.starts_with("tcp:") {
-        return Err(miette::miette!(
-            "{} must be a UNIX socket path so sandbox child processes can hide it",
-            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
-        ));
+        return Ok(None);
     }
     let path = trimmed.strip_prefix("unix:").unwrap_or(trimmed);
     let path = Path::new(path);
@@ -280,51 +372,11 @@ fn cstring_path(path: &Path) -> Result<CString> {
 }
 
 #[cfg(target_os = "linux")]
-fn create_supervisor_identity_mount_namespace(target: &Path) -> Result<OwnedFd> {
-    let original_ns = open_current_mount_namespace()
-        .map_err(|err| miette::miette!("failed to open original mount namespace: {err}"))?;
-
-    private_mount_namespace()
-        .map_err(|err| miette::miette!("failed to create supervisor identity namespace: {err}"))?;
-
-    let target = cstring_path(target)?;
-    let result = (|| -> Result<OwnedFd> {
-        mount_empty_tmpfs(&target).map_err(|err| {
-            miette::miette!("failed to hide supervisor identity mount from child namespace: {err}")
-        })?;
-        open_current_mount_namespace()
-            .map_err(|err| miette::miette!("failed to open sanitized mount namespace: {err}"))
-    })();
-
-    set_mount_namespace(original_ns.as_raw_fd()).map_err(|restore_err| {
-        let result_msg = result.as_ref().err().map_or_else(
-            || "sanitized namespace was created".to_string(),
-            ToString::to_string,
-        );
-        miette::miette!(
-            "failed to restore original mount namespace after supervisor identity isolation setup: \
-             {restore_err}; setup result: {result_msg}"
-        )
-    })?;
-
-    result
-}
-
-#[cfg(target_os = "linux")]
-fn open_current_mount_namespace() -> std::io::Result<OwnedFd> {
-    let file = std::fs::File::open("/proc/thread-self/ns/mnt")?;
-    Ok(file.into())
-}
-
-#[cfg(target_os = "linux")]
 fn private_mount_namespace() -> std::io::Result<()> {
     #[allow(unsafe_code)]
     let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
     if rc != 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to create private mount namespace: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error());
     }
 
     #[allow(unsafe_code)]
@@ -339,23 +391,7 @@ fn private_mount_namespace() -> std::io::Result<()> {
         )
     };
     if rc != 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to mark mount namespace private: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn set_mount_namespace(fd: RawFd) -> std::io::Result<()> {
-    #[allow(unsafe_code)]
-    let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNS) };
-    if rc != 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to enter mount namespace: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -375,10 +411,7 @@ fn mount_empty_tmpfs(target: &CString) -> std::io::Result<()> {
         )
     };
     if rc != 0 {
-        return Err(std::io::Error::other(format!(
-            "failed to hide supervisor identity mount from child process: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -520,11 +553,6 @@ impl ProcessHandle {
         #[cfg(target_os = "linux")]
         let prepared_sandbox = sandbox::linux::prepare(policy, workdir)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
-        #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = supervisor_identity_mount_from_env().map_err(|err| {
-            miette::miette!("Failed to prepare supervisor identity isolation: {err}")
-        })?;
-
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -544,17 +572,15 @@ impl ProcessHandle {
                         libc::setpgid(0, 0);
                     }
 
-                    // Enter network namespace before applying other restrictions
+                    // Enter network namespace before applying other restrictions.
                     if let Some(fd) = netns_fd {
                         let result = libc::setns(fd, libc::CLONE_NEWNET);
                         if result != 0 {
-                            return Err(std::io::Error::last_os_error());
+                            return Err(std::io::Error::other(format!(
+                                "failed to enter network namespace: {}",
+                                std::io::Error::last_os_error()
+                            )));
                         }
-                    }
-
-                    #[cfg(target_os = "linux")]
-                    if let Some(mount) = supervisor_identity_mount {
-                        mount.enter_for_child()?;
                     }
 
                     // Drop privileges. initgroups/setgid/setuid need access to
@@ -579,7 +605,15 @@ impl ProcessHandle {
             }
         }
 
-        let child = cmd.spawn().into_diagnostic()?;
+        #[cfg(target_os = "linux")]
+        let child = spawn_command_with_supervisor_identity_namespace(cmd)
+            .into_diagnostic()
+            .wrap_err("failed to spawn sandbox entrypoint process")?;
+        #[cfg(not(target_os = "linux"))]
+        let child = cmd
+            .spawn()
+            .into_diagnostic()
+            .wrap_err("failed to spawn sandbox entrypoint process")?;
         let pid = child.id().unwrap_or(0);
         managed_children::register(pid);
 
@@ -1514,7 +1548,11 @@ mod tests {
 
     #[test]
     fn supervisor_identity_mount_target_rejects_unhideable_endpoints() {
-        assert!(supervisor_identity_mount_target("tcp:127.0.0.1:8081").is_err());
+        assert_eq!(
+            supervisor_identity_mount_target("tcp:127.0.0.1:8081")
+                .expect("tcp endpoint should not require mount hiding"),
+            None
+        );
         assert!(supervisor_identity_mount_target("spiffe-workload-api/spire-agent.sock").is_err());
         assert!(supervisor_identity_mount_target("/spire-agent.sock").is_err());
     }

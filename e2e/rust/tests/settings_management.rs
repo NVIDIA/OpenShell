@@ -44,14 +44,7 @@ impl GlobalSettingCleanup {
 impl Drop for GlobalSettingCleanup {
     fn drop(&mut self) {
         let _ = std::process::Command::new(openshell_bin())
-            .args([
-                "settings",
-                "delete",
-                "--global",
-                "--key",
-                self.key,
-                "--yes",
-            ])
+            .args(["settings", "delete", "--global", "--key", self.key, "--yes"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -122,20 +115,12 @@ async fn settings_global_override_round_trip() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _global_cleanup = GlobalSettingCleanup::new(TEST_KEY);
 
-    let cleanup_before = run_cli(&[
-        "settings",
-        "delete",
-        "--global",
-        "--key",
-        TEST_KEY,
-        "--yes",
-    ])
-    .await;
+    let cleanup_before =
+        run_cli(&["settings", "delete", "--global", "--key", TEST_KEY, "--yes"]).await;
     assert!(
         cleanup_before.success,
         "initial global setting cleanup should succeed (exit {:?}):\n{}",
-        cleanup_before.exit_code,
-        cleanup_before.clean_output
+        cleanup_before.exit_code, cleanup_before.clean_output
     );
 
     let mut guard =
@@ -147,47 +132,52 @@ async fn settings_global_override_round_trip() {
     assert!(
         initial.success,
         "settings get should succeed (exit {:?}):\n{}",
-        initial.exit_code,
-        initial.clean_output
+        initial.exit_code, initial.clean_output
     );
     assert_setting_line_with_scope(&initial.clean_output, TEST_KEY, "<unset>", "unset");
 
     let set_sandbox = run_cli(&[
-        "settings", "set", &guard.name, "--key", TEST_KEY, "--value", "true",
+        "settings",
+        "set",
+        &guard.name,
+        "--key",
+        TEST_KEY,
+        "--value",
+        "true",
     ])
     .await;
     assert!(
         set_sandbox.success,
         "sandbox setting set should succeed (exit {:?}):\n{}",
-        set_sandbox.exit_code,
-        set_sandbox.clean_output
+        set_sandbox.exit_code, set_sandbox.clean_output
     );
 
     // Wait for the gateway to reflect the setting change. The setting is stored
     // server-side, so `settings get` reads it immediately. Poll to ensure the
     // config_revision has been updated (visible in the output).
-    wait_for_setting_value(&guard.name, TEST_KEY, "true", "sandbox", Duration::from_secs(10))
-        .await;
+    wait_for_setting_value(
+        &guard.name,
+        TEST_KEY,
+        "true",
+        "sandbox",
+        Duration::from_secs(10),
+    )
+    .await;
 
     let after_sandbox_set = run_cli(&["settings", "get", &guard.name]).await;
     assert!(
         after_sandbox_set.success,
         "settings get after sandbox set should succeed (exit {:?}):\n{}",
-        after_sandbox_set.exit_code,
-        after_sandbox_set.clean_output
+        after_sandbox_set.exit_code, after_sandbox_set.clean_output
     );
     assert_setting_line_with_scope(&after_sandbox_set.clean_output, TEST_KEY, "true", "sandbox");
 
     // Sandbox-scoped delete should succeed when not globally managed.
-    let sandbox_delete = run_cli(&[
-        "settings", "delete", &guard.name, "--key", TEST_KEY,
-    ])
-    .await;
+    let sandbox_delete = run_cli(&["settings", "delete", &guard.name, "--key", TEST_KEY]).await;
     assert!(
         sandbox_delete.success,
         "sandbox setting delete should succeed (exit {:?}):\n{}",
-        sandbox_delete.exit_code,
-        sandbox_delete.clean_output
+        sandbox_delete.exit_code, sandbox_delete.clean_output
     );
     assert!(
         sandbox_delete
@@ -213,10 +203,20 @@ async fn settings_global_override_round_trip() {
 
     // Re-set at sandbox scope so we can test global override next.
     let re_set = run_cli(&[
-        "settings", "set", &guard.name, "--key", TEST_KEY, "--value", "true",
+        "settings",
+        "set",
+        &guard.name,
+        "--key",
+        TEST_KEY,
+        "--value",
+        "true",
     ])
     .await;
-    assert!(re_set.success, "re-set should succeed:\n{}", re_set.clean_output);
+    assert!(
+        re_set.success,
+        "re-set should succeed:\n{}",
+        re_set.clean_output
+    );
 
     let set_global = run_cli(&[
         "settings", "set", "--global", "--key", TEST_KEY, "--value", "false", "--yes",
@@ -225,8 +225,7 @@ async fn settings_global_override_round_trip() {
     assert!(
         set_global.success,
         "global setting set should succeed (exit {:?}):\n{}",
-        set_global.exit_code,
-        set_global.clean_output
+        set_global.exit_code, set_global.clean_output
     );
     assert!(
         set_global
@@ -237,7 +236,13 @@ async fn settings_global_override_round_trip() {
     );
 
     let blocked_sandbox_set = run_cli(&[
-        "settings", "set", &guard.name, "--key", TEST_KEY, "--value", "true",
+        "settings",
+        "set",
+        &guard.name,
+        "--key",
+        TEST_KEY,
+        "--value",
+        "true",
     ])
     .await;
     assert!(
@@ -252,10 +257,8 @@ async fn settings_global_override_round_trip() {
     );
 
     // Sandbox-scoped delete should also be blocked while globally managed.
-    let blocked_sandbox_delete = run_cli(&[
-        "settings", "delete", &guard.name, "--key", TEST_KEY,
-    ])
-    .await;
+    let blocked_sandbox_delete =
+        run_cli(&["settings", "delete", &guard.name, "--key", TEST_KEY]).await;
     assert!(
         !blocked_sandbox_delete.success,
         "sandbox delete should fail while key is global-managed:\n{}",
@@ -266,25 +269,16 @@ async fn settings_global_override_round_trip() {
     assert!(
         global_get.success,
         "global settings get should succeed (exit {:?}):\n{}",
-        global_get.exit_code,
-        global_get.clean_output
+        global_get.exit_code, global_get.clean_output
     );
     assert_setting_line(&global_get.clean_output, TEST_KEY, "false");
 
-    let delete_global = run_cli(&[
-        "settings",
-        "delete",
-        "--global",
-        "--key",
-        TEST_KEY,
-        "--yes",
-    ])
-    .await;
+    let delete_global =
+        run_cli(&["settings", "delete", "--global", "--key", TEST_KEY, "--yes"]).await;
     assert!(
         delete_global.success,
         "global settings delete should succeed (exit {:?}):\n{}",
-        delete_global.exit_code,
-        delete_global.clean_output
+        delete_global.exit_code, delete_global.clean_output
     );
     assert!(
         delete_global
@@ -298,30 +292,38 @@ async fn settings_global_override_round_trip() {
     assert!(
         global_after_delete.success,
         "global settings get after delete should succeed (exit {:?}):\n{}",
-        global_after_delete.exit_code,
-        global_after_delete.clean_output
+        global_after_delete.exit_code, global_after_delete.clean_output
     );
     assert_setting_line(&global_after_delete.clean_output, TEST_KEY, "<unset>");
 
     let sandbox_set_after_delete = run_cli(&[
-        "settings", "set", &guard.name, "--key", TEST_KEY, "--value", "false",
+        "settings",
+        "set",
+        &guard.name,
+        "--key",
+        TEST_KEY,
+        "--value",
+        "false",
     ])
     .await;
     assert!(
         sandbox_set_after_delete.success,
         "sandbox setting set after global delete should succeed (exit {:?}):\n{}",
-        sandbox_set_after_delete.exit_code,
-        sandbox_set_after_delete.clean_output
+        sandbox_set_after_delete.exit_code, sandbox_set_after_delete.clean_output
     );
 
     let sandbox_after_delete = run_cli(&["settings", "get", &guard.name]).await;
     assert!(
         sandbox_after_delete.success,
         "settings get after global delete should succeed (exit {:?}):\n{}",
-        sandbox_after_delete.exit_code,
-        sandbox_after_delete.clean_output
+        sandbox_after_delete.exit_code, sandbox_after_delete.clean_output
     );
-    assert_setting_line_with_scope(&sandbox_after_delete.clean_output, TEST_KEY, "false", "sandbox");
+    assert_setting_line_with_scope(
+        &sandbox_after_delete.clean_output,
+        TEST_KEY,
+        "false",
+        "sandbox",
+    );
 
     guard.cleanup().await;
 }

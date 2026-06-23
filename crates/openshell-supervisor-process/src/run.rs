@@ -378,7 +378,9 @@ pub async fn run_process(
         handle.wait().await
     };
 
-    let status = result.into_diagnostic()?;
+    let status = result
+        .into_diagnostic()
+        .map_err(|err| err.wrap_err("failed to wait for sandbox entrypoint process"))?;
 
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
