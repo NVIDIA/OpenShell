@@ -37,7 +37,7 @@ pub mod telemetry;
 pub mod time;
 
 pub use config::{
-    ComputeDriverKind, Config, DetectedDriver, GatewayAuthConfig, GatewayJwtConfig,
+    ComputeDriverConfig, ComputeDriverKind, Config, GatewayAuthConfig, GatewayJwtConfig,
     MtlsAuthConfig, OidcConfig, TlsConfig,
 };
 pub use error::{ComputeDriverError, Error, Result};

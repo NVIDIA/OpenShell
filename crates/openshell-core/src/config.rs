@@ -91,22 +91,16 @@ impl FromStr for ComputeDriverKind {
     }
 }
 
-/// Result of [`detect_driver`] or an explicitly configured driver, carrying
-/// any driver-specific connection metadata discovered during probing.
+/// A compute driver variant with any driver-specific connection metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DetectedDriver {
+pub enum ComputeDriverConfig {
     Kubernetes,
     Docker,
-    /// VM is never auto-detected but flows through the same path when
-    /// explicitly configured via `--drivers vm`.
     Vm,
-    Podman {
-        /// API socket path verified during detection.
-        socket_path: PathBuf,
-    },
+    Podman { socket_path: PathBuf },
 }
 
-impl DetectedDriver {
+impl ComputeDriverConfig {
     /// The [`ComputeDriverKind`] for logging and match guards.
     #[must_use]
     pub fn kind(&self) -> ComputeDriverKind {
@@ -126,21 +120,21 @@ impl DetectedDriver {
 ///
 /// Returns the first driver where the environment check passes.
 /// Returns `None` if no compatible driver is found.
-pub fn detect_driver() -> Option<DetectedDriver> {
+pub fn detect_driver() -> Option<ComputeDriverConfig> {
     // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
     if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
-        return Some(DetectedDriver::Kubernetes);
+        return Some(ComputeDriverConfig::Kubernetes);
     }
 
     // Podman: check for a reachable local API socket, falling back to CLI
     // discovery which also resolves the host-side socket path.
     if let Some(socket_path) = detect_podman() {
-        return Some(DetectedDriver::Podman { socket_path });
+        return Some(ComputeDriverConfig::Podman { socket_path });
     }
 
     // Docker: check if the CLI is available or a local Docker socket exists.
     if is_docker_available() {
-        return Some(DetectedDriver::Docker);
+        return Some(ComputeDriverConfig::Docker);
     }
 
     None
@@ -875,7 +869,7 @@ mod tests {
     #[cfg(unix)]
     use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, DetectedDriver,
+        ComputeDriverConfig, ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN,
         GatewayJwtConfig, detect_driver, docker_host_unix_socket_path, is_unix_socket,
         parse_podman_info_socket, parse_podman_machine_inspect, podman_socket_candidates_from_env,
         podman_socket_responds,
@@ -1129,7 +1123,7 @@ mod tests {
         }
 
         let result = detect_driver();
-        assert_eq!(result, Some(DetectedDriver::Kubernetes));
+        assert_eq!(result, Some(ComputeDriverConfig::Kubernetes));
 
         // Restore the original env var
         unsafe {
