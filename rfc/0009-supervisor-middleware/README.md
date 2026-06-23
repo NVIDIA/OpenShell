@@ -162,10 +162,8 @@ service SupervisorMiddleware {
   rpc Describe(google.protobuf.Empty) returns (MiddlewareManifest);
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
 
-  // method=HttpRequest, phase=pre_credentials. Declared as a bidirectional stream
-  // so large bodies can be chunked later; v1 exchanges exactly one
-  // HttpRequestEvaluation and one HttpRequestResult.
-  rpc EvaluateHttpRequest(stream HttpRequestEvaluation) returns (stream HttpRequestResult);
+  // method=HttpRequest, phase=pre_credentials.
+  rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
 }
 
 message MiddlewareManifest {
@@ -183,7 +181,6 @@ message Operation {
 }
 
 // Context plus body as two top-level fields, so the body is cleanly separable.
-// v1 sets both in one message; a future stream sends body-only follow-ups.
 message HttpRequestEvaluation {
   Operation operation = 1;
   RequestContext context = 2;
@@ -233,7 +230,7 @@ The evaluation and result are shaped so middleware composes cleanly in a chain. 
 
 Header mutation is deliberately narrow in v1. Middleware may only append safe, non-credential request headers approved by OpenShell. It cannot remove headers, rewrite existing headers, or set credential-bearing and request-routing headers such as `Authorization`, `Cookie`, `Host`, `X-Amz-*`, or OpenShell credential placeholders. This keeps request-body transformation useful while preserving the credential boundary and avoiding a second, middleware-owned routing surface.
 
-The interface is gRPC. The hot-path RPC is declared as a bidirectional stream, but v1 exchanges exactly one `HttpRequestEvaluation` and one `HttpRequestResult` over it: the supervisor buffers the bounded body and the middleware replies once. Declaring it as a stream now is deliberate, because gRPC method cardinality cannot change compatibly. It lets a later version chunk large payloads without altering the method signature. Possible extensions (chunked streaming, additional operation phases, semantic context) are collected in the [protocol-extensions appendix](appendices/protocol-extensions.md), including what streaming does and does not buy. The baseline middleware ships in the supervisor and is served in-process over the same gRPC contract, with no network hop. The exact field set is settled during implementation; the sketch above is the contract shape this RFC asks reviewers to evaluate.
+The interface is gRPC. The hot-path v1 RPC is unary: the supervisor buffers the bounded body, sends one `HttpRequestEvaluation`, and receives one `HttpRequestResult`. Streaming is deliberately not baked into `EvaluateHttpRequest`; if OpenShell later needs chunked or incremental processing, it should add a separate operation-specific method rather than changing the v1 method cardinality. Possible extensions (streaming operations, additional operation phases, semantic context) are collected in the [protocol-extensions appendix](appendices/protocol-extensions.md). The baseline middleware ships in the supervisor and is served in-process over the same gRPC contract, with no network hop. The exact field set is settled during implementation; the sketch above is the contract shape this RFC asks reviewers to evaluate.
 
 The `actor` process is the same identity OpenShell already resolves on the egress path - the binary, pid, and ancestor chain it uses for binary-scoped network policy and OCSF audit. It is resolved when the connection is established, so it is per-connection rather than strictly per-request: over a reused or pooled connection it identifies the process that opened the connection, which a middleware should not over-trust for per-request attribution. The field is optional because proxy-only or future shared-supervisor modes may not have reliable actor data; middleware must treat missing actor data as "unavailable" rather than as an authorization failure.
 
@@ -454,7 +451,7 @@ The cost of *not* doing this is leaving content-level egress control entirely ou
 ## Alternatives
 
 - **Build content checks into OpenShell directly.** A fixed, built-in set of DLP/redaction rules avoids a contract and an external service. Rejected as the primary model: OpenShell cannot embed every useful detection and transformation approach, and a stable contract lets dedicated tools and research scanners iterate without changing OpenShell. First-party built-in middleware still ships for narrow cases, over the same contract.
-- **REST instead of gRPC.** A REST/JSON hook is simpler to call, and with OpenAPI it could still offer a manifest handshake and a typed contract. Rejected because gRPC's typing is stronger and its streaming story is cleaner: the hot-path RPC is already declared as a stream so large bodies can be chunked later without a breaking signature change, which is awkward to match over REST. OpenShell already uses gRPC across its service contracts, so staying on a single toolchain avoids a second RPC stack to build, secure, and maintain.
+- **REST instead of gRPC.** A REST/JSON hook is simpler to call, and with OpenAPI it could still offer a manifest handshake and a typed contract. Rejected because gRPC's typing is stronger, OpenShell already uses gRPC across its service contracts, and gRPC leaves room for future streaming operations if large or incremental payload processing becomes necessary. Staying on a single toolchain avoids a second RPC stack to build, secure, and maintain.
 - **Other deployment modes (WASM, sidecar, in-sandbox).** In-process WASM filters or sidecars avoid a network hop and can tighten the trust boundary. Deferred rather than rejected: v1 commits to a single external-service shape to keep the contract small, and other shapes remain open. See [appendices/deployment-options.md](appendices/deployment-options.md).
 - **Doing nothing.** The cost of declining is covered at the end of Risks: content-level egress control stays outside OpenShell, and operators must build bespoke proxies that lose the policy integration, audit, and trust boundary the supervisor already provides.
 
@@ -462,9 +459,9 @@ The cost of *not* doing this is leaving content-level egress control entirely ou
 
 Calling an external service from a proxy to inspect, transform, or block in-flight traffic is well-established. The closest analogs:
 
-- **Envoy `ext_proc` (External Processing).** The primary model for this RFC. Envoy streams request headers and body to an external gRPC service that can mutate the body (for example redaction), allow, or deny, and the proxy and the processing service scale independently. Our `HttpRequest/pre_credentials` hook is effectively a buffered, single-hook v1 of the same boundary, with the proto shaped to grow toward `ext_proc`-style streaming later.
+- **Envoy `ext_proc` (External Processing).** The primary model for this RFC. Envoy streams request headers and body to an external gRPC service that can mutate the body (for example redaction), allow, or deny, and the proxy and the processing service scale independently. Our `HttpRequest/pre_credentials` hook is a buffered, single-hook v1 of the same boundary; if OpenShell later needs `ext_proc`-style streaming, it should add a separate streaming operation.
 - **Envoy `ext_authz` (External Authorization).** A narrower sibling: an external service returns an allow/deny decision per request. It validates the "delegate the per-request decision to an external service in the hot path" pattern, without the content-transformation half that this RFC needs.
-- **ICAP (RFC 3507).** HTTP proxies offload content adaptation, virus scanning, DLP, and content filtering to external ICAP servers that can modify or block request/response content. It is the closest *functional* precedent for content-aware egress control. Two details map directly onto our design: ICAP supports **pipelining** multiple servers (our middleware chain) and a **content preview** of the first bytes before full processing (our bounded-body buffering). What we avoid is its dated, text-based wire protocol; gRPC gives us typed contracts and a path to streaming.
+- **ICAP (RFC 3507).** HTTP proxies offload content adaptation, virus scanning, DLP, and content filtering to external ICAP servers that can modify or block request/response content. It is the closest *functional* precedent for content-aware egress control. Two details map directly onto our design: ICAP supports **pipelining** multiple servers (our middleware chain) and a **content preview** of the first bytes before full processing (our bounded-body buffering). What we avoid is its dated, text-based wire protocol; gRPC gives us typed contracts and room for future operation-specific streaming if we need it.
 - **HashiCorp `go-plugin` (Terraform, Vault).** Third-party plugins run as separate processes and communicate with the core exclusively over gRPC. It shows a strictly typed gRPC contract is a robust way to manage cross-language third-party extensions, which informs our registration plus manifest handshake (`Describe`, `ValidateConfig`).
 - **Kubernetes CSI / KMS.** Vendor-specific integrations are offloaded to external gRPC services rather than compiled into the core. Same "core defines the contract; integrators implement it out-of-process" split we use for middleware.
 - **Proxy-Wasm (Envoy/Istio Wasm filters).** In-process WebAssembly extensions with strong default-deny sandboxing and no IPC latency. Relevant to the future WASM deployment mode (see the deployment-options appendix); set aside for v1 because it is currently weak for GPU-backed or memory-heavy semantic guards.

@@ -6,37 +6,39 @@ The v1 contract is intentionally minimal: one HTTP request hook, buffered unary 
 
 ## Streaming
 
-The hot-path `EvaluateHttpRequest` RPC is already declared as a bidirectional stream (see the contract in the RFC). v1 uses it in its degenerate form: the supervisor sends one `HttpRequestEvaluation` and the middleware returns one `HttpRequestResult`. This section records how the same method grows to carry chunked payloads, and importantly what streaming does and does not buy, since the distinction is easy to get wrong.
+The v1 `EvaluateHttpRequest` RPC is unary. The supervisor buffers the bounded request body, sends one `HttpRequestEvaluation`, and receives one `HttpRequestResult`. Streaming is deliberately left out of that method: if OpenShell later needs chunked payload transport or incremental processing, it should add a separate operation-specific method rather than changing `EvaluateHttpRequest` cardinality.
+
+This section records what such a future streaming operation would need to consider, and importantly what streaming does and does not buy, since the distinction is easy to get wrong.
 
 ### Transport streaming vs processing streaming
 
 These are different concepts and are easy to conflate:
 
-- **Transport streaming** - the gRPC call carries multiple messages (chunks). This is what a service advertises in its manifest and what the supervisor negotiates.
+- **Transport streaming** - a separate gRPC operation carries multiple messages (chunks). This is what a service would advertise in its manifest and what the supervisor would negotiate.
 - **Processing streaming** - the middleware can act on partial content before it has the whole body.
 
-The manifest field governs only the transport. It does not promise the middleware can process incrementally.
+The manifest field would govern only the transport. It would not promise the middleware can process incrementally.
 
 ### Full-body guards still buffer
 
 Many guards need the entire body to do anything: a JSON-aware redactor must parse the whole document, and a PII scan must see all of it. Such a guard, even over a streaming transport, accumulates every chunk internally, then parses, then emits a single response at end-of-stream - the decision still arrives after the last byte. Incremental processing only helps narrower cases such as byte-level regex redaction or secret scanning over a text stream.
 
-### Why support transport streaming at all
+### Why add a streaming operation later
 
-Even when the middleware must buffer the full body, chunked transport buys two things:
+Even when the middleware must buffer the full body, a separate chunked transport operation would buy two things:
 
 - It moves the large buffer off the supervisor. The supervisor does not hold a multi-MB body to put in a single message; the middleware, which needs it anyway and can be resourced for it, accumulates it.
 - It avoids gRPC's per-message size limit (4 MB by default). A 20 MB inference request cannot fit in one message without raising limits, but it can be chunked.
 
-This is the strongest reason to keep the door open for streaming, more so than incremental parsing.
+This is the strongest reason to keep the door open for a streaming operation, more so than incremental parsing.
 
 ### How it would work
 
-A service advertises chunked-transport support (and limits) in `Describe`. When supported, the supervisor may send the body as a sequence of messages; when not supported (or in v1), it buffers the bounded body and sends a single message, and a body over the cap uses the middleware config's `on_error` behavior.
+A service would advertise chunked-transport support (and limits) in `Describe`. When supported, the supervisor could use the streaming operation and send the body as a sequence of messages. When not supported, it would continue to use the unary v1 operation, and a body over the unary cap would use the middleware config's `on_error` behavior.
 
-Because the method is already a stream, chunking is field-additive rather than a signature change. Within a single streamed request, the first message carries the request context plus the first body bytes, and subsequent messages carry only further `body` bytes that the middleware appends; stream close marks end of request. This keeps the v1 messages flat and lets v1 stay a true single-message exchange.
+The streaming method should have its own messages instead of reusing `HttpRequestEvaluation` directly. Within a single streamed request, the first message would carry the request context plus the first body bytes, and subsequent messages would carry only further body chunks that the middleware appends; stream close would mark end of request. This keeps the v1 unary messages flat and gives streaming its own cleaner shape.
 
-A cleaner phased design -- a `oneof` over `context` and `body_chunk`, in the style of Envoy `ext_proc` - is the alternative, but it is a now-or-never choice rather than a later add-on. v1's flat message sets the context fields and `body` together, which a phase `oneof` forbids (only one member may be set), so a `oneof` cannot be retrofitted over the v1 message compatibly. We keep the flat shape because the append convention already covers the memory and message-size goals without forcing v1 into a multi-message exchange.
+A cleaner phased design -- a `oneof` over `context` and `body_chunk`, in the style of Envoy `ext_proc` - is available for a future streaming operation because it would not need to preserve the unary v1 message shape. V1 keeps the flat unary request because it is simpler for bounded bodies and avoids making every middleware implement streaming mechanics before the need is proven.
 
 ## Additional operation phases
 
