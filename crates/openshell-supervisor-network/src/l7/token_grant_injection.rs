@@ -357,7 +357,8 @@ fn inject_header(raw_header: &[u8], header_name: &str, header_value: &str) -> Re
 pub mod test_support {
     use super::*;
     use openshell_core::proto::{
-        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType, ProviderProfileCredential,
+        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantSubjectToken,
+        ProviderCredentialTokenGrantType, ProviderProfileCredential,
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -471,6 +472,34 @@ pub mod test_support {
             );
             assert!(request.requested_token_type.is_empty());
         }
+
+        pub fn assert_one_token_exchange_request(&self, expected_provider_key: &str) {
+            let requests = self
+                .requests
+                .lock()
+                .expect("fake token grant requests lock poisoned");
+            assert_eq!(requests.len(), 1);
+
+            let request = &requests[0];
+            assert_eq!(request.provider_key, expected_provider_key);
+            assert_eq!(request.token_endpoint, "https://auth.example.com/token");
+            assert_eq!(request.jwt_svid_audience, "https://auth.example.com");
+            assert_eq!(
+                request.client_assertion_type,
+                "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe"
+            );
+            assert_eq!(request.audience, "api://example");
+            assert_eq!(request.scopes, ["read"]);
+            assert_eq!(request.cache_ttl_seconds, 300);
+            assert_eq!(
+                request.grant_type,
+                ProviderCredentialTokenGrantType::TokenExchange as i32
+            );
+            assert_eq!(
+                request.requested_token_type,
+                "urn:ietf:params:oauth:token-type:access_token"
+            );
+        }
     }
 
     fn token_grant() -> ProviderCredentialTokenGrant {
@@ -486,6 +515,21 @@ pub mod test_support {
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
             subject_token: None,
             requested_token_type: String::new(),
+        }
+    }
+
+    fn token_exchange_grant() -> ProviderCredentialTokenGrant {
+        ProviderCredentialTokenGrant {
+            client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe"
+                .to_string(),
+            grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+            subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                source: "provider_credential".to_string(),
+                credential: "user_oidc_token".to_string(),
+                subject_token_type: "urn:ietf:params:oauth:token-type:id_token".to_string(),
+            }),
+            requested_token_type: "urn:ietf:params:oauth:token-type:access_token".to_string(),
+            ..token_grant()
         }
     }
 
@@ -805,6 +849,7 @@ mod tests {
             activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
         };
         let req = L7Request {
             action: "GET".to_string(),
