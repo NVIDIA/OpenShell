@@ -102,7 +102,7 @@ impl ComputeDriver for ComputeDriverService {
             .create_sandbox(&sandbox)
             .await
             .map_err(Status::from)?;
-        Ok(Response::new(CreateSandboxResponse {}))
+        Ok(Response::new(CreateSandboxResponse { warm_claim: None }))
     }
 
     async fn stop_sandbox(

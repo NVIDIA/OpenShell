@@ -189,12 +189,49 @@ workspace_default_storage_size = "10Gi"
 # default_runtime_class_name   = "kata-containers"
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
 sa_token_ttl_secs              = 3600
+
 # Optional SPIFFE Workload API socket mounted into sandbox pods for dynamic
 # provider token grants. Use an absolute path under a dedicated directory;
 # shared roots such as /run, /var, /tmp, and /etc are rejected.
 # Supervisor-to-gateway auth still uses gateway JWTs.
 provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
+
+# Warm-pooled sandboxes (optional). When enabled, the gateway pre-declares
+# operator-owned SandboxWarmPools and satisfies matching CreateSandbox requests
+# by binding a pre-warmed pod (~0.1s) instead of cold-creating one. Requires the
+# agent-sandbox warm-pool extension CRDs installed in the cluster. Only the
+# trusted default image with no per-request template/env overrides is pooled;
+# anything else falls back to the cold path.
+[openshell.drivers.kubernetes.warm_pool]
+enabled = true
+
+[[openshell.drivers.kubernetes.warm_pool.pools]]
+name     = "default"
+replicas = 3
+
+[[openshell.drivers.kubernetes.warm_pool.pools]]
+name               = "gpu"
+replicas           = 1
+gpu                = true
+runtime_class_name = "nvidia"
+# Optional shared, read-only data volume (datasets / models / caches). Mounted
+# read-only into every pooled pod; safe to share because it holds no per-agent
+# state. The PVC must support a read-many access mode (ROX/RWX) when pods land
+# on multiple nodes.
+shared_volume = { claim_name = "models", mount_path = "/models" }
 ```
+
+Each pool maps to one `(image, runtimeClass, gpu)` shape. The writable per-agent
+workspace (`/sandbox`) on a pooled pod is an ephemeral `emptyDir` seeded from the
+image — it is never shared and is reclaimed with the pod, so claimed pods are
+single-use. Large shared files belong on the read-only `shared_volume` instead.
+The Helm chart exposes this as `server.warmPool.{enabled,pools}`.
+
+A pooled pod enforces the pool's baseline policy and cannot be assigned a
+per-sandbox policy after it boots, so a `sandbox create` request that supplies a
+custom policy automatically falls back to the cold create path (its policy is
+applied faithfully). Requests for a non-default image, a custom template, or
+extra environment variables also fall back to cold.
 
 ### Docker
 

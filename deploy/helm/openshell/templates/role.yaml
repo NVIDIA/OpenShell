@@ -22,6 +22,37 @@ rules:
       - patch
       - update
       - watch
+  # Warm-pool extension CRDs (issue #1879). The gateway reconciles the
+  # operator-owned SandboxTemplate + SandboxWarmPool, creates/deletes a
+  # SandboxClaim per warm-pooled sandbox, and reads claims during the
+  # IssueSandboxToken identity re-anchor. The sandbox pod ServiceAccount is a
+  # separate identity and is intentionally NOT granted any of these — a
+  # compromised sandbox must not be able to mutate claims, templates, or pools.
+  #
+  # Least privilege: only the verbs the gateway actually exercises are granted.
+  # Templates/pools are reconciled with server-side apply (create + patch only —
+  # never update/get/list/watch). Claims are created, deleted, read back, and
+  # watched (create/delete/get/list/watch) — the driver runs a live watcher on
+  # SandboxClaims to surface warm/claim-bound sandboxes. The gateway never writes
+  # the controller-owned status subresources, so they are omitted.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxtemplates
+      - sandboxwarmpools
+    verbs:
+      - create
+      - patch
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxclaims
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - watch
   - apiGroups:
       - ""
     resources:

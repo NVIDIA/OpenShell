@@ -320,11 +320,15 @@ pub async fn run_server(
         let sandbox_service_account = kubernetes_config.service_account_name;
         match kube::Client::try_default().await {
             Ok(client) => {
+                // The warm-path identity re-anchor reads the durable claim
+                // mapping from the shared Store (HA-safe across replicas).
+                let claim_mapping: Arc<dyn auth::k8s_sa::ClaimMappingLookup> = store.clone();
                 let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
                     client,
                     &sandbox_namespace,
                     "openshell-gateway".to_string(),
                     sandbox_service_account.clone(),
+                    claim_mapping,
                 ));
                 let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
                 state.k8s_sa_authenticator = Some(Arc::new(authenticator));

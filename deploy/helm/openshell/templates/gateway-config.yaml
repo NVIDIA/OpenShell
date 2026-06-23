@@ -141,3 +141,21 @@ data:
     {{- if .Values.supervisor.image.pullPolicy }}
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}
+    {{- if .Values.server.warmPool.enabled }}
+
+    [openshell.drivers.kubernetes.warm_pool]
+    enabled = true
+    {{- range .Values.server.warmPool.pools }}
+
+    [[openshell.drivers.kubernetes.warm_pool.pools]]
+    name     = {{ .name | quote }}
+    replicas = {{ .replicas }}
+    gpu      = {{ .gpu | default false }}
+    {{- if .runtimeClassName }}
+    runtime_class_name = {{ .runtimeClassName | quote }}
+    {{- end }}
+    {{- if .sharedVolume }}
+    shared_volume = { claim_name = {{ .sharedVolume.claimName | quote }}, mount_path = {{ .sharedVolume.mountPath | quote }}{{ if .sharedVolume.subPath }}, sub_path = {{ .sharedVolume.subPath | quote }}{{ end }} }
+    {{- end }}
+    {{- end }}
+    {{- end }}

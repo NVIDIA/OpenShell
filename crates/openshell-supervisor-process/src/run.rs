@@ -296,14 +296,19 @@ pub async fn run_process(
     }
 
     // Spawn the persistent supervisor session if we have a gateway endpoint
-    // and sandbox identity. The session provides relay channels for SSH
-    // connect and ExecSandbox through the gateway.
-    if let (Some(endpoint), Some(id), Some(socket)) =
-        (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
-    {
+    // and a relay socket. The session provides relay channels for SSH connect
+    // and ExecSandbox through the gateway.
+    //
+    // A boot-time sandbox identity is NOT required: warm-pooled pods boot
+    // before a claim assigns their `openshell.io/sandbox-id`, so the session
+    // sends an empty id in its hello and the gateway derives the sandbox
+    // identity from the gateway-minted JWT (resolved server-side from the pod
+    // annotation during `IssueSandboxToken`). Cold sandboxes pass their known
+    // id through unchanged.
+    if let (Some(endpoint), Some(socket)) = (openshell_endpoint, ssh_socket_path.as_ref()) {
         crate::supervisor_session::spawn(
             endpoint.to_string(),
-            id.to_string(),
+            sandbox_id.map(str::to_string),
             socket.clone(),
             ssh_netns_fd,
         );

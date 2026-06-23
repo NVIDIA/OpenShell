@@ -171,6 +171,7 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         MAX_MAP_VALUE_LEN,
         "template.labels",
     )?;
+    validate_reserved_metadata_keys(&tmpl.labels, "template.labels")?;
     validate_string_map(
         &tmpl.annotations,
         MAX_TEMPLATE_MAP_ENTRIES,
@@ -178,6 +179,7 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         MAX_MAP_VALUE_LEN,
         "template.annotations",
     )?;
+    validate_reserved_metadata_keys(&tmpl.annotations, "template.annotations")?;
     validate_string_map(
         &tmpl.environment,
         MAX_TEMPLATE_MAP_ENTRIES,
@@ -212,6 +214,40 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         }
     }
 
+    Ok(())
+}
+
+/// Metadata key prefixes/keys reserved for `OpenShell` and the agent-sandbox
+/// platform. Users must not set these on a sandbox's labels or template
+/// labels/annotations: they drive sandbox identity, the warm-pool claim binding,
+/// SPIFFE selection, and managed-by ownership. Allowing user control would let a
+/// request spoof identity or confuse the warm/cold auth re-anchor (issue #1879).
+const RESERVED_METADATA_PREFIXES: &[&str] = &[
+    "openshell.io/",
+    "openshell.ai/",
+    "agents.x-k8s.io/",
+    "extensions.agents.x-k8s.io/",
+    "spiffe.io/",
+];
+
+/// Reject any reserved-prefix keys in a user-supplied metadata map. Applied to
+/// `request.labels`, `template.labels`, and `template.annotations` (the latter
+/// flows through to pod annotations).
+pub(super) fn validate_reserved_metadata_keys(
+    map: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    for key in map.keys() {
+        if let Some(prefix) = RESERVED_METADATA_PREFIXES
+            .iter()
+            .find(|prefix| key.starts_with(**prefix))
+        {
+            return Err(Status::invalid_argument(format!(
+                "{field_name} key '{key}' uses the reserved '{prefix}' prefix; \
+                 these are managed by OpenShell and cannot be set by the caller"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -749,6 +785,44 @@ mod tests {
 
     fn default_spec() -> SandboxSpec {
         SandboxSpec::default()
+    }
+
+    #[test]
+    fn reserved_metadata_keys_rejected() {
+        for reserved in [
+            "openshell.io/sandbox-id",
+            "openshell.ai/managed-by",
+            "agents.x-k8s.io/claim-uid",
+            "extensions.agents.x-k8s.io/foo",
+            "spiffe.io/whatever",
+        ] {
+            let map = HashMap::from([(reserved.to_string(), "x".to_string())]);
+            let err = validate_reserved_metadata_keys(&map, "labels")
+                .expect_err("reserved key must be rejected");
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn reserved_metadata_allows_ordinary_keys() {
+        let map = HashMap::from([
+            ("team".to_string(), "platform".to_string()),
+            ("example.com/owner".to_string(), "me".to_string()),
+        ]);
+        validate_reserved_metadata_keys(&map, "labels").expect("ordinary keys are allowed");
+    }
+
+    #[test]
+    fn sandbox_template_rejects_reserved_annotation() {
+        let tmpl = SandboxTemplate {
+            annotations: HashMap::from([(
+                "openshell.io/sandbox-id".to_string(),
+                "spoof".to_string(),
+            )]),
+            ..SandboxTemplate::default()
+        };
+        let err = validate_sandbox_template(&tmpl).expect_err("reserved annotation must reject");
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     #[test]

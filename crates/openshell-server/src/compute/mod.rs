@@ -21,7 +21,7 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    ValidateSandboxCreateRequest, WarmClaimBinding, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
     watch_sandboxes_event,
 };
@@ -340,6 +340,11 @@ impl ComputeRuntime {
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
+        // Pre-declare operator-owned warm pools. Non-fatal: a reconcile failure
+        // (e.g. extension CRDs not installed) leaves the cold path fully working.
+        if let Err(err) = driver.reconcile_warm_pools().await {
+            warn!(error = %err, "warm pool reconcile failed; cold create path remains available");
+        }
         let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
         Self::from_driver(
             ComputeDriverKind::Kubernetes,
@@ -489,7 +494,18 @@ impl ComputeRuntime {
             }))
             .await
         {
-            Ok(_) => {
+            Ok(response) => {
+                // Warm path: the driver bound a pre-warmed pod via a SandboxClaim
+                // and returned its identity. Record the durable, gateway-created
+                // (namespace, claim_name, claim_uid) -> sandbox_id mapping that
+                // the IssueSandboxToken bootstrap re-anchors against (HA-safe in
+                // the shared Store). If persistence fails, tear the claim back
+                // down — a bound-but-unmapped pod can never bootstrap — and fail
+                // the create so the caller retries cleanly.
+                if let Some(binding) = response.into_inner().warm_claim {
+                    self.record_warm_claim_mapping(binding, &sandbox, &sandbox_id)
+                        .await?;
+                }
                 self.sandbox_watch_bus.notify(sandbox.object_id());
                 if let Some(metadata) = sandbox.metadata.as_mut() {
                     metadata.resource_version = result.resource_version;
@@ -560,6 +576,15 @@ impl ComputeRuntime {
 
         if !deleted && let Err(e) = self.store.delete(Sandbox::object_type(), &id).await {
             warn!(sandbox_id = %id, error = %e, "Failed to clean up store after delete");
+        }
+
+        // Drop any warm-pool claim mapping for this sandbox. Harmless no-op for
+        // cold sandboxes; a leaked mapping would fail closed at auth time, but
+        // we clean it up eagerly so stale rows never accumulate.
+        if matches!(self.driver_kind, Some(ComputeDriverKind::Kubernetes))
+            && let Err(e) = self.store.delete_claim_mapping_for_sandbox(&id).await
+        {
+            warn!(sandbox_id = %id, error = %e, "Failed to clean up warm claim mapping");
         }
 
         self.cleanup_sandbox_state(&id);
@@ -989,6 +1014,7 @@ impl ComputeRuntime {
             if let Err(err) = self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD).await {
                 warn!(error = %err, "Store reconciliation sweep failed");
             }
+            self.gc_claim_mappings().await;
             tokio::select! {
                 () = tokio::time::sleep(RECONCILE_INTERVAL) => {}
                 _ = cancel.changed() => return,
@@ -1082,11 +1108,159 @@ impl ComputeRuntime {
         self.apply_sandbox_update_locked(incoming, existing).await
     }
 
+    /// Persist the durable `(namespace, claim_name, claim_uid) -> sandbox_id`
+    /// mapping for a warm-pool bind, rolling the claim back on failure.
+    ///
+    /// The mapping is what `IssueSandboxToken` re-anchors a warm pod's identity
+    /// against, so it must exist before the pod can bootstrap. If the
+    /// synchronous write fails, tear the claim (and the half-created sandbox)
+    /// back down and surface the error so the caller retries cleanly — a
+    /// bound-but-unmapped pod could never bootstrap.
+    async fn record_warm_claim_mapping(
+        &self,
+        binding: WarmClaimBinding,
+        sandbox: &Sandbox,
+        sandbox_id: &str,
+    ) -> Result<(), Status> {
+        let mapping = crate::persistence::ClaimMapping {
+            namespace: binding.namespace,
+            claim_name: binding.claim_name,
+            claim_uid: binding.claim_uid,
+            sandbox_id: sandbox_id.to_string(),
+        };
+        if let Err(err) = self.store.put_claim_mapping(&mapping).await {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %err,
+                "failed to persist warm claim mapping; rolling back claim"
+            );
+            let _ = self
+                .driver
+                .delete_sandbox(Request::new(DeleteSandboxRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    sandbox_name: sandbox.object_name().to_string(),
+                }))
+                .await;
+            let _ = self.store.delete(Sandbox::object_type(), sandbox_id).await;
+            self.sandbox_index.remove_sandbox(sandbox_id);
+            return Err(Status::internal(format!(
+                "persist warm claim mapping failed: {err}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Ensure the durable warm-pool claim mapping exists for an observed warm
+    /// sandbox. The driver surfaces the binding claim's `name`/`uid` on warm
+    /// observations; this re-creates a mapping that a replica crash (between
+    /// claim creation and the synchronous write) would otherwise have lost.
+    /// Best-effort and idempotent; a no-op for cold sandboxes.
+    async fn backfill_claim_mapping(&self, incoming: &DriverSandbox) {
+        let Some(status) = incoming.status.as_ref() else {
+            return;
+        };
+        if status.claim_name.is_empty() || status.claim_uid.is_empty() {
+            return;
+        }
+        // Trust boundary: `incoming.id` is reconstructed from the live
+        // SandboxClaim's `openshell.ai/sandbox-id` label, which is authoritative
+        // only because claim creation is gateway-exclusive (the sandbox pod's
+        // ServiceAccount has no claims write — see the chart Role). To keep
+        // backfill from ever *fabricating* an identity, recover a mapping only
+        // for a sandbox the gateway actually minted: require its Store record to
+        // exist. The create path persists that record (MustCreate) *before*
+        // creating the claim, so the legitimate crash window — claim created,
+        // replica died before the synchronous mapping write — always satisfies
+        // this. `put_claim_mapping` further refuses to rebind an existing
+        // (namespace, claim_name, claim_uid) key to a different sandbox id, and
+        // the apiserver-unique claim_uid scopes that key, so a stale or forged
+        // claim cannot hijack an existing mapping.
+        match self.store.get(Sandbox::object_type(), &incoming.id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                debug!(
+                    sandbox_id = %incoming.id,
+                    claim = %status.claim_name,
+                    "warm claim mapping backfill skipped: no gateway sandbox record"
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    sandbox_id = %incoming.id,
+                    error = %err,
+                    "warm claim mapping backfill: sandbox lookup failed"
+                );
+                return;
+            }
+        }
+        let mapping = crate::persistence::ClaimMapping {
+            namespace: incoming.namespace.clone(),
+            claim_name: status.claim_name.clone(),
+            claim_uid: status.claim_uid.clone(),
+            sandbox_id: incoming.id.clone(),
+        };
+        if let Err(err) = self.store.put_claim_mapping(&mapping).await {
+            debug!(
+                sandbox_id = %incoming.id,
+                claim = %status.claim_name,
+                error = %err,
+                "warm claim mapping backfill skipped"
+            );
+        }
+    }
+
+    /// Garbage-collect warm-pool claim mappings whose sandbox record is gone
+    /// (a backstop for missed deletes / crashes). A leaked mapping fails closed
+    /// at auth time regardless; this keeps the table from accumulating cruft.
+    async fn gc_claim_mappings(&self) {
+        if !matches!(self.driver_kind, Some(ComputeDriverKind::Kubernetes)) {
+            return;
+        }
+        let mappings = match self.store.list_claim_mappings(1000, 0).await {
+            Ok(mappings) => mappings,
+            Err(err) => {
+                warn!(error = %err, "failed to list warm claim mappings for GC");
+                return;
+            }
+        };
+        for mapping in mappings {
+            match self
+                .store
+                .get(Sandbox::object_type(), &mapping.sandbox_id)
+                .await
+            {
+                Ok(Some(_)) => {} // sandbox still exists; keep the mapping
+                Ok(None) => {
+                    if let Err(err) = self
+                        .store
+                        .delete_claim_mapping_for_sandbox(&mapping.sandbox_id)
+                        .await
+                    {
+                        warn!(
+                            sandbox_id = %mapping.sandbox_id,
+                            error = %err,
+                            "failed to GC orphaned warm claim mapping"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "warm claim mapping GC lookup failed");
+                }
+            }
+        }
+    }
+
     async fn apply_sandbox_update_locked(
         &self,
         incoming: DriverSandbox,
         existing_record: Option<ObjectRecord>,
     ) -> Result<(), String> {
+        // Recover a missing warm-pool claim mapping (e.g. a replica crashed
+        // between claim creation and the synchronous mapping write). Idempotent
+        // and a no-op for cold sandboxes.
+        self.backfill_claim_mapping(&incoming).await;
+
         let existing = existing_record
             .as_ref()
             .map(decode_sandbox_record)
@@ -1502,6 +1676,10 @@ fn driver_sandbox_spec_from_public(
             .transpose()?,
         gpu: spec.gpu,
         sandbox_token: String::new(),
+        // A custom policy cannot be applied to a warm-pooled pod (it boots on
+        // the pool's baseline policy and Landlock can't be loosened later), so
+        // force the cold path to avoid silently downgrading the policy.
+        disallow_warm_pool: spec.policy.is_some(),
     })
 }
 
@@ -1732,6 +1910,9 @@ fn driver_status_from_public(status: &SandboxStatus) -> DriverSandboxStatus {
             .map(driver_condition_from_public)
             .collect(),
         deleting: SandboxPhase::try_from(status.phase) == Ok(SandboxPhase::Deleting),
+        // Warm-pool claim identity is set only by the Kubernetes driver on warm
+        // observations; the public status carries none.
+        ..Default::default()
     }
 }
 
@@ -1989,7 +2170,7 @@ impl ComputeDriver for NoopTestDriver {
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::CreateSandboxResponse>, Status>
     {
         Ok(tonic::Response::new(
-            openshell_core::proto::compute::v1::CreateSandboxResponse {},
+            openshell_core::proto::compute::v1::CreateSandboxResponse { warm_claim: None },
         ))
     }
 
@@ -2209,7 +2390,9 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
-            Ok(tonic::Response::new(CreateSandboxResponse {}))
+            Ok(tonic::Response::new(CreateSandboxResponse {
+                warm_claim: None,
+            }))
         }
 
         async fn stop_sandbox(
@@ -2323,6 +2506,7 @@ mod tests {
             sandbox_fd: String::new(),
             conditions: vec![condition],
             deleting: false,
+            ..Default::default()
         }
     }
 
@@ -2713,6 +2897,7 @@ mod tests {
                         last_transition_time: String::new(),
                     }],
                     deleting: false,
+                    ..Default::default()
                 }),
             })
             .await
@@ -2922,6 +3107,7 @@ mod tests {
                         last_transition_time: String::new(),
                     }],
                     deleting: false,
+                    ..Default::default()
                 }),
             }],
             current_sandboxes: vec![DriverSandbox {
@@ -2942,6 +3128,7 @@ mod tests {
                         last_transition_time: String::new(),
                     }],
                     deleting: false,
+                    ..Default::default()
                 }),
             }],
         }))
@@ -3040,6 +3227,7 @@ mod tests {
                         last_transition_time: String::new(),
                     }],
                     deleting: false,
+                    ..Default::default()
                 }),
             }],
             ..Default::default()

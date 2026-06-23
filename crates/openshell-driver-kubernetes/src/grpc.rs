@@ -99,11 +99,12 @@ impl ComputeDriver for ComputeDriverService {
             .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
-        self.driver
+        let warm_claim = self
+            .driver
             .create_sandbox(&sandbox)
             .await
             .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
-        Ok(Response::new(CreateSandboxResponse {}))
+        Ok(Response::new(CreateSandboxResponse { warm_claim }))
     }
 
     async fn stop_sandbox(

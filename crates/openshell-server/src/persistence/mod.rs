@@ -23,6 +23,14 @@ pub use sqlite::SqliteStore;
 pub const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
 /// Object type string for draft policy chunk records.
 pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
+/// Object type string for warm-pool `SandboxClaim` → sandbox-id mappings.
+///
+/// Stored in the shared `objects` table so any HA gateway replica can serve the
+/// `IssueSandboxToken` bootstrap. The record `id` is keyed on
+/// `(namespace, claim_name, claim_uid)` (so a lookup miss on a uid mismatch
+/// fails closed) and the record `name` is the sandbox-id (so a sandbox can be
+/// torn down by id without re-deriving the claim key).
+pub const CLAIM_MAPPING_OBJECT_TYPE: &str = "k8s_claim_mapping";
 
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
@@ -507,6 +515,130 @@ impl Store {
         updated.set_resource_version(result.resource_version);
         Ok(updated)
     }
+
+    // -----------------------------------------------------------------------
+    // Warm-pool claim mappings
+    // -----------------------------------------------------------------------
+
+    /// Persist a durable `(namespace, claim_name, claim_uid) -> sandbox_id`
+    /// mapping for a gateway-created warm-pool `SandboxClaim`.
+    ///
+    /// Idempotent: a re-write of the identical mapping (same key + same
+    /// sandbox-id) is accepted so create, bootstrap, and reconcile back-fill
+    /// retries converge. A write that would rebind an existing claim key to a
+    /// *different* sandbox-id is rejected — that must never happen because the
+    /// claim UID is apiserver-assigned and unique.
+    pub async fn put_claim_mapping(&self, mapping: &ClaimMapping) -> PersistenceResult<()> {
+        let id = claim_mapping_id(&mapping.namespace, &mapping.claim_name, &mapping.claim_uid);
+
+        if let Some(existing) = self.get_claim_mapping_by_id(&id).await? {
+            return if existing.sandbox_id == mapping.sandbox_id {
+                Ok(())
+            } else {
+                Err(claim_mapping_rebind_error(&id))
+            };
+        }
+
+        let payload = serde_json::to_vec(mapping)
+            .map_err(|e| PersistenceError::Encode(format!("claim mapping encode error: {e}")))?;
+
+        match self
+            .put_if(
+                CLAIM_MAPPING_OBJECT_TYPE,
+                &id,
+                &mapping.sandbox_id,
+                &payload,
+                None,
+                WriteCondition::MustCreate,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Lost a concurrent MustCreate race: accept iff the winner stored
+            // the same binding, otherwise surface the conflict.
+            Err(PersistenceError::UniqueViolation { .. }) => {
+                match self.get_claim_mapping_by_id(&id).await? {
+                    Some(existing) if existing.sandbox_id == mapping.sandbox_id => Ok(()),
+                    _ => Err(claim_mapping_rebind_error(&id)),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Look up the sandbox-id bound to a warm-pool claim. A miss (including a
+    /// `claim_uid` that does not match a stored record) returns `Ok(None)` so
+    /// callers fail closed.
+    pub async fn get_claim_mapping(
+        &self,
+        namespace: &str,
+        claim_name: &str,
+        claim_uid: &str,
+    ) -> PersistenceResult<Option<ClaimMapping>> {
+        self.get_claim_mapping_by_id(&claim_mapping_id(namespace, claim_name, claim_uid))
+            .await
+    }
+
+    async fn get_claim_mapping_by_id(&self, id: &str) -> PersistenceResult<Option<ClaimMapping>> {
+        let Some(record) = self.get(CLAIM_MAPPING_OBJECT_TYPE, id).await? else {
+            return Ok(None);
+        };
+        let mapping: ClaimMapping = serde_json::from_slice(&record.payload)
+            .map_err(|e| PersistenceError::Decode(format!("claim mapping decode error: {e}")))?;
+        Ok(Some(mapping))
+    }
+
+    /// Delete a warm-pool claim mapping by its sandbox-id (the record name).
+    /// Returns `true` when a mapping was removed.
+    pub async fn delete_claim_mapping_for_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> PersistenceResult<bool> {
+        self.delete_by_name(CLAIM_MAPPING_OBJECT_TYPE, sandbox_id)
+            .await
+    }
+
+    /// List all warm-pool claim mappings (used by reconcile GC). Bounded by
+    /// `limit`/`offset`.
+    pub async fn list_claim_mappings(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ClaimMapping>> {
+        let records = self.list(CLAIM_MAPPING_OBJECT_TYPE, limit, offset).await?;
+        let mut mappings = Vec::with_capacity(records.len());
+        for record in records {
+            let mapping: ClaimMapping = serde_json::from_slice(&record.payload).map_err(|e| {
+                PersistenceError::Decode(format!("claim mapping decode error: {e}"))
+            })?;
+            mappings.push(mapping);
+        }
+        Ok(mappings)
+    }
+}
+
+/// Durable mapping that binds a gateway-created warm-pool `SandboxClaim` to the
+/// sandbox identity the gateway assigned. The auth bootstrap re-anchors a warm
+/// sandbox pod's identity to this record (see `auth::k8s_sa`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClaimMapping {
+    pub namespace: String,
+    pub claim_name: String,
+    pub claim_uid: String,
+    pub sandbox_id: String,
+}
+
+fn claim_mapping_id(namespace: &str, claim_name: &str, claim_uid: &str) -> String {
+    format!("{namespace}/{claim_name}/{claim_uid}")
+}
+
+fn claim_mapping_rebind_error(id: &str) -> PersistenceError {
+    PersistenceError::unique_violation(
+        Some(CLAIM_MAPPING_OBJECT_TYPE.to_string()),
+        Some(format!(
+            "claim mapping {id} is already bound to a different sandbox"
+        )),
+    )
 }
 
 pub fn current_time_ms() -> i64 {

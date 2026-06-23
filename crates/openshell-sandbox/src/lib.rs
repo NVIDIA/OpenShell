@@ -1223,7 +1223,22 @@ async fn load_policy(
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
-    if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+    if let Some(endpoint) = &openshell_endpoint {
+        // Warm-pool path: a pooled pod boots before its claim assigns an
+        // identity, so there is no per-sandbox policy to fetch yet. Boot on the
+        // image's baseline policy (default-deny) and enforce it; the per-sandbox
+        // policy is NOT applied on the warm path because Landlock is applied
+        // once at process start and cannot be loosened afterwards. Requests that
+        // carry a custom policy fall back to the cold path (see the driver's
+        // warm-pool eligibility check), so there is no silent policy downgrade.
+        let Some(id) = sandbox_id.as_deref().filter(|id| !id.is_empty()) else {
+            info!("Warm-pool sandbox: loading baseline policy (no boot-time identity)");
+            let mut proto_policy = discover_policy_from_disk_or_default();
+            enrich_proto_baseline_paths(&mut proto_policy);
+            let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
+            let policy = SandboxPolicy::try_from(proto_policy.clone())?;
+            return Ok((policy, opa_engine, Some(proto_policy)));
+        };
         info!(
             sandbox_id = %id,
             endpoint = %endpoint,

@@ -195,6 +195,30 @@ server:
   # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
   # UID and capabilities become namespaced.
   enableUserNamespaces: false
+  # Warm-pooled sandboxes (issue #1879). The gateway pre-declares operator-owned
+  # SandboxWarmPools and satisfies matching CreateSandbox requests by binding a
+  # pre-warmed pod (~0.1s) instead of cold-creating one (~4s+). Requires the
+  # agent-sandbox warm-pool extension CRDs installed in the cluster.
+  warmPool:
+    # -- Enable warm pooling. Off by default; only the trusted default sandbox
+    # image with no per-request template/env overrides is warm-pooled — any
+    # other request falls back to the cold create path.
+    enabled: false
+    # -- Operator-declared pools. Each maps to one (image, runtimeClass, gpu)
+    # shape. Example:
+    #   pools:
+    #     - name: default
+    #       replicas: 3
+    #     - name: gpu
+    #       replicas: 1
+    #       gpu: true
+    #       runtimeClassName: nvidia
+    #       # Optional shared, read-only data volume (datasets/models/caches).
+    #       sharedVolume:
+    #         claimName: models          # existing PVC (ROX/RWX for multi-node)
+    #         mountPath: /models
+    #         subPath: ""               # optional
+    pools: []
   # -- Kubernetes AppArmor profile requested for sandbox agent containers.
   # Default Unconfined avoids runtime/default AppArmor blocking the supervisor's
   # network namespace mount setup on AppArmor-enabled nodes. Set to "" to omit

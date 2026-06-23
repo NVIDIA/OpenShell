@@ -264,6 +264,8 @@ fn build_driver_sandbox(
             sandbox_fd: String::new(),
             conditions: vec![condition],
             deleting,
+            // Warm-pool claim fields apply to the Kubernetes driver only.
+            ..Default::default()
         }),
     }
 }
@@ -496,6 +498,7 @@ mod tests {
                 sandbox_fd: String::new(),
                 conditions: vec![condition],
                 deleting: false,
+                ..Default::default()
             }),
         };
 
