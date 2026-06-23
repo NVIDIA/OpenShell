@@ -43,6 +43,7 @@ pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin
 pub struct JsonRpcRequestInfo {
     pub calls: Vec<JsonRpcCallInfo>,
     pub is_batch: bool,
+    pub receive_stream: bool,
     pub has_response: bool,
     pub error: Option<String>,
 }
@@ -58,6 +59,7 @@ impl JsonRpcRequestInfo {
         Self {
             calls: Vec::new(),
             is_batch: false,
+            receive_stream: true,
             has_response: false,
             error: None,
         }
@@ -91,6 +93,27 @@ pub(crate) fn jsonrpc_receive_stream_request(request: &L7Request) -> bool {
             crate::l7::provider::BodyLength::None
                 | crate::l7::provider::BodyLength::ContentLength(0)
         )
+        && request_accepts_sse(request)
+}
+
+fn request_accepts_sse(request: &L7Request) -> bool {
+    let header_end = request
+        .raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(request.raw_header.len(), |p| p + 4);
+    let header = String::from_utf8_lossy(&request.raw_header[..header_end]);
+    header.lines().skip(1).any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case("accept")
+            && value.split(',').any(|part| {
+                part.split(';').next().is_some_and(|media_type| {
+                    media_type.trim().eq_ignore_ascii_case("text/event-stream")
+                })
+            })
+    })
 }
 /// Parse a JSON-RPC 2.0 request body and extract the `method` field.
 ///
@@ -101,6 +124,7 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
         return JsonRpcRequestInfo {
             calls: Vec::new(),
             is_batch: false,
+            receive_stream: false,
             has_response: false,
             error: Some("invalid JSON".to_string()),
         };
@@ -111,6 +135,7 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
             return JsonRpcRequestInfo {
                 calls: Vec::new(),
                 is_batch: true,
+                receive_stream: false,
                 has_response: false,
                 error: Some("empty batch".to_string()),
             };
@@ -125,6 +150,7 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
                     return JsonRpcRequestInfo {
                         calls: Vec::new(),
                         is_batch: true,
+                        receive_stream: false,
                         has_response: false,
                         error: Some(format!("batch item invalid: {error}")),
                     };
@@ -134,6 +160,7 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
         return JsonRpcRequestInfo {
             calls,
             is_batch: true,
+            receive_stream: false,
             has_response,
             error: None,
         };
@@ -143,18 +170,21 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
         Ok(JsonRpcMessageInfo::Call(call)) => JsonRpcRequestInfo {
             calls: vec![call],
             is_batch: false,
+            receive_stream: false,
             has_response: false,
             error: None,
         },
         Ok(JsonRpcMessageInfo::Response) => JsonRpcRequestInfo {
             calls: Vec::new(),
             is_batch: false,
+            receive_stream: false,
             has_response: true,
             error: None,
         },
         Err(error) => JsonRpcRequestInfo {
             calls: Vec::new(),
             is_batch: false,
+            receive_stream: false,
             has_response: false,
             error: Some(error),
         },
@@ -380,16 +410,31 @@ mod tests {
             action: "GET".to_string(),
             target: "/mcp".to_string(),
             query_params: HashMap::new(),
-            raw_header: Vec::new(),
+            raw_header: b"GET /mcp HTTP/1.1\r\nHost: mcp.test\r\nAccept: application/json, text/event-stream\r\n\r\n".to_vec(),
             body_length: crate::l7::provider::BodyLength::None,
         };
 
         assert!(jsonrpc_receive_stream_request(&request));
 
         let info = JsonRpcRequestInfo::receive_stream();
+        assert!(info.receive_stream);
         assert!(info.error.is_none());
         assert!(info.calls.is_empty());
         assert!(info.params_sha256().is_none());
+    }
+
+    #[test]
+    fn bodyless_get_without_sse_accept_is_not_receive_stream() {
+        let request = L7Request {
+            action: "GET".to_string(),
+            target: "/mcp".to_string(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /mcp HTTP/1.1\r\nHost: mcp.test\r\nAccept: application/json\r\n\r\n"
+                .to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+
+        assert!(!jsonrpc_receive_stream_request(&request));
     }
 
     #[test]

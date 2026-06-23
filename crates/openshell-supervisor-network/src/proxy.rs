@@ -4524,6 +4524,7 @@ network_policies:
             jsonrpc: Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
                 calls: Vec::new(),
                 is_batch: false,
+                receive_stream: false,
                 has_response: false,
                 error: Some("ambiguous dotted params key 'arguments.scope'".to_string()),
             }),
@@ -4547,6 +4548,7 @@ network_policies:
             jsonrpc: Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
                 calls: Vec::new(),
                 is_batch: false,
+                receive_stream: false,
                 has_response: true,
                 error: None,
             }),

@@ -463,6 +463,7 @@ request_allowed_for_endpoint(request, endpoint) if {
 	endpoint.protocol == "json-rpc"
 	request.method == "GET"
 	is_object(request.jsonrpc)
+	object.get(request.jsonrpc, "receive_stream", false)
 	jsonrpc_no_parse_error(request.jsonrpc)
 	object.get(request.jsonrpc, "method", null) == null
 	not object.get(request.jsonrpc, "has_response", false)

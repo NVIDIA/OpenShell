@@ -2770,6 +2770,7 @@ network_policies:
                 "jsonrpc": {
                     "method": null,
                     "params": {},
+                    "receive_stream": true,
                     "error": null
                 }
             }
@@ -2790,11 +2791,32 @@ network_policies:
                 "jsonrpc": {
                     "method": null,
                     "params": {},
+                    "receive_stream": true,
                     "error": null
                 }
             }
         });
         assert!(!eval_l7(&engine, &deny_input));
+
+        let bodyless_get_without_receive_stream = serde_json::json!({
+            "network": { "host": "mcp.stream.test", "port": 8000 },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "GET",
+                "path": "/mcp",
+                "query_params": {},
+                "jsonrpc": {
+                    "method": null,
+                    "params": {},
+                    "error": null
+                }
+            }
+        });
+        assert!(!eval_l7(&engine, &bodyless_get_without_receive_stream));
     }
 
     #[test]
