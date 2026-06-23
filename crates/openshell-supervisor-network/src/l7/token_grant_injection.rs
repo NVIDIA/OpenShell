@@ -532,39 +532,46 @@ fn validate_header_name(header_name: &str) -> Result<()> {
     }
 }
 
+/// Injects (or replaces) a header in the raw HTTP request.
+///
+/// Operates byte-wise so that non-UTF-8 obs-text bytes in unrelated
+/// headers do not cause the injection to fail.  Only the header name
+/// comparison is ASCII — header values are preserved as raw bytes.
 fn inject_header(raw_header: &[u8], header_name: &str, header_value: &str) -> Result<Vec<u8>> {
     let header_end = raw_header
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| miette!("HTTP headers missing final CRLF CRLF"))?;
 
-    let header_block = std::str::from_utf8(&raw_header[..header_end])
-        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    let mut lines = header_block.split("\r\n");
-    let request_line = lines
-        .next()
-        .ok_or_else(|| miette!("HTTP headers missing request line"))?;
-
+    let header_name_bytes = header_name.as_bytes();
     let inserted_header = format!("{header_name}: {header_value}");
     let mut new_raw_header = Vec::with_capacity(raw_header.len() + inserted_header.len() + 2);
-    new_raw_header.extend_from_slice(request_line.as_bytes());
-    new_raw_header.extend_from_slice(b"\r\n");
 
-    for line in lines {
+    let mut first_line = true;
+    for line in raw_header[..header_end].split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if first_line {
+            // Request line — always preserve.
+            first_line = false;
+            new_raw_header.extend_from_slice(line);
+            new_raw_header.extend_from_slice(b"\r\n");
+            continue;
+        }
         if line.is_empty() {
             break;
         }
-        if line
-            .split_once(':')
-            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(header_name))
-        {
-            continue;
+        if let Some(colon_pos) = line.iter().position(|&b| b == b':') {
+            let name = trim_ascii(&line[..colon_pos]);
+            if name.eq_ignore_ascii_case(header_name_bytes) {
+                continue; // drop the existing header — we'll append the new one
+            }
         }
-        new_raw_header.extend_from_slice(line.as_bytes());
+        new_raw_header.extend_from_slice(line);
         new_raw_header.extend_from_slice(b"\r\n");
     }
 
     new_raw_header.extend_from_slice(inserted_header.as_bytes());
+    // Preserve the original terminator and any trailing body bytes.
     new_raw_header.extend_from_slice(&raw_header[header_end..]);
 
     Ok(new_raw_header)
@@ -1335,6 +1342,51 @@ mod tests {
         assert!(
             msg.contains("placeholder"),
             "error should mention placeholder conflict, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_static_credential_succeeds_with_non_utf8_obs_text_in_unrelated_header() {
+        // A request with non-UTF-8 obs-text in an unrelated header must NOT
+        // cause inject_header to fail.  The injection should succeed and
+        // preserve the non-UTF-8 bytes in the unrelated header.
+        let (ctx, _) =
+            static_credential_ctx("GITHUB_TOKEN", "ghp_secret123", "bearer", "Authorization");
+        let mut raw = b"GET /repos/owner/repo HTTP/1.1\r\nHost: api.example.com\r\n".to_vec();
+        // obs-text byte (0x80) in a different header — valid HTTP but not valid UTF-8.
+        raw.extend_from_slice(b"X-Custom: value\x80rest\r\n");
+        raw.extend_from_slice(b"\r\n");
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/repos/owner/repo".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: raw,
+            body_length: BodyLength::None,
+        };
+
+        let result = inject_if_needed(req, &ctx)
+            .await
+            .expect("injection must succeed despite non-UTF-8 in unrelated header");
+
+        // The injected header must be present.
+        let header_end = result
+            .raw_header
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("must have header terminator");
+        let header_block = &result.raw_header[..header_end];
+        assert!(
+            header_block
+                .windows(b"Authorization: Bearer ghp_secret123".len())
+                .any(|w| w == b"Authorization: Bearer ghp_secret123"),
+            "injected Authorization header must be present"
+        );
+        // The non-UTF-8 header must be preserved as raw bytes.
+        assert!(
+            header_block
+                .windows(b"X-Custom: value\x80rest".len())
+                .any(|w| w == b"X-Custom: value\x80rest"),
+            "non-UTF-8 obs-text header must be preserved"
         );
     }
 
