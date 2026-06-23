@@ -3733,6 +3733,7 @@ dependencies = [
  "nix",
  "oci-client",
  "openshell-core",
+ "openshell-policy",
  "openshell-vfio",
  "polling",
  "prost",

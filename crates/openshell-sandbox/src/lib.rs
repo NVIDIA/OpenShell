@@ -128,7 +128,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (policy, opa_engine, retained_proto) = load_policy(
+    let (mut policy, opa_engine, retained_proto) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -136,6 +136,39 @@ pub async fn run_sandbox(
         policy_data,
     )
     .await?;
+
+    // Override the policy's process identity with the driver-resolved UID/GID
+    // from the pod environment. The policy defaults to the name "sandbox" which
+    // resolves via /etc/passwd, but the driver may have chosen a different
+    // numeric UID (e.g. from OpenShift SCC annotations).
+    // Validate overrides against the same rules as the policy layer to prevent
+    // env-injected values (e.g. GID 0) from bypassing policy restrictions.
+    if let Ok(uid) = std::env::var(openshell_core::sandbox_env::SANDBOX_UID)
+        && !uid.is_empty()
+    {
+        if !openshell_policy::is_valid_sandbox_identity(&uid) {
+            return Err(miette::miette!(
+                "OPENSHELL_SANDBOX_UID contains invalid sandbox identity '{uid}'; \
+                 expected 'sandbox' or a numeric UID in range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_UID,
+                openshell_policy::MAX_SANDBOX_UID,
+            ));
+        }
+        policy.process.run_as_user = Some(uid);
+    }
+    if let Ok(gid) = std::env::var(openshell_core::sandbox_env::SANDBOX_GID)
+        && !gid.is_empty()
+    {
+        if !openshell_policy::is_valid_sandbox_identity(&gid) {
+            return Err(miette::miette!(
+                "OPENSHELL_SANDBOX_GID contains invalid sandbox identity '{gid}'; \
+                 expected 'sandbox' or a numeric GID in range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_UID,
+                openshell_policy::MAX_SANDBOX_UID,
+            ));
+        }
+        policy.process.run_as_group = Some(gid);
+    }
 
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start

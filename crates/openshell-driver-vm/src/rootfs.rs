@@ -26,6 +26,7 @@ pub const fn sandbox_guest_init_path() -> &'static str {
     SANDBOX_GUEST_INIT_PATH
 }
 
+#[allow(clippy::similar_names)]
 pub fn prepare_sandbox_rootfs_from_image_root(
     rootfs: &Path,
     image_identity: &str,
@@ -350,6 +351,7 @@ fn append_symlink_to_archive(
         .map_err(|e| format!("append symlink {}: {e}", source_path.display()))
 }
 
+#[allow(clippy::similar_names)]
 fn prepare_sandbox_rootfs(rootfs: &Path, sandbox_uid: u32, sandbox_gid: u32) -> Result<(), String> {
     for relative in ["opt/openshell/.initialized", "opt/openshell/.rootfs-type"] {
         remove_rootfs_path(rootfs, relative)?;
@@ -754,6 +756,7 @@ fn temporary_injection_path(image_path: &Path) -> PathBuf {
     ))
 }
 
+#[allow(clippy::similar_names)]
 fn ensure_sandbox_guest_user(
     rootfs: &Path,
     sandbox_uid: u32,

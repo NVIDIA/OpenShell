@@ -241,10 +241,13 @@ pub struct KubernetesComputeConfig {
         deserialize_with = "deserialize_provider_spiffe_workload_api_socket_path"
     )]
     pub provider_spiffe_workload_api_socket_path: String,
-    /// UID used for the supervisor container `securityContext.runAsUser` and
-    /// PVC init container ownership operations. When empty, the driver
-    /// auto-detects from OpenShift SCC annotations on the target namespace;
-    /// if those are also absent, falls back to `1000`.
+    /// UID used for privilege-drop operations and workspace init container
+    /// ownership. The supervisor container always runs as UID 0 (root) to
+    /// create network namespaces and configure Landlock/seccomp; the
+    /// `sandbox_uid` is injected as the `SANDBOX_UID` environment variable so
+    /// the supervisor knows which UID to drop to for child processes.
+    /// When empty, the driver auto-detects from `OpenShift` SCC annotations on
+    /// the target namespace; if those are also absent, falls back to `1000`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_uid: Option<u32>,
     /// GID used alongside `sandbox_uid` for PVC init container operations.
@@ -261,15 +264,15 @@ pub const MIN_SA_TOKEN_TTL_SECS: i64 = 600;
 /// pod start).
 pub const MAX_SA_TOKEN_TTL_SECS: i64 = 86_400;
 
-/// Default sandbox UID used when neither config nor OpenShift SCC annotations
+/// Default sandbox UID used when neither config nor `OpenShift` SCC annotations
 /// provide a resolved value.
 pub(crate) const DEFAULT_SANDBOX_UID: u32 = 1000;
 
-/// The annotation key for the OpenShift ServiceAccount UID range.
+/// The annotation key for the `OpenShift` `ServiceAccount` UID range.
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
 pub const ANNOTATION_SCC_UID_RANGE: &str = "openshift.io/sa.scc.uid-range";
 
-/// The annotation key for the OpenShift ServiceAccount supplemental groups.
+/// The annotation key for the `OpenShift` `ServiceAccount` supplemental groups.
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
 pub const ANNOTATION_SCC_SUPPLEMENTAL_GROUPS: &str = "openshift.io/sa.scc.supplemental-groups";
 
@@ -337,7 +340,7 @@ impl KubernetesComputeConfig {
     ///
     /// Resolution order:
     /// 1. Configured `sandbox_uid` / `sandbox_gid` (explicit override)
-    /// 2. OpenShift SCC namespace annotations (`sa.scc.uid-range`,
+    /// 2. `OpenShift` SCC namespace annotations (`sa.scc.uid-range`,
     ///    `sa.scc.supplemental-groups`) — passed in as the optional
     ///    `namespace_annotations` map
     /// 3. Fallback defaults: UID=`1000`, GID=UID
@@ -348,13 +351,11 @@ impl KubernetesComputeConfig {
         if let Some(uid) = self.sandbox_uid {
             return uid;
         }
-        // Try OpenShift SCC annotation.
-        if let Some(anns) = namespace_annotations {
-            if let Some(range) = anns.get(ANNOTATION_SCC_UID_RANGE) {
-                if let Some(uid) = Self::from_open_shift_uid_range(range) {
-                    return uid;
-                }
-            }
+        if let Some(anns) = namespace_annotations
+            && let Some(range) = anns.get(ANNOTATION_SCC_UID_RANGE)
+            && let Some(uid) = Self::from_open_shift_uid_range(range)
+        {
+            return uid;
         }
         DEFAULT_SANDBOX_UID
     }
@@ -365,30 +366,52 @@ impl KubernetesComputeConfig {
         _namespace_annotations: Option<&std::collections::BTreeMap<String, String>>,
     ) -> u32 {
         self.sandbox_gid
-            .or_else(|| self.sandbox_uid)
+            .or(self.sandbox_uid)
             .unwrap_or(resolved_uid)
     }
 
-    /// Parse OpenShift SCC `sa.scc.uid-range` annotation.
+    /// Parse `OpenShift` SCC `sa.scc.uid-range` annotation.
     ///
     /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
     pub fn from_open_shift_uid_range(annotation: &str) -> Option<u32> {
         let (start, _) = annotation.split_once('/')?;
-        start
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|&uid| uid >= openshell_policy::MIN_SANDBOX_UID)
+        start.trim().parse::<u32>().ok().filter(|&uid| {
+            (openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID).contains(&uid)
+        })
     }
 
-    /// Parse OpenShift SCC `sa.scc.supplemental-groups` annotation.
+    /// Parse `OpenShift` SCC `sa.scc.supplemental-groups` annotation.
     pub fn from_open_shift_supplemental_groups(annotation: &str) -> Option<u32> {
         let (start, _) = annotation.split_once('/')?;
-        start
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|&gid| gid >= openshell_policy::MIN_SANDBOX_UID)
+        start.trim().parse::<u32>().ok().filter(|&gid| {
+            (openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID).contains(&gid)
+        })
+    }
+
+    /// Validate that configured `sandbox_uid` and `sandbox_gid` fall within
+    /// the policy-enforced UID/GID range. Called during driver initialization
+    /// before any pod parameters are rendered.
+    pub fn validate_sandbox_identity_config(&self) -> Result<(), String> {
+        let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
+        if let Some(uid) = self.sandbox_uid
+            && !range.contains(&uid)
+        {
+            return Err(format!(
+                "sandbox_uid {uid} is outside the allowed range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_UID,
+                openshell_policy::MAX_SANDBOX_UID,
+            ));
+        }
+        if let Some(gid) = self.sandbox_gid
+            && !range.contains(&gid)
+        {
+            return Err(format!(
+                "sandbox_gid {gid} is outside the allowed range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_UID,
+                openshell_policy::MAX_SANDBOX_UID,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -628,7 +651,7 @@ mod tests {
     fn parse_openshift_uid_range() {
         assert_eq!(
             KubernetesComputeConfig::from_open_shift_uid_range("1000000000/10000"),
-            Some(1000000000)
+            Some(1_000_000_000)
         );
         assert_eq!(
             KubernetesComputeConfig::from_open_shift_uid_range("1000/50000"),
@@ -643,6 +666,51 @@ mod tests {
             KubernetesComputeConfig::from_open_shift_uid_range("999/50000"),
             None
         );
+    }
+
+    #[test]
+    fn parse_openshift_uid_range_rejects_above_max() {
+        // u32::MAX is well above MAX_SANDBOX_UID — should be rejected.
+        assert_eq!(
+            KubernetesComputeConfig::from_open_shift_uid_range("4294967295/10000"),
+            None
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_identity_config_accepts_valid_range() {
+        let cfg = KubernetesComputeConfig {
+            sandbox_uid: Some(1000),
+            sandbox_gid: Some(1000),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_sandbox_identity_config().is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_identity_config_rejects_uid_zero() {
+        let cfg = KubernetesComputeConfig {
+            sandbox_uid: Some(0),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_sandbox_identity_config().unwrap_err();
+        assert!(err.contains("sandbox_uid"));
+    }
+
+    #[test]
+    fn validate_sandbox_identity_config_rejects_gid_above_max() {
+        let cfg = KubernetesComputeConfig {
+            sandbox_gid: Some(openshell_policy::MAX_SANDBOX_UID + 1),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_sandbox_identity_config().unwrap_err();
+        assert!(err.contains("sandbox_gid"));
+    }
+
+    #[test]
+    fn validate_sandbox_identity_config_accepts_none_fields() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.validate_sandbox_identity_config().is_ok());
     }
 
     #[test]
@@ -676,7 +744,7 @@ mod tests {
             ANNOTATION_SCC_UID_RANGE.to_string(),
             "1000000000/10000".to_string(),
         );
-        assert_eq!(cfg.resolve_sandbox_uid(Some(&anns)), 1000000000);
+        assert_eq!(cfg.resolve_sandbox_uid(Some(&anns)), 1_000_000_000);
     }
 
     #[test]

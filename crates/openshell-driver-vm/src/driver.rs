@@ -264,7 +264,7 @@ impl Default for VmDriverConfig {
 }
 
 impl VmDriverConfig {
-    /// Resolve the sandbox UID, falling back to DEFAULT_SANDBOX_UID.
+    /// Resolve the sandbox UID, falling back to `DEFAULT_SANDBOX_UID`.
     pub fn resolve_sandbox_uid(&self) -> u32 {
         self.sandbox_uid.unwrap_or(DEFAULT_SANDBOX_UID)
     }
@@ -272,6 +272,29 @@ impl VmDriverConfig {
     /// Resolve the sandbox GID, falling back to the resolved UID.
     pub fn resolve_sandbox_gid(&self, resolved_uid: u32) -> u32 {
         self.sandbox_gid.unwrap_or(resolved_uid)
+    }
+
+    pub fn validate_sandbox_identity(&self) -> Result<(), String> {
+        let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
+        if let Some(uid) = self.sandbox_uid
+            && !range.contains(&uid)
+        {
+            return Err(format!(
+                "sandbox_uid {uid} is outside the allowed range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_UID,
+                openshell_policy::MAX_SANDBOX_UID,
+            ));
+        }
+        if let Some(gid) = self.sandbox_gid
+            && !range.contains(&gid)
+        {
+            return Err(format!(
+                "sandbox_gid {gid} is outside the allowed range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_UID,
+                openshell_policy::MAX_SANDBOX_UID,
+            ));
+        }
+        Ok(())
     }
 
     fn requires_tls_materials(&self) -> bool {
@@ -392,6 +415,7 @@ impl VmDriver {
         lifecycle_extensions
             .validate()
             .map_err(|err| err.message().to_string())?;
+        config.validate_sandbox_identity()?;
         if config.openshell_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
         }
@@ -2511,6 +2535,7 @@ impl VmDriver {
         );
     }
 
+    #[allow(clippy::similar_names)]
     async fn build_cached_local_image_rootfs_image(
         &self,
         sandbox_id: &str,
@@ -2638,6 +2663,7 @@ impl VmDriver {
         Ok(())
     }
 
+    #[allow(clippy::similar_names)]
     async fn build_cached_registry_image_rootfs_image(
         &self,
         sandbox_id: &str,

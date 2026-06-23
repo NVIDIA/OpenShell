@@ -218,6 +218,9 @@ impl KubernetesComputeDriver {
         config
             .validate_provider_spiffe_workload_api_socket_path()
             .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_sandbox_identity_config()
+            .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
@@ -331,14 +334,14 @@ impl KubernetesComputeDriver {
         ))
     }
 
-    /// Resolve sandbox UID/GID from config or OpenShift SCC namespace annotations.
+    /// Resolve sandbox UID/GID from config or `OpenShift` SCC namespace annotations.
     ///
     /// Returns `(uid, gid, ns_annotations_map)`:
     /// - If `sandbox_uid` is set in config, returns that (with fallback GID)
     /// - Otherwise fetches the target namespace and checks for
     ///   `openshift.io/sa.scc.uid-range` / `openshift.io/sa.scc.supplemental-groups`
     ///   annotations.
-    /// - If neither config nor OpenShift is found, returns `(1000, 1000, {})` as defaults.
+    /// - If neither config nor `OpenShift` is found, returns `(1000, 1000, {})` as defaults.
     async fn resolve_sandbox_identity(&self) -> (u32, u32, BTreeMap<String, String>) {
         // Explicit config takes priority — skip namespace lookup entirely.
         if self.config.sandbox_uid.is_some() {
@@ -356,22 +359,47 @@ impl KubernetesComputeDriver {
         {
             Ok(Ok(ns)) => {
                 let anns = ns.metadata.annotations.unwrap_or_default();
+                tracing::info!(
+                    namespace = %self.config.namespace,
+                    uid_range = ?anns.get(crate::config::ANNOTATION_SCC_UID_RANGE),
+                    sup_groups = ?anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS),
+                    "Resolved namespace annotations for sandbox identity"
+                );
                 let uid = self.config.resolve_sandbox_uid(Some(&anns));
-                // Collect supplemental groups annotation for sandbox init containers.
-                let gid = if let Some(sup_range) =
-                    anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS)
-                {
-                    KubernetesComputeConfig::from_open_shift_supplemental_groups(sup_range)
-                        .unwrap_or(uid)
-                } else {
-                    uid
-                };
+                // Explicit sandbox_gid config wins; SCC annotation only applies when not set.
+                let baseline_gid = self.config.resolve_sandbox_gid(uid, None);
+                let gid = self.config.sandbox_gid.map_or_else(
+                    || {
+                        anns.get(crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS)
+                            .and_then(|sup_range| {
+                                KubernetesComputeConfig::from_open_shift_supplemental_groups(
+                                    sup_range,
+                                )
+                            })
+                            .unwrap_or(baseline_gid)
+                    },
+                    |_| baseline_gid,
+                );
+                tracing::info!(uid, gid, "Resolved sandbox identity");
                 (uid, gid, anns)
             }
-            Ok(Err(_)) | Err(_) => {
-                // Namespace fetch failed or timed out — fall back to defaults.
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    namespace = %self.config.namespace,
+                    error = %e,
+                    "Failed to fetch namespace for SCC annotations, falling back to defaults"
+                );
                 let uid = DEFAULT_SANDBOX_UID;
-                let gid = uid;
+                let gid = self.config.resolve_sandbox_gid(uid, None);
+                (uid, gid, BTreeMap::new())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    namespace = %self.config.namespace,
+                    "Namespace fetch timed out, falling back to defaults"
+                );
+                let uid = DEFAULT_SANDBOX_UID;
+                let gid = self.config.resolve_sandbox_gid(uid, None);
                 (uid, gid, BTreeMap::new())
             }
         }
@@ -496,6 +524,7 @@ impl KubernetesComputeDriver {
         }
     }
 
+    #[allow(clippy::similar_names)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
         let _ = KubernetesSandboxDriverConfig::from_sandbox(sandbox)
             .map_err(KubernetesDriverError::InvalidArgument)?;
@@ -521,7 +550,6 @@ impl KubernetesComputeDriver {
 
         // Resolve sandbox UID/GID from config or OpenShift SCC namespace annotations.
         let (resolved_uid, resolved_gid, ns_annotations) = self.resolve_sandbox_identity().await;
-
 
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
@@ -550,17 +578,29 @@ impl KubernetesComputeDriver {
             sandbox_gid: resolved_gid,
         };
 
-        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
-        let resource = ApiResource::from_gvk(&gvk);
-        let mut obj = DynamicObject::new(name, &resource);
+        let mut obj = DynamicObject::new(name, &agent_sandbox_api.resource);
+        // Copy only the SCC-related annotations onto the Sandbox CR for
+        // traceability. Copying the full namespace annotation map exposes
+        // unrelated cluster metadata and can fail with oversized annotations.
+        let scc_annotations: BTreeMap<String, String> = [
+            crate::config::ANNOTATION_SCC_UID_RANGE,
+            crate::config::ANNOTATION_SCC_SUPPLEMENTAL_GROUPS,
+        ]
+        .iter()
+        .filter_map(|key| {
+            ns_annotations
+                .get(*key)
+                .map(|v| ((*key).to_string(), v.clone()))
+        })
+        .collect();
         obj.metadata = ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(self.config.namespace.clone()),
             labels: Some(sandbox_labels(sandbox)),
-            annotations: if ns_annotations.is_empty() {
+            annotations: if scc_annotations.is_empty() {
                 None
             } else {
-                Some(ns_annotations)
+                Some(scc_annotations)
             },
             ..Default::default()
         };
@@ -1080,6 +1120,7 @@ fn supervisor_init_container(
 /// In both cases, the agent container gets a command override to run the
 /// side-loaded binary and `runAsUser: 0` so it can create network namespaces,
 /// set up the proxy, and configure Landlock/seccomp.
+#[allow(clippy::similar_names)]
 fn apply_supervisor_sideload(
     pod_template: &mut serde_json::Value,
     supervisor_image: &str,
@@ -1205,12 +1246,20 @@ fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
     image_pull_policy: &str,
-    sandbox_uid: u32,
     sandbox_gid: u32,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
     };
+
+    // fsGroup is a pod-level field — it instructs kubelet to chown mounted
+    // volumes to this GID. It is invalid at the container securityContext level.
+    let pod_sc = spec
+        .entry("securityContext")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(pod_sc_obj) = pod_sc.as_object_mut() {
+        pod_sc_obj.insert("fsGroup".to_string(), serde_json::json!(sandbox_gid));
+    }
 
     // 1. Add workspace volume mount to the agent container
     let containers = spec.get_mut("containers").and_then(|v| v.as_array_mut());
@@ -1270,9 +1319,7 @@ fn apply_workspace_persistence(
             "image": image,
             "command": ["sh", "-c", copy_cmd],
             "securityContext": {
-                "runAsUser": sandbox_uid,
-                "runAsGroup": sandbox_gid,
-                "fsGroup": sandbox_gid,
+                "runAsUser": 0,
             },
             "volumeMounts": [{
                 "name": WORKSPACE_VOLUME_NAME,
@@ -1733,7 +1780,6 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
             &mut result,
             image,
             params.image_pull_policy,
-            params.sandbox_uid,
             params.sandbox_gid,
         );
     }
@@ -3037,7 +3083,6 @@ mod tests {
             &mut pod_template,
             "openshell/sandbox:latest",
             "IfNotPresent",
-            1000, // sandbox_uid
             1000, // sandbox_gid
         );
 
@@ -3049,8 +3094,8 @@ mod tests {
         assert_eq!(init_containers[0]["name"], WORKSPACE_INIT_CONTAINER_NAME);
         assert_eq!(init_containers[0]["image"], "openshell/sandbox:latest");
         assert_eq!(init_containers[0]["imagePullPolicy"], "IfNotPresent");
-        // init container runs as the resolved sandbox UID (not root)
-        assert_eq!(init_containers[0]["securityContext"]["runAsUser"], 1000);
+        // init container always runs as root to handle PVC root directory permissions
+        assert_eq!(init_containers[0]["securityContext"]["runAsUser"], 0);
 
         // Init container mounts PVC at temp path, not /sandbox
         let init_mounts = init_containers[0]["volumeMounts"]
@@ -3098,7 +3143,6 @@ mod tests {
             "my-custom-image:v2",
             "IfNotPresent",
             1000,
-            1000,
         );
 
         let init_image = pod_template["spec"]["initContainers"][0]["image"]
@@ -3121,7 +3165,7 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000, 1000);
+        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000);
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()
