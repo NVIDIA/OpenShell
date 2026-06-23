@@ -19,6 +19,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 PORT = int(sys.argv[1])
@@ -74,6 +75,14 @@ def log(message: str) -> None:
 def canonical_ip(value: str):
     parsed = ip_address(value)
     return getattr(parsed, "ipv4_mapped", None) or parsed
+
+
+def captured_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
 
 def subprocess_env(
@@ -173,14 +182,14 @@ class Handler(BaseHTTPRequestHandler):
         except subprocess.TimeoutExpired as err:
             body = {
                 "exit_code": 124,
-                "stdout": err.stdout or "",
-                "stderr": (err.stderr or "")
+                "stdout": captured_text(err.stdout),
+                "stderr": captured_text(err.stderr)
                 + f"\nhost bridge timed out after {TIMEOUT}s\n",
             }
         self.send_json(200, body)
 
-    def log_message(self, fmt: str, *args: object) -> None:
-        log(fmt % args)
+    def log_message(self, format: str, *args: Any) -> None:
+        log(format % args)
 
 
 def main() -> None:
