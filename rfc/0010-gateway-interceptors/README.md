@@ -158,7 +158,7 @@ Each gateway interceptor is a registered service instance that implements the
 ```proto
 service GatewayInterceptor {
   rpc Describe(google.protobuf.Empty) returns (InterceptorManifest);
-  rpc Evaluate(InterceptorEvaluation) returns (InterceptorDecision);
+  rpc Evaluate(InterceptorEvaluation) returns (InterceptorResult);
 }
 ```
 
@@ -195,11 +195,11 @@ input available after state loading and defaulting; it is the main payload for
 `modify_operation`, `validate`, and `post_commit`. `existing_state` is populated
 only when the operation has prior gateway-owned state.
 
-The gateway interceptor response returns an allow/deny decision, optional
+The gateway interceptor response returns an allow/deny result, optional
 patches, and diagnostic metadata for selected gateway operations.
 
 ```proto
-message InterceptorDecision {
+message InterceptorResult {
   bool allowed = 1;
   string reason = 2;
   string status_code = 3;
@@ -219,19 +219,13 @@ service-declared binding that selected the evaluation.
 
 ### Gateway interceptor endpoints
 
-The framework uses one protobuf/gRPC service contract. The gateway derives the
-endpoint type and TLS mode from the gateway interceptor `grpc_endpoint` URI:
+The framework uses one protobuf/gRPC service contract. Gateway interceptor
+endpoints connect over gRPC, either to a remote endpoint or over a Unix domain
+socket.
 
-- `grpc://host:port` connects to a plaintext gRPC gateway interceptor service
-  over TCP.
-- `grpcs://host:port` connects to a TLS-protected gRPC gateway interceptor
-  service over TCP.
-- `unix:///path/to/socket` connects to a gRPC gateway interceptor service over a
-  Unix domain socket.
-
-All gateway interceptor connections require authentication, regardless of
-endpoint type. The exact approach is out of scope for this RFC, but the
-implementation should support mTLS and bearer-token authentication.
+All gateway interceptor connections require authentication. The exact
+authentication model is out of scope for this RFC, but implementations should
+support mTLS and bearer-token authentication.
 
 ### Selection and ordering
 
@@ -257,7 +251,7 @@ message InterceptorBinding {
   repeated string rpcs = 3;
   int32 order = 4;
   bool modifies = 5;
-  string default_failure_policy = 6;
+  string on_error = 6;
   InterceptorSelector selector = 7;
 }
 
@@ -281,7 +275,7 @@ Gateway config example for a remote policy provider:
 ```toml
 [[openshell.gateway.interceptors]]
 name = "policy-provider"
-grpc_endpoint = "grpcs://policy-provider.example.com:8443"
+grpc_endpoint = "https://policy-provider.example.com:8443"
 order = 100
 failure_policy = "fail_closed"
 timeout = "500ms"
@@ -308,8 +302,8 @@ modification order for the same field if that can be detected statically.
 ### Failure policy
 
 Each binding has an effective failure policy. The gateway starts with the
-service default, applies the gateway interceptor service-level gateway config,
-then applies any binding override.
+service-declared binding `on_error` value, applies the gateway interceptor
+service-level gateway config, then applies any binding override.
 
 | Failure policy | Behavior |
 |---|---|
@@ -327,14 +321,14 @@ interceptor service call. Each binding also has a maximum patch count.
 
 ### Observability and audit
 
-Every gateway interceptor decision should emit structured gateway logs with:
+Every gateway interceptor result should emit structured gateway logs with:
 
 - gateway interceptor name
 - binding ID
 - phase
 - RPC service and method
 - principal
-- decision
+- result
 - reason
 - latency
 - failure policy
@@ -369,14 +363,14 @@ InterceptorManifest {
       phases: ["modify_operation"]
       rpcs: ["openshell.v1.OpenShell/CreateSandbox"]
       modifies: true
-      default_failure_policy: "fail_closed"
+      on_error: "fail_closed"
     },
     {
       id: "policy-authority"
       phases: ["validate"]
       rpcs: ["openshell.v1.OpenShell/UpdateConfig"]
       modifies: false
-      default_failure_policy: "fail_closed"
+      on_error: "fail_closed"
     }
   ]
 }
@@ -387,14 +381,14 @@ binding:
 
 ```rust
 // Toy implementation of the GatewayInterceptor Evaluate RPC.
-async fn evaluate(&self, req: InterceptorEvaluation) -> InterceptorDecision {
+async fn evaluate(&self, req: InterceptorEvaluation) -> InterceptorResult {
     match (req.rpc_method.as_str(), req.phase.as_str()) {
         // CreateSandbox: ask the remote policy provider for the approved
         // initial policy and stamp it into the prepared operation input.
         ("CreateSandbox", "modify_operation") => {
             let approved_policy = self.policy_provider.initial_policy(&req).await;
 
-            InterceptorDecision::allow().with_patch(JsonPatch::replace(
+            InterceptorResult::allow().with_patch(JsonPatch::replace(
                 "/policy",
                 approved_policy,
             ))
@@ -402,20 +396,20 @@ async fn evaluate(&self, req: InterceptorEvaluation) -> InterceptorDecision {
 
         // UpdateConfig: reject policy writes the remote provider does not approve.
         ("UpdateConfig", "validate") => {
-            let decision = self.policy_provider.validate_update(&req).await;
-            if !decision.allowed {
-                return InterceptorDecision::reject(
+            let validation = self.policy_provider.validate_update(&req).await;
+            if !validation.allowed {
+                return InterceptorResult::reject(
                     "PERMISSION_DENIED",
-                    decision.reason,
+                    validation.reason,
                 );
             }
 
-            InterceptorDecision::allow()
+            InterceptorResult::allow()
         }
 
         // The service should only receive bound RPCs, but defaulting to allow
         // keeps the handler safe if the manifest grows later.
-        _ => InterceptorDecision::allow(),
+        _ => InterceptorResult::allow(),
     }
 }
 ```
@@ -426,7 +420,7 @@ bindings:
 ```toml
 [[openshell.gateway.interceptors]]
 name = "policy-provider"
-grpc_endpoint = "grpcs://policy-provider.example.com:8443"
+grpc_endpoint = "https://policy-provider.example.com:8443"
 order = 100
 failure_policy = "fail_closed"
 timeout = "500ms"
@@ -450,9 +444,9 @@ This example illustrates the general gateway interceptor design loop:
    application, and test helpers.
 2. Add gateway interceptor configuration parsing to gateway config and validate
    it at startup.
-3. Implement gRPC gateway interceptor clients that derive TCP or Unix domain
-   socket transport from the configured `grpc_endpoint` URI and call `Describe`
-   during startup or config reload.
+3. Implement gRPC gateway interceptor clients that connect to configured
+   gateway interceptor `grpc_endpoint` values and call `Describe` during startup
+   or config reload.
 4. Build an execution plan from service manifests plus gateway-configured
    overrides.
 5. Wire gateway interceptor execution into the gateway API operation pipeline so
@@ -460,7 +454,7 @@ This example illustrates the general gateway interceptor design loop:
    `validate`, and `post_commit` where applicable.
 6. Audit existing gateway operations and route each resource-affecting path
    through the shared gateway interceptor pipeline.
-7. Add gateway interceptor decision audit logging and metrics.
+7. Add gateway interceptor result audit logging and metrics.
 8. Document gateway interceptor configuration, endpoint requirements, failure
     modes, and security guidance.
 
