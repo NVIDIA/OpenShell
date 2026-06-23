@@ -140,12 +140,20 @@ pub async fn run_networking(
                         attempt = attempt,
                         "Container filesystem accessible, resolving policy binary symlinks"
                     );
-                    match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
-                        Ok(()) => {
+                    match resolve_engine
+                        .reload_from_proto_with_pid_if_symlinks_changed(&resolve_proto, pid)
+                    {
+                        Ok(true) => {
                             info!(
                                 pid = pid,
                                 "Policy binary symlink resolution complete \
                                  (check logs above for per-binary results)"
+                            );
+                        }
+                        Ok(false) => {
+                            info!(
+                                pid = pid,
+                                "Policy binary symlink resolution found no additional paths"
                             );
                         }
                         Err(e) => {

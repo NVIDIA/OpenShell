@@ -424,6 +424,26 @@ impl OpaEngine {
         Ok(())
     }
 
+    /// Reload after startup symlink resolution only when resolution changes
+    /// the policy data produced from this same proto.
+    ///
+    /// This is for the one-time post-startup symlink pass. Generic policy
+    /// reloads must use [`Self::reload_from_proto_with_pid`] so a new policy
+    /// snapshot is applied even when it contains no resolvable symlinks.
+    pub fn reload_from_proto_with_pid_if_symlinks_changed(
+        &self,
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+    ) -> Result<bool> {
+        let unresolved_data_json = proto_to_opa_data_json(proto, 0);
+        let resolved_data_json = proto_to_opa_data_json(proto, entrypoint_pid);
+        if resolved_data_json == unresolved_data_json {
+            return Ok(false);
+        }
+        self.reload_from_proto_with_pid(proto, entrypoint_pid)?;
+        Ok(true)
+    }
+
     /// Current policy generation. Successful reloads increment this value.
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
@@ -5118,9 +5138,15 @@ network_policies:
 
         // Hot-reload with real PID — symlinks resolved
         let our_pid = std::process::id();
+        let before_reload_generation = engine.current_generation();
         engine
             .reload_from_proto_with_pid(&proto, our_pid)
             .expect("reload with PID");
+        assert_eq!(
+            engine.current_generation(),
+            before_reload_generation + 1,
+            "symlink expansion should update policy generation"
+        );
 
         // Now the resolved path should be ALLOWED
         let decision = engine.evaluate_network(&input_resolved).unwrap();
@@ -5128,6 +5154,55 @@ network_policies:
             decision.allowed,
             "After reload with PID, resolved path should be allowed: {}",
             decision.reason
+        );
+    }
+
+    #[test]
+    fn reload_from_proto_with_pid_skips_noop_generation_change() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "python".to_string(),
+            NetworkPolicyRule {
+                name: "python".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "pypi.org".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/python*".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+
+        let engine = OpaEngine::from_proto(&proto).expect("initial load");
+        let generation = engine.current_generation();
+        let reloaded = engine
+            .reload_from_proto_with_pid_if_symlinks_changed(&proto, std::process::id())
+            .expect("noop symlink resolution with PID");
+
+        assert!(!reloaded, "glob-only policy should not require a reload");
+        assert_eq!(
+            engine.current_generation(),
+            generation,
+            "no-op symlink resolution must not invalidate in-flight L7 guards"
         );
     }
 
