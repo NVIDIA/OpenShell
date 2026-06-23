@@ -2,16 +2,16 @@
 
 > This is an appendix to the [RFC](../README.md). Please familiarize yourself with the RFC before reading this.
 
-This appendix records why the first version uses an externally managed service endpoint and what deployment modes remain open for later evaluation. Supporting multiple deployment modes is an explicit non-goal of the main RFC; this document preserves the analysis so the decision is not lost.
+This appendix records why the first version of supervisor middleware uses an externally managed network service endpoint and what deployment modes remain open for later evaluation. Supporting multiple deployment modes is an explicit non-goal of the main RFC; this document preserves the analysis so the decision is not lost.
 
 ## Decision: an externally managed service endpoint
 
-The first version routes selected egress to a middleware service reachable over the network, operated by the user. OpenShell holds only the connection details (endpoint, transport, and any auth material) and the request/response contract. It does not package, deploy, or manage the lifecycle of the middleware.
+The first version routes selected egress evaluations to a middleware service reachable by the supervisor, operated by the user. OpenShell holds only the connection details (endpoint, transport, and any auth material) and the operation-specific evaluation/result contract. It does not package, deploy, or manage the lifecycle of the middleware.
 
 Rationale:
 
 - **Minimal new infrastructure.** OpenShell does not have to build image packaging, process supervision, or a runtime for the middleware. The first iteration can focus on the contract, failure behavior, and the supervisor integration.
-- **Portable across compute drivers.** A network endpoint is reachable from a sandbox regardless of whether it runs as a container, a VM, or a local process. A Unix socket would not cross the VM boundary, so a network endpoint is the portable choice that works the same way everywhere.
+- **Portable across compute drivers.** A network endpoint is reachable from supervisors regardless of whether the sandbox workload runs as a container, a VM, or a local process. Other endpoint shapes do not have a universal way to be shared with every relevant supervisor environment yet, so a network endpoint is the portable choice that works the same way everywhere.
 - **Independent iteration.** The middleware is an integration point with another team. An external service lets them deploy, scale, and update it on their own cadence, without coupling releases to OpenShell.
 - **Heavy compute friendly.** Detection work may need GPUs or significant memory. An external service can live wherever those resources are, and can be scaled separately from the sandbox fleet.
 
