@@ -216,9 +216,40 @@ import urllib.request
 
 HOST = {host:?}
 PORT = {port}
-DETAILS = {{}}
+DETAILS = {{
+    "debug_target": {{"host": HOST, "port": PORT}},
+    "debug_proxy_env": {{
+        "http_proxy": os.environ.get("http_proxy"),
+        "https_proxy": os.environ.get("https_proxy"),
+        "HTTP_PROXY": os.environ.get("HTTP_PROXY"),
+        "HTTPS_PROXY": os.environ.get("HTTPS_PROXY"),
+        "NO_PROXY": os.environ.get("NO_PROXY"),
+        "no_proxy": os.environ.get("no_proxy"),
+    }},
+}}
 
-def post_jsonrpc(method, params=None, req_id=1):
+def text(data):
+    return data.decode(errors="replace")
+
+def selected_headers(headers):
+    return {{
+        key.lower(): value
+        for key, value in headers.items()
+        if key.lower() in ("content-type", "content-length", "server")
+    }}
+
+def record_http_error(label, error, request_body):
+    response_body = error.read()
+    DETAILS[f"{{label}}_request"] = request_body
+    DETAILS[f"{{label}}_response"] = {{
+        "status": error.code,
+        "reason": str(error.reason),
+        "headers": selected_headers(error.headers),
+        "body": text(response_body),
+    }}
+    return error.code
+
+def post_jsonrpc(label, method, params=None, req_id=1):
     body = {{"jsonrpc": "2.0", "id": req_id, "method": method}}
     if params is not None:
         body["params"] = params
@@ -234,10 +265,9 @@ def post_jsonrpc(method, params=None, req_id=1):
             response.read()
             return response.status
     except urllib.error.HTTPError as error:
-        error.read()
-        return error.code
+        return record_http_error(label, error, body)
 
-def post_jsonrpc_batch(requests):
+def post_jsonrpc_batch(label, requests):
     encoded = json.dumps(requests).encode()
     request = urllib.request.Request(
         f"http://{{HOST}}:{{PORT}}/mcp",
@@ -250,10 +280,9 @@ def post_jsonrpc_batch(requests):
             response.read()
             return response.status
     except urllib.error.HTTPError as error:
-        error.read()
-        return error.code
+        return record_http_error(label, error, requests)
 
-def post_invalid_json():
+def post_invalid_json(label):
     encoded = b"not valid json {{"
     request = urllib.request.Request(
         f"http://{{HOST}}:{{PORT}}/mcp",
@@ -266,8 +295,7 @@ def post_invalid_json():
             response.read()
             return response.status
     except urllib.error.HTTPError as error:
-        error.read()
-        return error.code
+        return record_http_error(label, error, text(encoded))
 
 def proxy_parts(*names):
     proxy_url = next((os.environ.get(name) for name in names if os.environ.get(name)), None)
@@ -309,6 +337,14 @@ def status_code(response, label):
         DETAILS[f"{{label}}_raw"] = response.decode(errors="replace")
         raise RuntimeError(f"{{label}}: non-numeric HTTP status: {{response!r}}") from error
 
+def record_raw_response(label, response, body=b""):
+    code = status_code(response, label)
+    if code != 200:
+        DETAILS[f"{{label}}_raw"] = text(response)
+        if body:
+            DETAILS[f"{{label}}_body"] = text(body)
+    return code
+
 def connect_http_status(label, request):
     proxy_host, proxy_port = proxy_parts("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
     target = f"{{HOST}}:{{PORT}}"
@@ -321,13 +357,13 @@ def connect_http_status(label, request):
                     f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode()
                 )
                 connect_response = read_until(sock, b"\r\n\r\n")
-                connect_code = status_code(connect_response, f"{{label}}_connect")
+                connect_code = record_raw_response(f"{{label}}_connect", connect_response)
                 if connect_code != 200:
                     return connect_code
                 sock.sendall(request)
                 sock.shutdown(socket.SHUT_WR)
-                response = read_until(sock, b"\r\n\r\n")
-                return status_code(response, f"{{label}}_response")
+                response, body = read_response(sock)
+                return record_raw_response(f"{{label}}_response", response, body)
         except (OSError, RuntimeError) as error:
             last_error = error
             DETAILS[f"{{label}}_attempt_{{attempt + 1}}_error"] = str(error)
@@ -353,31 +389,31 @@ def connect_jsonrpc_status(method, params, label):
 
 results = {{
     # forward proxy — method-only allow rules
-    "forward_method_initialize_allowed": post_jsonrpc("initialize", {{"protocolVersion": "2025-11-25", "capabilities": {{}}}}),
-    "forward_method_tools_list_allowed": post_jsonrpc("tools/list"),
+    "forward_method_initialize_allowed": post_jsonrpc("forward_method_initialize_allowed", "initialize", {{"protocolVersion": "2025-11-25", "capabilities": {{}}}}),
+    "forward_method_tools_list_allowed": post_jsonrpc("forward_method_tools_list_allowed", "tools/list"),
 
     # forward proxy — params allow rules
-    "forward_tools_call_params_name_no_args_allowed": post_jsonrpc("tools/call", {{"name": "read_status"}}),
-    "forward_tools_call_params_nested_args_allowed": post_jsonrpc("tools/call", {{"name": "submit_report", "arguments": {{"scope": "workspace/main", "title": "test"}}}}),
+    "forward_tools_call_params_name_no_args_allowed": post_jsonrpc("forward_tools_call_params_name_no_args_allowed", "tools/call", {{"name": "read_status"}}),
+    "forward_tools_call_params_nested_args_allowed": post_jsonrpc("forward_tools_call_params_nested_args_allowed", "tools/call", {{"name": "submit_report", "arguments": {{"scope": "workspace/main", "title": "test"}}}}),
 
     # forward proxy — params denied
-    "forward_tools_call_params_name_no_args_denied": post_jsonrpc("tools/call", {{"name": "blocked_action"}}),
-    "forward_tools_call_params_name_with_args_denied": post_jsonrpc("tools/call", {{"name": "blocked_action", "arguments": {{"reason": "test"}}}}),
+    "forward_tools_call_params_name_no_args_denied": post_jsonrpc("forward_tools_call_params_name_no_args_denied", "tools/call", {{"name": "blocked_action"}}),
+    "forward_tools_call_params_name_with_args_denied": post_jsonrpc("forward_tools_call_params_name_with_args_denied", "tools/call", {{"name": "blocked_action", "arguments": {{"reason": "test"}}}}),
 
     # forward proxy — batch: all requests allowed
-    "forward_batch_all_allowed": post_jsonrpc_batch([
+    "forward_batch_all_allowed": post_jsonrpc_batch("forward_batch_all_allowed", [
         {{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}},
         {{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {{"name": "read_status"}}}},
     ]),
 
     # forward proxy — batch: one denied request causes full batch denial
-    "forward_batch_one_denied": post_jsonrpc_batch([
+    "forward_batch_one_denied": post_jsonrpc_batch("forward_batch_one_denied", [
         {{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}},
         {{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {{"name": "blocked_action"}}}},
     ]),
 
     # forward proxy — invalid JSON body fails closed before generic rules apply
-    "forward_invalid_json_denied": post_invalid_json(),
+    "forward_invalid_json_denied": post_invalid_json("forward_invalid_json_denied"),
 
     # CONNECT path — representative allowed and denied cases
     "connect_method_initialize_allowed": connect_jsonrpc_status("initialize", {{"protocolVersion": "2025-11-25", "capabilities": {{}}}}, "connect_method_initialize_allowed"),
