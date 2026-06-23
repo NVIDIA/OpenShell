@@ -1724,7 +1724,11 @@ where
                 client.write_all(overflow).await.into_diagnostic()?;
                 client.flush().await.into_diagnostic()?;
             }
-            relay_until_eof(upstream, client).await?;
+            if event_stream {
+                relay_until_eof_without_idle_timeout(upstream, client).await?;
+            } else {
+                relay_until_eof(upstream, client).await?;
+            }
             client.flush().await.into_diagnostic()?;
             return Ok(RelayOutcome::Consumed);
         }
@@ -2024,6 +2028,26 @@ where
                 return Ok(());
             }
         }
+    }
+}
+
+/// Relay all bytes from reader to writer until EOF without an idle timeout.
+///
+/// Used for server-sent events, where long idle gaps are part of the protocol
+/// and do not mean the response body is complete.
+async fn relay_until_eof_without_idle_timeout<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; RELAY_BUF_SIZE];
+    loop {
+        let n = reader.read(&mut buf).await.into_diagnostic()?;
+        if n == 0 {
+            return Ok(());
+        }
+        writer.write_all(&buf[..n]).await.into_diagnostic()?;
+        writer.flush().await.into_diagnostic()?;
     }
 }
 
@@ -3158,6 +3182,60 @@ mod tests {
         let received_str = String::from_utf8_lossy(&received);
         assert!(received_str.contains("Content-Type: text/event-stream"));
         assert!(received_str.contains("event: message"));
+    }
+
+    #[tokio::test]
+    async fn relay_response_no_framing_event_stream_survives_idle_gap() {
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        let upstream_task = tokio::spawn(async move {
+            upstream_write
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            upstream_write
+                .write_all(b"event: first\ndata: {}\r\n\r\n")
+                .await
+                .unwrap();
+            upstream_write.flush().await.unwrap();
+            tokio::time::sleep(RELAY_EOF_IDLE_TIMEOUT + std::time::Duration::from_secs(1)).await;
+            let _ = upstream_write
+                .write_all(b"event: second\ndata: {}\r\n\r\n")
+                .await;
+            let _ = upstream_write.shutdown().await;
+        });
+
+        let result = tokio::time::timeout(
+            RELAY_EOF_IDLE_TIMEOUT + std::time::Duration::from_secs(3),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
+        )
+        .await
+        .expect("event stream relay must outlive the generic EOF idle timeout");
+
+        let outcome = result.expect("relay_response should succeed");
+        assert!(
+            matches!(outcome, RelayOutcome::Consumed),
+            "event stream is consumed by read-until-EOF"
+        );
+        upstream_task.await.expect("upstream task should complete");
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received_str = String::from_utf8_lossy(&received);
+        assert!(received_str.contains("event: first"));
+        assert!(
+            received_str.contains("event: second"),
+            "SSE event after idle gap should be forwarded, got: {received_str}"
+        );
     }
 
     #[tokio::test]
