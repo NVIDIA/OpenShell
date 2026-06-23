@@ -19,11 +19,13 @@ OpenShell e2e gateway and one reusable client sandbox serve the whole scenario
 list. The runner deliberately has no gateway credentials; keeping the privileged
 client launch on `host-bridge.py` is the trust boundary. The harness gives the
 runner a per-run bridge capability and gives the bridge the runner container IP.
-The bridge only accepts requests with that capability from that source IP, only
-renders server URLs whose host is the runner container IP, only forwards the MCP
-conformance scenario environment allowlist, and starts the client wrapper with a
-small host environment allowlist instead of inheriting token-bearing host
-environment variables.
+The bridge only accepts requests with that capability, only renders server URLs
+whose host is the runner container IP, only forwards the MCP conformance
+scenario environment allowlist, and starts the client wrapper with a small host
+environment allowlist instead of inheriting token-bearing host environment
+variables. It does not use the HTTP peer source address as the runner identity,
+because Docker NAT can make legitimate callbacks appear to come from a gateway
+address.
 
 The upstream runner reports its test server URL as `localhost`. The runner
 container has an ordinary, externally-routable address on the e2e network, so
