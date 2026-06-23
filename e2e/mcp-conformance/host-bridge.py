@@ -12,6 +12,7 @@ the untrusted runner never needs gateway credentials.
 Usage: host-bridge.py <port> <repo-root> <log-path>
 """
 
+import hmac
 import json
 import os
 import subprocess
@@ -28,6 +29,9 @@ LOG_PATH = Path(sys.argv[3])
 TIMEOUT = (
     int(os.environ.get("OPENSHELL_MCP_CONFORMANCE_CLIENT_TIMEOUT_SECONDS", "120")) + 30
 )
+REQUEST_BODY_TIMEOUT_SECONDS = 10
+MAX_REQUEST_BODY_BYTES = 256 * 1024
+TOKEN_HEADER = "x-openshell-mcp-conformance-token"
 BRIDGE_TOKEN = os.environ["OPENSHELL_MCP_CONFORMANCE_BRIDGE_TOKEN"]
 RUNNER_IP = os.environ["OPENSHELL_MCP_CONFORMANCE_RUNNER_IP"]
 ALLOWED_CONFORMANCE_ENV = frozenset(
@@ -95,17 +99,64 @@ def subprocess_env(
 
 
 class Handler(BaseHTTPRequestHandler):
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(REQUEST_BODY_TIMEOUT_SECONDS)
+
     def send_json(self, status: int, body: dict[str, object]) -> None:
         encoded = json.dumps(body).encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(encoded)))
+        self.send_header("connection", "close")
         self.end_headers()
         self.wfile.write(encoded)
 
     def reject(self, status: int, detail: str) -> None:
+        self.close_connection = True
         log(f"rejecting bridge request from {self.client_address[0]}: {detail}")
         self.send_json(status, {"error": "invalid_bridge_request", "detail": detail})
+
+    def bridge_token_valid(self) -> bool:
+        supplied = self.headers.get(TOKEN_HEADER, "")
+        return hmac.compare_digest(supplied, BRIDGE_TOKEN)
+
+    def request_body_length(self) -> int | None:
+        raw_length = self.headers.get("content-length")
+        if raw_length is None:
+            self.reject(411, "content-length is required")
+            return None
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self.reject(400, "content-length must be an integer")
+            return None
+        if length < 0:
+            self.reject(400, "content-length must not be negative")
+            return None
+        if length > MAX_REQUEST_BODY_BYTES:
+            self.reject(413, "request body is too large")
+            return None
+        return length
+
+    def read_request_payload(self, length: int) -> dict[str, Any] | None:
+        try:
+            raw_body = self.rfile.read(length)
+        except TimeoutError:
+            self.reject(408, "timed out reading request body")
+            return None
+        if len(raw_body) != length:
+            self.reject(400, "request body ended before content-length")
+            return None
+        try:
+            payload = json.loads(raw_body)
+        except json.JSONDecodeError as err:
+            self.reject(400, str(err))
+            return None
+        if not isinstance(payload, dict):
+            self.reject(400, "request body must be a JSON object")
+            return None
+        return payload
 
     def do_POST(self) -> None:
         if self.path != "/run":
@@ -113,24 +164,21 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        try:
-            length = int(self.headers.get("content-length", "0"))
-            payload = json.loads(self.rfile.read(length))
-        except (json.JSONDecodeError, ValueError) as err:
-            self.reject(400, str(err))
+        if not self.bridge_token_valid():
+            self.reject(403, "invalid bridge capability")
             return
 
-        if not isinstance(payload, dict):
-            self.reject(400, "request body must be a JSON object")
+        length = self.request_body_length()
+        if length is None:
+            return
+
+        payload = self.read_request_payload(length)
+        if payload is None:
             return
 
         server_url = payload.get("server_url")
         if not isinstance(server_url, str):
             self.reject(400, "server_url must be a string")
-            return
-
-        if self.headers.get("x-openshell-mcp-conformance-token") != BRIDGE_TOKEN:
-            self.reject(403, "invalid bridge capability")
             return
 
         parsed = urlparse(server_url)
