@@ -391,11 +391,27 @@ pub mod test_support {
             Self::new(key, Ok(token))
         }
 
+        pub fn success_token_exchange(key: &str, token: &str) -> Self {
+            Self::new_with_grant(key, Ok(token), token_exchange_grant())
+        }
+
         pub fn failure(key: &str, error: &str) -> Self {
             Self::new(key, Err(error))
         }
 
+        pub fn failure_token_exchange(key: &str, error: &str) -> Self {
+            Self::new_with_grant(key, Err(error), token_exchange_grant())
+        }
+
         fn new(key: &str, response: std::result::Result<&str, &str>) -> Self {
+            Self::new_with_grant(key, response, token_grant())
+        }
+
+        fn new_with_grant(
+            key: &str,
+            response: std::result::Result<&str, &str>,
+            token_grant: ProviderCredentialTokenGrant,
+        ) -> Self {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let resolver = Arc::new(FakeTokenGrantResolver {
                 requests: requests.clone(),
@@ -409,7 +425,7 @@ pub mod test_support {
                     name: "access_token".to_string(),
                     auth_style: "bearer".to_string(),
                     header_name: "Authorization".to_string(),
-                    token_grant: Some(token_grant()),
+                    token_grant: Some(token_grant),
                     ..Default::default()
                 },
             );
@@ -769,6 +785,45 @@ mod tests {
 
         assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
         fixture.assert_one_request("api.example.com\t443\t/v1/**\tprovider:access_token");
+    }
+
+    #[tokio::test]
+    async fn inject_if_needed_passes_token_exchange_grant_to_resolver() {
+        let fixture = TokenGrantTestFixture::success_token_exchange(
+            "api.example.com\t443\t/v1/**\tprovider:access_token",
+            "grant-token",
+        );
+
+        let ctx = L7EvalContext {
+            host: "api.example.com".into(),
+            port: 443,
+            policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            token_grant_resolver: Some(fixture.resolver()),
+        };
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/projects".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let rewritten = inject_if_needed(req, &ctx)
+            .await
+            .expect("fake token exchange grant should inject");
+        let rewritten =
+            String::from_utf8(rewritten.raw_header).expect("rewritten request should be UTF-8");
+
+        assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
+        fixture.assert_one_token_exchange_request(
+            "api.example.com\t443\t/v1/**\tprovider:access_token",
+        );
     }
 
     #[tokio::test]
