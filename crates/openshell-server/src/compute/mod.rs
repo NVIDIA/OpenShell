@@ -292,7 +292,6 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
-        _allows_loopback_endpoints: bool,
         gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
         let capabilities = driver
@@ -365,7 +364,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             gateway_bind_addresses,
         )
         .await
@@ -394,7 +392,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            false,
             Vec::new(),
         )
         .await
@@ -420,7 +417,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             Vec::new(),
         )
         .await
@@ -449,7 +445,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             Vec::new(),
         )
         .await
