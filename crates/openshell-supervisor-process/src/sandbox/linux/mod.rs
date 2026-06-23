@@ -38,7 +38,14 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     if let Some(ruleset) = prepared.landlock {
         landlock::enforce(ruleset)?;
     }
-    seccomp::apply(&prepared.policy)?;
+    if crate::bootstrap_skipped(crate::BootstrapSubsystem::WorkloadSeccomp) {
+        tracing::warn!(
+            subsystem = "workload-seccomp",
+            "Skipping workload seccomp filter (--skip-bootstrap: outer sandbox owns it)"
+        );
+    } else {
+        seccomp::apply(&prepared.policy)?;
+    }
     Ok(())
 }
 

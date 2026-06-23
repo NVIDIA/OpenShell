@@ -89,7 +89,14 @@ pub async fn run_process(
     // tasks. By this point the orchestrator has finished privileged startup
     // helpers (network namespace setup, nftables probes via run_networking),
     // and the SSH listener and entrypoint child have not been exposed yet.
-    crate::sandbox::apply_supervisor_startup_hardening()?;
+    if crate::bootstrap_skipped(crate::BootstrapSubsystem::SupervisorSeccomp) {
+        tracing::warn!(
+            subsystem = "supervisor-seccomp",
+            "Skipping supervisor seccomp prelude (--skip-bootstrap: outer sandbox owns it)"
+        );
+    } else {
+        crate::sandbox::apply_supervisor_startup_hardening()?;
+    }
 
     // Spawn the bypass detection monitor. It tails dmesg for nftables LOG
     // entries fired by rules installed on the workload's network namespace

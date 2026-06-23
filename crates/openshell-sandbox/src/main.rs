@@ -152,6 +152,15 @@ struct Args {
     /// enforcement runs in another pod.
     #[arg(long, default_value = DEFAULT_MODE)]
     mode: Mode,
+
+    /// Bootstrap subsystems the environment (e.g. an outer sandbox like gVisor)
+    /// owns, so the supervisor SKIPS attempting them instead of failing on the
+    /// host's refusal. Comma-separated: `netns`, `supervisor-seccomp`,
+    /// `workload-seccomp`, or `all`. Empty (the default) attempts all three and
+    /// treats any failure as fatal — byte-identical to upstream. A subsystem
+    /// that is NOT skipped and fails is still fatal.
+    #[arg(long, value_delimiter = ',', env = "OPENSHELL_SKIP_BOOTSTRAP")]
+    skip_bootstrap: Vec<String>,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -221,6 +230,15 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+
+    // Operator-declared skips: bootstrap subsystems the environment owns are
+    // not attempted; everything else stays fatal-on-failure (the upstream
+    // default). Done before run_sandbox so the declaration is in place before
+    // any bootstrap step runs. Empty (default) skips nothing.
+    if !args.skip_bootstrap.is_empty() {
+        let skipped = openshell_sandbox::parse_skip_bootstrap(&args.skip_bootstrap)?;
+        openshell_sandbox::set_skipped_bootstrap(skipped);
+    }
 
     // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).

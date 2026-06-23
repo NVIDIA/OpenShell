@@ -62,6 +62,9 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
+pub use openshell_supervisor_process::{
+    BootstrapSubsystem, parse_skip_bootstrap, set_skipped_bootstrap,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Run a command in the sandbox.
