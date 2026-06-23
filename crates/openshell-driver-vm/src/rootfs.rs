@@ -29,8 +29,10 @@ pub const fn sandbox_guest_init_path() -> &'static str {
 pub fn prepare_sandbox_rootfs_from_image_root(
     rootfs: &Path,
     image_identity: &str,
+    sandbox_user_id: u32,
+    sandbox_group_id: u32,
 ) -> Result<(), String> {
-    prepare_sandbox_rootfs(rootfs)?;
+    prepare_sandbox_rootfs(rootfs, sandbox_user_id, sandbox_group_id)?;
     validate_sandbox_rootfs(rootfs)?;
     fs::write(
         rootfs.join(ROOTFS_VARIANT_MARKER),
@@ -348,7 +350,11 @@ fn append_symlink_to_archive(
         .map_err(|e| format!("append symlink {}: {e}", source_path.display()))
 }
 
-fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
+fn prepare_sandbox_rootfs(
+    rootfs: &Path,
+    sandbox_user_id: u32,
+    sandbox_group_id: u32,
+) -> Result<(), String> {
     for relative in ["opt/openshell/.initialized", "opt/openshell/.rootfs-type"] {
         remove_rootfs_path(rootfs, relative)?;
     }
@@ -377,7 +383,7 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     fs::create_dir_all(&opt_dir).map_err(|e| format!("create {}: {e}", opt_dir.display()))?;
     fs::write(opt_dir.join(".rootfs-type"), "sandbox\n")
         .map_err(|e| format!("write sandbox rootfs marker: {e}"))?;
-    ensure_sandbox_guest_user(rootfs)?;
+    ensure_sandbox_guest_user(rootfs, sandbox_user_id, sandbox_group_id)?;
     create_sandbox_mountpoint(&rootfs.join("sandbox"))?;
     create_sandbox_mountpoint(&rootfs.join("image-cache"))?;
     create_sandbox_mountpoint(&rootfs.join("lower"))?;
@@ -752,16 +758,17 @@ fn temporary_injection_path(image_path: &Path) -> PathBuf {
     ))
 }
 
-fn ensure_sandbox_guest_user(rootfs: &Path) -> Result<(), String> {
-    const SANDBOX_UID: u32 = 10001;
-    const SANDBOX_GID: u32 = 10001;
-
+fn ensure_sandbox_guest_user(
+    rootfs: &Path,
+    sandbox_user_id: u32,
+    sandbox_group_id: u32,
+) -> Result<(), String> {
     let etc_dir = rootfs.join("etc");
     fs::create_dir_all(&etc_dir).map_err(|e| format!("create {}: {e}", etc_dir.display()))?;
 
     ensure_line_in_file(
         &etc_dir.join("group"),
-        &format!("sandbox:x:{SANDBOX_GID}:"),
+        &format!("sandbox:x:{sandbox_group_id}:"),
         |line| line.starts_with("sandbox:"),
     )?;
     ensure_line_in_file(&etc_dir.join("gshadow"), "sandbox:!::", |line| {
@@ -769,7 +776,9 @@ fn ensure_sandbox_guest_user(rootfs: &Path) -> Result<(), String> {
     })?;
     ensure_line_in_file(
         &etc_dir.join("passwd"),
-        &format!("sandbox:x:{SANDBOX_UID}:{SANDBOX_GID}:OpenShell Sandbox:/sandbox:/bin/bash"),
+        &format!(
+            "sandbox:x:{sandbox_user_id}:{sandbox_group_id}:OpenShell Sandbox:/sandbox:/bin/bash"
+        ),
         |line| line.starts_with("sandbox:"),
     )?;
     ensure_line_in_file(
@@ -936,7 +945,9 @@ mod tests {
         fs::write(rootfs.join("bin/sed"), b"sed").expect("write sed");
         fs::write(rootfs.join("sbin/ip"), b"ip").expect("write ip");
 
-        prepare_sandbox_rootfs(&rootfs).expect("prepare sandbox rootfs");
+        // Use a non-standard UID so the test doesn't collide with the default.
+        let uid = 20001;
+        prepare_sandbox_rootfs(&rootfs, uid, uid).expect("prepare sandbox rootfs");
         validate_sandbox_rootfs(&rootfs).expect("validate sandbox rootfs");
 
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
@@ -955,12 +966,14 @@ mod tests {
         assert!(
             fs::read_to_string(rootfs.join("etc/passwd"))
                 .expect("read passwd")
-                .contains("sandbox:x:10001:10001:OpenShell Sandbox:/sandbox:/bin/bash")
+                .contains(&format!(
+                    "sandbox:x:{uid}:{uid}:OpenShell Sandbox:/sandbox:/bin/bash"
+                ))
         );
         assert!(
             fs::read_to_string(rootfs.join("etc/group"))
                 .expect("read group")
-                .contains("sandbox:x:10001:")
+                .contains(&format!("sandbox:x:{uid}:"))
         );
         assert_eq!(
             fs::read_to_string(rootfs.join("etc/hosts")).expect("read hosts"),
@@ -980,7 +993,7 @@ mod tests {
         fs::create_dir_all(rootfs.join("sandbox")).expect("create sandbox workdir");
         fs::write(rootfs.join("sandbox/app.py"), "print('hello')\n").expect("write app");
 
-        prepare_sandbox_rootfs(&rootfs).expect("prepare sandbox rootfs");
+        prepare_sandbox_rootfs(&rootfs, 10001, 10001).expect("prepare sandbox rootfs");
 
         assert!(rootfs.join("sandbox").is_dir());
         assert_eq!(
