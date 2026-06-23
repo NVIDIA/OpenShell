@@ -111,17 +111,21 @@ openshell_bin() {
 
 start_host_bridge() {
   local port=$1
-  local runner_ip
+  local openshell runner_ip
   HOST_BRIDGE_LOG="${ROOT}/.cache/mcp-conformance/host-bridge.log"
   mkdir -p "$(dirname "${HOST_BRIDGE_LOG}")"
 
+  if ! openshell="$(openshell_bin)"; then
+    return 1
+  fi
   if ! runner_ip="$(runner_container_ip)"; then
     return 1
   fi
 
   RUNNER_CONTAINER_IP="${runner_ip}"
   HOST_BRIDGE_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
-  OPENSHELL_MCP_CONFORMANCE_RUNNER_IP="${runner_ip}" \
+  OPENSHELL_BIN="${openshell}" \
+    OPENSHELL_MCP_CONFORMANCE_RUNNER_IP="${runner_ip}" \
     OPENSHELL_MCP_CONFORMANCE_BRIDGE_TOKEN="${HOST_BRIDGE_TOKEN}" \
     python3 "${ROOT}/e2e/mcp-conformance/host-bridge.py" \
     "${port}" "${ROOT}" "${HOST_BRIDGE_LOG}" &

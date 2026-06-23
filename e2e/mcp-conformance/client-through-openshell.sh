@@ -27,8 +27,10 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
 # shellcheck source=e2e/support/gateway-common.sh disable=SC1091
 source "${ROOT}/e2e/support/gateway-common.sh"
-TARGET_DIR="$(e2e_cargo_target_dir "${ROOT}")"
-OPENSHELL_BIN="${OPENSHELL_BIN:-${TARGET_DIR}/debug/openshell}"
+if [ -z "${OPENSHELL_BIN:-}" ]; then
+  TARGET_DIR="$(e2e_cargo_target_dir "${ROOT}")"
+  OPENSHELL_BIN="${TARGET_DIR}/debug/openshell"
+fi
 
 require_active_gateway() {
   local status_output
