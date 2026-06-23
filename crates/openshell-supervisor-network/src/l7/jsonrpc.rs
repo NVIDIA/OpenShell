@@ -271,9 +271,12 @@ fn parse_jsonrpc_response(value: &serde_json::Value) -> std::result::Result<(), 
 fn flatten_jsonrpc_params(
     value: &serde_json::Value,
 ) -> std::result::Result<HashMap<String, String>, String> {
-    let mut params = HashMap::new();
-    flatten_json_value("", value, &mut params)?;
-    Ok(params)
+    let mut params = HashMap::<String, FlattenedParam>::new();
+    flatten_json_value("", 0, value, &mut params)?;
+    Ok(params
+        .into_iter()
+        .map(|(key, param)| (key, param.value))
+        .collect())
 }
 
 fn canonical_params_map(params: &HashMap<String, String>) -> BTreeMap<String, String> {
@@ -290,47 +293,61 @@ fn sha256_json(value: &impl serde::Serialize) -> String {
 
 fn flatten_json_value(
     prefix: &str,
+    path_segments: usize,
     value: &serde_json::Value,
-    out: &mut HashMap<String, String>,
+    out: &mut HashMap<String, FlattenedParam>,
 ) -> std::result::Result<(), String> {
     match value {
         serde_json::Value::Object(map) => {
             for (key, child) in map {
-                if key.contains('.') {
-                    return Err(format!(
-                        "ambiguous dotted params key '{key}' is not allowed"
-                    ));
-                }
+                let next_path_segments = path_segments + 1;
                 let next = if prefix.is_empty() {
                     key.clone()
                 } else {
                     format!("{prefix}.{key}")
                 };
-                flatten_json_value(&next, child, out)?;
+                flatten_json_value(&next, next_path_segments, child, out)?;
             }
         }
         serde_json::Value::String(s) if !prefix.is_empty() => {
-            insert_flattened_param(out, prefix, s.clone())?;
+            insert_flattened_param(out, prefix, s.clone(), path_segments)?;
         }
         serde_json::Value::Number(n) if !prefix.is_empty() => {
-            insert_flattened_param(out, prefix, n.to_string())?;
+            insert_flattened_param(out, prefix, n.to_string(), path_segments)?;
         }
         serde_json::Value::Bool(b) if !prefix.is_empty() => {
-            insert_flattened_param(out, prefix, b.to_string())?;
+            insert_flattened_param(out, prefix, b.to_string(), path_segments)?;
         }
         _ => {}
     }
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct FlattenedParam {
+    value: String,
+    path_segments: usize,
+}
+
 fn insert_flattened_param(
-    out: &mut HashMap<String, String>,
+    out: &mut HashMap<String, FlattenedParam>,
     key: &str,
     value: String,
+    path_segments: usize,
 ) -> std::result::Result<(), String> {
-    if out.insert(key.to_string(), value).is_some() {
-        return Err(format!("ambiguous params key collision at '{key}'"));
+    let param = FlattenedParam {
+        value,
+        path_segments,
+    };
+    if let Some(existing) = out.get_mut(key) {
+        if param.path_segments < existing.path_segments {
+            *existing = param;
+        } else if param.path_segments == existing.path_segments {
+            return Err(format!("ambiguous params key collision at '{key}'"));
+        }
+        return Ok(());
     }
+    out.insert(key.to_string(), param);
     Ok(())
 }
 
@@ -391,16 +408,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_literal_dotted_param_keys() {
+    fn allows_literal_dotted_param_keys() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments.scope":"workspace/other","arguments":{"scope":"workspace/main"}}}"#;
         let info = parse_jsonrpc_body(body);
+        let params = &info.calls.first().expect("single request call").params;
 
-        assert!(info.calls.is_empty());
-        assert!(
-            info.error
-                .as_deref()
-                .is_some_and(|error| error.contains("ambiguous dotted params key")),
-            "expected dotted params key error, got {info:?}"
+        assert!(info.error.is_none());
+        assert_eq!(
+            params.get("arguments.scope").map(String::as_str),
+            Some("workspace/other")
         );
     }
 
@@ -479,9 +495,15 @@ mod tests {
 
     #[test]
     fn detects_flattened_param_collisions() {
-        let mut params = HashMap::from([("arguments.scope".to_string(), "first".to_string())]);
+        let mut params = HashMap::from([(
+            "arguments.scope".to_string(),
+            FlattenedParam {
+                value: "first".to_string(),
+                path_segments: 2,
+            },
+        )]);
 
-        let error = insert_flattened_param(&mut params, "arguments.scope", "second".to_string())
+        let error = insert_flattened_param(&mut params, "arguments.scope", "second".to_string(), 2)
             .expect_err("duplicate flattened key should be ambiguous");
 
         assert!(error.contains("ambiguous params key collision"));

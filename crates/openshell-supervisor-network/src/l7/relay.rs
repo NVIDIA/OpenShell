@@ -2355,6 +2355,61 @@ network_policies:
     }
 
     #[test]
+    fn jsonrpc_params_policy_matches_literal_dotted_keys() {
+        let data = r#"
+network_policies:
+  jsonrpc_api:
+    name: jsonrpc_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow:
+              method: "tools/call"
+              params:
+                arguments.scope: workspace/other
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "jsonrpc_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let mut request = L7RequestInfo {
+            action: "POST".into(),
+            target: "/mcp".into(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+            jsonrpc: Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments.scope":"workspace/other","arguments":{"scope":"workspace/main"}}}"#,
+            )),
+        };
+
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        assert!(allowed, "{reason}");
+
+        request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{"scope":"workspace/other"}}}"#,
+        ));
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        assert!(allowed, "{reason}");
+    }
+
+    #[test]
     fn jsonrpc_log_records_digest_not_args() {
         let info = crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_resource","arguments":{"scope":"secret-scope"}}}"#,

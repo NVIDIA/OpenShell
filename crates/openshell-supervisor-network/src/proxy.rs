@@ -4526,7 +4526,7 @@ network_policies:
                 is_batch: false,
                 receive_stream: false,
                 has_response: false,
-                error: Some("ambiguous dotted params key 'arguments.scope'".to_string()),
+                error: Some("missing or non-string 'jsonrpc' field".to_string()),
             }),
         };
 
@@ -4534,7 +4534,7 @@ network_policies:
 
         assert_eq!(
             reason,
-            "JSON-RPC request rejected: ambiguous dotted params key 'arguments.scope'"
+            "JSON-RPC request rejected: missing or non-string 'jsonrpc' field"
         );
     }
 

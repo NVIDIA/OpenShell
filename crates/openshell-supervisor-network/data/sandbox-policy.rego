@@ -690,8 +690,9 @@ query_value_matches(value, matcher) if {
 	glob.match(any_patterns[i], [], value)
 }
 
-# JSON-RPC method and params matching. The sandbox flattens object params into
-# dot-separated keys before policy evaluation, e.g. arguments.scope.
+# JSON-RPC method and params matching. The sandbox presents scalar object params
+# as dot-separated matcher keys, e.g. arguments.scope. Literal dotted param keys
+# are preserved by Rust flattening and take precedence over deeper nested paths.
 jsonrpc_rule_matches(request, rule) if {
 	jsonrpc := object.get(request, "jsonrpc", {})
 	is_object(jsonrpc)
