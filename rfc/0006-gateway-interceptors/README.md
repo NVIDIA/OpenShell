@@ -216,8 +216,7 @@ endpoint type and TLS mode from the interceptor endpoint URI:
 - `unix:///path/to/socket` connects to a gRPC interceptor service over a Unix domain
   socket.
 
-Remote gRPC interceptors require authentication. The exact configuration shape
-is out of scope for this RFC, but the implementation should support mTLS and
+Remote gRPC interceptors require authentication. The exact approach is out of scope for this RFC, but the implementation should support mTLS and
 bearer-token authentication.
 
 ### Selection and ordering
