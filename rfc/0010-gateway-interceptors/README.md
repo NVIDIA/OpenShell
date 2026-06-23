@@ -322,8 +322,8 @@ Defaults:
 - Modifying and validating bindings default to `fail_closed`.
 - `post_commit` bindings default to `ignore`.
 
-Every gateway interceptor service has a timeout and response size limit. Each
-binding also has a maximum patch count.
+The gateway enforces a timeout and response size limit for every gateway
+interceptor service call. Each binding also has a maximum patch count.
 
 ### Observability and audit
 
