@@ -10,12 +10,12 @@
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
 use aws_sigv4::http_request::SignableBody;
-use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::secrets::{
     SecretResolver, contains_reserved_credential_marker, rewrite_http_header_block,
 };
+use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -442,7 +442,7 @@ where
     // Authorization header (which embeds placeholder strings).
     let raw_for_rewrite;
     let header_source = if options.credential_signing.is_sigv4() {
-        raw_for_rewrite = crate::sigv4::strip_aws_headers(&req.raw_header[..header_end]);
+        raw_for_rewrite = crate::sigv4::strip_aws_headers(&req.raw_header[..header_end])?;
         &raw_for_rewrite[..]
     } else {
         &req.raw_header[..header_end]
@@ -543,17 +543,23 @@ where
                         // be buffered for signing. detect_payload_mode() should
                         // route chunked requests to the streaming path, but
                         // guard here as defense-in-depth.
-                        if matches!(parse_body_length(header_str)?, BodyLength::Chunked) {
+                        let body_length = parse_body_length(header_str)?;
+                        if matches!(body_length, BodyLength::Chunked) {
                             return Err(miette!(
                                 "SigV4 body signing requires Content-Length; \
                                  chunked transfer encoding is not supported in this mode"
                             ));
                         }
+                        // NOTE(defense-in-depth): Build the full request from
+                        // rewritten headers + body. `rewrite_result.rewritten`
+                        // has already had AWS auth headers stripped by
+                        // `strip_aws_headers`; `apply_sigv4_to_request` strips
+                        // them again internally via `parse_request_parts` —
+                        // the redundancy is intentional.
                         let overflow = &req.raw_header[header_end..];
                         let mut full_request = rewrite_result.rewritten.clone();
                         full_request.extend_from_slice(overflow);
-                        if let BodyLength::ContentLength(body_len) = parse_body_length(header_str)?
-                        {
+                        if let BodyLength::ContentLength(body_len) = body_length {
                             if body_len > MAX_SIGV4_BODY_BYTES as u64 {
                                 return Err(miette!(
                                     "SigV4 body signing buffers at most {MAX_SIGV4_BODY_BYTES} bytes"

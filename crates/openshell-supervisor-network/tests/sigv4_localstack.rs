@@ -1,6 +1,9 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 // Local-only integration test — not checked in.
 // Requires LocalStack running on localhost:4566.
-// Run with: cargo test -p openshell-sandbox --test sigv4_localstack -- --ignored --nocapture
+// Run with: cargo test -p openshell-supervisor-network --test sigv4_localstack -- --ignored --nocapture
 
 use openshell_supervisor_network::sigv4::{apply_sigv4_headers_only, apply_sigv4_to_request};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -33,12 +36,10 @@ async fn send_raw(raw: &[u8]) -> (u16, String) {
     let mut buf = Vec::with_capacity(16384);
     let mut tmp = [0u8; 4096];
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut tmp)).await
-        {
-            Ok(Ok(0)) => break,
+        match tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut tmp)).await {
+            Ok(Ok(0)) | Err(_) => break,
             Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
             Ok(Err(e)) => panic!("read error: {e}"),
-            Err(_) => break,
         }
     }
 
@@ -113,7 +114,7 @@ async fn delete_bucket(bucket: &str) {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires LocalStack on localhost:4566"]
 async fn sigv4_s3_create_bucket() {
     let bucket = unique_bucket();
     create_bucket(&bucket).await;
@@ -122,7 +123,7 @@ async fn sigv4_s3_create_bucket() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires LocalStack on localhost:4566"]
 async fn sigv4_s3_put_and_delete_object() {
     let bucket = unique_bucket();
     create_bucket(&bucket).await;
@@ -133,7 +134,7 @@ async fn sigv4_s3_put_and_delete_object() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires LocalStack on localhost:4566"]
 async fn sigv4_s3_get_object_unsigned_payload() {
     let bucket = unique_bucket();
     create_bucket(&bucket).await;
@@ -169,7 +170,7 @@ async fn sigv4_s3_get_object_unsigned_payload() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires LocalStack on localhost:4566"]
 async fn sigv4_sts_get_caller_identity() {
     let body = "Action=GetCallerIdentity&Version=2011-06-15";
     let raw = format!(
@@ -201,7 +202,7 @@ async fn sigv4_sts_get_caller_identity() {
 }
 
 #[tokio::test]
-#[ignore]
+#[ignore = "requires LocalStack on localhost:4566"]
 async fn sigv4_s3_put_with_session_token() {
     let bucket = unique_bucket();
     create_bucket(&bucket).await;

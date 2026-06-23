@@ -64,13 +64,21 @@ pub fn extract_aws_region(host: &str) -> Option<String> {
 /// Removes `Authorization`, `X-Amz-Date`, `X-Amz-Security-Token`, and
 /// `X-Amz-Content-Sha256` headers so the request can pass through the
 /// proxy's fail-closed placeholder scan before re-signing.
-pub fn strip_aws_headers(raw: &[u8]) -> Vec<u8> {
+///
+/// Returns `Err` if the header block is not valid UTF-8.  Failing closed
+/// prevents non-UTF-8 requests from passing through with their original
+/// AWS credentials intact.
+pub fn strip_aws_headers(raw: &[u8]) -> Result<Vec<u8>> {
     let header_end = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(raw.len(), |p| p + 4);
 
-    let header_str = String::from_utf8_lossy(&raw[..header_end]);
+    // The caller (rest.rs) validates UTF-8 strictly before reaching this
+    // point, so `from_utf8` should never fail here. Fail closed so that
+    // crafted non-UTF-8 bytes cannot smuggle AWS credentials through.
+    let header_str = std::str::from_utf8(&raw[..header_end])
+        .map_err(|e| miette!("strip_aws_headers: header block is not valid UTF-8: {e}"))?;
     let lines: Vec<&str> = header_str.split("\r\n").collect();
 
     let mut output = Vec::with_capacity(raw.len());
@@ -102,7 +110,7 @@ pub fn strip_aws_headers(raw: &[u8]) -> Vec<u8> {
         output.extend_from_slice(&raw[header_end..]);
     }
 
-    output
+    Ok(output)
 }
 
 struct RequestParts<'a> {
@@ -119,6 +127,11 @@ struct RequestParts<'a> {
 /// signature. Signing all headers causes failures when the proxy or
 /// transport modifies unsigned-by-convention headers (Connection,
 /// Accept-Encoding, etc.) between signing and delivery.
+///
+/// Header names are lowercased for comparison and stored in lowered form
+/// in `all_headers`. This is intentional — AWS services accept
+/// case-insensitive header names, and this function is only used on the
+/// `SigV4` signing path.
 fn parse_request_parts(header_str: &str) -> RequestParts<'_> {
     // Headers stripped entirely — the SDK re-generates auth headers, and
     // `Expect` is handled by the proxy before forwarding.
@@ -259,8 +272,9 @@ pub fn apply_sigv4_to_request(
         &[]
     };
 
-    let header_str = String::from_utf8_lossy(&raw[..header_end]);
-    let parts = parse_request_parts(&header_str);
+    let header_str = std::str::from_utf8(&raw[..header_end])
+        .map_err(|e| miette!("SigV4 signing: request headers are not valid UTF-8: {e}"))?;
+    let parts = parse_request_parts(header_str);
     let uri = format!("https://{host}{}", parts.path);
     let identity = build_identity(access_key, secret_key, session_token);
     let signing_params = build_signing_params(&identity, region, service)?;
@@ -325,8 +339,9 @@ pub fn apply_sigv4_headers_only_with_body(
     session_token: Option<&str>,
     body: SignableBody<'_>,
 ) -> Result<Vec<u8>> {
-    let header_str = String::from_utf8_lossy(raw_headers);
-    let parts = parse_request_parts(&header_str);
+    let header_str = std::str::from_utf8(raw_headers)
+        .map_err(|e| miette!("SigV4 signing: request headers are not valid UTF-8: {e}"))?;
+    let parts = parse_request_parts(header_str);
     let uri = format!("https://{host}{}", parts.path);
     let identity = build_identity(access_key, secret_key, session_token);
     let signing_params = build_signing_params(&identity, region, service)?;
