@@ -69,11 +69,13 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
+use compute::{
+    ComputeRuntime, DockerComputeConfig, KubernetesComputeConfig, PodmanComputeConfig,
+    VmComputeConfig,
+};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
-use openshell_driver_kubernetes::KubernetesComputeConfig;
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
@@ -858,11 +860,9 @@ fn kubernetes_config_for_k8s_sa_bootstrap(
 }
 
 /// Same pattern as [`kubernetes_config_from_file`] but for Podman.
-fn podman_config_from_file(
-    file: Option<&config_file::ConfigFile>,
-) -> Result<openshell_driver_podman::PodmanComputeConfig> {
+fn podman_config_from_file(file: Option<&config_file::ConfigFile>) -> Result<PodmanComputeConfig> {
     let Some(file) = file else {
-        return Ok(openshell_driver_podman::PodmanComputeConfig::default());
+        return Ok(PodmanComputeConfig::default());
     };
     let merged = config_file::driver_table(
         ComputeDriverKind::Podman,
@@ -876,7 +876,7 @@ fn podman_config_from_file(
 
 fn apply_podman_local_tls_defaults(
     config: &Config,
-    podman: &mut openshell_driver_podman::PodmanComputeConfig,
+    podman: &mut PodmanComputeConfig,
 ) -> Result<()> {
     if config.tls.is_none()
         || podman.guest_tls_ca.is_some()
