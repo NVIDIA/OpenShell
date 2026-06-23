@@ -46,7 +46,7 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
                 "command argument {i} exceeds {MAX_EXEC_ARG_LEN} byte limit"
             )));
         }
-        reject_null_bytes(arg, &format!("command argument {i}"))?;
+        reject_null_char(arg, &format!("command argument {i}"))?;
     }
     for (key, value) in &req.environment {
         if value.len() > MAX_EXEC_ARG_LEN {
@@ -70,28 +70,26 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
 
 /// Reject null bytes and newlines in a user-supplied value.
 pub(super) fn reject_control_chars(value: &str, field_name: &str) -> Result<(), Status> {
+    reject_null_char(value, field_name)?;
+    reject_newline_chars(value, field_name)?;
+    Ok(())
+}
+
+/// Reject null bytes in a user-supplied value.
+pub(super) fn reject_null_char(value: &str, field_name: &str) -> Result<(), Status> {
     if value.bytes().any(|b| b == 0) {
         return Err(Status::invalid_argument(format!(
             "{field_name} contains null bytes"
-        )));
-    }
-    if value.bytes().any(|b| b == b'\n' || b == b'\r') {
-        return Err(Status::invalid_argument(format!(
-            "{field_name} contains newline or carriage return characters"
         )));
     }
     Ok(())
 }
 
-/// Reject only null bytes in a user-supplied value.
-///
-/// Use this for exec command arguments where newlines are legitimate
-/// (e.g. multi-line scripts passed to `bash -c` or `python3 -c`).
-/// The shell-escape layer handles newline safety via single-quoting.
-pub(super) fn reject_null_bytes(value: &str, field_name: &str) -> Result<(), Status> {
-    if value.bytes().any(|b| b == 0) {
+/// Reject newline and carriage return characters in a user-supplied value.
+pub(super) fn reject_newline_chars(value: &str, field_name: &str) -> Result<(), Status> {
+    if value.bytes().any(|b| b == b'\n' || b == b'\r') {
         return Err(Status::invalid_argument(format!(
-            "{field_name} contains null bytes"
+            "{field_name} contains newline or carriage return characters"
         )));
     }
     Ok(())
