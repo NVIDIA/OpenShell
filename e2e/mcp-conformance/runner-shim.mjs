@@ -46,6 +46,10 @@ const bridgeUrl = process.env.MCP_CONFORMANCE_HOST_BRIDGE_URL;
 if (!bridgeUrl) {
   throw new Error('MCP_CONFORMANCE_HOST_BRIDGE_URL is required');
 }
+const bridgeToken = process.env.MCP_CONFORMANCE_HOST_BRIDGE_TOKEN;
+if (!bridgeToken) {
+  throw new Error('MCP_CONFORMANCE_HOST_BRIDGE_TOKEN is required');
+}
 const parsedBridgeUrl = new URL(bridgeUrl);
 if (parsedBridgeUrl.protocol !== 'http:') {
   throw new Error(`bridge URL must use http:, got ${parsedBridgeUrl.protocol}`);
@@ -75,6 +79,7 @@ function postJson(url, payload) {
       headers: {
         'content-type': 'application/json',
         'content-length': body.length,
+        'x-openshell-mcp-conformance-token': bridgeToken,
       },
       agent: false,
     }, (response) => {

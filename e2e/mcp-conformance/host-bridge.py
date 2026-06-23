@@ -27,6 +27,8 @@ LOG_PATH = Path(sys.argv[3])
 TIMEOUT = (
     int(os.environ.get("OPENSHELL_MCP_CONFORMANCE_CLIENT_TIMEOUT_SECONDS", "120")) + 30
 )
+BRIDGE_TOKEN = os.environ["OPENSHELL_MCP_CONFORMANCE_BRIDGE_TOKEN"]
+RUNNER_IP = os.environ["OPENSHELL_MCP_CONFORMANCE_RUNNER_IP"]
 ALLOWED_CONFORMANCE_ENV = frozenset(
     {
         "MCP_CONFORMANCE_SCENARIO",
@@ -118,18 +120,24 @@ class Handler(BaseHTTPRequestHandler):
             self.reject(400, "server_url must be a string")
             return
 
+        if self.headers.get("x-openshell-mcp-conformance-token") != BRIDGE_TOKEN:
+            self.reject(403, "invalid bridge capability")
+            return
+
         parsed = urlparse(server_url)
-        expected_host = os.environ.get(
-            "OPENSHELL_MCP_CONFORMANCE_RUNNER_IP", self.client_address[0]
-        )
         try:
             target_ip = canonical_ip(parsed.hostname or "")
-            expected_ip = canonical_ip(expected_host)
+            expected_ip = canonical_ip(RUNNER_IP)
+            peer_ip = canonical_ip(self.client_address[0])
         except ValueError:
             self.reject(403, "server_url host must match the runner container IP")
             return
 
-        if parsed.scheme not in {"http", "https"} or target_ip != expected_ip:
+        if (
+            parsed.scheme not in {"http", "https"}
+            or target_ip != expected_ip
+            or peer_ip != expected_ip
+        ):
             self.reject(403, "server_url host must match the runner container IP")
             return
 

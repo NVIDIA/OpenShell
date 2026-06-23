@@ -17,10 +17,12 @@ TypeScript `everything-client` inside an OpenShell client sandbox for each
 scenario, so the MCP traffic crosses the sandbox proxy. A single Docker-backed
 OpenShell e2e gateway and one reusable client sandbox serve the whole scenario
 list. The runner deliberately has no gateway credentials; keeping the privileged
-client launch on `host-bridge.py` is the trust boundary. The bridge only accepts
-server URLs whose host is the requesting runner container IP, only forwards the
-MCP conformance scenario environment allowlist, and starts the client wrapper
-with a small host environment allowlist instead of inheriting token-bearing host
+client launch on `host-bridge.py` is the trust boundary. The harness gives the
+runner a per-run bridge capability and gives the bridge the runner container IP.
+The bridge only accepts requests with that capability from that source IP, only
+renders server URLs whose host is the runner container IP, only forwards the MCP
+conformance scenario environment allowlist, and starts the client wrapper with a
+small host environment allowlist instead of inheriting token-bearing host
 environment variables.
 
 The upstream runner reports its test server URL as `localhost`. The runner
