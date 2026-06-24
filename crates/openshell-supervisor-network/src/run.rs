@@ -78,6 +78,7 @@ pub async fn run_networking(
     opa_engine: Option<&Arc<OpaEngine>>,
     retained_proto: Option<&ProtoSandboxPolicy>,
     entrypoint_pid: Arc<AtomicU32>,
+    process_enabled: bool,
     provider_credentials: &ProviderCredentialState,
     sandbox_id: Option<&str>,
     sandbox_name: Option<&str>,
@@ -109,78 +110,83 @@ pub async fn run_networking(
     // before run_process spawns the child, so first wait for the orchestrator
     // to publish a non-zero PID, then poll for proc-root readiness.
     if let (Some(engine), Some(proto)) = (opa_engine, retained_proto) {
-        let resolve_engine = engine.clone();
-        let resolve_proto = proto.clone();
-        let resolve_pid = entrypoint_pid.clone();
-        tokio::spawn(async move {
-            // Phase 1: wait for run_process to publish the entrypoint PID.
-            // 20 attempts * 250ms = 5s window.
-            let mut pid = 0;
-            for attempt in 1..=20 {
-                pid = resolve_pid.load(Ordering::Acquire);
-                if pid != 0 {
-                    break;
-                }
-                debug!(
-                    attempt,
-                    "Entrypoint PID not yet published, waiting before symlink resolution"
-                );
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            if pid == 0 {
-                warn!(
-                    "Entrypoint PID never published; binary symlink resolution skipped. \
-                     Policy binary paths will be matched literally."
-                );
-                let _ = engine_ready_tx.send(true);
-                return;
-            }
-
-            // Phase 2: wait for /proc/<pid>/root/ to become traversable. The
-            // child's mount namespace is typically ready within a few hundred
-            // ms of spawn. 10 attempts * 500ms = 5s window.
-            let probe_path = format!("/proc/{pid}/root/");
-            for attempt in 1..=10 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if std::fs::metadata(&probe_path).is_ok() {
-                    info!(
-                        pid = pid,
-                        attempt = attempt,
-                        "Container filesystem accessible, resolving policy binary symlinks"
-                    );
-                    match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
-                        Ok(()) => {
-                            info!(
-                                pid = pid,
-                                "Policy binary symlink resolution complete \
-                                 (check logs above for per-binary results)"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to rebuild OPA engine with symlink resolution \
-                                 (non-fatal, falling back to literal path matching): {e}"
-                            );
-                        }
+        if process_enabled {
+            let resolve_engine = engine.clone();
+            let resolve_proto = proto.clone();
+            let resolve_pid = entrypoint_pid.clone();
+            tokio::spawn(async move {
+                // Phase 1: wait for run_process to publish the entrypoint PID.
+                // 20 attempts * 250ms = 5s window.
+                let mut pid = 0;
+                for attempt in 1..=20 {
+                    pid = resolve_pid.load(Ordering::Acquire);
+                    if pid != 0 {
+                        break;
                     }
+                    debug!(
+                        attempt,
+                        "Entrypoint PID not yet published, waiting before symlink resolution"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                if pid == 0 {
+                    warn!(
+                        "Entrypoint PID never published; binary symlink resolution skipped. \
+                     Policy binary paths will be matched literally."
+                    );
                     let _ = engine_ready_tx.send(true);
                     return;
                 }
-                debug!(
-                    pid = pid,
-                    attempt = attempt,
-                    probe_path = %probe_path,
-                    "Container filesystem not yet accessible, retrying symlink resolution"
-                );
-            }
-            warn!(
-                "Container filesystem /proc/{pid}/root/ not accessible after 10 attempts (5s); \
+
+                // Phase 2: wait for /proc/<pid>/root/ to become traversable. The
+                // child's mount namespace is typically ready within a few hundred
+                // ms of spawn. 10 attempts * 500ms = 5s window.
+                let probe_path = format!("/proc/{pid}/root/");
+                for attempt in 1..=10 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if std::fs::metadata(&probe_path).is_ok() {
+                        info!(
+                            pid = pid,
+                            attempt = attempt,
+                            "Container filesystem accessible, resolving policy binary symlinks"
+                        );
+                        match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
+                            Ok(()) => {
+                                info!(
+                                    pid = pid,
+                                    "Policy binary symlink resolution complete \
+                                 (check logs above for per-binary results)"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to rebuild OPA engine with symlink resolution \
+                                 (non-fatal, falling back to literal path matching): {e}"
+                                );
+                            }
+                        }
+                        let _ = engine_ready_tx.send(true);
+                        return;
+                    }
+                    debug!(
+                        pid = pid,
+                        attempt = attempt,
+                        probe_path = %probe_path,
+                        "Container filesystem not yet accessible, retrying symlink resolution"
+                    );
+                }
+                warn!(
+                    "Container filesystem /proc/{pid}/root/ not accessible after 10 attempts (5s); \
                  binary symlink resolution skipped. Policy binary paths will be matched literally. \
                  If binaries are symlinks, use canonical paths in your policy \
                  (run 'readlink -f <path>' inside the sandbox)"
-            );
+                );
+                let _ = engine_ready_tx.send(true);
+            });
+        } else {
+            // No process supervisor — PID will never arrive, skip symlink resolution.
             let _ = engine_ready_tx.send(true);
-        });
+        }
     } else {
         // No symlink resolution needed — unblock the proxy immediately.
         let _ = engine_ready_tx.send(true);

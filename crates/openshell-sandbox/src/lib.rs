@@ -273,6 +273,7 @@ pub async fn run_sandbox(
                 opa_engine.as_ref(),
                 retained_proto.as_ref(),
                 entrypoint_pid.clone(),
+                process_enabled,
                 &provider_credentials,
                 sandbox_id.as_deref(),
                 sandbox_name_for_agg.as_deref(),
