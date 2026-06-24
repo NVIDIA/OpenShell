@@ -344,7 +344,7 @@ pub async fn run_server(
 
     let state = Arc::new(state);
 
-    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Resume sandboxes that were stopped during the previous gateway
     // shutdown so the running compute state matches the persisted store.
