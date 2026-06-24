@@ -193,6 +193,10 @@ impl CredentialRuntime {
         self.drivers.contains_key(&driver_name)
     }
 
+    pub fn storage_owns_handle(&self, handle: &CredentialHandle) -> bool {
+        normalize_driver_name(&handle.driver) == self.registry.storage_owner_name()
+    }
+
     pub async fn store_provider_credentials(
         &self,
         provider_name: &str,

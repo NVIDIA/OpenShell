@@ -287,9 +287,6 @@ async fn update_provider_record_validating(
         candidate.credential_expires_at_ms,
         provider.credential_expires_at_ms,
     );
-    for key in updated_credential_values.keys() {
-        candidate.credential_handles.remove(key);
-    }
 
     // Validate BEFORE writing to prevent persisting invalid state.
     // Validate only the mutable fields (credentials/config) plus metadata and
@@ -298,25 +295,42 @@ async fn update_provider_record_validating(
     // strand legacy records whose stored type predates current limits. See
     // #1347.
     super::validation::validate_object_metadata(candidate.metadata.as_ref(), "provider")?;
-    validate_provider_mutable_fields(&candidate)?;
-    delete_removed_provider_credentials(
+    let credential_update = prepare_provider_credential_update(
         credentials,
         candidate.object_name(),
-        &removed_credential_handles,
-    )
-    .await?;
-    for key in removed_credential_handles.keys() {
-        candidate.credential_handles.remove(key);
-    }
-    store_provider_credentials_if_configured(
-        credentials,
-        &mut candidate,
         &updated_credential_values,
         &existing_handles,
     )
     .await?;
-    validate_provider_mutable_fields(&candidate)?;
-    validate_provider_update_against_attached_sandboxes(store, &candidate).await?;
+    if credentials.is_some_and(crate::credentials::CredentialRuntime::stores_provider_credentials) {
+        for key in updated_credential_values.keys() {
+            candidate.credentials.remove(key);
+        }
+    }
+    for key in removed_credential_handles.keys() {
+        candidate.credential_handles.remove(key);
+    }
+    candidate
+        .credential_handles
+        .extend(credential_update.pre_stored_handles.clone());
+    if let Err(err) = validate_provider_mutable_fields(&candidate) {
+        cleanup_pre_stored_provider_credentials(
+            credentials,
+            candidate.object_name(),
+            &credential_update.pre_stored_handles,
+        )
+        .await;
+        return Err(err);
+    }
+    if let Err(err) = validate_provider_update_against_attached_sandboxes(store, &candidate).await {
+        cleanup_pre_stored_provider_credentials(
+            credentials,
+            candidate.object_name(),
+            &credential_update.pre_stored_handles,
+        )
+        .await;
+        return Err(err);
+    }
 
     // Serialize labels for storage
     let labels_map = candidate.object_labels();
@@ -326,14 +340,22 @@ async fn update_provider_record_validating(
     {
         None
     } else {
-        Some(
-            serde_json::to_string(&labels_map)
-                .map_err(|e| Status::internal(format!("serialize labels failed: {e}")))?,
-        )
+        match serde_json::to_string(&labels_map) {
+            Ok(labels_json) => Some(labels_json),
+            Err(e) => {
+                cleanup_pre_stored_provider_credentials(
+                    credentials,
+                    candidate.object_name(),
+                    &credential_update.pre_stored_handles,
+                )
+                .await;
+                return Err(Status::internal(format!("serialize labels failed: {e}")));
+            }
+        }
     };
 
     // Write validated candidate with CAS condition
-    let result = store
+    let write_result = store
         .put_if(
             Provider::object_type(),
             candidate.object_id(),
@@ -342,22 +364,29 @@ async fn update_provider_record_validating(
             labels_json.as_deref(),
             WriteCondition::MatchResourceVersion(cas_version),
         )
-        .await
-        .map_err(|e| {
-            if matches!(e, crate::persistence::PersistenceError::Conflict { .. }) {
-                Status::aborted(format!(
-                    "provider was modified concurrently (current resource_version: {})",
-                    match e {
-                        crate::persistence::PersistenceError::Conflict {
-                            current_resource_version,
-                        } => current_resource_version.unwrap_or(0),
-                        _ => 0,
-                    }
-                ))
-            } else {
-                Status::internal(format!("update provider failed: {e}"))
-            }
-        })?;
+        .await;
+
+    let result = match write_result {
+        Ok(result) => result,
+        Err(e) => {
+            cleanup_pre_stored_provider_credentials(
+                credentials,
+                candidate.object_name(),
+                &credential_update.pre_stored_handles,
+            )
+            .await;
+            return Err(provider_update_persistence_error_to_status(e));
+        }
+    };
+
+    finish_provider_credential_update(
+        credentials,
+        candidate.object_name(),
+        credential_update,
+        &removed_credential_handles,
+        &existing_handles,
+    )
+    .await?;
 
     // Update resource_version from successful write
     if let Some(metadata) = candidate.metadata.as_mut() {
@@ -564,22 +593,132 @@ fn credential_handles_removed_by_update(
         .collect()
 }
 
-async fn delete_removed_provider_credentials(
+#[derive(Debug, Clone, Default)]
+struct ProviderCredentialUpdate {
+    pre_stored_handles: std::collections::HashMap<String, CredentialHandle>,
+    deferred_store_values: std::collections::HashMap<String, String>,
+    replaced_handles: std::collections::HashMap<String, CredentialHandle>,
+}
+
+async fn prepare_provider_credential_update(
     credentials: Option<&crate::credentials::CredentialRuntime>,
     provider_name: &str,
+    updated_values: &std::collections::HashMap<String, String>,
+    existing_handles: &std::collections::HashMap<String, CredentialHandle>,
+) -> Result<ProviderCredentialUpdate, Status> {
+    let Some(credentials) = credentials else {
+        return Ok(ProviderCredentialUpdate::default());
+    };
+    if !credentials.stores_provider_credentials() || updated_values.is_empty() {
+        return Ok(ProviderCredentialUpdate::default());
+    }
+
+    let mut update = ProviderCredentialUpdate::default();
+    let mut values_requiring_new_handles = std::collections::HashMap::new();
+    for (credential_key, value) in updated_values {
+        match existing_handles.get(credential_key) {
+            Some(existing_handle) if credentials.storage_owns_handle(existing_handle) => {
+                update
+                    .deferred_store_values
+                    .insert(credential_key.clone(), value.clone());
+            }
+            Some(replaced_handle) => {
+                values_requiring_new_handles.insert(credential_key.clone(), value.clone());
+                update
+                    .replaced_handles
+                    .insert(credential_key.clone(), replaced_handle.clone());
+            }
+            None => {
+                values_requiring_new_handles.insert(credential_key.clone(), value.clone());
+            }
+        }
+    }
+
+    if !values_requiring_new_handles.is_empty() {
+        update.pre_stored_handles = credentials
+            .store_provider_credentials(
+                provider_name,
+                &values_requiring_new_handles,
+                &std::collections::HashMap::new(),
+            )
+            .await?;
+    }
+
+    Ok(update)
+}
+
+async fn finish_provider_credential_update(
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    provider_name: &str,
+    update: ProviderCredentialUpdate,
     removed_handles: &std::collections::HashMap<String, CredentialHandle>,
+    existing_handles: &std::collections::HashMap<String, CredentialHandle>,
 ) -> Result<(), Status> {
-    if removed_handles.is_empty() {
+    let Some(credentials) = credentials else {
+        return Ok(());
+    };
+    if !credentials.stores_provider_credentials() {
         return Ok(());
     }
-    let credentials = credentials.ok_or_else(|| {
-        Status::failed_precondition(
-            "provider credential handles require a configured credential runtime",
-        )
-    })?;
-    credentials
-        .delete_provider_credential_handles(provider_name, removed_handles)
+
+    if !update.deferred_store_values.is_empty() {
+        credentials
+            .store_provider_credentials(
+                provider_name,
+                &update.deferred_store_values,
+                existing_handles,
+            )
+            .await?;
+    }
+
+    let mut handles_to_delete = removed_handles.clone();
+    handles_to_delete.extend(update.replaced_handles);
+    if !handles_to_delete.is_empty() {
+        credentials
+            .delete_provider_credential_handles(provider_name, &handles_to_delete)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn cleanup_pre_stored_provider_credentials(
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    provider_name: &str,
+    handles: &std::collections::HashMap<String, CredentialHandle>,
+) {
+    if handles.is_empty() {
+        return;
+    }
+    let Some(credentials) = credentials else {
+        return;
+    };
+    if let Err(err) = credentials
+        .delete_provider_credential_handles(provider_name, handles)
         .await
+    {
+        warn!(
+            provider_name = %provider_name,
+            error = %err,
+            "failed to clean up staged provider credentials after provider update failure"
+        );
+    }
+}
+
+fn provider_update_persistence_error_to_status(
+    err: crate::persistence::PersistenceError,
+) -> Status {
+    if let crate::persistence::PersistenceError::Conflict {
+        current_resource_version,
+    } = err
+    {
+        Status::aborted(format!(
+            "provider was modified concurrently (current resource_version: {})",
+            current_resource_version.unwrap_or(0)
+        ))
+    } else {
+        Status::internal(format!("update provider failed: {err}"))
+    }
 }
 
 async fn store_provider_credentials_if_configured(
@@ -6712,6 +6851,69 @@ mod tests {
         );
         assert!(!unchanged.credentials.contains_key("NEW_KEY"));
         assert!(!unchanged.credential_handles.contains_key("NEW_KEY"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_stale_version_does_not_overwrite_stored_credential() {
+        let mut state = test_server_state().await;
+        let config = state
+            .config
+            .clone()
+            .with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = config;
+        state_mut.credentials = credentials;
+
+        handle_create_provider(
+            &state,
+            Request::new(CreateProviderRequest {
+                provider: Some(provider_with_credential_value(
+                    "openai-local",
+                    "openai",
+                    "OPENAI_API_KEY",
+                    "sk-first",
+                )),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Provider>("openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut stale_provider = current.clone();
+        stale_provider.credential_handles.clear();
+        stale_provider
+            .credentials
+            .insert("OPENAI_API_KEY".to_string(), "sk-stale".to_string());
+        stale_provider.metadata.as_mut().unwrap().resource_version = 99;
+
+        let err = handle_update_provider(
+            &state,
+            Request::new(UpdateProviderRequest {
+                provider: Some(stale_provider),
+                credential_expires_at_ms: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::Aborted);
+
+        let resolved = resolve_provider_environment_with_credentials(
+            state.store.as_ref(),
+            &["openai-local".to_string()],
+            &state.credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved.get("OPENAI_API_KEY"),
+            Some(&"sk-first".to_string())
+        );
     }
 
     #[tokio::test]
