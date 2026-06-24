@@ -815,9 +815,12 @@ fn spawn_pty_shell(
             netns_fd,
             #[cfg(target_os = "linux")]
             prepared_sandbox,
-        )?;
+        );
     }
 
+    #[cfg(target_os = "linux")]
+    let mut child = crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd)?;
+    #[cfg(not(target_os = "linux"))]
     let mut child = cmd.spawn()?;
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
@@ -963,9 +966,12 @@ fn spawn_pipe_exec(
             netns_fd,
             #[cfg(target_os = "linux")]
             prepared_sandbox,
-        )?;
+        );
     }
 
+    #[cfg(target_os = "linux")]
+    let mut child = crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd)?;
+    #[cfg(not(target_os = "linux"))]
     let mut child = cmd.spawn()?;
     #[cfg(target_os = "linux")]
     let child_pid = child.id();
@@ -1100,16 +1106,11 @@ mod unsafe_pty {
         slave_fd: RawFd,
         netns_fd: Option<RawFd>,
         #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
-    ) -> anyhow::Result<()> {
+    ) {
         // Wrap in Option so we can .take() it out of the FnMut closure.
         // pre_exec is only called once (after fork, before exec).
         #[cfg(target_os = "linux")]
         let mut prepared = Some(prepared);
-        #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = crate::process::supervisor_identity_mount_from_env()
-            .map_err(|err| {
-                anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
-            })?;
         unsafe {
             cmd.pre_exec(move || {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -1119,13 +1120,10 @@ mod unsafe_pty {
                     netns_fd,
                     &policy,
                     #[cfg(target_os = "linux")]
-                    supervisor_identity_mount,
-                    #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
             });
         }
-        Ok(())
     }
 
     /// Pre-exec hook for pipe-based (non-PTY) exec.
@@ -1145,35 +1143,24 @@ mod unsafe_pty {
         _workdir: Option<String>,
         netns_fd: Option<RawFd>,
         #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
-    ) -> anyhow::Result<()> {
+    ) {
         #[cfg(target_os = "linux")]
         let mut prepared = Some(prepared);
-        #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = crate::process::supervisor_identity_mount_from_env()
-            .map_err(|err| {
-                anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
-            })?;
         unsafe {
             cmd.pre_exec(move || {
                 enter_netns_and_sandbox(
                     netns_fd,
                     &policy,
                     #[cfg(target_os = "linux")]
-                    supervisor_identity_mount,
-                    #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
             });
         }
-        Ok(())
     }
 
     fn enter_netns_and_sandbox(
         netns_fd: Option<RawFd>,
         policy: &SandboxPolicy,
-        #[cfg(target_os = "linux")] supervisor_identity_mount: Option<
-            &crate::process::SupervisorIdentityMountNamespace,
-        >,
         #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> std::io::Result<()> {
         // Enter network namespace before dropping privileges.
@@ -1191,11 +1178,6 @@ mod unsafe_pty {
 
         #[cfg(not(target_os = "linux"))]
         let _ = netns_fd;
-
-        #[cfg(target_os = "linux")]
-        if let Some(mount) = supervisor_identity_mount {
-            mount.enter_for_child()?;
-        }
 
         // Drop privileges. initgroups/setgid/setuid need /etc/group and
         // /etc/passwd which would be blocked if Landlock were already enforced.
@@ -1582,8 +1564,7 @@ mod tests {
                 None,
             )
             .expect("prepare should succeed in test environment"),
-        )
-        .expect("install pre_exec should succeed");
+        );
 
         let output = cmd
             .spawn()

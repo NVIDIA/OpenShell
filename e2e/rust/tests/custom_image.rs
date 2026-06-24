@@ -52,15 +52,10 @@ async fn sandbox_from_custom_dockerfile() {
 
     // Step 2: Create a sandbox from the Dockerfile.
     let dockerfile_str = dockerfile_path.to_str().expect("Dockerfile path is UTF-8");
-    let mut guard = SandboxGuard::create(&[
-        "--from",
-        dockerfile_str,
-        "--",
-        "cat",
-        "/etc/marker.txt",
-    ])
-    .await
-    .expect("sandbox create from Dockerfile");
+    let mut guard =
+        SandboxGuard::create(&["--from", dockerfile_str, "--", "cat", "/etc/marker.txt"])
+            .await
+            .expect("sandbox create from Dockerfile");
 
     // Step 3: Verify the marker file content appears in the output.
     let clean_output = strip_ansi(&guard.create_output);

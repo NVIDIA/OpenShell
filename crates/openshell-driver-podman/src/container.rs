@@ -56,6 +56,8 @@ const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
 const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
 const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
+const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
+    openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 
 /// Directory inside sandbox containers where the supervisor binary is mounted.
 const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
@@ -403,6 +405,13 @@ fn build_env(
         env.insert(
             openshell_core::sandbox_env::TLS_KEY.into(),
             TLS_KEY_MOUNT_PATH.into(),
+        );
+    }
+
+    if let Some(socket_path) = provider_spiffe_workload_api_socket_env_value(config) {
+        env.insert(
+            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET.into(),
+            socket_path,
         );
     }
 
@@ -1013,6 +1022,18 @@ pub fn build_container_spec_with_token_and_gpu_devices(
                     options: ro,
                 });
             }
+            if let Some(path) = provider_spiffe_workload_api_socket_mount_source(config) {
+                let mut ro = vec!["ro".into(), "rbind".into()];
+                if is_selinux_enabled() {
+                    ro.push("z".into());
+                }
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: path.display().to_string(),
+                    destination: PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR.into(),
+                    options: ro,
+                });
+            }
             m.extend(user_mounts.mounts);
             m
         },
@@ -1027,6 +1048,33 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     };
 
     Ok(serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail"))
+}
+
+fn provider_spiffe_workload_api_socket_env_value(config: &PodmanComputeConfig) -> Option<String> {
+    let host_path = config.provider_spiffe_workload_api_socket.as_ref()?;
+    let raw = host_path.to_str()?;
+    if raw.starts_with("tcp:") {
+        return Some(raw.to_string());
+    }
+    let host_path = raw
+        .strip_prefix("unix:")
+        .map_or(host_path.as_path(), Path::new);
+    let file_name = host_path.file_name()?.to_str()?;
+    Some(format!(
+        "{PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR}/{file_name}"
+    ))
+}
+
+fn provider_spiffe_workload_api_socket_mount_source(config: &PodmanComputeConfig) -> Option<&Path> {
+    let host_path = config.provider_spiffe_workload_api_socket.as_ref()?;
+    let raw = host_path.to_str()?;
+    if raw.starts_with("tcp:") {
+        return None;
+    }
+    let host_path = raw
+        .strip_prefix("unix:")
+        .map_or(host_path.as_path(), Path::new);
+    host_path.parent()
 }
 
 fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
@@ -2231,6 +2279,33 @@ mod tests {
             m["type"].as_str() == Some("bind")
                 && m["source"].as_str() == Some("/host/token.jwt")
                 && m["destination"].as_str() == Some("/etc/openshell/auth/sandbox.jwt")
+        }));
+    }
+
+    #[test]
+    fn container_spec_includes_provider_spiffe_socket_when_configured() {
+        let sandbox = test_sandbox("spiffe-id", "spiffe-name");
+        let mut config = test_config();
+        config.provider_spiffe_workload_api_socket =
+            Some(std::path::PathBuf::from("/host/spire-agent.sock"));
+
+        let spec = build_container_spec(&sandbox, &config);
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env_map
+                .get(openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET)
+                .and_then(|v| v.as_str()),
+            Some("/spiffe-workload-api/spire-agent.sock"),
+        );
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        assert!(mounts.iter().any(|m| {
+            m["type"].as_str() == Some("bind")
+                && m["source"].as_str() == Some("/host")
+                && m["destination"].as_str() == Some(PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR)
         }));
     }
 

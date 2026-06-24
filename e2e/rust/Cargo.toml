@@ -63,6 +63,11 @@ path = "tests/podman_gateway_resume.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "provider_token_exchange"
+path = "tests/provider_token_exchange.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
 name = "vm_gateway_resume"
 path = "tests/vm_gateway_resume.rs"
 required-features = ["e2e-vm"]
@@ -110,14 +115,19 @@ futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-prost = "0.13"
+jsonwebtoken = "9"
+prost = "0.14"
 tokio = { version = "1.43", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tempfile = "3"
 sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.9"
 serde_json = "1"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+tower = "0.5"
 
 [lints.rust]
 unsafe_code = "warn"

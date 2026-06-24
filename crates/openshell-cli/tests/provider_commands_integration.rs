@@ -14,7 +14,8 @@ use openshell_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRefreshRequest, DeleteProviderRefreshResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
     GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
@@ -22,11 +23,12 @@ use openshell_core::proto::{
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
-    ProviderProfileDiscovery, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest, setting_value,
+    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant,
+    ProviderCredentialTokenGrantSubjectToken, ProviderCredentialTokenGrantType, ProviderProfile,
+    ProviderProfileCredential, ProviderProfileDiscovery, ProviderResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    Sandbox, SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingValue, SupervisorMessage,
+    UpdateProviderRequest, WatchSandboxRequest, setting_value,
 };
 use openshell_core::{ObjectId, ObjectName};
 use std::collections::HashMap;
@@ -332,6 +334,13 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(RevokeSshSessionResponse::default()))
     }
 
+    async fn exchange_provider_subject_token(
+        &self,
+        _request: tonic::Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn create_provider(
         &self,
         request: tonic::Request<CreateProviderRequest>,
@@ -554,8 +563,8 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
+        let request = request.into_inner();
         let provider = request
-            .into_inner()
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
 
@@ -608,7 +617,7 @@ impl OpenShell for TestOpenShell {
             config: merge(existing.config, provider.config),
             credential_expires_at_ms: merge_expiry(
                 existing.credential_expires_at_ms,
-                provider.credential_expires_at_ms,
+                request.credential_expires_at_ms,
             ),
         };
         let updated_name = updated.object_name().to_string();
@@ -1047,6 +1056,95 @@ async fn enable_providers_v2(ts: &TestServer) {
     );
 }
 
+async fn register_oidc_token_exchange_profile(ts: &TestServer) {
+    ts.state.profiles.lock().await.insert(
+        "oidc-token-exchange".to_string(),
+        ProviderProfile {
+            id: "oidc-token-exchange".to_string(),
+            display_name: "OIDC Token Exchange".to_string(),
+            credentials: vec![
+                ProviderProfileCredential {
+                    name: "user_oidc_token".to_string(),
+                    required: true,
+                    ..Default::default()
+                },
+                ProviderProfileCredential {
+                    name: "api_token".to_string(),
+                    required: true,
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+                        token_endpoint: "https://issuer.example.com/token".to_string(),
+                        subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                            source: "provider_credential".to_string(),
+                            credential: "user_oidc_token".to_string(),
+                            subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
+                                .to_string(),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+    );
+}
+
+async fn register_ambiguous_oidc_token_exchange_profile(ts: &TestServer) {
+    ts.state.profiles.lock().await.insert(
+        "ambiguous-oidc-token-exchange".to_string(),
+        ProviderProfile {
+            id: "ambiguous-oidc-token-exchange".to_string(),
+            display_name: "Ambiguous OIDC Token Exchange".to_string(),
+            credentials: vec![
+                ProviderProfileCredential {
+                    name: "user_oidc_token".to_string(),
+                    required: true,
+                    ..Default::default()
+                },
+                ProviderProfileCredential {
+                    name: "admin_oidc_token".to_string(),
+                    required: true,
+                    ..Default::default()
+                },
+                ProviderProfileCredential {
+                    name: "api_token".to_string(),
+                    required: true,
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+                        token_endpoint: "https://issuer.example.com/token".to_string(),
+                        subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                            source: "provider_credential".to_string(),
+                            credential: "user_oidc_token".to_string(),
+                            subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
+                                .to_string(),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ProviderProfileCredential {
+                    name: "admin_api_token".to_string(),
+                    required: true,
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        grant_type: ProviderCredentialTokenGrantType::TokenExchange as i32,
+                        token_endpoint: "https://issuer.example.com/token".to_string(),
+                        subject_token: Some(ProviderCredentialTokenGrantSubjectToken {
+                            source: "provider_credential".to_string(),
+                            credential: "admin_oidc_token".to_string(),
+                            subject_token_type: "urn:ietf:params:oauth:token-type:access_token"
+                                .to_string(),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+    );
+}
+
 #[tokio::test]
 async fn provider_cli_run_functions_support_full_crud_flow() {
     let ts = run_server().await;
@@ -1071,21 +1169,221 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         .await
         .expect("provider list");
 
-    run::provider_update(
-        &ts.endpoint,
-        "my-claude",
-        false,
-        &["API_KEY=rotated".to_string()],
-        &["profile=prod".to_string()],
-        &[],
-        &ts.tls,
-    )
+    run::provider_update(run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "my-claude",
+        from_existing: false,
+        from_oidc_token: false,
+        credentials: &["API_KEY=rotated".to_string()],
+        config: &["profile=prod".to_string()],
+        credential_expires_at: &[],
+        tls: &ts.tls,
+    })
     .await
     .expect("provider update");
 
     run::provider_delete(&ts.endpoint, &["my-claude".to_string()], &ts.tls)
         .await
         .expect("provider delete");
+}
+
+#[tokio::test]
+async fn provider_create_from_oidc_token_stores_active_gateway_token() {
+    let ts = run_server().await;
+    register_oidc_token_exchange_profile(&ts).await;
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _xdg = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
+    let gateway_name = "oidc-gateway";
+    openshell_bootstrap::oidc_token::store_oidc_token(
+        gateway_name,
+        &openshell_bootstrap::oidc_token::OidcTokenBundle {
+            access_token: "user-access-token".to_string(),
+            refresh_token: Some("user-refresh-token".to_string()),
+            expires_at: Some(1_893_456_000),
+            issuer: "https://issuer.example.com".to_string(),
+            client_id: "openshell-cli".to_string(),
+        },
+    )
+    .expect("store oidc token");
+    let tls = ts.tls.with_gateway_name(gateway_name);
+
+    run::provider_create_with_options(run::ProviderCreateOptions {
+        server: &ts.endpoint,
+        name: "custom-api",
+        provider_type: "oidc-token-exchange",
+        credentials: &[],
+        credential_source: run::ProviderCreateCredentialSource::OidcToken,
+        config: &[],
+        tls: &tls,
+    })
+    .await
+    .expect("provider create from oidc token");
+
+    let provider = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("custom-api")
+        .cloned()
+        .expect("provider");
+    assert_eq!(
+        provider.credentials.get("user_oidc_token"),
+        Some(&"user-access-token".to_string())
+    );
+    assert_eq!(
+        provider.credential_expires_at_ms.get("user_oidc_token"),
+        Some(&1_893_456_000_000)
+    );
+}
+
+#[tokio::test]
+async fn provider_update_from_oidc_token_replaces_subject_token() {
+    let ts = run_server().await;
+    register_oidc_token_exchange_profile(&ts).await;
+    ts.state.providers.lock().await.insert(
+        "custom-api".to_string(),
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-id".to_string(),
+                name: "custom-api".to_string(),
+                ..Default::default()
+            }),
+            r#type: "oidc-token-exchange".to_string(),
+            credentials: std::iter::once(("user_oidc_token".to_string(), "old-token".to_string()))
+                .collect(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+        },
+    );
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _xdg = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
+    let gateway_name = "oidc-gateway";
+    openshell_bootstrap::oidc_token::store_oidc_token(
+        gateway_name,
+        &openshell_bootstrap::oidc_token::OidcTokenBundle {
+            access_token: "new-user-access-token".to_string(),
+            refresh_token: None,
+            expires_at: Some(1_893_456_300),
+            issuer: "https://issuer.example.com".to_string(),
+            client_id: "openshell-cli".to_string(),
+        },
+    )
+    .expect("store oidc token");
+    let tls = ts.tls.with_gateway_name(gateway_name);
+
+    run::provider_update(run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "custom-api",
+        from_existing: false,
+        from_oidc_token: true,
+        credentials: &[],
+        config: &[],
+        credential_expires_at: &[],
+        tls: &tls,
+    })
+    .await
+    .expect("provider update from oidc token");
+
+    let provider = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("custom-api")
+        .cloned()
+        .expect("provider");
+    assert_eq!(
+        provider.credentials.get("user_oidc_token"),
+        Some(&"new-user-access-token".to_string())
+    );
+    assert_eq!(
+        provider.credential_expires_at_ms.get("user_oidc_token"),
+        Some(&1_893_456_300_000)
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_oidc_token_rejects_non_subject_credential() {
+    let ts = run_server().await;
+    register_oidc_token_exchange_profile(&ts).await;
+
+    let err = run::provider_create_with_options(run::ProviderCreateOptions {
+        server: &ts.endpoint,
+        name: "custom-api",
+        provider_type: "oidc-token-exchange",
+        credentials: &["api_token".to_string()],
+        credential_source: run::ProviderCreateCredentialSource::OidcToken,
+        config: &[],
+        tls: &ts.tls,
+    })
+    .await
+    .expect_err("wrong subject credential should fail");
+
+    let message = err.to_string();
+    assert!(message.contains("is not a token_exchange subject credential"));
+    assert!(message.contains("user_oidc_token"));
+}
+
+#[tokio::test]
+async fn provider_create_from_oidc_token_requires_credential_for_ambiguous_profile() {
+    let ts = run_server().await;
+    register_ambiguous_oidc_token_exchange_profile(&ts).await;
+
+    let err = run::provider_create_with_options(run::ProviderCreateOptions {
+        server: &ts.endpoint,
+        name: "custom-api",
+        provider_type: "ambiguous-oidc-token-exchange",
+        credentials: &[],
+        credential_source: run::ProviderCreateCredentialSource::OidcToken,
+        config: &[],
+        tls: &ts.tls,
+    })
+    .await
+    .expect_err("ambiguous subject credential should fail");
+
+    let message = err.to_string();
+    assert!(message.contains("declares multiple token_exchange subject credentials"));
+    assert!(message.contains("user_oidc_token"));
+    assert!(message.contains("admin_oidc_token"));
+    assert!(message.contains("--credential KEY"));
+}
+
+#[tokio::test]
+async fn provider_create_from_oidc_token_reports_expired_token_without_refresh_token() {
+    let ts = run_server().await;
+    register_oidc_token_exchange_profile(&ts).await;
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _xdg = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
+    let gateway_name = "oidc-gateway";
+    openshell_bootstrap::oidc_token::store_oidc_token(
+        gateway_name,
+        &openshell_bootstrap::oidc_token::OidcTokenBundle {
+            access_token: "expired-user-access-token".to_string(),
+            refresh_token: None,
+            expires_at: Some(1),
+            issuer: "https://issuer.example.com".to_string(),
+            client_id: "openshell-cli".to_string(),
+        },
+    )
+    .expect("store oidc token");
+    let tls = ts.tls.with_gateway_name(gateway_name);
+
+    let err = run::provider_create_with_options(run::ProviderCreateOptions {
+        server: &ts.endpoint,
+        name: "custom-api",
+        provider_type: "oidc-token-exchange",
+        credentials: &[],
+        credential_source: run::ProviderCreateCredentialSource::OidcToken,
+        config: &[],
+        tls: &tls,
+    })
+    .await
+    .expect_err("expired oidc token without refresh token should fail");
+
+    let message = err.to_string();
+    assert!(message.contains("failed to load or refresh OIDC token"));
+    assert!(message.contains("no refresh token available"));
 }
 
 #[tokio::test]
@@ -1255,17 +1553,15 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         },
     );
 
-    run::provider_create_with_options(
-        &ts.endpoint,
-        "custom-refresh-provider",
-        "custom-refresh",
-        false,
-        &[],
-        false,
-        true,
-        &[],
-        &ts.tls,
-    )
+    run::provider_create_with_options(run::ProviderCreateOptions {
+        server: &ts.endpoint,
+        name: "custom-refresh-provider",
+        provider_type: "custom-refresh",
+        credentials: &[],
+        credential_source: run::ProviderCreateCredentialSource::Runtime,
+        config: &[],
+        tls: &ts.tls,
+    })
     .await
     .expect("provider create");
 
@@ -1759,9 +2055,18 @@ async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() 
     );
     let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
 
-    run::provider_update(&ts.endpoint, "custom-update", true, &[], &[], &[], &ts.tls)
-        .await
-        .expect("profile-backed provider update --from-existing");
+    run::provider_update(run::ProviderUpdateOptions {
+        server: &ts.endpoint,
+        name: "custom-update",
+        from_existing: true,
+        from_oidc_token: false,
+        credentials: &[],
+        config: &[],
+        credential_expires_at: &[],
+        tls: &ts.tls,
+    })
+    .await
+    .expect("profile-backed provider update --from-existing");
 
     let provider = ts
         .state
@@ -2047,8 +2352,9 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_from_existing() {
     .expect_err("from-gcloud-adc and from-existing should be mutually exclusive");
 
     assert!(
-        err.to_string()
-            .contains("--from-gcloud-adc cannot be combined with --from-existing or --credential"),
+        err.to_string().contains(
+            "--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential"
+        ),
         "unexpected error: {err}"
     );
     assert!(ts.state.providers.lock().await.is_empty());
@@ -2072,8 +2378,9 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_credentials() {
     .expect_err("from-gcloud-adc and credentials should be mutually exclusive");
 
     assert!(
-        err.to_string()
-            .contains("--from-gcloud-adc cannot be combined with --from-existing or --credential"),
+        err.to_string().contains(
+            "--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential"
+        ),
         "unexpected error: {err}"
     );
     assert!(ts.state.providers.lock().await.is_empty());

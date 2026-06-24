@@ -180,14 +180,20 @@ even when local Helm values disable TLS.
 
 If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
 render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
-SPIRE is used only by sandbox pods for dynamic provider token grants. Verify
-that SPIRE is installed, the CSI driver is available, and the Kubernetes driver
-config includes `provider_spiffe_workload_api_socket_path`:
+SPIRE is used by both the gateway and sandbox supervisors for dynamic provider
+token grants. The gateway pod must mount the `spiffe-workload-api` CSI volume
+and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; sandbox pods must
+receive the matching Workload API socket from the Kubernetes driver config.
+The gateway verifies supervisor JWT-SVIDs from JWT bundles fetched through this
+Workload API socket, not from the SPIRE OIDC discovery endpoint.
+Verify that SPIRE is installed, the CSI driver is available, and the Kubernetes
+driver config includes `provider_spiffe_workload_api_socket_path`:
 
 ```bash
 helm -n openshell get values openshell | grep -E 'providerTokenGrants|workloadApiSocketPath'
 kubectl get pods -A | grep -E 'spire|spiffe'
 kubectl -n openshell get configmap openshell-config -o yaml | grep provider_spiffe_workload_api_socket_path
+kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
 ```
 
 Sandbox pods using provider token grants should have an

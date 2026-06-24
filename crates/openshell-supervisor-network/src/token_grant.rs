@@ -39,6 +39,7 @@ use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::proto::ProviderCredentialTokenGrantType;
 use openshell_core::sandbox_env;
 use serde::Deserialize;
 use spiffe::WorkloadApiClient;
@@ -60,6 +61,7 @@ const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
 const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
 const DEFAULT_CLIENT_ASSERTION_TYPE: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+const DEFAULT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 
 /// `OAuth2` token response from the authorization server.
 #[derive(Debug, Clone, Deserialize)]
@@ -153,41 +155,87 @@ impl TokenCache {
 /// - JWT-SVID fetch fails
 /// - Token service request fails
 /// - Token response is invalid
-pub async fn obtain_provider_token(
-    provider_name: &str,
-    token_endpoint: &str,
-    jwt_svid_audience: &str,
-    client_assertion_type: &str,
-    audience: &str,
-    scopes: &[String],
-    cache_ttl_override: i64,
-) -> Result<String> {
+pub struct ObtainProviderTokenRequest<'a> {
+    pub provider_name: &'a str,
+    pub token_endpoint: &'a str,
+    pub jwt_svid_audience: &'a str,
+    pub client_assertion_type: &'a str,
+    pub audience: &'a str,
+    pub scopes: &'a [String],
+    pub cache_ttl_override: i64,
+    pub grant_type: i32,
+    pub subject_token_type: &'a str,
+    pub requested_token_type: &'a str,
+}
+
+pub async fn obtain_provider_token(request: ObtainProviderTokenRequest<'_>) -> Result<String> {
+    let grant_type = ProviderCredentialTokenGrantType::try_from(request.grant_type)
+        .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials);
     obtain_provider_token_with_grant(
         ObtainProviderTokenInput {
             cache: &TOKEN_CACHE,
-            provider_name,
-            token_endpoint,
-            jwt_svid_audience,
-            client_assertion_type,
-            audience,
-            scopes,
-            cache_ttl_override,
+            provider_name: request.provider_name,
+            token_endpoint: request.token_endpoint,
+            jwt_svid_audience: request.jwt_svid_audience,
+            client_assertion_type: request.client_assertion_type,
+            audience: request.audience,
+            scopes: request.scopes,
+            cache_ttl_override: request.cache_ttl_override,
+            grant_type,
+            requested_token_type: request.requested_token_type,
         },
         |jwt_audience| async move {
             // Fetch JWT-SVID with authorization server as audience
             // For RFC 7523, the JWT assertion's aud claim identifies the issuer/realm
             let jwt_svid = fetch_jwt_svid_for_token_grant(&jwt_audience).await?;
 
-            // Perform OAuth2 JWT client assertion grant
-            // The audience parameter in the token request specifies the resource server
-            perform_token_grant(
-                token_endpoint,
-                &jwt_svid,
-                client_assertion_type,
-                audience,
-                scopes,
-            )
-            .await
+            match grant_type {
+                ProviderCredentialTokenGrantType::ClientCredentials
+                | ProviderCredentialTokenGrantType::Unspecified => {
+                    // Perform OAuth2 JWT client assertion grant. The audience
+                    // parameter in the token request specifies the resource server.
+                    perform_token_grant(
+                        request.token_endpoint,
+                        &jwt_svid,
+                        request.client_assertion_type,
+                        request.audience,
+                        request.scopes,
+                    )
+                    .await
+                }
+                ProviderCredentialTokenGrantType::TokenExchange => {
+                    let (provider, credential_key) =
+                        parse_provider_credential_key(request.provider_name)?;
+                    let endpoint = supervisor_gateway_endpoint_from_env()?;
+                    let sandbox_id = supervisor_sandbox_id_from_env()?;
+                    let intermediate =
+                        openshell_core::grpc_client::exchange_provider_subject_token(
+                            &endpoint,
+                            &sandbox_id,
+                            provider,
+                            credential_key,
+                            &jwt_svid,
+                        )
+                        .await
+                        .map_err(|err| {
+                            miette::miette!(
+                                "gateway intermediate provider token exchange failed: {err}"
+                            )
+                        })?;
+                    validate_access_token(&intermediate.access_token)?;
+                    perform_token_exchange(
+                        request.token_endpoint,
+                        &jwt_svid,
+                        request.client_assertion_type,
+                        &intermediate.access_token,
+                        request.subject_token_type,
+                        request.audience,
+                        request.scopes,
+                        request.requested_token_type,
+                    )
+                    .await
+                }
+            }
         },
     )
     .await
@@ -202,6 +250,8 @@ struct ObtainProviderTokenInput<'a> {
     audience: &'a str,
     scopes: &'a [String],
     cache_ttl_override: i64,
+    grant_type: ProviderCredentialTokenGrantType,
+    requested_token_type: &'a str,
 }
 
 async fn obtain_provider_token_with_grant<F, Fut>(
@@ -216,14 +266,16 @@ where
     // For Keycloak: https://auth.example.com/realms/openshell/protocol/openid-connect/token
     //           -> https://auth.example.com/realms/openshell
     let jwt_audience = effective_jwt_svid_audience(input.token_endpoint, input.jwt_svid_audience);
-    let cache_key = token_cache_key(
-        input.provider_name,
-        input.token_endpoint,
-        &jwt_audience,
-        effective_client_assertion_type(input.client_assertion_type),
-        input.audience,
-        input.scopes,
-    );
+    let cache_key = token_cache_key(TokenCacheKeyInput {
+        provider_name: input.provider_name,
+        token_endpoint: input.token_endpoint,
+        jwt_svid_audience: &jwt_audience,
+        client_assertion_type: effective_client_assertion_type(input.client_assertion_type),
+        audience: input.audience,
+        scopes: input.scopes,
+        grant_type: input.grant_type,
+        requested_token_type: effective_token_type(input.requested_token_type),
+    });
 
     // Check cache first
     if let Some(cached) = input.cache.get(&cache_key) {
@@ -256,7 +308,7 @@ async fn fetch_jwt_svid_for_token_grant(audience: &str) -> Result<String> {
     let socket_path = provider_spiffe_workload_api_socket_from_env()?;
 
     let endpoint =
-        crate::spiffe_endpoint::workload_api_endpoint(std::path::Path::new(&socket_path));
+        openshell_core::spiffe::workload_api_endpoint(std::path::Path::new(&socket_path));
 
     // Connect to SPIRE agent
     let client = WorkloadApiClient::connect_to(&endpoint)
@@ -355,6 +407,74 @@ async fn perform_token_grant(
         .await
         .into_diagnostic()
         .wrap_err("failed to parse token response as JSON")?;
+    validate_access_token(&token_response.access_token)?;
+    Ok(token_response)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn perform_token_exchange(
+    token_endpoint: &str,
+    jwt_svid: &str,
+    client_assertion_type: &str,
+    subject_token: &str,
+    subject_token_type: &str,
+    audience: &str,
+    scopes: &[String],
+    requested_token_type: &str,
+) -> Result<TokenResponse> {
+    let token_endpoint_url = parse_token_endpoint_url(token_endpoint)?;
+    let client_assertion_type = effective_client_assertion_type(client_assertion_type);
+    let subject_token_type = effective_token_type(subject_token_type);
+    let requested_token_type = effective_token_type(requested_token_type);
+    let mut form_params = vec![
+        (
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+        ),
+        ("client_assertion_type", client_assertion_type),
+        ("client_assertion", jwt_svid),
+        ("subject_token", subject_token),
+        ("subject_token_type", subject_token_type),
+        ("requested_token_type", requested_token_type),
+    ];
+
+    let audience_param;
+    if !audience.is_empty() {
+        audience_param = audience.to_string();
+        form_params.push(("audience", &audience_param));
+    }
+
+    let scope_param;
+    if !scopes.is_empty() {
+        scope_param = scopes.join(" ");
+        form_params.push(("scope", &scope_param));
+    }
+
+    let response = TOKEN_GRANT_HTTP_CLIENT
+        .post(token_endpoint_url)
+        .form(&form_params)
+        .send()
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to POST token exchange to {token_endpoint}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read response body>".to_string());
+        return Err(miette::miette!(
+            "{}",
+            token_grant_failure_message(status, &body)
+        ));
+    }
+
+    let token_response = response
+        .json::<TokenResponse>()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to parse token exchange response as JSON")?;
     validate_access_token(&token_response.access_token)?;
     Ok(token_response)
 }
@@ -491,22 +611,59 @@ fn effective_client_assertion_type(client_assertion_type: &str) -> &str {
     }
 }
 
-fn token_cache_key(
-    provider_name: &str,
-    token_endpoint: &str,
-    jwt_svid_audience: &str,
-    client_assertion_type: &str,
-    audience: &str,
-    scopes: &[String],
-) -> String {
+fn effective_token_type(token_type: &str) -> &str {
+    if token_type.trim().is_empty() {
+        DEFAULT_TOKEN_TYPE
+    } else {
+        token_type
+    }
+}
+
+fn supervisor_gateway_endpoint_from_env() -> Result<String> {
+    std::env::var(sandbox_env::ENDPOINT)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| miette::miette!("{} not set", sandbox_env::ENDPOINT))
+}
+
+fn supervisor_sandbox_id_from_env() -> Result<String> {
+    std::env::var(sandbox_env::SANDBOX_ID)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| miette::miette!("{} not set", sandbox_env::SANDBOX_ID))
+}
+
+fn parse_provider_credential_key(key: &str) -> Result<(&str, &str)> {
+    let provider_and_credential = key
+        .rsplit_once('\t')
+        .map_or(key, |(_, provider_and_credential)| provider_and_credential);
+    provider_and_credential.split_once(':').ok_or_else(|| {
+        miette::miette!("dynamic token grant key is missing provider credential identity")
+    })
+}
+
+struct TokenCacheKeyInput<'a> {
+    provider_name: &'a str,
+    token_endpoint: &'a str,
+    jwt_svid_audience: &'a str,
+    client_assertion_type: &'a str,
+    audience: &'a str,
+    scopes: &'a [String],
+    grant_type: ProviderCredentialTokenGrantType,
+    requested_token_type: &'a str,
+}
+
+fn token_cache_key(input: TokenCacheKeyInput<'_>) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}",
-        provider_name,
-        token_endpoint,
-        jwt_svid_audience,
-        client_assertion_type,
-        audience,
-        scopes.join(" ")
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        input.provider_name,
+        input.token_endpoint,
+        input.jwt_svid_audience,
+        input.client_assertion_type,
+        input.audience,
+        input.scopes.join(" "),
+        input.grant_type as i32,
+        input.requested_token_type
     )
 }
 
@@ -778,6 +935,8 @@ mod tests {
                 audience: input.audience,
                 scopes: input.scopes,
                 cache_ttl_override: input.cache_ttl_override,
+                grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+                requested_token_type: "",
             },
             move |_| {
                 let grant_calls = input.grant_calls.clone();
@@ -814,6 +973,8 @@ mod tests {
                 audience,
                 scopes,
                 cache_ttl_override,
+                grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+                requested_token_type: "",
             },
             |_| async { Err(miette::miette!("grant should not be called on cache hit")) },
         )
@@ -916,42 +1077,97 @@ mod tests {
 
     #[test]
     fn token_cache_key_varies_by_resource_audience_and_scopes() {
-        let base = token_cache_key(
-            "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
-            "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
-            "https://auth.example.com/realms/openshell",
-            DEFAULT_CLIENT_ASSERTION_TYPE,
-            "alpha",
-            &["alpha".to_string()],
-        );
-        let different_audience = token_cache_key(
-            "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
-            "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
-            "https://auth.example.com/realms/openshell",
-            DEFAULT_CLIENT_ASSERTION_TYPE,
-            "delta",
-            &["alpha".to_string()],
-        );
-        let different_scopes = token_cache_key(
-            "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
-            "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
-            "https://auth.example.com/realms/openshell",
-            DEFAULT_CLIENT_ASSERTION_TYPE,
-            "alpha",
-            &["delta".to_string()],
-        );
-        let different_assertion_type = token_cache_key(
-            "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
-            "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
-            "https://auth.example.com/realms/openshell",
-            "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
-            "alpha",
-            &["alpha".to_string()],
-        );
+        let provider_name = "alpha.default.svc.cluster.local\t80\t\tprovider:access_token";
+        let token_endpoint =
+            "https://auth.example.com/realms/openshell/protocol/openid-connect/token";
+        let jwt_svid_audience = "https://auth.example.com/realms/openshell";
+        let alpha_scopes = ["alpha".to_string()];
+        let delta_scopes = ["delta".to_string()];
+        let base = token_cache_key(TokenCacheKeyInput {
+            provider_name,
+            token_endpoint,
+            jwt_svid_audience,
+            client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+            audience: "alpha",
+            scopes: &alpha_scopes,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+            requested_token_type: DEFAULT_TOKEN_TYPE,
+        });
+        let different_audience = token_cache_key(TokenCacheKeyInput {
+            provider_name,
+            token_endpoint,
+            jwt_svid_audience,
+            client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+            audience: "delta",
+            scopes: &alpha_scopes,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+            requested_token_type: DEFAULT_TOKEN_TYPE,
+        });
+        let different_scopes = token_cache_key(TokenCacheKeyInput {
+            provider_name,
+            token_endpoint,
+            jwt_svid_audience,
+            client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+            audience: "alpha",
+            scopes: &delta_scopes,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+            requested_token_type: DEFAULT_TOKEN_TYPE,
+        });
+        let different_assertion_type = token_cache_key(TokenCacheKeyInput {
+            provider_name,
+            token_endpoint,
+            jwt_svid_audience,
+            client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
+            audience: "alpha",
+            scopes: &alpha_scopes,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+            requested_token_type: DEFAULT_TOKEN_TYPE,
+        });
 
         assert_ne!(base, different_audience);
         assert_ne!(base, different_scopes);
         assert_ne!(base, different_assertion_type);
+    }
+
+    #[test]
+    fn token_cache_key_varies_by_provider_env_revision_prefix() {
+        let token_endpoint =
+            "https://auth.example.com/realms/openshell/protocol/openid-connect/token";
+        let jwt_svid_audience = "https://auth.example.com/realms/openshell";
+        let scopes = ["alpha".to_string()];
+        let revision_one = token_cache_key(TokenCacheKeyInput {
+            provider_name: "api.example.test\t443\t/v1/**\trev:1\tprovider:access_token",
+            token_endpoint,
+            jwt_svid_audience,
+            client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+            audience: "alpha",
+            scopes: &scopes,
+            grant_type: ProviderCredentialTokenGrantType::TokenExchange,
+            requested_token_type: DEFAULT_TOKEN_TYPE,
+        });
+        let revision_two = token_cache_key(TokenCacheKeyInput {
+            provider_name: "api.example.test\t443\t/v1/**\trev:2\tprovider:access_token",
+            token_endpoint,
+            jwt_svid_audience,
+            client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
+            audience: "alpha",
+            scopes: &scopes,
+            grant_type: ProviderCredentialTokenGrantType::TokenExchange,
+            requested_token_type: DEFAULT_TOKEN_TYPE,
+        });
+
+        assert_ne!(revision_one, revision_two);
+    }
+
+    #[test]
+    fn provider_credential_key_parser_ignores_revision_segment() {
+        assert_eq!(
+            parse_provider_credential_key(
+                "api.example.test\t443\t/v1/**\trev:42\tprovider:access_token"
+            )
+            .expect("parse provider credential key"),
+            ("provider", "access_token")
+        );
     }
 
     #[test]
@@ -1077,14 +1293,16 @@ mod tests {
         let jwt_svid_audience = "https://auth.example.com";
         let audience = "api://resource";
 
-        let cache_key = token_cache_key(
+        let cache_key = token_cache_key(TokenCacheKeyInput {
             provider_name,
             token_endpoint,
             jwt_svid_audience,
-            DEFAULT_CLIENT_ASSERTION_TYPE,
+            client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
             audience,
-            &scopes,
-        );
+            scopes: &scopes,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+            requested_token_type: DEFAULT_TOKEN_TYPE,
+        });
         cache.set(
             cache_key,
             "expired-token".to_string(),
@@ -1128,6 +1346,8 @@ mod tests {
                 audience,
                 scopes: &scopes,
                 cache_ttl_override: 0,
+                grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+                requested_token_type: "",
             },
             |_| async {
                 Ok(TokenResponse {
@@ -1141,14 +1361,16 @@ mod tests {
         .await
         .expect_err("malformed access token should fail before caching");
 
-        let cache_key = token_cache_key(
+        let cache_key = token_cache_key(TokenCacheKeyInput {
             provider_name,
             token_endpoint,
             jwt_svid_audience,
-            DEFAULT_CLIENT_ASSERTION_TYPE,
+            client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
             audience,
-            &scopes,
-        );
+            scopes: &scopes,
+            grant_type: ProviderCredentialTokenGrantType::ClientCredentials,
+            requested_token_type: DEFAULT_TOKEN_TYPE,
+        });
 
         assert_eq!(
             err.to_string(),

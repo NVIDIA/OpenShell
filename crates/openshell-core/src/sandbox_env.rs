@@ -71,3 +71,9 @@ pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
 /// exchanges without using SPIFFE for gateway authentication.
 pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET: &str =
     "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET";
+
+/// Filesystem path to the gateway's SPIFFE Workload API UNIX socket.
+///
+/// When set, the gateway can fetch its own JWT-SVID for provider token exchange
+/// client assertions.
+pub const GATEWAY_SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET";

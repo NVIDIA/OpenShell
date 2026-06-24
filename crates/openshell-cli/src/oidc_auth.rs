@@ -259,10 +259,11 @@ pub async fn oidc_refresh_token(
     Ok(refreshed)
 }
 
-/// Ensure we have a valid OIDC token for the given gateway, refreshing if needed.
-///
-/// Returns the access token string.
-pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Result<String> {
+/// Ensure we have a valid OIDC token bundle for the given gateway, refreshing if needed.
+pub async fn ensure_valid_oidc_token_bundle(
+    gateway_name: &str,
+    insecure: bool,
+) -> Result<OidcTokenBundle> {
     let bundle =
         openshell_bootstrap::oidc_token::load_oidc_token(gateway_name).ok_or_else(|| {
             miette::miette!(
@@ -272,7 +273,7 @@ pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Resu
         })?;
 
     if !openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
-        return Ok(bundle.access_token);
+        return Ok(bundle);
     }
 
     debug!(
@@ -281,7 +282,16 @@ pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Resu
     );
     let refreshed = oidc_refresh_token(&bundle, insecure).await?;
     openshell_bootstrap::oidc_token::store_oidc_token(gateway_name, &refreshed)?;
-    Ok(refreshed.access_token)
+    Ok(refreshed)
+}
+
+/// Ensure we have a valid OIDC token for the given gateway, refreshing if needed.
+///
+/// Returns the access token string.
+pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Result<String> {
+    Ok(ensure_valid_oidc_token_bundle(gateway_name, insecure)
+        .await?
+        .access_token)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

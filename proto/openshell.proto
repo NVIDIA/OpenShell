@@ -157,6 +157,11 @@ service OpenShell {
   rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
       returns (GetSandboxProviderEnvironmentResponse);
 
+  // Exchange a stored provider subject token for an intermediate token scoped
+  // to the calling supervisor's SPIFFE identity.
+  rpc ExchangeProviderSubjectToken(ExchangeProviderSubjectTokenRequest)
+      returns (ExchangeProviderSubjectTokenResponse);
+
   // Fetch recent sandbox logs (one-shot).
   rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse);
 
@@ -927,6 +932,25 @@ message ProviderCredentialTokenGrantAudienceOverride {
 
 // Provider credential token grant configuration.
 // When present, the credential is obtained dynamically via OAuth2 grant when needed.
+enum ProviderCredentialTokenGrantType {
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_CLIENT_CREDENTIALS = 1;
+  PROVIDER_CREDENTIAL_TOKEN_GRANT_TYPE_TOKEN_EXCHANGE = 2;
+}
+
+message ProviderCredentialTokenGrantSubjectToken {
+  // Source for the token exchange subject token. Phase one supports
+  // "provider_credential".
+  string source = 1;
+
+  // Provider credential key that stores the subject token.
+  string credential = 2;
+
+  // OAuth2 subject_token_type. If omitted, OpenShell uses
+  // urn:ietf:params:oauth:token-type:access_token.
+  string subject_token_type = 3;
+}
+
 message ProviderCredentialTokenGrant {
   // OAuth2 token endpoint URL (e.g., https://keycloak.example.com/realms/my-realm/protocol/openid-connect/token)
   string token_endpoint = 1;
@@ -951,6 +975,17 @@ message ProviderCredentialTokenGrant {
   // Optional: OAuth2 client_assertion_type value. If omitted, OpenShell uses
   // urn:ietf:params:oauth:client-assertion-type:jwt-bearer.
   string client_assertion_type = 7;
+
+  // Grant type. If omitted/unspecified, OpenShell treats this as client_credentials
+  // for backwards compatibility.
+  ProviderCredentialTokenGrantType grant_type = 8;
+
+  // Subject token metadata for token_exchange grants.
+  ProviderCredentialTokenGrantSubjectToken subject_token = 9;
+
+  // OAuth2 requested_token_type. If omitted for token_exchange, OpenShell uses
+  // urn:ietf:params:oauth:token-type:access_token.
+  string requested_token_type = 10;
 }
 
 // Provider credential declaration.
@@ -1189,6 +1224,27 @@ message GetSandboxProviderEnvironmentResponse {
   // Maps endpoint-bound provider metadata to credential metadata.
   // Supervisor uses this to inject Authorization headers for token grant credentials.
   map<string, ProviderProfileCredential> dynamic_credentials = 4;
+}
+
+message ExchangeProviderSubjectTokenRequest {
+  // The sandbox ID. Must match the authenticated sandbox principal.
+  string sandbox_id = 1;
+
+  // Attached provider record holding the configured subject token credential.
+  string provider = 2;
+
+  // Provider profile credential that declares the token_exchange grant.
+  string credential_key = 3;
+
+  // Supervisor JWT-SVID. The gateway verifies this and uses its `sub` claim
+  // as the requested audience for the intermediate token.
+  string supervisor_jwt_svid = 4;
+}
+
+message ExchangeProviderSubjectTokenResponse {
+  string access_token = 1;
+  int64 expires_in = 2;
+  string token_type = 3;
 }
 
 // ---------------------------------------------------------------------------

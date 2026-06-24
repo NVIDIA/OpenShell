@@ -82,6 +82,15 @@ podman_cmd() {
 WORKDIR_PARENT="${TMPDIR:-/tmp}"
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
 WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-podman.XXXXXX")"
+if [ "${OPENSHELL_E2E_SPIFFE_FIXTURE:-0}" = "1" ]; then
+  mkdir -p "${WORKDIR}/spiffe"
+  export OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET="${OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET:-${WORKDIR}/spiffe/gateway.sock}"
+  if [ -z "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
+    OPENSHELL_E2E_PROVIDER_SPIFFE_PORT="$(e2e_pick_port)"
+    export OPENSHELL_E2E_PROVIDER_SPIFFE_LISTEN="0.0.0.0:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
+    export OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET="tcp:169.254.1.2:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
+  fi
+fi
 GATEWAY_BIN=""
 CLI_BIN=""
 GATEWAY_PID=""
@@ -421,6 +430,9 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
   printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client/tls.crt")"
   printf 'guest_tls_key = %s\n'    "$(toml_string "${PKI_DIR}/client/tls.key")"
   printf 'enable_bind_mounts = true\n'
+  if [ -n "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
+    printf 'provider_spiffe_workload_api_socket = %s\n' "$(toml_string "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET}")"
+  fi
   # The in-process Podman driver reads `socket_path` from TOML only — the
   # OPENSHELL_PODMAN_SOCKET env var is honoured by the standalone driver
   # binary, not the in-process driver used here. Pin the socket to the one
@@ -453,6 +465,7 @@ e2e_export_gateway_restart_metadata \
 
 OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
 OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
+OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET="${OPENSHELL_E2E_GATEWAY_SPIFFE_SOCKET:-}" \
   "${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" >"${GATEWAY_LOG}" 2>&1 &
 GATEWAY_PID=$!
 printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"

@@ -19,7 +19,8 @@ use openshell_core::proto::{
     DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteServiceRequest, DeleteServiceResponse, DetachSandboxProviderRequest,
-    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
+    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse,
+    ExchangeProviderSubjectTokenRequest, ExchangeProviderSubjectTokenResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, GatewayMessage,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderProfileRequest,
@@ -501,6 +502,14 @@ impl OpenShell for OpenShellService {
         request: Request<GetSandboxProviderEnvironmentRequest>,
     ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
         policy::handle_get_sandbox_provider_environment(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "sandbox")]
+    async fn exchange_provider_subject_token(
+        &self,
+        request: Request<ExchangeProviderSubjectTokenRequest>,
+    ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+        provider::handle_exchange_provider_subject_token(&self.state, request).await
     }
 
     #[rpc_auth(auth = "dual", scope = "config:write", role = "admin")]

@@ -26,9 +26,7 @@ use openshell_e2e::harness::output::strip_ansi;
 /// Run `openshell <args>` using the system's configured gateway.
 async fn run_cli(args: &[&str]) -> (String, i32) {
     let mut cmd = openshell_cmd();
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd.output().await.expect("spawn openshell");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -164,20 +162,16 @@ async fn ws_tunnel_status_through_edge_proxy() {
 
     // Extract the gateway endpoint from the info output.
     // The format varies, but it should contain a URL-like string.
-    let endpoint = info_clean
-        .lines()
-        .find_map(|line| {
-            if line.to_lowercase().contains("endpoint")
-                || line.to_lowercase().contains("gateway")
-            {
-                // Try to extract a URL from the line
-                line.split_whitespace()
-                    .find(|word| word.starts_with("http://") || word.starts_with("https://"))
-                    .map(String::from)
-            } else {
-                None
-            }
-        });
+    let endpoint = info_clean.lines().find_map(|line| {
+        if line.to_lowercase().contains("endpoint") || line.to_lowercase().contains("gateway") {
+            // Try to extract a URL from the line
+            line.split_whitespace()
+                .find(|word| word.starts_with("http://") || word.starts_with("https://"))
+                .map(String::from)
+        } else {
+            None
+        }
+    });
 
     let Some(endpoint) = endpoint else {
         eprintln!(
@@ -208,12 +202,8 @@ async fn ws_tunnel_status_through_edge_proxy() {
         "dummy-test-jwt",
     );
 
-    let (output, code) = run_cli_with_config(tmpdir.path(), &[
-        "--gateway",
-        "edge-tunnel-test",
-        "status",
-    ])
-    .await;
+    let (output, code) =
+        run_cli_with_config(tmpdir.path(), &["--gateway", "edge-tunnel-test", "status"]).await;
 
     let clean = strip_ansi(&output);
     assert_eq!(

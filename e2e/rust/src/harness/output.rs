@@ -16,7 +16,7 @@ pub fn strip_ansi(s: &str) -> String {
             // Consume the `[` and everything up to the terminating letter.
             if chars.peek() == Some(&'[') {
                 chars.next(); // consume '['
-                              // Consume parameter bytes (digits, ';') and the final byte.
+                // Consume parameter bytes (digits, ';') and the final byte.
                 for c in chars.by_ref() {
                     if c.is_ascii_alphabetic() {
                         break;

@@ -126,6 +126,9 @@ pub struct PodmanComputeConfig {
     /// `template.driver_config`.
     #[serde(default)]
     pub enable_bind_mounts: bool,
+    /// Host path to a SPIFFE Workload API Unix socket exposed to sandbox
+    /// supervisors for provider token exchange client assertions.
+    pub provider_spiffe_workload_api_socket: Option<PathBuf>,
     /// Health check interval in seconds for sandbox containers.
     ///
     /// Podman runs the health check command at this interval to determine
@@ -261,6 +264,7 @@ impl Default for PodmanComputeConfig {
             guest_tls_key: None,
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
             enable_bind_mounts: false,
+            provider_spiffe_workload_api_socket: None,
             health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
         }
     }
@@ -284,6 +288,10 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("guest_tls_key", &self.guest_tls_key)
             .field("sandbox_pids_limit", &self.sandbox_pids_limit)
             .field("enable_bind_mounts", &self.enable_bind_mounts)
+            .field(
+                "provider_spiffe_workload_api_socket",
+                &self.provider_spiffe_workload_api_socket,
+            )
             .field(
                 "health_check_interval_secs",
                 &self.health_check_interval_secs,

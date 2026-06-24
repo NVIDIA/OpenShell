@@ -169,8 +169,7 @@ fn extract_version(output: &str) -> Option<u32> {
 
 /// Extract the policy hash from `policy get` output.
 fn extract_hash(output: &str) -> Option<String> {
-    extract_field(output, "Hash")
-        .or_else(|| extract_field(output, "Policy hash"))
+    extract_field(output, "Hash").or_else(|| extract_field(output, "Policy hash"))
 }
 
 /// Check that a version number appears in `policy list` output as a
@@ -203,8 +202,7 @@ fn list_output_contains_version(output: &str, version: u32) -> bool {
 async fn live_policy_update_round_trip() {
     // --- Write two distinct policy files ---
     let policy_a = write_policy(&["api.anthropic.com"]).expect("write policy A");
-    let policy_b =
-        write_policy(&["api.anthropic.com", "example.com"]).expect("write policy B");
+    let policy_b = write_policy(&["api.anthropic.com", "example.com"]).expect("write policy B");
 
     let policy_a_path = policy_a
         .path()
@@ -218,16 +216,21 @@ async fn live_policy_update_round_trip() {
         .to_string();
 
     // --- Create a long-running sandbox ---
-    let mut guard = SandboxGuard::create_keep(
-        &["sh", "-c", "echo Ready && sleep infinity"],
-        "Ready",
-    )
-    .await
-    .expect("create keep sandbox");
+    let mut guard =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("create keep sandbox");
 
     // --- Set initial policy A ---
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_a_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &policy_a_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -244,8 +247,12 @@ async fn live_policy_update_round_trip() {
         r.exit_code, r.output
     );
 
-    let initial_version = extract_version(&r.output)
-        .unwrap_or_else(|| panic!("could not parse version from policy get output:\n{}", r.output));
+    let initial_version = extract_version(&r.output).unwrap_or_else(|| {
+        panic!(
+            "could not parse version from policy get output:\n{}",
+            r.output
+        )
+    });
     assert!(
         initial_version >= 1,
         "initial policy version should be >= 1, got {initial_version}"
@@ -255,7 +262,14 @@ async fn live_policy_update_round_trip() {
 
     // --- Push same policy A again -> should be idempotent ---
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_a_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &policy_a_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -265,7 +279,11 @@ async fn live_policy_update_round_trip() {
     );
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get after repeat should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get after repeat should succeed:\n{}",
+        r.output
+    );
 
     let repeat_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version after repeat:\n{}", r.output));
@@ -280,7 +298,14 @@ async fn live_policy_update_round_trip() {
 
     // --- Push policy B -> should create new version ---
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_b_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &policy_b_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -290,7 +315,11 @@ async fn live_policy_update_round_trip() {
     );
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get after B should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get after B should succeed:\n{}",
+        r.output
+    );
 
     let new_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version after B:\n{}", r.output));
@@ -305,7 +334,14 @@ async fn live_policy_update_round_trip() {
 
     // --- Push policy B again -> idempotent ---
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &policy_b_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &policy_b_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -315,7 +351,11 @@ async fn live_policy_update_round_trip() {
     );
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get after B repeat should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get after B repeat should succeed:\n{}",
+        r.output
+    );
 
     let repeat_b_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version after B repeat:\n{}", r.output));
@@ -370,16 +410,21 @@ async fn live_policy_update_from_empty_network_policies() {
         .to_string();
 
     // Create sandbox with empty network policy.
-    let mut guard = SandboxGuard::create_keep(
-        &["sh", "-c", "echo Ready && sleep infinity"],
-        "Ready",
-    )
-    .await
-    .expect("create keep sandbox");
+    let mut guard =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("create keep sandbox");
 
     // Set initial empty policy.
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &empty_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &empty_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
@@ -389,14 +434,25 @@ async fn live_policy_update_from_empty_network_policies() {
     );
 
     let r = run_cli(&["policy", "get", &guard.name]).await;
-    assert!(r.success, "policy get (empty) should succeed:\n{}", r.output);
+    assert!(
+        r.success,
+        "policy get (empty) should succeed:\n{}",
+        r.output
+    );
 
     let initial_version = extract_version(&r.output)
         .unwrap_or_else(|| panic!("could not parse version from empty policy:\n{}", r.output));
 
     // Push policy with network rules.
     let r = run_cli(&[
-        "policy", "set", &guard.name, "--policy", &full_path, "--wait", "--timeout", "120",
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &full_path,
+        "--wait",
+        "--timeout",
+        "120",
     ])
     .await;
     assert!(
