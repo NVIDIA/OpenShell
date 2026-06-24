@@ -131,18 +131,18 @@ const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct StoredSettings {
-    revision: u64,
-    settings: BTreeMap<String, StoredSettingValue>,
+pub struct StoredSettings {
+    pub revision: u64,
+    pub settings: BTreeMap<String, StoredSettingValue>,
     /// Database `resource_version` for CAS. Not persisted in the JSON payload;
     /// loaded from `ObjectRecord` and used for optimistic concurrency control.
     #[serde(skip)]
-    resource_version: u64,
+    pub resource_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "value")]
-enum StoredSettingValue {
+pub enum StoredSettingValue {
     String(String),
     Bool(bool),
     Int(i64),

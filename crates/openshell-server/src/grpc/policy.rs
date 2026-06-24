@@ -1605,6 +1605,11 @@ async fn handle_update_config_inner(
         if key != POLICY_SETTING_KEY {
             validate_registered_setting_key(key)?;
         }
+        if state.runtime_settings.is_managed_key(key) {
+            return Err(Status::failed_precondition(format!(
+                "setting '{key}' is managed by the gateway runtime config file; update that file instead"
+            )));
+        }
 
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let changed = if req.delete_setting {
@@ -3698,14 +3703,11 @@ fn upsert_setting_value(
     }
 }
 
-pub(super) async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
+pub async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
     load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, GLOBAL_SETTINGS_NAME).await
 }
 
-pub(super) async fn save_global_settings(
-    store: &Store,
-    settings: &StoredSettings,
-) -> Result<(), Status> {
+pub async fn save_global_settings(store: &Store, settings: &StoredSettings) -> Result<(), Status> {
     save_settings_record(
         store,
         GLOBAL_SETTINGS_OBJECT_TYPE,
@@ -8985,6 +8987,159 @@ mod tests {
             err.message().contains("autom") && err.message().contains("manual"),
             "expected rejection message to echo the bad value and list allowed values; got: {}",
             err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_global_rejects_set_for_runtime_managed_key() {
+        let state = test_server_state().await;
+        state
+            .runtime_settings
+            .set_managed_keys([settings::PROVIDERS_V2_ENABLED_KEY.to_string()]);
+
+        let req = with_user(Request::new(UpdateConfigRequest {
+            global: true,
+            setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::BoolValue(false)),
+            }),
+            ..Default::default()
+        }));
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("runtime-managed setting must reject global set");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(
+            err.message().contains("runtime config file"),
+            "expected runtime config file guidance; got: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_global_rejects_delete_for_runtime_managed_key() {
+        let state = test_server_state().await;
+        state
+            .runtime_settings
+            .set_managed_keys([settings::PROVIDERS_V2_ENABLED_KEY.to_string()]);
+
+        let req = with_user(Request::new(UpdateConfigRequest {
+            global: true,
+            setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            delete_setting: true,
+            ..Default::default()
+        }));
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("runtime-managed setting must reject global delete");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn gateway_config_uses_stored_global_settings_when_no_runtime_file_is_configured() {
+        let state = test_server_state().await;
+        let mut global = StoredSettings::default();
+        global.settings.insert(
+            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            StoredSettingValue::Bool(true),
+        );
+        global.revision = 1;
+        save_global_settings(state.store.as_ref(), &global)
+            .await
+            .unwrap();
+
+        let response =
+            handle_get_gateway_config(&state, Request::new(GetGatewayConfigRequest::default()))
+                .await
+                .expect("gateway config should load")
+                .into_inner();
+        assert_eq!(response.settings_revision, 1);
+        assert_eq!(
+            response
+                .settings
+                .get(settings::PROVIDERS_V2_ENABLED_KEY)
+                .and_then(|setting| setting.value.as_ref()),
+            Some(&setting_value::Value::BoolValue(true))
+        );
+
+        let req = with_user(Request::new(UpdateConfigRequest {
+            global: true,
+            setting_key: settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::BoolValue(false)),
+            }),
+            ..Default::default()
+        }));
+        handle_update_config(&state, req)
+            .await
+            .expect("global setting should remain mutable without runtime config");
+
+        let loaded = load_global_settings(state.store.as_ref()).await.unwrap();
+        assert_eq!(
+            loaded.settings.get(settings::PROVIDERS_V2_ENABLED_KEY),
+            Some(&StoredSettingValue::Bool(false))
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_config_manages_defined_keys_only_and_leaves_omitted_keys_mutable() {
+        let state = test_server_state().await;
+        state
+            .runtime_settings
+            .set_managed_keys([settings::PROVIDERS_V2_ENABLED_KEY.to_string()]);
+
+        let mut global = StoredSettings::default();
+        global.settings.insert(
+            settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+            StoredSettingValue::Bool(true),
+        );
+        global.settings.insert(
+            "ocsf_json_enabled".to_string(),
+            StoredSettingValue::Bool(false),
+        );
+        global.revision = 1;
+        save_global_settings(state.store.as_ref(), &global)
+            .await
+            .unwrap();
+
+        let response =
+            handle_get_gateway_config(&state, Request::new(GetGatewayConfigRequest::default()))
+                .await
+                .expect("gateway config should load")
+                .into_inner();
+        assert_eq!(
+            response
+                .settings
+                .get(settings::PROVIDERS_V2_ENABLED_KEY)
+                .and_then(|setting| setting.value.as_ref()),
+            Some(&setting_value::Value::BoolValue(true)),
+            "runtime-managed key should expose the reconciled file value"
+        );
+        assert_eq!(
+            response
+                .settings
+                .get("ocsf_json_enabled")
+                .and_then(|setting| setting.value.as_ref()),
+            Some(&setting_value::Value::BoolValue(false)),
+            "omitted key should use the stored global value"
+        );
+
+        let req = with_user(Request::new(UpdateConfigRequest {
+            global: true,
+            setting_key: "ocsf_json_enabled".to_string(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::BoolValue(true)),
+            }),
+            ..Default::default()
+        }));
+        handle_update_config(&state, req)
+            .await
+            .expect("key omitted from runtime config should remain mutable");
+
+        let loaded = load_global_settings(state.store.as_ref()).await.unwrap();
+        assert_eq!(
+            loaded.settings.get("ocsf_json_enabled"),
+            Some(&StoredSettingValue::Bool(true))
         );
     }
 

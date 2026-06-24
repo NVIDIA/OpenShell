@@ -218,6 +218,17 @@ server:
     # -- gRPC rate-limit window length in seconds. Must be positive (alongside
     # requests) to enable rate limiting; 0 (default) disables it.
     windowSeconds: 0
+  runtimeConfig:
+    # -- Mount a runtime settings file and configure the gateway to watch it.
+    enabled: false
+    # -- Existing ConfigMap containing the runtime settings file. When empty
+    # and runtimeConfig.enabled=true, the chart renders one from settings.
+    existingConfigMap: ""
+    # -- Runtime settings filename inside the ConfigMap.
+    filename: runtime.toml
+    # -- Gateway runtime settings rendered under [openshell.runtime.settings].
+    # Values must match registered runtime setting types.
+    settings: {}
   auth:
     # -- UNSAFE: accept unauthenticated CLI/user requests as a local developer
     # principal. Intended only for trusted local Skaffold/k3d development or a

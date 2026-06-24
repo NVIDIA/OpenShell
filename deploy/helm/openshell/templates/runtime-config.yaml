@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{{- if and (eq (include "openshell.runtimeConfigEnabled" .) "true") (not .Values.server.runtimeConfig.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openshell.runtimeConfigMapName" . }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+data:
+  {{ include "openshell.runtimeConfigFilename" . }}: |
+    [openshell.runtime.settings]
+    {{- range $key, $value := (.Values.server.runtimeConfig.settings | default dict) }}
+    {{ $key }} = {{ $value | toJson }}
+    {{- end }}
+{{- end }}
