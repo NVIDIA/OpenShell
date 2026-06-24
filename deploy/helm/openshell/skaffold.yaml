@@ -143,3 +143,13 @@ profiles:
         path: /deploy/helm/releases/0/setValues
         value:
           server.disableTls: "false"
+  - name: credential-driver-kubernetes-secrets
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-credential-driver-kubernetes-secrets.yaml
+  - name: credential-driver-vault
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-credential-driver-vault.yaml

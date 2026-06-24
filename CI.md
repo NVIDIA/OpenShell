@@ -15,10 +15,11 @@ Three opt-in labels enable the long-running E2E suites:
 - `test:e2e` runs the standard E2E suite in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
-  (`replicaCount: 2` and bundled PostgreSQL) in `Branch E2E Checks`
+  (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
+  (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
 
 When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once and fans out all enabled suites in parallel.
-The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while HA behavior is under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
+The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
 
 The GitHub ruleset should require the `OpenShell / ...` statuses published by `Required CI Gates`, not the push-triggered workflow jobs directly.
 
@@ -110,7 +111,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E PR checks. Triggers on `push: pull-request/[0-9]+`. |
-| `.github/workflows/branch-e2e.yml` | Opt-in standard, GPU, and Kubernetes HA E2E. Triggers on `push: pull-request/[0-9]+` and runs jobs selected by `test:e2e`, `test:e2e-gpu`, or `test:e2e-kubernetes`. |
+| `.github/workflows/branch-e2e.yml` | Opt-in standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. Triggers on `push: pull-request/[0-9]+` and runs jobs selected by `test:e2e`, `test:e2e-gpu`, or `test:e2e-kubernetes`. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. Triggers on `push: pull-request/[0-9]+` and skips lint jobs unless Helm inputs changed. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |

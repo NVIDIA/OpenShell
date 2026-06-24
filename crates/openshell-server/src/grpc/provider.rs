@@ -8,8 +8,9 @@
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
 };
+
 use openshell_core::proto::{
-    Provider, ProviderCredentialTokenGrantAudienceOverride, ProviderProfile,
+    CredentialHandle, Provider, ProviderCredentialTokenGrantAudienceOverride, ProviderProfile,
     ProviderProfileCredential, Sandbox,
 };
 use openshell_core::telemetry::{
@@ -36,6 +37,13 @@ fn redact_provider_credentials(mut provider: Provider) -> Provider {
     for value in provider.credentials.values_mut() {
         *value = "REDACTED".to_string();
     }
+    for key in provider.credential_handles.keys() {
+        provider
+            .credentials
+            .entry(key.clone())
+            .or_insert_with(|| "REDACTED".to_string());
+    }
+    provider.credential_handles.clear();
     provider
 }
 
@@ -63,9 +71,18 @@ impl ProviderEnvironment {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn create_provider_record(
     store: &Store,
+    provider: Provider,
+) -> Result<Provider, Status> {
+    create_provider_record_validating(store, provider, None).await
+}
+
+async fn create_provider_record_validating(
+    store: &Store,
     mut provider: Provider,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
 ) -> Result<Provider, Status> {
     use crate::persistence::{ObjectName, current_time_ms};
 
@@ -97,6 +114,11 @@ pub(super) async fn create_provider_record(
     if provider.r#type.trim().is_empty() {
         return Err(Status::invalid_argument("provider.type is required"));
     }
+    if !provider.credential_handles.is_empty() {
+        return Err(Status::invalid_argument(
+            "provider.credential_handles is internal gateway state and cannot be supplied",
+        ));
+    }
     if provider.credentials.is_empty()
         && !provider_type_allows_empty_credentials(store, &provider.r#type).await?
     {
@@ -115,8 +137,18 @@ pub(super) async fn create_provider_record(
         metadata.id.clone_from(&provider_id);
     }
 
+    let credentials_to_store = provider.credentials.clone();
+    store_provider_credentials_if_configured(
+        credentials,
+        &mut provider,
+        &credentials_to_store,
+        &std::collections::HashMap::new(),
+    )
+    .await?;
+    validate_provider_fields(&provider)?;
+
     // Create with MustCreate condition to prevent duplicate creation race
-    let result = store
+    let write_result = store
         .put_if(
             Provider::object_type(),
             &provider_id,
@@ -125,17 +157,30 @@ pub(super) async fn create_provider_record(
             None,
             WriteCondition::MustCreate,
         )
-        .await
-        .map_err(|e| {
+        .await;
+
+    let result = match write_result {
+        Ok(result) => result,
+        Err(e) => {
+            if !provider.credential_handles.is_empty()
+                && let Some(credentials) = credentials
+            {
+                let _ = credentials
+                    .delete_provider_credential_handles(
+                        provider.object_name(),
+                        &provider.credential_handles,
+                    )
+                    .await;
+            }
             if matches!(
                 e,
                 crate::persistence::PersistenceError::UniqueViolation { .. }
             ) {
-                Status::already_exists("provider already exists")
-            } else {
-                Status::internal(format!("persist provider failed: {e}"))
+                return Err(Status::already_exists("provider already exists"));
             }
-        })?;
+            return Err(Status::internal(format!("persist provider failed: {e}")));
+        }
+    };
 
     if let Some(metadata) = provider.metadata.as_mut() {
         metadata.resource_version = result.resource_version;
@@ -177,6 +222,14 @@ pub(super) async fn update_provider_record(
     store: &Store,
     provider: Provider,
 ) -> Result<Provider, Status> {
+    update_provider_record_validating(store, provider, None).await
+}
+
+async fn update_provider_record_validating(
+    store: &Store,
+    provider: Provider,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+) -> Result<Provider, Status> {
     use crate::persistence::{ObjectId, ObjectName};
 
     if provider.object_name().is_empty() {
@@ -204,6 +257,11 @@ pub(super) async fn update_provider_record(
             "provider type cannot be changed; delete and recreate the provider",
         ));
     }
+    if !provider.credential_handles.is_empty() {
+        return Err(Status::invalid_argument(
+            "provider.credential_handles is internal gateway state and cannot be supplied",
+        ));
+    }
 
     let current_version = existing.metadata.as_ref().map_or(0, |m| m.resource_version);
 
@@ -215,12 +273,23 @@ pub(super) async fn update_provider_record(
 
     // Apply merge to create candidate
     let mut candidate = existing.clone();
+    let existing_handles = existing.credential_handles.clone();
+    let removed_credential_handles = credential_handles_removed_by_update(&existing, &provider);
+    let updated_credential_values = provider
+        .credentials
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<std::collections::HashMap<_, _>>();
     candidate.credentials = merge_map(candidate.credentials, provider.credentials);
     candidate.config = merge_map(candidate.config, provider.config);
     candidate.credential_expires_at_ms = merge_i64_map(
         candidate.credential_expires_at_ms,
         provider.credential_expires_at_ms,
     );
+    for key in updated_credential_values.keys() {
+        candidate.credential_handles.remove(key);
+    }
 
     // Validate BEFORE writing to prevent persisting invalid state.
     // Validate only the mutable fields (credentials/config) plus metadata and
@@ -229,6 +298,23 @@ pub(super) async fn update_provider_record(
     // strand legacy records whose stored type predates current limits. See
     // #1347.
     super::validation::validate_object_metadata(candidate.metadata.as_ref(), "provider")?;
+    validate_provider_mutable_fields(&candidate)?;
+    delete_removed_provider_credentials(
+        credentials,
+        candidate.object_name(),
+        &removed_credential_handles,
+    )
+    .await?;
+    for key in removed_credential_handles.keys() {
+        candidate.credential_handles.remove(key);
+    }
+    store_provider_credentials_if_configured(
+        credentials,
+        &mut candidate,
+        &updated_credential_values,
+        &existing_handles,
+    )
+    .await?;
     validate_provider_mutable_fields(&candidate)?;
     validate_provider_update_against_attached_sandboxes(store, &candidate).await?;
 
@@ -281,6 +367,7 @@ pub(super) async fn update_provider_record(
     Ok(redact_provider_credentials(candidate))
 }
 
+#[cfg(test)]
 pub(super) async fn delete_provider_record(store: &Store, name: &str) -> Result<bool, Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -301,6 +388,44 @@ pub(super) async fn delete_provider_record(store: &Store, name: &str) -> Result<
             blocking_sandboxes.join(", ")
         )));
     }
+
+    crate::provider_refresh::delete_refresh_states_for_provider(store, provider.object_id())
+        .await?;
+
+    store
+        .delete_by_name(Provider::object_type(), name)
+        .await
+        .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
+}
+
+pub(super) async fn delete_provider_record_with_credentials(
+    store: &Store,
+    credentials: &crate::credentials::CredentialRuntime,
+    name: &str,
+) -> Result<bool, Status> {
+    if name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+
+    let Some(provider) = store
+        .get_message_by_name::<Provider>(name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+    else {
+        return Ok(false);
+    };
+
+    let blocking_sandboxes = sandboxes_using_provider(store, name).await?;
+    if !blocking_sandboxes.is_empty() {
+        return Err(Status::failed_precondition(format!(
+            "provider '{name}' is attached to sandbox(es): {}",
+            blocking_sandboxes.join(", ")
+        )));
+    }
+
+    credentials
+        .delete_provider_credential_handles(provider.object_name(), &provider.credential_handles)
+        .await?;
 
     crate::provider_refresh::delete_refresh_states_for_provider(store, provider.object_id())
         .await?;
@@ -421,6 +546,67 @@ fn merge_i64_map(
     existing
 }
 
+fn credential_handles_removed_by_update(
+    existing: &Provider,
+    incoming: &Provider,
+) -> std::collections::HashMap<String, CredentialHandle> {
+    incoming
+        .credentials
+        .iter()
+        .filter(|(_, value)| value.is_empty())
+        .filter_map(|(key, _)| {
+            existing
+                .credential_handles
+                .get(key)
+                .cloned()
+                .map(|handle| (key.clone(), handle))
+        })
+        .collect()
+}
+
+async fn delete_removed_provider_credentials(
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    provider_name: &str,
+    removed_handles: &std::collections::HashMap<String, CredentialHandle>,
+) -> Result<(), Status> {
+    if removed_handles.is_empty() {
+        return Ok(());
+    }
+    let credentials = credentials.ok_or_else(|| {
+        Status::failed_precondition(
+            "provider credential handles require a configured credential runtime",
+        )
+    })?;
+    credentials
+        .delete_provider_credential_handles(provider_name, removed_handles)
+        .await
+}
+
+async fn store_provider_credentials_if_configured(
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    provider: &mut Provider,
+    values_to_store: &std::collections::HashMap<String, String>,
+    existing_handles: &std::collections::HashMap<String, CredentialHandle>,
+) -> Result<(), Status> {
+    let Some(credentials) = credentials else {
+        return Ok(());
+    };
+    if !credentials.stores_provider_credentials() || values_to_store.is_empty() {
+        return Ok(());
+    }
+
+    let provider_name = provider.object_name().to_string();
+    let stored_handles = credentials
+        .store_provider_credentials(&provider_name, values_to_store, existing_handles)
+        .await?;
+
+    for key in stored_handles.keys() {
+        provider.credentials.remove(key);
+    }
+    provider.credential_handles.extend(stored_handles);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Provider environment resolution
 // ---------------------------------------------------------------------------
@@ -431,9 +617,22 @@ fn merge_i64_map(
 /// collects credential key-value pairs. Returns a map of environment variables
 /// to inject into the sandbox. Credential keys must be unique across attached
 /// providers so one provider cannot silently overwrite another provider's token.
+#[cfg(test)]
 pub(super) async fn resolve_provider_environment(
     store: &Store,
     provider_names: &[String],
+) -> Result<ProviderEnvironment, Status> {
+    let credentials = crate::credentials::CredentialRuntime::from_config(
+        &openshell_core::Config::new(None).with_credential_drivers(["test-static"]),
+    )
+    .map_err(|err| Status::internal(format!("initialize credential runtime failed: {err}")))?;
+    resolve_provider_environment_with_credentials(store, provider_names, &credentials).await
+}
+
+pub(super) async fn resolve_provider_environment_with_credentials(
+    store: &Store,
+    provider_names: &[String],
+    credentials: &crate::credentials::CredentialRuntime,
 ) -> Result<ProviderEnvironment, Status> {
     if provider_names.is_empty() {
         return Ok(ProviderEnvironment::default());
@@ -485,6 +684,37 @@ pub(super) async fn resolve_provider_environment(
                     provider_name = %name,
                     key = %key,
                     "skipping credential with invalid env var key"
+                );
+            }
+        }
+
+        let resolved_refs = credentials
+            .resolve_provider_handles(&provider, now_ms)
+            .await?;
+        for (key, value) in resolved_refs.values {
+            if is_non_injectable_provider_credential(&provider, &key) {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    "skipping non-injectable provider credential handle"
+                );
+                continue;
+            }
+            if is_valid_env_key(&key) {
+                if let Some(expires_at_ms) = resolved_refs
+                    .expires_at_ms
+                    .get(&key)
+                    .copied()
+                    .filter(|expires_at_ms| *expires_at_ms > 0)
+                {
+                    expires.entry(key.clone()).or_insert(expires_at_ms);
+                }
+                env.entry(key).or_insert(value);
+            } else {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    "skipping credential handle with invalid env var key"
                 );
             }
         }
@@ -1080,19 +1310,31 @@ async fn active_provider_environment_keys(
 }
 
 fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<String> {
-    provider
+    let mut keys: Vec<String> = provider
         .credentials
         .keys()
         .filter(|key| !is_non_injectable_provider_credential(provider, key))
         .filter(|key| is_valid_env_key(key))
-        .filter(|key| {
-            provider
-                .credential_expires_at_ms
-                .get(*key)
-                .is_none_or(|expires_at_ms| *expires_at_ms <= 0 || *expires_at_ms > now_ms)
-        })
+        .filter(|key| provider_credential_not_expired(provider, key, now_ms))
         .cloned()
-        .collect()
+        .collect();
+    keys.extend(
+        provider
+            .credential_handles
+            .keys()
+            .filter(|key| !is_non_injectable_provider_credential(provider, key))
+            .filter(|key| is_valid_env_key(key))
+            .filter(|key| provider_credential_not_expired(provider, key, now_ms))
+            .cloned(),
+    );
+    keys
+}
+
+fn provider_credential_not_expired(provider: &Provider, key: &str, now_ms: i64) -> bool {
+    provider
+        .credential_expires_at_ms
+        .get(key)
+        .is_none_or(|expires_at_ms| *expires_at_ms <= 0 || *expires_at_ms > now_ms)
 }
 
 fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
@@ -1161,7 +1403,9 @@ pub(super) async fn handle_create_provider(
         return Err(Status::invalid_argument("provider is required"));
     };
     let provider_type = provider.r#type.clone();
-    let result = create_provider_record(state.store.as_ref(), provider).await;
+    let result =
+        create_provider_record_validating(state.store.as_ref(), provider, Some(&state.credentials))
+            .await;
     match result {
         Ok(provider) => {
             emit_provider_lifecycle(
@@ -1904,7 +2148,9 @@ pub(super) async fn handle_update_provider(
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
-    let result = update_provider_record(state.store.as_ref(), provider).await;
+    let result =
+        update_provider_record_validating(state.store.as_ref(), provider, Some(&state.credentials))
+            .await;
     match result {
         Ok(provider) => {
             emit_provider_lifecycle(
@@ -2154,6 +2400,7 @@ pub(super) async fn handle_configure_provider_refresh(
                 credential_key.to_string(),
                 expires_at_ms,
             )]),
+            credential_handles: std::collections::HashMap::new(),
         };
         update_provider_record(state.store.as_ref(), updated).await?;
     }
@@ -2180,6 +2427,7 @@ pub(super) async fn handle_rotate_provider_credential(
     }
     let refresh_state = crate::provider_refresh::refresh_provider_credential(
         state.store.as_ref(),
+        Some(&state.credentials),
         provider_name,
         credential_key,
     )
@@ -2249,6 +2497,7 @@ pub(super) async fn handle_delete_provider_refresh(
                 credential_key.to_string(),
                 0,
             )]),
+            credential_handles: std::collections::HashMap::new(),
         };
         update_provider_record(state.store.as_ref(), updated).await?;
     }
@@ -2264,7 +2513,9 @@ pub(super) async fn handle_delete_provider(
 ) -> Result<Response<DeleteProviderResponse>, Status> {
     let name = request.into_inner().name;
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &name).await;
-    let result = delete_provider_record(state.store.as_ref(), &name).await;
+    let result =
+        delete_provider_record_with_credentials(state.store.as_ref(), &state.credentials, &name)
+            .await;
     match result {
         Ok(deleted) => {
             let outcome = TelemetryOutcome::from_success(deleted);
@@ -2531,6 +2782,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -2995,6 +3247,58 @@ mod tests {
             .into_iter()
             .collect(),
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
+        }
+    }
+
+    fn provider_with_credential_handle(
+        name: &str,
+        provider_type: &str,
+        credential_key: &str,
+    ) -> Provider {
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: name.to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: provider_type.to_string(),
+            credentials: HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+            credential_handles: std::iter::once((
+                credential_key.to_string(),
+                CredentialHandle {
+                    driver: "test-static".to_string(),
+                    handle: format!("{name}:{credential_key}"),
+                    metadata: HashMap::new(),
+                },
+            ))
+            .collect(),
+        }
+    }
+
+    fn provider_with_credential_value(
+        name: &str,
+        provider_type: &str,
+        credential_key: &str,
+        value: &str,
+    ) -> Provider {
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: name.to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: provider_type.to_string(),
+            credentials: std::iter::once((credential_key.to_string(), value.to_string())).collect(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -3633,6 +3937,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -3745,6 +4050,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -3808,6 +4114,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -3850,6 +4157,7 @@ mod tests {
                     "MS_GRAPH_ACCESS_TOKEN".to_string(),
                     manual_expires_at_ms,
                 )]),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -3903,6 +4211,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -3922,6 +4231,7 @@ mod tests {
                     .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -3991,6 +4301,7 @@ mod tests {
                     credentials: HashMap::new(),
                     config: HashMap::new(),
                     credential_expires_at_ms: HashMap::new(),
+                    credential_handles: HashMap::new(),
                 },
             )
             .await
@@ -4080,6 +4391,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4147,6 +4459,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4299,6 +4612,7 @@ mod tests {
                 config: std::iter::once(("endpoint".to_string(), "https://gitlab.com".to_string()))
                     .collect(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4347,6 +4661,335 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(missing.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn create_provider_record_stores_credentials_with_runtime() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+
+        let persisted = create_provider_record_validating(
+            &store,
+            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-test"),
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(persisted.object_name(), "openai-local");
+        assert_eq!(
+            persisted
+                .credentials
+                .get("OPENAI_API_KEY")
+                .map(String::as_str),
+            Some("REDACTED")
+        );
+        assert!(persisted.credential_handles.is_empty());
+
+        let stored: Provider = store
+            .get_message_by_name("openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.credentials.is_empty());
+        assert_eq!(
+            stored
+                .credential_handles
+                .get("OPENAI_API_KEY")
+                .map(|handle| handle.driver.as_str()),
+            Some("test-static")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_provider_record_overwrites_credentials_with_runtime() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+
+        create_provider_record_validating(
+            &store,
+            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-first"),
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+        let stored_first: Provider = store
+            .get_message_by_name("openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        let first_handle = stored_first
+            .credential_handles
+            .get("OPENAI_API_KEY")
+            .expect("stored handle")
+            .handle
+            .clone();
+
+        let updated = update_provider_record_validating(
+            &store,
+            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-second"),
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            updated
+                .credentials
+                .get("OPENAI_API_KEY")
+                .map(String::as_str),
+            Some("REDACTED")
+        );
+        assert!(updated.credential_handles.is_empty());
+
+        let stored_second: Provider = store
+            .get_message_by_name("openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored_second.credentials.is_empty());
+        assert_eq!(
+            stored_second
+                .credential_handles
+                .get("OPENAI_API_KEY")
+                .map(|handle| handle.handle.as_str()),
+            Some(first_handle.as_str())
+        );
+
+        let result = resolve_provider_environment_with_credentials(
+            &store,
+            &["openai-local".to_string()],
+            &credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.get("OPENAI_API_KEY"), Some(&"sk-second".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_provider_record_with_runtime_preserves_legacy_inline_credentials_on_noop() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+
+        create_provider_record(&store, provider_with_values("legacy-provider", "openai"))
+            .await
+            .unwrap();
+
+        let updated = update_provider_record_validating(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "legacy-provider".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: String::new(),
+                credentials: HashMap::new(),
+                config: std::iter::once((
+                    "endpoint".to_string(),
+                    "https://updated.example.com".to_string(),
+                ))
+                .collect(),
+                credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
+            },
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.credentials.len(), 2);
+        assert!(updated.credential_handles.is_empty());
+
+        let stored: Provider = store
+            .get_message_by_name("legacy-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.credentials.get("API_TOKEN").map(String::as_str),
+            Some("token-123")
+        );
+        assert_eq!(
+            stored.credentials.get("SECONDARY").map(String::as_str),
+            Some("secondary-token")
+        );
+        assert!(stored.credential_handles.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_provider_record_with_runtime_stores_only_updated_legacy_inline_credentials() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+
+        create_provider_record(&store, provider_with_values("legacy-provider", "openai"))
+            .await
+            .unwrap();
+
+        update_provider_record_validating(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "legacy-provider".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: String::new(),
+                credentials: std::iter::once((
+                    "API_TOKEN".to_string(),
+                    "rotated-token".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
+            },
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+
+        let stored: Provider = store
+            .get_message_by_name("legacy-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!stored.credentials.contains_key("API_TOKEN"));
+        assert_eq!(
+            stored.credentials.get("SECONDARY").map(String::as_str),
+            Some("secondary-token")
+        );
+        assert_eq!(
+            stored
+                .credential_handles
+                .get("API_TOKEN")
+                .map(|handle| handle.driver.as_str()),
+            Some("test-static")
+        );
+
+        let result = resolve_provider_environment_with_credentials(
+            &store,
+            &["legacy-provider".to_string()],
+            &credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.get("API_TOKEN"), Some(&"rotated-token".to_string()));
+        assert_eq!(
+            result.get("SECONDARY"),
+            Some(&"secondary-token".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_create_provider_rejects_user_supplied_credential_handles() {
+        let state = test_server_state().await;
+
+        let err = handle_create_provider(
+            &state,
+            Request::new(CreateProviderRequest {
+                provider: Some(provider_with_credential_handle(
+                    "openai-ref",
+                    "openai",
+                    "OPENAI_API_KEY",
+                )),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("internal gateway state"));
+    }
+
+    #[tokio::test]
+    async fn handle_create_provider_stores_inline_credentials_with_enabled_driver() {
+        let mut state = test_server_state().await;
+        let config = state
+            .config
+            .clone()
+            .with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        let state_mut = Arc::get_mut(&mut state).unwrap();
+        state_mut.config = config;
+        state_mut.credentials = credentials;
+
+        let response = handle_create_provider(
+            &state,
+            Request::new(CreateProviderRequest {
+                provider: Some(provider_with_credential_value(
+                    "openai-local",
+                    "openai",
+                    "OPENAI_API_KEY",
+                    "sk-test",
+                )),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let provider = response.provider.expect("provider");
+        assert_eq!(
+            provider
+                .credentials
+                .get("OPENAI_API_KEY")
+                .map(String::as_str),
+            Some("REDACTED")
+        );
+        assert!(provider.credential_handles.is_empty());
+
+        let stored: Provider = state
+            .store
+            .get_message_by_name("openai-local")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.credentials.is_empty());
+        assert!(stored.credential_handles.contains_key("OPENAI_API_KEY"));
+
+        let result = resolve_provider_environment_with_credentials(
+            state.store.as_ref(),
+            &["openai-local".to_string()],
+            &state.credentials,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.get("OPENAI_API_KEY"), Some(&"sk-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn handle_update_provider_rejects_user_supplied_credential_handles() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            provider_with_values("openai-local", "openai"),
+        )
+        .await
+        .unwrap();
+
+        let err = handle_update_provider(
+            &state,
+            Request::new(UpdateProviderRequest {
+                provider: Some(provider_with_credential_handle(
+                    "openai-local",
+                    "openai",
+                    "OPENAI_API_KEY",
+                )),
+                credential_expires_at_ms: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("internal gateway state"));
     }
 
     #[tokio::test]
@@ -4464,6 +5107,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4493,6 +5137,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4523,6 +5168,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4543,6 +5189,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4617,6 +5264,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4653,6 +5301,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4689,6 +5338,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4709,6 +5359,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4735,6 +5386,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4763,6 +5415,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4810,6 +5463,7 @@ mod tests {
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
                 config: std::iter::once(("region".to_string(), String::new())).collect(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4861,6 +5515,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4890,6 +5545,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4921,6 +5577,7 @@ mod tests {
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -4949,6 +5606,7 @@ mod tests {
             credentials: std::iter::once(("API_TOKEN".to_string(), "old".to_string())).collect(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         };
         store.put_message(&legacy).await.unwrap();
 
@@ -4967,6 +5625,7 @@ mod tests {
                     .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5006,6 +5665,7 @@ mod tests {
             ))
             .collect(),
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
 
@@ -5036,6 +5696,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_provider_env_rejects_unresolvable_credential_handle() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        create_provider_record_validating(
+            &store,
+            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-test"),
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+        let other_credentials =
+            crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+
+        let err = resolve_provider_environment_with_credentials(
+            &store,
+            &["openai-local".to_string()],
+            &other_credentials,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::NotFound);
+        assert!(err.message().contains("credential handle"));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_resolves_credential_handles_with_runtime() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        create_provider_record_validating(
+            &store,
+            provider_with_credential_value("openai-local", "openai", "OPENAI_API_KEY", "sk-test"),
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment_with_credentials(
+            &store,
+            &["openai-local".to_string()],
+            &credentials,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.get("OPENAI_API_KEY"), Some(&"sk-test".to_string()));
+    }
+
+    #[tokio::test]
     async fn resolve_provider_env_skips_expired_credentials_and_returns_expiry_metadata() {
         let store = test_store().await;
         let now_ms = crate::persistence::current_time_ms();
@@ -5061,6 +5772,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            credential_handles: HashMap::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
 
@@ -5106,6 +5818,7 @@ mod tests {
             .collect(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
 
@@ -5138,6 +5851,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5157,6 +5871,7 @@ mod tests {
                     .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5190,6 +5905,7 @@ mod tests {
                     .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5212,6 +5928,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5223,6 +5940,52 @@ mod tests {
         )
         .await
         .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("SHARED_KEY"));
+        assert!(err.message().contains("provider-a"));
+        assert!(err.message().contains("provider-b"));
+    }
+
+    #[tokio::test]
+    async fn validate_provider_environment_keys_unique_includes_credential_handles() {
+        let store = test_store().await;
+        let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+        let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "provider-a".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "claude".to_string(),
+                credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
+                    .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        create_provider_record_validating(
+            &store,
+            provider_with_credential_value("provider-b", "gitlab", "SHARED_KEY", "second-value"),
+            Some(&credentials),
+        )
+        .await
+        .unwrap();
+
+        let err = validate_provider_environment_keys_unique(
+            &store,
+            &["provider-a".to_string(), "provider-b".to_string()],
+        )
+        .await
+        .unwrap_err();
+
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("SHARED_KEY"));
         assert!(err.message().contains("provider-a"));
@@ -5258,6 +6021,7 @@ mod tests {
                 .into_iter()
                 .collect(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5331,6 +6095,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5368,6 +6133,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5426,6 +6192,7 @@ mod tests {
                 .into_iter()
                 .collect(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5460,6 +6227,7 @@ mod tests {
                     .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5501,6 +6269,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5523,6 +6292,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5561,6 +6331,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5595,6 +6366,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             },
         )
         .await
@@ -5695,6 +6467,7 @@ mod tests {
             credentials: HashMap::new(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         };
 
         // Attempt to update with an oversized credential key (exceeds MAX_MAP_KEY_LEN)
@@ -5832,6 +6605,7 @@ mod tests {
 
         // Prepare an update with the correct resource_version
         let mut updated_provider = current.clone();
+        updated_provider.credential_handles.clear();
         updated_provider
             .credentials
             .insert("NEW_KEY".to_string(), "new-value".to_string());
@@ -5900,6 +6674,7 @@ mod tests {
 
         // Prepare an update with a stale resource_version
         let mut stale_provider = current.clone();
+        stale_provider.credential_handles.clear();
         stale_provider
             .credentials
             .insert("NEW_KEY".to_string(), "new-value".to_string());
@@ -5936,6 +6711,7 @@ mod tests {
             current_version
         );
         assert!(!unchanged.credentials.contains_key("NEW_KEY"));
+        assert!(!unchanged.credential_handles.contains_key("NEW_KEY"));
     }
 
     #[tokio::test]
@@ -5970,6 +6746,7 @@ mod tests {
         for i in 0..3 {
             let state_clone = Arc::clone(&state);
             let mut updated = initial.clone();
+            updated.credential_handles.clear();
             updated
                 .credentials
                 .insert(format!("KEY_{i}"), format!("value-{i}"));
@@ -6024,7 +6801,11 @@ mod tests {
 
         // Exactly one of KEY_0, KEY_1, or KEY_2 should be present
         let new_keys_count = (0..3)
-            .filter(|i| final_provider.credentials.contains_key(&format!("KEY_{i}")))
+            .filter(|i| {
+                final_provider
+                    .credential_handles
+                    .contains_key(&format!("KEY_{i}"))
+            })
             .count();
         assert_eq!(new_keys_count, 1);
     }
@@ -6042,6 +6823,7 @@ mod tests {
             credentials: HashMap::new(),
             config,
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -6144,6 +6926,7 @@ mod tests {
             credentials: HashMap::new(),
             config: HashMap::from([("project_id".to_string(), "should-be-ignored".to_string())]),
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         };
         let mut env = HashMap::new();
         openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);

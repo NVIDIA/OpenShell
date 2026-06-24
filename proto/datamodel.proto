@@ -28,17 +28,31 @@ message ObjectMeta {
   uint64 resource_version = 5;
 }
 
+// Opaque handle for a provider credential stored by gateway credential storage.
+// Handles are created by OpenShell and must not be authored by users.
+message CredentialHandle {
+  // Internal storage owner or credential driver that owns this handle.
+  string driver = 1;
+  // Owner-owned opaque handle string.
+  string handle = 2;
+  // Owner-owned non-secret metadata.
+  map<string, string> metadata = 3;
+}
+
 // Provider model stored by OpenShell.
 message Provider {
   // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
   ObjectMeta metadata = 1;
   // Canonical provider type slug (for example: "claude", "gitlab").
   string type = 2;
-  // Secret values used for authentication.
+  // Inline secret values used for authentication.
   map<string, string> credentials = 3;
   // Non-secret provider configuration.
   map<string, string> config = 4;
   // Expiration timestamps for credential values, keyed by credential/env var
   // name. A zero or missing value means the credential does not expire.
   map<string, int64> credential_expires_at_ms = 5;
+  // Opaque handles for secret values stored through gateway credential storage.
+  // This map is internal gateway state and is not accepted as user-authored input.
+  map<string, CredentialHandle> credential_handles = 6;
 }
