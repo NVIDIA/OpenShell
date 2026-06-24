@@ -628,7 +628,7 @@ async fn run_server() -> TestServer {
 async fn sandbox_get_sends_correct_name() {
     let ts = run_server().await;
 
-    run::sandbox_get(&ts.endpoint, "my-sandbox", false, &ts.tls)
+    run::sandbox_get(&ts.endpoint, "my-sandbox", false, "table", &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 
@@ -645,7 +645,7 @@ async fn sandbox_get_sends_correct_name() {
 async fn sandbox_get_policy_only_round_trip() {
     let ts = run_server().await;
 
-    run::sandbox_get(&ts.endpoint, "my-sandbox", true, &ts.tls)
+    run::sandbox_get(&ts.endpoint, "my-sandbox", true, "table", &ts.tls)
         .await
         .expect("sandbox_get with policy_only should succeed");
 
@@ -671,7 +671,7 @@ async fn sandbox_get_with_persisted_last_sandbox() {
     assert_eq!(resolved, "persisted-sb");
 
     // Call sandbox_get with the resolved name.
-    run::sandbox_get(&ts.endpoint, &resolved, false, &ts.tls)
+    run::sandbox_get(&ts.endpoint, &resolved, false, "table", &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 
@@ -821,7 +821,7 @@ async fn explicit_name_takes_precedence_over_persisted() {
     // Persist one name, but supply a different one explicitly.
     save_last_sandbox("my-cluster", "old-sandbox").expect("save should succeed");
 
-    run::sandbox_get(&ts.endpoint, "explicit-sandbox", false, &ts.tls)
+    run::sandbox_get(&ts.endpoint, "explicit-sandbox", false, "table", &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 
