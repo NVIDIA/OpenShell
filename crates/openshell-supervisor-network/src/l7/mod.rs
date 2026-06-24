@@ -28,6 +28,7 @@ pub enum L7Protocol {
     Graphql,
     Sql,
     JsonRpc,
+    Mcp,
 }
 
 impl L7Protocol {
@@ -38,8 +39,13 @@ impl L7Protocol {
             "graphql" => Some(Self::Graphql),
             "sql" => Some(Self::Sql),
             "json-rpc" => Some(Self::JsonRpc),
+            "mcp" => Some(Self::Mcp),
             _ => None,
         }
+    }
+
+    pub fn is_jsonrpc_family(self) -> bool {
+        matches!(self, Self::JsonRpc | Self::Mcp)
     }
 }
 
@@ -82,6 +88,9 @@ pub struct L7EndpointConfig {
     pub graphql_max_body_bytes: usize,
     /// Maximum JSON-RPC request body bytes to buffer for inspection.
     pub json_rpc_max_body_bytes: usize,
+    /// MCP-only strict validation for tools/call params.name. Defaults to true
+    /// for MCP endpoints and is ignored by other JSON-RPC-family protocols.
+    pub mcp_strict_tool_names: bool,
     /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
     /// rather than rejected at the parser. Needed by upstreams like GitLab
     /// that embed `%2F` in namespaced project paths. Defaults to false.
@@ -177,6 +186,8 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         .and_then(|v| usize::try_from(v).ok())
         .filter(|v| *v > 0)
         .unwrap_or(jsonrpc::DEFAULT_MAX_BODY_BYTES);
+    let mcp_strict_tool_names = protocol == L7Protocol::Mcp
+        && get_object_bool(val, "mcp_strict_tool_names").unwrap_or(true);
 
     Some(L7EndpointConfig {
         protocol,
@@ -185,6 +196,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         enforcement,
         graphql_max_body_bytes,
         json_rpc_max_body_bytes,
+        mcp_strict_tool_names,
         allow_encoded_slash,
         websocket_credential_rewrite,
         request_body_credential_rewrite,
@@ -483,28 +495,45 @@ fn validate_graphql_rule(
     validate_graphql_fields(errors, warnings, loc, rule.get("fields"));
 }
 
-fn validate_l7_matcher_map(
+#[derive(Clone, Copy)]
+enum MatcherNesting {
+    // REST query matchers are a flat map: each key maps directly to a matcher.
+    Flat,
+    // JSON-RPC/MCP params may use nested maps that flatten into dot-path keys
+    // before Rego evaluation.
+    Nested,
+}
+
+// Validate a matcher map when it exists. Null is treated like omission because
+// policy loading normalizes absent optional maps the same way.
+fn validate_matcher_map(
     errors: &mut Vec<String>,
     warnings: &mut Vec<String>,
     loc: &str,
-    value: &serde_json::Value,
-    label: &str,
+    value: Option<&serde_json::Value>,
+    nesting: MatcherNesting,
 ) {
-    let Some(matchers) = value.as_object() else {
-        errors.push(format!("{loc}: expected map of {label} matchers"));
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return;
+    };
+    let Some(obj) = value.as_object() else {
+        errors.push(format!("{loc}: expected map of matchers"));
         return;
     };
 
-    for (param, matcher) in matchers {
-        validate_l7_matcher(errors, warnings, &format!("{loc}.{param}"), matcher);
+    for (key, matcher) in obj {
+        validate_matcher_value(errors, warnings, &format!("{loc}.{key}"), matcher, nesting);
     }
 }
 
-fn validate_l7_matcher(
+// Validate one matcher leaf. In nested mode, an object without `glob` or `any`
+// is treated as another params namespace and walked recursively.
+fn validate_matcher_value(
     errors: &mut Vec<String>,
     warnings: &mut Vec<String>,
     loc: &str,
     matcher: &serde_json::Value,
+    nesting: MatcherNesting,
 ) {
     if let Some(glob_str) = matcher.as_str() {
         if let Some(warning) = check_glob_syntax(glob_str) {
@@ -514,12 +543,35 @@ fn validate_l7_matcher(
     }
 
     let Some(matcher_obj) = matcher.as_object() else {
-        errors.push(format!("{loc}: expected string glob or object with `any`"));
+        errors.push(format!("{loc}: {}", matcher_expected_message(nesting)));
         return;
     };
 
     let has_any = matcher_obj.get("any").is_some();
     let has_glob = matcher_obj.get("glob").is_some();
+    if !has_any && !has_glob {
+        if matches!(nesting, MatcherNesting::Flat) {
+            errors.push(format!(
+                "{loc}: unknown matcher keys; only `glob` or `any` are supported"
+            ));
+            return;
+        }
+        if matcher_obj.is_empty() {
+            errors.push(format!("{loc}: nested matcher map must not be empty"));
+            return;
+        }
+        for (key, child) in matcher_obj {
+            validate_matcher_value(
+                errors,
+                warnings,
+                &format!("{loc}.{key}"),
+                child,
+                MatcherNesting::Nested,
+            );
+        }
+        return;
+    }
+
     let has_unknown = matcher_obj.keys().any(|k| k != "any" && k != "glob");
     if has_unknown {
         errors.push(format!(
@@ -535,18 +587,11 @@ fn validate_l7_matcher(
         return;
     }
 
-    if !has_glob && !has_any {
-        errors.push(format!(
-            "{loc}: object matcher requires `glob` string or non-empty `any` list"
-        ));
-        return;
-    }
-
     if has_glob {
         match matcher_obj.get("glob").and_then(|v| v.as_str()) {
             None => errors.push(format!("{loc}.glob: expected glob string")),
-            Some(g) => {
-                if let Some(warning) = check_glob_syntax(g) {
+            Some(glob_str) => {
+                if let Some(warning) = check_glob_syntax(glob_str) {
                     warnings.push(format!("{loc}.glob: {warning}"));
                 }
             }
@@ -554,26 +599,265 @@ fn validate_l7_matcher(
         return;
     }
 
-    let any = matcher_obj.get("any").and_then(|v| v.as_array());
-    let Some(any) = any else {
+    let Some(any) = matcher_obj.get("any").and_then(|v| v.as_array()) else {
         errors.push(format!("{loc}.any: expected array of glob strings"));
         return;
     };
-
     if any.is_empty() {
         errors.push(format!("{loc}.any: list must not be empty"));
         return;
     }
-
     if any.iter().any(|v| v.as_str().is_none()) {
         errors.push(format!("{loc}.any: all values must be strings"));
     }
-
     for item in any.iter().filter_map(|v| v.as_str()) {
         if let Some(warning) = check_glob_syntax(item) {
             warnings.push(format!("{loc}.any: {warning}"));
         }
     }
+}
+
+// Keep the leaf-shape error specific to the policy surface being validated:
+// REST query maps cannot nest, while JSON-RPC/MCP params maps can.
+fn matcher_expected_message(nesting: MatcherNesting) -> &'static str {
+    match nesting {
+        MatcherNesting::Flat => "expected string glob or matcher object",
+        MatcherNesting::Nested => "expected string glob, matcher object, or nested matcher map",
+    }
+}
+
+// Validate the shared JSON-RPC-family rule surface. Generic JSON-RPC requires
+// an explicit method and can match params. MCP keeps method optional while the
+// endpoint-level method profile is enabled; disabling that profile makes
+// method explicit on every authored MCP rule. MCP does not expose tool-argument
+// matching.
+fn validate_jsonrpc_rule_fields(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    rule: &serde_json::Value,
+    protocol: &str,
+    mcp_strict_tool_names: bool,
+    mcp_allow_all_known_mcp_methods: bool,
+) {
+    let method = rule.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let has_params = rule.get("params").is_some_and(|v| !v.is_null());
+    let has_tool = rule.get("tool").is_some_and(|v| !v.is_null());
+    let has_tool_selector = mcp_rule_has_tool_selector(rule);
+
+    if protocol == "json-rpc" {
+        if method.is_empty() {
+            errors.push(format!("{loc}.method: required for {protocol} L7 rules"));
+        } else if let Some(warning) = check_glob_syntax(method) {
+            warnings.push(format!("{loc}.method: {warning}"));
+        }
+        validate_matcher_map(
+            errors,
+            warnings,
+            &format!("{loc}.params"),
+            rule.get("params"),
+            MatcherNesting::Nested,
+        );
+        if json_rule_has_non_empty_path_or_query(rule) {
+            errors.push(format!(
+                "{loc}: {protocol} L7 rules must use method/params, not path/query"
+            ));
+        }
+        return;
+    }
+
+    if protocol == "mcp" {
+        validate_mcp_method_field(errors, warnings, loc, method);
+        if method.is_empty() && !mcp_allow_all_known_mcp_methods {
+            errors.push(format!(
+                "{loc}.method: required when mcp.allow_all_known_mcp_methods is false"
+            ));
+        } else if has_tool_selector && !method.is_empty() && method != "tools/call" {
+            errors.push(format!(
+                "{loc}.method: must be tools/call when an MCP rule uses tool or params.name, got '{method}'"
+            ));
+        }
+        validate_mcp_tool_field(errors, warnings, loc, rule, mcp_strict_tool_names);
+        validate_mcp_params_field(errors, warnings, loc, rule, has_tool, mcp_strict_tool_names);
+        if json_rule_has_non_empty_path_or_query(rule) {
+            errors.push(format!(
+                "{loc}: {protocol} L7 rules must use method/tool, not path/query"
+            ));
+        }
+        return;
+    }
+
+    if has_tool {
+        errors.push(format!(
+            "{loc}.tool: MCP tool matching is only valid for protocol mcp"
+        ));
+    }
+
+    if has_params {
+        errors.push(format!(
+            "{loc}.params: JSON-RPC params matching is only valid for protocol json-rpc or mcp"
+        ));
+    }
+}
+
+fn validate_mcp_method_field(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    method: &str,
+) {
+    if method.is_empty() {
+        return;
+    }
+    if let Some(warning) = check_glob_syntax(method) {
+        warnings.push(format!("{loc}.method: {warning}"));
+    }
+    if glob_uses_wildcard(method) && !method.starts_with("tools/") {
+        errors.push(format!(
+            "{loc}.method: MCP method globs are only valid for the tools/ method family; omit method to use the endpoint method profile"
+        ));
+    }
+}
+
+fn method_matcher_matches_tools_call(method: &str) -> bool {
+    method == "tools/call"
+        || method == "*"
+        || glob::Pattern::new(method).is_ok_and(|pattern| pattern.matches("tools/call"))
+}
+
+fn mcp_rule_has_tool_selector(rule: &serde_json::Value) -> bool {
+    rule.get("tool").is_some_and(|v| !v.is_null())
+        || rule
+            .get("params")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|params| params.get("name"))
+            .is_some_and(|v| !v.is_null())
+}
+
+fn mcp_endpoint_has_tool_allow_selectors(ep: &serde_json::Value) -> bool {
+    ep.get("rules")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                let allow = rule.get("allow").unwrap_or(rule);
+                mcp_rule_has_tool_selector(allow)
+            })
+        })
+}
+
+fn validate_mcp_tool_field(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    rule: &serde_json::Value,
+    mcp_strict_tool_names: bool,
+) {
+    let Some(tool) = rule.get("tool").filter(|v| !v.is_null()) else {
+        return;
+    };
+    validate_matcher_value(
+        errors,
+        warnings,
+        &format!("{loc}.tool"),
+        tool,
+        MatcherNesting::Flat,
+    );
+    validate_mcp_tool_name_wildcard_policy(
+        errors,
+        &format!("{loc}.tool"),
+        tool,
+        mcp_strict_tool_names,
+    );
+}
+
+fn validate_mcp_params_field(
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+    loc: &str,
+    rule: &serde_json::Value,
+    has_tool: bool,
+    mcp_strict_tool_names: bool,
+) {
+    let Some(params) = rule.get("params").filter(|v| !v.is_null()) else {
+        return;
+    };
+    let Some(params_obj) = params.as_object() else {
+        errors.push(format!("{loc}.params: expected map of matchers"));
+        return;
+    };
+
+    if has_tool && params_obj.contains_key("name") {
+        errors.push(format!(
+            "{loc}: MCP rules must use either tool or params.name, not both"
+        ));
+    }
+
+    for key in params_obj.keys() {
+        if key != "name" {
+            errors.push(format!(
+                "{loc}.params.{key}: MCP tool argument matching is not supported yet"
+            ));
+        }
+    }
+
+    validate_matcher_map(
+        errors,
+        warnings,
+        &format!("{loc}.params"),
+        Some(params),
+        MatcherNesting::Nested,
+    );
+    if let Some(name_matcher) = params_obj.get("name") {
+        validate_mcp_tool_name_wildcard_policy(
+            errors,
+            &format!("{loc}.params.name"),
+            name_matcher,
+            mcp_strict_tool_names,
+        );
+    }
+}
+
+fn validate_mcp_tool_name_wildcard_policy(
+    errors: &mut Vec<String>,
+    loc: &str,
+    matcher: &serde_json::Value,
+    mcp_strict_tool_names: bool,
+) {
+    if !mcp_strict_tool_names && matcher_uses_glob_wildcard(matcher) {
+        errors.push(format!(
+            "{loc}: wildcard tool-name matchers require mcp.strict_tool_names to remain enabled"
+        ));
+    }
+}
+
+fn matcher_uses_glob_wildcard(matcher: &serde_json::Value) -> bool {
+    if let Some(glob) = matcher.as_str() {
+        return glob_uses_wildcard(glob);
+    }
+
+    let Some(obj) = matcher.as_object() else {
+        return false;
+    };
+    if obj
+        .get("glob")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(glob_uses_wildcard)
+    {
+        return true;
+    }
+    obj.get("any")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(glob_uses_wildcard)
+        })
+}
+
+fn glob_uses_wildcard(glob: &str) -> bool {
+    glob.bytes()
+        .any(|b| matches!(b, b'*' | b'?' | b'[' | b']' | b'{' | b'}'))
 }
 
 fn json_rule_has_graphql_fields(rule: &serde_json::Value) -> bool {
@@ -591,11 +875,6 @@ fn json_rule_has_transport_fields(rule: &serde_json::Value) -> bool {
     rule.get("method").is_some() || rule.get("path").is_some() || rule.get("query").is_some()
 }
 
-fn json_rule_has_non_empty_jsonrpc_params(rule: &serde_json::Value) -> bool {
-    rule.get("params")
-        .is_some_and(|v| !v.is_null() && !v.as_object().is_some_and(serde_json::Map::is_empty))
-}
-
 fn json_rule_has_non_empty_path_or_query(rule: &serde_json::Value) -> bool {
     rule.get("path")
         .and_then(|v| v.as_str())
@@ -604,33 +883,6 @@ fn json_rule_has_non_empty_path_or_query(rule: &serde_json::Value) -> bool {
             .get("query")
             .and_then(|v| v.as_object())
             .is_some_and(|v| !v.is_empty())
-}
-
-fn validate_jsonrpc_rule(
-    errors: &mut Vec<String>,
-    warnings: &mut Vec<String>,
-    loc: &str,
-    rule: &serde_json::Value,
-    kind: &str,
-) {
-    let method = rule.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    if method.is_empty() {
-        errors.push(format!(
-            "{loc}: JSON-RPC {kind} rules must specify method, for example \"*\""
-        ));
-    } else if let Some(warning) = check_glob_syntax(method) {
-        warnings.push(format!("{loc}.method: {warning}"));
-    }
-
-    if json_rule_has_non_empty_path_or_query(rule) {
-        errors.push(format!(
-            "{loc}: JSON-RPC {kind} rules must use method/params, not path/query"
-        ));
-    }
-
-    if let Some(params) = rule.get("params").filter(|v| !v.is_null()) {
-        validate_l7_matcher_map(errors, warnings, &format!("{loc}.params"), params, "params");
-    }
 }
 
 fn json_endpoint_has_graphql_policy(ep: &serde_json::Value) -> bool {
@@ -679,6 +931,8 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
 
         for (i, ep) in endpoints.iter().enumerate() {
             let protocol = ep.get("protocol").and_then(|v| v.as_str()).unwrap_or("");
+            let l7_protocol = L7Protocol::parse(protocol);
+            let jsonrpc_family = l7_protocol.is_some_and(L7Protocol::is_jsonrpc_family);
             let tls = ep.get("tls").and_then(|v| v.as_str()).unwrap_or("");
             let enforcement = ep.get("enforcement").and_then(|v| v.as_str()).unwrap_or("");
             let access = ep.get("access").and_then(|v| v.as_str()).unwrap_or("");
@@ -703,6 +957,19 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 |arr| arr.iter().filter_map(serde_json::Value::as_u64).collect(),
             );
             let loc = format!("{name}.endpoints[{i}]");
+
+            if protocol == "mcp" {
+                if host.trim().is_empty() {
+                    errors.push(format!(
+                        "{loc}: protocol mcp requires host; protocol alone is not a wildcard endpoint"
+                    ));
+                }
+                if !ports.iter().any(|port| *port > 0) {
+                    errors.push(format!(
+                        "{loc}: protocol mcp requires port or ports; protocol alone is not a wildcard endpoint"
+                    ));
+                }
+            }
 
             if !endpoint_path.is_empty() {
                 if !endpoint_path.starts_with('/') && endpoint_path != "**" {
@@ -737,28 +1004,34 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 errors.push(format!("{loc}: rules and access are mutually exclusive"));
             }
 
-            if protocol == "json-rpc" && !access.is_empty() {
-                errors.push(format!(
-                    "{loc}: protocol json-rpc does not support access presets; use explicit rules with allow.method such as \"*\""
-                ));
+            if jsonrpc_family && !access.is_empty() {
+                if protocol == "mcp" {
+                    errors.push(format!(
+                        "{loc}: protocol {protocol} does not support access presets; use rules/deny_rules or omit rules for the default allow-all MCP policy"
+                    ));
+                } else {
+                    errors.push(format!(
+                        "{loc}: protocol {protocol} does not support access presets; use explicit rules with allow.method such as \"*\""
+                    ));
+                }
             }
 
             if protocol == "json-rpc" && !has_rules {
                 errors.push(format!(
-                    "{loc}: protocol json-rpc requires explicit rules with allow.method"
+                    "{loc}: protocol {protocol} requires explicit rules with allow.method"
                 ));
             }
 
             // protocol requires rules or access
-            if !protocol.is_empty() && !has_rules && access.is_empty() {
+            if !protocol.is_empty() && protocol != "mcp" && !has_rules && access.is_empty() {
                 errors.push(format!(
                     "{loc}: protocol requires rules or access to define allowed traffic"
                 ));
             }
 
-            if !protocol.is_empty() && L7Protocol::parse(protocol).is_none() {
+            if !protocol.is_empty() && l7_protocol.is_none() {
                 errors.push(format!(
-                    "{loc}: unknown protocol '{protocol}' (expected rest, websocket, graphql, sql, or json-rpc)"
+                    "{loc}: unknown protocol '{protocol}' (expected rest, websocket, graphql, sql, json-rpc, or mcp)"
                 ));
             }
 
@@ -807,9 +1080,59 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 ));
             }
 
-            if protocol != "json-rpc" && ep.get("json_rpc_max_body_bytes").is_some() {
+            if !jsonrpc_family && ep.get("json_rpc_max_body_bytes").is_some() {
                 warnings.push(format!(
-                    "{loc}: JSON-RPC-specific endpoint fields are ignored unless protocol is json-rpc"
+                    "{loc}: JSON-RPC-specific endpoint fields are ignored unless protocol is json-rpc or mcp"
+                ));
+            }
+            let has_mcp_strict_tool_names = ep.get("mcp_strict_tool_names").is_some();
+            let has_mcp_allow_all_known_mcp_methods =
+                ep.get("mcp_allow_all_known_mcp_methods").is_some();
+            if has_mcp_strict_tool_names {
+                if ep
+                    .get("mcp_strict_tool_names")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_none()
+                {
+                    errors.push(format!("{loc}: mcp.strict_tool_names must be boolean"));
+                }
+                if protocol != "mcp" {
+                    errors.push(format!(
+                        "{loc}: mcp.strict_tool_names is only valid for protocol mcp"
+                    ));
+                }
+            }
+            if has_mcp_allow_all_known_mcp_methods {
+                if ep
+                    .get("mcp_allow_all_known_mcp_methods")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_none()
+                {
+                    errors.push(format!(
+                        "{loc}: mcp.allow_all_known_mcp_methods must be boolean"
+                    ));
+                }
+                if protocol != "mcp" {
+                    errors.push(format!(
+                        "{loc}: mcp.allow_all_known_mcp_methods is only valid for protocol mcp"
+                    ));
+                }
+            }
+            let mcp_strict_tool_names = ep
+                .get("mcp_strict_tool_names")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let mcp_allow_all_known_mcp_methods = ep
+                .get("mcp_allow_all_known_mcp_methods")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            if protocol == "mcp"
+                && !has_rules
+                && access.is_empty()
+                && !mcp_allow_all_known_mcp_methods
+            {
+                errors.push(format!(
+                    "{loc}: protocol mcp requires rules when mcp.allow_all_known_mcp_methods is false"
                 ));
             }
 
@@ -899,15 +1222,30 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
 
                 // deny_rules require some allow base (access or rules)
-                if !has_rules && access.is_empty() {
+                if protocol != "mcp" && !has_rules && access.is_empty() {
                     errors.push(format!(
                         "{loc}: deny_rules require rules or access to define the base allow set"
                     ));
                 }
 
+                let has_mcp_tool_allow_selectors =
+                    protocol == "mcp" && mcp_endpoint_has_tool_allow_selectors(ep);
+
                 if let Some(deny_rules) = ep.get("deny_rules").and_then(|v| v.as_array()) {
                     for (deny_idx, deny_rule) in deny_rules.iter().enumerate() {
                         let deny_loc = format!("{loc}.deny_rules[{deny_idx}]");
+
+                        if has_mcp_tool_allow_selectors
+                            && deny_rule
+                                .get("method")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(method_matcher_matches_tools_call)
+                            && !mcp_rule_has_tool_selector(deny_rule)
+                        {
+                            errors.push(format!(
+                                "{deny_loc}: method matcher denies every tool call and conflicts with MCP tool allow rules; add tool or params.name to deny specific tools, or remove the tool allow rules"
+                            ));
+                        }
 
                         // Validate method
                         if let Some(method) = deny_rule.get("method").and_then(|m| m.as_str())
@@ -932,14 +1270,24 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
 
                         // Validate query matchers — mirrors allow-side validation exactly
                         if let Some(query) = deny_rule.get("query").filter(|v| !v.is_null()) {
-                            validate_l7_matcher_map(
+                            validate_matcher_map(
                                 &mut errors,
                                 &mut warnings,
                                 &format!("{deny_loc}.query"),
-                                query,
-                                "query",
+                                Some(query),
+                                MatcherNesting::Flat,
                             );
                         }
+
+                        validate_jsonrpc_rule_fields(
+                            &mut errors,
+                            &mut warnings,
+                            &deny_loc,
+                            deny_rule,
+                            protocol,
+                            mcp_strict_tool_names,
+                            mcp_allow_all_known_mcp_methods,
+                        );
 
                         // SQL command validation
                         if let Some(command) = deny_rule.get("command").and_then(|c| c.as_str())
@@ -971,20 +1319,6 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                         } else if deny_has_graphql {
                             warnings.push(format!(
                                 "{deny_loc}: GraphQL rule fields are ignored unless protocol is graphql or websocket"
-                            ));
-                        }
-
-                        if protocol == "json-rpc" {
-                            validate_jsonrpc_rule(
-                                &mut errors,
-                                &mut warnings,
-                                &deny_loc,
-                                deny_rule,
-                                "deny",
-                            );
-                        } else if json_rule_has_non_empty_jsonrpc_params(deny_rule) {
-                            errors.push(format!(
-                                "{deny_loc}: params are only valid on protocol json-rpc endpoints"
                             ));
                         }
                     }
@@ -1028,35 +1362,44 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                             continue;
                         };
 
-                        validate_l7_matcher_map(
+                        validate_matcher_map(
                             &mut errors,
                             &mut warnings,
                             &format!("{loc}.rules[{rule_idx}].allow.query"),
-                            query,
-                            "query",
+                            Some(query),
+                            MatcherNesting::Flat,
                         );
                     }
                 }
             }
 
+            let has_mcp_tool_allow_selectors =
+                protocol == "mcp" && mcp_endpoint_has_tool_allow_selectors(ep);
             if has_rules && let Some(rules) = ep.get("rules").and_then(|v| v.as_array()) {
                 for (rule_idx, rule) in rules.iter().enumerate() {
                     let allow = rule.get("allow").unwrap_or(rule);
                     let rule_loc = format!("{loc}.rules[{rule_idx}].allow");
-                    let allow_has_graphql = json_rule_has_graphql_fields(allow);
-                    if protocol == "json-rpc" {
-                        validate_jsonrpc_rule(
-                            &mut errors,
-                            &mut warnings,
-                            &rule_loc,
-                            allow,
-                            "allow",
-                        );
-                    } else if json_rule_has_non_empty_jsonrpc_params(allow) {
+                    if has_mcp_tool_allow_selectors
+                        && allow
+                            .get("method")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(method_matcher_matches_tools_call)
+                        && !mcp_rule_has_tool_selector(allow)
+                    {
                         errors.push(format!(
-                            "{rule_loc}: params are only valid on protocol json-rpc endpoints"
+                            "{rule_loc}: method matcher allows every tool call and conflicts with MCP tool allow rules; add tool or params.name to narrow tools/call, or remove the tool allow rules"
                         ));
                     }
+                    validate_jsonrpc_rule_fields(
+                        &mut errors,
+                        &mut warnings,
+                        &rule_loc,
+                        allow,
+                        protocol,
+                        mcp_strict_tool_names,
+                        mcp_allow_all_known_mcp_methods,
+                    );
+                    let allow_has_graphql = json_rule_has_graphql_fields(allow);
                     if websocket_has_graphql_policy
                         && allow
                             .get("method")
@@ -1107,29 +1450,46 @@ pub fn expand_access_presets(data: &mut serde_json::Value) {
         };
 
         for ep in endpoints.iter_mut() {
+            let protocol = ep
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("rest");
+            let has_rules = ep
+                .get("rules")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty());
             let access = ep
                 .get("access")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
 
+            let mcp_allow_all_known_mcp_methods = ep
+                .get("mcp_allow_all_known_mcp_methods")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+
+            if protocol == "mcp"
+                && access.is_empty()
+                && !has_rules
+                && mcp_allow_all_known_mcp_methods
+            {
+                ep.as_object_mut().unwrap().insert(
+                    "rules".to_string(),
+                    serde_json::Value::Array(vec![jsonrpc_rule_json("*")]),
+                );
+                continue;
+            }
+
             if access.is_empty() {
                 continue;
             }
 
             // Don't expand if rules already exist (validation will catch this)
-            if ep
-                .get("rules")
-                .and_then(|v| v.as_array())
-                .is_some_and(|a| !a.is_empty())
-            {
+            if has_rules {
                 continue;
             }
 
-            let protocol = ep
-                .get("protocol")
-                .and_then(|v| v.as_str())
-                .unwrap_or("rest");
             let rules = if protocol == "graphql" {
                 match access.as_str() {
                     "read-only" => vec![graphql_rule_json("query")],
@@ -1176,6 +1536,14 @@ fn rule_json(method: &str, path: &str) -> serde_json::Value {
         "allow": {
             "method": method,
             "path": path
+        }
+    })
+}
+
+fn jsonrpc_rule_json(method: &str) -> serde_json::Value {
+    serde_json::json!({
+        "allow": {
+            "method": method
         }
     })
 }
@@ -1271,6 +1639,26 @@ mod tests {
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert!(config.allow_encoded_slash);
+    }
+
+    #[test]
+    fn parse_l7_config_mcp_strict_tool_names_defaults_true() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(config.mcp_strict_tool_names);
+    }
+
+    #[test]
+    fn parse_l7_config_mcp_strict_tool_names_can_disable() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_strict_tool_names": false}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert!(!config.mcp_strict_tool_names);
     }
 
     #[test]
@@ -1580,7 +1968,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| { e.contains("JSON-RPC allow rules must specify method") }),
+                .any(|e| { e.contains("rules[0].allow.method") && e.contains("required") }),
             "JSON-RPC allow rules without method should be rejected: {errors:?}"
         );
         assert!(
@@ -1588,6 +1976,323 @@ mod tests {
                 .iter()
                 .any(|e| { e.contains("must use method/params, not path/query") }),
             "JSON-RPC allow rules with path/query should be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_tool_selectors_use_endpoint_method_profile_and_reject_arguments() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "mcp",
+                        "rules": [{
+                            "allow": {
+                                "tool": { "any": ["read_status", "submit_*"] }
+                            }
+                        }, {
+                            "allow": {
+                                "method": "tools/call",
+                                "tool": "submit_report",
+                                "params": {
+                                    "arguments": {
+                                        "scope": "workspace/main"
+                                    }
+                                }
+                            }
+                        }, {
+                            "allow": {
+                                "method": "initialize"
+                            }
+                        }, {
+                            "allow": {
+                                "method": "tools/call",
+                                "tool": "list_reports"
+                            }
+                        }],
+                        "deny_rules": [{
+                            "tool": "delete_*"
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("rules[0].allow.method") && e.contains("required")),
+            "MCP tool rules can omit method while allow_all_known_mcp_methods is enabled: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[1].allow.params.arguments")
+                    && e.contains("argument matching is not supported")
+            }),
+            "MCP argument params should be rejected: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("rules[2].allow.method")),
+            "MCP method-only rules should not require a tool selector: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("rules[3].allow.method")),
+            "MCP tool rules with method: tools/call should validate: {errors:?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|e| e.contains("deny_rules[0].method") && e.contains("tools/call")),
+            "MCP deny tool rules can omit method while allow_all_known_mcp_methods is enabled: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_tool_selectors_require_method_when_method_profile_disabled() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "mcp",
+                        "mcp_allow_all_known_mcp_methods": false,
+                        "rules": [{
+                            "allow": {
+                                "tool": "read_status"
+                            }
+                        }],
+                        "deny_rules": [{
+                            "tool": "delete_*"
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[0].allow.method")
+                    && e.contains("mcp.allow_all_known_mcp_methods is false")
+            }),
+            "MCP allow tool rules should require method when method profile is disabled: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("deny_rules[0].method")
+                    && e.contains("mcp.allow_all_known_mcp_methods is false")
+            }),
+            "MCP deny tool rules should require method when method profile is disabled: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_method_globs_are_tools_family_only() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "mcp",
+                        "rules": [{
+                            "allow": {
+                                "method": "vendor/extension"
+                            }
+                        }, {
+                            "allow": {
+                                "method": "vendor/*"
+                            }
+                        }, {
+                            "allow": {
+                                "method": "*"
+                            }
+                        }, {
+                            "allow": {
+                                "method": "tools/*"
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            !errors.iter().any(|e| e.contains("rules[0].allow.method")),
+            "literal extension methods should stay addressable: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[1].allow.method")
+                    && e.contains("only valid for the tools/ method family")
+            }),
+            "non-tools method globs should be rejected: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[2].allow.method")
+                    && e.contains("only valid for the tools/ method family")
+            }),
+            "authored method: * should be rejected for MCP: {errors:?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("rules[3].allow.method")),
+            "tools-family method globs should validate: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_wildcard_tool_requires_strict_tool_names() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "mcp",
+                        "mcp_strict_tool_names": false,
+                        "rules": [{
+                            "allow": {
+                                "method": "tools/call",
+                                "tool": "read_*"
+                            }
+                        }, {
+                            "allow": {
+                                "method": "tools/call",
+                                "params": {
+                                    "name": { "any": ["safe_tool", "list_*"] }
+                                }
+                            }
+                        }],
+                        "deny_rules": [{
+                            "method": "tools/call",
+                            "tool": "delete_resource"
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[0].allow.tool")
+                    && e.contains("strict_tool_names to remain enabled")
+            }),
+            "wildcard tool aliases should require strict tool names: {errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[1].allow.params.name")
+                    && e.contains("strict_tool_names to remain enabled")
+            }),
+            "wildcard params.name should require strict tool names: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_protocol_requires_endpoint_target() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "protocol": "mcp"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("protocol mcp requires host")),
+            "MCP protocol-only endpoint should require host: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("protocol mcp requires port or ports")),
+            "MCP protocol-only endpoint should require port: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_broad_tools_call_deny_rejects_tool_allow_rules() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "mcp",
+                        "rules": [{
+                            "allow": {
+                                "method": "tools/call",
+                                "tool": "read_status"
+                            }
+                        }],
+                        "deny_rules": [{
+                            "method": "tools/call"
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("deny_rules[0]")
+                    && e.contains("denies every tool call")
+                    && e.contains("conflicts with MCP tool allow rules")
+            }),
+            "broad tools/call deny should reject tool allow rules with a reason: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_broad_tools_call_allow_rejects_tool_allow_rules() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "mcp",
+                        "rules": [{
+                            "allow": {
+                                "method": "tools/*"
+                            }
+                        }, {
+                            "allow": {
+                                "tool": "read_status"
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("rules[0].allow")
+                    && e.contains("allows every tool call")
+                    && e.contains("conflicts with MCP tool allow rules")
+            }),
+            "broad tools/call allow should reject tool allow rules with a reason: {errors:?}"
         );
     }
 
@@ -1621,14 +2326,111 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| { e.contains("rules[0].allow") && e.contains("params are only valid") }),
+                .any(|e| { e.contains("rules[0].allow.params") && e.contains("only valid") }),
             "REST allow rules with JSON-RPC fields should be rejected: {errors:?}"
         );
         assert!(
             errors
                 .iter()
-                .any(|e| { e.contains("deny_rules[0]") && e.contains("params are only valid") }),
+                .any(|e| { e.contains("deny_rules[0].params") && e.contains("only valid") }),
             "REST deny rules with JSON-RPC fields should be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_strict_tool_names_is_mcp_only() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [
+                        {
+                            "host": "mcp.example.com",
+                            "port": 443,
+                            "path": "/mcp",
+                            "protocol": "mcp",
+                            "mcp_strict_tool_names": false,
+                            "rules": [{ "allow": { "method": "tools/call" } }]
+                        },
+                        {
+                            "host": "api.example.com",
+                            "port": 443,
+                            "protocol": "rest",
+                            "mcp_strict_tool_names": false,
+                            "mcp_allow_all_known_mcp_methods": false,
+                            "access": "full"
+                        }
+                    ],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.contains("is only valid for protocol mcp"))
+                .count(),
+            2,
+            "only the REST endpoint should reject MCP-specific options: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_options_require_bool() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "mcp",
+                        "mcp_strict_tool_names": "false",
+                        "mcp_allow_all_known_mcp_methods": "false",
+                        "rules": [{ "allow": { "method": "tools/call" } }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("mcp.strict_tool_names must be boolean")),
+            "expected bool validation error: {errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("mcp.allow_all_known_mcp_methods must be boolean")),
+            "expected bool validation error: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_mcp_requires_rules_when_method_profile_disabled() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "path": "/mcp",
+                        "protocol": "mcp",
+                        "mcp_allow_all_known_mcp_methods": false
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|error| {
+                error.contains("protocol mcp requires rules")
+                    && error.contains("mcp.allow_all_known_mcp_methods is false")
+            }),
+            "expected disabled method profile to require rules: {errors:?}"
         );
     }
 
@@ -1659,7 +2461,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("JSON-RPC deny rules must specify method")),
+                .any(|e| e.contains("deny_rules[0].method") && e.contains("required")),
             "JSON-RPC deny rules without method should be rejected: {errors:?}"
         );
     }
@@ -1678,7 +2480,7 @@ mod tests {
                             "allow": {
                                 "method": "tools/call",
                                 "params": {
-                                    "name": { "mode": "read-*" },
+                                    "name": { "glob": "read-*", "mode": "strict" },
                                     "scope": { "any": [] },
                                     "count": 1
                                 }
@@ -1710,7 +2512,8 @@ mod tests {
         );
         assert!(
             errors.iter().any(|e| {
-                e.contains("allow.params.count") && e.contains("expected string glob or object")
+                e.contains("allow.params.count")
+                    && e.contains("expected string glob, matcher object, or nested matcher map")
             }),
             "JSON-RPC params should reject non-string/non-object matchers: {errors:?}"
         );
@@ -2491,6 +3294,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_jsonrpc_nested_params_matchers_are_accepted() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "mcp.example.com",
+                        "port": 443,
+                        "protocol": "json-rpc",
+                        "rules": [{
+                            "allow": {
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "submit_report",
+                                    "arguments": {
+                                        "scope": "workspace/main",
+                                        "repository": { "any": ["NVIDIA/OpenShell", "NVIDIA/*"] }
+                                    }
+                                }
+                            }
+                        }]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "valid nested params matchers should not error: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "valid nested params matchers should not warn: {warnings:?}"
+        );
+    }
+
     // --- Deny rules validation tests ---
 
     #[test]
@@ -2644,7 +3484,7 @@ mod tests {
         assert!(
             errors
                 .iter()
-                .any(|e| e.contains("expected string glob or object")),
+                .any(|e| e.contains("expected string glob or matcher object")),
             "should reject non-string/non-object matcher in deny query: {errors:?}"
         );
     }

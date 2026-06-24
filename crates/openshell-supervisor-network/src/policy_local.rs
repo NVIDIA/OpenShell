@@ -1128,6 +1128,7 @@ fn network_endpoint_from_json(
         graphql_persisted_queries: HashMap::new(),
         graphql_max_body_bytes: 0,
         json_rpc_max_body_bytes: 0,
+        mcp: None,
         path: String::new(),
     })
 }

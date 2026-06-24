@@ -257,7 +257,7 @@ deny_request if {
 # --- L7 deny rule matching: REST method + path + query ---
 
 request_denied_for_endpoint(request, endpoint) if {
-	object.get(endpoint, "protocol", "") != "json-rpc"
+	not jsonrpc_family_endpoint(endpoint)
 	some deny_rule
 	deny_rule := endpoint.deny_rules[_]
 	deny_rule.method
@@ -278,7 +278,7 @@ request_denied_for_endpoint(request, endpoint) if {
 # --- L7 deny rule matching: JSON-RPC method + params ---
 
 request_denied_for_endpoint(request, endpoint) if {
-	endpoint.protocol == "json-rpc"
+	jsonrpc_family_endpoint(endpoint)
 	request.method == "POST"
 	some deny_rule
 	deny_rule := endpoint.deny_rules[_]
@@ -403,6 +403,7 @@ request_deny_reason := reason if {
 request_deny_reason := reason if {
 	input.request
 	jsonrpc_response_frame_present(input.request)
+	matched_endpoint_config.protocol == "json-rpc"
 	reason := "JSON-RPC response frames are not permitted from client to server"
 }
 
@@ -426,7 +427,7 @@ request_deny_reason := reason if {
 # --- L7 rule matching: REST method + path ---
 
 request_allowed_for_endpoint(request, endpoint) if {
-	object.get(endpoint, "protocol", "") != "json-rpc"
+	not jsonrpc_family_endpoint(endpoint)
 	some rule
 	rule := endpoint.rules[_]
 	rule.allow.method
@@ -447,7 +448,7 @@ request_allowed_for_endpoint(request, endpoint) if {
 # --- L7 rule matching: JSON-RPC method ---
 
 request_allowed_for_endpoint(request, endpoint) if {
-	endpoint.protocol == "json-rpc"
+	jsonrpc_family_endpoint(endpoint)
 	request.method == "POST"
 	some rule
 	rule := endpoint.rules[_]
@@ -456,17 +457,68 @@ request_allowed_for_endpoint(request, endpoint) if {
 	jsonrpc_rule_matches(request, rule.allow)
 }
 
-# MCP Streamable HTTP uses GET on the JSON-RPC endpoint as a receive stream for
-# server-to-client messages. The stream itself has no client-to-server JSON-RPC
-# request body to inspect; allow it once the endpoint path and binary matched.
+# MCP can allow the method layer by endpoint option while still using
+# tool-specific rules to narrow tools/call params.name.
 request_allowed_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "mcp"
+	mcp_allow_all_known_mcp_methods(endpoint)
+	request.method == "POST"
+	not jsonrpc_response_frame_present(request)
+	jsonrpc := object.get(request, "jsonrpc", null)
+	is_object(jsonrpc)
+	jsonrpc_no_parse_error(jsonrpc)
+	method := object.get(jsonrpc, "method", "")
+	is_string(method)
+	method != ""
+	not mcp_tool_call_narrowed_by_policy(endpoint, method)
+}
+
+# MCP Streamable HTTP allows client-to-server JSON-RPC response frames for
+# server-originated requests such as elicitation/create. Generic JSON-RPC keeps
+# response frames denied because it has no MCP request-correlation semantics.
+request_allowed_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "mcp"
+	request.method == "POST"
+	jsonrpc_response_frame_present(request)
+	jsonrpc := object.get(request, "jsonrpc", null)
+	is_object(jsonrpc)
+	jsonrpc_no_parse_error(jsonrpc)
+}
+
+jsonrpc_family_endpoint(endpoint) if {
 	endpoint.protocol == "json-rpc"
+}
+
+jsonrpc_family_endpoint(endpoint) if {
+	endpoint.protocol == "mcp"
+}
+
+mcp_allow_all_known_mcp_methods(endpoint) if {
+	object.get(endpoint, "mcp_allow_all_known_mcp_methods", true)
+}
+
+mcp_tool_call_narrowed_by_policy(endpoint, method) if {
+	method == "tools/call"
+	some rule
+	rule := endpoint.rules[_]
+	params := object.get(rule.allow, "params", {})
+	is_object(params)
+	params.name
+}
+
+# MCP Streamable HTTP uses GET on the JSON-RPC-family endpoint as a receive
+# stream for server-to-client messages. The stream itself has no
+# client-to-server JSON-RPC request body to inspect; allow it once the endpoint
+# path and binary matched.
+request_allowed_for_endpoint(request, endpoint) if {
+	jsonrpc_family_endpoint(endpoint)
 	request.method == "GET"
-	is_object(request.jsonrpc)
-	object.get(request.jsonrpc, "receive_stream", false)
-	jsonrpc_no_parse_error(request.jsonrpc)
-	object.get(request.jsonrpc, "method", null) == null
-	not object.get(request.jsonrpc, "has_response", false)
+	jsonrpc := object.get(request, "jsonrpc", null)
+	is_object(jsonrpc)
+	object.get(jsonrpc, "receive_stream", false)
+	jsonrpc_no_parse_error(jsonrpc)
+	object.get(jsonrpc, "method", null) == null
+	not object.get(jsonrpc, "has_response", false)
 }
 
 # --- L7 rule matching: GraphQL operation ---
@@ -694,31 +746,38 @@ query_value_matches(value, matcher) if {
 # as dot-separated matcher keys, e.g. arguments.scope. Literal dotted param keys
 # are preserved by Rust flattening and take precedence over deeper nested paths.
 jsonrpc_rule_matches(request, rule) if {
-	jsonrpc := object.get(request, "jsonrpc", {})
+	jsonrpc := object.get(request, "jsonrpc", null)
 	is_object(jsonrpc)
-	method := object.get(jsonrpc, "method", null)
-	method != null
-	glob.match(rule.method, [], method)
+	method := object.get(jsonrpc, "method", "")
+	is_string(method)
+	method != ""
+	rule_method := object.get(rule, "method", "")
+	is_string(rule_method)
+	rule_method != ""
+	glob.match(rule_method, [], method)
 	jsonrpc_params_match(jsonrpc, rule)
 }
 
 jsonrpc_response_frame_present(request) if {
-	jsonrpc := object.get(request, "jsonrpc", {})
+	jsonrpc := object.get(request, "jsonrpc", null)
 	is_object(jsonrpc)
 	object.get(jsonrpc, "has_response", false)
 }
 
 jsonrpc_no_parse_error(jsonrpc) if {
+	is_object(jsonrpc)
 	object.get(jsonrpc, "error", null) == null
 }
 
 jsonrpc_no_parse_error(jsonrpc) if {
+	is_object(jsonrpc)
 	object.get(jsonrpc, "error", "") == ""
 }
 
 jsonrpc_params_match(jsonrpc, rule) if {
 	is_object(jsonrpc)
 	param_rules := object.get(rule, "params", {})
+	is_object(param_rules)
 	not jsonrpc_param_mismatch(jsonrpc, param_rules)
 }
 
@@ -729,6 +788,7 @@ jsonrpc_param_mismatch(jsonrpc, param_rules) if {
 }
 
 jsonrpc_param_key_matches(jsonrpc, key, matcher) if {
+	is_object(jsonrpc)
 	params := object.get(jsonrpc, "params", {})
 	is_object(params)
 	value := object.get(params, key, null)

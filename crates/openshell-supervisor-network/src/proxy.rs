@@ -428,7 +428,10 @@ fn emit_forward_success_activity(tx: Option<&ActivitySender>, l7_activity_pendin
     );
 }
 
-fn forward_l7_hard_deny_reason(request_info: &crate::l7::L7RequestInfo) -> Option<String> {
+fn forward_l7_hard_deny_reason(
+    protocol: crate::l7::L7Protocol,
+    request_info: &crate::l7::L7RequestInfo,
+) -> Option<String> {
     request_info
         .graphql
         .as_ref()
@@ -440,9 +443,7 @@ fn forward_l7_hard_deny_reason(request_info: &crate::l7::L7RequestInfo) -> Optio
                     .as_deref()
                     .map(|error| format!("JSON-RPC request rejected: {error}"))
                     .or_else(|| {
-                        info.has_response.then(|| {
-                            crate::l7::relay::JSONRPC_RESPONSE_FRAME_DENY_REASON.to_string()
-                        })
+                        crate::l7::relay::jsonrpc_response_frame_hard_deny_reason(protocol, info)
                     })
             })
         })
@@ -3585,7 +3586,7 @@ async fn handle_forward_proxy(
         } else {
             None
         };
-        let jsonrpc = if l7_config.config.protocol == crate::l7::L7Protocol::JsonRpc {
+        let jsonrpc = if l7_config.config.protocol.is_jsonrpc_family() {
             let header_end = forward_request_bytes
                 .windows(4)
                 .position(|w| w == b"\r\n\r\n")
@@ -3636,7 +3637,10 @@ async fn handle_forward_proxy(
                     }
                 };
                 forward_request_bytes = jsonrpc_request.raw_header;
-                Some(crate::l7::jsonrpc::parse_jsonrpc_body(&body))
+                Some(crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
+                    &body,
+                    crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(&l7_config.config),
+                ))
             }
         } else {
             None
@@ -3649,7 +3653,8 @@ async fn handle_forward_proxy(
             jsonrpc,
         };
 
-        let parse_error_reason = forward_l7_hard_deny_reason(&request_info);
+        let parse_error_reason =
+            forward_l7_hard_deny_reason(l7_config.config.protocol, &request_info);
         let force_deny = parse_error_reason.is_some();
         let (allowed, reason) = parse_error_reason.map_or_else(
             || {
@@ -3693,6 +3698,7 @@ async fn handle_forward_proxy(
             let engine_type = match l7_config.config.protocol {
                 crate::l7::L7Protocol::Graphql => "l7-graphql",
                 crate::l7::L7Protocol::JsonRpc => "l7-jsonrpc",
+                crate::l7::L7Protocol::Mcp => "l7-mcp",
                 _ => "l7",
             };
             let log_message = request_info.jsonrpc.as_ref().map_or_else(
@@ -4356,6 +4362,7 @@ mod tests {
             enforcement: crate::l7::EnforcementMode::Enforce,
             graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+            mcp_strict_tool_names: true,
             allow_encoded_slash: false,
             websocket_credential_rewrite,
             request_body_credential_rewrite: false,
@@ -4530,7 +4537,8 @@ network_policies:
             }),
         };
 
-        let reason = forward_l7_hard_deny_reason(&request_info).expect("JSON-RPC parse error");
+        let reason = forward_l7_hard_deny_reason(crate::l7::L7Protocol::JsonRpc, &request_info)
+            .expect("JSON-RPC parse error");
 
         assert_eq!(
             reason,
@@ -4554,10 +4562,14 @@ network_policies:
             }),
         };
 
-        let reason =
-            forward_l7_hard_deny_reason(&request_info).expect("JSON-RPC response hard deny");
+        let reason = forward_l7_hard_deny_reason(crate::l7::L7Protocol::JsonRpc, &request_info)
+            .expect("JSON-RPC response hard deny");
 
         assert_eq!(reason, crate::l7::relay::JSONRPC_RESPONSE_FRAME_DENY_REASON);
+        assert!(
+            forward_l7_hard_deny_reason(crate::l7::L7Protocol::Mcp, &request_info).is_none(),
+            "MCP response frames are evaluated by policy instead of hard-denied"
+        );
     }
 
     #[test]
@@ -5119,6 +5131,7 @@ network_policies:
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+                    mcp_strict_tool_names: true,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
@@ -5133,6 +5146,7 @@ network_policies:
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+                    mcp_strict_tool_names: true,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,

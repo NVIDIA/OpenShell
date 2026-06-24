@@ -35,19 +35,30 @@ bridge at `host.openshell.internal` (the alias `e2e/with-docker-gateway.sh`
 attaches to the CI job container on the e2e network), at `host.docker.internal`
 on local Docker Desktop, or via `--add-host ...:host-gateway` on local Linux.
 
-The generated policy allows valid JSON-RPC requests to the conformance server
-with `method: "*"`. That keeps OpenShell deny-by-default at the network
-boundary while allowing the upstream scenarios to exercise MCP behavior. The
-policy body lives in `policy-template.yaml`; the wrapper renders its host, port,
-and path placeholders from the upstream server URL.
+The generated policy uses `protocol: mcp` and allows valid MCP requests to the
+conformance server by omitting `method`, which uses the endpoint MCP method
+profile. That keeps OpenShell deny-by-default at the network boundary while
+allowing the upstream scenarios to exercise MCP behavior. The policy body lives
+in `policy-template.yaml`; the wrapper renders its host, port, and path
+placeholders from the upstream server URL.
 
-The upstream `everything-client` has a few handler names that do not line up
-with released-spec scenario names. The wrapper maps those names when forwarding
-`MCP_CONFORMANCE_SCENARIO` into the sandbox, but it does not patch the upstream
-checkout.
+For local runs, build or stage a static supervisor binary and pass it with
+`OPENSHELL_DOCKER_SUPERVISOR_BIN` if the default local supervisor build is
+linked against a newer glibc than the conformance client image provides.
+
+The pinned upstream checkout includes reference-client fixture drift that is
+tracked in `modelcontextprotocol/conformance#345`. The wrapper patches the
+checkout before building the client image so the bundled TypeScript client
+advertises `elicitation.form.applyDefaults` and accepts the canonical
+`elicitation-sep1034-client-defaults` scenario. It also routes `sse-retry` to
+the upstream standalone `sse-retry-test.ts` client so the reconnect timing path
+is exercised instead of aliasing it to another scenario.
+
+Remove those local workarounds when `OPENSHELL_MCP_CONFORMANCE_REF` points at
+an upstream release that includes the `#345` fixes.
 
 When enabling broader upstream suites, add scenarios that OpenShell does not yet
-support through the JSON-RPC proxy to `expected-failures.yml`. The upstream
+support through the MCP proxy to `expected-failures.yml`. The upstream
 runner treats listed failures as allowed and treats stale entries as failures.
 The default run uses a static scenario list in `e2e/mcp-conformance.sh`. To
 refresh it after changing the pinned upstream ref or default spec, list the

@@ -60,24 +60,13 @@ trap 'rm -f "${POLICY_FILE}"' EXIT
 CLIENT_SERVER_URL="$(python3 "${ROOT}/e2e/mcp-conformance/render-policy.py" "${SERVER_URL}" "${POLICY_FILE}" "${POLICY_TEMPLATE}")"
 
 ENV_ARGS=()
-CLIENT_SCENARIO="${MCP_CONFORMANCE_SCENARIO:-}"
-case "${CLIENT_SCENARIO}" in
-  elicitation-sep1034-client-defaults)
-    CLIENT_SCENARIO="elicitation-defaults"
-    ;;
-  sse-retry)
-    CLIENT_SCENARIO="tools_call"
-    ;;
-esac
 
 # These environment variables are set by the upstream conformance test runner
 # before it invokes the configured client command. Forward them into the
 # sandbox because the sandboxed TypeScript client depends on them to select the
 # scenario and read scenario-specific context.
 for NAME in MCP_CONFORMANCE_SCENARIO MCP_CONFORMANCE_CONTEXT MCP_CONFORMANCE_PROTOCOL_VERSION; do
-  if [ "${NAME}" = "MCP_CONFORMANCE_SCENARIO" ] && [ -n "${CLIENT_SCENARIO}" ]; then
-    ENV_ARGS+=(--env "MCP_CONFORMANCE_SCENARIO=${CLIENT_SCENARIO}")
-  elif [ -n "${!NAME+x}" ]; then
+  if [ -n "${!NAME+x}" ]; then
     ENV_ARGS+=(--env "${NAME}=${!NAME}")
   fi
 done
@@ -91,7 +80,12 @@ if [ "${POLICY_WAIT}" = "1" ]; then
 fi
 "${POLICY_SET_COMMAND[@]}"
 
+# Exec request validation rejects newline/control characters in command
+# arguments, so keep the sandbox-side script as a single argument without
+# embedded newlines.
 # shellcheck disable=SC2016
+SANDBOX_CLIENT_SCRIPT='cd /opt/mcp-conformance; case "${MCP_CONFORMANCE_SCENARIO:-}" in tools_call|tools-call) client=examples/clients/typescript/test2.ts ;; sse-retry) client=examples/clients/typescript/sse-retry-test.ts ;; *) client=examples/clients/typescript/everything-client.ts ;; esac; exec ./node_modules/.bin/tsx "$client" "$1"'
+
 SANDBOX_COMMAND=(
   "${OPENSHELL_BIN}" sandbox exec
   --name "${CLIENT_SANDBOX}"
@@ -99,7 +93,7 @@ SANDBOX_COMMAND=(
   --timeout "${CLIENT_TIMEOUT_SECONDS}"
   "${ENV_ARGS[@]}"
   --
-  sh -c 'cd /opt/mcp-conformance && exec ./node_modules/.bin/tsx examples/clients/typescript/everything-client.ts "$1"'
+  sh -c "${SANDBOX_CLIENT_SCRIPT}" \
   sh "${CLIENT_SERVER_URL}"
 )
 

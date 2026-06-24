@@ -148,7 +148,7 @@ The following steps outline the hot-reload policy update workflow.
 
    To inspect a stored sandbox-authored revision instead of the current effective policy, pass `--rev <version>`.
 
-5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, `rules`, or protocol-specific matchers such as GraphQL operation fields and JSON-RPC `method` / `params` rules.
+5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, `rules`, or protocol-specific matchers such as GraphQL operation fields, MCP `method` / `tool` rules, and generic JSON-RPC `method` / `params` rules.
 
 6. Push the updated policy when you need a full replacement. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
 
@@ -173,7 +173,7 @@ Use `openshell policy update` when you want to merge network policy changes into
 - remove one endpoint or one named rule without rewriting the rest of the file.
 - preview a merged result locally with `--dry-run` before you send it to the gateway.
 
-Use `openshell policy set` instead when you want to replace the full policy, update static sections, or make broader edits that are easier to express in YAML. Use full YAML for GraphQL and JSON-RPC rule shapes.
+Use `openshell policy set` instead when you want to replace the full policy, update static sections, or make broader edits that are easier to express in YAML. Use full YAML for GraphQL, MCP, and JSON-RPC rule shapes.
 
 ### Update Commands
 
@@ -210,7 +210,7 @@ This is the practical difference:
 Current constraints:
 
 - `--add-allow` and `--add-deny` work on `protocol: rest` and `protocol: websocket` endpoints.
-- GraphQL and JSON-RPC fine-grained rules require full policy YAML applied with `openshell policy set`.
+- GraphQL, MCP, and JSON-RPC fine-grained rules require full policy YAML applied with `openshell policy set`.
 - `--add-deny` requires the endpoint to already have an allow base, either an `access` preset or explicit allow `rules`.
 - `protocol: sql` is not a practical incremental workflow today. OpenShell does not do full SQL parsing, and SQL enforcement is not meaningfully supported yet.
 
@@ -549,7 +549,7 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
       - { path: /usr/bin/gh }
 ```
 
-Endpoints with `protocol: rest` enable HTTP request inspection and can opt in to supported text request body credential rewrite. Endpoints with `protocol: websocket` validate WebSocket upgrades and inspect client text messages on the upgraded request path. WebSocket endpoints can also classify GraphQL-over-WebSocket operation messages with the same operation rules used by GraphQL-over-HTTP. Endpoints with `protocol: graphql` parse GraphQL-over-HTTP payloads before evaluating rules. Endpoints with `protocol: json-rpc` parse JSON-RPC-over-HTTP request bodies and evaluate `method` and optional params rules. The endpoint-level `path` field lets these protocols share `api.github.com:443` without treating GraphQL payloads as plain REST `POST /graphql` requests.
+Endpoints with `protocol: rest` enable HTTP request inspection and can opt in to supported text request body credential rewrite. Endpoints with `protocol: websocket` validate WebSocket upgrades and inspect client text messages on the upgraded request path. WebSocket endpoints can also classify GraphQL-over-WebSocket operation messages with the same operation rules used by GraphQL-over-HTTP. Endpoints with `protocol: graphql` parse GraphQL-over-HTTP payloads before evaluating rules. Endpoints with `protocol: mcp` parse MCP Streamable HTTP request bodies and evaluate `method`, optional `tool`, and optional params rules. Endpoints with `protocol: json-rpc` keep generic JSON-RPC-over-HTTP compatibility by evaluating `method` and optional params rules. The endpoint-level `path` field lets these protocols share `api.github.com:443` without treating GraphQL payloads as plain REST `POST /graphql` requests.
 </Tab>
 
 </Tabs>
@@ -580,13 +580,15 @@ REST rules can also constrain query parameter values:
 
 `query` matchers are case-sensitive and run on decoded values. If a request has duplicate keys (for example, `tag=a&tag=b`), every value for that key must match the configured glob(s).
 
-### JSON-RPC matching
+### MCP and JSON-RPC matching
 
-JSON-RPC endpoints use `protocol: json-rpc`. The proxy parses sandbox-to-server JSON-RPC-over-HTTP request bodies, evaluates the JSON-RPC `method` field against rule `method`, and can match object params through dot-separated `params` keys.
+MCP endpoints use `protocol: mcp`. The proxy parses sandbox-to-server MCP Streamable HTTP request bodies, validates known MCP request and notification params, can evaluate the MCP method against rule `method`, and can match tool calls with the `tool` alias. Unknown extension methods stay addressable as literal method strings. Until OpenShell exposes MCP version profiles, `mcp.allow_all_known_mcp_methods` defaults to `true`; with that default, rules can omit `method` and tool selectors are normalized to `tools/call` internally. Set `mcp.allow_all_known_mcp_methods: false` to require explicit MCP method rules; in that mode, rules with `tool` or `params.name` must set `method: tools/call`. By default, MCP `tools/call` tool names must match `^[A-Za-z0-9_.-]{1,128}$`; set `mcp.strict_tool_names: false` on that endpoint only when a server intentionally uses names outside the MCP-recommended pattern. Wildcard `tool` matchers require `mcp.strict_tool_names` to remain enabled. Generic JSON-RPC endpoints use `protocol: json-rpc`, evaluate `method`, and can match object params.
 
-JSON-RPC policy enforcement is directional. It applies to HTTP request bodies sent by the sandboxed process to the configured endpoint. JSON-RPC responses and server-to-client messages carried on response bodies or MCP SSE streams are relayed but are not currently parsed for policy enforcement.
+MCP endpoints must declare a concrete destination with `host` and `port` or `ports`. A policy entry that only sets `protocol: mcp` is invalid and is not treated as a wildcard MCP authorization. Use `path: /mcp` when the server's MCP endpoint is path-scoped; omitting `path` matches every HTTP path on that host and port.
 
-JSON-RPC endpoint policies currently require full policy YAML applied with `openshell policy set`; the incremental `openshell policy update --add-endpoint` parser does not accept `json-rpc` as a protocol.
+MCP policy enforcement is directional. It applies to HTTP request bodies sent by the sandboxed process to the configured endpoint. JSON-RPC responses and server-to-client MCP messages carried on response bodies or SSE streams are relayed but are not currently parsed for policy enforcement.
+
+MCP and JSON-RPC endpoint policies currently require full policy YAML applied with `openshell policy set`; the incremental `openshell policy update --add-endpoint` parser does not accept `mcp` or `json-rpc` as protocols.
 
 ```yaml showLineNumbers={false}
   mcp_server:
@@ -595,35 +597,29 @@ JSON-RPC endpoint policies currently require full policy YAML applied with `open
       - host: mcp.example.com
         port: 443
         path: /mcp
-        protocol: json-rpc
+        protocol: mcp
         enforcement: enforce
-        json_rpc:
+        mcp:
           max_body_bytes: 131072
         rules:
           - allow:
-              method: initialize
+              tool: read_status
           - allow:
-              method: tools/list
-          - allow:
-              method: tools/call
-              params:
-                name: read_status
-          - allow:
-              method: tools/call
-              params:
-                name: submit_report
-                arguments.scope: workspace/main
+              tool:
+                any: [submit_report, list_reports]
         deny_rules:
-          - method: tools/call
-            params:
-              name: delete_resource
+          - tool: delete_resource
     binaries:
       - { path: /usr/bin/python3 }
 ```
 
-`json_rpc.max_body_bytes` controls how many JSON-RPC-over-HTTP request body bytes OpenShell buffers for inspection. It defaults to `65536`.
+`mcp.max_body_bytes` controls how many MCP-over-HTTP request body bytes OpenShell buffers for inspection. It defaults to `65536`. `mcp.strict_tool_names` defaults to `true` for each MCP endpoint. `mcp.allow_all_known_mcp_methods` defaults to `true`; when it is `false`, the endpoint must define explicit MCP method rules. If an MCP endpoint omits `rules` while `mcp.allow_all_known_mcp_methods` is unset or `true`, OpenShell allows all MCP-family methods and all tools, then applies any `deny_rules`. A broad allow or deny rule whose method matcher includes `tools/call` cannot be combined with tool-specific allow rules because it would bypass or erase the tool filter; add `tool` or `params.name` to scope `tools/call`, or remove the tool-specific rules.
 
-`params` matchers are case-sensitive and use the same string glob or `{ any: [...] }` matcher syntax as REST query parameters. They match scalar leaf values from object params: strings, numbers, and booleans are converted to strings, and nested JSON object params are flattened with dot-separated keys before matching. Arrays, `null`, and non-object top-level params do not produce matcher keys. Literal `.` characters in JSON-RPC params object keys are allowed; when a literal key and a flattened nested path produce the same matcher key, the literal key takes precedence. This is useful for controls such as matching MCP `tools/call` by `params.name`, but it is not a complete MCP payload policy for rich nested content. For batch requests, OpenShell evaluates each JSON-RPC call independently and denies the whole batch if any call is denied.
+Use `protocol: json-rpc` and `method` when you need generic JSON-RPC 2.0 matching for a non-MCP server. `json_rpc.max_body_bytes` controls the generic JSON-RPC inspection buffer.
+
+Generic JSON-RPC `params` matchers are case-sensitive and use the same string glob or `{ any: [...] }` matcher syntax as REST query parameters. They match scalar leaf values from object params: strings, numbers, and booleans are converted to strings, and nested JSON object params are flattened with dot-separated keys before matching. Arrays, `null`, and non-object top-level params do not produce matcher keys. Literal `.` characters in JSON-RPC params object keys are allowed; when a literal key and a flattened nested path produce the same matcher key, the literal key takes precedence.
+
+For MCP, `tool` accepts a string glob or `{ any: [...] }` matcher for `tools/call` `params.name`. Rules that use `tool` or lower-level `params.name` can omit `method` while `mcp.allow_all_known_mcp_methods` is enabled; if that option is `false`, those rules must set `method: tools/call`. MCP method globs are accepted only for the `tools/` method family, such as `tools/*`; omit `method` instead of writing `method: "*"` when the endpoint method profile should allow all MCP methods. Omit `tool` to allow all tools for a `tools/call` method rule. OpenShell does not support MCP tool argument matching yet; allowed tools accept all argument payloads by default. Other MCP `params` keys are rejected. For batch requests, OpenShell evaluates each JSON-RPC call independently and denies the whole batch if any call is denied.
 
 ### GraphQL matching
 

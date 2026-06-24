@@ -21,6 +21,10 @@
 # The default community sandbox image uses :latest. This wrapper refreshes it
 # before starting the gateway, while the Docker driver defaults to IfNotPresent
 # so local Dockerfile-built images remain usable.
+#
+# Set OPENSHELL_DOCKER_SUPERVISOR_BIN to force a specific Linux
+# openshell-sandbox binary. This is useful when a staged static supervisor
+# binary should be used instead of the host glibc-linked local target build.
 
 set -euo pipefail
 
@@ -428,32 +432,46 @@ fi
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
 
-SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
-if [ -n "${SUPERVISOR_IMAGE}" ]; then
-  ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
-  echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
-  DOCKER_SUPERVISOR_ARGS=(--docker-supervisor-image "${SUPERVISOR_IMAGE}")
-else
-  echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
-  mkdir -p "${SUPERVISOR_OUT_DIR}"
-  if [ "${HOST_OS}" = "Linux" ] && [ "${HOST_ARCH}" = "${DAEMON_ARCH}" ]; then
-    rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
-    cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
-      --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
-    cp "${TARGET_DIR}/${SUPERVISOR_TARGET}/release/openshell-sandbox" "${SUPERVISOR_BIN}"
-  else
-    CONTAINER_ENGINE=docker \
-    DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
-    DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_OUT_DIR}" \
-      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
-  fi
-
+if [ -n "${OPENSHELL_DOCKER_SUPERVISOR_BIN:-}" ]; then
+  case "${OPENSHELL_DOCKER_SUPERVISOR_BIN}" in
+    /*) SUPERVISOR_BIN="${OPENSHELL_DOCKER_SUPERVISOR_BIN}" ;;
+    *) SUPERVISOR_BIN="${ROOT}/${OPENSHELL_DOCKER_SUPERVISOR_BIN}" ;;
+  esac
   if [ ! -f "${SUPERVISOR_BIN}" ]; then
-    echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
-    exit 1
+    echo "ERROR: Docker supervisor binary '${SUPERVISOR_BIN}' does not exist." >&2
+    exit 2
   fi
   chmod +x "${SUPERVISOR_BIN}"
+  echo "Using Docker supervisor binary: ${SUPERVISOR_BIN}"
   DOCKER_SUPERVISOR_ARGS=(--docker-supervisor-bin "${SUPERVISOR_BIN}")
+else
+  SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
+  if [ -n "${SUPERVISOR_IMAGE}" ]; then
+    ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
+    echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
+    DOCKER_SUPERVISOR_ARGS=(--docker-supervisor-image "${SUPERVISOR_IMAGE}")
+  else
+    echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
+    mkdir -p "${SUPERVISOR_OUT_DIR}"
+    if [ "${HOST_OS}" = "Linux" ] && [ "${HOST_ARCH}" = "${DAEMON_ARCH}" ]; then
+      rustup target add "${SUPERVISOR_TARGET}" >/dev/null 2>&1 || true
+      cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
+        --release -p openshell-sandbox --target "${SUPERVISOR_TARGET}"
+      cp "${TARGET_DIR}/${SUPERVISOR_TARGET}/release/openshell-sandbox" "${SUPERVISOR_BIN}"
+    else
+      CONTAINER_ENGINE=docker \
+      DOCKER_PLATFORM="linux/${DAEMON_ARCH}" \
+      DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_OUT_DIR}" \
+        bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor-output
+    fi
+
+    if [ ! -f "${SUPERVISOR_BIN}" ]; then
+      echo "ERROR: expected supervisor binary at ${SUPERVISOR_BIN}" >&2
+      exit 1
+    fi
+    chmod +x "${SUPERVISOR_BIN}"
+    DOCKER_SUPERVISOR_ARGS=(--docker-supervisor-bin "${SUPERVISOR_BIN}")
+  fi
 fi
 
 DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"

@@ -140,6 +140,7 @@ fn engine_type_for_protocol(protocol: L7Protocol) -> &'static str {
     match protocol {
         L7Protocol::Graphql => "l7-graphql",
         L7Protocol::JsonRpc => "l7-jsonrpc",
+        L7Protocol::Mcp => "l7-mcp",
         L7Protocol::Websocket => "l7-websocket",
         L7Protocol::Rest | L7Protocol::Sql => "l7",
     }
@@ -216,7 +217,9 @@ where
                 .into_diagnostic()?;
             Ok(())
         }
-        L7Protocol::JsonRpc => relay_jsonrpc(config, &engine, client, upstream, ctx).await,
+        L7Protocol::JsonRpc | L7Protocol::Mcp => {
+            relay_jsonrpc(config, &engine, client, upstream, ctx).await
+        }
     }
 }
 
@@ -310,6 +313,43 @@ where
         } else {
             None
         };
+        let jsonrpc_info = if config.protocol.is_jsonrpc_family() {
+            if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&req) {
+                Some(crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream())
+            } else {
+                match crate::l7::http::read_body_for_inspection(
+                    client,
+                    &mut req,
+                    config.json_rpc_max_body_bytes,
+                )
+                .await
+                {
+                    Ok(body) => Some(crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
+                        &body,
+                        crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
+                    )),
+                    Err(e) => {
+                        if is_benign_connection_error(&e) {
+                            debug!(
+                                host = %ctx.host,
+                                port = ctx.port,
+                                error = %e,
+                                "JSON-RPC L7 connection closed"
+                            );
+                        } else {
+                            let detail = parse_rejection_detail(
+                                &e.to_string(),
+                                ParseRejectionMode::L7Endpoint,
+                            );
+                            emit_parse_rejection(ctx, &detail, "l7-jsonrpc");
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
@@ -340,7 +380,7 @@ where
             target: redacted_target.clone(),
             query_params: req.query_params.clone(),
             graphql: graphql_info.clone(),
-            jsonrpc: None,
+            jsonrpc: jsonrpc_info.clone(),
         };
         let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
         if config.protocol == L7Protocol::Websocket && !websocket_request {
@@ -364,7 +404,13 @@ where
         let parse_error_reason = graphql_info
             .as_ref()
             .and_then(|info| info.error.as_deref())
-            .map(|error| format!("GraphQL request rejected: {error}"));
+            .map(|error| format!("GraphQL request rejected: {error}"))
+            .or_else(|| {
+                jsonrpc_info
+                    .as_ref()
+                    .and_then(|info| info.error.as_deref())
+                    .map(|error| format!("JSON-RPC request rejected: {error}"))
+            });
         let force_deny = parse_error_reason.is_some();
         let (allowed, reason) = if let Some(reason) = parse_error_reason {
             (false, reason)
@@ -385,8 +431,12 @@ where
         let engine_type = match config.protocol {
             L7Protocol::Graphql => "l7-graphql",
             L7Protocol::Websocket => "l7-websocket",
-            L7Protocol::Rest | L7Protocol::Sql | L7Protocol::JsonRpc => "l7",
+            L7Protocol::JsonRpc => "l7-jsonrpc",
+            L7Protocol::Mcp => "l7-mcp",
+            L7Protocol::Rest | L7Protocol::Sql => "l7",
         };
+        let protocol_summary =
+            l7_protocol_log_summary(graphql_info.as_ref(), jsonrpc_info.as_ref());
         emit_l7_request_log(
             ctx,
             &request_info,
@@ -394,7 +444,7 @@ where
             decision_str,
             engine_type,
             &reason,
-            graphql_info.as_ref(),
+            &protocol_summary,
         );
 
         let _ = &eval_target;
@@ -472,7 +522,7 @@ fn emit_l7_request_log(
     decision_str: &str,
     engine_type: &str,
     reason: &str,
-    graphql_info: Option<&crate::l7::graphql::GraphqlRequestInfo>,
+    protocol_summary: &str,
 ) {
     let (action_id, disposition_id, severity) = match decision_str {
         "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
@@ -487,9 +537,6 @@ fn emit_l7_request_log(
             SeverityId::Informational,
         ),
     };
-    let summary = graphql_info
-        .map(|info| format!(" {}", graphql_log_summary(info)))
-        .unwrap_or_default();
     let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
         .action(action_id)
@@ -503,11 +550,31 @@ fn emit_l7_request_log(
         .firewall_rule(&ctx.policy_name, engine_type)
         .message(format!(
             "L7_REQUEST {decision_str} {} {}:{}{}{} reason={}",
-            request_info.action, ctx.host, ctx.port, redacted_target, summary, reason,
+            request_info.action, ctx.host, ctx.port, redacted_target, protocol_summary, reason,
         ))
         .build();
     ocsf_emit!(event);
     emit_activity(ctx, decision_str == "deny", "l7_policy");
+}
+
+fn l7_protocol_log_summary(
+    graphql_info: Option<&crate::l7::graphql::GraphqlRequestInfo>,
+    jsonrpc_info: Option<&crate::l7::jsonrpc::JsonRpcRequestInfo>,
+) -> String {
+    if let Some(info) = graphql_info {
+        return format!(" {}", graphql_log_summary(info));
+    }
+
+    if let Some(info) = jsonrpc_info {
+        return format!(
+            " rule_methods={} params_sha256={}",
+            rule_method_names_for_log(info),
+            info.params_sha256()
+                .unwrap_or_else(|| "<empty>".to_string())
+        );
+    }
+
+    String::new()
 }
 
 fn emit_activity(ctx: &L7EvalContext, denied: bool, deny_group: &'static str) {
@@ -657,6 +724,13 @@ pub(crate) fn websocket_extension_mode(config: &L7EndpointConfig) -> WebSocketEx
         WebSocketExtensionMode::PermessageDeflate
     } else {
         WebSocketExtensionMode::Preserve
+    }
+}
+
+fn jsonrpc_engine_type(protocol: L7Protocol) -> &'static str {
+    match protocol {
+        L7Protocol::Mcp => "l7-mcp",
+        _ => "l7-jsonrpc",
     }
 }
 
@@ -950,6 +1024,9 @@ where
             return Ok(());
         }
 
+        // Future MCP version-profile request checks should hook here before OPA
+        // evaluation. See McpOptions in proto/sandbox.proto for the policy
+        // roadmap and source documentation.
         let parsed = match crate::l7::jsonrpc::parse_jsonrpc_http_request(
             client,
             config.json_rpc_max_body_bytes,
@@ -957,6 +1034,7 @@ where
                 allow_encoded_slash: config.allow_encoded_slash,
                 ..Default::default()
             },
+            crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
         )
         .await
         {
@@ -973,7 +1051,7 @@ where
                 } else {
                     let detail =
                         parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
-                    emit_parse_rejection(ctx, &detail, "l7-jsonrpc");
+                    emit_parse_rejection(ctx, &detail, jsonrpc_engine_type(config.protocol));
                 }
                 return Ok(());
             }
@@ -1000,9 +1078,8 @@ where
             .error
             .as_deref()
             .map(|e| format!("JSON-RPC request rejected: {e}"));
-        let response_frame_reason = jsonrpc_info
-            .has_response
-            .then(|| JSONRPC_RESPONSE_FRAME_DENY_REASON.to_string());
+        let response_frame_reason =
+            jsonrpc_response_frame_hard_deny_reason(config.protocol, &jsonrpc_info);
         let force_deny = parse_error_reason.is_some() || response_frame_reason.is_some();
         let (allowed, reason, jsonrpc_log_info) = if let Some(reason) = parse_error_reason {
             (false, reason, jsonrpc_info.clone())
@@ -1049,7 +1126,7 @@ where
                     OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                .firewall_rule(&ctx.policy_name, "l7-jsonrpc")
+                .firewall_rule(&ctx.policy_name, jsonrpc_engine_type(config.protocol))
                 .message(jsonrpc_log_message(
                     decision_str,
                     &request_info.action,
@@ -1064,6 +1141,11 @@ where
         }
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+            // Future MCP response/SSE introspection or rewrite would hook here
+            // before returning upstream bytes. The current policy schema has no
+            // trusted-annotations or version-profile field, so MCP responses and
+            // SSE streams are relayed unchanged; see McpOptions in
+            // proto/sandbox.proto for planned policy extensions.
             let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
                 &req,
                 client,
@@ -1357,9 +1439,16 @@ pub(crate) fn rule_method_names_for_log(info: &crate::l7::jsonrpc::JsonRpcReques
     }
     info.calls
         .iter()
-        .map(|call| call.method.as_str())
+        .map(|call| sanitize_log_token(&call.method))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn sanitize_log_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { '?' } else { ch })
+        .collect()
 }
 
 struct JsonRpcEvaluation {
@@ -1370,6 +1459,14 @@ struct JsonRpcEvaluation {
 
 pub(crate) const JSONRPC_RESPONSE_FRAME_DENY_REASON: &str =
     "JSON-RPC response frames are not permitted from client to server";
+
+pub(crate) fn jsonrpc_response_frame_hard_deny_reason(
+    protocol: L7Protocol,
+    jsonrpc: &crate::l7::jsonrpc::JsonRpcRequestInfo,
+) -> Option<String> {
+    (protocol != L7Protocol::Mcp && jsonrpc.has_response)
+        .then(|| JSONRPC_RESPONSE_FRAME_DENY_REASON.to_string())
+}
 
 /// Check if a miette error represents a benign connection close.
 ///
@@ -1398,15 +1495,15 @@ pub fn evaluate_l7_request(
     request: &L7RequestInfo,
 ) -> Result<(bool, String)> {
     if let Some(jsonrpc) = &request.jsonrpc
-        && jsonrpc.has_response
-    {
-        return Ok((false, JSONRPC_RESPONSE_FRAME_DENY_REASON.to_string()));
-    }
-
-    if let Some(jsonrpc) = &request.jsonrpc
         && jsonrpc.is_batch
         && !jsonrpc.calls.is_empty()
     {
+        if jsonrpc.has_response {
+            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+            if !allowed {
+                return Ok((false, reason));
+            }
+        }
         for call in &jsonrpc.calls {
             let item_request = jsonrpc_request_for_call(request, call);
             let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
@@ -1427,11 +1524,14 @@ fn evaluate_jsonrpc_l7_request_for_log(
     jsonrpc: &crate::l7::jsonrpc::JsonRpcRequestInfo,
 ) -> Result<JsonRpcEvaluation> {
     if jsonrpc.has_response {
-        return Ok(JsonRpcEvaluation {
-            allowed: false,
-            reason: JSONRPC_RESPONSE_FRAME_DENY_REASON.to_string(),
-            log_info: jsonrpc.clone(),
-        });
+        let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+        if !allowed || !jsonrpc.is_batch || jsonrpc.calls.is_empty() {
+            return Ok(JsonRpcEvaluation {
+                allowed,
+                reason,
+                log_info: jsonrpc.clone(),
+            });
+        }
     }
 
     if jsonrpc.is_batch && !jsonrpc.calls.is_empty() {
@@ -1889,6 +1989,52 @@ network_policies:
         (config, tunnel_engine, ctx)
     }
 
+    fn mcp_test_relay_context() -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        let data = r"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: initialize
+    binaries:
+      - { path: /usr/bin/python3 }
+";
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "mcp.example.test".into(),
+            port: 8000,
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "mcp.example.test".into(),
+            port: 8000,
+            policy_name: "mcp_api".into(),
+            binary_path: "/usr/bin/python3".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        (config, tunnel_engine, ctx)
+    }
+
     fn authorization_header_count(headers: &str) -> usize {
         headers
             .lines()
@@ -2270,6 +2416,7 @@ network_policies:
                     {"jsonrpc":"2.0","id":1,"method":"tools/list"},
                     {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_status"}}
                 ]"#,
+                crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
             )),
         };
 
@@ -2281,6 +2428,7 @@ network_policies:
                 {"jsonrpc":"2.0","id":1,"method":"tools/list"},
                 {"jsonrpc":"2.0","id":2,"result":{"ok":true}}
             ]"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         ));
         let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
         assert!(!allowed);
@@ -2298,6 +2446,7 @@ network_policies:
 
         request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         ));
         let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
         assert!(!allowed);
@@ -2316,6 +2465,7 @@ network_policies:
                 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"blocked_action"}},
                 {"jsonrpc":"2.0","id":3,"method":"tools/delete","params":{"name":"purge_cache"}}
             ]"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         ));
         let (allowed, _) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
         assert!(!allowed);
@@ -2396,6 +2546,7 @@ network_policies:
             graphql: None,
             jsonrpc: Some(crate::l7::jsonrpc::parse_jsonrpc_body(
                 br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments.scope":"workspace/other","arguments":{"scope":"workspace/main"}}}"#,
+                crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
             )),
         };
 
@@ -2404,15 +2555,97 @@ network_policies:
 
         request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{"scope":"workspace/other"}}}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         ));
         let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
         assert!(allowed, "{reason}");
     }
 
     #[test]
+    fn mcp_tool_deny_rule_blocks_tools_call() {
+        let data = r#"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+        path: "/mcp"
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          max_body_bytes: 131072
+        rules:
+          - allow:
+              method: initialize
+          - allow:
+              method: tools/list
+          - allow:
+              method: tools/call
+              tool: read_status
+        deny_rules:
+          - method: tools/call
+            tool: delete_resource
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "mcp_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let mut request = L7RequestInfo {
+            action: "POST".into(),
+            target: "/mcp".into(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+            jsonrpc: Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_status","arguments":{}}}"#,
+                crate::l7::jsonrpc::JsonRpcInspectionMode::Mcp,
+            )),
+        };
+
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        assert!(allowed, "{reason}");
+
+        request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_resource","arguments":{"scope":"workspace/main"}}}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::Mcp,
+        ));
+        let parsed = request.jsonrpc.as_ref().expect("parsed MCP request");
+        assert!(
+            parsed.error.is_none(),
+            "MCP request should parse: {parsed:?}"
+        );
+        assert_eq!(
+            parsed.calls.first().and_then(|call| call.tool.as_deref()),
+            Some("delete_resource")
+        );
+
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        assert!(!allowed, "delete_resource must match the MCP deny rule");
+        assert!(
+            reason.contains("deny rule"),
+            "deny reason should identify policy denial: {reason}"
+        );
+    }
+
+    #[test]
     fn jsonrpc_log_records_digest_not_args() {
         let info = crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_resource","arguments":{"scope":"secret-scope"}}}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         );
         let params_sha256 = info.params_sha256().expect("params digest");
         let message = jsonrpc_log_message(
@@ -2438,6 +2671,7 @@ network_policies:
                 {"jsonrpc":"2.0","id":1,"method":"tools/list"},
                 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_resource"}}
             ]"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         );
         let batch_params_sha256 = batch.params_sha256().expect("batch params digest");
         let batch_message = jsonrpc_log_message(
@@ -2459,6 +2693,7 @@ network_policies:
 
         let no_params = crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
         );
         let no_params_sha256 = no_params
             .params_sha256()
@@ -2505,6 +2740,7 @@ network_policies:
             enforcement: EnforcementMode::Enforce,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+            mcp_strict_tool_names: true,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -2609,6 +2845,7 @@ network_policies:
             enforcement: EnforcementMode::Enforce,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+            mcp_strict_tool_names: true,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -2730,6 +2967,7 @@ network_policies:
             enforcement: EnforcementMode::Enforce,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
+            mcp_strict_tool_names: true,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -3136,6 +3374,62 @@ network_policies:
             .expect("upstream response should reach client")
             .unwrap();
         assert!(String::from_utf8_lossy(&response[..n]).contains("200 OK"));
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should complete")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_forwards_jsonrpc_response_frame() {
+        let (config, tunnel_engine, ctx) = mcp_test_relay_context();
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"{"jsonrpc":"2.0","id":7,"result":{"action":"accept","content":{}}}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.write_all(body).await.unwrap();
+
+        let mut upstream_buf = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_buf),
+        )
+        .await
+        .expect("MCP response frame should reach upstream")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_buf[..n]);
+        assert!(upstream_request.starts_with("POST /mcp HTTP/1.1"));
+        assert!(upstream_request.contains(r#""result":{"action":"accept""#));
+
+        upstream
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut response = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("upstream response should reach client")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).contains("202 Accepted"));
 
         drop(app);
         tokio::time::timeout(std::time::Duration::from_secs(1), relay)

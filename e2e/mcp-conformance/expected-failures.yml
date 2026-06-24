@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Add client scenarios here when enabling broader MCP conformance suites that
-# currently fail in the pinned upstream example client or through OpenShell.
-client:
-  - elicitation-sep1034-client-defaults
-  - sse-retry
+# Add scenarios here only for known OpenShell MCP conformance gaps.
+# Upstream reference-client fixture drift is handled by the local wrapper and
+# checkout patching in e2e/mcp-conformance.sh so it does not hide OpenShell
+# regressions behind expected failures.
+client: []
 server: []

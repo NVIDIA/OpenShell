@@ -8,10 +8,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh disable=SC1091
 source "${ROOT}/e2e/support/gateway-common.sh"
 CONFORMANCE_DIR="${OPENSHELL_MCP_CONFORMANCE_DIR:-${ROOT}/.cache/mcp-conformance}"
-# Pinned after v0.1.16 because that tag has an upstream scenario-name mismatch:
-# the runner exposes `tools_call`, while the bundled client only accepts
-# `tools-call`. This commit registers both names in the client and keeps the
-# runner's canonical `tools_call` scenario name.
+# Pinned after v0.1.16 for the upstream tools_call fixture fix. The current
+# checkout still needs temporary client-fixture patches for
+# modelcontextprotocol/conformance#345; remove patch_conformance_clients when
+# OPENSHELL_MCP_CONFORMANCE_REF points at a release containing those fixes.
 CONFORMANCE_REF="${OPENSHELL_MCP_CONFORMANCE_REF:-b9041ea41b0188581803459dbae71bc7e02fd995}"
 CLIENT_IMAGE="${OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE:-openshell-mcp-conformance-client:local}"
 SCENARIOS="${OPENSHELL_MCP_CONFORMANCE_SCENARIOS:-}"
@@ -22,6 +22,7 @@ DOCKER_PULL="${OPENSHELL_MCP_CONFORMANCE_DOCKER_PULL:-0}"
 CLIENT_IMAGE_REF_LABEL="org.openshell.mcp-conformance.ref"
 CLIENT_IMAGE_DOCKERFILE_LABEL="org.openshell.mcp-conformance.dockerfile"
 CLIENT_IMAGE_DOCKERIGNORE_LABEL="org.openshell.mcp-conformance.dockerignore"
+CLIENT_IMAGE_FIXTURE_HASH_LABEL="org.openshell.mcp-conformance.fixture-hash"
 RUN_SCENARIOS_COMMAND="__openshell_mcp_run_scenarios"
 CLIENT_SANDBOX_MANAGED=0
 HOST_BRIDGE_PID=""
@@ -107,6 +108,67 @@ openshell_bin() {
   local target_dir
   target_dir="$(e2e_cargo_target_dir "${ROOT}")"
   printf '%s\n' "${target_dir}/debug/openshell"
+}
+
+patch_conformance_clients() {
+  node - "${CONFORMANCE_DIR}" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+
+const root = process.argv[2];
+
+function rewrite(file, rewriter) {
+  const target = path.join(root, file);
+  const source = fs.readFileSync(target, 'utf8');
+  const next = rewriter(source, file);
+
+  if (next !== source) {
+    fs.writeFileSync(target, next);
+    console.error(`Patched upstream MCP conformance fixture: ${file}`);
+  }
+}
+
+function patchApplyDefaults(source, file) {
+  if (/elicitation:\s*{\s*form:\s*{\s*applyDefaults:\s*true\s*}\s*}/m.test(source)) {
+    return source;
+  }
+
+  const broken = /elicitation:\s*{\s*applyDefaults:\s*true\s*}/m;
+  if (!broken.test(source)) {
+    throw new Error(`${file}: could not find the known elicitation defaults fixture`);
+  }
+
+  return source.replace(
+    broken,
+    `elicitation: {
+            form: {
+              applyDefaults: true
+            }
+          }`
+  );
+}
+
+rewrite('examples/clients/typescript/everything-client.ts', (source, file) => {
+  let next = patchApplyDefaults(source, file);
+  if (next.includes('elicitation-sep1034-client-defaults')) {
+    return next;
+  }
+
+  const oldRegistration = "registerScenario('elicitation-defaults', runElicitationDefaultsClient);";
+  const newRegistration = `registerScenarios(
+  ['elicitation-defaults', 'elicitation-sep1034-client-defaults'],
+  runElicitationDefaultsClient
+);`;
+
+  if (!next.includes(oldRegistration)) {
+    throw new Error(`${file}: could not find the known elicitation scenario registration`);
+  }
+
+  return next.replace(oldRegistration, newRegistration);
+});
+
+rewrite('examples/clients/typescript/elicitation-defaults-test.ts', patchApplyDefaults);
+NODE
 }
 
 start_host_bridge() {
@@ -210,21 +272,29 @@ stop_host_bridge() {
 }
 
 build_client_image() {
-  local conformance_head dockerfile_hash dockerignore_hash
-  local image_ref image_dockerfile image_dockerignore
+  local conformance_head dockerfile_hash dockerignore_hash fixture_hash
+  local image_ref image_dockerfile image_dockerignore image_fixture_hash
   local -a pull_args=()
 
   conformance_head="$(git -C "${CONFORMANCE_DIR}" rev-parse HEAD)"
   dockerfile_hash="$(git -C "${ROOT}" hash-object "${ROOT}/e2e/mcp-conformance/Dockerfile.client")"
   dockerignore_hash="$(git -C "${ROOT}" hash-object "${ROOT}/e2e/mcp-conformance/Dockerfile.client.dockerignore")"
+  fixture_hash="$(
+    git -C "${CONFORMANCE_DIR}" diff -- \
+      examples/clients/typescript/everything-client.ts \
+      examples/clients/typescript/elicitation-defaults-test.ts |
+      git hash-object --stdin
+  )"
 
   image_ref="$(docker_image_label "${CLIENT_IMAGE}" "${CLIENT_IMAGE_REF_LABEL}")"
   image_dockerfile="$(docker_image_label "${CLIENT_IMAGE}" "${CLIENT_IMAGE_DOCKERFILE_LABEL}")"
   image_dockerignore="$(docker_image_label "${CLIENT_IMAGE}" "${CLIENT_IMAGE_DOCKERIGNORE_LABEL}")"
+  image_fixture_hash="$(docker_image_label "${CLIENT_IMAGE}" "${CLIENT_IMAGE_FIXTURE_HASH_LABEL}")"
   if [ "${FORCE_REBUILD}" != "1" ] \
     && [ "${image_ref}" = "${conformance_head}" ] \
     && [ "${image_dockerfile}" = "${dockerfile_hash}" ] \
-    && [ "${image_dockerignore}" = "${dockerignore_hash}" ]; then
+    && [ "${image_dockerignore}" = "${dockerignore_hash}" ] \
+    && [ "${image_fixture_hash}" = "${fixture_hash}" ]; then
     echo "Using cached MCP conformance client image ${CLIENT_IMAGE} (${conformance_head})." >&2
     return
   fi
@@ -237,6 +307,7 @@ build_client_image() {
     --label "${CLIENT_IMAGE_REF_LABEL}=${conformance_head}" \
     --label "${CLIENT_IMAGE_DOCKERFILE_LABEL}=${dockerfile_hash}" \
     --label "${CLIENT_IMAGE_DOCKERIGNORE_LABEL}=${dockerignore_hash}" \
+    --label "${CLIENT_IMAGE_FIXTURE_HASH_LABEL}=${fixture_hash}" \
     -f "${ROOT}/e2e/mcp-conformance/Dockerfile.client" \
     -t "${CLIENT_IMAGE}" \
     "${CONFORMANCE_DIR}"
@@ -429,16 +500,18 @@ main() {
     return
   fi
 
-  # git fetches and pins the upstream conformance repo (and hashes it for image
-  # caching); docker builds and runs the runner/client containers; python3 runs
-  # the host bridge and renders policies. The conformance runner itself (node,
-  # npm, tsx) now runs inside the container image, not on the host.
+  # git fetches and pins the upstream conformance repo; node patches temporary
+  # fixture drift before the image build; docker builds and runs the
+  # runner/client containers; python3 runs the host bridge and renders policies.
+  # npm and tsx run inside the container image, not on the host.
   require_command git
+  require_command node
   require_command docker
   require_command python3
 
   echo "MCP conformance spec version: ${SPEC_VERSION}" >&2
   checkout_conformance
+  patch_conformance_clients
   build_client_image
   run_scenarios_under_gateway "$@"
 }

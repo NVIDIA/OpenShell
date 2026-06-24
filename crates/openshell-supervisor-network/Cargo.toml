@@ -38,6 +38,7 @@ spiffe = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tower-mcp-types = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 webpki-roots = { workspace = true }
