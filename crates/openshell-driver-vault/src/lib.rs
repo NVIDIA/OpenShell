@@ -131,13 +131,18 @@ impl VaultCredentialDriver {
         &self,
         request: StoreCredentialRequest,
     ) -> Result<CredentialHandle, Status> {
-        let token = self.auth_token().await?;
         let logical_path = if let Some(existing_handle) = request.existing_handle.as_ref() {
             Self::logical_path_from_handle(existing_handle)?
         } else {
             managed_secret_path(&request.provider_name, &request.credential_key)
         };
         validate_secret_path(&logical_path).map_err(Status::invalid_argument)?;
+        validate_managed_secret_path(
+            &request.provider_name,
+            &request.credential_key,
+            &logical_path,
+        )?;
+        let token = self.auth_token().await?;
         let reference = VaultSecretReference {
             api_path: api_path_for_reference(
                 &self.settings.mount,
@@ -157,9 +162,14 @@ impl VaultCredentialDriver {
     }
 
     pub async fn delete_credential(&self, request: DeleteCredentialRequest) -> Result<(), Status> {
-        let token = self.auth_token().await?;
         let handle = Self::handle_from_request("delete", request.handle)?;
         let logical_path = Self::logical_path_from_handle(&handle)?;
+        validate_managed_secret_path(
+            &request.provider_name,
+            &request.credential_key,
+            &logical_path,
+        )?;
+        let token = self.auth_token().await?;
         let api_path = delete_api_path_for_reference(
             &self.settings.mount,
             self.settings.kv_version,
@@ -172,11 +182,16 @@ impl VaultCredentialDriver {
         &self,
         requests: Vec<ResolveCredentialRequest>,
     ) -> Result<Vec<ResolvedCredential>, Status> {
-        let token = self.auth_token().await?;
         let mut responses = Vec::with_capacity(requests.len());
+        let mut resolved_requests = Vec::with_capacity(requests.len());
         for request in requests {
             let handle = Self::handle_from_request(&request.request_id, request.handle)?;
             let logical_path = Self::logical_path_from_handle(&handle)?;
+            validate_managed_secret_path(
+                &request.provider_name,
+                &request.credential_key,
+                &logical_path,
+            )?;
             let reference = VaultSecretReference {
                 api_path: api_path_for_reference(
                     &self.settings.mount,
@@ -186,9 +201,14 @@ impl VaultCredentialDriver {
                 key: STORED_VALUE_KEY.to_string(),
                 kv_version: self.settings.kv_version,
             };
+            resolved_requests.push((request.request_id, reference));
+        }
+
+        let token = self.auth_token().await?;
+        for (request_id, reference) in resolved_requests {
             let value = self.resolve_secret_value(&reference, &token).await?;
             responses.push(ResolvedCredential {
-                request_id: request.request_id,
+                request_id,
                 value,
                 expires_at_ms: 0,
             });
@@ -690,6 +710,20 @@ fn managed_secret_path(provider_name: &str, credential_key: &str) -> String {
     format!("openshell/provider-credentials/{}", &hex[..40])
 }
 
+fn validate_managed_secret_path(
+    provider_name: &str,
+    credential_key: &str,
+    logical_path: &str,
+) -> Result<(), Status> {
+    let expected = managed_secret_path(provider_name, credential_key);
+    if logical_path == expected {
+        return Ok(());
+    }
+    Err(Status::invalid_argument(format!(
+        "vault credential handle path does not match the managed path for provider credential '{credential_key}'"
+    )))
+}
+
 async fn read_secret_file(path: &Path, description: &str) -> Result<String, Status> {
     let contents = tokio::fs::read_to_string(path).await.map_err(|err| {
         Status::unauthenticated(format!(
@@ -920,6 +954,19 @@ mod tests {
         assert!(err.message().contains("path segments"));
     }
 
+    #[test]
+    fn handle_rejects_unexpected_managed_path() {
+        let err = validate_managed_secret_path(
+            "nvidia-prod",
+            "NVIDIA_API_KEY",
+            "openshell/provider-credentials/other",
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("managed path"));
+    }
+
     #[tokio::test]
     async fn store_and_resolve_token_file_kv2_secret() {
         let mock_server = MockServer::start().await;
@@ -985,10 +1032,9 @@ mod tests {
     #[tokio::test]
     async fn store_with_existing_handle_reuses_logical_path() {
         let mock_server = MockServer::start().await;
+        let logical_path = managed_secret_path("nvidia-prod", "NVIDIA_API_KEY");
         Mock::given(method("POST"))
-            .and(path(
-                "/v1/secret/data/openshell/provider-credentials/existing",
-            ))
+            .and(path(format!("/v1/secret/data/{logical_path}")))
             .and(header("x-vault-token", "dev-token"))
             .and(body_string_contains("updated-secret"))
             .respond_with(ResponseTemplate::new(200))
@@ -1010,21 +1056,20 @@ mod tests {
                 provider_name: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
                 value: "updated-secret".to_string(),
-                existing_handle: Some(handle("v1:openshell/provider-credentials/existing")),
+                existing_handle: Some(handle(&format!("v1:{logical_path}"))),
             })
             .await
             .unwrap();
 
-        assert_eq!(stored.handle, "v1:openshell/provider-credentials/existing");
+        assert_eq!(stored.handle, format!("v1:{logical_path}"));
     }
 
     #[tokio::test]
     async fn delete_token_file_kv2_secret() {
         let mock_server = MockServer::start().await;
+        let logical_path = managed_secret_path("nvidia-prod", "NVIDIA_API_KEY");
         Mock::given(method("DELETE"))
-            .and(path(
-                "/v1/secret/metadata/openshell/provider-credentials/existing",
-            ))
+            .and(path(format!("/v1/secret/metadata/{logical_path}")))
             .and(header("x-vault-token", "dev-token"))
             .respond_with(ResponseTemplate::new(204))
             .mount(&mock_server)
@@ -1044,7 +1089,7 @@ mod tests {
             .delete_credential(DeleteCredentialRequest {
                 provider_name: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
-                handle: Some(handle("v1:openshell/provider-credentials/existing")),
+                handle: Some(handle(&format!("v1:{logical_path}"))),
             })
             .await
             .unwrap();
@@ -1105,10 +1150,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_maps_missing_key() {
         let mock_server = MockServer::start().await;
+        let logical_path = managed_secret_path("nvidia-prod", "NVIDIA_API_KEY");
         Mock::given(method("GET"))
-            .and(path(
-                "/v1/secret/data/openshell/provider-credentials/missing-key",
-            ))
+            .and(path(format!("/v1/secret/data/{logical_path}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "data": {}
@@ -1132,7 +1176,7 @@ mod tests {
                 request_id: "credential-0".to_string(),
                 provider_name: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
-                handle: Some(handle("v1:openshell/provider-credentials/missing-key")),
+                handle: Some(handle(&format!("v1:{logical_path}"))),
             }])
             .await
             .unwrap_err();
@@ -1144,10 +1188,9 @@ mod tests {
     #[tokio::test]
     async fn resolve_maps_permission_denied() {
         let mock_server = MockServer::start().await;
+        let logical_path = managed_secret_path("nvidia-prod", "NVIDIA_API_KEY");
         Mock::given(method("GET"))
-            .and(path(
-                "/v1/secret/data/openshell/provider-credentials/denied",
-            ))
+            .and(path(format!("/v1/secret/data/{logical_path}")))
             .respond_with(ResponseTemplate::new(403))
             .mount(&mock_server)
             .await;
@@ -1167,7 +1210,7 @@ mod tests {
                 request_id: "credential-0".to_string(),
                 provider_name: "nvidia-prod".to_string(),
                 credential_key: "NVIDIA_API_KEY".to_string(),
-                handle: Some(handle("v1:openshell/provider-credentials/denied")),
+                handle: Some(handle(&format!("v1:{logical_path}"))),
             }])
             .await
             .unwrap_err();
