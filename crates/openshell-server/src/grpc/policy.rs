@@ -1815,11 +1815,12 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         &provider_names,
     )
     .await?;
-    let provider_environment = super::provider::resolve_provider_environment_with_catalog(
+    let provider_environment = super::provider::resolve_provider_environment_with_credentials(
         state.store.as_ref(),
         &provider_profile_catalog,
         &workspace,
         &provider_names,
+        &state.credentials,
     )
     .await?;
 
@@ -5664,6 +5665,7 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
             profile_workspace: "default".to_string(),
+            credential_handles: HashMap::new(),
         }
     }
 

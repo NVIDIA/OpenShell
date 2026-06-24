@@ -786,7 +786,9 @@ pub mod test_support {
             new_test_runtime_for_driver(store.clone(), driver_name).await
         };
         Arc::new(ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            Config::new(None)
+                .with_database_url("sqlite::memory:?cache=shared")
+                .with_credential_drivers(["test-static"]),
             store,
             compute,
             SandboxIndex::new(),

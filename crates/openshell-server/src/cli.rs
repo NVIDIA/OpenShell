@@ -385,6 +385,15 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
     {
         config = config.with_provider_profile_sources(sources);
     }
+
+    if let Some(gateway_file) = file.as_ref().map(|f| &f.openshell.gateway) {
+        if let Some(drivers) = &gateway_file.credential_drivers {
+            config = config.with_credential_drivers(drivers.clone());
+        }
+        if let Some(default_driver) = &gateway_file.default_credential_driver {
+            config = config.with_default_credential_driver(Some(default_driver.clone()));
+        }
+    }
     validate_grpc_rate_limit_args(
         args.grpc_rate_limit_requests,
         args.grpc_rate_limit_window_seconds,

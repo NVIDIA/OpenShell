@@ -18,10 +18,11 @@ Three opt-in labels enable the long-running E2E suites:
   suites in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
-  (`replicaCount: 2` and bundled PostgreSQL) in `Branch E2E Checks`
+  (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
+  (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
 
 When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once, builds one CLI artifact per runner architecture, builds the Linux VM driver artifact once, and fans out all enabled suites in parallel. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E jobs reuse the matching prebuilt gateway and CLI binaries instead of compiling additional debug binaries in each job; Kubernetes E2E consumes the gateway image directly and reuses the prebuilt CLI. VM E2E also reuses the prebuilt VM driver artifact and falls back to local VM-driver/runtime preparation for local runs or workflow invocations that omit the artifact.
-The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while HA behavior is under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
+The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
 
 The GitHub ruleset should require the `OpenShell / ...` statuses published by `Required CI Gates`, not the push-triggered workflow jobs directly.
 
@@ -135,7 +136,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, and Kubernetes HA E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |

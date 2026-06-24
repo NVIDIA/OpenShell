@@ -151,6 +151,7 @@ Suites:
 - Docker suite (`--features e2e-docker`) - common suite plus Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway resume.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
+- Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
 
 GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
 Podman container that requests `--device nvidia.com/gpu=all`. The probe image
@@ -178,6 +179,14 @@ Run the VM-backed Rust CLI e2e suite:
 
 ```shell
 mise run e2e:vm
+```
+
+Run the targeted Kubernetes credential-driver e2e suite. This deploys an
+OpenBao fixture for the Vault-compatible driver path and validates Kubernetes
+Secrets and Vault storage backends one at a time:
+
+```shell
+mise run e2e:kubernetes:credential-drivers
 ```
 
 Run a single test directly with cargo:
@@ -210,3 +219,4 @@ The harness (`e2e/rust/src/harness/`) provides:
 | `OPENSHELL_GATEWAY` | Override active gateway name for E2E tests |
 | `OPENSHELL_GATEWAY_ENDPOINT` | Run E2E tests against an existing plaintext HTTP gateway endpoint |
 | `OPENSHELL_E2E_DRIVER` | Driver name exported by the e2e gateway wrapper (`docker`, `podman`, or `vm`) |
+| `OPENSHELL_E2E_CREDENTIAL_DRIVERS` | Enables the Kubernetes credential-driver fixture path in `e2e/with-kube-gateway.sh` |
