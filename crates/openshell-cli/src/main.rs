@@ -1693,9 +1693,13 @@ enum PolicyCommands {
         #[arg(long = "rev", default_value_t = 0)]
         rev: u32,
 
-        /// Include the full policy payload.
-        #[arg(long)]
+        /// Include the effective policy payload, including provider-composed entries.
+        #[arg(long, conflicts_with = "base")]
         full: bool,
+
+        /// Include the base policy payload without provider-composed entries.
+        #[arg(long)]
+        base: bool,
 
         /// Output format.
         #[arg(short = 'o', long = "output", value_enum, default_value_t = PolicyGetOutput::Table)]
@@ -2378,14 +2382,16 @@ async fn main() -> Result<()> {
                     name,
                     rev,
                     full,
+                    base,
                     output,
                     global,
                 } => {
+                    let view = run::PolicyGetView::from_flags(base, full);
                     if global {
                         run::sandbox_policy_get_global(
                             &ctx.endpoint,
                             rev,
-                            full,
+                            view,
                             output.as_str(),
                             &tls,
                         )
@@ -2396,7 +2402,7 @@ async fn main() -> Result<()> {
                             &ctx.endpoint,
                             &name,
                             rev,
-                            full,
+                            view,
                             output.as_str(),
                             &tls,
                         )
@@ -4364,12 +4370,37 @@ mod tests {
             Some(Commands::Policy {
                 command:
                     Some(PolicyCommands::Get {
-                        name, full, output, ..
+                        name,
+                        full,
+                        base,
+                        output,
+                        ..
                     }),
             }) => {
                 assert_eq!(name.as_deref(), Some("my-sandbox"));
                 assert!(full);
+                assert!(!base);
                 assert!(matches!(output, PolicyGetOutput::Json));
+            }
+            other => panic!("expected policy get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_get_base_output_parses() {
+        let cli = Cli::try_parse_from(["openshell", "policy", "get", "my-sandbox", "--base"])
+            .expect("policy get --base should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command:
+                    Some(PolicyCommands::Get {
+                        name, full, base, ..
+                    }),
+            }) => {
+                assert_eq!(name.as_deref(), Some("my-sandbox"));
+                assert!(!full);
+                assert!(base);
             }
             other => panic!("expected policy get command, got: {other:?}"),
         }

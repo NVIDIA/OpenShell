@@ -132,21 +132,39 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(GetSandboxConfigResponse {
             policy: Some(SandboxPolicy {
                 version: 9,
-                network_policies: std::iter::once((
-                    "_provider_api".to_string(),
-                    NetworkPolicyRule {
-                        name: "_provider_api".to_string(),
-                        endpoints: vec![NetworkEndpoint {
-                            host: "api.provider.example.com".to_string(),
-                            port: 443,
-                            protocol: "rest".to_string(),
-                            enforcement: "enforce".to_string(),
-                            access: "read-only".to_string(),
+                network_policies: [
+                    (
+                        "user_api".to_string(),
+                        NetworkPolicyRule {
+                            name: "user_api".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "api.user.example.com".to_string(),
+                                port: 443,
+                                protocol: "rest".to_string(),
+                                enforcement: "enforce".to_string(),
+                                access: "read-only".to_string(),
+                                ..Default::default()
+                            }],
                             ..Default::default()
-                        }],
-                        ..Default::default()
-                    },
-                ))
+                        },
+                    ),
+                    (
+                        "_provider_api".to_string(),
+                        NetworkPolicyRule {
+                            name: "_provider_api".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "api.provider.example.com".to_string(),
+                                port: 443,
+                                protocol: "rest".to_string(),
+                                enforcement: "enforce".to_string(),
+                                access: "read-only".to_string(),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        },
+                    ),
+                ]
+                .into_iter()
                 .collect(),
                 ..Default::default()
             }),
@@ -675,7 +693,7 @@ async fn policy_get_full_json_cli_prints_policy_payload() {
         &ts.endpoint,
         "my-sandbox",
         0,
-        true,
+        run::PolicyGetView::Full,
         "json",
         &ts.tls,
         (&mut stdout, &mut stderr),
@@ -707,6 +725,51 @@ async fn policy_get_full_json_cli_prints_policy_payload() {
         json["policy"]["network_policies"]["_provider_api"]["endpoints"][0]["host"],
         "api.provider.example.com"
     );
+    assert_eq!(
+        json["policy"]["network_policies"]["user_api"]["endpoints"][0]["host"],
+        "api.user.example.com"
+    );
+}
+
+#[tokio::test]
+async fn policy_get_base_json_cli_prints_round_trippable_policy_payload() {
+    let ts = run_server().await;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    run::sandbox_policy_get_to_writer(
+        &ts.endpoint,
+        "my-sandbox",
+        0,
+        run::PolicyGetView::Base,
+        "json",
+        &ts.tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await
+    .expect("policy get --base should succeed");
+
+    assert!(
+        stderr.is_empty(),
+        "policy get --base should not print stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["scope"], "sandbox");
+    assert_eq!(json["sandbox"], "my-sandbox");
+    assert_eq!(json["status"], "effective");
+    assert!(
+        json["policy"]["network_policies"]
+            .get("_provider_api")
+            .is_none(),
+        "base policy output must omit provider-composed policy entries"
+    );
+    assert_eq!(
+        json["policy"]["network_policies"]["user_api"]["endpoints"][0]["host"],
+        "api.user.example.com"
+    );
 }
 
 #[tokio::test]
@@ -719,7 +782,7 @@ async fn policy_get_explicit_revision_uses_stored_policy_status() {
         &ts.endpoint,
         "my-sandbox",
         3,
-        true,
+        run::PolicyGetView::Full,
         "json",
         &ts.tls,
         (&mut stdout, &mut stderr),

@@ -547,7 +547,7 @@ openshell sandbox create \
   -- claude
 ```
 
-When `providers_v2_enabled=true`, each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. When the setting is disabled, the sandbox receives provider credentials but not provider-derived policy entries.
+When `providers_v2_enabled=true`, each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. The base policy is the user-authored sandbox policy that you can edit and apply. The effective policy is the composed policy that the sandbox enforces: base policy plus provider policy layers. When the setting is disabled, the sandbox receives provider credentials but not provider-derived policy entries.
 
 Updating a custom provider profile affects every provider instance whose `type` matches that profile ID. Provider instances are not rewritten, and sandbox-authored policies are not modified. Running sandboxes observe the updated provider-derived policy on their next config sync. If a gateway-global policy is active, provider-derived policy layers remain suppressed.
 
@@ -565,7 +565,7 @@ The list output includes provider name, provider type, credential key count, and
 
 ## Policy Composition
 
-OpenShell stores sandbox-authored policy and provider attachments separately. When a sandbox asks for its effective policy, the gateway composes the current sandbox policy with provider policy layers just in time.
+OpenShell stores the base policy and provider attachments separately. When a sandbox asks for its effective policy, the gateway composes the current base policy with provider policy layers just in time.
 
 For example, the built-in GitHub profile contains these endpoints and binaries:
 
@@ -643,14 +643,20 @@ network_policies:
 Inspect the effective policy:
 
 ```shell
-openshell policy get provider-demo
+openshell policy get provider-demo --full
+```
+
+Pull the round-trippable base policy without provider entries:
+
+```shell
+openshell policy get provider-demo --base
 ```
 
 Composition follows these rules:
 
 - Provider policy entries use reserved `_provider_*` keys derived from provider instance names.
-- Provider policy entries are derived data. OpenShell does not persist them back into the sandbox-authored policy.
-- If a user-authored rule already uses the same key, OpenShell keeps the user rule and adds a numeric suffix to the provider rule.
+- Provider policy entries are derived data. OpenShell does not persist them back into the base policy.
+- User-authored policies cannot define `_provider_*` network policy keys. The gateway rejects those keys on sandbox create and full policy replacement, and sandbox-originated policy sync strips them before persistence.
 - Provider and user rules are concatenated. Overlapping endpoints remain separate rules.
 - A gateway global policy override suppresses provider-derived policy layers.
 

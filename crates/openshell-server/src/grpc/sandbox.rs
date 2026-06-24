@@ -46,8 +46,8 @@ use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique,
 };
 use super::validation::{
-    level_matches, source_matches, validate_exec_request_fields, validate_policy_safety,
-    validate_sandbox_spec,
+    level_matches, source_matches, validate_exec_request_fields,
+    validate_no_reserved_provider_policy_keys, validate_policy_safety, validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, clamp_limit};
 use crate::persistence::current_time_ms;
@@ -162,6 +162,7 @@ async fn handle_create_sandbox_inner(
     // empty, then validate policy safety before persisting.
     if let Some(ref mut policy) = spec.policy {
         openshell_policy::ensure_sandbox_process_identity(policy);
+        validate_no_reserved_provider_policy_keys(policy)?;
         validate_policy_safety(policy)?;
     }
 
@@ -2594,6 +2595,37 @@ mod tests {
         assert!(err.message().contains("TOKEN"));
         assert!(err.message().contains("provider-a"));
         assert!(err.message().contains("provider-b"));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_reserved_provider_policy_key() {
+        let state = test_server_state().await;
+        let mut policy = openshell_core::proto::SandboxPolicy::default();
+        policy.network_policies.insert(
+            "_provider_work_github".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "_provider_work_github".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let err = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "reserved-policy-key".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    policy: Some(policy),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("_provider_work_github"));
+        assert!(err.message().contains("reserved '_provider_' prefix"));
     }
 
     #[tokio::test]

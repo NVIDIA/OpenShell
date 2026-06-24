@@ -24,7 +24,10 @@ use openshell_core::proto::{
 };
 use serde::{Deserialize, Serialize};
 
-pub use compose::{ProviderPolicyLayer, compose_effective_policy, provider_rule_name};
+pub use compose::{
+    PROVIDER_RULE_NAME_PREFIX, ProviderPolicyLayer, compose_effective_policy,
+    is_provider_rule_name, provider_rule_name, strip_provider_rule_names,
+};
 pub use merge::{
     PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
     merge_policy, policy_covers_rule,

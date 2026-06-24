@@ -638,6 +638,22 @@ pub(super) fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), 
     Ok(())
 }
 
+/// Validate that user-authored policy does not use provider-derived rule keys.
+pub(super) fn validate_no_reserved_provider_policy_keys(
+    policy: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    if let Some(key) = policy
+        .network_policies
+        .keys()
+        .find(|key| openshell_policy::is_provider_rule_name(key))
+    {
+        return Err(Status::invalid_argument(format!(
+            "network_policies key '{key}' uses reserved '_provider_' prefix for provider composition; use 'openshell policy get <sandbox> --base' for a round-trippable base policy, or use 'openshell policy get <sandbox> --full' to inspect the effective policy including provider entries"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate that static policy fields (filesystem, landlock, process) haven't changed
 /// from the baseline (version 1) policy.
 pub(super) fn validate_static_fields_unchanged(
@@ -1603,6 +1619,43 @@ mod tests {
         let err = validate_policy_safety(&policy).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("TLD wildcard"));
+    }
+
+    #[test]
+    fn validate_no_reserved_provider_policy_keys_rejects_reserved_key() {
+        use openshell_core::proto::NetworkPolicyRule;
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "_provider_work_github".into(),
+            NetworkPolicyRule {
+                name: "_provider_work_github".into(),
+                ..Default::default()
+            },
+        );
+
+        let err = validate_no_reserved_provider_policy_keys(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("_provider_work_github"));
+        assert!(err.message().contains("reserved '_provider_' prefix"));
+        assert!(err.message().contains("policy get <sandbox> --base"));
+        assert!(err.message().contains("round-trippable base policy"));
+    }
+
+    #[test]
+    fn validate_no_reserved_provider_policy_keys_accepts_user_key() {
+        use openshell_core::proto::NetworkPolicyRule;
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "provider_work_github".into(),
+            NetworkPolicyRule {
+                name: "provider_work_github".into(),
+                ..Default::default()
+            },
+        );
+
+        assert!(validate_no_reserved_provider_policy_keys(&policy).is_ok());
     }
 
     // ---- Static field validation ----

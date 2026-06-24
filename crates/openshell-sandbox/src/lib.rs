@@ -886,6 +886,23 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
     modified
 }
 
+fn strip_proto_provider_policy_entries(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
+    openshell_policy::strip_provider_rule_names(proto)
+}
+
+fn proto_sync_payload_for_enriched_policy(
+    proto: &openshell_core::proto::SandboxPolicy,
+    enriched: bool,
+) -> Option<openshell_core::proto::SandboxPolicy> {
+    if !enriched {
+        return None;
+    }
+
+    let mut sync_policy = proto.clone();
+    strip_proto_provider_policy_entries(&mut sync_policy);
+    Some(sync_policy)
+}
+
 /// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
 /// paths required by proxy-mode sandboxes and GPU runtimes. Used for the
 /// local-file code path where no proto is available.
@@ -1048,6 +1065,89 @@ mod baseline_tests {
             !filesystem.read_write.contains(&"/tmp".to_string()),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
         );
+    }
+
+    #[test]
+    fn proto_strip_provider_policy_entries_removes_only_reserved_entries() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "_provider_work_github".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "_provider_work_github".to_string(),
+                ..Default::default()
+            },
+        );
+        policy.network_policies.insert(
+            "sandbox_only".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "sandbox_only".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert!(strip_proto_provider_policy_entries(&mut policy));
+        assert!(
+            !policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+        assert!(policy.network_policies.contains_key("sandbox_only"));
+        assert!(!strip_proto_provider_policy_entries(&mut policy));
+    }
+
+    #[test]
+    fn proto_sync_payload_not_created_for_provider_entries_without_enrichment() {
+        let mut runtime_policy = openshell_policy::restrictive_default_policy();
+        runtime_policy.network_policies.insert(
+            "_provider_work_github".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "_provider_work_github".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert!(proto_sync_payload_for_enriched_policy(&runtime_policy, false).is_none());
+        assert!(
+            runtime_policy
+                .network_policies
+                .contains_key("_provider_work_github"),
+            "provider-derived rules alone must not trigger sync or mutate runtime policy"
+        );
+    }
+
+    #[test]
+    fn proto_sync_payload_for_enrichment_strips_provider_entries_without_mutating_runtime_policy() {
+        let mut runtime_policy = openshell_policy::restrictive_default_policy();
+        runtime_policy.network_policies.insert(
+            "_provider_work_github".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "_provider_work_github".to_string(),
+                ..Default::default()
+            },
+        );
+        runtime_policy.network_policies.insert(
+            "sandbox_only".to_string(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "sandbox_only".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let sync_policy = proto_sync_payload_for_enriched_policy(&runtime_policy, true)
+            .expect("enrichment should create a sync payload");
+
+        assert!(
+            runtime_policy
+                .network_policies
+                .contains_key("_provider_work_github"),
+            "runtime policy must retain provider-derived rules for OPA input"
+        );
+        assert!(
+            !sync_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+        assert!(sync_policy.network_policies.contains_key("sandbox_only"));
     }
 
     #[test]
@@ -1298,6 +1398,7 @@ async fn load_policy(
             // Enrich before syncing so the gateway baseline includes
             // baseline paths from the start.
             enrich_proto_baseline_paths(&mut discovered);
+            strip_proto_provider_policy_entries(&mut discovered);
             let sandbox = sandbox.as_deref().ok_or_else(|| {
                 miette::miette!(
                     "Cannot sync discovered policy: sandbox not available.\n\
@@ -1322,11 +1423,11 @@ async fn load_policy(
         // sandboxes.  If the policy was enriched, sync the updated version
         // back to the gateway so users can see the effective policy.
         let enriched = enrich_proto_baseline_paths(&mut proto_policy);
-        if enriched
+        let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched);
+        if let Some(sync_policy) = sync_policy
             && let Some(sandbox_name) = sandbox.as_deref()
             && let Err(e) =
-                openshell_core::grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy)
-                    .await
+                openshell_core::grpc_client::sync_policy(endpoint, sandbox_name, &sync_policy).await
         {
             warn!(
                 error = %e,

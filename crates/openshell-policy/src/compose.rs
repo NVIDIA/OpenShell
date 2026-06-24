@@ -5,10 +5,17 @@
 
 use openshell_core::proto::{NetworkPolicyRule, SandboxPolicy};
 
+pub const PROVIDER_RULE_NAME_PREFIX: &str = "_provider_";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProviderPolicyLayer {
     pub rule_name: String,
     pub rule: NetworkPolicyRule,
+}
+
+#[must_use]
+pub fn is_provider_rule_name(rule_name: &str) -> bool {
+    rule_name.starts_with(PROVIDER_RULE_NAME_PREFIX)
 }
 
 #[must_use]
@@ -27,10 +34,18 @@ pub fn provider_rule_name(provider_name: &str) -> String {
         .to_string();
 
     if sanitized.is_empty() {
-        "_provider_unnamed".to_string()
+        format!("{PROVIDER_RULE_NAME_PREFIX}unnamed")
     } else {
-        format!("_provider_{sanitized}")
+        format!("{PROVIDER_RULE_NAME_PREFIX}{sanitized}")
     }
+}
+
+pub fn strip_provider_rule_names(policy: &mut SandboxPolicy) -> bool {
+    let original_len = policy.network_policies.len();
+    policy
+        .network_policies
+        .retain(|key, _| !is_provider_rule_name(key));
+    policy.network_policies.len() != original_len
 }
 
 /// Compose a normal sandbox policy from user-authored policy plus provider
@@ -38,8 +53,8 @@ pub fn provider_rule_name(provider_name: &str) -> String {
 ///
 /// The returned policy is derived data. It preserves the source policy's
 /// static fields and user-authored network policies, then concatenates each
-/// provider rule under a reserved `_provider_*` key. Existing user keys are not
-/// overwritten; a numeric suffix is added if needed.
+/// provider rule under a reserved `_provider_*` key. Existing keys are not
+/// overwritten; a numeric suffix is added if provider rule names collide.
 #[must_use]
 pub fn compose_effective_policy(
     source_policy: &SandboxPolicy,
@@ -76,7 +91,10 @@ fn unique_provider_rule_key(policy: &SandboxPolicy, preferred: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderPolicyLayer, compose_effective_policy, provider_rule_name};
+    use super::{
+        PROVIDER_RULE_NAME_PREFIX, ProviderPolicyLayer, compose_effective_policy,
+        is_provider_rule_name, provider_rule_name, strip_provider_rule_names,
+    };
     use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule, SandboxPolicy};
 
     fn rule(name: &str, host: &str) -> NetworkPolicyRule {
@@ -108,23 +126,57 @@ mod tests {
     }
 
     #[test]
+    fn provider_rule_name_prefix_identifies_reserved_keys() {
+        assert_eq!(PROVIDER_RULE_NAME_PREFIX, "_provider_");
+        assert!(is_provider_rule_name("_provider_work_github"));
+        assert!(is_provider_rule_name("_provider_work_github_2"));
+        assert!(is_provider_rule_name("_provider_"));
+        assert!(!is_provider_rule_name("provider_work_github"));
+        assert!(!is_provider_rule_name("custom_provider_work_github"));
+    }
+
+    #[test]
+    fn strip_provider_rule_names_removes_only_reserved_keys() {
+        let mut policy = SandboxPolicy::default();
+        policy.network_policies.insert(
+            "_provider_work_github".to_string(),
+            rule("_provider_work_github", "api.github.com"),
+        );
+        policy.network_policies.insert(
+            "sandbox_only".to_string(),
+            rule("sandbox_only", "sandbox.example.com"),
+        );
+
+        assert!(strip_provider_rule_names(&mut policy));
+        assert!(
+            !policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+        assert!(policy.network_policies.contains_key("sandbox_only"));
+        assert!(!strip_provider_rule_names(&mut policy));
+    }
+
+    #[test]
     fn compose_concatenates_provider_rules_without_overwriting_user_rules() {
         let mut source = SandboxPolicy::default();
         source.network_policies.insert(
             "custom_github".to_string(),
             rule("custom_github", "api.github.com"),
         );
-        source.network_policies.insert(
-            "_provider_work_github".to_string(),
-            rule("_provider_work_github", "example.com"),
-        );
 
         let effective = compose_effective_policy(
             &source,
-            &[ProviderPolicyLayer {
-                rule_name: "_provider_work_github".to_string(),
-                rule: rule("_provider_work_github", "github.com"),
-            }],
+            &[
+                ProviderPolicyLayer {
+                    rule_name: "_provider_work_github".to_string(),
+                    rule: rule("_provider_work_github", "github.com"),
+                },
+                ProviderPolicyLayer {
+                    rule_name: "_provider_work_github".to_string(),
+                    rule: rule("_provider_work_github", "github.example.com"),
+                },
+            ],
         );
 
         assert!(effective.network_policies.contains_key("custom_github"));
@@ -138,7 +190,16 @@ mod tests {
                 .network_policies
                 .contains_key("_provider_work_github_2")
         );
-        assert_eq!(source.network_policies.len(), 2);
+        assert_eq!(
+            effective
+                .network_policies
+                .get("custom_github")
+                .unwrap()
+                .endpoints[0]
+                .host,
+            "api.github.com"
+        );
+        assert_eq!(source.network_policies.len(), 1);
         assert_eq!(effective.network_policies.len(), 3);
     }
 }

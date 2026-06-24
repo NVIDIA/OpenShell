@@ -7,6 +7,8 @@ use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
 };
 
+use crate::is_provider_rule_name;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolicyMergeOp {
     AddRule {
@@ -413,7 +415,7 @@ fn add_rule(
         let mut keys: Vec<_> = policy.network_policies.keys().cloned().collect();
         keys.sort();
         keys.into_iter()
-            .filter(|k| !k.starts_with("_provider_"))
+            .filter(|k| !is_provider_rule_name(k))
             .find(|key| {
                 policy
                     .network_policies
@@ -653,7 +655,7 @@ fn find_endpoint_mut<'a>(
     keys.sort();
     let target_key = keys
         .into_iter()
-        .filter(|k| !k.starts_with("_provider_"))
+        .filter(|k| !is_provider_rule_name(k))
         .find(|key| {
             policy.network_policies.get(key).is_some_and(|rule| {
                 rule.endpoints
