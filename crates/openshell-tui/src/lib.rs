@@ -1379,6 +1379,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 ..Default::default()
             }),
             labels: HashMap::new(),
+            annotations: HashMap::new(),
         };
 
         let sandbox_name =
@@ -1643,6 +1644,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                     }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
@@ -1735,6 +1737,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: ptype,
                 credentials,

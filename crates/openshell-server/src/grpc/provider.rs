@@ -78,6 +78,7 @@ pub(super) async fn create_provider_record(
             created_at_ms: now_ms,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
         });
     }
 
@@ -1812,6 +1813,7 @@ fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
             created_at_ms: now_ms,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
         }),
         profile: Some(profile),
     }
@@ -2146,6 +2148,7 @@ pub(super) async fn handle_configure_provider_refresh(
                 created_at_ms: 0,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: String::new(),
             credentials: std::collections::HashMap::new(),
@@ -2241,6 +2244,7 @@ pub(super) async fn handle_delete_provider_refresh(
                 created_at_ms: 0,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: String::new(),
             credentials: std::collections::HashMap::new(),
@@ -2526,6 +2530,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
@@ -2603,6 +2608,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec![
@@ -2918,6 +2924,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec![
@@ -2980,6 +2987,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
             credentials: [
@@ -3589,6 +3597,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["custom-provider".to_string()],
@@ -3624,6 +3633,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -3736,6 +3746,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -3799,6 +3810,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -3842,6 +3854,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -3894,6 +3907,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -3916,6 +3930,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once(("OTHER_TOKEN".to_string(), "other".to_string()))
@@ -3935,6 +3950,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
@@ -3986,6 +4002,7 @@ mod tests {
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                     }),
                     r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                     credentials: HashMap::new(),
@@ -4005,6 +4022,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["first-graph".to_string(), "second-graph".to_string()],
@@ -4071,6 +4089,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -4138,6 +4157,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "outlook".to_string(),
                 credentials: std::iter::once((
@@ -4289,6 +4309,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -4411,6 +4432,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["gitlab-local".to_string()],
@@ -4455,6 +4477,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: std::iter::once((
@@ -4484,6 +4507,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: std::iter::once((
@@ -4518,6 +4542,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4538,6 +4563,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: HashMap::new(),
@@ -4612,6 +4638,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "delegated-refresh-api".to_string(),
                 credentials: HashMap::new(),
@@ -4648,6 +4675,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "mixed-required-api".to_string(),
                 credentials: HashMap::new(),
@@ -4684,6 +4712,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "optional-static-api".to_string(),
                 credentials: HashMap::new(),
@@ -4704,6 +4733,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: HashMap::new(),
@@ -4730,6 +4760,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4758,6 +4789,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4805,6 +4837,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
@@ -4856,6 +4889,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4885,6 +4919,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: HashMap::new(),
@@ -4916,6 +4951,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
@@ -4944,6 +4980,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: oversized_type.clone(),
             credentials: std::iter::once(("API_TOKEN".to_string(), "old".to_string())).collect(),
@@ -4961,6 +4998,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once(("API_TOKEN".to_string(), "new".to_string()))
@@ -4992,6 +5030,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "claude".to_string(),
             credentials: [
@@ -5046,6 +5085,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "test".to_string(),
             credentials: [
@@ -5095,6 +5135,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "test".to_string(),
             credentials: [
@@ -5129,6 +5170,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
@@ -5151,6 +5193,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
@@ -5184,6 +5227,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
@@ -5203,6 +5247,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -5241,6 +5286,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -5315,6 +5361,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: [
@@ -5359,6 +5406,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -5407,6 +5455,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: [
@@ -5454,6 +5503,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
@@ -5492,6 +5542,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "outlook".to_string(),
                 credentials: std::iter::once((
@@ -5514,6 +5565,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-drive".to_string(),
                 credentials: std::iter::once((
@@ -5534,6 +5586,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["provider-a".to_string(), "provider-b".to_string()],
@@ -5552,6 +5605,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((
@@ -5586,6 +5640,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
@@ -5607,6 +5662,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["my-claude".to_string()],
@@ -5643,6 +5699,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec::default()),
             status: None,
@@ -5690,6 +5747,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: String::new(), // Empty type is ignored in update
             credentials: HashMap::new(),
@@ -6037,6 +6095,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "google-cloud".to_string(),
             credentials: HashMap::new(),
@@ -6139,6 +6198,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "github".to_string(),
             credentials: HashMap::new(),

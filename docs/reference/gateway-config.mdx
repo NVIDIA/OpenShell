@@ -145,7 +145,7 @@ max_patches        = 32
 
 [[openshell.gateway.interceptors.bindings]]
 id             = "quota-create-sandbox"
-phases         = ["pre_request", "validate"]
+phases         = ["modify_operation", "validate"]
 failure_policy = "fail_closed"
 
 [[openshell.gateway.interceptors.bindings]]

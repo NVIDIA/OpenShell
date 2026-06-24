@@ -66,7 +66,6 @@ pub type Result<T> = std::result::Result<T, InterceptorError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Phase {
-    PreRequest,
     ModifyOperation,
     Validate,
     PostCommit,
@@ -76,7 +75,6 @@ impl Phase {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::PreRequest => "pre_request",
             Self::ModifyOperation => "modify_operation",
             Self::Validate => "validate",
             Self::PostCommit => "post_commit",
@@ -86,7 +84,6 @@ impl Phase {
     #[must_use]
     pub const fn to_proto(self) -> GatewayInterceptorPhase {
         match self {
-            Self::PreRequest => GatewayInterceptorPhase::PreRequest,
             Self::ModifyOperation => GatewayInterceptorPhase::ModifyOperation,
             Self::Validate => GatewayInterceptorPhase::Validate,
             Self::PostCommit => GatewayInterceptorPhase::PostCommit,
@@ -99,7 +96,6 @@ impl TryFrom<GatewayInterceptorPhase> for Phase {
 
     fn try_from(value: GatewayInterceptorPhase) -> Result<Self> {
         match value {
-            GatewayInterceptorPhase::PreRequest => Ok(Self::PreRequest),
             GatewayInterceptorPhase::ModifyOperation => Ok(Self::ModifyOperation),
             GatewayInterceptorPhase::Validate => Ok(Self::Validate),
             GatewayInterceptorPhase::PostCommit => Ok(Self::PostCommit),
@@ -113,7 +109,6 @@ impl TryFrom<GatewayInterceptorPhase> for Phase {
 impl From<GatewayInterceptorPhaseConfig> for Phase {
     fn from(value: GatewayInterceptorPhaseConfig) -> Self {
         match value {
-            GatewayInterceptorPhaseConfig::PreRequest => Self::PreRequest,
             GatewayInterceptorPhaseConfig::ModifyOperation => Self::ModifyOperation,
             GatewayInterceptorPhaseConfig::Validate => Self::Validate,
             GatewayInterceptorPhaseConfig::PostCommit => Self::PostCommit,
@@ -350,14 +345,9 @@ impl GatewayInterceptorRuntime {
         };
         self.routes
             .is_interceptable(&selector.service, &selector.method)
-            && [
-                Phase::PreRequest,
-                Phase::ModifyOperation,
-                Phase::Validate,
-                Phase::PostCommit,
-            ]
-            .iter()
-            .any(|phase| self.bindings.contains_key(&(selector.clone(), *phase)))
+            && [Phase::ModifyOperation, Phase::Validate, Phase::PostCommit]
+                .iter()
+                .any(|phase| self.bindings.contains_key(&(selector.clone(), *phase)))
     }
 
     pub async fn evaluate_request(
@@ -379,9 +369,6 @@ impl GatewayInterceptorRuntime {
             .decode_message_to_json(&input_type, &frame.message)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
-        operation = self
-            .evaluate_phase(&selector, Phase::PreRequest, operation, context)
-            .await?;
         operation = self
             .evaluate_phase(&selector, Phase::ModifyOperation, operation, context)
             .await?;
@@ -1875,6 +1862,7 @@ mod tests {
             }),
             name: "demo".to_string(),
             labels: HashMap::from([("team".to_string(), "agent".to_string())]),
+            annotations: HashMap::new(),
         };
         let bytes = request.encode_to_vec();
         let json = descriptors

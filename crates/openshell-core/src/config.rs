@@ -621,7 +621,6 @@ pub struct GatewayInterceptorBindingOverride {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayInterceptorPhaseConfig {
-    PreRequest,
     ModifyOperation,
     Validate,
     PostCommit,

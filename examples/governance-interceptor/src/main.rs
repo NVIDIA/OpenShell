@@ -4,8 +4,12 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+};
 use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
     InterceptorManifest, InterceptorResult, InterceptorSelector, JsonPatch,
@@ -17,19 +21,117 @@ use openshell_core::proto::{
 };
 use openshell_policy::parse_sandbox_policy;
 use prost_types::{ListValue, Struct, Value as ProtoValue, value::Kind};
+use rcgen::{KeyPair, PKCS_ED25519};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-const LABEL_KEY: &str = "openshell.nvidia.com/policy-signature";
+const POLICY_SIGNATURE_ANNOTATION: &str = "openshell.nvidia.com/policy-signature";
+const POLICY_JWT_ISSUER: &str = "openshell-governance-interceptor";
+const POLICY_JWT_AUDIENCE: &str = "openshell-governance-policy";
+const POLICY_JWT_SUBJECT: &str = "policy.yaml";
 const SERVICE: &str = "openshell.v1.OpenShell";
 const GOVERNED_PROVIDERS: [&str; 2] = ["github", "gitlab"];
+
+#[derive(Clone)]
+struct PolicySigner {
+    encoding_key: EncodingKey,
+    decoding_key: DecodingKey,
+    kid: String,
+}
+
+impl std::fmt::Debug for PolicySigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PolicySigner")
+            .field("kid", &self.kid)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PolicySignatureClaims {
+    sub: String,
+    iss: String,
+    aud: String,
+    iat: i64,
+    exp: i64,
+    policy_sha256: String,
+}
+
+impl PolicySigner {
+    fn generate() -> Result<Self, String> {
+        let keypair = KeyPair::generate_for(&PKCS_ED25519)
+            .map_err(|err| format!("failed to generate policy signing key: {err}"))?;
+        let signing_key_pem = keypair.serialize_pem();
+        let public_key_pem = keypair.public_key_pem();
+        let encoding_key = EncodingKey::from_ed_pem(signing_key_pem.as_bytes())
+            .map_err(|err| format!("failed to parse policy signing key: {err}"))?;
+        let decoding_key = DecodingKey::from_ed_pem(public_key_pem.as_bytes())
+            .map_err(|err| format!("failed to parse policy verification key: {err}"))?;
+        let kid = kid_from_public_key_der(&keypair.public_key_der());
+        Ok(Self {
+            encoding_key,
+            decoding_key,
+            kid,
+        })
+    }
+
+    fn kid(&self) -> &str {
+        &self.kid
+    }
+
+    fn sign_policy(&self, policy_hash: &str) -> Result<String, String> {
+        let claims = PolicySignatureClaims {
+            sub: POLICY_JWT_SUBJECT.to_string(),
+            iss: POLICY_JWT_ISSUER.to_string(),
+            aud: POLICY_JWT_AUDIENCE.to_string(),
+            iat: now_secs(),
+            exp: 0,
+            policy_sha256: policy_hash.to_string(),
+        };
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(self.kid.clone());
+        encode(&header, &claims, &self.encoding_key)
+            .map_err(|err| format!("failed to sign policy JWT: {err}"))
+    }
+
+    fn verify_policy_signature(&self, token: &str, policy_hash: &str) -> Result<(), String> {
+        let header = decode_header(token)
+            .map_err(|err| format!("failed to decode policy JWT header: {err}"))?;
+        if header.kid.as_deref() != Some(self.kid.as_str()) {
+            return Err("unexpected policy signing key id".to_string());
+        }
+        if header.alg != Algorithm::EdDSA {
+            return Err("unexpected policy signing algorithm".to_string());
+        }
+
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.algorithms = vec![Algorithm::EdDSA];
+        validation.set_issuer(&[POLICY_JWT_ISSUER]);
+        validation.set_audience(&[POLICY_JWT_AUDIENCE]);
+        validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
+        validation.validate_exp = false;
+
+        let data = decode::<PolicySignatureClaims>(token, &self.decoding_key, &validation)
+            .map_err(|err| format!("failed to verify policy JWT: {err}"))?;
+        if data.claims.sub != POLICY_JWT_SUBJECT {
+            return Err("unexpected policy JWT subject".to_string());
+        }
+        if data.claims.policy_sha256 != policy_hash {
+            return Err("signed policy hash does not match sandbox policy".to_string());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 struct GovernanceInterceptorService {
     policy: Value,
+    policy_hash: String,
     policy_signature: String,
+    policy_signer: PolicySigner,
 }
 
 impl GovernanceInterceptorService {
@@ -38,15 +140,14 @@ impl GovernanceInterceptorService {
             .map_err(|err| format!("failed to parse policy YAML: {err}"))?;
         let policy = sandbox_policy_to_proto_json(&policy);
         let policy = normalize_for_struct(policy)?;
-        let policy_digest: [u8; 32] = Sha256::digest(
-            serde_json::to_vec(&policy)
-                .map_err(|err| format!("failed to encode policy JSON: {err}"))?,
-        )
-        .into();
-        let policy_signature = format!("sha256-{}", URL_SAFE_NO_PAD.encode(policy_digest));
+        let policy_hash = policy_hash(&policy)?;
+        let policy_signer = PolicySigner::generate()?;
+        let policy_signature = policy_signer.sign_policy(&policy_hash)?;
         Ok(Self {
             policy,
+            policy_hash,
             policy_signature,
+            policy_signer,
         })
     }
 
@@ -158,42 +259,48 @@ impl GovernanceInterceptorService {
             )?);
         }
 
-        if operation.get("labels").is_some_and(Value::is_object) {
-            patches.push(json_patch(
-                "add",
-                &format!("/labels/{}", json_pointer_escape(LABEL_KEY)),
-                Value::String(self.policy_signature.clone()),
-            )?);
-        } else {
-            patches.push(json_patch(
-                "add",
-                "/labels",
-                json!({ LABEL_KEY: self.policy_signature }),
-            )?);
-        }
+        add_policy_signature_patches(operation, &mut patches, &self.policy_signature)?;
 
         let mut result = allow();
         result.patches = patches;
+        result
+            .audit_annotations
+            .insert("policy_hash".to_string(), self.policy_hash.clone());
         result.audit_annotations.insert(
-            "policy_signature".to_string(),
-            self.policy_signature.clone(),
+            "policy_signature_kid".to_string(),
+            self.policy_signer.kid().to_string(),
         );
         Ok(result)
     }
 
     fn validate_create_sandbox(&self, operation: &Value) -> InterceptorResult {
-        if operation.pointer("/spec/policy") != Some(&self.policy) {
+        let Some(policy) = operation.pointer("/spec/policy") else {
+            return deny("sandbox policy must match the source-control governance baseline");
+        };
+        let sandbox_policy_hash = match policy_hash(policy) {
+            Ok(hash) => hash,
+            Err(err) => return deny(&format!("sandbox policy cannot be hashed: {err}")),
+        };
+        let Some(signature) = operation
+            .pointer(&format!(
+                "/annotations/{}",
+                json_pointer_escape(POLICY_SIGNATURE_ANNOTATION)
+            ))
+            .and_then(Value::as_str)
+        else {
+            return deny("sandbox is missing the governance policy signature");
+        };
+        if let Err(err) = self
+            .policy_signer
+            .verify_policy_signature(signature, &sandbox_policy_hash)
+        {
+            return deny(&format!("sandbox policy signature is invalid: {err}"));
+        }
+        if sandbox_policy_hash != self.policy_hash || policy != &self.policy {
             return deny("sandbox policy must match the source-control governance baseline");
         }
         if !providers_are_governed(operation.pointer("/spec/providers")) {
             return deny("sandbox providers must be exactly github and gitlab");
-        }
-        if operation
-            .pointer(&format!("/labels/{}", json_pointer_escape(LABEL_KEY)))
-            .and_then(Value::as_str)
-            != Some(self.policy_signature.as_str())
-        {
-            return deny("sandbox is missing the governance policy signature label");
         }
         allow()
     }
@@ -329,12 +436,71 @@ fn json_patch(op: &str, path: &str, value: Value) -> Result<JsonPatch, Status> {
     })
 }
 
+fn add_policy_signature_patches(
+    operation: &Value,
+    patches: &mut Vec<JsonPatch>,
+    policy_signature: &str,
+) -> Result<(), Status> {
+    let signature = Value::String(policy_signature.to_string());
+    if operation.get("annotations").is_none_or(|value| !value.is_object()) {
+        patches.push(json_patch(
+            "add",
+            "/annotations",
+            json!({
+                POLICY_SIGNATURE_ANNOTATION: policy_signature,
+            }),
+        )?);
+    } else {
+        patches.push(json_patch(
+            "add",
+            &format!(
+                "/annotations/{}",
+                json_pointer_escape(POLICY_SIGNATURE_ANNOTATION)
+            ),
+            signature,
+        )?);
+    }
+    Ok(())
+}
+
 fn json_pointer_escape(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
 }
 
 fn normalize_for_struct(value: Value) -> Result<Value, String> {
     json_to_proto_value(&value).map(|value| proto_value_to_json(&value))
+}
+
+fn policy_hash(policy: &Value) -> Result<String, String> {
+    let policy = normalize_for_struct(policy.clone())?;
+    let encoded = serde_json::to_vec(&policy)
+        .map_err(|err| format!("failed to encode policy JSON: {err}"))?;
+    let digest: [u8; 32] = Sha256::digest(encoded).into();
+    Ok(format!("sha256-{}", URL_SAFE_NO_PAD.encode(digest)))
+}
+
+fn kid_from_public_key_der(public_key_der: &[u8]) -> String {
+    let digest = Sha256::digest(public_key_der);
+    hex_encode_prefix(&digest, 16)
+}
+
+fn hex_encode_prefix(bytes: &[u8], n: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(n * 2);
+    for byte in bytes.iter().take(n) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn now_secs() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 fn sandbox_policy_to_proto_json(policy: &SandboxPolicy) -> Value {
@@ -679,6 +845,53 @@ mod tests {
         }
     }
 
+    fn governed_create_operation(policy: Value, signature: String) -> Value {
+        let mut operation = json!({
+            "spec": {
+                "policy": policy,
+                "providers": GOVERNED_PROVIDERS,
+            },
+            "annotations": {},
+        });
+        operation
+            .pointer_mut("/annotations")
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(
+                POLICY_SIGNATURE_ANNOTATION.to_string(),
+                Value::String(signature),
+            );
+        operation
+    }
+
+    fn valid_create_operation(service: &GovernanceInterceptorService) -> Value {
+        governed_create_operation(service.policy.clone(), service.policy_signature.clone())
+    }
+
+    fn signature_patch_token(result: &InterceptorResult) -> String {
+        result
+            .patches
+            .iter()
+            .find(|patch| {
+                patch.path == "/annotations/openshell.nvidia.com~1policy-signature"
+                    || patch.path == "/annotations"
+            })
+            .and_then(|patch| patch.value.as_ref())
+            .map(proto_value_to_json)
+            .and_then(|value| {
+                value.as_str().map(ToString::to_string).or_else(|| {
+                    value
+                        .pointer(&format!(
+                            "/{}",
+                            json_pointer_escape(POLICY_SIGNATURE_ANNOTATION)
+                        ))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+            })
+            .expect("signature patch value")
+    }
+
     #[test]
     fn manifest_declares_governance_bindings() {
         let manifest = GovernanceInterceptorService::manifest();
@@ -711,7 +924,99 @@ mod tests {
             .collect();
         assert!(paths.contains(&"/spec/policy"));
         assert!(paths.contains(&"/spec/providers"));
-        assert!(paths.contains(&"/labels/openshell.nvidia.com~1policy-signature"));
+        assert!(
+            paths.contains(&"/annotations")
+                || paths.contains(&"/annotations/openshell.nvidia.com~1policy-signature")
+        );
+        let token = signature_patch_token(&result);
+        assert_eq!(token.split('.').count(), 3);
+        assert!(result.audit_annotations.contains_key("policy_hash"));
+        assert!(
+            result
+                .audit_annotations
+                .contains_key("policy_signature_kid")
+        );
+        assert!(!result.audit_annotations.contains_key("policy_signature"));
+    }
+
+    #[test]
+    fn create_sandbox_validate_accepts_signed_policy() {
+        let service = service();
+        let result = service
+            .evaluate_inner(&evaluation(
+                "CreateSandbox",
+                GatewayInterceptorPhase::Validate,
+                valid_create_operation(&service),
+            ))
+            .unwrap();
+        assert!(result.allowed);
+    }
+
+    #[test]
+    fn create_sandbox_validate_denies_missing_signature() {
+        let service = service();
+        let result = service
+            .evaluate_inner(&evaluation(
+                "CreateSandbox",
+                GatewayInterceptorPhase::Validate,
+                json!({
+                    "spec": {
+                        "policy": service.policy,
+                        "providers": GOVERNED_PROVIDERS,
+                    },
+                }),
+            ))
+            .unwrap();
+        assert!(!result.allowed);
+        assert!(result.reason.contains("missing"));
+    }
+
+    #[test]
+    fn create_sandbox_validate_denies_malformed_signature() {
+        let service = service();
+        let result = service
+            .evaluate_inner(&evaluation(
+                "CreateSandbox",
+                GatewayInterceptorPhase::Validate,
+                governed_create_operation(service.policy.clone(), "not-a-jwt".to_string()),
+            ))
+            .unwrap();
+        assert!(!result.allowed);
+        assert!(result.reason.contains("signature"));
+    }
+
+    #[test]
+    fn create_sandbox_validate_denies_signature_from_other_key() {
+        let governance = service();
+        let other = service();
+        let result = governance
+            .evaluate_inner(&evaluation(
+                "CreateSandbox",
+                GatewayInterceptorPhase::Validate,
+                governed_create_operation(governance.policy.clone(), other.policy_signature),
+            ))
+            .unwrap();
+        assert!(!result.allowed);
+        assert!(result.reason.contains("signature"));
+    }
+
+    #[test]
+    fn create_sandbox_validate_denies_signed_policy_mismatch() {
+        let service = service();
+        let mut tampered_policy = service.policy.clone();
+        tampered_policy
+            .as_object_mut()
+            .unwrap()
+            .insert("version".to_string(), json!(999));
+        let result = service
+            .evaluate_inner(&evaluation(
+                "CreateSandbox",
+                GatewayInterceptorPhase::Validate,
+                governed_create_operation(tampered_policy, service.policy_signature.clone()),
+            ))
+            .unwrap();
+        assert!(!result.allowed);
+        assert!(result.reason.contains("signature"));
     }
 
     #[test]

@@ -447,6 +447,8 @@ message CreateSandboxRequest {
   string name = 2;
   // Optional labels for the sandbox (key-value metadata).
   map<string, string> labels = 3;
+  // Optional annotations for the sandbox (non-selector metadata).
+  map<string, string> annotations = 4;
 }
 
 // Get sandbox request.

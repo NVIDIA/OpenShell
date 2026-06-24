@@ -1928,6 +1928,7 @@ pub async fn sandbox_create(
         }),
         name: name.unwrap_or_default().to_string(),
         labels,
+        annotations: HashMap::new(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -3427,10 +3428,15 @@ pub async fn sandbox_list(
 fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
     let meta = sandbox.metadata.as_ref();
     let labels = meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.labels));
+    let annotations = meta.map_or_else(
+        || serde_json::json!({}),
+        |m| serde_json::json!(m.annotations),
+    );
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "labels": labels,
+        "annotations": annotations,
         "resource_version": meta.map_or(0, |m| m.resource_version),
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase()),
@@ -3883,6 +3889,7 @@ async fn auto_create_provider(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
@@ -3925,6 +3932,7 @@ async fn auto_create_provider(
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                     }),
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
@@ -4805,6 +4813,7 @@ pub async fn provider_create_with_options(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.clone(),
                 credentials: credential_map,
@@ -5751,6 +5760,7 @@ pub async fn provider_update(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: credential_map,
@@ -9724,6 +9734,7 @@ mod tests {
             resource_version: 42,
             created_at_ms: 1_234_567_890_000,
             labels,
+            annotations: std::collections::HashMap::new(),
         };
 
         let provider = Provider {

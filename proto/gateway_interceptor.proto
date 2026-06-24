@@ -23,7 +23,6 @@ message DescribeRequest {}
 
 enum GatewayInterceptorPhase {
   GATEWAY_INTERCEPTOR_PHASE_UNSPECIFIED = 0;
-  GATEWAY_INTERCEPTOR_PHASE_PRE_REQUEST = 1;
   GATEWAY_INTERCEPTOR_PHASE_MODIFY_OPERATION = 2;
   GATEWAY_INTERCEPTOR_PHASE_VALIDATE = 3;
   GATEWAY_INTERCEPTOR_PHASE_POST_COMMIT = 4;
@@ -49,8 +48,8 @@ message InterceptorEvaluation {
 }
 
 message InterceptorResult {
-  // False denies the operation before side effects for pre_request,
-  // modify_operation, and validate. Post-commit denial is invalid.
+  // False denies the operation before side effects for modify_operation and
+  // validate. Post-commit denial is invalid.
   bool allowed = 1;
   // Human-readable reason for logs and denied gRPC status messages.
   string reason = 2;

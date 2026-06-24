@@ -12,9 +12,12 @@ license = "Apache-2.0"
 
 [dependencies]
 base64 = "0.22"
+jsonwebtoken = "9"
 openshell-core = { path = "../../crates/openshell-core", default-features = false }
 openshell-policy = { path = "../../crates/openshell-policy" }
 prost-types = "0.14"
+rcgen = { version = "0.13", features = ["crypto", "pem"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "fs", "signal"] }

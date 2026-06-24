@@ -15,7 +15,6 @@ GATEWAY_LOG="$LOG_DIR/gateway.log"
 INTERCEPTOR_ADDR="${OPENSHELL_GOVERNANCE_INTERCEPTOR_ADDR:-127.0.0.1:18081}"
 GATEWAY_ADDR="${OPENSHELL_GOVERNANCE_GATEWAY_ADDR:-127.0.0.1:18080}"
 HEALTH_ADDR="${OPENSHELL_GOVERNANCE_HEALTH_ADDR:-127.0.0.1:18082}"
-DRIVER="${OPENSHELL_GOVERNANCE_SMOKE_DRIVER:-}"
 SANDBOX_NAME="${OPENSHELL_GOVERNANCE_SANDBOX_NAME:-governed-smoke-$$}"
 ROOT_BUILD_ARGS=()
 mkdir -p "$LOG_DIR"
@@ -189,11 +188,6 @@ run_step "build governance interceptor" cargo build --quiet --manifest-path "$EX
   --policy "$EXAMPLE_DIR/policy.yaml" >"$INTERCEPTOR_LOG" 2>&1 &
 INTERCEPTOR_PID=$!
 
-driver_line=""
-if [[ -n "$DRIVER" ]]; then
-  driver_line="compute_drivers = [\"$DRIVER\"]"
-fi
-
 cat > "$TMPDIR/gateway.toml" <<EOF
 [openshell]
 version = 1
@@ -203,7 +197,6 @@ bind_address = "$GATEWAY_ADDR"
 health_bind_address = "$HEALTH_ADDR"
 disable_tls = true
 log_level = "warn"
-$driver_line
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
