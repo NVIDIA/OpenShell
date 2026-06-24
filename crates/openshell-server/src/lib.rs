@@ -147,6 +147,10 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+
+    /// Immutable gateway interceptor execution plan. `None` when disabled.
+    pub(crate) gateway_interceptors:
+        Option<openshell_gateway_interceptors::GatewayInterceptorRuntime>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -197,6 +201,7 @@ impl ServerState {
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
             grpc_rate_limiter,
+            gateway_interceptors: None,
         }
     }
 }
@@ -263,6 +268,12 @@ pub(crate) async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
+    let gateway_interceptors =
+        openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone())
+            .await
+            .map_err(|e| {
+                Error::config(format!("gateway interceptor initialization failed: {e}"))
+            })?;
     let mut state = ServerState::new(
         config.clone(),
         store.clone(),
@@ -273,6 +284,7 @@ pub(crate) async fn run_server(
         supervisor_sessions,
         oidc_cache,
     );
+    state.gateway_interceptors = gateway_interceptors;
 
     // Load the gateway-minted sandbox JWT signing key when configured.
     // Optional so single-driver dev deployments without certgen continue

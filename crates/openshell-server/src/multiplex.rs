@@ -7,9 +7,9 @@
 //! to either the gRPC service or HTTP endpoints based on the request headers.
 
 use bytes::Bytes;
-use http::{HeaderValue, Request, Response};
+use http::{Extensions, HeaderValue, Request, Response};
 use http_body::Body;
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -21,6 +21,9 @@ use openshell_core::Config;
 use openshell_core::proto::{
     inference_server::InferenceServer, open_shell_server::OpenShellServer,
 };
+use openshell_gateway_interceptors::{EvaluationContext, GatewayInterceptorRuntime};
+use std::collections::BTreeMap;
+use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -154,6 +157,8 @@ impl MultiplexService {
     {
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let openshell =
+            GatewayInterceptorGrpcService::new(openshell, self.state.gateway_interceptors.clone());
         let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
@@ -220,6 +225,164 @@ impl MultiplexService {
             .await?;
 
         Ok(())
+    }
+}
+
+/// `OpenShell` gRPC wrapper that applies configured gateway interceptors before
+/// tonic dispatches to a specific RPC handler.
+#[derive(Clone)]
+struct GatewayInterceptorGrpcService<S> {
+    inner: S,
+    interceptors: Option<GatewayInterceptorRuntime>,
+}
+
+impl<S> GatewayInterceptorGrpcService<S> {
+    fn new(inner: S, interceptors: Option<GatewayInterceptorRuntime>) -> Self {
+        Self {
+            inner,
+            interceptors,
+        }
+    }
+}
+
+impl<S> tower::Service<Request<BoxBody>> for GatewayInterceptorGrpcService<S>
+where
+    S: tower::Service<Request<BoxBody>, Response = Response<tonic::body::Body>>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
+        let interceptors = self.interceptors.clone();
+        let mut inner = self.inner.clone();
+
+        Box::pin(async move {
+            let Some(interceptors) = interceptors else {
+                return inner.ready().await?.call(req).await;
+            };
+
+            let path = req.uri().path().to_string();
+            if !interceptors.should_intercept_path(&path) {
+                return inner.ready().await?.call(req).await;
+            }
+
+            let context = gateway_interceptor_context(req.extensions());
+            let (parts, body) = req.into_parts();
+            let body = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(err) => {
+                    return Ok(tonic::Status::internal(format!(
+                        "failed to read gRPC request body for interceptor evaluation: {err}"
+                    ))
+                    .into_http());
+                }
+            };
+
+            let intercepted = match interceptors.evaluate_request(&path, &body, &context).await {
+                Ok(intercepted) => intercepted,
+                Err(status) => return Ok(status.into_http()),
+            };
+
+            let req = Request::from_parts(
+                parts,
+                boxed_body_from_bytes(Bytes::from(intercepted.body.clone())),
+            );
+            let response = inner.ready().await?.call(req).await?;
+
+            if grpc_status_from_response(&response) == "0"
+                && let Err(status) = interceptors
+                    .evaluate_post_commit(&intercepted, &context)
+                    .await
+            {
+                return Ok(status.into_http());
+            }
+
+            Ok(response)
+        })
+    }
+}
+
+fn boxed_body_from_bytes(bytes: Bytes) -> BoxBody {
+    let body = Full::new(bytes)
+        .map_err(|never: Infallible| -> Box<dyn std::error::Error + Send + Sync> { match never {} })
+        .boxed_unsync();
+    BoxBody(body)
+}
+
+fn gateway_interceptor_context(extensions: &Extensions) -> EvaluationContext {
+    EvaluationContext {
+        principal: extensions
+            .get::<Principal>()
+            .map_or_else(unknown_gateway_principal, gateway_principal_fields),
+        current_state: None,
+    }
+}
+
+fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
+    use crate::auth::principal::SandboxIdentitySource;
+
+    let mut fields = BTreeMap::new();
+    match principal {
+        Principal::User(user) => {
+            fields.insert("kind".to_string(), "user".to_string());
+            fields.insert("subject".to_string(), user.identity.subject.clone());
+            if let Some(display_name) = &user.identity.display_name {
+                fields.insert("display_name".to_string(), display_name.clone());
+            }
+            fields.insert(
+                "provider".to_string(),
+                identity_provider_name(user.identity.provider).to_string(),
+            );
+            if !user.identity.roles.is_empty() {
+                fields.insert("roles".to_string(), user.identity.roles.join(","));
+            }
+            if !user.identity.scopes.is_empty() {
+                fields.insert("scopes".to_string(), user.identity.scopes.join(","));
+            }
+        }
+        Principal::Sandbox(sandbox) => {
+            fields.insert("kind".to_string(), "sandbox".to_string());
+            fields.insert("sandbox_id".to_string(), sandbox.sandbox_id.clone());
+            fields.insert(
+                "source".to_string(),
+                match &sandbox.source {
+                    SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
+                    SandboxIdentitySource::BootstrapCert { .. } => "bootstrap_cert",
+                    SandboxIdentitySource::K8sServiceAccount { .. } => "k8s_service_account",
+                }
+                .to_string(),
+            );
+            if let Some(trust_domain) = &sandbox.trust_domain {
+                fields.insert("trust_domain".to_string(), trust_domain.clone());
+            }
+        }
+        Principal::Anonymous => {
+            fields.insert("kind".to_string(), "anonymous".to_string());
+        }
+    }
+    fields
+}
+
+fn unknown_gateway_principal() -> BTreeMap<String, String> {
+    BTreeMap::from([("kind".to_string(), "unknown".to_string())])
+}
+
+fn identity_provider_name(provider: crate::auth::identity::IdentityProvider) -> &'static str {
+    match provider {
+        crate::auth::identity::IdentityProvider::Oidc => "oidc",
+        crate::auth::identity::IdentityProvider::Mtls => "mtls",
+        crate::auth::identity::IdentityProvider::CloudflareAccess => "cloudflare_access",
+        crate::auth::identity::IdentityProvider::LocalDev => "local_dev",
     }
 }
 
@@ -963,7 +1126,7 @@ mod tests {
 
     impl Service<Request<()>> for CountingGrpcService {
         type Response = Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
+        type Error = Infallible;
         type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
 
         fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -995,7 +1158,7 @@ mod tests {
 
     impl Service<Request<()>> for PendingInnerService {
         type Response = Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
+        type Error = Infallible;
         type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
 
         fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -1376,7 +1539,7 @@ mod tests {
 
         impl<B: Send + 'static> Service<Request<B>> for PrincipalRecorder {
             type Response = Response<tonic::body::Body>;
-            type Error = std::convert::Infallible;
+            type Error = Infallible;
             type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
             fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

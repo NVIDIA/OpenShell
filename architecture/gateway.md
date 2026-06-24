@@ -41,6 +41,17 @@ Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
 
+Gateway interceptors run in one middleware layer on the `openshell.v1.OpenShell`
+gRPC service after authentication and before tonic dispatches to individual
+handlers. At startup the gateway calls each configured interceptor's `Describe`
+RPC, validates declared bindings against the compiled OpenShell descriptor set,
+and builds an immutable execution plan. Unary OpenShell requests that are not
+streaming, supervisor-facing, read-only, or introspection methods are decoded
+through the descriptor set into protobuf JSON, evaluated through configured
+phases, and re-encoded before the handler sees the request. This keeps
+interception centralized: adding an interceptable unary RPC does not require
+method-specific gateway instrumentation.
+
 Supported auth modes:
 
 | Mode | Use |

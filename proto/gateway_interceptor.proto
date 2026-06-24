@@ -1,0 +1,98 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.gateway_interceptor.v1;
+
+import "google/protobuf/struct.proto";
+
+// GatewayInterceptor lets an external governance service evaluate gateway
+// control-plane operations after OpenShell admission and before or after the
+// gateway applies the operation.
+service GatewayInterceptor {
+  // Describe returns the interceptor manifest and declared bindings.
+  rpc Describe(DescribeRequest) returns (InterceptorManifest);
+
+  // Evaluate returns an allow, deny, or mutation decision for one operation
+  // phase.
+  rpc Evaluate(InterceptorEvaluation) returns (InterceptorResult);
+}
+
+message DescribeRequest {}
+
+enum GatewayInterceptorPhase {
+  GATEWAY_INTERCEPTOR_PHASE_UNSPECIFIED = 0;
+  GATEWAY_INTERCEPTOR_PHASE_PRE_REQUEST = 1;
+  GATEWAY_INTERCEPTOR_PHASE_MODIFY_OPERATION = 2;
+  GATEWAY_INTERCEPTOR_PHASE_VALIDATE = 3;
+  GATEWAY_INTERCEPTOR_PHASE_POST_COMMIT = 4;
+}
+
+message InterceptorEvaluation {
+  // Configured interceptor instance name.
+  string interceptor_name = 1;
+  // Manifest binding id selected for this evaluation.
+  string binding_id = 2;
+  // Public gRPC service name, e.g. "openshell.v1.OpenShell".
+  string service = 3;
+  // Public gRPC method name, e.g. "CreateSandbox".
+  string method = 4;
+  // Evaluation phase.
+  GatewayInterceptorPhase phase = 5;
+  // Protobuf JSON-shaped operation payload.
+  google.protobuf.Struct operation = 6;
+  // Read-only gateway state relevant to the operation.
+  google.protobuf.Struct current_state = 7;
+  // Caller identity summary. Values are intentionally non-secret.
+  map<string, string> principal = 8;
+}
+
+message InterceptorResult {
+  // False denies the operation before side effects for pre_request,
+  // modify_operation, and validate. Post-commit denial is invalid.
+  bool allowed = 1;
+  // Human-readable reason for logs and denied gRPC status messages.
+  string reason = 2;
+  // Optional gRPC status code name for denials, e.g. "PERMISSION_DENIED".
+  string status_code = 3;
+  // RFC 6902 JSON patches. Only valid during modify_operation.
+  repeated JsonPatch patches = 4;
+  // Non-secret annotations included in gateway audit logs.
+  map<string, string> audit_annotations = 5;
+}
+
+message InterceptorManifest {
+  // Human-readable interceptor name declared by the service.
+  string name = 1;
+  // Bindings declared by the interceptor service.
+  repeated InterceptorBinding bindings = 2;
+  // Optional default failure policy for bindings without their own policy.
+  string failure_policy = 3;
+}
+
+message InterceptorBinding {
+  // Stable binding id used for config overrides and audit logs.
+  string id = 1;
+  // RPC selector. Selectors are intentionally tied to the public API shape.
+  InterceptorSelector selector = 2;
+  // Phases this binding wants to evaluate.
+  repeated GatewayInterceptorPhase phases = 3;
+  // Optional binding-specific failure policy.
+  string failure_policy = 4;
+}
+
+message InterceptorSelector {
+  // Full selector form: "openshell.v1.OpenShell/CreateSandbox".
+  string rpc = 1;
+  // Structured service/method form. If rpc is set, it takes precedence.
+  string service = 2;
+  string method = 3;
+}
+
+message JsonPatch {
+  string op = 1;
+  string path = 2;
+  google.protobuf.Value value = 3;
+  string from = 4;
+}
