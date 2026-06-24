@@ -1,0 +1,116 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+project: openshell
+
+backends:
+    garden:
+        type: adhoc
+        allocate: |
+            # Spread automatically injects /snap/bin to PATH. When we are
+            # running from the image-garden snap then SPREAD_HOST_PATH is the
+            # original path before such modifications were applied. Snap
+            # applications cannot normally run /snap/bin/* entry-points
+            # successfully so re-set PATH to the original value, as provided by
+            # snapcraft.
+            if [ -n "${SPREAD_HOST_PATH-}" ]; then
+                PATH="${SPREAD_HOST_PATH}"
+            fi
+            export GARDEN_ARCH="$(uname -m)"
+            export SYSTEM="${SPREAD_SYSTEM/-plus-/+}"
+            export SYSTEM="${SYSTEM/-at-/@}"
+            exec image-garden allocate --spread "$SYSTEM"."$GARDEN_ARCH"
+        discard: |
+            # Spread automatically injects /snap/bin to PATH. When we are
+            # running from the image-garden snap then SPREAD_HOST_PATH is the
+            # original path before such modifications were applied. Snap
+            # applications cannot normally run /snap/bin/* entry-points
+            # successfully so re-set PATH to the original value, as provided by
+            # snapcraft.
+            if [ -n "${SPREAD_HOST_PATH-}" ]; then
+                PATH="${SPREAD_HOST_PATH}"
+            fi
+            image-garden discard "$SPREAD_SYSTEM_ADDRESS"
+        systems:
+            # Each system name follows the pattern: {os}-{version}-{variant}.
+            #
+            # Three variants are available:
+            #
+            #   snapd-no-docker   — snapd installed, no docker. The installer
+            #                       chooses the snap install path.
+            #
+            #   *-classic-docker  — snapd + native docker installed. The
+            #                       installer chooses the classic (deb/rpm)
+            #                       install path.
+            #
+            #   no-snapd          — docker installed, snapd absent. The
+            #                       installer chooses the classic (deb/rpm)
+            #                       install path.
+            #
+            # See .image-garden.mk for the cloud-init templates that define
+            # the per-system setup.
+            - ubuntu-cloud-24.04-at-snapd-no-docker:
+                  username: root
+                  password: root
+            - ubuntu-cloud-24.04-at-snapd-classic-docker:
+                  username: root
+                  password: root
+            - ubuntu-cloud-24.04-at-no-snapd:
+                  username: root
+                  password: root
+            - ubuntu-cloud-26.04-at-snapd-no-docker:
+                  username: root
+                  password: root
+            - ubuntu-cloud-26.04-at-snapd-classic-docker:
+                  username: root
+                  password: root
+            - ubuntu-cloud-26.04-at-no-snapd:
+                  username: root
+                  password: root
+            - debian-cloud-13-at-snapd-no-docker:
+                  username: root
+                  password: root
+            - debian-cloud-13-at-snapd-classic-docker:
+                  username: root
+                  password: root
+            - debian-cloud-13-at-no-snapd:
+                  username: root
+                  password: root
+            - fedora-cloud-44-at-snapd-no-docker:
+                  username: root
+                  password: root
+                  environment:
+                      PATH: /var/lib/snapd/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            - fedora-cloud-44-at-snapd-docker:
+                  username: root
+                  password: root
+                  environment:
+                      PATH: /var/lib/snapd/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            - fedora-cloud-44-at-no-snapd:
+                  username: root
+                  password: root
+
+exclude:
+    - ".cache/*"
+    - ".image-garden/*"
+    - "target/*"
+    - ".spread-reuse.*.yaml"
+
+path: /root/openshell
+
+debug-each: |
+    echo "Kernel and architecture:"
+    uname -a
+
+    echo "OS release info:"
+    cat /etc/os-release
+
+    echo "Docker availability:"
+    command -v docker >/dev/null 2>&1 && {
+        docker version --format '{{.Server.Version}}' 2>/dev/null || true
+    }
+    command -v snap >/dev/null 2>&1 && snap list docker 2>/dev/null || true
+
+suites:
+    tests/install/:
+        summary: Install smoke tests for OpenShell

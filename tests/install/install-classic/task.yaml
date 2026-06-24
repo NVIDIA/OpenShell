@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+summary: Install via native package (deb or rpm) on classic install path
+details: |
+    This test installs OpenShell via the classic install path using a native
+    package (deb on Ubuntu/Debian, rpm on Fedora). The installer chooses this
+    path when native docker is present. On Ubuntu 24.04, Ubuntu 26.04 and
+    Debian 13, snapd is removed via cloud-init for the no-snapd variant; on
+    Fedora 44, snapd is absent by default. This verifies that the native
+    package installation, user gateway service, and gateway registration work
+    correctly across all supported systems.
+
+systems:
+    - ubuntu-cloud-24.04-at-snapd-classic-docker
+    - ubuntu-cloud-24.04-at-no-snapd
+    - ubuntu-cloud-26.04-at-snapd-classic-docker
+    - ubuntu-cloud-26.04-at-no-snapd
+    - debian-cloud-13-at-snapd-classic-docker
+    - debian-cloud-13-at-no-snapd
+    - fedora-cloud-44-at-snapd-docker
+    - fedora-cloud-44-at-no-snapd
+
+prepare: |
+    cat "$SPREAD_PATH/install.sh" | sh
+
+execute: |
+    which openshell | NOMATCH "/snap/"
+    openshell status | sed 's/\x1b\[[0-9;]*m//g' | MATCH "Status: Connected"
