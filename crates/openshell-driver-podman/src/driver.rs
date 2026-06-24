@@ -12,8 +12,13 @@ use crate::watcher::{
 use openshell_core::ComputeDriverError;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::supervisor_image_should_refresh;
-use openshell_core::gpu::{CdiGpuInventory, CdiGpuRoundRobin, CdiGpuSelectionError};
-use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use openshell_core::gpu::{
+    CdiGpuDefaultSelector, CdiGpuInventory, CdiGpuSelectionError, driver_gpu_requirements,
+    effective_driver_gpu_count, validate_specific_gpu_device_request,
+};
+use openshell_core::proto::compute::v1::{
+    DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,9 +42,8 @@ pub struct PodmanComputeDriver {
     /// The host's IP on the bridge network. Sandbox containers use this to
     /// reach the gateway server when no explicit gRPC endpoint is configured.
     network_gateway_ip: Option<String>,
-    gpu_inventory: CdiGpuInventory,
-    allow_all_default_gpu: bool,
-    gpu_selector: Arc<CdiGpuRoundRobin>,
+    gpu_selector: Arc<CdiGpuDefaultSelector>,
+    gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
 }
 
 impl std::fmt::Debug for PodmanComputeDriver {
@@ -48,10 +52,14 @@ impl std::fmt::Debug for PodmanComputeDriver {
             .field("socket_path", &self.config.socket_path)
             .field("default_image", &self.config.default_image)
             .field("network_name", &self.config.network_name)
-            .field("gpu_inventory", &self.gpu_inventory)
-            .field("allow_all_default_gpu", &self.allow_all_default_gpu)
+            .field("gpu_inventory", &self.gpu_selector.device_ids())
             .finish()
     }
+}
+
+struct ValidatedPodmanSandbox<'a> {
+    driver_config: PodmanSandboxDriverConfig,
+    gpu_requirements: Option<&'a GpuResourceRequirements>,
 }
 
 /// Construct and validate a container name from a sandbox name.
@@ -166,6 +174,13 @@ fn local_podman_all_gpu_default_supported() -> bool {
     local_podman_all_gpu_default_supported_from(Path::new("/dev"))
 }
 
+fn local_podman_gpu_selector_state() -> (CdiGpuInventory, bool) {
+    (
+        local_podman_cdi_gpu_inventory(),
+        local_podman_all_gpu_default_supported(),
+    )
+}
+
 fn podman_gpu_selection_error(err: CdiGpuSelectionError) -> ComputeDriverError {
     ComputeDriverError::Precondition(err.to_string())
 }
@@ -267,8 +282,7 @@ impl PodmanComputeDriver {
             "Bridge network ready"
         );
 
-        let gpu_inventory = local_podman_cdi_gpu_inventory();
-        let allow_all_default_gpu = local_podman_all_gpu_default_supported();
+        let (gpu_inventory, allow_all_default_gpu) = local_podman_gpu_selector_state();
         if !gpu_inventory.is_empty() {
             info!(
                 device_count = gpu_inventory.as_slice().len(),
@@ -304,9 +318,11 @@ impl PodmanComputeDriver {
             client,
             config,
             network_gateway_ip,
-            gpu_inventory,
-            allow_all_default_gpu,
-            gpu_selector: Arc::new(CdiGpuRoundRobin::new()),
+            gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
+                gpu_inventory,
+                allow_all_default_gpu,
+            )),
+            gpu_inventory_refresh: Arc::new(local_podman_gpu_selector_state),
         })
     }
 
@@ -338,54 +354,85 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let gpu_requested = sandbox.spec.as_ref().is_some_and(|s| s.gpu);
-        let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
-        if !gpu_requested && driver_config.cdi_devices.is_some() {
-            return Err(ComputeDriverError::InvalidArgument(
-                "driver_config.cdi_devices requires gpu=true".to_string(),
-            ));
-        }
-        self.validate_user_volume_mounts_available(sandbox).await?;
-        let _ = self.peek_default_gpu_device(sandbox)?;
+        let _ = self.validated_sandbox_create(sandbox).await?;
         Ok(())
     }
 
-    fn peek_default_gpu_device(
+    async fn validated_sandbox_create<'a>(
         &self,
-        sandbox: &DriverSandbox,
-    ) -> Result<Option<String>, ComputeDriverError> {
-        self.selected_default_gpu_device(sandbox, false)
+        sandbox: &'a DriverSandbox,
+    ) -> Result<ValidatedPodmanSandbox<'a>, ComputeDriverError> {
+        let gpu_requirements = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.resource_requirements.as_ref())
+            .and_then(|requirements| driver_gpu_requirements(Some(requirements)));
+        let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
+        Self::validate_gpu_request(gpu_requirements, &driver_config)?;
+        self.validate_user_volume_mounts_available(sandbox).await?;
+        let _ = self.resolve_gpu_cdi_devices(
+            gpu_requirements,
+            &driver_config,
+            CdiGpuDefaultSelector::peek_device_ids,
+        )?;
+        Ok(ValidatedPodmanSandbox {
+            driver_config,
+            gpu_requirements,
+        })
     }
 
-    fn next_default_gpu_device(
-        &self,
-        sandbox: &DriverSandbox,
-    ) -> Result<Option<String>, ComputeDriverError> {
-        self.selected_default_gpu_device(sandbox, true)
+    fn validate_gpu_request(
+        gpu_requirements: Option<&GpuResourceRequirements>,
+        driver_config: &PodmanSandboxDriverConfig,
+    ) -> Result<(), ComputeDriverError> {
+        let _ = effective_driver_gpu_count(gpu_requirements)
+            .map_err(ComputeDriverError::InvalidArgument)?;
+        if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
+            validate_specific_gpu_device_request(
+                gpu_requirements,
+                cdi_devices,
+                "driver_config.cdi_devices",
+            )
+            .map_err(ComputeDriverError::InvalidArgument)?;
+        }
+
+        Ok(())
     }
 
-    fn selected_default_gpu_device(
+    fn refresh_gpu_inventory(&self) {
+        let (inventory, allow_all_default_gpu) = (self.gpu_inventory_refresh)();
+        self.gpu_selector.refresh(inventory, allow_all_default_gpu);
+    }
+
+    fn resolve_gpu_cdi_devices(
         &self,
-        sandbox: &DriverSandbox,
-        consume: bool,
-    ) -> Result<Option<String>, ComputeDriverError> {
-        let Some(spec) = sandbox.spec.as_ref() else {
+        gpu_requirements: Option<&GpuResourceRequirements>,
+        driver_config: &PodmanSandboxDriverConfig,
+        select_default_devices: fn(
+            &CdiGpuDefaultSelector,
+            u32,
+        ) -> Result<Vec<String>, CdiGpuSelectionError>,
+    ) -> Result<Option<Vec<String>>, ComputeDriverError> {
+        if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
+            validate_specific_gpu_device_request(
+                gpu_requirements,
+                cdi_devices,
+                "driver_config.cdi_devices",
+            )
+            .map_err(ComputeDriverError::InvalidArgument)?;
+            return Ok(Some(cdi_devices.to_vec()));
+        }
+
+        let Some(count) = effective_driver_gpu_count(gpu_requirements)
+            .map_err(ComputeDriverError::InvalidArgument)?
+        else {
             return Ok(None);
         };
-        let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
-        if !spec.gpu || driver_config.cdi_devices.is_some() {
-            return Ok(None);
-        }
 
-        let selected = if consume {
-            self.gpu_selector
-                .next_default_device_id(&self.gpu_inventory, self.allow_all_default_gpu)
-        } else {
-            self.gpu_selector
-                .peek_default_device_id(&self.gpu_inventory, self.allow_all_default_gpu)
-        }
-        .map_err(podman_gpu_selection_error)?;
-        Ok(Some(selected))
+        self.refresh_gpu_inventory();
+        select_default_devices(&self.gpu_selector, count)
+            .map(Some)
+            .map_err(podman_gpu_selection_error)
     }
 
     async fn validate_user_volume_mounts_available(
@@ -433,7 +480,7 @@ impl PodmanComputeDriver {
         // resources (volume), so we don't leave orphans when the name is
         // invalid.
         let name = validated_container_name(&sandbox.name)?;
-        self.validate_sandbox_create(sandbox).await?;
+        let validated = self.validated_sandbox_create(sandbox).await?;
 
         let vol_name = container::volume_name(&sandbox.id);
 
@@ -499,19 +546,23 @@ impl PodmanComputeDriver {
         };
 
         // 3. Create container.
-        let selected_default_gpu = match self.next_default_gpu_device(sandbox) {
-            Ok(device) => device,
+        let gpu_devices = match self.resolve_gpu_cdi_devices(
+            validated.gpu_requirements,
+            &validated.driver_config,
+            CdiGpuDefaultSelector::next_device_ids,
+        ) {
+            Ok(devices) => devices,
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
                 cleanup_sandbox_token_file(&sandbox.id);
                 return Err(e);
             }
         };
-        let spec = match container::build_container_spec_with_token_and_gpu_default(
+        let spec = match container::build_container_spec_with_token_and_gpu_devices(
             sandbox,
             &self.config,
             token_host_path.as_deref(),
-            selected_default_gpu.as_deref(),
+            gpu_devices.as_deref(),
         ) {
             Ok(spec) => spec,
             Err(e) => {
@@ -742,13 +793,18 @@ impl PodmanComputeDriver {
         allow_all_default_gpu: bool,
     ) -> Self {
         let client = PodmanClient::new(config.socket_path.clone());
+        let refresh_inventory = gpu_inventory.clone();
         Self {
             client,
             config,
             network_gateway_ip: None,
-            gpu_inventory,
-            allow_all_default_gpu,
-            gpu_selector: Arc::new(CdiGpuRoundRobin::new()),
+            gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
+                gpu_inventory,
+                allow_all_default_gpu,
+            )),
+            gpu_inventory_refresh: Arc::new(move || {
+                (refresh_inventory.clone(), allow_all_default_gpu)
+            }),
         }
     }
 }
@@ -805,7 +861,9 @@ mod tests {
     use super::*;
     use crate::test_utils::{StubResponse, spawn_podman_stub};
     use hyper::StatusCode;
-    use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+    use openshell_core::proto::compute::v1::{
+        DriverSandboxSpec, DriverSandboxTemplate, ResourceRequirements,
+    };
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -833,6 +891,12 @@ mod tests {
         }
     }
 
+    fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
+        ResourceRequirements {
+            gpu: Some(GpuResourceRequirements { count }),
+        }
+    }
+
     #[test]
     fn podman_driver_error_from_conflict() {
         let err = ComputeDriverError::from(PodmanApiError::Conflict("exists".into()));
@@ -843,6 +907,69 @@ mod tests {
     fn podman_driver_error_from_not_found() {
         let err = ComputeDriverError::from(PodmanApiError::NotFound("gone".into()));
         assert!(matches!(err, ComputeDriverError::Message(_)));
+    }
+
+    #[test]
+    fn validate_gpu_request_accepts_gpu_count_request_shape() {
+        let gpu = GpuResourceRequirements { count: Some(2) };
+        let driver_config = PodmanSandboxDriverConfig::default();
+
+        PodmanComputeDriver::validate_gpu_request(Some(&gpu), &driver_config)
+            .expect("default GPU count shape should be accepted before inventory selection");
+    }
+
+    #[test]
+    fn validate_gpu_request_accepts_single_cdi_device_without_gpu_count() {
+        let gpu = GpuResourceRequirements { count: None };
+        let mut driver_config = PodmanSandboxDriverConfig::default();
+        driver_config.cdi_devices = Some(vec!["nvidia.com/gpu=0".to_string()]);
+
+        PodmanComputeDriver::validate_gpu_request(Some(&gpu), &driver_config)
+            .expect("single exact CDI device should pass count validation");
+    }
+
+    #[test]
+    fn validate_gpu_request_rejects_multiple_cdi_devices_without_gpu_count() {
+        let gpu = GpuResourceRequirements { count: None };
+        let mut driver_config = PodmanSandboxDriverConfig::default();
+        driver_config.cdi_devices = Some(vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string(),
+        ]);
+        let err = PodmanComputeDriver::validate_gpu_request(Some(&gpu), &driver_config)
+            .expect_err("missing CDI device count should be rejected for multiple devices");
+
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(
+            err.to_string()
+                .contains("gpu count (1) must match driver_config.cdi_devices length (2)")
+        );
+    }
+
+    #[test]
+    fn validate_gpu_request_rejects_cdi_devices_without_gpu_request() {
+        let mut driver_config = PodmanSandboxDriverConfig::default();
+        driver_config.cdi_devices = Some(vec!["nvidia.com/gpu=0".to_string()]);
+        let err = PodmanComputeDriver::validate_gpu_request(None, &driver_config)
+            .expect_err("missing GPU request should be rejected");
+
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(err.to_string().contains("requires a gpu request"));
+    }
+
+    #[test]
+    fn validate_gpu_request_rejects_mismatched_cdi_device_count() {
+        let gpu = GpuResourceRequirements { count: Some(2) };
+        let mut driver_config = PodmanSandboxDriverConfig::default();
+        driver_config.cdi_devices = Some(vec!["nvidia.com/gpu=0".to_string()]);
+        let err = PodmanComputeDriver::validate_gpu_request(Some(&gpu), &driver_config)
+            .expect_err("mismatched CDI device count should be rejected");
+
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(
+            err.to_string()
+                .contains("gpu count (2) must match driver_config.cdi_devices length (1)")
+        );
     }
 
     // ── grpc_endpoint auto-detection ───────────────────────────────────
@@ -975,7 +1102,7 @@ mod tests {
         );
         let sandbox = DriverSandbox {
             spec: Some(DriverSandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources(None)),
                 ..Default::default()
             }),
             ..Default::default()
@@ -995,7 +1122,7 @@ mod tests {
         );
         let sandbox = DriverSandbox {
             spec: Some(DriverSandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources(None)),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1014,7 +1141,7 @@ mod tests {
         );
         let sandbox = DriverSandbox {
             spec: Some(DriverSandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources(None)),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1032,7 +1159,7 @@ mod tests {
         let driver = PodmanComputeDriver::for_tests(PodmanComputeConfig::default());
         let sandbox = DriverSandbox {
             spec: Some(DriverSandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources(None)),
                 template: Some(DriverSandboxTemplate {
                     driver_config: Some(cdi_devices_config(&["nvidia.com/gpu=0"])),
                     ..Default::default()
@@ -1057,7 +1184,7 @@ mod tests {
             id: "sbx-first".to_string(),
             name: "first".to_string(),
             spec: Some(DriverSandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources(None)),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1066,35 +1193,35 @@ mod tests {
             id: "sbx-second".to_string(),
             name: "second".to_string(),
             spec: Some(DriverSandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources(None)),
                 ..Default::default()
             }),
             ..Default::default()
         };
 
         assert_eq!(
-            driver.peek_default_gpu_device(&first_sandbox).unwrap(),
-            Some("nvidia.com/gpu=0".to_string())
+            driver.gpu_selector.peek_device_ids(1).unwrap(),
+            vec!["nvidia.com/gpu=0".to_string()]
         );
-        let first_device = driver.next_default_gpu_device(&first_sandbox).unwrap();
-        let first_spec = container::build_container_spec_with_token_and_gpu_default(
+        let first_devices = driver.gpu_selector.next_device_ids(1).unwrap();
+        let first_spec = container::build_container_spec_with_token_and_gpu_devices(
             &first_sandbox,
             &driver.config,
             None,
-            first_device.as_deref(),
+            Some(&first_devices),
         )
         .unwrap();
 
         assert_eq!(
-            driver.peek_default_gpu_device(&second_sandbox).unwrap(),
-            Some("nvidia.com/gpu=1".to_string())
+            driver.gpu_selector.peek_device_ids(1).unwrap(),
+            vec!["nvidia.com/gpu=1".to_string()]
         );
-        let second_device = driver.next_default_gpu_device(&second_sandbox).unwrap();
-        let second_spec = container::build_container_spec_with_token_and_gpu_default(
+        let second_devices = driver.gpu_selector.next_device_ids(1).unwrap();
+        let second_spec = container::build_container_spec_with_token_and_gpu_devices(
             &second_sandbox,
             &driver.config,
             None,
-            second_device.as_deref(),
+            Some(&second_devices),
         )
         .unwrap();
 

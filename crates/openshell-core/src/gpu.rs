@@ -1,12 +1,62 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared GPU request helpers.
+//! Shared GPU resource requirement helpers.
 
+use std::collections::HashSet;
 use std::fmt;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::CDI_GPU_DEVICE_ALL;
+use crate::proto::ResourceRequirements as SandboxResourceRequirements;
+use crate::proto::compute::v1::{
+    GpuResourceRequirements as DriverGpuResourceRequirements,
+    ResourceRequirements as DriverResourceRequirements,
+};
+
+/// Return whether sandbox resource requirements request a GPU.
+#[must_use]
+pub fn sandbox_gpu_requested(resources: Option<&SandboxResourceRequirements>) -> bool {
+    resources
+        .and_then(|resources| resources.gpu.as_ref())
+        .is_some()
+}
+
+/// Return the requested sandbox GPU count, if one was specified.
+#[must_use]
+pub fn sandbox_gpu_count(resources: Option<&SandboxResourceRequirements>) -> Option<u32> {
+    resources
+        .and_then(|resources| resources.gpu.as_ref())
+        .and_then(|gpu| gpu.count)
+}
+
+/// Return the effective compute-driver GPU count.
+///
+/// A present GPU requirement with an omitted count requests one GPU.
+///
+/// # Errors
+/// Returns an error when a GPU requirement explicitly requests zero GPUs.
+pub fn effective_driver_gpu_count(
+    gpu: Option<&DriverGpuResourceRequirements>,
+) -> Result<Option<u32>, String> {
+    let Some(gpu) = gpu else {
+        return Ok(None);
+    };
+    let count = gpu.count.unwrap_or(1);
+    if count == 0 {
+        return Err("gpu count must be greater than 0".to_string());
+    }
+    Ok(Some(count))
+}
+
+/// Return the requested compute-driver GPU requirements, if present.
+#[must_use]
+pub fn driver_gpu_requirements(
+    resources: Option<&DriverResourceRequirements>,
+) -> Option<&DriverGpuResourceRequirements> {
+    resources.and_then(|resources| resources.gpu.as_ref())
+}
 
 const CDI_NVIDIA_GPU_PREFIX: &str = "nvidia.com/gpu=";
 const CDI_NVIDIA_GPU_ALL_SUFFIX: &str = "all";
@@ -86,9 +136,84 @@ impl CdiGpuInventory {
     }
 }
 
+#[derive(Debug)]
+struct CdiGpuSelectorState {
+    inventory: CdiGpuInventory,
+    allow_all_devices: bool,
+}
+
+/// Concurrency-safe default CDI GPU selector used by local container drivers.
+#[derive(Debug)]
+pub struct CdiGpuDefaultSelector {
+    state: RwLock<CdiGpuSelectorState>,
+    round_robin: CdiGpuRoundRobin,
+}
+
+impl CdiGpuDefaultSelector {
+    /// Create a selector with an initial discovered CDI GPU inventory snapshot.
+    #[must_use]
+    pub fn new(inventory: CdiGpuInventory, allow_all_devices: bool) -> Self {
+        Self {
+            state: RwLock::new(CdiGpuSelectorState {
+                inventory,
+                allow_all_devices,
+            }),
+            round_robin: CdiGpuRoundRobin::new(),
+        }
+    }
+
+    /// Replace the cached inventory snapshot without resetting the cursor.
+    pub fn refresh(&self, inventory: CdiGpuInventory, allow_all_devices: bool) {
+        let mut state = self
+            .state
+            .write()
+            .expect("CDI GPU selector state lock poisoned");
+        state.inventory = inventory;
+        state.allow_all_devices = allow_all_devices;
+    }
+
+    /// Return the cached normalized inventory snapshot.
+    #[must_use]
+    pub fn device_ids(&self) -> Vec<String> {
+        self.state
+            .read()
+            .expect("CDI GPU selector state lock poisoned")
+            .inventory
+            .as_slice()
+            .to_vec()
+    }
+
+    /// Return the current default device IDs without advancing the cursor.
+    pub fn peek_device_ids(&self, count: u32) -> Result<Vec<String>, CdiGpuSelectionError> {
+        self.selected_device_ids(count, false)
+    }
+
+    /// Return the next default device IDs and advance the cursor.
+    pub fn next_device_ids(&self, count: u32) -> Result<Vec<String>, CdiGpuSelectionError> {
+        self.selected_device_ids(count, true)
+    }
+
+    fn selected_device_ids(
+        &self,
+        count: u32,
+        consume: bool,
+    ) -> Result<Vec<String>, CdiGpuSelectionError> {
+        let state = self
+            .state
+            .read()
+            .expect("CDI GPU selector state lock poisoned");
+        self.round_robin.selected_default_device_ids(
+            &state.inventory,
+            count,
+            consume,
+            state.allow_all_devices,
+        )
+    }
+}
+
 /// Concurrency-safe round-robin cursor for default CDI GPU selection.
 #[derive(Debug, Default)]
-pub struct CdiGpuRoundRobin {
+struct CdiGpuRoundRobin {
     next: AtomicUsize,
 }
 
@@ -100,37 +225,34 @@ impl CdiGpuRoundRobin {
         }
     }
 
-    /// Return the next default device ID and advance the cursor.
-    pub fn next_default_device_id(
+    fn selected_default_device_ids(
         &self,
         inventory: &CdiGpuInventory,
-        allow_all_devices: bool,
-    ) -> Result<String, CdiGpuSelectionError> {
-        self.selected_default_device_id(inventory, true, allow_all_devices)
-    }
-
-    /// Return the current default device ID without advancing the cursor.
-    pub fn peek_default_device_id(
-        &self,
-        inventory: &CdiGpuInventory,
-        allow_all_devices: bool,
-    ) -> Result<String, CdiGpuSelectionError> {
-        self.selected_default_device_id(inventory, false, allow_all_devices)
-    }
-
-    fn selected_default_device_id(
-        &self,
-        inventory: &CdiGpuInventory,
+        count: u32,
         consume: bool,
         allow_all_devices: bool,
-    ) -> Result<String, CdiGpuSelectionError> {
+    ) -> Result<Vec<String>, CdiGpuSelectionError> {
         let devices = inventory.default_device_family(allow_all_devices)?;
+        let count =
+            usize::try_from(count).map_err(|_| CdiGpuSelectionError::InsufficientDevices {
+                requested: count,
+                available: u32::try_from(devices.len()).unwrap_or(u32::MAX),
+            })?;
+        let available = devices.len();
+        if count > available {
+            return Err(CdiGpuSelectionError::InsufficientDevices {
+                requested: u32::try_from(count).unwrap_or(u32::MAX),
+                available: u32::try_from(available).unwrap_or(u32::MAX),
+            });
+        }
         let base = if consume {
-            self.next.fetch_add(1, Ordering::Relaxed)
+            self.next.fetch_add(count, Ordering::Relaxed)
         } else {
             self.next.load(Ordering::Relaxed)
         };
-        Ok(devices[base % devices.len()].clone())
+        Ok((0..count)
+            .map(|offset| devices[(base + offset) % available].clone())
+            .collect())
     }
 }
 
@@ -138,19 +260,37 @@ impl CdiGpuRoundRobin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CdiGpuSelectionError {
     NoAvailableDevices,
-    MissingDefaultDevice,
     AllDevicesDefaultUnsupported,
+    InsufficientDevices { requested: u32, available: u32 },
 }
 
 impl fmt::Display for CdiGpuSelectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoAvailableDevices => f.write_str("no NVIDIA CDI GPU devices were discovered"),
-            Self::MissingDefaultDevice => {
-                f.write_str("GPU request requires a selected default CDI GPU device")
-            }
             Self::AllDevicesDefaultUnsupported => f.write_str(
                 "default GPU request resolved only to nvidia.com/gpu=all, which is not allowed on this platform; set driver_config.cdi_devices to [\"nvidia.com/gpu=all\"] explicitly to request all GPUs",
+            ),
+            Self::InsufficientDevices {
+                requested,
+                available: 0,
+            } => write!(
+                f,
+                "GPU sandbox requested {requested} GPUs, but no selectable NVIDIA CDI GPU devices are available"
+            ),
+            Self::InsufficientDevices {
+                requested,
+                available: 1,
+            } => write!(
+                f,
+                "GPU sandbox requested {requested} GPUs, but only 1 selectable NVIDIA CDI GPU device is available"
+            ),
+            Self::InsufficientDevices {
+                requested,
+                available,
+            } => write!(
+                f,
+                "GPU sandbox requested {requested} GPUs, but only {available} selectable NVIDIA CDI GPU devices are available"
             ),
         }
     }
@@ -158,40 +298,49 @@ impl fmt::Display for CdiGpuSelectionError {
 
 impl std::error::Error for CdiGpuSelectionError {}
 
-/// Resolve a local runtime GPU request into CDI device identifiers.
-///
-/// `None` means no GPU was requested. Explicit driver-configured CDI devices
-/// pass through unchanged. A default GPU request uses the driver-selected
-/// default CDI ID.
-pub fn cdi_gpu_device_ids(
-    gpu: bool,
-    cdi_devices: &[String],
-    selected_default_device: Option<&str>,
-) -> Result<Option<Vec<String>>, CdiGpuSelectionError> {
-    if !gpu {
-        return Ok(None);
-    }
-    if !cdi_devices.is_empty() {
-        return Ok(Some(cdi_devices.to_vec()));
-    }
-    let device = selected_default_device.ok_or(CdiGpuSelectionError::MissingDefaultDevice)?;
-    Ok(Some(vec![device.to_string()]))
-}
-
-/// Resolve a GPU request with the legacy all-GPU default.
-#[must_use]
-pub fn cdi_gpu_device_ids_or_all(gpu: bool, cdi_devices: &[String]) -> Option<Vec<String>> {
-    gpu.then(|| {
-        if cdi_devices.is_empty() {
-            vec![CDI_GPU_DEVICE_ALL.to_string()]
-        } else {
-            cdi_devices.to_vec()
-        }
-    })
-}
-
 fn cdi_nvidia_gpu_suffix(id: &str) -> Option<&str> {
     id.strip_prefix(CDI_NVIDIA_GPU_PREFIX)
+}
+
+/// Validate a compute-driver GPU request against driver-owned specific devices.
+///
+/// Drivers call this when a sandbox request combines portable GPU requirements
+/// with exact device identifiers in `driver_config`.
+///
+/// # Errors
+/// Returns an error when the sandbox GPU request is absent, when `gpu.count`
+/// is zero, when device IDs are duplicated, or when the effective GPU count
+/// does not equal the number of specific devices.
+pub fn validate_specific_gpu_device_request(
+    gpu: Option<&DriverGpuResourceRequirements>,
+    specific_devices: &[String],
+    driver_config_field: &str,
+) -> Result<(), String> {
+    let device_count = specific_devices.len();
+    if device_count == 0 {
+        return Ok(());
+    }
+
+    let mut seen = HashSet::with_capacity(device_count);
+    for device in specific_devices {
+        if !seen.insert(device.as_str()) {
+            return Err(format!(
+                "{driver_config_field} contains duplicate device ID '{device}'"
+            ));
+        }
+    }
+
+    let Some(count) = effective_driver_gpu_count(gpu)? else {
+        return Err(format!("{driver_config_field} requires a gpu request"));
+    };
+
+    if usize::try_from(count).ok() != Some(device_count) {
+        return Err(format!(
+            "gpu count ({count}) must match {driver_config_field} length ({device_count})"
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -199,49 +348,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cdi_gpu_device_ids_returns_none_when_absent() {
-        assert_eq!(cdi_gpu_device_ids(false, &[], None), Ok(None));
+    fn effective_driver_gpu_count_normalizes_missing_count() {
+        let gpu = DriverGpuResourceRequirements { count: None };
+
+        assert_eq!(effective_driver_gpu_count(Some(&gpu)), Ok(Some(1)));
+        assert_eq!(effective_driver_gpu_count(None), Ok(None));
     }
 
     #[test]
-    fn cdi_gpu_device_ids_uses_selected_default_device() {
-        assert_eq!(
-            cdi_gpu_device_ids(true, &[], Some("nvidia.com/gpu=0")),
-            Ok(Some(vec!["nvidia.com/gpu=0".to_string()]))
-        );
-    }
+    fn effective_driver_gpu_count_rejects_zero_count() {
+        let gpu = DriverGpuResourceRequirements { count: Some(0) };
 
-    #[test]
-    fn cdi_gpu_device_ids_rejects_missing_default_device() {
         assert_eq!(
-            cdi_gpu_device_ids(true, &[], None),
-            Err(CdiGpuSelectionError::MissingDefaultDevice)
-        );
-    }
-
-    #[test]
-    fn cdi_gpu_device_ids_passes_explicit_device_ids_through() {
-        assert_eq!(
-            cdi_gpu_device_ids(
-                true,
-                &[
-                    "nvidia.com/gpu=0".to_string(),
-                    "nvidia.com/gpu=1".to_string()
-                ],
-                None
-            ),
-            Ok(Some(vec![
-                "nvidia.com/gpu=0".to_string(),
-                "nvidia.com/gpu=1".to_string()
-            ]))
-        );
-    }
-
-    #[test]
-    fn cdi_gpu_device_ids_or_all_uses_all_when_no_devices_are_configured() {
-        assert_eq!(
-            cdi_gpu_device_ids_or_all(true, &[]),
-            Some(vec![CDI_GPU_DEVICE_ALL.to_string()])
+            effective_driver_gpu_count(Some(&gpu)),
+            Err("gpu count must be greater than 0".to_string())
         );
     }
 
@@ -264,69 +384,69 @@ mod tests {
     }
 
     #[test]
-    fn round_robin_prefers_indexed_family_and_sorts_numerically() {
+    fn selector_prefers_indexed_family_and_sorts_numerically() {
         let inventory = CdiGpuInventory::new([
             "nvidia.com/gpu=10",
             "nvidia.com/gpu=UUID-b",
             "nvidia.com/gpu=2",
             "nvidia.com/gpu=all",
         ]);
-        let selector = CdiGpuRoundRobin::new();
+        let selector = CdiGpuDefaultSelector::new(inventory, false);
 
         assert_eq!(
-            selector.next_default_device_id(&inventory, false),
-            Ok("nvidia.com/gpu=2".to_string())
+            selector.next_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=2".to_string()])
         );
         assert_eq!(
-            selector.next_default_device_id(&inventory, false),
-            Ok("nvidia.com/gpu=10".to_string())
+            selector.next_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=10".to_string()])
         );
         assert_eq!(
-            selector.next_default_device_id(&inventory, false),
-            Ok("nvidia.com/gpu=2".to_string())
+            selector.next_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=2".to_string()])
         );
     }
 
     #[test]
-    fn round_robin_uses_named_family_when_no_indexed_ids_exist() {
+    fn selector_uses_named_family_when_no_indexed_ids_exist() {
         let inventory = CdiGpuInventory::new(["nvidia.com/gpu=UUID-b", "nvidia.com/gpu=UUID-a"]);
-        let selector = CdiGpuRoundRobin::new();
+        let selector = CdiGpuDefaultSelector::new(inventory, false);
 
         assert_eq!(
-            selector.next_default_device_id(&inventory, false),
-            Ok("nvidia.com/gpu=UUID-a".to_string())
+            selector.next_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=UUID-a".to_string()])
         );
     }
 
     #[test]
-    fn round_robin_uses_all_only_inventory_when_allowed() {
+    fn selector_uses_all_only_inventory_when_allowed() {
         let inventory = CdiGpuInventory::new([CDI_GPU_DEVICE_ALL]);
-        let selector = CdiGpuRoundRobin::new();
+        let selector = CdiGpuDefaultSelector::new(inventory, true);
 
         assert_eq!(
-            selector.next_default_device_id(&inventory, true),
-            Ok(CDI_GPU_DEVICE_ALL.to_string())
+            selector.next_device_ids(1),
+            Ok(vec![CDI_GPU_DEVICE_ALL.to_string()])
         );
     }
 
     #[test]
-    fn round_robin_rejects_all_only_inventory_when_not_allowed() {
+    fn selector_rejects_all_only_inventory_when_not_allowed() {
         let inventory = CdiGpuInventory::new([CDI_GPU_DEVICE_ALL]);
-        let selector = CdiGpuRoundRobin::new();
+        let selector = CdiGpuDefaultSelector::new(inventory, false);
 
         assert_eq!(
-            selector.next_default_device_id(&inventory, false),
+            selector.next_device_ids(1),
             Err(CdiGpuSelectionError::AllDevicesDefaultUnsupported)
         );
     }
 
     #[test]
-    fn round_robin_rejects_empty_inventory() {
+    fn selector_rejects_empty_inventory() {
         let inventory = CdiGpuInventory::new(["vendor.example/device=0"]);
-        let selector = CdiGpuRoundRobin::new();
+        let selector = CdiGpuDefaultSelector::new(inventory, false);
 
         assert_eq!(
-            selector.next_default_device_id(&inventory, false),
+            selector.next_device_ids(1),
             Err(CdiGpuSelectionError::NoAvailableDevices)
         );
     }
@@ -334,23 +454,205 @@ mod tests {
     #[test]
     fn peek_does_not_advance_round_robin_cursor() {
         let inventory = CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]);
-        let selector = CdiGpuRoundRobin::new();
+        let selector = CdiGpuDefaultSelector::new(inventory, false);
 
         assert_eq!(
-            selector.peek_default_device_id(&inventory, false),
-            Ok("nvidia.com/gpu=0".to_string())
+            selector.peek_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=0".to_string()])
         );
         assert_eq!(
-            selector.peek_default_device_id(&inventory, false),
-            Ok("nvidia.com/gpu=0".to_string())
+            selector.peek_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=0".to_string()])
         );
         assert_eq!(
-            selector.next_default_device_id(&inventory, false),
-            Ok("nvidia.com/gpu=0".to_string())
+            selector.next_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=0".to_string()])
         );
         assert_eq!(
-            selector.next_default_device_id(&inventory, false),
-            Ok("nvidia.com/gpu=1".to_string())
+            selector.next_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=1".to_string()])
+        );
+    }
+
+    #[test]
+    fn selector_selects_multiple_distinct_devices_in_cursor_order() {
+        let inventory =
+            CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1", "nvidia.com/gpu=2"]);
+        let selector = CdiGpuDefaultSelector::new(inventory, false);
+
+        assert_eq!(
+            selector.next_device_ids(2),
+            Ok(vec![
+                "nvidia.com/gpu=0".to_string(),
+                "nvidia.com/gpu=1".to_string()
+            ])
+        );
+        assert_eq!(
+            selector.next_device_ids(2),
+            Ok(vec![
+                "nvidia.com/gpu=2".to_string(),
+                "nvidia.com/gpu=0".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn selector_rejects_count_larger_than_selectable_family_without_advancing() {
+        let inventory = CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]);
+        let selector = CdiGpuDefaultSelector::new(inventory, false);
+
+        assert_eq!(
+            selector.next_device_ids(3),
+            Err(CdiGpuSelectionError::InsufficientDevices {
+                requested: 3,
+                available: 2
+            })
+        );
+        assert_eq!(
+            selector.next_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=0".to_string()])
+        );
+    }
+
+    #[test]
+    fn selector_treats_all_only_inventory_as_one_selectable_device() {
+        let inventory = CdiGpuInventory::new([CDI_GPU_DEVICE_ALL]);
+        let selector = CdiGpuDefaultSelector::new(inventory, true);
+
+        assert_eq!(
+            selector.next_device_ids(2),
+            Err(CdiGpuSelectionError::InsufficientDevices {
+                requested: 2,
+                available: 1
+            })
+        );
+    }
+
+    #[test]
+    fn selector_refreshes_inventory_without_resetting_cursor() {
+        let inventory = CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]);
+        let selector = CdiGpuDefaultSelector::new(inventory, false);
+
+        assert_eq!(
+            selector.next_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=0".to_string()])
+        );
+        selector.refresh(
+            CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1", "nvidia.com/gpu=2"]),
+            false,
+        );
+        assert_eq!(
+            selector.next_device_ids(1),
+            Ok(vec!["nvidia.com/gpu=1".to_string()])
+        );
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_ignores_empty_devices() {
+        validate_specific_gpu_device_request(None, &[], "driver_config.cdi_devices")
+            .expect("empty exact device lists should not be validated");
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_accepts_matching_count() {
+        let gpu = DriverGpuResourceRequirements { count: Some(2) };
+        let specific_devices = vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string(),
+        ];
+
+        validate_specific_gpu_device_request(
+            Some(&gpu),
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect("matching count should be accepted");
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_accepts_missing_count_for_one_device() {
+        let gpu = DriverGpuResourceRequirements { count: None };
+        let specific_devices = vec!["nvidia.com/gpu=0".to_string()];
+
+        validate_specific_gpu_device_request(
+            Some(&gpu),
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect("single exact device should be compatible with a default GPU request");
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_rejects_missing_gpu_request() {
+        let specific_devices = vec!["nvidia.com/gpu=0".to_string()];
+
+        let err = validate_specific_gpu_device_request(
+            None,
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect_err("missing GPU request should be rejected");
+
+        assert_eq!(err, "driver_config.cdi_devices requires a gpu request");
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_rejects_missing_count_for_multiple_devices() {
+        let gpu = DriverGpuResourceRequirements { count: None };
+        let specific_devices = vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string(),
+        ];
+
+        let err = validate_specific_gpu_device_request(
+            Some(&gpu),
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect_err("missing count should be rejected for multiple devices");
+
+        assert_eq!(
+            err,
+            "gpu count (1) must match driver_config.cdi_devices length (2)"
+        );
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_rejects_mismatch() {
+        let gpu = DriverGpuResourceRequirements { count: Some(2) };
+        let specific_devices = vec!["nvidia.com/gpu=0".to_string()];
+
+        let err = validate_specific_gpu_device_request(
+            Some(&gpu),
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect_err("mismatched count should be rejected");
+
+        assert_eq!(
+            err,
+            "gpu count (2) must match driver_config.cdi_devices length (1)"
+        );
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_rejects_duplicate_ids() {
+        let gpu = DriverGpuResourceRequirements { count: Some(2) };
+        let specific_devices = vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=0".to_string(),
+        ];
+
+        let err = validate_specific_gpu_device_request(
+            Some(&gpu),
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect_err("duplicates should be rejected");
+
+        assert_eq!(
+            err,
+            "driver_config.cdi_devices contains duplicate device ID 'nvidia.com/gpu=0'"
         );
     }
 }

@@ -5,7 +5,8 @@
 
 use crate::config::PodmanComputeConfig;
 use openshell_core::ComputeDriverError;
-use openshell_core::gpu::cdi_gpu_device_ids;
+#[cfg(test)]
+use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
 use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
@@ -476,35 +477,6 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
     if value > 0 { Some(value) } else { None }
 }
 
-/// Build CDI GPU device list if GPU is requested.
-fn build_devices(
-    sandbox: &DriverSandbox,
-    selected_default_device: Option<&str>,
-) -> Result<Option<Vec<LinuxDevice>>, ComputeDriverError> {
-    let Some(spec) = sandbox.spec.as_ref() else {
-        return Ok(None);
-    };
-    let cdi_devices = PodmanSandboxDriverConfig::from_sandbox(sandbox)?
-        .cdi_devices
-        .unwrap_or_default();
-    if !spec.gpu && !cdi_devices.is_empty() {
-        return Err(ComputeDriverError::InvalidArgument(
-            "driver_config.cdi_devices requires gpu=true".to_string(),
-        ));
-    }
-
-    cdi_gpu_device_ids(spec.gpu, &cdi_devices, selected_default_device)
-        .map(|device_ids| {
-            device_ids.map(|device_ids| {
-                device_ids
-                    .into_iter()
-                    .map(|path| LinuxDevice { path })
-                    .collect()
-            })
-        })
-        .map_err(|err| ComputeDriverError::Precondition(err.to_string()))
-}
-
 pub fn podman_driver_volume_mount_sources(
     sandbox: &DriverSandbox,
     enable_bind_mounts: bool,
@@ -795,14 +767,30 @@ pub fn try_build_container_spec_with_token(
     config: &PodmanComputeConfig,
     token_host_path: Option<&Path>,
 ) -> Result<Value, ComputeDriverError> {
-    build_container_spec_with_token_and_gpu_default(sandbox, config, token_host_path, None)
+    let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
+    let gpu_requirements = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| driver_gpu_requirements(spec.resource_requirements.as_ref()));
+    let cdi_devices = if let Some(cdi_devices) = driver_config.cdi_devices.as_ref() {
+        validate_specific_gpu_device_request(
+            gpu_requirements,
+            cdi_devices,
+            "driver_config.cdi_devices",
+        )
+        .map_err(ComputeDriverError::InvalidArgument)?;
+        Some(cdi_devices.as_slice())
+    } else {
+        None
+    };
+    build_container_spec_with_token_and_gpu_devices(sandbox, config, token_host_path, cdi_devices)
 }
 
-pub fn build_container_spec_with_token_and_gpu_default(
+pub fn build_container_spec_with_token_and_gpu_devices(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
     token_host_path: Option<&Path>,
-    selected_default_device: Option<&str>,
+    gpu_device_ids: Option<&[String]>,
 ) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
@@ -813,7 +801,13 @@ pub fn build_container_spec_with_token_and_gpu_default(
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
-    let devices = build_devices(sandbox, selected_default_device)?;
+    let devices = gpu_device_ids.map(|device_ids| {
+        device_ids
+            .iter()
+            .cloned()
+            .map(|path| LinuxDevice { path })
+            .collect()
+    });
 
     // Network configuration -- always bridge mode.
     // Matches libpod's network spec format `{name: {opts}}`; the unit-struct
@@ -1107,6 +1101,7 @@ fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -1145,6 +1140,12 @@ mod tests {
                         .collect(),
                 })),
             },
+        }
+    }
+
+    fn gpu_resources(count: Option<u32>) -> ResourceRequirements {
+        ResourceRequirements {
+            gpu: Some(GpuResourceRequirements { count }),
         }
     }
 
@@ -1260,15 +1261,16 @@ mod tests {
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            resource_requirements: Some(gpu_resources(None)),
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec_with_token_and_gpu_default(
+        let gpu_devices = vec!["nvidia.com/gpu=1".to_string()];
+        let spec = build_container_spec_with_token_and_gpu_devices(
             &sandbox,
             &config,
             None,
-            Some("nvidia.com/gpu=1"),
+            Some(&gpu_devices),
         )
         .unwrap();
 
@@ -1279,21 +1281,20 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_rejects_missing_default_cdi_device() {
+    fn container_spec_omits_devices_without_resolved_default_cdi_devices() {
         use openshell_core::proto::compute::v1::DriverSandboxSpec;
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            resource_requirements: Some(gpu_resources(None)),
             ..Default::default()
         });
         let config = test_config();
 
-        let err = build_container_spec_with_token_and_gpu_default(&sandbox, &config, None, None)
-            .unwrap_err();
+        let spec =
+            build_container_spec_with_token_and_gpu_devices(&sandbox, &config, None, None).unwrap();
 
-        assert!(matches!(err, ComputeDriverError::Precondition(_)));
-        assert!(err.to_string().contains("selected default CDI GPU device"));
+        assert!(spec.get("devices").is_none());
     }
 
     #[test]
@@ -1302,7 +1303,7 @@ mod tests {
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            resource_requirements: Some(gpu_resources(None)),
             template: Some(DriverSandboxTemplate {
                 driver_config: Some(cdi_devices_config(&["nvidia.com/gpu=0"])),
                 ..Default::default()
@@ -1319,7 +1320,60 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_rejects_cdi_devices_without_gpu() {
+    fn container_spec_accepts_gpu_count_matching_cdi_devices() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            resource_requirements: Some(gpu_resources(Some(2))),
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_devices_config(&[
+                    "nvidia.com/gpu=0",
+                    "nvidia.com/gpu=1",
+                ])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(spec["devices"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            spec["devices"][0]["path"].as_str(),
+            Some("nvidia.com/gpu=0")
+        );
+        assert_eq!(
+            spec["devices"][1]["path"].as_str(),
+            Some("nvidia.com/gpu=1")
+        );
+    }
+
+    #[test]
+    fn container_spec_rejects_gpu_count_mismatched_cdi_devices() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            resource_requirements: Some(gpu_resources(Some(2))),
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_devices_config(&["nvidia.com/gpu=0"])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(
+            err.to_string()
+                .contains("gpu count (2) must match driver_config.cdi_devices length (1)")
+        );
+    }
+
+    #[test]
+    fn container_spec_rejects_cdi_devices_without_gpu_request() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
@@ -1334,7 +1388,7 @@ mod tests {
 
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
         assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
-        assert!(err.to_string().contains("requires gpu=true"));
+        assert!(err.to_string().contains("requires a gpu request"));
     }
 
     #[test]
@@ -1343,7 +1397,7 @@ mod tests {
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            resource_requirements: Some(gpu_resources(None)),
             template: Some(DriverSandboxTemplate {
                 driver_config: Some(cdi_devices_config(&[])),
                 ..Default::default()
@@ -1363,7 +1417,7 @@ mod tests {
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            resource_requirements: Some(gpu_resources(None)),
             template: Some(DriverSandboxTemplate {
                 driver_config: Some(cdi_device_typo_config(&["nvidia.com/gpu=0"])),
                 ..Default::default()

@@ -321,8 +321,9 @@ message SandboxSpec {
   openshell.sandbox.v1.SandboxPolicy policy = 7;
   // Provider names to attach to this sandbox.
   repeated string providers = 8;
-  // Request NVIDIA GPU resources for this sandbox.
-  bool gpu = 9;
+  // Portable resource requirements used by the gateway for driver selection
+  // and by drivers for provisioning.
+  ResourceRequirements resource_requirements = 9;
   reserved 10;
   reserved "gpu_device";
   // Field 11 was `proposal_approval_mode`. The approval mode is now a
@@ -331,6 +332,18 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+}
+
+message ResourceRequirements {
+  // GPU requirements for the sandbox. Presence indicates a GPU request.
+  GpuResourceRequirements gpu = 1;
+}
+
+// Public GPU resource requirements.
+message GpuResourceRequirements {
+  // Optional number of GPUs requested. When omitted, the request is for one
+  // GPU using the selected driver's default assignment behavior.
+  optional uint32 count = 1;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

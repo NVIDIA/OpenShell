@@ -53,14 +53,29 @@ openshell sandbox create \
 ```
 
 Driver config is for fields without a stable public flag. Prefer `--cpu`,
-`--memory`, and `--gpu` for portable resource intent.
+`--memory`, and `--gpu` for supported resource intent. When `--gpu` is present
+without a count, OpenShell treats it as a request for one GPU. Pass
+`--gpu COUNT` when requesting more than one GPU.
+
+Kubernetes maps the GPU count to the `nvidia.com/gpu` pod resource limit.
+Docker and Podman satisfy count-only GPU requests by selecting the requested
+number of NVIDIA CDI devices from the local CDI inventory in round-robin order.
+The drivers refresh the CDI inventory before validating or creating the
+sandbox, so CDI devices added or removed after gateway start can affect later
+creates. On WSL2 all-only runtimes, Docker or Podman can use
+`nvidia.com/gpu=all` as a compatibility fallback, where it counts as one
+selectable device.
 
 Exact GPU device selection remains driver-owned and requires `--gpu`. Docker
-and Podman accept `cdi_devices`; replace the top-level `docker` key with
-`podman` when using the Podman driver, for example
-`{"docker":{"cdi_devices":["nvidia.com/gpu=0"]}}`. The VM driver accepts
-`gpu_device_ids`, for example `{"vm":{"gpu_device_ids":["0000:2d:00.0"]}}`;
-the current VM implementation accepts at most one entry.
+and Podman accept `cdi_devices` as opaque CDI device names; replace the
+top-level `docker` key with `podman` when using the Podman driver, for example
+`{"docker":{"cdi_devices":["nvidia.com/gpu=0"]}}`. Explicit CDI device lists
+must not contain duplicates, and their length must match the effective GPU
+count. A single exact CDI device is compatible with the default `--gpu`
+request. The VM driver accepts `gpu_device_ids`, for example
+`{"vm":{"gpu_device_ids":["0000:2d:00.0"]}}`; the current VM implementation
+accepts at most one entry and allows either `--gpu` or `--gpu 1` when
+`gpu_device_ids` is set.
 
 For Kubernetes, `pod.runtime_class_name` maps to PodSpec `runtimeClassName`.
 It overrides the gateway's configured default runtime class for that sandbox,

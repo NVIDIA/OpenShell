@@ -55,11 +55,9 @@ through the driver configuration. The Helm chart defaults sandbox agents to
 `Unconfined` so runtime/default AppArmor profiles do not block supervisor
 network namespace setup on AppArmor-enabled nodes.
 
-GPU requests enter the driver layer through `SandboxSpec.gpu` and
-`SandboxSpec.gpu_device`. Docker and Podman map default GPU requests to one
-concrete NVIDIA CDI device when individual CDI devices are available, use
-`nvidia.com/gpu=all` only for WSL2/all-only compatibility, and pass explicit
-driver-native device IDs through.
+Resource requirements enter the driver layer through `SandboxSpec.resource_requirements`. This includes a set of GPU requirements, where a user
+can request a specific number of GPUs or the driver-specific default behaviour.
+For all in-tree drivers, this is equivalent to selecting a single GPU.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
@@ -98,7 +96,10 @@ users.
 Custom sandbox images must include the agent runtime and any system
 dependencies, but they should not need to include the gateway. GPU-capable
 images must include the user-space libraries required by the workload. The
-runtime still owns GPU device injection.
+runtime still owns GPU device injection. GPU requests are explicit, and can be
+refined with a driver-native device identifier or requested count; the gateway
+validates the request shape and each runtime enforces the GPU allocation modes it
+supports.
 
 ## Deployment Shape
 

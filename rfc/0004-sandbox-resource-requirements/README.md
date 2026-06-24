@@ -7,6 +7,8 @@ links:
   - https://github.com/NVIDIA/OpenShell/pull/1340
   - https://github.com/NVIDIA/OpenShell/pull/1360
   - https://github.com/NVIDIA/OpenShell/issues/1492
+  - https://github.com/NVIDIA/OpenShell/pull/1675
+  - https://github.com/NVIDIA/OpenShell/pull/1815
 ---
 
 # RFC 0004 - Sandbox Resource Requirements
@@ -25,6 +27,11 @@ The gateway uses resource requirements to prefilter configured compute drivers,
 then relies on the selected driver to validate and provision the request.
 `SandboxTemplate.resources` remains a platform-native realization layer and
 escape hatch. It is not the portable driver-selection interface.
+
+The current implementation lands the first GPU-focused phase of this model:
+`resource_requirements.gpu` replaces the legacy GPU-specific request fields,
+with an optional count. The broader generic compute/device/dataset model in
+this RFC remains the target direction for later expansion.
 
 ## Motivation
 
@@ -59,6 +66,12 @@ configuration remains separate and is interpreted by the resource driver.
 Exposing a general-purpose driver-specific configuration surface is related, but
 tracked separately in issue #1492.
 
+Since this RFC was first drafted, `SandboxTemplate.driver_config` has been
+added as the driver-owned configuration surface. The gateway selects the block
+for the active driver and forwards that inner object unchanged. Exact GPU
+selection for Docker, Podman, and VM is now expressed there rather than in the
+portable resource requirement.
+
 ## Non-goals
 
 - Defining dataset allocation, mount, caching, or access-control semantics.
@@ -69,8 +82,10 @@ tracked separately in issue #1492.
 - Defining the general driver-specific configuration passthrough API. Issue
   #1492 tracks that related API surface.
 - Publishing allocated resource identities in sandbox status.
-- Preserving long-term compatibility for `gpu`, `gpu_device`, or a
-  GPU-specific `gpu_count` request field.
+- Preserving alpha-era compatibility for `gpu`, `gpu_device`, or a
+  GPU-specific `gpu_count` request field. The legacy GPU-specific request
+  fields are intentionally not carried forward into the API shape this RFC
+  aims to stabilize.
 
 ## Proposal
 
@@ -89,26 +104,52 @@ message SandboxSpec {
 
   // Portable resource requirements used by the gateway for driver selection
   // and by drivers for provisioning.
-  SandboxResourceRequirements resource_requirements = 11;
+  ResourceRequirements resource_requirements = 9;
 
-  reserved 9, 10;
-  reserved "gpu", "gpu_device";
+  reserved 10;
+  reserved "gpu_device";
 }
 ```
+
+The public sandbox API is still alpha. This migration intentionally replaces
+the old `bool gpu = 9` field with the typed `resource_requirements = 9` message
+instead of reserving the legacy field number. Old live requests and persisted
+sandbox records that encode GPU intent through the legacy boolean are not
+migrated; callers should use a matching OpenShell CLI/API version and recreate
+GPU sandboxes after upgrade when they need the new typed shape. Avoiding
+alpha-era reserved fields keeps the proto surface closer to the API intended
+for stabilization.
 
 `SandboxTemplate.resources` keeps its existing role as platform-native workload
 configuration. It may contain Kubernetes-style CPU, memory, and extended
 resource requests and limits, but it is not the portable resource contract.
 
+The implemented first phase uses this narrower proto shape:
+
+```proto
+message ResourceRequirements {
+  // GPU requirements for the sandbox. Presence indicates a GPU request.
+  GpuResourceRequirements gpu = 1;
+}
+
+message GpuResourceRequirements {
+  // Optional number of GPUs requested. When omitted, the request is for one
+  // GPU using the selected driver's default assignment behavior.
+  optional uint32 count = 1;
+}
+```
+
+`gpu.count` must be greater than zero when present. When `gpu` is present and
+`count` is omitted, the effective count is one. Drivers apply that same
+effective-count rule when validating exact driver-config device lists.
+
 The CLI should not expose a JSON flag for `resource_requirements`. Common
 portable requests should use typed flags such as CPU, memory, and GPU-count
 flags, and SDK/API callers should use the typed protobuf messages directly.
-JSON-formatted driver-specific configuration is a related but separate API
-topic. Issue #1492 tracks exposing an opaque driver-owned configuration surface,
-potentially named `driver_config`. This RFC only requires that driver-native
-configuration remains separate from portable resource requirements.
+JSON-formatted driver-specific configuration remains separate from portable
+resource requirements and is passed through `SandboxTemplate.driver_config`.
 
-### Resource requirements
+### Long-term resource requirements
 
 Use typed requirement domains for stable first-party resource concepts instead
 of making every request stringly typed through a `kind` field.
@@ -250,6 +291,11 @@ Portable GPU semantics are limited to:
 - `count`
 - exact-match attributes in `selector.match_attributes`
 
+In the current GPU-focused implementation, only the `gpu.count` portion is
+implemented in `ResourceRequirements`. Exact device IDs are not portable
+selector attributes yet; they remain driver-owned config. Docker and Podman use
+`driver_config.cdi_devices`, and VM uses `driver_config.gpu_device_ids`.
+
 Driver-native GPU details are expressed through namespaced parameters. Example
 parameter namespaces:
 
@@ -317,9 +363,22 @@ Example realizations:
 | Driver | Realization |
 |---|---|
 | Kubernetes | Convert `className=gpu,count=N` into a pod resource limit such as `limits["nvidia.com/gpu"] = "N"` unless Kubernetes-specific parameters select another resource name or class. |
-| Docker | Convert CDI parameters into Docker CDI device injection. For a count-only request, select an available CDI GPU device when device inventory is available. |
-| Podman | Convert CDI parameters into Podman CDI device injection. For a count-only request, select an available CDI GPU device when device inventory is available. |
+| Docker | Use exact `driver_config.cdi_devices` values when present; otherwise select `count` default CDI GPU IDs from the discovered inventory. |
+| Podman | Use exact `driver_config.cdi_devices` values when present; otherwise select `count` default CDI GPU IDs from the discovered inventory. |
 | VM | Convert VM parameters into BDF or index-based device assignment. |
+
+Docker and Podman default selection is round-robin over the normalized NVIDIA
+CDI inventory. Indexed IDs are preferred and sorted numerically; named IDs are
+used when no indexed IDs exist. On WSL2 all-only runtimes, `nvidia.com/gpu=all`
+can be used as a fallback and counts as one selectable device. The selector
+refreshes its inventory before validating and creating default GPU requests so
+CDI devices added or removed after driver startup can affect later creates.
+
+Explicit CDI IDs are opaque. The drivers do not parse aliases, normalize
+`nvidia.com/gpu=all`, or treat it specially on the explicit path. Exact ID
+lists must not contain duplicates and their length must match the effective GPU
+count. A list of two explicit IDs with `--gpu` and no count fails because the
+effective count is one.
 
 Docker and Podman should not interpret VM BDF/index parameters. The VM driver
 should not interpret CDI parameters. Gateway namespace prefiltering should avoid
@@ -505,17 +564,22 @@ other.
 ### Related driver-specific configuration
 
 Driver-specific configuration is intentionally separate from portable resource
-requirements. Issue #1492 tracks an opaque driver-owned configuration surface
-for backend-native settings such as Kubernetes node selectors, tolerations,
-image pull secrets, Docker network mode, or VM disk shape. A future design may
-place that surface on `SandboxTemplate.driver_config` and may use a namespaced
-map-of-maps shape, but this RFC does not standardize that API or its CLI flags.
+requirements. The current API uses `SandboxTemplate.driver_config` as an
+opaque envelope keyed by driver name. The gateway selects the block for the
+active driver and forwards that inner object to the compute driver; the driver
+owns nested schema validation.
+
+`driver_config` is the right place for backend-native settings such as
+Kubernetes node selectors, tolerations, image pull secrets, Docker or Podman
+mounts, and exact GPU IDs. These settings are not portable resource
+requirements, and the gateway must not interpret them as a scheduling contract.
 
 This RFC does not introduce `--resources-json`, `--resource-requirements-json`,
 or `--template-resources-json`. CPU, memory, GPU count, and exact GPU selection
-should use typed resource fields or typed CLI flags. Backend-native settings
-that are not modeled by `resource_requirements` should remain driver-specific
-and should not be presented as portable resource requests.
+should use typed resource fields, typed CLI flags, or the selected driver's
+documented `driver_config` fields. Backend-native settings that are not modeled
+by `resource_requirements` should remain driver-specific and should not be
+presented as portable resource requests.
 
 ### Template realization and conflicts
 
@@ -551,21 +615,43 @@ message DriverSandboxSpec {
   string log_level = 1;
   map<string, string> environment = 5;
   DriverSandboxTemplate template = 6;
-  DriverSandboxResourceRequirements resource_requirements = 11;
+  ResourceRequirements resource_requirements = 9;
 
-  reserved 9, 10;
-  reserved "gpu", "gpu_device";
+  reserved 10;
+  reserved "gpu_device";
 }
 ```
 
 Driver-owned resource requirement messages should have the same semantics as
 the public messages, but live in `compute_driver.proto` to keep the public and
-internal contracts separated.
+internal contracts separated. In the current implementation, the driver proto
+mirrors the narrow GPU-focused shape:
+
+```proto
+message ResourceRequirements {
+  GpuResourceRequirements gpu = 1;
+}
+
+message GpuResourceRequirements {
+  optional uint32 count = 1;
+}
+```
+
+The compute-driver API is version-coupled to the gateway in current deployments:
+local drivers are launched by the gateway at startup, and the driver proto is
+not treated as a public compatibility surface. It follows the same alpha-era
+field replacement as the public API rather than preserving transitional GPU
+fields.
 
 ### Driver capabilities
 
-Replace GPU-specific capability fields with coarse resource capability
-summaries:
+The current implementation removes the GPU-specific `supports_gpu` and
+`gpu_count` capability fields from the compute-driver proto. It does not yet
+replace them with a stable resource capability summary. Until that lands, the
+selected driver's `ValidateSandboxCreate` remains the authority for whether a
+GPU request can be served.
+
+A later phase should add coarse resource capability summaries:
 
 ```proto
 message GetCapabilitiesResponse {
@@ -638,30 +724,44 @@ or if driver-specific validation rejects parameter values.
 When no resource requirements are present, the gateway should preserve today's
 default behavior and use the configured default driver.
 
-## Implementation plan
+## Implementation state and plan
 
-1. Update public protobufs to add `SandboxResourceRequirements` and remove the
-   long-term use of `gpu` and `gpu_device`.
-2. Update compute-driver protobufs with mirrored driver-owned resource
-   requirements and coarse resource capability summaries.
-3. Update gateway validation and public-to-driver translation.
-4. Add validation that rejects conflicts between portable resource requirements
-   and template resource passthrough.
-5. Allow the gateway to consider multiple configured compute drivers for a
-   create request, using capability prefiltering plus `ValidateSandboxCreate`.
-6. Update Kubernetes, Docker, Podman, and VM drivers to advertise compute and
-   GPU device capability summaries and interpret their supported parameter
-   namespaces.
-7. Update CLI/API request construction so CPU, memory, GPU count, and exact GPU
-   selection use resource requirements instead of GPU-specific request fields.
-8. Do not expose JSON-formatted portable resource request flags.
-9. Update user-facing docs and driver README files once behavior is
-   implemented.
+Implemented in the first phase:
 
-Because this is a breaking request-spec change, the implementation must either
-land in a breaking API version or be explicitly called out as a breaking change
-for the current API. Removed protobuf tags should be reserved rather than
-reused.
+1. Replace the public and driver `gpu`/`gpu_device` request fields with
+   `resource_requirements.gpu`.
+2. Treat a present GPU requirement with omitted `count` as an effective request
+   for one GPU, and reject `count = 0`.
+3. Pass GPU requirements through gateway-to-driver create and validation paths.
+4. Keep exact device IDs in `driver_config`:
+   `driver_config.cdi_devices` for Docker and Podman, and
+   `driver_config.gpu_device_ids` for VM.
+5. Reject duplicate exact device IDs and require exact device list length to
+   match the effective GPU count.
+6. Let Kubernetes map GPU count to the `nvidia.com/gpu` limit.
+7. Let Docker and Podman satisfy count-only GPU requests by selecting default
+   CDI devices from a refreshed local inventory.
+8. Remove GPU-specific capability fields from the compute-driver proto without
+   adding replacement resource capability summaries yet.
+9. Do not expose JSON-formatted portable resource request flags.
+
+Remaining follow-up work:
+
+1. Add the broader compute/device/dataset resource model when those semantics
+   are stable enough for the public API.
+2. Add coarse resource capability summaries and gateway matching across
+   multiple configured drivers.
+3. Add conflict validation between portable resource requirements and
+   platform-native template resource passthrough where both can express the
+   same resource.
+4. Decide whether and how drivers should expose inventory or capacity for
+   advisory matching without turning it into a reservation API.
+
+Because the public and driver APIs are still alpha, the first implementation
+intentionally breaks old live and persisted GPU intent instead of preserving
+compatibility shims for the legacy GPU fields. Callers should use a matching
+OpenShell CLI/API version and recreate GPU sandboxes after upgrade when they
+need the new typed request shape.
 
 ## Tests
 
@@ -669,23 +769,27 @@ The implementation should include:
 
 - protobuf translation tests for public resource requirements into driver
   resource requirements.
-- gateway matching tests for compute capability support, device class, count,
-  selector, and parameter namespace filtering.
-- gateway tests showing that the selected driver is the first validating
-  candidate in configured order.
-- validation tests for conflicts between resource requirements and template
-  resource passthrough.
-- validation tests that unsupported parameter namespaces are rejected.
+- shared helper tests showing that omitted GPU count is effective count one and
+  explicit zero count is rejected.
+- validation tests for duplicate exact device IDs and for mismatched exact
+  device-list length versus effective GPU count.
 - Kubernetes tests that map compute requirements to pod CPU/memory resources
   and GPU count to `nvidia.com/gpu` limits.
-- Docker and Podman GPU e2e tests that request a CDI GPU with
-  `cdi.openshell.ai`.
+- Docker and Podman selector tests for numeric CDI ID ordering, named CDI ID
+  fallback, count-based round-robin selection, all-only fallback, insufficient
+  devices, and inventory refresh without cursor reset.
+- Docker and Podman validation tests showing that explicit CDI IDs bypass
+  default inventory selection and remain opaque.
 - VM tests that map CPU/memory to VM allocation and request a GPU by BDF or
-  index with `vm.openshell.ai`.
-- tests showing that template-only resources are treated as platform-native
-  passthrough and are not used for portable driver matching.
+  index through `driver_config.gpu_device_ids`.
 - CLI request-shape tests showing that there is no JSON-formatted portable
   resource request flag.
+- future gateway matching tests for compute capability support, device class,
+  count, selector, and parameter namespace filtering once resource capability
+  summaries are added.
+- future validation tests for conflicts between resource requirements and
+  template resource passthrough once those conflicts can occur through stable
+  portable fields.
 - error-message tests for no matching driver and validation failure across all
   candidates.
 

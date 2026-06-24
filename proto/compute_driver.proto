@@ -83,8 +83,9 @@ message DriverSandboxSpec {
   map<string, string> environment = 5;
   // Runtime template consumed by the driver during provisioning.
   DriverSandboxTemplate template = 6;
-  // Request NVIDIA GPU resources for this sandbox.
-  bool gpu = 9;
+  // Portable resource requirements used by the gateway for driver selection
+  // and by drivers for provisioning.
+  ResourceRequirements resource_requirements = 9;
   reserved 10;
   reserved "gpu_device";
   // Gateway-minted JWT identifying this sandbox to the gateway. Set by
@@ -94,6 +95,18 @@ message DriverSandboxSpec {
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11;
+}
+
+message ResourceRequirements {
+  // GPU requirements for the sandbox. Presence indicates a GPU request.
+  GpuResourceRequirements gpu = 1;
+}
+
+// Driver GPU resource requirements.
+message GpuResourceRequirements {
+  // Optional number of GPUs requested. When omitted, the request is for one
+  // GPU using the selected driver's default assignment behavior.
+  optional uint32 count = 1;
 }
 
 // Driver-owned runtime template consumed by the compute platform.
