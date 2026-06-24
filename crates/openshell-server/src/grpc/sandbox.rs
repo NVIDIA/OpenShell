@@ -1484,6 +1484,36 @@ fn shell_escape(value: &str) -> Result<String, String> {
 /// Maximum total length of the assembled shell command string.
 const MAX_COMMAND_STRING_LEN: usize = 256 * 1024; // 256 KiB
 
+/// SSH keepalive for silent exec relays; stdout idle is not a timeout signal.
+const EXEC_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Allow this many missed keepalive responses before russh fails the relay.
+const EXEC_KEEPALIVE_MAX: usize = 4;
+
+/// Max wait for a trailing `Close` after `ExitStatus`.
+const EXEC_POST_EXIT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// russh client config for exec relays.
+fn exec_ssh_client_config() -> russh::client::Config {
+    russh::client::Config {
+        keepalive_interval: Some(EXEC_KEEPALIVE_INTERVAL),
+        keepalive_max: EXEC_KEEPALIVE_MAX,
+        ..Default::default()
+    }
+}
+
+/// Treat channel EOF before an exit status as relay failure, not exit code 1.
+fn exec_loop_result(exit_code: Option<i32>) -> Result<i32, Status> {
+    exit_code.map_or_else(
+        || {
+            Err(Status::unavailable(
+                "exec relay closed before the command reported an exit status",
+            ))
+        },
+        Ok,
+    )
+}
+
 fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
     let mut parts = Vec::new();
     let mut env_entries = req.environment.iter().collect::<Vec<_>>();
@@ -1690,7 +1720,7 @@ async fn run_interactive_exec_with_russh(
         .await
         .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
 
-    let config = Arc::new(russh::client::Config::default());
+    let config = Arc::new(exec_ssh_client_config());
     let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
         .await
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
@@ -1746,7 +1776,19 @@ async fn run_interactive_exec_with_russh(
     });
 
     let mut exit_code: Option<i32> = None;
-    while let Some(msg) = read_half.wait().await {
+    loop {
+        // Bound the post-ExitStatus wait against a lost Close.
+        let msg = if exit_code.is_some() {
+            match tokio::time::timeout(EXEC_POST_EXIT_CLOSE_TIMEOUT, read_half.wait()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) | Err(_) => break,
+            }
+        } else {
+            match read_half.wait().await {
+                Some(msg) => msg,
+                None => break,
+            }
+        };
         match msg {
             ChannelMsg::Data { data } => {
                 let event = Ok(ExecSandboxEvent {
@@ -1787,7 +1829,7 @@ async fn run_interactive_exec_with_russh(
         .disconnect(russh::Disconnect::ByApplication, "exec complete", "en")
         .await;
 
-    Ok(exit_code.unwrap_or(1))
+    exec_loop_result(exit_code)
 }
 
 /// Create a localhost SSH proxy that bridges to a relay `DuplexStream`.
@@ -1849,7 +1891,7 @@ async fn run_exec_with_russh(
         .await
         .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
 
-    let config = Arc::new(russh::client::Config::default());
+    let config = Arc::new(exec_ssh_client_config());
     let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
         .await
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
@@ -1897,7 +1939,19 @@ async fn run_exec_with_russh(
         .map_err(|e| Status::internal(format!("failed to close ssh stdin: {e}")))?;
 
     let mut exit_code: Option<i32> = None;
-    while let Some(msg) = channel.wait().await {
+    loop {
+        // Bound the post-ExitStatus wait against a lost Close.
+        let msg = if exit_code.is_some() {
+            match tokio::time::timeout(EXEC_POST_EXIT_CLOSE_TIMEOUT, channel.wait()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) | Err(_) => break,
+            }
+        } else {
+            match channel.wait().await {
+                Some(msg) => msg,
+                None => break,
+            }
+        };
         match msg {
             ChannelMsg::Data { data } => {
                 let _ = tx
@@ -1935,7 +1989,7 @@ async fn run_exec_with_russh(
         .disconnect(russh::Disconnect::ByApplication, "exec complete", "en")
         .await;
 
-    Ok(exit_code.unwrap_or(1))
+    exec_loop_result(exit_code)
 }
 
 // ---------------------------------------------------------------------------

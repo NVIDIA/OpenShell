@@ -365,6 +365,15 @@ The same relay pattern backs interactive SSH, command execution, file sync, and
 local service forwarding. The gateway tracks live sessions in memory and
 persists session records so tokens can expire or be revoked.
 
+Relay liveness has two backstops so a reset supervisor session cannot leave a
+request parked forever. The gateway runs server-side HTTP/2 keepalive on
+supervisor connections, and each exec relay's SSH client uses SSH keepalive: an
+exec channel may be legitimately silent for a long time (e.g. an agent whose
+stdout is redirected to a file), so the exec is never ended on output-idle
+alone — instead an unanswered keepalive on a wedged or orphaned relay closes the
+channel and returns the exec with an error. Once a command reports its exit
+status, the gateway also bounds how long it waits for the trailing channel close.
+
 `ForwardTcp` is the client-facing byte stream for SSH and service forwarding.
 The first frame is a `TcpForwardInit` that carries the sandbox ID, an
 authorization token from `CreateSshSession`, and an explicit target:

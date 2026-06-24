@@ -12,7 +12,7 @@ use http_body::Body;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder,
     service::TowerToHyperService,
 };
@@ -185,7 +185,16 @@ impl MultiplexService {
         let service = MultiplexedService::new(grpc_service, http_service);
 
         let mut builder = Builder::new(TokioExecutor::new());
-        builder.http2().adaptive_window(true);
+        // Server-side HTTP/2 keepalive: supervisors hold long-lived sessions, and without
+        // it the gateway never PINGs them, so idle/half-dead connections linger and orphan
+        // in-flight relay execs. The timer is required — hyper panics on the keepalive
+        // interval without one.
+        builder
+            .http2()
+            .timer(TokioTimer::new())
+            .adaptive_window(true)
+            .keep_alive_interval(Some(Duration::from_secs(20)))
+            .keep_alive_timeout(Duration::from_secs(10));
 
         builder
             .serve_connection_with_upgrades(TokioIo::new(stream), service)
