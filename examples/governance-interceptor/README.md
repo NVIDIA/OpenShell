@@ -10,8 +10,6 @@ This standalone example implements the `openshell.gateway_interceptor.v1.Gateway
 - users cannot create provider records other than `github` and `gitlab`
 - users cannot update or delete the governed `github` or `gitlab` provider records
 
-Run these commands from `examples/governance-interceptor`.
-
 Run the interceptor:
 
 ```shell
