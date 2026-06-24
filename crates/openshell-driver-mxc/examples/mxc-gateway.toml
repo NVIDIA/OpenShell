@@ -10,18 +10,24 @@
 # Keep `share_dir`, `agent_cwd`, the agent_command target path, and demo.yaml's
 # `filesystem_policy.read_write` entry IDENTICAL, or the positive proof will not
 # line up.
+#
+# The recommended agent is the packaged `mxc-demo-agent.exe` test application: it
+# runs BOTH the positive (in-policy) write and the negative (out-of-policy,
+# expected-denied) write in a single run and exits 0 only when policy is enforced
+# correctly. The runbook copies it into `share_dir` so it is mapped into the
+# sandbox and launchable from inside.
 
 [openshell.drivers.mxc]
 # Path to wxc-exec.exe — REQUIRED for live runs on the demo box. Leave commented
 # for mock-mode smoke tests (set OPENSHELL_MXC_MOCK_WXC=1 instead).
-# wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
+wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 
 # Backend to target:
 #   "isolation_session" (default) - persistent session; grant-only filesystem
 #       policy (NO default-deny: a write to an ungranted path may still succeed).
 #   "process_container" - one-shot AppContainer; genuinely default-deny (a write
 #       to any ungranted path is denied by the OS). No persistent session.
-# backend = "process_container"
+backend = "process_container"
 
 # process_container only: request a Less-Privileged AppContainer (stricter).
 # pc_least_privilege = false
@@ -37,15 +43,37 @@ share_dir = "C:/work/openshell-mxc-demo"
 # Working directory for the agent inside the sandbox (defaults to share_dir).
 agent_cwd = "C:/work/openshell-mxc-demo"
 
-# The agent the driver execs (exec-in-driver). POSITIVE demo: writes hello.txt
-# INSIDE the granted share. Swap target to an out-of-policy path (e.g.
-# C:/Windows/Temp/hello.txt) to drive the NEGATIVE proof.
+# Environment variables injected into the agent process inside the sandbox
+# (MXC process.env). Each entry is either:
+#   "KEY=VALUE" - passed through verbatim, or
+#   "KEY"       - resolved from the GATEWAY HOST environment at launch.
+# Use the bare-"KEY" form for secrets (e.g. inference API keys): set the value
+# on the gateway host (e.g. $env:NV_API_KEY) and reference it by name so it
+# never lands in this file. Unset host vars are skipped with a warning.
+# agent_env = [
+#   "NV_API_KEY",            # resolved from the gateway host env
+#   "OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1",
+# ]
+
+# The agent the driver execs (exec-in-driver). Runs mxc-demo-agent.exe from the
+# mapped share folder; the test app performs the positive (in-policy) write +
+# read-back AND the negative (out-of-policy) write, then writes its verdict to
+# `mxc-demo-agent-result.txt` in the share (host-visible). Args are optional and
+# default to the demo paths; passed explicitly here so they track this config.
 agent_command = [
-  "powershell",
-  "-NoProfile",
-  "-Command",
-  "Set-Content -Path 'C:/work/openshell-mxc-demo/hello.txt' -Value 'hello from mxc'",
+  "C:/work/openshell-mxc-demo/mxc-demo-agent.exe",
+  "C:/work/openshell-mxc-demo",
+  "C:/Windows/Temp/openshell-mxc-out-of-policy.txt",
 ]
+
+# Fallback (no test app): one-liner that only drives the POSITIVE proof. Swap the
+# target to an out-of-policy path to manually drive the NEGATIVE proof.
+# agent_command = [
+#   "powershell",
+#   "-NoProfile",
+#   "-Command",
+#   "Set-Content -Path 'C:/work/openshell-mxc-demo/hello.txt' -Value 'hello from mxc'",
+# ]
 
 # Enable --debug on wxc-exec invocations.
 debug = false

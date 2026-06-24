@@ -71,6 +71,14 @@ pub struct MxcComputeConfig {
     pub agent_command: Vec<String>,
     /// Working directory for the agent command inside the sandbox.
     pub agent_cwd: String,
+    /// Environment variables injected into the agent process inside the sandbox
+    /// (becomes MXC `process.env`). Each entry is either:
+    ///   - `KEY=VALUE` — passed through verbatim, or
+    ///   - `KEY` — resolved from the gateway host's environment at launch.
+    /// The bare-`KEY` form keeps secrets (e.g. inference API keys) out of the
+    /// config file: set the value on the gateway host and reference it by name.
+    /// Host vars that are not set are skipped with a warning.
+    pub agent_env: Vec<String>,
     /// Host directory mapped into the sandbox as a read-write grant.
     /// Appears in the shared host folder for the positive-proof artifact.
     pub share_dir: String,
@@ -96,6 +104,7 @@ impl Default for MxcComputeConfig {
             default_configuration_id: crate::mxc::DEFAULT_CONFIGURATION_ID.into(),
             agent_command: Vec::new(),
             agent_cwd: String::new(),
+            agent_env: Vec::new(),
             share_dir: String::new(),
             egress_proxy: false,
             egress_proxy_addr: String::new(),
@@ -235,6 +244,28 @@ fn configured_egress_addr(config: &MxcComputeConfig) -> Result<Option<SocketAddr
         )));
     }
     Ok(Some(addr))
+}
+
+/// Resolve configured `agent_env` entries into concrete `KEY=VALUE` strings for
+/// MXC `process.env`. `KEY=VALUE` entries pass through verbatim; bare `KEY`
+/// entries are looked up in the gateway host environment so secrets never have
+/// to live in the config file. Unset host vars are skipped with a warning.
+fn resolve_agent_env(entries: &[String]) -> Vec<String> {
+    let mut resolved = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.contains('=') {
+            resolved.push(entry.clone());
+            continue;
+        }
+        match std::env::var(entry) {
+            Ok(value) => resolved.push(format!("{entry}={value}")),
+            Err(_) => warn!(
+                var = %entry,
+                "agent_env passthrough variable not set in gateway host environment; skipping"
+            ),
+        }
+    }
+    resolved
 }
 
 impl MxcComputeBackend {
@@ -580,7 +611,7 @@ async fn run_lifecycle(
     let process = MxcProcess {
         command_line: command_line.clone(),
         cwd,
-        env: Vec::new(),
+        env: resolve_agent_env(&config.agent_env),
         timeout: 0,
     };
     let network = proxy_addr.map(|addr| MxcNetwork {
@@ -882,6 +913,26 @@ mod lifecycle_tests {
         let config = MxcComputeConfig::default();
         assert!(!config.egress_proxy);
         assert!(config.egress_proxy_addr.is_empty());
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::{set,remove}_var are unsafe under edition 2024
+    fn resolve_agent_env_passthrough_and_host_lookup() {
+        // Literal KEY=VALUE passes through verbatim.
+        assert_eq!(
+            resolve_agent_env(&["FOO=bar".into()]),
+            vec!["FOO=bar".to_string()]
+        );
+
+        // Bare KEY for an unset host var is skipped (not emitted empty).
+        assert!(resolve_agent_env(&["OPENSHELL_TEST_DEFINITELY_UNSET_VAR".into()]).is_empty());
+
+        // Bare KEY for a set host var resolves to KEY=value from the host env.
+        let var = "OPENSHELL_TEST_AGENT_ENV_KEY";
+        unsafe { std::env::set_var(var, "secret-123") };
+        let resolved = resolve_agent_env(&[var.to_string()]);
+        unsafe { std::env::remove_var(var) };
+        assert_eq!(resolved, vec![format!("{var}=secret-123")]);
     }
 
     #[test]
