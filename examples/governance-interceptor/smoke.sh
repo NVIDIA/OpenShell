@@ -7,16 +7,48 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EXAMPLE_DIR="$ROOT/examples/governance-interceptor"
 TMPDIR="$(mktemp -d)"
+SMOKE_RUN_ID="${OPENSHELL_GOVERNANCE_RUN_ID:-governance-smoke-$$-$RANDOM}"
+port_is_free() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    ! nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+  fi
+}
+
+choose_port_block() {
+  local count="$1"
+  local start offset ok
+  for _ in {1..200}; do
+    start=$((20000 + RANDOM % 20000))
+    ok=1
+    for ((offset = 0; offset < count; offset++)); do
+      if ! port_is_free "$((start + offset))"; then
+        ok=0
+        break
+      fi
+    done
+    if [[ "$ok" == "1" ]]; then
+      printf '%s\n' "$start"
+      return
+    fi
+  done
+  echo "failed to find free local ports for smoke test" >&2
+  exit 1
+}
+
+DEFAULT_PORT_BASE="$(choose_port_block 3)"
 JWT_DIR="$TMPDIR/jwt"
 LOG_DIR="${OPENSHELL_GOVERNANCE_LOG_DIR:-$TMPDIR/logs}"
 SMOKE_LOG="$LOG_DIR/smoke.log"
 INTERCEPTOR_LOG="$LOG_DIR/interceptor.log"
 GATEWAY_LOG="$LOG_DIR/gateway.log"
-INTERCEPTOR_ADDR="${OPENSHELL_GOVERNANCE_INTERCEPTOR_ADDR:-127.0.0.1:18081}"
-GATEWAY_ADDR="${OPENSHELL_GOVERNANCE_GATEWAY_ADDR:-127.0.0.1:18080}"
-HEALTH_ADDR="${OPENSHELL_GOVERNANCE_HEALTH_ADDR:-127.0.0.1:18082}"
-SANDBOX_NAME="${OPENSHELL_GOVERNANCE_SANDBOX_NAME:-governed-smoke-$$}"
-ROOT_BUILD_ARGS=()
+INTERCEPTOR_ADDR="${OPENSHELL_GOVERNANCE_INTERCEPTOR_ADDR:-127.0.0.1:$DEFAULT_PORT_BASE}"
+GATEWAY_ADDR="${OPENSHELL_GOVERNANCE_GATEWAY_ADDR:-127.0.0.1:$((DEFAULT_PORT_BASE + 1))}"
+HEALTH_ADDR="${OPENSHELL_GOVERNANCE_HEALTH_ADDR:-127.0.0.1:$((DEFAULT_PORT_BASE + 2))}"
+GATEWAY_ID="${OPENSHELL_GOVERNANCE_GATEWAY_ID:-$SMOKE_RUN_ID}"
+SANDBOX_NAME="${OPENSHELL_GOVERNANCE_SANDBOX_NAME:-$SMOKE_RUN_ID-sandbox}"
 mkdir -p "$LOG_DIR"
 
 cleanup() {
@@ -43,10 +75,45 @@ pass() {
 
 fail() {
   printf 'FAIL %s\n' "$1" >&2
-  printf '  smoke log: %s\n' "$SMOKE_LOG" >&2
-  printf '  gateway log: %s\n' "$GATEWAY_LOG" >&2
-  printf '  interceptor log: %s\n' "$INTERCEPTOR_LOG" >&2
+  dump_logs
   exit 1
+}
+
+setup_fail() {
+  printf 'ERROR %s\n' "$1" >&2
+  dump_logs
+  exit 1
+}
+
+dump_log_file() {
+  local label="$1"
+  local path="$2"
+  printf '\n--- %s: %s ---\n' "$label" "$path" >&2
+  if [[ -f "$path" ]]; then
+    cat "$path" >&2
+  else
+    printf '(missing)\n' >&2
+  fi
+}
+
+dump_logs() {
+  dump_log_file "smoke log" "$SMOKE_LOG"
+  dump_log_file "gateway log" "$GATEWAY_LOG"
+  dump_log_file "interceptor log" "$INTERCEPTOR_LOG"
+}
+
+run_setup_step() {
+  local label="$1"
+  shift
+  printf 'INFO %s\n' "$label"
+  {
+    printf '\n== %s ==\n' "$label"
+    printf '+ %q ' "$@"
+    printf '\n'
+  } >>"$SMOKE_LOG"
+  if ! "$@" >>"$SMOKE_LOG" 2>&1; then
+    setup_fail "$label"
+  fi
 }
 
 run_step() {
@@ -97,20 +164,6 @@ expect_output_contains() {
   fi
 }
 
-missing_z3() {
-  cat >&2 <<'EOF'
-No usable local Z3 installation found.
-
-Install Z3 or point the build at an existing install, then rerun:
-  brew install z3
-  Z3_SYS_Z3_HEADER=/path/to/include/z3.h Z3_LIBRARY_PATH_OVERRIDE=/path/to/lib examples/governance-interceptor/smoke.sh
-
-The bundled Z3 build downloads source metadata from GitHub and can fail in offline or rate-limited environments.
-To opt into that path anyway, set OPENSHELL_GOVERNANCE_ALLOW_BUNDLED_Z3=1.
-EOF
-  exit 1
-}
-
 configure_native_build_env() {
   if [[ "$(uname -s)" == "Darwin" && "${OPENSHELL_GOVERNANCE_KEEP_CC:-0}" != "1" ]]; then
     export CC="${OPENSHELL_GOVERNANCE_CC:-clang}"
@@ -129,38 +182,56 @@ configure_native_build_env() {
   fi
 }
 
-configure_z3_build_env() {
-  if [[ -n "${Z3_SYS_Z3_HEADER:-}" || -n "${Z3_LIBRARY_PATH_OVERRIDE:-}" ]]; then
-    log "Using caller-provided Z3 build environment."
+docker_socket_responds() {
+  local socket="$1"
+  curl --silent --fail --unix-socket "$socket" http://localhost/_ping >/dev/null 2>&1
+}
+
+docker_context_socket() {
+  if ! command -v docker >/dev/null 2>&1; then
     return
   fi
 
-  if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists z3 >/dev/null 2>&1; then
-    log "Using pkg-config Z3 for workspace builds."
+  local endpoint
+  endpoint="$(docker context inspect --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null || true)"
+  if [[ "$endpoint" == unix://* ]]; then
+    printf '%s\n' "${endpoint#unix://}"
+  fi
+}
+
+configure_container_runtime_env() {
+  if [[ -n "${DOCKER_HOST:-}" ]]; then
+    log "Using caller-provided DOCKER_HOST=$DOCKER_HOST"
     return
   fi
 
-  z3_prefix=""
-  if command -v brew >/dev/null 2>&1; then
-    z3_prefix="$(brew --prefix z3 2>/dev/null || true)"
+  local candidate
+  local -a candidates=()
+
+  candidate="$(docker_context_socket)"
+  if [[ -n "$candidate" ]]; then
+    candidates+=("$candidate")
   fi
 
-  for candidate in "$z3_prefix" /opt/homebrew/opt/z3 /usr/local/opt/z3; do
-    if [[ -n "$candidate" && -f "$candidate/include/z3.h" && -d "$candidate/lib" ]]; then
-      log "Using local Z3 from ${candidate} for workspace builds."
-      export Z3_SYS_Z3_HEADER="${candidate}/include/z3.h"
-      export Z3_LIBRARY_PATH_OVERRIDE="${candidate}/lib"
+  if [[ -n "${HOME:-}" ]]; then
+    candidates+=(
+      "$HOME/.colima/default/docker.sock"
+      "$HOME/.colima/docker.sock"
+      "$HOME/.docker/run/docker.sock"
+    )
+  fi
+
+  candidates+=("/var/run/docker.sock")
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -S "$candidate" ]] && docker_socket_responds "$candidate"; then
+      export DOCKER_HOST="unix://$candidate"
+      log "Using Docker socket from $DOCKER_HOST for workspace builds and gateway runtime."
       return
     fi
   done
 
-  if [[ "${OPENSHELL_GOVERNANCE_ALLOW_BUNDLED_Z3:-0}" == "1" ]]; then
-    log "Falling back to bundled Z3 for workspace builds."
-    ROOT_BUILD_ARGS+=(--features bundled-z3)
-    return
-  fi
-
-  missing_z3
+  log "No reachable Docker socket detected; relying on gateway driver autodetection."
 }
 
 generate_gateway_jwt_bundle() {
@@ -172,16 +243,49 @@ generate_gateway_jwt_bundle() {
   mkdir -p "$JWT_DIR"
   openssl genpkey -algorithm ed25519 -out "$JWT_DIR/signing.pem" >/dev/null 2>&1
   openssl pkey -in "$JWT_DIR/signing.pem" -pubout -out "$JWT_DIR/public.pem" >/dev/null 2>&1
-  printf 'governance-smoke\n' > "$JWT_DIR/kid"
+  printf '%s\n' "$GATEWAY_ID" > "$JWT_DIR/kid"
+}
+
+start_dedicated_gateway() {
+  printf 'INFO starting dedicated gateway\n'
+  log "Starting dedicated gateway id=$GATEWAY_ID endpoint=http://$GATEWAY_ADDR health=http://$HEALTH_ADDR"
+  env \
+    -u OPENSHELL_GATEWAY_CONFIG \
+    -u OPENSHELL_BIND_ADDRESS \
+    -u OPENSHELL_SERVER_PORT \
+    -u OPENSHELL_HEALTH_PORT \
+    -u OPENSHELL_METRICS_PORT \
+    -u OPENSHELL_LOG_LEVEL \
+    -u OPENSHELL_TLS_CERT \
+    -u OPENSHELL_TLS_KEY \
+    -u OPENSHELL_TLS_CLIENT_CA \
+    -u OPENSHELL_LOCAL_TLS_DIR \
+    -u OPENSHELL_DRIVERS \
+    -u OPENSHELL_DISABLE_TLS \
+    -u OPENSHELL_OIDC_ISSUER \
+    -u OPENSHELL_ENABLE_MTLS_AUTH \
+    -u OPENSHELL_OIDC_AUDIENCE \
+    -u OPENSHELL_OIDC_JWKS_TTL \
+    -u OPENSHELL_OIDC_ROLES_CLAIM \
+    -u OPENSHELL_OIDC_ADMIN_ROLE \
+    -u OPENSHELL_OIDC_USER_ROLE \
+    -u OPENSHELL_OIDC_SCOPES_CLAIM \
+    -u OPENSHELL_GRPC_RATE_LIMIT_REQUESTS \
+    -u OPENSHELL_GRPC_RATE_LIMIT_WINDOW_SECONDS \
+    -u OPENSHELL_SERVER_SAN \
+    -u OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP \
+    "OPENSHELL_DB_URL=sqlite://$TMPDIR/gateway.db" \
+    "$ROOT/target/debug/openshell-gateway" --config "$TMPDIR/gateway.toml" >"$GATEWAY_LOG" 2>&1 &
+  GATEWAY_PID=$!
 }
 
 cd "$ROOT"
 configure_native_build_env
-configure_z3_build_env
+configure_container_runtime_env
 generate_gateway_jwt_bundle
-run_step "build gateway" cargo build --quiet -p openshell-server --bin openshell-gateway "${ROOT_BUILD_ARGS[@]}"
-run_step "build CLI" cargo build --quiet -p openshell-cli --bin openshell "${ROOT_BUILD_ARGS[@]}"
-run_step "build governance interceptor" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
+run_setup_step "building gateway" cargo build --quiet -p openshell-server --bin openshell-gateway
+run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
+run_setup_step "building governance interceptor" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
 
 "$EXAMPLE_DIR/target/debug/governance-interceptor" \
   --listen "$INTERCEPTOR_ADDR" \
@@ -205,7 +309,7 @@ allow_unauthenticated_users = true
 signing_key_path = "$JWT_DIR/signing.pem"
 public_key_path = "$JWT_DIR/public.pem"
 kid_path = "$JWT_DIR/kid"
-gateway_id = "governance-smoke"
+gateway_id = "$GATEWAY_ID"
 ttl_secs = 0
 
 [[openshell.gateway.interceptors]]
@@ -218,18 +322,16 @@ max_response_bytes = 1048576
 max_patches = 32
 EOF
 
-OPENSHELL_DB_URL="sqlite://$TMPDIR/gateway.db" \
-  "$ROOT/target/debug/openshell-gateway" --config "$TMPDIR/gateway.toml" >"$GATEWAY_LOG" 2>&1 &
-GATEWAY_PID=$!
+start_dedicated_gateway
 
 gateway_ready=0
 for _ in {1..60}; do
+  if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+    fail "gateway starts with interceptor"
+  fi
   if curl -fsS "http://$HEALTH_ADDR/healthz" >/dev/null 2>&1; then
     gateway_ready=1
     break
-  fi
-  if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-    fail "gateway starts with interceptor"
   fi
   sleep 1
 done
@@ -239,7 +341,15 @@ else
   fail "gateway starts with interceptor"
 fi
 
-CLI=("$ROOT/target/debug/openshell" --gateway-endpoint "http://$GATEWAY_ADDR")
+CLI=(
+  env
+  -u OPENSHELL_GATEWAY
+  -u OPENSHELL_GATEWAY_ENDPOINT
+  -u OPENSHELL_GATEWAY_INSECURE
+  -u OPENSHELL_SANDBOX_POLICY
+  "$ROOT/target/debug/openshell"
+  --gateway-endpoint "http://$GATEWAY_ADDR"
+)
 
 run_step "allows github provider create" "${CLI[@]}" provider create --name github --type github --credential GITHUB_TOKEN=dummy
 run_step "allows gitlab provider create" "${CLI[@]}" provider create --name gitlab --type gitlab --credential GITLAB_TOKEN=dummy

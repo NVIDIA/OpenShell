@@ -902,10 +902,21 @@ fn apply_json_patches(operation: &Value, patches: &[JsonPatch]) -> Result<Value>
     Ok(candidate)
 }
 
-fn emit_evaluation_metrics(_plan: &BindingPlan, _result: &str, patch_count: usize) {
-    counter!("openshell_gateway_interceptor_evaluations_total").increment(1);
+fn emit_evaluation_metrics(plan: &BindingPlan, result: &str, patch_count: usize) {
+    counter!(
+        "openshell_gateway_interceptor_evaluations_total",
+        "decision" => result.to_string(),
+        "interceptor" => plan.interceptor_name.clone(),
+        "binding_id" => plan.binding_id.clone(),
+    )
+    .increment(1);
     if patch_count > 0 {
-        counter!("openshell_gateway_interceptor_patches_total").increment(patch_count as u64);
+        counter!(
+            "openshell_gateway_interceptor_patches_total",
+            "interceptor" => plan.interceptor_name.clone(),
+            "binding_id" => plan.binding_id.clone(),
+        )
+        .increment(patch_count as u64);
     }
 }
 

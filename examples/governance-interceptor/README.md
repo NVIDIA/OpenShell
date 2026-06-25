@@ -1,10 +1,13 @@
 # Governance Interceptor Example
 
-This standalone example implements the `openshell.gateway_interceptor.v1.GatewayInterceptor` service. It enforces a source-control governance baseline:
+This standalone example implements the
+`openshell.gateway_interceptor.v1.GatewayInterceptor` service. It demonstrates how to
+extend OpenShell to provide advanced governance over sandbox policies.
 
-- every new sandbox receives `policy.yaml`
+- every new sandbox receives `policy.yaml` sourced from this examples folder
 - every new sandbox is attached to exactly `github` and `gitlab`
 - every new sandbox gets an `openshell.nvidia.com/policy-signature` metadata annotation
+  that is used to verify the policy
 - users cannot attach or detach other providers after sandbox creation
 - users cannot replace or merge sandbox policy after sandbox creation
 - users cannot create provider records other than `github` and `gitlab`
@@ -42,10 +45,9 @@ max_response_bytes = 1048576
 max_patches        = 32
 ```
 
-Run the smoke test against a local gateway and compute driver:
+Run the smoke test script to automatically start the gateway, interceptor, and test the
+governance controls
 
 ```shell
 ./smoke.sh
 ```
-
-The smoke test prints one `PASS` or `FAIL` line per case. Gateway, interceptor, build, and CLI logs are written to a temporary log directory and shown only if a case fails. Set `OPENSHELL_GOVERNANCE_KEEP_LOGS=1` or `OPENSHELL_GOVERNANCE_LOG_DIR=/path/to/logs` to keep logs after a successful run.
