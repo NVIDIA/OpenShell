@@ -16,6 +16,7 @@ metadata:
 type: Opaque
 stringData:
   password: openshell-e2e-postgres
+  uri: postgresql://openshell:openshell-e2e-postgres@openshell-e2e-postgres.openshell.svc/openshell
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -48,6 +49,13 @@ spec:
                   key: password
             - name: POSTGRES_DB
               value: openshell
+            # OpenShift assigns a random UID from the namespace range instead of
+            # running as the image's "postgres" user (UID 70). The postgres
+            # entrypoint fails to chmod /var/lib/postgresql/data because it is
+            # owned by UID 70. Setting PGDATA to a subdirectory causes postgres
+            # to mkdir+chmod a new directory it owns, which succeeds.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
           ports:
             - name: postgres
               containerPort: 5432
@@ -61,6 +69,16 @@ spec:
             periodSeconds: 3
             timeoutSeconds: 2
             failureThreshold: 20
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+            - name: postgres-run
+              mountPath: /var/run/postgresql
+      volumes:
+        - name: postgres-data
+          emptyDir: {}
+        - name: postgres-run
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
