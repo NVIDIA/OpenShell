@@ -244,31 +244,37 @@ impl GatewayInterceptorRuntime {
         for config in configs {
             validate_service_config(&config)?;
             let channel = connect_endpoint(&config.grpc_endpoint).await?;
+            let timeout = match config.timeout.as_deref() {
+                Some(timeout) => parse_duration(timeout)?,
+                None => DEFAULT_TIMEOUT,
+            };
             let mut client = GatewayInterceptorClient::new(channel.clone())
                 .max_decoding_message_size(
                     config
                         .max_response_bytes
                         .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES),
                 );
-            let manifest = client
-                .describe(Request::new(DescribeRequest {}))
-                .await
-                .map_err(|status| {
-                    InterceptorError::Transport(format!(
-                        "Describe failed for '{}': {status}",
-                        config.name
-                    ))
-                })?
-                .into_inner();
+            let manifest =
+                tokio::time::timeout(timeout, client.describe(Request::new(DescribeRequest {})))
+                    .await
+                    .map_err(|_| {
+                        InterceptorError::Transport(format!(
+                            "Describe timed out for '{}'",
+                            config.name
+                        ))
+                    })?
+                    .map_err(|status| {
+                        InterceptorError::Transport(format!(
+                            "Describe failed for '{}': {status}",
+                            config.name
+                        ))
+                    })?
+                    .into_inner();
             let service_default = config
                 .failure_policy
                 .map(FailurePolicy::from)
                 .or_else(|| parse_failure_policy(manifest.failure_policy.as_str()).ok())
                 .unwrap_or(FailurePolicy::FailClosed);
-            let timeout = match config.timeout.as_deref() {
-                Some(timeout) => parse_duration(timeout)?,
-                None => DEFAULT_TIMEOUT,
-            };
             let max_response_bytes = config
                 .max_response_bytes
                 .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
@@ -448,12 +454,15 @@ impl GatewayInterceptorRuntime {
 
             if phase == Phase::ModifyOperation && !result.patches.is_empty() {
                 let patch_count = result.patches.len();
-                let patch_ops = json_patch_operations(&result.patches)
-                    .map_err(|err| Status::invalid_argument(err.to_string()))?;
-                patch(&mut operation, &patch_ops).map_err(|err| {
-                    Status::invalid_argument(format!("invalid JSON patch: {err}"))
-                })?;
-                emit_evaluation_metrics(plan, "allow", patch_count);
+                match apply_json_patches(&operation, &result.patches) {
+                    Ok(patched) => {
+                        operation = patched;
+                        emit_evaluation_metrics(plan, "allow", patch_count);
+                    }
+                    Err(err) => {
+                        apply_failure_policy(plan, &err)?;
+                    }
+                }
             } else {
                 emit_evaluation_metrics(plan, "allow", 0);
             }
@@ -885,6 +894,14 @@ fn json_patch_operations(patches: &[JsonPatch]) -> Result<Vec<PatchOperation>> {
         .map_err(|e| InterceptorError::InvalidResult(format!("invalid JSON patch: {e}")))
 }
 
+fn apply_json_patches(operation: &Value, patches: &[JsonPatch]) -> Result<Value> {
+    let patch_ops = json_patch_operations(patches)?;
+    let mut candidate = operation.clone();
+    patch(&mut candidate, &patch_ops)
+        .map_err(|err| InterceptorError::InvalidResult(format!("invalid JSON patch: {err}")))?;
+    Ok(candidate)
+}
+
 fn emit_evaluation_metrics(_plan: &BindingPlan, _result: &str, patch_count: usize) {
     counter!("openshell_gateway_interceptor_evaluations_total").increment(1);
     if patch_count > 0 {
@@ -1041,6 +1058,10 @@ impl ProtoDescriptors {
     }
 
     fn decode_message_to_json(&self, type_name: &str, bytes: &[u8]) -> Result<Value> {
+        if let Some(value) = decode_well_known_json(type_name, bytes) {
+            return value;
+        }
+
         let message = self.message(type_name)?;
         let mut values: HashMap<u32, Vec<Value>> = HashMap::new();
         let mut input = bytes;
@@ -1243,6 +1264,10 @@ impl ProtoDescriptors {
     }
 
     fn encode_json_to_message(&self, type_name: &str, value: &Value) -> Result<Vec<u8>> {
+        if let Some(encoded) = encode_well_known_json(type_name, value) {
+            return encoded;
+        }
+
         let message = self.message(type_name)?;
         let Value::Object(map) = value else {
             return Err(InterceptorError::Transcode(format!(
@@ -1589,6 +1614,20 @@ fn json_to_struct(value: Value) -> Result<Struct> {
     }
 }
 
+fn json_to_list_value(value: Value) -> Result<prost_types::ListValue> {
+    match value {
+        Value::Array(values) => Ok(prost_types::ListValue {
+            values: values
+                .into_iter()
+                .map(json_to_protobuf_value)
+                .collect::<Result<_>>()?,
+        }),
+        _ => Err(InterceptorError::Transcode(
+            "google.protobuf.ListValue JSON must be an array".to_string(),
+        )),
+    }
+}
+
 fn json_to_protobuf_value(value: Value) -> Result<prost_types::Value> {
     let kind = match value {
         Value::Null => prost_types::value::Kind::NullValue(0),
@@ -1615,22 +1654,76 @@ fn json_to_protobuf_value(value: Value) -> Result<prost_types::Value> {
     Ok(prost_types::Value { kind: Some(kind) })
 }
 
+fn decode_well_known_json(type_name: &str, bytes: &[u8]) -> Option<Result<Value>> {
+    match trim_type_name(type_name) {
+        "google.protobuf.Struct" => Some(
+            Struct::decode(bytes)
+                .map(|value| protobuf_struct_to_json(&value))
+                .map_err(|err| {
+                    InterceptorError::Transcode(format!(
+                        "invalid google.protobuf.Struct bytes: {err}"
+                    ))
+                }),
+        ),
+        "google.protobuf.Value" => Some(
+            prost_types::Value::decode(bytes)
+                .map(|value| protobuf_value_to_json(&value))
+                .map_err(|err| {
+                    InterceptorError::Transcode(format!(
+                        "invalid google.protobuf.Value bytes: {err}"
+                    ))
+                }),
+        ),
+        "google.protobuf.ListValue" => Some(
+            prost_types::ListValue::decode(bytes)
+                .map(|value| protobuf_list_value_to_json(&value))
+                .map_err(|err| {
+                    InterceptorError::Transcode(format!(
+                        "invalid google.protobuf.ListValue bytes: {err}"
+                    ))
+                }),
+        ),
+        _ => None,
+    }
+}
+
+fn encode_well_known_json(type_name: &str, value: &Value) -> Option<Result<Vec<u8>>> {
+    match trim_type_name(type_name) {
+        "google.protobuf.Struct" => {
+            Some(json_to_struct(value.clone()).map(|value| value.encode_to_vec()))
+        }
+        "google.protobuf.Value" => {
+            Some(json_to_protobuf_value(value.clone()).map(|value| value.encode_to_vec()))
+        }
+        "google.protobuf.ListValue" => {
+            Some(json_to_list_value(value.clone()).map(|value| value.encode_to_vec()))
+        }
+        _ => None,
+    }
+}
+
+fn protobuf_struct_to_json(value: &Struct) -> Value {
+    Value::Object(
+        value
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), protobuf_value_to_json(value)))
+            .collect(),
+    )
+}
+
+fn protobuf_list_value_to_json(value: &prost_types::ListValue) -> Value {
+    Value::Array(value.values.iter().map(protobuf_value_to_json).collect())
+}
+
 fn protobuf_value_to_json(value: &prost_types::Value) -> Value {
     match value.kind.as_ref() {
         Some(prost_types::value::Kind::NullValue(_)) | None => Value::Null,
         Some(prost_types::value::Kind::NumberValue(value)) => number_json(*value),
         Some(prost_types::value::Kind::StringValue(value)) => Value::String(value.clone()),
         Some(prost_types::value::Kind::BoolValue(value)) => Value::Bool(*value),
-        Some(prost_types::value::Kind::StructValue(value)) => Value::Object(
-            value
-                .fields
-                .iter()
-                .map(|(key, value)| (key.clone(), protobuf_value_to_json(value)))
-                .collect(),
-        ),
-        Some(prost_types::value::Kind::ListValue(value)) => {
-            Value::Array(value.values.iter().map(protobuf_value_to_json).collect())
-        }
+        Some(prost_types::value::Kind::StructValue(value)) => protobuf_struct_to_json(value),
+        Some(prost_types::value::Kind::ListValue(value)) => protobuf_list_value_to_json(value),
     }
 }
 
@@ -1842,7 +1935,8 @@ fn json_u32(value: &Value, field: &str) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{CreateSandboxRequest, SandboxSpec};
+    use openshell_core::proto::{CreateSandboxRequest, SandboxSpec, SandboxTemplate};
+    use serde_json::json;
 
     #[test]
     fn parses_timeout_suffixes() {
@@ -1875,5 +1969,98 @@ mod tests {
             .unwrap();
         let decoded = CreateSandboxRequest::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn dynamic_round_trip_uses_protobuf_json_for_struct_fields() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let request = CreateSandboxRequest {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    resources: Some(
+                        json_to_struct(json!({
+                            "limits": {
+                                "cpu": "2",
+                                "memory": "4Gi"
+                            }
+                        }))
+                        .unwrap(),
+                    ),
+                    driver_config: Some(
+                        json_to_struct(json!({
+                            "docker": {
+                                "userns": "host"
+                            }
+                        }))
+                        .unwrap(),
+                    ),
+                    ..SandboxTemplate::default()
+                }),
+                ..SandboxSpec::default()
+            }),
+            name: "demo".to_string(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+
+        let bytes = request.encode_to_vec();
+        let json = descriptors
+            .decode_message_to_json("openshell.v1.CreateSandboxRequest", &bytes)
+            .unwrap();
+
+        assert_eq!(json["spec"]["template"]["resources"]["limits"]["cpu"], "2");
+        assert_eq!(
+            json["spec"]["template"]["driverConfig"]["docker"]["userns"],
+            "host"
+        );
+        assert!(
+            json["spec"]["template"]["resources"]
+                .get("fields")
+                .is_none()
+        );
+
+        let encoded = descriptors
+            .encode_json_to_message("openshell.v1.CreateSandboxRequest", &json)
+            .unwrap();
+        let decoded = CreateSandboxRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[tokio::test]
+    async fn invalid_modify_patch_honors_fail_open_without_mutating_operation() {
+        let plan = BindingPlan {
+            interceptor_name: "test".to_string(),
+            binding_id: "binding".to_string(),
+            selector: RpcSelector {
+                service: "openshell.v1.OpenShell".to_string(),
+                method: "CreateSandbox".to_string(),
+            },
+            phase: Phase::ModifyOperation,
+            failure_policy: FailurePolicy::FailOpen,
+            timeout: DEFAULT_TIMEOUT,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_patches: DEFAULT_MAX_PATCHES,
+            client: GatewayInterceptorClient::new(
+                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+        };
+        let operation = json!({ "name": "demo" });
+        let result = InterceptorResult {
+            allowed: true,
+            patches: vec![JsonPatch {
+                op: "replace".to_string(),
+                path: "/missing".to_string(),
+                value: Some(prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue("value".to_string())),
+                }),
+                from: String::new(),
+            }],
+            ..InterceptorResult::default()
+        };
+
+        let err = apply_json_patches(&operation, &result.patches).unwrap_err();
+        apply_failure_policy(&plan, &err).unwrap();
+        assert_eq!(operation, json!({ "name": "demo" }));
     }
 }
