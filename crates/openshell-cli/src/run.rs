@@ -77,7 +77,7 @@ pub use crate::ssh::{
     sandbox_ssh_proxy_by_name, sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
 pub use openshell_core::forward::{
-    find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
+    ForwardSpec, find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1574,10 +1574,7 @@ pub fn doctor_check() -> Result<()> {
     Err(miette::miette!("docker info failed: {}", stderr.trim()))
 }
 
-fn sandbox_should_persist(
-    keep: bool,
-    forward: Option<&openshell_core::forward::ForwardSpec>,
-) -> bool {
+fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
     keep || forward.is_some()
 }
 
@@ -1745,31 +1742,86 @@ async fn finalize_sandbox_create_session(
     session_result
 }
 
+/// Configuration for creating a sandbox via the CLI.
+///
+/// Infrastructure parameters (`server`, `gateway_name`, `tls`) remain positional
+/// on the function signature, following the `provider_refresh_config(server, input, tls)`
+/// precedent. This struct captures sandbox-specific options.
+#[derive(Debug)]
+pub struct SandboxCreateConfig<'a> {
+    pub name: Option<&'a str>,
+    pub from: Option<&'a str>,
+    pub uploads: &'a [(String, Option<String>, bool)],
+    pub keep: bool,
+    pub gpu_requirements: Option<GpuResourceRequirements>,
+    pub cpu: Option<&'a str>,
+    pub memory: Option<&'a str>,
+    pub driver_config_json: Option<&'a str>,
+    pub editor: Option<Editor>,
+    pub providers: &'a [String],
+    pub policy: Option<&'a str>,
+    pub forward: Option<ForwardSpec>,
+    pub command: &'a [String],
+    pub tty_override: Option<bool>,
+    pub auto_providers_override: Option<bool>,
+    pub labels: HashMap<String, String>,
+    pub environment: HashMap<String, String>,
+    pub approval_mode: &'a str,
+}
+
+impl Default for SandboxCreateConfig<'_> {
+    fn default() -> Self {
+        Self {
+            name: None,
+            from: None,
+            uploads: &[],
+            keep: false,
+            gpu_requirements: None,
+            cpu: None,
+            memory: None,
+            driver_config_json: None,
+            editor: None,
+            providers: &[],
+            policy: None,
+            forward: None,
+            command: &[],
+            tty_override: None,
+            auto_providers_override: None,
+            labels: HashMap::new(),
+            environment: HashMap::new(),
+            approval_mode: "manual",
+        }
+    }
+}
+
 /// Create a sandbox with default settings.
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher)] // user-facing CLI command; default hasher is fine
 pub async fn sandbox_create(
     server: &str,
-    name: Option<&str>,
-    from: Option<&str>,
     gateway_name: &str,
-    uploads: &[(String, Option<String>, bool)],
-    keep: bool,
-    gpu_requirements: Option<GpuResourceRequirements>,
-    cpu: Option<&str>,
-    memory: Option<&str>,
-    driver_config_json: Option<&str>,
-    editor: Option<Editor>,
-    providers: &[String],
-    policy: Option<&str>,
-    forward: Option<openshell_core::forward::ForwardSpec>,
-    command: &[String],
-    tty_override: Option<bool>,
-    auto_providers_override: Option<bool>,
-    labels: &HashMap<String, String>,
-    environment: &HashMap<String, String>,
-    approval_mode: &str,
+    config: SandboxCreateConfig<'_>,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let SandboxCreateConfig {
+        name,
+        from,
+        uploads,
+        keep,
+        gpu_requirements,
+        cpu,
+        memory,
+        driver_config_json,
+        editor,
+        providers,
+        policy,
+        forward,
+        command,
+        tty_override,
+        auto_providers_override,
+        labels,
+        environment,
+        approval_mode,
+    } = config;
+
     if editor.is_some() && !command.is_empty() {
         return Err(miette::miette!(
             "--editor cannot be used with a trailing command; use `openshell sandbox connect <name> --editor ...` after the sandbox is ready"
@@ -1846,14 +1898,14 @@ pub async fn sandbox_create(
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             resource_requirements,
-            environment: environment.clone(),
+            environment,
             policy,
             providers: configured_providers,
             template,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
-        labels: labels.clone(),
+        labels,
     };
 
     let response = match client.create_sandbox(request).await {

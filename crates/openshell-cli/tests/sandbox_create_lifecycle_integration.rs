@@ -1099,6 +1099,19 @@ fn gpu_requirements(count: Option<u32>) -> GpuResourceRequirements {
     GpuResourceRequirements { count }
 }
 
+/// Shared defaults for integration tests. Note: `keep` is `true` here (most
+/// tests expect persistent sandboxes) while `SandboxCreateConfig::default()`
+/// sets `keep: false` (the safe production default). Tests that exercise
+/// ephemeral behavior must explicitly override with `keep: false`.
+fn test_config() -> run::SandboxCreateConfig<'static> {
+    run::SandboxCreateConfig {
+        keep: true,
+        tty_override: Some(false),
+        auto_providers_override: Some(false),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn sandbox_create_keeps_command_sessions_by_default() {
     let server = run_server().await;
@@ -1110,25 +1123,12 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("default-command"),
-        None,
         "openshell",
-        &[],
-        true,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("default-command"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1153,25 +1153,14 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("resources"),
-        None,
         "openshell",
-        &[],
-        true,
-        None,
-        Some("500m"),
-        Some("2Gi"),
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("resources"),
+            cpu: Some("500m"),
+            memory: Some("2Gi"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1230,25 +1219,15 @@ async fn sandbox_create_sends_driver_config_json() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("driver-config"),
-        None,
         "openshell",
-        &[],
-        true,
-        None,
-        None,
-        None,
-        Some(r#"{"kubernetes":{"pod":{"priority_class_name":"batch-low"}}}"#),
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("driver-config"),
+            driver_config_json: Some(
+                r#"{"kubernetes":{"pod":{"priority_class_name":"batch-low"}}}"#,
+            ),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1303,25 +1282,13 @@ async fn sandbox_create_sends_gpu_default_request() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("gpu-default"),
-        None,
         "openshell",
-        &[],
-        true,
-        Some(gpu_requirements(None)),
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("gpu-default"),
+            gpu_requirements: Some(gpu_requirements(None)),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1349,25 +1316,13 @@ async fn sandbox_create_sends_gpu_count_request() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("gpu-two"),
-        None,
         "openshell",
-        &[],
-        true,
-        Some(gpu_requirements(Some(2))),
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("gpu-two"),
+            gpu_requirements: Some(gpu_requirements(Some(2))),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1396,25 +1351,13 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("v2-no-inferred-provider"),
-        None,
         "openshell",
-        &[],
-        true,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["claude".to_string(), "--version".to_string()],
-        Some(true),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("v2-no-inferred-provider"),
+            command: &["claude".into(), "--version".into()],
+            tty_override: Some(true),
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1454,25 +1397,12 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
     let started_at = Instant::now();
     let err = run::sandbox_create(
         &server.endpoint,
-        Some("vm-error"),
-        None,
         "openshell",
-        &[],
-        true,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("vm-error"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1508,25 +1438,12 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("vm-slow-progress"),
-        None,
         "openshell",
-        &[],
-        true,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("vm-slow-progress"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1554,25 +1471,12 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
     let started_at = Instant::now();
     let err = run::sandbox_create(
         &server.endpoint,
-        Some("vm-log-churn"),
-        None,
         "openshell",
-        &[],
-        true,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("vm-log-churn"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1596,25 +1500,13 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("ephemeral-command"),
-        None,
         "openshell",
-        &[],
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("ephemeral-command"),
+            keep: false,
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1642,25 +1534,13 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("ephemeral-shell"),
-        None,
         "openshell",
-        &[],
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &[],
-        Some(true),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("ephemeral-shell"),
+            keep: false,
+            tty_override: Some(true),
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1688,25 +1568,12 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("persistent-keep"),
-        None,
         "openshell",
-        &[],
-        true,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("persistent-keep"),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1734,25 +1601,14 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
 
     run::sandbox_create(
         &server.endpoint,
-        Some("persistent-forward"),
-        None,
         "openshell",
-        &[],
-        false,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        Some(openshell_core::forward::ForwardSpec::new(forward_port)),
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &HashMap::new(),
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("persistent-forward"),
+            keep: false,
+            forward: Some(openshell_core::forward::ForwardSpec::new(forward_port)),
+            command: &["echo".into(), "OK".into()],
+            ..test_config()
+        },
         &tls,
     )
     .await
@@ -1880,31 +1736,18 @@ async fn sandbox_create_sends_environment_variables() {
     let tls = test_tls(&server);
     install_fake_ssh(&fake_ssh_dir);
 
-    let mut env_map = HashMap::new();
-    env_map.insert("FOO".to_string(), "bar".to_string());
-    env_map.insert("BAZ".to_string(), "qux=with=equals".to_string());
-
     run::sandbox_create(
         &server.endpoint,
-        Some("env-test"),
-        None,
         "openshell",
-        &[],
-        true,
-        None,
-        None,
-        None,
-        None,
-        None,
-        &[],
-        None,
-        None,
-        &["echo".to_string(), "OK".to_string()],
-        Some(false),
-        Some(false),
-        &HashMap::new(),
-        &env_map,
-        "manual",
+        run::SandboxCreateConfig {
+            name: Some("env-test"),
+            command: &["echo".into(), "OK".into()],
+            environment: HashMap::from([
+                ("FOO".into(), "bar".into()),
+                ("BAZ".into(), "qux=with=equals".into()),
+            ]),
+            ..test_config()
+        },
         &tls,
     )
     .await
