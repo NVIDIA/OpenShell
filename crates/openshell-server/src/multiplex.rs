@@ -9,7 +9,7 @@
 use bytes::Bytes;
 use http::{Extensions, HeaderValue, Request, Response};
 use http_body::Body;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -123,6 +123,7 @@ macro_rules! request_id_middleware {
 /// bound memory allocation from a single request. Sandbox creation is
 /// the largest payload and well within this cap under normal use.
 const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
+const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = MAX_GRPC_DECODE_SIZE + 5;
 
 /// Multiplexed gRPC/HTTP service.
 #[derive(Clone)]
@@ -278,14 +279,9 @@ where
 
             let context = gateway_interceptor_context(req.extensions());
             let (parts, body) = req.into_parts();
-            let body = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(err) => {
-                    return Ok(tonic::Status::internal(format!(
-                        "failed to read gRPC request body for interceptor evaluation: {err}"
-                    ))
-                    .into_http());
-                }
+            let body = match collect_intercepted_grpc_body(body).await {
+                Ok(body) => body,
+                Err(status) => return Ok(status.into_http()),
             };
 
             let intercepted = match interceptors.evaluate_request(&path, &body, &context).await {
@@ -310,6 +306,24 @@ where
             Ok(response)
         })
     }
+}
+
+async fn collect_intercepted_grpc_body(body: BoxBody) -> Result<Bytes, tonic::Status> {
+    Limited::new(body, MAX_INTERCEPTED_GRPC_BODY_SIZE)
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .map_err(|err| {
+            if err.downcast_ref::<LengthLimitError>().is_some() {
+                tonic::Status::resource_exhausted(format!(
+                    "gRPC request body exceeds interceptor evaluation limit of {MAX_INTERCEPTED_GRPC_BODY_SIZE} bytes"
+                ))
+            } else {
+                tonic::Status::internal(format!(
+                    "failed to read gRPC request body for interceptor evaluation: {err}"
+                ))
+            }
+        })
 }
 
 fn boxed_body_from_bytes(bytes: Bytes) -> BoxBody {
@@ -1047,6 +1061,16 @@ mod tests {
         }
         let req = builder.body(Empty::<Bytes>::new()).unwrap();
         sender.send_request(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn intercepted_grpc_body_collection_rejects_oversized_body() {
+        let oversized = Bytes::from(vec![0_u8; MAX_INTERCEPTED_GRPC_BODY_SIZE + 1]);
+        let status = collect_intercepted_grpc_body(boxed_body_from_bytes(oversized))
+            .await
+            .expect_err("oversized body should be rejected");
+
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 
     #[tokio::test]
