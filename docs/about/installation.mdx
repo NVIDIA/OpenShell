@@ -80,7 +80,7 @@ sudo loginctl enable-linger $USER
 Install the OpenShell snap from the Snap Store:
 
 ```shell
-sudo snap install openshell --classic
+sudo snap install openshell
 ```
 
 The snap defines two apps: the `openshell` CLI and the `openshell.gateway`
@@ -88,6 +88,11 @@ systemd service. The gateway listens on `https://127.0.0.1:17670` and
 stores its database at `$SNAP_COMMON/gateway.db` (typically
 `/var/snap/openshell/common/gateway.db`). Create `$SNAP_COMMON/gateway.toml`
 when you need to override gateway settings.
+
+The snap CLI stores per-user config, data, and state under `$SNAP_USER_COMMON`,
+typically `~/snap/openshell/common`. Gateway registrations live under
+`$SNAP_USER_COMMON/.config/openshell/gateways/` instead of
+`~/.config/openshell/gateways/`.
 
 ### Snap store installs
 
@@ -108,7 +113,7 @@ manually.
 When installing a locally built `.snap` file, no plugs are connected by default:
 
 ```shell
-sudo snap install ./openshell_*.snap --dangerous --classic
+sudo snap install ./openshell_*.snap --dangerous
 sudo snap connect openshell:home
 sudo snap connect openshell:network
 sudo snap connect openshell:network-bind
