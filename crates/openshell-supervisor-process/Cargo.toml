@@ -35,6 +35,7 @@ libc = "0.2"
 rustix = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+capctl = "0.2.4"
 landlock = "0.4"
 seccompiler = "0.5"
 tempfile = "3"
