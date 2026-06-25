@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 E2E_TEST="${OPENSHELL_E2E_PODMAN_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_PODMAN_FEATURES:-e2e-podman}"
 
-cargo build -p openshell-cli --features openshell-core/dev-settings
+cargo build -p openshell-cli
 
 TEST_ARGS=(
   cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml"

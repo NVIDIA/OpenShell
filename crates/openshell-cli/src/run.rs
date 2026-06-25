@@ -8097,16 +8097,15 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn parse_cli_setting_value_parses_bool_aliases() {
-        let yes_value = parse_cli_setting_value("dummy_bool", "yes").expect("parse yes");
+        let yes_value = parse_cli_setting_value("ocsf_json_enabled", "yes").expect("parse yes");
         assert_eq!(
             yes_value.value,
             Some(openshell_core::proto::setting_value::Value::BoolValue(true))
         );
 
-        let zero_value = parse_cli_setting_value("dummy_bool", "0").expect("parse 0");
+        let zero_value = parse_cli_setting_value("ocsf_json_enabled", "0").expect("parse 0");
         assert_eq!(
             zero_value.value,
             Some(openshell_core::proto::setting_value::Value::BoolValue(
@@ -8115,21 +8114,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "dev-settings")]
-    #[test]
-    fn parse_cli_setting_value_parses_int_key() {
-        let int_value = parse_cli_setting_value("dummy_int", "42").expect("parse int");
-        assert_eq!(
-            int_value.value,
-            Some(openshell_core::proto::setting_value::Value::IntValue(42))
-        );
-    }
-
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn parse_cli_setting_value_rejects_invalid_bool() {
-        let err =
-            parse_cli_setting_value("dummy_bool", "maybe").expect_err("invalid bool should fail");
+        let err = parse_cli_setting_value("ocsf_json_enabled", "maybe")
+            .expect_err("invalid bool should fail");
         assert!(err.to_string().contains("invalid bool value"));
     }
 

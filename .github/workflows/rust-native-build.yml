@@ -30,7 +30,7 @@ on:
         description: "Cargo features to enable"
         required: false
         type: string
-        default: "openshell-core/dev-settings"
+        default: ""
       retention-days:
         description: "Artifact retention period"
         required: false

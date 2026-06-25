@@ -91,8 +91,7 @@ echo "==> Building openshell-gateway, openshell-driver-vm, openshell (CLI)"
 cargo build \
   -p openshell-server \
   -p openshell-driver-vm \
-  -p openshell-cli \
-  --features openshell-core/dev-settings
+  -p openshell-cli
 
 if [ "$(uname -s)" = "Darwin" ]; then
   echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"

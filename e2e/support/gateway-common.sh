@@ -186,13 +186,11 @@ e2e_build_gateway_binaries() {
 
   echo "Building openshell-gateway..."
   cargo build "${jobs[@]}" \
-    -p openshell-server --bin openshell-gateway \
-    --features openshell-core/dev-settings
+    -p openshell-server --bin openshell-gateway
 
   echo "Building openshell-cli..."
   cargo build "${jobs[@]}" \
-    -p openshell-cli --bin openshell \
-    --features openshell-core/dev-settings
+    -p openshell-cli
 
   if [ ! -x "${target_dir}/debug/openshell-gateway" ]; then
     echo "ERROR: expected openshell-gateway binary at ${target_dir}/debug/openshell-gateway" >&2

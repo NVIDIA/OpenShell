@@ -8895,24 +8895,22 @@ mod tests {
         assert!(err.message().contains("unknown setting key"));
     }
 
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn proto_setting_to_stored_rejects_type_mismatch() {
         let value = SettingValue {
             value: Some(setting_value::Value::StringValue("true".to_string())),
         };
-        let err = proto_setting_to_stored("dummy_bool", &value).unwrap_err();
+        let err = proto_setting_to_stored("ocsf_json_enabled", &value).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("expects bool value"));
     }
 
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn proto_setting_to_stored_accepts_bool_for_registered_bool_key() {
         let value = SettingValue {
             value: Some(setting_value::Value::BoolValue(true)),
         };
-        let stored = proto_setting_to_stored("dummy_bool", &value).unwrap();
+        let stored = proto_setting_to_stored("ocsf_json_enabled", &value).unwrap();
         assert_eq!(stored, StoredSettingValue::Bool(true));
     }
 
@@ -8988,17 +8986,19 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn merge_effective_settings_global_overrides_sandbox_key() {
         let global = StoredSettings {
             revision: 2,
             settings: [
                 (
-                    "log_level".to_string(),
-                    StoredSettingValue::String("warn".to_string()),
+                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    StoredSettingValue::Bool(false),
                 ),
-                ("dummy_int".to_string(), StoredSettingValue::Int(7)),
+                (
+                    settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY.to_string(),
+                    StoredSettingValue::Bool(false),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -9008,10 +9008,13 @@ mod tests {
             revision: 1,
             settings: [
                 (
-                    "log_level".to_string(),
-                    StoredSettingValue::String("debug".to_string()),
+                    settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                    StoredSettingValue::Bool(true),
                 ),
-                ("dummy_bool".to_string(), StoredSettingValue::Bool(true)),
+                (
+                    "ocsf_json_enabled".to_string(),
+                    StoredSettingValue::Bool(true),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -9019,39 +9022,45 @@ mod tests {
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
-        let log_level = merged.get("log_level").expect("log_level present");
-        assert_eq!(log_level.scope, SettingScope::Global as i32);
+        let providers_v2 = merged
+            .get(settings::PROVIDERS_V2_ENABLED_KEY)
+            .expect("providers_v2_enabled present");
+        assert_eq!(providers_v2.scope, SettingScope::Global as i32);
         assert_eq!(
-            log_level.value.as_ref().and_then(|v| v.value.as_ref()),
-            Some(&setting_value::Value::StringValue("warn".to_string()))
+            providers_v2.value.as_ref().and_then(|v| v.value.as_ref()),
+            Some(&setting_value::Value::BoolValue(false))
         );
 
-        let dummy_bool = merged.get("dummy_bool").expect("dummy_bool present");
-        assert_eq!(dummy_bool.scope, SettingScope::Sandbox as i32);
+        let ocsf_json = merged
+            .get("ocsf_json_enabled")
+            .expect("ocsf_json_enabled present");
+        assert_eq!(ocsf_json.scope, SettingScope::Sandbox as i32);
 
-        let dummy_int = merged.get("dummy_int").expect("dummy_int present");
-        assert_eq!(dummy_int.scope, SettingScope::Global as i32);
+        let proposals = merged
+            .get(settings::AGENT_POLICY_PROPOSALS_ENABLED_KEY)
+            .expect("agent_policy_proposals_enabled present");
+        assert_eq!(proposals.scope, SettingScope::Global as i32);
     }
 
-    #[cfg(feature = "dev-settings")]
     #[test]
     fn merge_effective_settings_sandbox_scoped_value_has_sandbox_scope() {
         let global = StoredSettings::default();
         let sandbox = StoredSettings {
             revision: 1,
-            settings: [(
-                "log_level".to_string(),
-                StoredSettingValue::String("debug".to_string()),
-            )]
-            .into_iter()
+            settings: std::iter::once((
+                "ocsf_json_enabled".to_string(),
+                StoredSettingValue::Bool(true),
+            ))
             .collect(),
             ..Default::default()
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
-        let log_level = merged.get("log_level").expect("log_level present");
-        assert_eq!(log_level.scope, SettingScope::Sandbox as i32);
-        assert!(log_level.value.is_some());
+        let ocsf_json = merged
+            .get("ocsf_json_enabled")
+            .expect("ocsf_json_enabled present");
+        assert_eq!(ocsf_json.scope, SettingScope::Sandbox as i32);
+        assert!(ocsf_json.value.is_some());
     }
 
     #[test]
@@ -9274,9 +9283,10 @@ mod tests {
             "log_level".to_string(),
             StoredSettingValue::String("error".to_string()),
         );
-        settings
-            .settings
-            .insert("dummy_bool".to_string(), StoredSettingValue::Bool(true));
+        settings.settings.insert(
+            "ocsf_json_enabled".to_string(),
+            StoredSettingValue::Bool(true),
+        );
         settings.revision = 5;
         save_global_settings(&store, &settings).await.unwrap();
 
@@ -9287,7 +9297,7 @@ mod tests {
             Some(&StoredSettingValue::String("error".to_string()))
         );
         assert_eq!(
-            loaded.settings.get("dummy_bool"),
+            loaded.settings.get("ocsf_json_enabled"),
             Some(&StoredSettingValue::Bool(true))
         );
     }
@@ -9298,9 +9308,10 @@ mod tests {
 
         let sandbox_name = "my-sandbox";
         let mut settings = StoredSettings::default();
-        settings
-            .settings
-            .insert("dummy_int".to_string(), StoredSettingValue::Int(99));
+        settings.settings.insert(
+            settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+            StoredSettingValue::String("auto".to_string()),
+        );
         settings.revision = 3;
         save_sandbox_settings(&store, sandbox_name, &settings)
             .await
@@ -9309,8 +9320,8 @@ mod tests {
         let loaded = load_sandbox_settings(&store, sandbox_name).await.unwrap();
         assert_eq!(loaded.revision, 3);
         assert_eq!(
-            loaded.settings.get("dummy_int"),
-            Some(&StoredSettingValue::Int(99))
+            loaded.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY),
+            Some(&StoredSettingValue::String("auto".to_string()))
         );
     }
 
@@ -9434,14 +9445,15 @@ mod tests {
         let store = test_store().await;
 
         let mut global = StoredSettings::default();
-        global
-            .settings
-            .insert("dummy_int".to_string(), StoredSettingValue::Int(42));
+        global.settings.insert(
+            "ocsf_json_enabled".to_string(),
+            StoredSettingValue::Bool(true),
+        );
         global.revision = 1;
         save_global_settings(&store, &global).await.unwrap();
 
         let loaded_global = load_global_settings(&store).await.unwrap();
-        assert!(loaded_global.settings.contains_key("dummy_int"));
+        assert!(loaded_global.settings.contains_key("ocsf_json_enabled"));
     }
 
     #[tokio::test]

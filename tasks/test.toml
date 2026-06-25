@@ -60,14 +60,14 @@ hide = true
 ["e2e:rust"]
 description = "Run Rust CLI e2e tests against a Docker-backed gateway"
 run = [
-  "cargo build -p openshell-cli --features openshell-core/dev-settings",
+  "cargo build -p openshell-cli",
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
 ]
 
 ["e2e:websocket-conformance"]
 description = "Run focused WebSocket conformance e2e tests against a Docker-backed gateway"
 run = [
-  "cargo build -p openshell-cli --features openshell-core/dev-settings",
+  "cargo build -p openshell-cli",
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test websocket_conformance",
 ]
 
@@ -110,7 +110,7 @@ run = "e2e/rust/e2e-docker.sh"
 ["e2e:mechanistic-smoke"]
 description = "Run mechanistic L4 smoke against a Docker-backed gateway"
 run = [
-  "cargo build -p openshell-cli --features openshell-core/dev-settings",
+  "cargo build -p openshell-cli",
   "e2e/with-docker-gateway.sh bash -lc 'target/debug/openshell settings set --global --key agent_policy_proposals_enabled --value true --yes && OPENSHELL_BIN=$PWD/target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh'",
 ]
 

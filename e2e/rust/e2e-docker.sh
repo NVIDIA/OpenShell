@@ -12,7 +12,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 E2E_TEST="${OPENSHELL_E2E_DOCKER_TEST:-smoke}"
 E2E_FEATURES="${OPENSHELL_E2E_DOCKER_FEATURES:-e2e,e2e-docker}"
 
-cargo build -p openshell-cli --features openshell-core/dev-settings
+cargo build -p openshell-cli
 
 exec "${ROOT}/e2e/with-docker-gateway.sh" \
   cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \

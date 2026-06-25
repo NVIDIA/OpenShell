@@ -21,7 +21,7 @@ use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tokio::time::{Instant, sleep};
 
-const TEST_KEY: &str = "dummy_bool";
+const TEST_KEY: &str = "ocsf_json_enabled";
 static SETTINGS_E2E_LOCK: Mutex<()> = Mutex::new(());
 
 struct CliResult {
@@ -231,7 +231,7 @@ async fn settings_global_override_round_trip() {
     assert!(
         set_global
             .clean_output
-            .contains("Set global setting dummy_bool=false"),
+            .contains(&format!("Set global setting {TEST_KEY}=false")),
         "expected global set output:\n{}",
         set_global.clean_output
     );
@@ -289,7 +289,7 @@ async fn settings_global_override_round_trip() {
     assert!(
         delete_global
             .clean_output
-            .contains("Deleted global setting dummy_bool"),
+            .contains(&format!("Deleted global setting {TEST_KEY}")),
         "expected global delete confirmation in output:\n{}",
         delete_global.clean_output
     );

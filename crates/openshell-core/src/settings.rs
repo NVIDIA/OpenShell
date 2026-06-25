@@ -137,20 +137,6 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         kind: SettingValueKind::String,
         allowed_string_values: Some(PROPOSAL_APPROVAL_MODE_VALUES),
     },
-    // Test-only keys live behind the `dev-settings` feature flag so they
-    // don't appear in production builds.
-    #[cfg(feature = "dev-settings")]
-    RegisteredSetting {
-        key: "dummy_int",
-        kind: SettingValueKind::Int,
-        allowed_string_values: None,
-    },
-    #[cfg(feature = "dev-settings")]
-    RegisteredSetting {
-        key: "dummy_bool",
-        kind: SettingValueKind::Bool,
-        allowed_string_values: None,
-    },
 ];
 
 /// Resolve a setting descriptor from the registry by key.
@@ -186,15 +172,6 @@ mod tests {
         REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
         registered_keys_csv, setting_for_key,
     };
-
-    #[cfg(feature = "dev-settings")]
-    #[test]
-    fn setting_for_key_returns_dev_entries() {
-        let setting = setting_for_key("dummy_bool").expect("dummy_bool should be registered");
-        assert_eq!(setting.kind, SettingValueKind::Bool);
-        let setting = setting_for_key("dummy_int").expect("dummy_int should be registered");
-        assert_eq!(setting.kind, SettingValueKind::Int);
-    }
 
     #[test]
     fn setting_for_key_returns_none_for_unknown() {

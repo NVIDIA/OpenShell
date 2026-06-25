@@ -84,13 +84,13 @@ jobs:
             gateway)
               binary_component=gateway
               binary_name=openshell-gateway
-              features="openshell-core/dev-settings bundled-z3"
+              features="bundled-z3"
               has_image=true
               ;;
             supervisor)
               binary_component=sandbox
               binary_name=openshell-sandbox
-              features="openshell-core/dev-settings"
+              features=""
               has_image=true
               ;;
             cli)
