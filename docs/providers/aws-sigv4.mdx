@@ -54,7 +54,6 @@ network_policies:
       - host: bedrock-runtime.us-east-1.amazonaws.com
         port: 443
         protocol: rest
-        access: allow
         credential_signing: sigv4
         signing_service: bedrock
         rules:
@@ -62,6 +61,10 @@ network_policies:
               method: POST
               path: /model/*/invoke
 ```
+
+<Note>
+The Bedrock example uses `rules` for fine-grained access control. When `rules` are present, omit the `access` field — they are mutually exclusive.
+</Note>
 
 ### S3 Example
 
@@ -72,7 +75,7 @@ network_policies:
       - host: "*.s3.us-east-1.amazonaws.com"
         port: 443
         protocol: rest
-        access: allow
+        access: full
         credential_signing: sigv4
         signing_service: s3
 ```
@@ -86,7 +89,7 @@ network_policies:
       - host: sts.us-east-1.amazonaws.com
         port: 443
         protocol: rest
-        access: allow
+        access: full
         credential_signing: sigv4
         signing_service: sts
 ```
@@ -123,7 +126,7 @@ endpoints:
   - host: custom-vpc-endpoint.example.com
     port: 443
     protocol: rest
-    access: allow
+    access: full
     credential_signing: sigv4
     signing_service: s3
     signing_region: us-west-2

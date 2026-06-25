@@ -1124,6 +1124,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if !e.signing_service.is_empty() {
                         ep["signing_service"] = e.signing_service.clone().into();
                     }
+                    if !e.signing_region.is_empty() {
+                        ep["signing_region"] = e.signing_region.clone().into();
+                    }
                     if !e.persisted_queries.is_empty() {
                         ep["persisted_queries"] = e.persisted_queries.clone().into();
                     }
@@ -2783,6 +2786,67 @@ network_policies:
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert_eq!(l7.credential_signing, crate::l7::CredentialSigning::SigV4);
         assert_eq!(l7.signing_service, "bedrock");
+    }
+
+    #[test]
+    fn l7_endpoint_config_preserves_proto_signing_region() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "custom_vpc".to_string(),
+            NetworkPolicyRule {
+                name: "custom_vpc".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "custom-vpc-endpoint.example.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    access: "full".to_string(),
+                    credential_signing: "sigv4".to_string(),
+                    signing_service: "s3".to_string(),
+                    signing_region: "us-west-2".to_string(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/local/bin/aws".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let input = NetworkInput {
+            host: "custom-vpc-endpoint.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/aws"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let config = engine
+            .query_endpoint_config(&input)
+            .unwrap()
+            .expect("endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).unwrap();
+        assert_eq!(l7.credential_signing, crate::l7::CredentialSigning::SigV4);
+        assert_eq!(l7.signing_service, "s3");
+        assert_eq!(l7.signing_region, "us-west-2");
     }
 
     #[test]
