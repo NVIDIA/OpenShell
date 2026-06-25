@@ -32,6 +32,11 @@ on:
         required: false
         type: string
         default: ""
+      agent-sandbox-version:
+        description: "Agent Sandbox release to install before OpenShell"
+        required: false
+        type: string
+        default: "v0.5.0"
       mise-version:
         description: "mise version to install on the bare Kubernetes e2e runner"
         required: false
@@ -114,6 +119,7 @@ jobs:
 
       - name: Run Kubernetes E2E (Rust smoke)
         env:
+          AGENT_SANDBOX_VERSION: ${{ inputs.agent-sandbox-version }}
           OPENSHELL_E2E_KUBE_CONTEXT: kind-${{ env.KIND_CLUSTER_NAME }}
           OPENSHELL_E2E_KUBE_EXTRA_VALUES: ${{ inputs.extra-helm-values }}
           OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET: ${{ inputs.external-postgres-secret }}

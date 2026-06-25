@@ -94,6 +94,18 @@ run = "e2e/rust/e2e-podman.sh"
 description = "Run Rust CLI e2e tests against an OpenShell gateway deployed on Kubernetes via Helm (set OPENSHELL_E2E_KUBE_CONTEXT to reuse a cluster; otherwise creates a local k3d cluster when k3d is installed; set OPENSHELL_E2E_KUBE_TEST=<name> to scope to one test)"
 run = "e2e/rust/e2e-kubernetes.sh"
 
+["e2e:kubernetes:v1alpha1"]
+description = "Run Kubernetes e2e against Agent Sandbox v1alpha1"
+env = { AGENT_SANDBOX_VERSION = "v0.4.6" }
+run = "e2e/rust/e2e-kubernetes.sh"
+
+["e2e:kubernetes:agent-sandbox-versions"]
+description = "Run Kubernetes e2e against Agent Sandbox v1beta1 and v1alpha1"
+run = [
+  "e2e/rust/e2e-kubernetes.sh",
+  "AGENT_SANDBOX_VERSION=v0.4.6 e2e/rust/e2e-kubernetes.sh",
+]
+
 ["e2e:kubernetes:db"]
 description = "Run Kubernetes e2e with all database backend scenarios (SQLite and external PostgreSQL with existingSecret)"
 env = { OPENSHELL_E2E_KUBE_DB_SCENARIOS = "1" }
