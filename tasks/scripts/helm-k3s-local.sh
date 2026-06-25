@@ -33,9 +33,10 @@ DEFAULT_SANDBOX_PRELOAD_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base
 PRELOAD_SANDBOX_IMAGE="${HELM_K3S_PRELOAD_SANDBOX_IMAGE-${DEFAULT_SANDBOX_PRELOAD_IMAGE}}"
 
 # Upstream agent-sandbox release pinned for both CRDs/controller and extensions.
-# Refresh this tag in lockstep with the supported field set in
-# crates/openshell-driver-kubernetes (see sandbox_to_k8s_spec).
-AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.4.6}"
+# The Kubernetes driver supports the v1beta1 Sandbox API introduced in v0.5.0
+# and falls back to v1alpha1 for v0.4.6 clusters. Override this env var to
+# exercise the v1alpha1 controller release.
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.0}"
 
 default_kubeconfig="${ROOT}/kubeconfig"
 if [[ -n "${HELM_K3S_KUBECONFIG:-}" ]]; then

@@ -23,6 +23,7 @@ use k8s_openapi::api::{
     core::v1::Pod,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::Error as KubeError;
 use kube::api::{Api, ApiResource, PostParams};
 use kube::core::{DynamicObject, gvk::GroupVersionKind};
 use std::sync::Arc;
@@ -40,8 +41,10 @@ pub const ISSUE_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/IssueSandbox
 /// include `patch pods` (see plan §11.8).
 pub const SANDBOX_ID_ANNOTATION: &str = "openshell.io/sandbox-id";
 const SANDBOX_API_GROUP: &str = "agents.x-k8s.io";
-const SANDBOX_API_VERSION: &str = "v1alpha1";
-const SANDBOX_API_VERSION_FULL: &str = "agents.x-k8s.io/v1alpha1";
+const SANDBOX_API_VERSION_V1BETA1: &str = "v1beta1";
+const SANDBOX_API_VERSION_V1ALPHA1: &str = "v1alpha1";
+const SANDBOX_API_VERSION_FULL_V1BETA1: &str = "agents.x-k8s.io/v1beta1";
+const SANDBOX_API_VERSION_FULL_V1ALPHA1: &str = "agents.x-k8s.io/v1alpha1";
 const SANDBOX_KIND: &str = "Sandbox";
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
@@ -140,6 +143,7 @@ struct TokenReviewIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SandboxOwnerReference {
+    api_version: String,
     name: String,
     uid: String,
 }
@@ -149,7 +153,8 @@ struct SandboxOwnerReference {
 pub struct LiveK8sResolver {
     token_reviews_api: Api<TokenReview>,
     pods_api: Api<Pod>,
-    sandboxes_api: Api<DynamicObject>,
+    sandboxes_api_v1beta1: Api<DynamicObject>,
+    sandboxes_api_v1alpha1: Api<DynamicObject>,
     expected_audience: String,
     sandbox_namespace: String,
     expected_service_account: String,
@@ -164,19 +169,50 @@ impl LiveK8sResolver {
     ) -> Self {
         let token_reviews_api: Api<TokenReview> = Api::all(client.clone());
         let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-        let sandbox_gvk =
-            GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION, SANDBOX_KIND);
-        let sandbox_resource = ApiResource::from_gvk(&sandbox_gvk);
-        let sandboxes_api: Api<DynamicObject> =
-            Api::namespaced_with(client, namespace, &sandbox_resource);
+        let sandbox_gvk_v1beta1 =
+            GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION_V1BETA1, SANDBOX_KIND);
+        let sandbox_resource_v1beta1 = ApiResource::from_gvk(&sandbox_gvk_v1beta1);
+        let sandbox_gvk_v1alpha1 = GroupVersionKind::gvk(
+            SANDBOX_API_GROUP,
+            SANDBOX_API_VERSION_V1ALPHA1,
+            SANDBOX_KIND,
+        );
+        let sandbox_resource_v1alpha1 = ApiResource::from_gvk(&sandbox_gvk_v1alpha1);
+        let sandboxes_api_v1beta1: Api<DynamicObject> =
+            Api::namespaced_with(client.clone(), namespace, &sandbox_resource_v1beta1);
+        let sandboxes_api_v1alpha1: Api<DynamicObject> =
+            Api::namespaced_with(client, namespace, &sandbox_resource_v1alpha1);
         Self {
             token_reviews_api,
             pods_api,
-            sandboxes_api,
+            sandboxes_api_v1beta1,
+            sandboxes_api_v1alpha1,
             expected_audience,
             sandbox_namespace: namespace.to_string(),
             expected_service_account,
         }
+    }
+
+    async fn get_sandbox_cr_for_owner(
+        &self,
+        owner: &SandboxOwnerReference,
+    ) -> Result<Option<DynamicObject>, KubeError> {
+        let apis = if owner.api_version == SANDBOX_API_VERSION_FULL_V1ALPHA1 {
+            [&self.sandboxes_api_v1alpha1, &self.sandboxes_api_v1beta1]
+        } else {
+            [&self.sandboxes_api_v1beta1, &self.sandboxes_api_v1alpha1]
+        };
+
+        for api in apis {
+            match api.get_opt(&owner.name).await {
+                Ok(Some(sandbox_cr)) => return Ok(Some(sandbox_cr)),
+                Ok(None) => {}
+                Err(err) if should_try_next_sandbox_api_version(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -258,10 +294,11 @@ impl K8sIdentityResolver for LiveK8sResolver {
         let sandbox_id = pod_sandbox_id(&pod)?;
 
         let owner = sandbox_owner_reference(&pod)?;
-        let sandbox_cr = self.sandboxes_api.get_opt(&owner.name).await.map_err(|e| {
+        let sandbox_cr = self.get_sandbox_cr_for_owner(&owner).await.map_err(|e| {
             warn!(
                 pod = %identity.pod_name,
                 sandbox_owner = %owner.name,
+                sandbox_owner_api_version = %owner.api_version,
                 error = %e,
                 "failed to fetch owning Sandbox CR for pod identity validation"
             );
@@ -271,6 +308,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
             warn!(
                 pod = %identity.pod_name,
                 sandbox_owner = %owner.name,
+                sandbox_owner_api_version = %owner.api_version,
                 "pod ownerReference points to a Sandbox CR that does not exist"
             );
             return Err(Status::permission_denied("sandbox owner not found"));
@@ -370,10 +408,25 @@ fn pod_sandbox_id(pod: &Pod) -> Result<String, Status> {
 #[allow(clippy::result_large_err)]
 fn sandbox_owner_reference(pod: &Pod) -> Result<SandboxOwnerReference, Status> {
     let owner_refs = pod.metadata.owner_references.as_deref().unwrap_or_default();
-    let mut sandbox_refs = owner_refs.iter().filter(|owner| {
-        owner.api_version == SANDBOX_API_VERSION_FULL && owner.kind == SANDBOX_KIND
-    });
+    let mut sandbox_refs = owner_refs
+        .iter()
+        .filter(|owner| is_supported_sandbox_owner_reference(owner));
     let Some(owner) = sandbox_refs.next() else {
+        let unsupported_sandbox_api_versions = owner_refs
+            .iter()
+            .filter(|owner| owner.kind == SANDBOX_KIND)
+            .map(|owner| owner.api_version.as_str())
+            .collect::<Vec<_>>();
+        if !unsupported_sandbox_api_versions.is_empty() {
+            warn!(
+                api_versions = ?unsupported_sandbox_api_versions,
+                supported_api_versions = ?[
+                    SANDBOX_API_VERSION_FULL_V1BETA1,
+                    SANDBOX_API_VERSION_FULL_V1ALPHA1,
+                ],
+                "pod Sandbox ownerReference uses unsupported apiVersion"
+            );
+        }
         return Err(Status::permission_denied(
             "pod is not controlled by an OpenShell Sandbox",
         ));
@@ -394,9 +447,28 @@ fn sandbox_owner_reference(pod: &Pod) -> Result<SandboxOwnerReference, Status> {
         ));
     }
     Ok(SandboxOwnerReference {
+        api_version: owner.api_version.clone(),
         name: owner.name.clone(),
         uid: owner.uid.clone(),
     })
+}
+
+fn is_supported_sandbox_owner_reference(
+    owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+) -> bool {
+    owner.kind == SANDBOX_KIND
+        && matches!(
+            owner.api_version.as_str(),
+            SANDBOX_API_VERSION_FULL_V1BETA1 | SANDBOX_API_VERSION_FULL_V1ALPHA1
+        )
+}
+
+fn should_try_next_sandbox_api_version(err: &KubeError) -> bool {
+    matches!(
+        err,
+        KubeError::Api(api)
+            if api.code == 404 && api.message.contains("could not find the requested resource")
+    )
 }
 
 #[allow(clippy::result_large_err)]
@@ -515,8 +587,12 @@ mod tests {
     }
 
     fn sandbox_owner(name: &str, uid: &str) -> OwnerReference {
+        sandbox_owner_with_api_version(SANDBOX_API_VERSION_FULL_V1BETA1, name, uid)
+    }
+
+    fn sandbox_owner_with_api_version(api_version: &str, name: &str, uid: &str) -> OwnerReference {
         OwnerReference {
-            api_version: SANDBOX_API_VERSION_FULL.to_string(),
+            api_version: api_version.to_string(),
             block_owner_deletion: None,
             controller: Some(true),
             kind: SANDBOX_KIND.to_string(),
@@ -549,7 +625,7 @@ mod tests {
 
     fn sandbox_cr(name: &str, uid: &str, sandbox_id: &str) -> DynamicObject {
         let sandbox_gvk =
-            GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION, SANDBOX_KIND);
+            GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION_V1BETA1, SANDBOX_KIND);
         let sandbox_resource = ApiResource::from_gvk(&sandbox_gvk);
         let mut cr = DynamicObject::new(name, &sandbox_resource);
         cr.metadata.uid = Some(uid.to_string());
@@ -681,6 +757,27 @@ mod tests {
         assert_eq!(
             owner,
             SandboxOwnerReference {
+                api_version: SANDBOX_API_VERSION_FULL_V1BETA1.to_string(),
+                name: "sandbox-a".to_string(),
+                uid: "cr-uid-a".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sandbox_owner_reference_accepts_v1alpha1_owner() {
+        let pod = pod_with_owner_refs(vec![sandbox_owner_with_api_version(
+            SANDBOX_API_VERSION_FULL_V1ALPHA1,
+            "sandbox-a",
+            "cr-uid-a",
+        )]);
+
+        let owner = sandbox_owner_reference(&pod).expect("expected v1alpha1 Sandbox owner");
+
+        assert_eq!(
+            owner,
+            SandboxOwnerReference {
+                api_version: SANDBOX_API_VERSION_FULL_V1ALPHA1.to_string(),
                 name: "sandbox-a".to_string(),
                 uid: "cr-uid-a".to_string(),
             }
@@ -692,6 +789,20 @@ mod tests {
         let pod = pod_with_owner_refs(vec![]);
 
         let err = sandbox_owner_reference(&pod).expect_err("missing owner must fail");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn sandbox_owner_reference_rejects_unsupported_sandbox_api_version() {
+        let pod = pod_with_owner_refs(vec![sandbox_owner_with_api_version(
+            "agents.x-k8s.io/v1",
+            "sandbox-a",
+            "cr-uid-a",
+        )]);
+
+        let err =
+            sandbox_owner_reference(&pod).expect_err("unsupported apiVersion must fail closed");
 
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
@@ -722,6 +833,7 @@ mod tests {
     #[test]
     fn validate_sandbox_owner_reference_requires_matching_cr_uid_and_label() {
         let owner = SandboxOwnerReference {
+            api_version: SANDBOX_API_VERSION_FULL_V1BETA1.to_string(),
             name: "sandbox-a".to_string(),
             uid: "cr-uid-a".to_string(),
         };

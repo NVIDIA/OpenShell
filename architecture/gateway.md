@@ -66,10 +66,13 @@ token through `IssueSandboxToken`. The gateway validates that projected token
 with Kubernetes `TokenReview`, requires the configured sandbox service account,
 checks the returned pod binding against the live pod UID, and verifies the pod's
 controlling `Sandbox` ownerReference against the live Sandbox CR UID and
-sandbox-id label before minting the gateway JWT. Supervisors renew gateway JWTs
-in memory before expiry only while the sandbox record still exists. Older tokens
-are not server-revoked; shared deployments bound replay exposure with short
-`gateway_jwt.ttl_secs` lifetimes. The config default is
+sandbox-id label before minting the gateway JWT. The bootstrap path accepts
+both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
+controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
+deployments. Supervisors renew gateway JWTs in memory before expiry only while
+the sandbox record still exists. Older tokens are not server-revoked; shared
+deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
+The config default is
 `gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
 gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
 shared deployments should set a positive TTL.

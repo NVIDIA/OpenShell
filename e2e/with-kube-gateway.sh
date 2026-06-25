@@ -51,9 +51,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh
 source "${ROOT}/e2e/support/gateway-common.sh"
 
-# Upstream agent-sandbox release. Bump in lockstep with the supported Sandbox
-# field set in crates/openshell-driver-kubernetes (see sandbox_to_k8s_spec).
-AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.4.6}"
+# Upstream agent-sandbox release. The Kubernetes driver supports the v1beta1
+# Sandbox API introduced in v0.5.0 and falls back to v1alpha1 for v0.4.6
+# clusters. Override this env var to exercise the v1alpha1 controller release.
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.5.0}"
 
 e2e_preserve_mise_dirs
 e2e_align_docker_host_with_cli_context
