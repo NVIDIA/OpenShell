@@ -2172,8 +2172,8 @@ mod tests {
             ..Default::default()
         };
 
-        let driver =
-            driver_sandbox_spec_from_public(&public, None).expect("driver spec should map");
+        let driver = driver_sandbox_spec_from_public(&public, "test-driver")
+            .expect("driver spec should map");
 
         let gpu = driver
             .resource_requirements
