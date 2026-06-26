@@ -834,7 +834,7 @@ fn kubernetes_config_from_file(
         return Ok(KubernetesComputeConfig::default());
     };
     let merged = config_file::driver_table(
-        ComputeDriverKind::Kubernetes,
+        ComputeDriverKind::Kubernetes.as_str(),
         &file.openshell.gateway,
         file.openshell.drivers.get("kubernetes"),
     );
@@ -865,7 +865,7 @@ fn podman_config_from_file(file: Option<&config_file::ConfigFile>) -> Result<Pod
         return Ok(PodmanComputeConfig::default());
     };
     let merged = config_file::driver_table(
-        ComputeDriverKind::Podman,
+        ComputeDriverKind::Podman.as_str(),
         &file.openshell.gateway,
         file.openshell.drivers.get("podman"),
     );

@@ -761,7 +761,7 @@ fn build_vm_config(
 ) -> Result<VmComputeConfig> {
     let mut cfg = if let Some(file) = file {
         let merged = config_file::driver_table(
-            ComputeDriverKind::Vm,
+            ComputeDriverKind::Vm.as_str(),
             &file.openshell.gateway,
             file.openshell.drivers.get("vm"),
         );
@@ -796,7 +796,7 @@ fn build_docker_config(
 ) -> Result<DockerComputeConfig> {
     let mut cfg = if let Some(file) = file {
         let merged = config_file::driver_table(
-            ComputeDriverKind::Docker,
+            ComputeDriverKind::Docker.as_str(),
             &file.openshell.gateway,
             file.openshell.drivers.get("docker"),
         );
@@ -1807,7 +1807,7 @@ namespace = "agents"
 "#,
         );
         let merged = crate::config_file::driver_table(
-            super::ComputeDriverKind::Kubernetes,
+            super::ComputeDriverKind::Kubernetes.as_str(),
             &file.openshell.gateway,
             file.openshell.drivers.get("kubernetes"),
         );
@@ -1830,7 +1830,7 @@ default_image = "k8s-specific:1.0"
 "#,
         );
         let merged = crate::config_file::driver_table(
-            super::ComputeDriverKind::Kubernetes,
+            super::ComputeDriverKind::Kubernetes.as_str(),
             &file.openshell.gateway,
             file.openshell.drivers.get("kubernetes"),
         );
