@@ -79,6 +79,12 @@ pub async fn run_process(
     #[cfg(unix)]
     crate::process::prepare_filesystem(policy)?;
 
+    // Wire the SPIFFE Workload API mount namespace so that
+    // supervisor_identity_mount_from_env() succeeds in spawn_entrypoint when
+    // PROVIDER_SPIFFE_WORKLOAD_API_SOCKET is set.
+    #[cfg(target_os = "linux")]
+    crate::process::prepare_supervisor_identity_mount_namespace_from_env()?;
+
     // Eagerly fetch initial settings and install the agent skill if the
     // proposals flag is on at startup, rather than waiting for the policy
     // poll loop's first tick. In offline/file-mode there is no gateway, so
