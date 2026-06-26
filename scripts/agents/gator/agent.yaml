@@ -86,5 +86,6 @@ subagents:
   - id: principal-engineer-reviewer
     source: repo://.claude/agents/principal-engineer-reviewer.md
     destination: subagents/principal-engineer-reviewer.md
+    expose_as: REVIEWER_COMMAND
 
 prompt_template: prompts/gator.md

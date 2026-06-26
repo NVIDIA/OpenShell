@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 OPENSHELL_BIN="${OPENSHELL_BIN:-openshell}"
 AGENT_ARG="${OPENSHELL_AGENT_DIR:-}"
@@ -27,11 +27,11 @@ BACKGROUND=0
 KEEP_SANDBOX=0
 
 usage() {
-    printf '%s\n' 'Usage: openshell-agents/run.sh --agent <name-or-path> [options] "agent prompt"'
+    printf '%s\n' 'Usage: scripts/agents/run.sh --agent <name-or-path> [options] "agent prompt"'
     cat <<'EOF'
 
 Options:
-  --agent NAME|PATH       Agent manifest directory or name under openshell-agents/
+  --agent NAME|PATH       Agent manifest directory or name under scripts/agents/
   --gateway NAME          Gateway name to use
   --name NAME             Sandbox name
   --from DOCKERFILE|DIR   Local Dockerfile source for the sandbox image
@@ -545,18 +545,36 @@ for ((upload_index = 0; upload_index < UPLOAD_COUNT; upload_index++)); do
     cp "$source_path" "$destination_path"
 done
 
-SUBAGENT_COMMAND="bash $PAYLOAD_IMAGE_DIR/runtime/subagent.sh principal-engineer-reviewer < task.md"
 PROMPT_TEMPLATE_PATH="$(resolve_manifest_path "$PROMPT_TEMPLATE")"
 [[ -f "$PROMPT_TEMPLATE_PATH" ]] || fail "missing prompt template: $PROMPT_TEMPLATE_PATH"
-ruby - "$PROMPT_TEMPLATE_PATH" "$PAYLOAD_DIR/agent-prompt.md" "$HARNESS" "$SUBAGENT_COMMAND" "$RUN_MODE" "$POLL_INTERVAL_SECONDS" "$USER_PROMPT" <<'RUBY'
-template_path, output_path, harness, subagent_command, run_mode, poll_interval_seconds, user_prompt = ARGV
+ruby -ryaml -rshellwords - "$PROMPT_TEMPLATE_PATH" "$PAYLOAD_DIR/agent-prompt.md" "$MANIFEST_FILE" "$PAYLOAD_IMAGE_DIR" "$HARNESS" "$RUN_MODE" "$POLL_INTERVAL_SECONDS" "$USER_PROMPT" <<'RUBY'
+template_path, output_path, manifest_path, payload_image_dir, harness, run_mode, poll_interval_seconds, user_prompt = ARGV
+manifest = YAML.load_file(manifest_path) || {}
+subagents = manifest.fetch("subagents", [])
+
+subagent_command = lambda do |id|
+  "bash #{Shellwords.escape(File.join(payload_image_dir, "runtime/subagent.sh"))} #{Shellwords.escape(id)} < task.md"
+end
+
 values = {
   "HARNESS" => harness,
-  "SUBAGENT_COMMAND" => subagent_command,
   "RUN_MODE" => run_mode,
   "POLL_INTERVAL_SECONDS" => poll_interval_seconds,
   "USER_PROMPT" => user_prompt,
 }
+
+subagents.each do |subagent|
+  next unless subagent.key?("expose_as")
+
+  expose_as = subagent.fetch("expose_as")
+  unless expose_as.match?(/\A[A-Z][A-Z0-9_]*\z/)
+    abort "invalid subagent expose_as '#{expose_as}': expected [A-Z][A-Z0-9_]*"
+  end
+  abort "prompt variable '#{expose_as}' is already defined" if values.key?(expose_as)
+
+  values[expose_as] = subagent_command.call(subagent.fetch("id"))
+end
+
 template = File.read(template_path)
 rendered = template.gsub(/\{\{([A-Z0-9_]+)\}\}/) do
   values.fetch(Regexp.last_match(1))

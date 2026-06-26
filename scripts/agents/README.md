@@ -1,6 +1,6 @@
 # OpenShell Agents
 
-`openshell-agents/` contains repository-owned agent launchers. An agent is a
+`scripts/agents/` contains repository-owned agent launchers. An agent is a
 manifest plus prompt assets that the shared launcher turns into an OpenShell
 sandbox run. Agents do not own harness implementations. Harness-specific setup
 and execution live in `runtime/harnesses/<name>/`.
@@ -8,7 +8,7 @@ and execution live in `runtime/harnesses/<name>/`.
 ## Directory Layout
 
 ```text
-openshell-agents/
+scripts/agents/
   run.sh                    # Generic manifest-driven launcher
   runtime/                  # Shared in-sandbox runtime
     entrypoint.sh           # Starts the in-sandbox supervisor
@@ -58,7 +58,7 @@ Manifest paths support these prefixes:
 
 ## Launch Order
 
-`openshell-agents/run.sh` performs the launch in this order:
+`scripts/agents/run.sh` performs the launch in this order:
 
 1. Parse CLI flags and select the agent directory from `--agent`.
 2. Load `agent.yaml`, select the requested harness, and reject unsupported
@@ -71,8 +71,8 @@ Manifest paths support these prefixes:
    `--codex-bin` is supplied.
 7. Copy manifest-declared skills and subagents into the payload.
 8. Render the prompt template with runtime values such as `{{HARNESS}}`,
-   `{{RUN_MODE}}`, `{{POLL_INTERVAL_SECONDS}}`, `{{SUBAGENT_COMMAND}}`, and
-   `{{USER_PROMPT}}`.
+   `{{RUN_MODE}}`, `{{POLL_INTERVAL_SECONDS}}`, `{{USER_PROMPT}}`, and
+   manifest-declared subagent variables such as `{{REVIEWER_COMMAND}}`.
 9. Build a temporary Docker context that bakes the rendered payload into
    `/etc/openshell/agent-payload`.
 10. Apply manifest-declared gateway settings.
@@ -189,7 +189,7 @@ warns that the later file is shadowed.
 Run it through the generic launcher:
 
 ```shell
-./openshell-agents/run.sh \
+./scripts/agents/run.sh \
   --agent gator \
   --gateway docker-dev \
   "Run gator on PR 1536 and keep watching until it closes or merges."

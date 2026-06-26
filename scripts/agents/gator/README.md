@@ -12,20 +12,20 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
 ## Usage
 
 ```shell
-./openshell-agents/run.sh \
+./scripts/agents/run.sh \
   --agent gator \
   --gateway docker-dev \
   --harness codex \
   "Run gator on PR 1536 and keep watching until it closes or merges."
 ```
 
-By default the launcher uses `openshell-agents/gator/Dockerfile` as the sandbox source. Local gateways build `openshell-agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes rendered prompts, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, so `--from` must point to a local Dockerfile or directory containing a Dockerfile.
+By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox source. Local gateways build `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes rendered prompts, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, so `--from` must point to a local Dockerfile or directory containing a Dockerfile.
 
-Use `--harness codex` to select Codex explicitly. Other harness names are rejected until their support is added to `agent.yaml` and `openshell-agents/runtime/harnesses/<name>/`. Agent directories do not carry their own harness implementations; they provide prompt templates and optional skills or subagents for the shared runtime to inject.
+Use `--harness codex` to select Codex explicitly. Other harness names are rejected until their support is added to `agent.yaml` and `scripts/agents/runtime/harnesses/<name>/`. Agent directories do not carry their own harness implementations; they provide prompt templates and optional skills or subagents for the shared runtime to inject.
 
 Use `--codex-bin "$(command -v codex)"` only when the host executable is compatible with the sandbox OS and architecture.
 
-The manifest-driven launcher at `openshell-agents/run.sh` reads `agent.yaml`, which defines the agent prompt template, provider profile IDs, provider credential sources, gateway settings, skills, subagents, sandbox defaults, runtime mode, and harness defaults. The shared sandbox entrypoint at `openshell-agents/runtime/entrypoint.sh` starts the in-sandbox supervisor, which invokes the selected harness adapter for bounded cycles.
+The manifest-driven launcher at `scripts/agents/run.sh` reads `agent.yaml`, which defines the agent prompt template, provider profile IDs, provider credential sources, gateway settings, skills, subagents, sandbox defaults, runtime mode, and harness defaults. The shared sandbox entrypoint at `scripts/agents/runtime/entrypoint.sh` starts the in-sandbox supervisor, which invokes the selected harness adapter for bounded cycles.
 
 The launcher:
 

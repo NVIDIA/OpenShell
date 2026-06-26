@@ -101,7 +101,8 @@ There must be at most one `gator:*` label on an issue or PR at any time.
 | `gator:validated` | Issue is valid and ready for work; no active PR monitoring needed |
 | `gator:in-review` | PR is valid and in agent review or author-feedback loop |
 | `gator:watch-pipeline` | Review feedback is resolved; CI/CD monitoring is active |
-| `gator:approval-needed` | Agent work is complete; maintainer approval or merge decision remains |
+| `gator:approval-needed` | Agent work is complete; maintainer approval is still needed |
+| `gator:merge-ready` | Maintainer approval is present; merge or close decision remains |
 
 If labels are missing and you have permission to create them, create them with clear descriptions. Otherwise report the missing labels to the operator.
 
@@ -112,12 +113,13 @@ gh label create "gator:validated" --description "Gator validated this issue as r
 gh label create "gator:in-review" --description "Gator is reviewing or awaiting PR review feedback" --color "1D76DB"
 gh label create "gator:watch-pipeline" --description "Gator is monitoring PR CI/CD status" --color "5319E7"
 gh label create "gator:approval-needed" --description "Gator completed review; maintainer approval needed" --color "C5DEF5"
+gh label create "gator:merge-ready" --description "Gator completed review and approval is present; merge decision pending" --color "0E8A16"
 ```
 
 When changing state, remove all existing `gator:*` labels first, then add the new one.
 
 ```bash
-for label in gator%3Afollow-up-needed gator%3Ablocked gator%3Avalidated gator%3Ain-review gator%3Awatch-pipeline gator%3Aapproval-needed; do
+for label in gator%3Afollow-up-needed gator%3Ablocked gator%3Avalidated gator%3Ain-review gator%3Awatch-pipeline gator%3Aapproval-needed gator%3Amerge-ready; do
   gh api --method DELETE repos/NVIDIA/OpenShell/issues/<number>/labels/$label --silent || true
 done
 gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/labels -f labels[]="gator:<state>"
@@ -164,7 +166,8 @@ for label in \
   gator:validated \
   gator:in-review \
   gator:watch-pipeline \
-  gator:approval-needed; do
+  gator:approval-needed \
+  gator:merge-ready; do
   gh pr list --repo NVIDIA/OpenShell --author "$author" --state closed \
     --search "label:$label" \
     --json number,title,state,mergedAt,closedAt,labels,url,updatedAt
@@ -209,14 +212,22 @@ gator:in-review
   -> gator:blocked           draft, vouch, DCO, merge conflict, or authority blocker
 
 gator:watch-pipeline
-  -> gator:approval-needed   required checks are green
+  -> gator:approval-needed   required checks are green and maintainer approval is missing
+  -> gator:merge-ready       required checks are green and maintainer approval is present
   -> gator:in-review         new review feedback or code changes need attention
   -> gator:follow-up-needed  author action needed for failures
   -> gator:blocked           process blocker prevents test execution
 
 gator:approval-needed
-  -> stop                    human maintainers take over
-  -> nudge maintainers       no maintainer action after 48 business hours
+  -> gator:merge-ready       maintainer approval arrives and checks remain green
+  -> nudge maintainers       no approval after 48 business hours
+  -> gator:watch-pipeline    checks are no longer green
+  -> gator:in-review         maintainer requests changes or author updates PR
+
+gator:merge-ready
+  -> stop                    PR merged or closed
+  -> nudge maintainers       no merge or close decision after 48 business hours
+  -> gator:watch-pipeline    checks are no longer green
   -> gator:in-review         maintainer requests changes or author updates PR
 ```
 
@@ -295,7 +306,7 @@ When not running under supervised watch mode, do not stop after a one-shot check
 
 Default live-watch cadence:
 
-- For supervised watch mode, set `next_poll_seconds` to 900 for PRs in active states: `gator:in-review`, `gator:watch-pipeline`, `gator:approval-needed`, and `gator:blocked`.
+- For supervised watch mode, set `next_poll_seconds` to 900 for PRs in active states: `gator:in-review`, `gator:watch-pipeline`, `gator:approval-needed`, `gator:merge-ready`, and `gator:blocked`.
 - Watch PRs indefinitely across gator state transitions until they close, merge, or the operator stops the session. In supervised watch mode this means return a `waiting` or `blocked` result sentinel and let the supervisor sleep outside the model session.
 - For supervised watch mode, set `next_poll_seconds` to 3600 for issue-only `gator:follow-up-needed` or issue-only `gator:blocked` states until they progress, close, or reach a TTL threshold.
 - Stop immediately for issue-only `gator:validated` items that have no associated PR.
@@ -312,8 +323,9 @@ State-specific monitoring:
 - `gator:blocked`: re-check the blocker. If resolved, continue to the previous intended state. If still blocked after 48 business hours, nudge the responsible party unless the PR was auto-closed by the vouch system.
 - `gator:validated`: for an issue-only item with no associated PR, stop; the issue is ready for work. If an associated PR exists or appears during a later invocation, validate the PR and move it to `gator:in-review`. If new information changes the scope, re-run validation.
 - `gator:in-review`: watch for author commits, trusted author responses, trusted maintainer comments, and unresolved gator findings. Ignore unacknowledged third-party comments. If feedback is addressed, move to E2E/test-label decision and then `gator:watch-pipeline`. If feedback is unanswered after 48 business hours, nudge the PR author. Continue watching after either action.
-- `gator:watch-pipeline`: watch checks until green, failed, or blocked. Move to `gator:approval-needed` only when required checks are green and no review feedback remains. Continue watching after the state transition because maintainer feedback can arrive later.
-- `gator:approval-needed`: watch for maintainer approval, merge, closure, new commits, author responses, or maintainer requested changes. If no maintainer action occurs after 48 business hours, nudge maintainers and CODEOWNERS. If humans request changes, move back to `gator:in-review` and continue watching author follow-up.
+- `gator:watch-pipeline`: watch checks until green, failed, or blocked. Move to `gator:approval-needed` when required checks are green, no review feedback remains, and maintainer approval is missing. Move directly to `gator:merge-ready` when required checks are green, no review feedback remains, and maintainer approval is present. Continue watching after either state transition because maintainer feedback can arrive later.
+- `gator:approval-needed`: watch for maintainer approval, merge, closure, new commits, author responses, or maintainer requested changes. If maintainer approval arrives while checks remain green and no review feedback remains, move to `gator:merge-ready`. If no approval arrives after 48 business hours, nudge maintainers and CODEOWNERS. If humans request changes, move back to `gator:in-review` and continue watching author follow-up.
+- `gator:merge-ready`: watch for merge, closure, new commits, failed checks, or maintainer requested changes. If no merge or close decision occurs after 48 business hours, nudge maintainers and CODEOWNERS. If checks are no longer green, move back to `gator:watch-pipeline`. If humans request changes or the author updates the PR, move back to `gator:in-review`.
 
 When calculating a nudge TTL, use the latest relevant event for that state:
 
@@ -517,7 +529,7 @@ Use the `principal-engineer-reviewer` sub-agent. Include:
 - Instruction to check whether direct UX changes update the Fern docs under `docs/` and navigation when needed
 - Instruction not to rely on local test execution
 
-When running inside the `openshell-agents/gator` sandbox launcher, invoke the reviewer command specified in the sandbox prompt. Use `task.md` for the subagent input. Put the PR metadata, linked issue context, and diff/file context in `task.md`, save the reviewer output, and use it as the independent review result. The main gator process remains responsible for labels, comments, docs gates, and CI monitoring. If the reviewer command exits nonzero or the saved reviewer output is absent or unusable, stop the cycle with the `reviewer_subagent_failed` transient result described above without changing GitHub labels or posting a public disposition.
+When running inside the `scripts/agents/gator` sandbox launcher, invoke the reviewer command specified in the sandbox prompt. Use `task.md` for the subagent input. Put the PR metadata, linked issue context, and diff/file context in `task.md`, save the reviewer output, and use it as the independent review result. The main gator process remains responsible for labels, comments, docs gates, and CI monitoring. If the reviewer command exits nonzero or the saved reviewer output is absent or unusable, stop the cycle with the `reviewer_subagent_failed` transient result described above without changing GitHub labels or posting a public disposition.
 
 Post findings as a gator comment or a GitHub PR review:
 
@@ -602,7 +614,7 @@ If checks fail:
 - If maintainer action is required, move to `gator:blocked`
 - If explicitly authorized to push fixes, make the minimal fix and continue watching
 
-When all required checks are green and no review feedback remains, move to `gator:approval-needed`.
+When all required checks are green and no review feedback remains, inspect `reviewDecision` and trusted maintainer reviews. Move to `gator:merge-ready` if maintainer approval is present. Otherwise move to `gator:approval-needed`.
 
 ## Step 11: Approval Needed
 
@@ -612,11 +624,11 @@ When applying `gator:approval-needed`, post a concise handoff comment:
 - Review status
 - CI status
 - E2E labels and outcomes
-- Remaining action: maintainer approval/merge decision
+- Remaining action: maintainer approval
 
 Do not approve or merge unless explicitly instructed and authorized.
 
-When resuming an item already in `gator:approval-needed`, check whether maintainer approval has been waiting for more than 48 business hours since the latest of:
+When resuming an item already in `gator:approval-needed`, first check whether maintainer approval is now present. If approval is present and required checks remain green with no unresolved review feedback, move to `gator:merge-ready`. Otherwise check whether maintainer approval has been waiting for more than 48 business hours since the latest of:
 
 - The first `gator:approval-needed` handoff comment
 - The most recent maintainer comment or review
@@ -625,6 +637,29 @@ When resuming an item already in `gator:approval-needed`, check whether maintain
 If more than 48 business hours have elapsed, post a single nudge comment tagging `@NVIDIA/openshell-maintainers` and any relevant CODEOWNERS. For PRs, derive relevant CODEOWNERS from `.github/CODEOWNERS` and the changed files; because OpenShell has broad ownership, include the broad owner set when no more specific owner exists.
 
 Do not post repeated nudges more often than once per 48 business hours. If the PR is no longer green, has new review feedback, or has changed materially, move it back to `gator:in-review` instead of nudging.
+
+## Step 12: Merge Ready
+
+When applying `gator:merge-ready`, post a concise handoff comment:
+
+- Validation summary
+- Review status
+- Approval status
+- CI status
+- E2E labels and outcomes
+- Remaining action: maintainer merge or close decision
+
+Do not merge unless explicitly instructed and authorized.
+
+When resuming an item already in `gator:merge-ready`, watch for merge, closure, new commits, failed checks, requested changes, or approval dismissal. If the PR merges or closes, perform closed/merged reconciliation. If checks fail or become pending, move to `gator:watch-pipeline`. If review feedback appears, approval is dismissed, or the author pushes new commits, move to `gator:in-review`.
+
+If no merge or close decision occurs after 48 business hours, post a single merge-decision nudge tagging `@NVIDIA/openshell-maintainers` and any relevant CODEOWNERS. Use the latest of these timestamps as the TTL start:
+
+- The first `gator:merge-ready` handoff comment
+- The most recent maintainer comment or review
+- The most recent gator merge-decision nudge comment
+
+Do not post repeated nudges more often than once per 48 business hours.
 
 ## Comment Templates
 
@@ -698,7 +733,7 @@ Disposition: <resolved / partially resolved / not resolved / needs clarification
 Remaining items:
 - <specific unresolved item, or "No blocking items remain">
 
-Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked|gator:approval-needed>`
+Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked|gator:approval-needed|gator:merge-ready>`
 ```
 
 ### Approval Needed
@@ -716,7 +751,26 @@ Docs: <summary>
 Checks: <summary>
 E2E: <summary or N/A>
 
-Human maintainer approval or merge decision is now required.
+Human maintainer approval is now required.
+```
+
+### Merge Ready
+
+```markdown
+> **gator-agent**
+
+## Merge Ready
+
+Gator validation and PR monitoring are complete, and maintainer approval is present.
+
+Validation: <summary>
+Review: <summary>
+Approval: <summary>
+Docs: <summary>
+Checks: <summary>
+E2E: <summary or N/A>
+
+Human maintainer merge or close decision is now required.
 ```
 
 ### Monitoring Complete
@@ -740,9 +794,21 @@ I removed the active `gator:*` label because there is nothing left for gator to 
 
 ## Maintainer Review Nudge
 
-This PR has been in `gator:approval-needed` for more than 48 business hours with no maintainer approval or merge decision.
+This PR has been in `gator:approval-needed` for more than 48 business hours with no maintainer approval.
 
 @NVIDIA/openshell-maintainers <relevant CODEOWNER mentions>, can someone review and either approve, request changes, or close this out?
+```
+
+### Merge Decision Nudge
+
+```markdown
+> **gator-agent**
+
+## Merge Decision Nudge
+
+This PR has been in `gator:merge-ready` for more than 48 business hours with maintainer approval present and no merge or close decision.
+
+@NVIDIA/openshell-maintainers <relevant CODEOWNER mentions>, can someone merge this PR or close/request changes if it should not proceed?
 ```
 
 ### Author Nudge
