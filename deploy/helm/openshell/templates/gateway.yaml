@@ -12,9 +12,21 @@ metadata:
 spec:
   gatewayClassName: {{ .Values.grpcRoute.gateway.className }}
   listeners:
-    - name: http
+    - name: {{ ternary "https" "http" (eq .Values.grpcRoute.gateway.listener.protocol "HTTPS") }}
       port: {{ .Values.grpcRoute.gateway.listener.port }}
       protocol: {{ .Values.grpcRoute.gateway.listener.protocol }}
+      {{- if eq .Values.grpcRoute.gateway.listener.protocol "HTTPS" }}
+      {{- if not .Values.grpcRoute.gateway.listener.tls.certificateRefs }}
+      {{- fail "grpcRoute.gateway.listener.tls.certificateRefs is required when grpcRoute.gateway.listener.protocol is HTTPS" }}
+      {{- end }}
+      {{- if not .Values.server.disableTls }}
+      {{- fail "grpcRoute.gateway.listener.protocol=HTTPS terminates TLS at Envoy Gateway, which forwards plaintext gRPC to the gateway pod; set server.disableTls=true so the pod listens plaintext (this chart does not render a BackendTLSPolicy for re-encryption to a TLS backend)" }}
+      {{- end }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          {{- toYaml .Values.grpcRoute.gateway.listener.tls.certificateRefs | nindent 10 }}
+      {{- end }}
       allowedRoutes:
         namespaces:
           from: {{ .Values.grpcRoute.gateway.listener.allowedRoutes }}
