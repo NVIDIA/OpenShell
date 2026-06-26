@@ -480,14 +480,18 @@ mod tests {
     #[tokio::test]
     async fn concurrent_steal_exactly_one_wins() {
         let store = test_store().await;
-        let l_holder = lease(store.clone(), "holder", Duration::ZERO);
+        let test_ttl = Duration::from_millis(100);
+        let expiry_slack = Duration::from_millis(25);
+
+        let l_holder = lease(store.clone(), "holder", test_ttl);
         let _guard = l_holder.try_acquire().await.unwrap();
+        tokio::time::sleep(test_ttl + expiry_slack).await;
 
         let mut tasks = Vec::new();
         for i in 0..5 {
             let s = store.clone();
             tasks.push(tokio::spawn(async move {
-                let l = lease(s, &format!("standby-{i}"), Duration::ZERO);
+                let l = lease(s, &format!("standby-{i}"), test_ttl);
                 l.try_steal_expired().await
             }));
         }
