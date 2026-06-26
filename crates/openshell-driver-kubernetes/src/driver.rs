@@ -258,36 +258,23 @@ impl KubernetesComputeDriver {
         &self.config.ssh_socket_path
     }
 
-    fn sandbox_api_for_version(&self, client: Client, version: &str) -> Api<DynamicObject> {
-        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, version, SANDBOX_KIND);
+    fn sandbox_api(&self, client: Client, sandbox_api_version: &str) -> Api<DynamicObject> {
+        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, sandbox_api_version, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
         Api::namespaced_with(client, &self.config.namespace, &resource)
     }
 
-    fn api_for_version(&self, version: &str) -> Api<DynamicObject> {
-        self.sandbox_api_for_version(self.client.clone(), version)
-    }
-
-    fn watch_api_for_version(&self, version: &str) -> Api<DynamicObject> {
-        self.sandbox_api_for_version(self.watch_client.clone(), version)
-    }
-
-    async fn supported_api_version(&self, watch_client: bool) -> Result<&'static str, String> {
-        let client = if watch_client {
-            self.watch_client.clone()
-        } else {
-            self.client.clone()
-        };
-        for version in SANDBOX_VERSIONS {
-            let api = self.sandbox_api_for_version(client.clone(), version);
+    async fn supported_sandbox_api_version(&self, client: Client) -> Result<&'static str, String> {
+        for sandbox_api_version in SANDBOX_VERSIONS {
+            let api = self.sandbox_api(client.clone(), sandbox_api_version);
             match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&ListParams::default().limit(1)))
                 .await
             {
-                Ok(Ok(_)) => return Ok(version),
+                Ok(Ok(_)) => return Ok(sandbox_api_version),
                 Ok(Err(err)) if should_try_next_sandbox_api_version(&err) => {
                     debug!(
                         namespace = %self.config.namespace,
-                        sandbox_api_version = %version,
+                        sandbox_api_version = %sandbox_api_version,
                         error = %err,
                         "Sandbox API version is not available; trying next supported version"
                     );
@@ -345,8 +332,10 @@ impl KubernetesComputeDriver {
             "Fetching sandbox from Kubernetes"
         );
 
-        let version = self.supported_api_version(false).await?;
-        let api = self.api_for_version(version);
+        let sandbox_api_version = self
+            .supported_sandbox_api_version(self.client.clone())
+            .await?;
+        let api = self.sandbox_api(self.client.clone(), sandbox_api_version);
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
             Ok(Ok(obj)) => sandbox_from_object(&self.config.namespace, obj).map(Some),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => {
@@ -381,8 +370,10 @@ impl KubernetesComputeDriver {
             "Listing sandboxes from Kubernetes"
         );
 
-        let version = self.supported_api_version(false).await?;
-        let api = self.api_for_version(version);
+        let sandbox_api_version = self
+            .supported_sandbox_api_version(self.client.clone())
+            .await?;
+        let api = self.sandbox_api(self.client.clone(), sandbox_api_version);
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&ListParams::default())).await {
             Ok(Ok(list)) => {
                 let mut sandboxes = list
@@ -437,11 +428,11 @@ impl KubernetesComputeDriver {
             "Creating sandbox in Kubernetes"
         );
 
-        let version = self
-            .supported_api_version(false)
+        let sandbox_api_version = self
+            .supported_sandbox_api_version(self.client.clone())
             .await
             .map_err(KubernetesDriverError::Message)?;
-        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, version, SANDBOX_KIND);
+        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, sandbox_api_version, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
         let mut obj = DynamicObject::new(name, &resource);
         obj.metadata = ObjectMeta {
@@ -475,7 +466,7 @@ impl KubernetesComputeDriver {
                 .provider_spiffe_workload_api_socket_path,
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
-        let api = self.api_for_version(version);
+        let api = self.sandbox_api(self.client.clone(), sandbox_api_version);
 
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), &obj)).await
         {
@@ -518,8 +509,10 @@ impl KubernetesComputeDriver {
             "Deleting sandbox from Kubernetes"
         );
 
-        let version = self.supported_api_version(false).await?;
-        let api = self.api_for_version(version);
+        let sandbox_api_version = self
+            .supported_sandbox_api_version(self.client.clone())
+            .await?;
+        let api = self.sandbox_api(self.client.clone(), sandbox_api_version);
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(name, &DeleteParams::default()))
             .await
         {
@@ -554,8 +547,10 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn sandbox_exists(&self, name: &str) -> Result<bool, String> {
-        let version = self.supported_api_version(false).await?;
-        let api = self.api_for_version(version);
+        let sandbox_api_version = self
+            .supported_sandbox_api_version(self.client.clone())
+            .await?;
+        let api = self.sandbox_api(self.client.clone(), sandbox_api_version);
         match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
             Ok(Ok(_)) => Ok(true),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(false),
@@ -571,8 +566,10 @@ impl KubernetesComputeDriver {
     #[allow(clippy::unused_async)]
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
         let namespace = self.config.namespace.clone();
-        let version = self.supported_api_version(true).await?;
-        let sandbox_api = self.watch_api_for_version(version);
+        let sandbox_api_version = self
+            .supported_sandbox_api_version(self.watch_client.clone())
+            .await?;
+        let sandbox_api = self.sandbox_api(self.watch_client.clone(), sandbox_api_version);
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
         let mut sandbox_stream = watcher::watcher(sandbox_api, watcher::Config::default()).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
