@@ -66,6 +66,22 @@ EOF
   chmod +x "$wrapper_dir/$tool"
 done
 
+cat >"$wrapper_dir/ar" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec "$zig" ar "\$@"
+EOF
+chmod +x "$wrapper_dir/ar"
+
+cat >"$wrapper_dir/ranlib" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec "$zig" ranlib "\$@"
+EOF
+chmod +x "$wrapper_dir/ranlib"
+
 processor=${cargo_target%%-*}
 toolchain_file="$wrapper_dir/toolchain.cmake"
 cat >"$toolchain_file" <<EOF
@@ -73,6 +89,8 @@ set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR "$processor")
 set(CMAKE_C_COMPILER "$wrapper_dir/cc")
 set(CMAKE_CXX_COMPILER "$wrapper_dir/c++")
+set(CMAKE_AR "$wrapper_dir/ar")
+set(CMAKE_RANLIB "$wrapper_dir/ranlib")
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 EOF
 
@@ -103,20 +121,28 @@ if [[ -n ${GITHUB_ENV:-} ]]; then
   {
     echo "CC_${target_env}=$wrapper_dir/cc"
     echo "CXX_${target_env}=$wrapper_dir/c++"
+    echo "AR_${target_env}=$wrapper_dir/ar"
+    echo "RANLIB_${target_env}=$wrapper_dir/ranlib"
     echo "CMAKE_TOOLCHAIN_FILE_${target_env}=$toolchain_file"
     if [[ $bare_target_env != "$target_env" ]]; then
       echo "CC_${bare_target_env}=$wrapper_dir/cc"
       echo "CXX_${bare_target_env}=$wrapper_dir/c++"
+      echo "AR_${bare_target_env}=$wrapper_dir/ar"
+      echo "RANLIB_${bare_target_env}=$wrapper_dir/ranlib"
       echo "CMAKE_TOOLCHAIN_FILE_${bare_target_env}=$toolchain_file"
     fi
   } >>"$GITHUB_ENV"
 else
   echo "export CC_${target_env}=$wrapper_dir/cc"
   echo "export CXX_${target_env}=$wrapper_dir/c++"
+  echo "export AR_${target_env}=$wrapper_dir/ar"
+  echo "export RANLIB_${target_env}=$wrapper_dir/ranlib"
   echo "export CMAKE_TOOLCHAIN_FILE_${target_env}=$toolchain_file"
   if [[ $bare_target_env != "$target_env" ]]; then
     echo "export CC_${bare_target_env}=$wrapper_dir/cc"
     echo "export CXX_${bare_target_env}=$wrapper_dir/c++"
+    echo "export AR_${bare_target_env}=$wrapper_dir/ar"
+    echo "export RANLIB_${bare_target_env}=$wrapper_dir/ranlib"
     echo "export CMAKE_TOOLCHAIN_FILE_${bare_target_env}=$toolchain_file"
   fi
 fi
