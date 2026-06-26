@@ -46,7 +46,7 @@ pub mod tracing_bus;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openshell_core::{ComputeDriverKind, Config, Error, Result};
+use openshell_core::{ComputeDriverConfig, ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -722,11 +722,11 @@ async fn build_compute_runtime(
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 ) -> Result<ComputeRuntime> {
     let driver = configured_compute_driver(config)?;
-    info!(driver = %driver, "Using compute driver");
-    warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, driver);
+    info!(driver = %driver.kind(), "Using compute driver");
+    warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, driver.kind());
 
     match driver {
-        ComputeDriverKind::Kubernetes => {
+        ComputeDriverConfig::Kubernetes => {
             let mut k8s = kubernetes_config_from_file(file)?;
             if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
                 k8s.workspace_default_storage_size = size;
@@ -742,7 +742,7 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ComputeDriverKind::Docker => ComputeRuntime::new_docker(
+        ComputeDriverConfig::Docker => ComputeRuntime::new_docker(
             config.clone(),
             docker_config.clone(),
             store,
@@ -753,7 +753,7 @@ async fn build_compute_runtime(
         )
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
-        ComputeDriverKind::Vm => {
+        ComputeDriverConfig::Vm => {
             let (channel, driver_process) = compute::vm::spawn(config, vm_config).await?;
             ComputeRuntime::new_remote_vm(
                 channel,
@@ -767,11 +767,13 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ComputeDriverKind::Podman => {
+        ComputeDriverConfig::Podman { socket_path } => {
             let mut podman = podman_config_from_file(file)?;
             podman.gateway_port = config.bind_address.port();
             if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
                 podman.socket_path = PathBuf::from(p);
+            } else {
+                podman.socket_path = socket_path;
             }
             if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
                 podman.host_gateway_ip = ip;
@@ -868,10 +870,10 @@ fn apply_podman_local_tls_defaults(
     Ok(())
 }
 
-fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
+fn configured_compute_driver(config: &Config) -> Result<ComputeDriverConfig> {
     match config.compute_drivers.as_slice() {
         [] => match openshell_core::config::detect_driver() {
-            Some(ComputeDriverKind::Vm) => Err(Error::config(
+            Some(ComputeDriverConfig::Vm) => Err(Error::config(
                 "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
             )),
             Some(driver) => Ok(driver),
@@ -880,12 +882,7 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
                 set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
             )),
         },
-        [
-            driver @ (ComputeDriverKind::Kubernetes
-            | ComputeDriverKind::Vm
-            | ComputeDriverKind::Docker
-            | ComputeDriverKind::Podman),
-        ] => Ok(*driver),
+        [driver] => explicit_driver(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers
@@ -895,6 +892,18 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
                 .join(",")
         ))),
     }
+}
+
+fn explicit_driver(kind: ComputeDriverKind) -> Result<ComputeDriverConfig> {
+    Ok(match kind {
+        ComputeDriverKind::Kubernetes => ComputeDriverConfig::Kubernetes,
+        ComputeDriverKind::Docker => ComputeDriverConfig::Docker,
+        ComputeDriverKind::Vm => ComputeDriverConfig::Vm,
+        ComputeDriverKind::Podman => ComputeDriverConfig::Podman {
+            socket_path: openshell_core::config::detect_podman()
+                .unwrap_or_else(openshell_driver_podman::PodmanComputeConfig::default_socket_path),
+        },
+    })
 }
 
 fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config, driver: ComputeDriverKind) -> bool {
@@ -923,7 +932,7 @@ mod tests {
         serve_gateway_listener,
     };
     use openshell_core::{
-        ComputeDriverKind, Config,
+        ComputeDriverConfig, ComputeDriverKind, Config,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
     use std::io::{Error, ErrorKind};
@@ -1239,9 +1248,9 @@ mod tests {
                 assert!(
                     matches!(
                         driver,
-                        ComputeDriverKind::Kubernetes
-                            | ComputeDriverKind::Docker
-                            | ComputeDriverKind::Podman
+                        ComputeDriverConfig::Kubernetes
+                            | ComputeDriverConfig::Docker
+                            | ComputeDriverConfig::Podman { .. }
                     ),
                     "auto-detected unexpected driver: {driver:?}"
                 );
@@ -1271,10 +1280,8 @@ mod tests {
     #[test]
     fn configured_compute_driver_accepts_podman() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
-        assert_eq!(
-            configured_compute_driver(&config).unwrap(),
-            ComputeDriverKind::Podman
-        );
+        let driver = configured_compute_driver(&config).unwrap();
+        assert_eq!(driver.kind(), ComputeDriverKind::Podman);
     }
 
     #[test]
@@ -1282,7 +1289,7 @@ mod tests {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
         assert_eq!(
             configured_compute_driver(&config).unwrap(),
-            ComputeDriverKind::Vm
+            ComputeDriverConfig::Vm
         );
     }
 
@@ -1291,7 +1298,7 @@ mod tests {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
         assert_eq!(
             configured_compute_driver(&config).unwrap(),
-            ComputeDriverKind::Docker
+            ComputeDriverConfig::Docker
         );
     }
 
