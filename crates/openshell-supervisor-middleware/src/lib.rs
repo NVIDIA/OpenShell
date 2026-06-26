@@ -100,7 +100,7 @@ pub struct ChainOutcome {
     pub applied: Vec<MiddlewareInvocation>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespacedFinding {
     pub middleware: String,
     pub finding: Finding,
@@ -112,6 +112,48 @@ pub struct MiddlewareInvocation {
     pub implementation: String,
     pub decision: Decision,
     pub transformed: bool,
+    /// True when the middleware could not be evaluated and `on_error` was applied
+    /// (service error, malformed/unsafe response, etc.). The `decision` reflects
+    /// the `on_error` outcome, not a decision the middleware actually returned.
+    pub failed: bool,
+}
+
+enum OnErrorAction {
+    /// `fail_open`: skip this middleware, leaving the request unchanged.
+    FailOpen,
+    /// `fail_closed`: short-circuit the chain and deny with the given reason.
+    FailClosed(String),
+}
+
+/// Apply a middleware entry's `on_error` policy after a failure (service error or
+/// malformed response). Records a `failed` invocation for telemetry in both cases.
+fn apply_on_error(
+    entry: &ChainEntry,
+    reason: &str,
+    applied: &mut Vec<MiddlewareInvocation>,
+) -> OnErrorAction {
+    match entry.on_error {
+        OnError::FailOpen => {
+            applied.push(MiddlewareInvocation {
+                name: entry.name.clone(),
+                implementation: entry.implementation.clone(),
+                decision: Decision::Allow,
+                transformed: false,
+                failed: true,
+            });
+            OnErrorAction::FailOpen
+        }
+        OnError::FailClosed => {
+            applied.push(MiddlewareInvocation {
+                name: entry.name.clone(),
+                implementation: entry.implementation.clone(),
+                decision: Decision::Deny,
+                transformed: false,
+                failed: true,
+            });
+            OnErrorAction::FailClosed(format!("middleware_failed: {reason}"))
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -150,20 +192,33 @@ impl ChainRunner {
                 .await
             {
                 Ok(result) => result.into_inner(),
-                Err(err) => match entry.on_error {
-                    OnError::FailOpen => {
-                        applied.push(MiddlewareInvocation {
-                            name: entry.name.clone(),
-                            implementation: entry.implementation.clone(),
-                            decision: Decision::Allow,
-                            transformed: false,
-                        });
-                        continue;
+                Err(err) => {
+                    match apply_on_error(entry, &safe_reason(&err.to_string()), &mut applied) {
+                        OnErrorAction::FailOpen => continue,
+                        OnErrorAction::FailClosed(reason) => {
+                            return Ok(ChainOutcome {
+                                allowed: false,
+                                reason,
+                                body,
+                                added_headers,
+                                findings,
+                                metadata,
+                                applied,
+                            });
+                        }
                     }
-                    OnError::FailClosed => {
+                }
+            };
+
+            // A result proposing unsafe header mutations is a malformed response:
+            // route it through `on_error` instead of applying any of it.
+            if validate_header_mutations(&headers, &result.add_headers).is_err() {
+                match apply_on_error(entry, "unsafe_response_headers", &mut applied) {
+                    OnErrorAction::FailOpen => continue,
+                    OnErrorAction::FailClosed(reason) => {
                         return Ok(ChainOutcome {
                             allowed: false,
-                            reason: format!("middleware_failed: {}", safe_reason(&err.to_string())),
+                            reason,
                             body,
                             added_headers,
                             findings,
@@ -171,17 +226,15 @@ impl ChainRunner {
                             applied,
                         });
                     }
-                },
-            };
-
-            validate_header_mutations(&headers, &result.add_headers)?;
+                }
+            }
             for (name, value) in &result.add_headers {
                 headers.insert(name.to_ascii_lowercase(), value.clone());
                 added_headers.insert(name.to_ascii_lowercase(), value.clone());
             }
             let transformed = result.has_body;
             if result.has_body {
-                body = result.body.clone();
+                result.body.clone_into(&mut body);
             }
             for finding in result.findings {
                 findings.push(NamespacedFinding {
@@ -200,6 +253,7 @@ impl ChainRunner {
                 implementation: entry.implementation.clone(),
                 decision: Decision::try_from(result.decision).unwrap_or(Decision::Unspecified),
                 transformed,
+                failed: false,
             });
             if result.decision == Decision::Deny as i32 {
                 return Ok(ChainOutcome {
@@ -264,7 +318,7 @@ fn validate_header_mutations(
     mutations: &HashMap<String, String>,
 ) -> Result<()> {
     let mut seen = HashSet::new();
-    for name in mutations.keys() {
+    for (name, value) in mutations {
         let lower = name.to_ascii_lowercase();
         if !seen.insert(lower.clone()) || existing_headers.contains_key(&lower) {
             return Err(miette!(
@@ -274,8 +328,25 @@ fn validate_header_mutations(
         if !is_safe_append_header(&lower) {
             return Err(miette!("middleware cannot append unsafe header '{name}'"));
         }
+        // Reject CR/LF and other control characters in the value: writing them
+        // verbatim into the upstream header block would enable header injection
+        // and request smuggling past the credential boundary.
+        if !is_safe_header_value(value) {
+            return Err(miette!(
+                "middleware cannot append header '{name}' with an unsafe value"
+            ));
+        }
     }
     Ok(())
+}
+
+/// A header value is safe to append only if it contains no control characters.
+/// Horizontal tab, printable ASCII, and obs-text (>= 0x80) are permitted; CR, LF,
+/// NUL, and other control bytes are rejected.
+fn is_safe_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b) || b >= 0x80)
 }
 
 fn is_safe_append_header(name: &str) -> bool {
@@ -312,13 +383,12 @@ mod tests {
             name: name.into(),
             implementation: BUILTIN_SECRETS.into(),
             config: prost_types::Struct {
-                fields: [(
+                fields: std::iter::once((
                     "secrets".into(),
                     prost_types::Value {
                         kind: Some(prost_types::value::Kind::StringValue("redact".into())),
                     },
-                )]
-                .into_iter()
+                ))
                 .collect(),
             },
             on_error,
@@ -427,11 +497,191 @@ mod tests {
     fn unsafe_header_mutation_is_rejected() {
         let err = validate_header_mutations(
             &BTreeMap::new(),
-            &[("Authorization".into(), "Bearer nope".into())]
-                .into_iter()
-                .collect(),
+            &std::iter::once(("Authorization".into(), "Bearer nope".into())).collect(),
         )
         .expect_err("unsafe header");
         assert!(err.to_string().contains("unsafe header"));
+    }
+
+    #[test]
+    fn header_value_with_crlf_is_rejected() {
+        // A safe header *name* with a CRLF-bearing value must still be rejected,
+        // otherwise it would inject extra headers into the upstream request.
+        let err = validate_header_mutations(
+            &BTreeMap::new(),
+            &std::iter::once((
+                "x-openshell-middleware-inject".into(),
+                "ok\r\nAuthorization: Bearer evil".into(),
+            ))
+            .collect(),
+        )
+        .expect_err("crlf value");
+        assert!(err.to_string().contains("unsafe value"));
+    }
+
+    /// A mock middleware that returns a fixed, caller-supplied result for every
+    /// evaluation. Used to exercise chain behavior the built-in cannot produce
+    /// (explicit deny, metadata, findings, unsafe header mutations).
+    struct ScriptedService {
+        result: openshell_core::proto::HttpRequestResult,
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for ScriptedService {
+        async fn describe(
+            &self,
+            _request: Request<()>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::MiddlewareManifest>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::MiddlewareManifest::default(),
+            ))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<openshell_core::proto::ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(self.result.clone()))
+        }
+    }
+
+    fn allow_result() -> openshell_core::proto::HttpRequestResult {
+        openshell_core::proto::HttpRequestResult {
+            decision: Decision::Allow as i32,
+            reason: String::new(),
+            body: Vec::new(),
+            has_body: false,
+            add_headers: HashMap::new(),
+            findings: Vec::new(),
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_decision_short_circuits_chain() {
+        let runner = ChainRunner::new(Arc::new(ScriptedService {
+            result: openshell_core::proto::HttpRequestResult {
+                decision: Decision::Deny as i32,
+                reason: "blocked_by_policy".into(),
+                ..allow_result()
+            },
+        }));
+        let outcome = runner
+            .evaluate(
+                &[
+                    entry("first", OnError::FailClosed),
+                    entry("second", OnError::FailClosed),
+                ],
+                input("hello"),
+            )
+            .await
+            .expect("evaluate");
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.reason, "blocked_by_policy");
+        // The deny short-circuits the chain: the second middleware never runs.
+        assert_eq!(outcome.applied.len(), 1);
+        assert_eq!(outcome.applied[0].decision, Decision::Deny);
+        assert!(!outcome.applied[0].failed);
+    }
+
+    #[tokio::test]
+    async fn metadata_and_findings_are_namespaced_per_config() {
+        let runner = ChainRunner::new(Arc::new(ScriptedService {
+            result: openshell_core::proto::HttpRequestResult {
+                findings: vec![Finding {
+                    r#type: "pii.email".into(),
+                    label: "email address".into(),
+                    count: 2,
+                    confidence: "high".into(),
+                    severity: "medium".into(),
+                }],
+                metadata: std::iter::once(("sensitivity".to_string(), "high".to_string()))
+                    .collect(),
+                ..allow_result()
+            },
+        }));
+        let outcome = runner
+            .evaluate(
+                &[
+                    entry("alpha", OnError::FailClosed),
+                    entry("beta", OnError::FailClosed),
+                ],
+                input("hello"),
+            )
+            .await
+            .expect("evaluate");
+        assert!(outcome.allowed);
+        // Metadata is bucketed under each config's local name, so two configs
+        // emitting the same key do not collide.
+        assert_eq!(outcome.metadata["alpha"]["sensitivity"], "high");
+        assert_eq!(outcome.metadata["beta"]["sensitivity"], "high");
+        // Findings are tagged with the emitting config's name.
+        assert_eq!(outcome.findings.len(), 2);
+        assert_eq!(outcome.findings[0].middleware, "alpha");
+        assert_eq!(outcome.findings[1].middleware, "beta");
+        assert_eq!(outcome.findings[0].finding.r#type, "pii.email");
+        assert_eq!(outcome.findings[0].finding.count, 2);
+    }
+
+    fn unsafe_header_service() -> ScriptedService {
+        ScriptedService {
+            result: openshell_core::proto::HttpRequestResult {
+                add_headers: std::iter::once((
+                    "x-openshell-middleware-inject".to_string(),
+                    "ok\r\nHost: evil".to_string(),
+                ))
+                .collect(),
+                ..allow_result()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_response_headers_fail_closed_denies() {
+        let runner = ChainRunner::new(Arc::new(unsafe_header_service()));
+        let outcome = runner
+            .evaluate(&[entry("redact", OnError::FailClosed)], input("hello"))
+            .await
+            .expect("evaluate");
+        assert!(!outcome.allowed);
+        assert!(outcome.reason.starts_with("middleware_failed:"));
+        assert!(outcome.applied.iter().any(|inv| inv.failed));
+        // The unsafe header is never forwarded.
+        assert!(outcome.added_headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_response_headers_fail_open_continues() {
+        let runner = ChainRunner::new(Arc::new(unsafe_header_service()));
+        let outcome = runner
+            .evaluate(&[entry("redact", OnError::FailOpen)], input("hello"))
+            .await
+            .expect("evaluate");
+        assert!(outcome.allowed);
+        assert_eq!(outcome.body, b"hello");
+        assert!(outcome.added_headers.is_empty());
+        assert_eq!(outcome.applied.len(), 1);
+        assert!(outcome.applied[0].failed);
     }
 }

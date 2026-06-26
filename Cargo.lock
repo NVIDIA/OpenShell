@@ -3980,6 +3980,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tower-mcp-types",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "webpki-roots 1.0.7",
 ]

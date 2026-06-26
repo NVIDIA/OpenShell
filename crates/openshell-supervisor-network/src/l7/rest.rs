@@ -774,11 +774,23 @@ pub(crate) struct BufferedRequestBody {
     pub(crate) body: Vec<u8>,
 }
 
+/// Result of attempting to buffer a request body for middleware inspection.
+pub(crate) enum BufferResult {
+    /// The full body was buffered within the size cap.
+    Buffered(BufferedRequestBody),
+    /// The body exceeded the inspection cap. `recoverable` is true when no body
+    /// bytes were consumed yet (a declared `Content-Length` over the cap), so the
+    /// request can still be streamed through unprocessed under fail-open. It is
+    /// false once bytes have been consumed (chunked overflow), where denying is
+    /// the only safe outcome.
+    OverCapacity { recoverable: bool },
+}
+
 pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
     req: &L7Request,
     client: &mut C,
     generation_guard: Option<&PolicyGenerationGuard>,
-) -> Result<BufferedRequestBody> {
+) -> Result<BufferResult> {
     let header_end = req
         .raw_header
         .windows(4)
@@ -787,17 +799,19 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
     let headers = req.raw_header[..header_end].to_vec();
     let already_read = &req.raw_header[header_end..];
     match req.body_length {
-        BodyLength::None => Ok(BufferedRequestBody {
+        BodyLength::None => Ok(BufferResult::Buffered(BufferedRequestBody {
             headers,
             body: already_read.to_vec(),
-        }),
+        })),
         BodyLength::ContentLength(len) => {
-            let len = usize::try_from(len)
-                .map_err(|_| miette!("request body is too large for middleware"))?;
+            // The declared length is known before any further reads, so an
+            // over-cap body here has not consumed the stream and can be passed
+            // through unprocessed if every middleware is fail-open.
+            let Ok(len) = usize::try_from(len) else {
+                return Ok(BufferResult::OverCapacity { recoverable: true });
+            };
             if len > MAX_MIDDLEWARE_BODY_BYTES {
-                return Err(miette!(
-                    "middleware buffers at most {MAX_MIDDLEWARE_BODY_BYTES} request body bytes"
-                ));
+                return Ok(BufferResult::OverCapacity { recoverable: true });
             }
             let initial_len = already_read.len().min(len);
             let mut body = Vec::with_capacity(len);
@@ -818,11 +832,21 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
                 body.extend_from_slice(&buf[..n]);
                 remaining -= n;
             }
-            Ok(BufferedRequestBody { headers, body })
+            Ok(BufferResult::Buffered(BufferedRequestBody {
+                headers,
+                body,
+            }))
         }
         BodyLength::Chunked => {
-            let body = collect_chunked_body(client, already_read, generation_guard).await?;
-            Ok(BufferedRequestBody { headers, body })
+            // Chunked bodies are decoded incrementally into the payload bytes
+            // middleware expects. On overflow, we have already consumed wire
+            // bytes from the client stream and cannot re-enter the normal raw
+            // relay path without a separate splice-through buffer.
+            Ok(collect_chunked_body(client, already_read, generation_guard)
+                .await
+                .map_or(BufferResult::OverCapacity { recoverable: false }, |body| {
+                    BufferResult::Buffered(BufferedRequestBody { headers, body })
+                }))
         }
     }
 }
@@ -835,7 +859,7 @@ pub(crate) fn rebuild_request_with_buffered_body(
 ) -> Result<L7Request> {
     let mut header_bytes = set_content_length(headers, body.len())?;
     header_bytes = strip_header(&header_bytes, "transfer-encoding")?;
-    header_bytes = append_headers(&header_bytes, add_headers)?;
+    header_bytes = append_headers(&header_bytes, add_headers);
     header_bytes.extend_from_slice(body);
     Ok(L7Request {
         action: req.action.clone(),
@@ -900,15 +924,11 @@ async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
         }
         BodyLength::Chunked => {
             let body = collect_chunked_body(client, already_read, generation_guard).await?;
-            if body_bytes_contain_reserved_marker(&body) {
-                return Err(miette!(
-                    "request body credential rewrite does not support chunked bodies containing credential placeholders"
-                ));
-            }
-            Ok(PreparedRequestBody {
-                headers: rewritten_headers.to_vec(),
-                body,
-            })
+            let (mut headers, body) =
+                rewrite_buffered_body(rewritten_headers, original_header_str, body, resolver)?;
+            headers = set_content_length(&headers, body.len())?;
+            headers = strip_header(&headers, "transfer-encoding")?;
+            Ok(PreparedRequestBody { headers, body })
         }
     }
 }
@@ -1076,37 +1096,15 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
     already_read: &[u8],
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<Vec<u8>> {
-    let mut read_buf = [0u8; RELAY_BUF_SIZE];
-    let mut parse_buf = Vec::from(already_read);
-    let mut pos = 0usize;
+    let mut buffered_pos = 0usize;
+    let mut body = Vec::new();
 
     loop {
-        if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
-            return Err(miette!(
-                "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
-            ));
-        }
-
-        let size_line_end = loop {
-            if let Some(end) = find_crlf(&parse_buf, pos) {
-                break end;
-            }
-            let n = client.read(&mut read_buf).await.into_diagnostic()?;
-            if n == 0 {
-                return Err(miette!("Chunked body ended before chunk-size line"));
-            }
-            if let Some(guard) = generation_guard {
-                guard.ensure_current()?;
-            }
-            parse_buf.extend_from_slice(&read_buf[..n]);
-            if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
-                return Err(miette!(
-                    "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
-                ));
-            }
-        };
-
-        let size_line = std::str::from_utf8(&parse_buf[pos..size_line_end])
+        let size_line =
+            read_chunked_line(client, already_read, &mut buffered_pos, generation_guard)
+                .await
+                .map_err(|e| miette!("Chunked body ended before chunk-size line: {e}"))?;
+        let size_line = std::str::from_utf8(&size_line)
             .into_diagnostic()
             .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
         let size_token = size_line
@@ -1117,62 +1115,107 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
         let chunk_size = usize::from_str_radix(size_token, 16)
             .into_diagnostic()
             .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
-        pos = size_line_end + 2;
 
         if chunk_size == 0 {
             loop {
-                let trailer_end = loop {
-                    if let Some(end) = find_crlf(&parse_buf, pos) {
-                        break end;
-                    }
-                    let n = client.read(&mut read_buf).await.into_diagnostic()?;
-                    if n == 0 {
-                        return Err(miette!("Chunked body ended before trailer terminator"));
-                    }
-                    if let Some(guard) = generation_guard {
-                        guard.ensure_current()?;
-                    }
-                    parse_buf.extend_from_slice(&read_buf[..n]);
-                    if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
-                        return Err(miette!(
-                            "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
-                        ));
-                    }
-                };
-                let trailer_line = &parse_buf[pos..trailer_end];
-                pos = trailer_end + 2;
+                let trailer_line =
+                    read_chunked_line(client, already_read, &mut buffered_pos, generation_guard)
+                        .await
+                        .map_err(|e| {
+                            miette!("Chunked body ended before trailer terminator: {e}")
+                        })?;
                 if trailer_line.is_empty() {
-                    return Ok(parse_buf);
+                    return Ok(body);
                 }
             }
         }
 
-        let chunk_end = pos
-            .checked_add(chunk_size)
-            .ok_or_else(|| miette!("Chunk size overflow"))?;
-        let chunk_with_crlf_end = chunk_end
-            .checked_add(2)
-            .ok_or_else(|| miette!("Chunk size overflow"))?;
-        while parse_buf.len() < chunk_with_crlf_end {
-            let n = client.read(&mut read_buf).await.into_diagnostic()?;
-            if n == 0 {
-                return Err(miette!("Chunked body ended mid-chunk"));
-            }
-            if let Some(guard) = generation_guard {
-                guard.ensure_current()?;
-            }
-            parse_buf.extend_from_slice(&read_buf[..n]);
-            if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
-                return Err(miette!(
-                    "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
-                ));
-            }
+        if body.len().saturating_add(chunk_size) > MAX_REWRITE_BODY_BYTES {
+            return Err(miette!(
+                "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+            ));
         }
-        if &parse_buf[chunk_end..chunk_with_crlf_end] != b"\r\n" {
+        read_buffered_exact(
+            client,
+            already_read,
+            &mut buffered_pos,
+            chunk_size,
+            &mut body,
+            generation_guard,
+        )
+        .await
+        .map_err(|e| miette!("Chunked body ended mid-chunk: {e}"))?;
+
+        let mut chunk_crlf = Vec::with_capacity(2);
+        read_buffered_exact(
+            client,
+            already_read,
+            &mut buffered_pos,
+            2,
+            &mut chunk_crlf,
+            generation_guard,
+        )
+        .await
+        .map_err(|e| miette!("Chunked body ended before chunk terminator: {e}"))?;
+        if chunk_crlf.as_slice() != b"\r\n" {
             return Err(miette!("Chunk missing terminating CRLF"));
         }
-        pos = chunk_with_crlf_end;
     }
+}
+
+async fn read_chunked_line<C: AsyncRead + Unpin>(
+    client: &mut C,
+    already_read: &[u8],
+    buffered_pos: &mut usize,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<Vec<u8>> {
+    let mut line = Vec::new();
+    loop {
+        let byte = read_buffered_byte(client, already_read, buffered_pos, generation_guard).await?;
+        line.push(byte);
+        if line.len() > MAX_REWRITE_BODY_BYTES {
+            return Err(miette!(
+                "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+            ));
+        }
+        if line.ends_with(b"\r\n") {
+            line.truncate(line.len() - 2);
+            return Ok(line);
+        }
+    }
+}
+
+async fn read_buffered_exact<C: AsyncRead + Unpin>(
+    client: &mut C,
+    already_read: &[u8],
+    buffered_pos: &mut usize,
+    len: usize,
+    out: &mut Vec<u8>,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<()> {
+    for _ in 0..len {
+        let byte = read_buffered_byte(client, already_read, buffered_pos, generation_guard).await?;
+        out.push(byte);
+    }
+    Ok(())
+}
+
+async fn read_buffered_byte<C: AsyncRead + Unpin>(
+    client: &mut C,
+    already_read: &[u8],
+    buffered_pos: &mut usize,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<u8> {
+    if *buffered_pos < already_read.len() {
+        let byte = already_read[*buffered_pos];
+        *buffered_pos += 1;
+        return Ok(byte);
+    }
+    let byte = client.read_u8().await.into_diagnostic()?;
+    if let Some(guard) = generation_guard {
+        guard.ensure_current()?;
+    }
+    Ok(byte)
 }
 
 fn content_type(headers: &str) -> Option<String> {
@@ -1262,9 +1305,9 @@ fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
 fn append_headers(
     headers: &[u8],
     add_headers: &std::collections::BTreeMap<String, String>,
-) -> Result<Vec<u8>> {
+) -> Vec<u8> {
     if add_headers.is_empty() {
-        return Ok(headers.to_vec());
+        return headers.to_vec();
     }
     let split = headers
         .windows(4)
@@ -1279,7 +1322,7 @@ fn append_headers(
         out.extend_from_slice(value.as_bytes());
     }
     out.extend_from_slice(b"\r\n\r\n");
-    Ok(out)
+    out
 }
 
 pub(crate) fn request_is_websocket_upgrade(raw_header: &[u8]) -> bool {
@@ -3149,6 +3192,20 @@ mod tests {
             BodyLength::None => {}
             other => panic!("Expected None for non-matching TE, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn collect_chunked_body_decodes_payload_bytes() {
+        let mut client = tokio::io::empty();
+        let body = collect_chunked_body(
+            &mut client,
+            b"5\r\nhello\r\n6;ext=value\r\n world\r\n0\r\nx-checksum: abc\r\n\r\n",
+            None,
+        )
+        .await
+        .expect("chunked body should decode");
+
+        assert_eq!(body, b"hello world");
     }
 
     /// SEC-009: Bare LF in headers enables header injection.
@@ -5255,6 +5312,38 @@ mod tests {
         assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
         assert!(forwarded.ends_with(expected_body));
         assert!(!forwarded.contains("OPENSHELL-RESOLVE-ENV"));
+    }
+
+    #[tokio::test]
+    async fn relay_request_body_rewrite_normalizes_chunked_payload() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider.v1-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let raw = format!(
+            "POST /api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Transfer-Encoding: chunked\r\n\r\n\
+             5\r\nhello\r\n0\r\n\r\n",
+        );
+
+        let forwarded = relay_and_capture_with_options(
+            raw.into_bytes(),
+            BodyLength::Chunked,
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("relay should succeed");
+
+        assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
+        assert!(forwarded.contains("Content-Length: 5\r\n"));
+        assert!(!forwarded.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(forwarded.ends_with("hello"));
     }
 
     #[tokio::test]

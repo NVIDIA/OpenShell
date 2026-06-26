@@ -783,9 +783,18 @@ async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
-    let buffered =
-        crate::l7::rest::buffer_request_body_for_middleware(&req, client, Some(generation_guard))
-            .await?;
+    let buffered = match crate::l7::rest::buffer_request_body_for_middleware(
+        &req,
+        client,
+        Some(generation_guard),
+    )
+    .await?
+    {
+        crate::l7::rest::BufferResult::Buffered(buffered) => buffered,
+        crate::l7::rest::BufferResult::OverCapacity { recoverable } => {
+            return Ok(resolve_unbuffered_body(ctx, req, &chain, recoverable));
+        }
+    };
     let headers = safe_middleware_headers(&buffered.headers)?;
     let input = openshell_supervisor_middleware::HttpRequestInput {
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -817,6 +826,52 @@ async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     } else {
         Ok(MiddlewareApplyResult::Denied(outcome.reason))
     }
+}
+
+/// Apply the chain's `on_error` policy when the request body cannot be buffered
+/// for inspection because it exceeds the size cap. The RFC treats an unbufferable
+/// body as an `on_error` event: it is denied unless every attached middleware is
+/// `fail_open`, and passing it through is only safe when no bytes were consumed.
+fn resolve_unbuffered_body(
+    ctx: &L7EvalContext,
+    req: crate::l7::provider::L7Request,
+    chain: &[openshell_supervisor_middleware::ChainEntry],
+    recoverable: bool,
+) -> MiddlewareApplyResult {
+    let all_fail_open = chain
+        .iter()
+        .all(|entry| entry.on_error == openshell_supervisor_middleware::OnError::FailOpen);
+    if recoverable && all_fail_open {
+        emit_middleware_body_unavailable(ctx, false);
+        return MiddlewareApplyResult::Allowed(req);
+    }
+    emit_middleware_body_unavailable(ctx, true);
+    MiddlewareApplyResult::Denied("middleware_failed: request_body_over_capacity".into())
+}
+
+fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
+    let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+        .severity(if denied {
+            SeverityId::High
+        } else {
+            SeverityId::Medium
+        })
+        .finding_info(FindingInfo::new(
+            "openshell.middleware.body_unavailable",
+            "Supervisor middleware could not inspect request body",
+        ))
+        .evidence_pairs(&[
+            ("policy", ctx.policy_name.as_str()),
+            ("host", ctx.host.as_str()),
+            ("disposition", if denied { "denied" } else { "fail_open" }),
+        ])
+        .message(if denied {
+            "Request body exceeded middleware inspection cap; denied"
+        } else {
+            "Request body exceeded middleware inspection cap; passed through (fail_open)"
+        })
+        .build();
+    ocsf_emit!(event);
 }
 
 fn safe_middleware_headers(headers: &[u8]) -> Result<BTreeMap<String, String>> {
@@ -885,14 +940,37 @@ fn emit_middleware_events(
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
             .firewall_rule(&ctx.policy_name, "middleware")
             .message(format!(
-                "MIDDLEWARE {} {} decision={:?} transformed={}",
+                "MIDDLEWARE {} {} decision={:?} transformed={} failed={}",
                 invocation.name,
                 invocation.implementation,
                 invocation.decision,
-                invocation.transformed
+                invocation.transformed,
+                invocation.failed
             ))
             .build();
         ocsf_emit!(event);
+
+        // A middleware that failed but was bypassed under `fail_open` is an
+        // enforcement failure operators must be able to alert on, even though the
+        // request proceeded.
+        if invocation.failed && allowed {
+            let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(SeverityId::Medium)
+                .finding_info(FindingInfo::new(
+                    "openshell.middleware.failure",
+                    "Supervisor middleware failed open",
+                ))
+                .evidence_pairs(&[
+                    ("middleware", invocation.name.as_str()),
+                    ("implementation", invocation.implementation.as_str()),
+                ])
+                .message(format!(
+                    "Middleware {} failed and was bypassed (fail_open)",
+                    invocation.name
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
     }
     if !outcome.allowed && outcome.reason.starts_with("middleware_failed:") {
         let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -2648,6 +2726,407 @@ network_policies:
         assert!(
             matches!(result, Err(_) | Ok(Ok(0))),
             "upstream should not receive request bytes"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn l7_rest_middleware_over_capacity_fails_closed() {
+        let (config, tunnel_engine, ctx) =
+            middleware_relay_context("openshell/secrets", "fail_closed");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        // A declared body far above the 256 KiB inspection cap must be denied
+        // (fail-closed) before the body is read or reaches the upstream.
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            300 * 1024
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"));
+        assert!(response.contains("request_body_over_capacity"));
+
+        let mut upstream_request = [0u8; 32];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_request),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "upstream should not receive request bytes"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn over_capacity_resolution_honors_on_error() {
+        use openshell_supervisor_middleware::{ChainEntry, OnError};
+
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "p".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let req = || crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let fail_open = ChainEntry {
+            name: "m".into(),
+            implementation: "openshell/secrets".into(),
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailOpen,
+        };
+        let fail_closed = ChainEntry {
+            on_error: OnError::FailClosed,
+            ..fail_open.clone()
+        };
+
+        // Recoverable (Content-Length over cap, nothing consumed) + all fail-open
+        // -> stream through unprocessed.
+        assert!(matches!(
+            resolve_unbuffered_body(&ctx, req(), std::slice::from_ref(&fail_open), true),
+            MiddlewareApplyResult::Allowed(_)
+        ));
+        // Any fail-closed entry -> deny.
+        assert!(matches!(
+            resolve_unbuffered_body(&ctx, req(), &[fail_open.clone(), fail_closed], true),
+            MiddlewareApplyResult::Denied(_)
+        ));
+        // Not recoverable (chunked overflow already consumed bytes) -> deny even
+        // when every entry is fail-open.
+        assert!(matches!(
+            resolve_unbuffered_body(&ctx, req(), &[fail_open], false),
+            MiddlewareApplyResult::Denied(_)
+        ));
+    }
+
+    /// Tracing layer that captures emitted `OcsfEvent`s for assertions.
+    struct OcsfCaptureLayer(Arc<std::sync::Mutex<Vec<openshell_ocsf::OcsfEvent>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OcsfCaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == openshell_ocsf::OCSF_TARGET
+                && let Some(ocsf_event) = openshell_ocsf::clone_current_event()
+            {
+                self.0.lock().unwrap().push(ocsf_event);
+            }
+        }
+    }
+
+    #[test]
+    fn middleware_ocsf_events_are_audit_safe() {
+        use openshell_supervisor_middleware::{
+            ChainOutcome, MiddlewareInvocation, NamespacedFinding,
+        };
+        use tracing_subscriber::layer::SubscriberExt;
+
+        const RAW_SECRET: &str = "sk-RAWSECRETVALUE0123456789";
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(OcsfCaptureLayer(Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/messages".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let outcome = ChainOutcome {
+            allowed: true,
+            reason: String::new(),
+            // The transformed body still holds the raw secret; emission must never
+            // serialize it.
+            body: format!(r#"{{"api_key":"{RAW_SECRET}"}}"#).into_bytes(),
+            added_headers: BTreeMap::new(),
+            findings: vec![NamespacedFinding {
+                middleware: "redact-secrets".into(),
+                finding: openshell_core::proto::Finding {
+                    r#type: "secret.common".into(),
+                    label: "common secret pattern".into(),
+                    count: 1,
+                    confidence: "medium".into(),
+                    severity: "medium".into(),
+                },
+            }],
+            metadata: BTreeMap::new(),
+            applied: vec![MiddlewareInvocation {
+                name: "redact-secrets".into(),
+                implementation: "openshell/secrets".into(),
+                decision: openshell_core::proto::Decision::Allow,
+                transformed: true,
+                failed: false,
+            }],
+        };
+
+        emit_middleware_events(&ctx, &req, &outcome);
+
+        let captured = events.lock().unwrap();
+        // Per-invocation decisions are HTTP Activity (class 4002).
+        assert!(
+            captured.iter().any(|e| e.class_uid() == 4002),
+            "expected an HTTP Activity event for the middleware invocation"
+        );
+        // Findings are Detection Finding (class 2004) with the finding's severity.
+        let finding_event = captured
+            .iter()
+            .find(|e| e.class_uid() == 2004)
+            .expect("expected a Detection Finding event");
+        assert_eq!(finding_event.base().severity, SeverityId::Medium);
+
+        // No raw payload material may appear in any emitted event.
+        let serialized = serde_json::to_string(&*captured).expect("serialize events");
+        assert!(
+            !serialized.contains(RAW_SECRET),
+            "raw secret leaked into OCSF events: {serialized}"
+        );
+        // Safe finding metadata is still present.
+        assert!(serialized.contains("secret.common"));
+    }
+
+    #[tokio::test]
+    async fn passthrough_relay_runs_middleware_redaction() {
+        // A no-protocol endpoint takes the credential-injection passthrough path;
+        // policy-level middleware must still inspect and redact its body.
+        let data = r#"
+network_middlewares:
+  - name: request-middleware
+    middleware: openshell/secrets
+    on_error: fail_closed
+network_policies:
+  passthrough_api:
+    name: passthrough_api
+    middleware: ["request-middleware"]
+    endpoints:
+      - host: api.example.test
+        port: 8080
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = Arc::new(OpaEngine::from_strings(TEST_POLICY, data).unwrap());
+        let generation_guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            policy_name: "passthrough_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let engine_task = Arc::clone(&engine);
+        let relay = tokio::spawn(async move {
+            relay_passthrough_with_credentials(
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+                &generation_guard,
+                Some(engine_task.as_ref()),
+            )
+            .await
+        });
+
+        let body = br#"{"api_key":"sk-1234567890abcdef"}"#;
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+
+        let mut upstream_request = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("request should reach upstream")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_request[..n]);
+        assert!(
+            upstream_request.contains(r#""api_key":"[REDACTED]""#),
+            "unexpected upstream request: {upstream_request:?}"
+        );
+        assert!(!upstream_request.contains("sk-1234567890abcdef"));
+
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("response should reach client")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("204 No Content"));
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_request_is_inspected_and_denied() {
+        // The WebSocket upgrade handshake is an HTTP request the hook can inspect
+        // and deny: a fail-closed middleware blocks the upgrade before it is
+        // forwarded.
+        let data = r#"
+network_middlewares:
+  - name: request-middleware
+    middleware: example/unavailable
+    on_error: fail_closed
+network_policies:
+  ws_api:
+    name: ws_api
+    middleware: ["request-middleware"]
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/ws"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "gateway.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "ws_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: gateway.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut response = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"));
+        assert!(response.contains("middleware_failed"));
+
+        let mut upstream_request = [0u8; 32];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_request),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "upstream should not receive the upgrade request"
         );
 
         drop(app);

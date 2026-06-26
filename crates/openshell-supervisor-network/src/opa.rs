@@ -777,11 +777,7 @@ fn query_middleware_chain_locked(
         .map_err(|e| miette::miette!("{e}"))?;
     let contexts = parse_middleware_contexts(&contexts_val);
     let Some(context) = select_middleware_context(&contexts, request_path) else {
-        return Ok(global_middleware_entries(
-            &configs,
-            &input.host,
-            &HashSet::new(),
-        )?);
+        return global_middleware_entries(&configs, &input.host, &HashSet::new());
     };
 
     let mut explicit = Vec::new();
@@ -876,12 +872,16 @@ fn middleware_selector_matches(config: &regorus::Value, host: &str) -> bool {
     let Some(selector) = get_field(config, "endpoints") else {
         return false;
     };
-    let includes = get_str_array(selector, "include");
-    let excludes = get_str_array(selector, "exclude");
-    let included =
-        !includes.is_empty() && includes.iter().any(|pattern| host_matches(pattern, host));
-    let excluded = excludes.iter().any(|pattern| host_matches(pattern, host));
-    included && !excluded
+    let include_patterns = get_str_array(selector, "include");
+    let exclude_patterns = get_str_array(selector, "exclude");
+    let matches_include = !include_patterns.is_empty()
+        && include_patterns
+            .iter()
+            .any(|pattern| host_matches(pattern, host));
+    let matches_exclude = exclude_patterns
+        .iter()
+        .any(|pattern| host_matches(pattern, host));
+    matches_include && !matches_exclude
 }
 
 fn host_matches(pattern: &str, host: &str) -> bool {
@@ -956,7 +956,6 @@ fn regorus_value_to_prost(value: &regorus::Value) -> prost_types::Value {
                     })
                     .collect(),
             }),
-            regorus::Value::Null | regorus::Value::Undefined => Kind::NullValue(0),
             _ => Kind::NullValue(0),
         }),
     }

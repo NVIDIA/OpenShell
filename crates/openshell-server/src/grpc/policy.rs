@@ -5746,6 +5746,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let submit = handle_submit_policy_analysis(
@@ -5959,6 +5960,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let submit = handle_submit_policy_analysis(
@@ -6075,6 +6077,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6180,6 +6183,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let mechanistic_submit = handle_submit_policy_analysis(
             &state,
@@ -6257,6 +6261,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let agent_submit = handle_submit_policy_analysis(
             &state,
@@ -6384,6 +6389,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6484,6 +6490,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6584,6 +6591,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6677,6 +6685,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6761,6 +6770,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6849,6 +6859,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6940,6 +6951,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -7026,6 +7038,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let response = handle_submit_policy_analysis(
@@ -7201,6 +7214,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -7297,6 +7311,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -7382,6 +7397,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -7523,6 +7539,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -7648,6 +7665,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let step1 = handle_submit_policy_analysis(
             &state,
@@ -7689,6 +7707,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let step2 = handle_submit_policy_analysis(
             &state,
@@ -7820,6 +7839,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let submit_one = |rule_name: &str, rule: NetworkPolicyRule| {
@@ -7928,6 +7948,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let submit_one = || {
             let state = state.clone();
@@ -8028,6 +8049,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         let submit = handle_submit_policy_analysis(
@@ -8159,6 +8181,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -8357,6 +8380,7 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         };
 
@@ -8385,6 +8409,7 @@ mod tests {
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         };
 
@@ -8413,6 +8438,7 @@ mod tests {
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         };
 
@@ -8440,6 +8466,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let chunk = DraftChunkRecord {
             id: "chunk-1".to_string(),
@@ -8508,6 +8535,7 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
+                    ..Default::default()
                 },
             ))
             .collect(),
@@ -8536,6 +8564,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let chunk = DraftChunkRecord {
             id: "chunk-merge".to_string(),
@@ -8609,6 +8638,7 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
+                    ..Default::default()
                 },
             ))
             .collect(),
@@ -8637,6 +8667,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let chunk = DraftChunkRecord {
             id: "chunk-new".to_string(),
@@ -8773,7 +8804,7 @@ mod tests {
                 allowed_ips: vec!["127.0.0.1".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8794,7 +8825,7 @@ mod tests {
                 allowed_ips: vec!["169.254.169.254".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8812,7 +8843,7 @@ mod tests {
                 port: 80,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8830,7 +8861,7 @@ mod tests {
                 port: 8080,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8848,7 +8879,7 @@ mod tests {
                 port: 80,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8896,7 +8927,7 @@ mod tests {
                 allowed_ips: vec!["10.0.5.0/24".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());
@@ -8913,7 +8944,7 @@ mod tests {
                 port: 443,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());
