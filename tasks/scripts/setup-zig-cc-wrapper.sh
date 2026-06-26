@@ -66,6 +66,16 @@ EOF
   chmod +x "$wrapper_dir/$tool"
 done
 
+for tool in ar ranlib; do
+  cat >"$wrapper_dir/$tool" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec "$zig" "$tool" "\$@"
+EOF
+  chmod +x "$wrapper_dir/$tool"
+done
+
 processor=${cargo_target%%-*}
 toolchain_file="$wrapper_dir/toolchain.cmake"
 cat >"$toolchain_file" <<EOF
@@ -73,6 +83,8 @@ set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR "$processor")
 set(CMAKE_C_COMPILER "$wrapper_dir/cc")
 set(CMAKE_CXX_COMPILER "$wrapper_dir/c++")
+set(CMAKE_AR "$wrapper_dir/ar")
+set(CMAKE_RANLIB "$wrapper_dir/ranlib")
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 EOF
 

@@ -340,7 +340,7 @@ impl OpenShell for TestOpenShell {
             .into_inner()
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
-        if provider.credentials.is_empty() {
+        if provider.credentials.is_empty() && provider.credential_handles.is_empty() {
             let bootstrap_allowed =
                 if let Some(profile) = openshell_providers::get_default_profile(&provider.r#type) {
                     profile.allows_empty_provider_credentials()
@@ -610,6 +610,11 @@ impl OpenShell for TestOpenShell {
                 existing.credential_expires_at_ms,
                 provider.credential_expires_at_ms,
             ),
+            credential_handles: if provider.credential_handles.is_empty() {
+                existing.credential_handles
+            } else {
+                provider.credential_handles
+            },
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());
@@ -1755,6 +1760,7 @@ async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() 
             credentials: HashMap::new(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         },
     );
     let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
@@ -2006,6 +2012,41 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
 }
 
 #[tokio::test]
+async fn provider_create_sends_inline_credentials() {
+    let ts = run_server().await;
+
+    run::provider_create_with_options(
+        &ts.endpoint,
+        "openai-inline",
+        "openai",
+        false,
+        &["OPENAI_API_KEY=sk-test".to_string()],
+        false,
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create with inline credential");
+
+    let stored = ts.state.providers.lock().await;
+    assert_eq!(
+        stored
+            .get("openai-inline")
+            .and_then(|provider| provider.credentials.get("OPENAI_API_KEY"))
+            .map(String::as_str),
+        Some("sk-test")
+    );
+    assert!(
+        stored
+            .get("openai-inline")
+            .expect("provider")
+            .credential_handles
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn provider_create_rejects_combined_from_existing_and_credentials() {
     let ts = run_server().await;
 
@@ -2048,7 +2089,7 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_from_existing() {
 
     assert!(
         err.to_string()
-            .contains("--from-gcloud-adc cannot be combined with --from-existing or --credential"),
+            .contains("--from-gcloud-adc cannot be combined with --from-existing, --credential"),
         "unexpected error: {err}"
     );
     assert!(ts.state.providers.lock().await.is_empty());
@@ -2073,7 +2114,7 @@ async fn provider_create_rejects_combined_from_gcloud_adc_and_credentials() {
 
     assert!(
         err.to_string()
-            .contains("--from-gcloud-adc cannot be combined with --from-existing or --credential"),
+            .contains("--from-gcloud-adc cannot be combined with --from-existing, --credential"),
         "unexpected error: {err}"
     );
     assert!(ts.state.providers.lock().await.is_empty());

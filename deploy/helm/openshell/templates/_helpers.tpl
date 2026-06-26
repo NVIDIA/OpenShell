@@ -103,6 +103,34 @@ Namespace where sandbox pods are created. An explicit
 {{- end }}
 
 {{/*
+Namespace where Kubernetes Secret-backed provider credentials live.
+*/}}
+{{- define "openshell.credentialKubernetesSecretsNamespace" -}}
+{{- .Values.server.credentialDrivers.kubernetesSecrets.namespace | default .Release.Namespace -}}
+{{- end }}
+
+{{/*
+Name of the Secret holding the default credential storage key-encryption key.
+*/}}
+{{- define "openshell.credentialStorageKeyEncryptionKeySecretName" -}}
+{{- printf "%s-credential-storage-key-encryption-key" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end }}
+
+{{/*
+Key inside the default credential storage key-encryption key Secret.
+*/}}
+{{- define "openshell.credentialStorageKeyEncryptionKeySecretKey" -}}
+key-encryption-key
+{{- end }}
+
+{{/*
+Gateway environment variable used to pass the default credential storage key-encryption key.
+*/}}
+{{- define "openshell.credentialStorageKeyEncryptionKeyEnvName" -}}
+OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY
+{{- end }}
+
+{{/*
 Name of the Secret holding gateway-minted sandbox JWT signing material.
 */}}
 {{- define "openshell.sandboxJwtSecretName" -}}
@@ -177,5 +205,15 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
+{{- end -}}
+{{- $credentialDrivers := list -}}
+{{- if .Values.server.credentialDrivers.kubernetesSecrets.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "kubernetes-secrets" -}}
+{{- end -}}
+{{- if .Values.server.credentialDrivers.vault.enabled -}}
+{{- $credentialDrivers = append $credentialDrivers "vault" -}}
+{{- end -}}
+{{- if gt (len $credentialDrivers) 1 -}}
+{{- fail "only one external server.credentialDrivers backend can be enabled at a time." -}}
 {{- end -}}
 {{- end }}

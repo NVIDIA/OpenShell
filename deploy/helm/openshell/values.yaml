@@ -218,6 +218,42 @@ server:
     # -- gRPC rate-limit window length in seconds. Must be positive (alongside
     # requests) to enable rate limiting; 0 (default) disables it.
     windowSeconds: 0
+  # Provider credential drivers store provider credential secret material in an
+  # external or native backend. When no driver is enabled, the gateway uses its
+  # default encrypted database credential storage with a retained Kubernetes
+  # Secret for the shared key-encryption key.
+  credentialDrivers:
+    kubernetesSecrets:
+      # -- Enable the in-tree Kubernetes Secret credential driver.
+      enabled: false
+      # -- Namespace where OpenShell-managed provider Secret objects are stored. Empty = Helm release namespace.
+      namespace: ""
+      # -- Deprecated compatibility field. Credential storage no longer supports user-authored namespace references.
+      allowReferenceNamespace: false
+      rbac:
+        # -- Create a Role/RoleBinding granting the gateway ServiceAccount read/write access to managed provider Secrets.
+        create: true
+    vault:
+      # -- Enable the in-tree Vault credential driver.
+      enabled: false
+      # -- Vault service base URL, for example http://vault.vault.svc.cluster.local:8200.
+      address: ""
+      # -- Default KV mount name.
+      mount: secret
+      # -- Default KV engine version. Use "1" or "2".
+      kvVersion: "2"
+      # -- Authentication method. Use "kubernetes" in-cluster or "token_file" for local/dev validation.
+      authMethod: kubernetes
+      # -- Vault Kubernetes auth role when authMethod is kubernetes.
+      role: ""
+      # -- Vault Kubernetes auth mount.
+      kubernetesAuthMount: kubernetes
+      # -- ServiceAccount token path used for Kubernetes auth.
+      serviceAccountTokenPath: /var/run/secrets/kubernetes.io/serviceaccount/token
+      # -- Mounted token file path when authMethod is token_file.
+      tokenPath: ""
+      # -- HTTP request timeout in seconds. Empty = driver default.
+      timeoutSecs: ""
   auth:
     # -- UNSAFE: accept unauthenticated CLI/user requests as a local developer
     # principal. Intended only for trusted local Skaffold/k3d development or a

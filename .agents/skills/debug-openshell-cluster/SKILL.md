@@ -143,6 +143,15 @@ release. Look for failed installs, unexpected values, missing namespace, wrong
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+When no external credential driver is enabled, the Helm chart uses the
+gateway's default encrypted database credential storage. The chart creates a
+retained Kubernetes Secret for the shared KEK, injects it into gateway pods, and
+stores encrypted credential envelopes in the OpenShell database. For
+`workload.kind=deployment` or multi-replica gateways, confirm
+`server.externalDbSecret` points at a shared database. A render/install error
+mentioning `server.credentialDrivers` means the values selected multiple
+external credential backends.
+
 For HA or PostgreSQL-backed installs, also check the external database Secret
 referenced by `server.externalDbSecret` and the PostgreSQL workload if the test
 or operator deployed one in-cluster:

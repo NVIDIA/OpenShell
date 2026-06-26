@@ -28,6 +28,22 @@ if [ -n "${OPENSHELL_E2E_KUBE_TEST:-}" ]; then
   test_filter+=(--test "${OPENSHELL_E2E_KUBE_TEST}")
 fi
 
+run_suite() {
+  "${ROOT}/e2e/with-kube-gateway.sh" \
+    cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
+      --features "${E2E_FEATURES}" \
+      --no-fail-fast \
+      ${test_filter[@]+"${test_filter[@]}"} \
+      -- --nocapture
+}
+
+if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
+   && [ -z "${OPENSHELL_E2E_CREDENTIAL_DRIVER:-}" ]; then
+  OPENSHELL_E2E_CREDENTIAL_DRIVER=kubernetes-secrets run_suite
+  OPENSHELL_E2E_CREDENTIAL_DRIVER=vault run_suite
+  exit 0
+fi
+
 exec "${ROOT}/e2e/with-kube-gateway.sh" \
   cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
     --features "${E2E_FEATURES}" \

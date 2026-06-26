@@ -9,7 +9,8 @@
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
 use openshell_core::proto::{
-    ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
+    CredentialHandle, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
+    SandboxTemplate,
 };
 use prost::Message;
 use tonic::Status;
@@ -344,6 +345,8 @@ pub(super) fn validate_provider_mutable_fields(provider: &Provider) -> Result<()
         MAX_MAP_VALUE_LEN,
         "provider.credentials",
     )?;
+    validate_provider_credential_handles(&provider.credential_handles)?;
+    validate_provider_credential_sources(provider)?;
     validate_string_map(
         &provider.config,
         MAX_PROVIDER_CONFIG_ENTRIES,
@@ -371,6 +374,99 @@ pub(super) fn validate_provider_mutable_fields(provider: &Provider) -> Result<()
         }
     }
     Ok(())
+}
+
+fn validate_provider_credential_sources(provider: &Provider) -> Result<(), Status> {
+    let total_credentials = provider.credentials.len() + provider.credential_handles.len();
+    if total_credentials > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "provider credential sources exceed maximum entries ({total_credentials} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})"
+        )));
+    }
+
+    for key in provider.credential_handles.keys() {
+        if provider.credentials.contains_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "provider credential key '{key}' cannot be present in both provider.credentials and provider.credential_handles"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_credential_handles(
+    credential_handles: &std::collections::HashMap<String, CredentialHandle>,
+) -> Result<(), Status> {
+    if credential_handles.len() > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "provider.credential_handles exceeds maximum entries ({} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})",
+            credential_handles.len()
+        )));
+    }
+
+    for (credential_key, handle) in credential_handles {
+        if credential_key.len() > MAX_MAP_KEY_LEN {
+            return Err(Status::invalid_argument(format!(
+                "provider.credential_handles key exceeds maximum length ({} > {MAX_MAP_KEY_LEN})",
+                credential_key.len()
+            )));
+        }
+        if !super::provider::is_valid_env_key(credential_key) {
+            return Err(Status::invalid_argument(format!(
+                "provider.credential_handles keys must match ^[A-Za-z_][A-Za-z0-9_]*$; got '{credential_key}'"
+            )));
+        }
+        validate_credential_handle(
+            handle,
+            &format!("provider.credential_handles['{credential_key}']"),
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_credential_handle(handle: &CredentialHandle, field_name: &str) -> Result<(), Status> {
+    validate_required_credential_handle_string(&handle.driver, field_name, "driver")?;
+    validate_required_credential_handle_string(&handle.handle, field_name, "handle")?;
+    validate_string_map(
+        &handle.metadata,
+        MAX_PROVIDER_CONFIG_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        &format!("{field_name}.metadata"),
+    )?;
+    for (key, value) in &handle.metadata {
+        reject_control_chars(key, &format!("{field_name}.metadata key"))?;
+        reject_control_chars(value, &format!("{field_name}.metadata value for '{key}'"))?;
+    }
+    Ok(())
+}
+
+fn validate_required_credential_handle_string(
+    value: &str,
+    field_name: &str,
+    component: &str,
+) -> Result<(), Status> {
+    if value.trim().is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "{field_name}.{component} is required"
+        )));
+    }
+    validate_optional_credential_handle_string(value, field_name, component)
+}
+
+fn validate_optional_credential_handle_string(
+    value: &str,
+    field_name: &str,
+    component: &str,
+) -> Result<(), Status> {
+    if value.len() > MAX_MAP_VALUE_LEN {
+        return Err(Status::invalid_argument(format!(
+            "{field_name}.{component} exceeds maximum length ({} > {MAX_MAP_VALUE_LEN})",
+            value.len()
+        )));
+    }
+    reject_control_chars(value, &format!("{field_name}.{component}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1230,18 @@ mod tests {
         std::iter::once(("KEY".to_string(), "val".to_string())).collect()
     }
 
+    fn one_credential_handle() -> HashMap<String, CredentialHandle> {
+        std::iter::once((
+            "API_KEY".to_string(),
+            CredentialHandle {
+                driver: "kubernetes-secrets".to_string(),
+                handle: "v1:openshell:provider-secret".to_string(),
+                metadata: HashMap::new(),
+            },
+        ))
+        .collect()
+    }
+
     fn make_test_provider(
         name: &str,
         provider_type: &str,
@@ -1152,6 +1260,7 @@ mod tests {
             credentials,
             config,
             credential_expires_at_ms: HashMap::new(),
+            credential_handles: HashMap::new(),
         }
     }
 
@@ -1164,6 +1273,72 @@ mod tests {
             std::iter::once(("endpoint".to_string(), "https://example.com".to_string())).collect(),
         );
         assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    #[test]
+    fn validate_provider_fields_accepts_credential_handles() {
+        let mut provider =
+            make_test_provider("my-provider", "claude", HashMap::new(), HashMap::new());
+        provider.credential_handles = one_credential_handle();
+
+        assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_duplicate_inline_and_referenced_key() {
+        let mut provider = make_test_provider(
+            "my-provider",
+            "claude",
+            std::iter::once(("API_KEY".to_string(), "inline".to_string())).collect(),
+            HashMap::new(),
+        );
+        provider.credential_handles = one_credential_handle();
+
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("provider.credentials"));
+        assert!(err.message().contains("provider.credential_handles"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_too_many_combined_credential_sources() {
+        let refs: HashMap<String, CredentialHandle> = (0..MAX_PROVIDER_CREDENTIALS_ENTRIES)
+            .map(|i| {
+                (
+                    format!("REF_{i}"),
+                    CredentialHandle {
+                        driver: "test".to_string(),
+                        handle: format!("handle-{i}"),
+                        metadata: HashMap::new(),
+                    },
+                )
+            })
+            .collect();
+        let mut provider = make_test_provider("ok", "claude", one_credential(), HashMap::new());
+        provider.credential_handles = refs;
+
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("credential sources"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_credential_handle_missing_handle() {
+        let mut provider =
+            make_test_provider("my-provider", "claude", HashMap::new(), HashMap::new());
+        provider.credential_handles = std::iter::once((
+            "API_KEY".to_string(),
+            CredentialHandle {
+                driver: "test".to_string(),
+                handle: String::new(),
+                metadata: HashMap::new(),
+            },
+        ))
+        .collect();
+
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("handle is required"));
     }
 
     #[test]

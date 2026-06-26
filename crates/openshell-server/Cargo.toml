@@ -17,8 +17,11 @@ path = "src/main.rs"
 [dependencies]
 openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core", default-features = false }
+openshell-driver-db-credstore = { path = "../openshell-driver-db-credstore" }
 openshell-driver-docker = { path = "../openshell-driver-docker" }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
+openshell-driver-kubernetes-secrets = { path = "../openshell-driver-kubernetes-secrets" }
+openshell-driver-vault = { path = "../openshell-driver-vault" }
 openshell-driver-podman = { path = "../openshell-driver-podman" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
@@ -71,9 +74,11 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
 # Utilities
+base64 = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 pin-project-lite = { workspace = true }
+ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

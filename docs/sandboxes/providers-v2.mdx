@@ -55,6 +55,7 @@ Providers v2 currently includes these user-facing features:
 - `openshell provider list-profiles` with table, YAML, and JSON output.
 - `openshell provider profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
 - Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
+- Provider instances whose submitted credentials can be stored by a configured gateway credential driver.
 - Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The built-in `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
 - Just-in-time effective policy composition from sandbox policy plus attached provider profiles.
 - Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
@@ -380,6 +381,30 @@ openshell provider create \
   --type custom-api \
   --credential CUSTOM_API_TOKEN
 ```
+
+Create a provider whose credential is stored by a configured gateway credential
+driver:
+
+```shell
+openshell provider create \
+  --name openai-stored \
+  --type openai \
+  --credential OPENAI_API_KEY
+```
+
+The create/update API stores submitted provider credentials through the
+gateway's active credential storage path and persists only internal credential
+handles. By default, the gateway stores AES-256-GCM encrypted credential
+envelopes in the gateway database outside the provider record. The Helm chart
+creates a retained Kubernetes Secret for the default storage key-encryption key
+and injects it into every gateway pod when no external credential driver is enabled.
+`credential_drivers = []` is invalid. Multi-replica Kubernetes gateways can use
+a shared database with the default encrypted store, or choose a shared backend
+such as `kubernetes-secrets` or `vault`.
+
+Provider records that already contain inline database credentials remain
+readable for upgrade compatibility. New provider create/update requests store
+credential values through the active credential driver and persist only handles.
 
 Provider profiles whose required credentials are fully runtime-resolvable through `token_grant` or gateway-managed refresh can be created without `--credential`.
 

@@ -39,6 +39,13 @@
 #   PostgreSQL Deployment and a matching Secret with a `uri` key before
 #   installing OpenShell. This is used by HA CI so the gateway can run multiple
 #   replicas without requiring the OpenShell chart to own a database.
+#
+# Credential-driver fixture:
+#   Set OPENSHELL_E2E_CREDENTIAL_DRIVERS=1 to enable one credential storage
+#   backend. Set OPENSHELL_E2E_CREDENTIAL_DRIVER to `kubernetes-secrets` or
+#   `vault`; the Rust `credential_drivers` e2e test validates the active
+#   backend. Vault mode installs a dev OpenBao fixture because it exposes the
+#   Vault-compatible API used by the driver.
 
 set -euo pipefail
 
@@ -79,6 +86,11 @@ EXTERNAL_PG_FIXTURE_SERVICE="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_USER="openshell"
 EXTERNAL_PG_FIXTURE_PASSWORD="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_DATABASE="openshell"
+VAULT_FIXTURE_DEPLOYED=0
+VAULT_NAMESPACE="${OPENSHELL_E2E_VAULT_NAMESPACE:-openbao}"
+VAULT_RELEASE_NAME="${OPENSHELL_E2E_VAULT_RELEASE_NAME:-openbao}"
+VAULT_CHART_VERSION="${OPENSHELL_E2E_OPENBAO_CHART_VERSION:-0.28.3}"
+VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -129,6 +141,47 @@ cleanup_postgres_fixture() {
   EXTERNAL_PG_FIXTURE_SECRET=""
 }
 
+deploy_vault_fixture() {
+  echo "Deploying OpenBao fixture for Vault credential-driver validation..."
+
+  helmctl repo add openbao https://openbao.github.io/openbao-helm \
+    >/dev/null 2>&1 || true
+  helmctl repo update openbao >/dev/null
+  helmctl upgrade --install "${VAULT_RELEASE_NAME}" openbao/openbao \
+    --namespace "${VAULT_NAMESPACE}" --create-namespace \
+    --version "${VAULT_CHART_VERSION}" \
+    --set "server.dev.enabled=true" \
+    --set "server.dev.devRootToken=${VAULT_DEV_ROOT_TOKEN}" \
+    --set "injector.enabled=false" \
+    --wait --timeout 5m
+  VAULT_FIXTURE_DEPLOYED=1
+
+  kctl -n "${VAULT_NAMESPACE}" wait \
+    --for=condition=Ready pod \
+    -l "app.kubernetes.io/name=openbao,component=server" \
+    --timeout=300s
+
+  export OPENSHELL_E2E_VAULT_NAMESPACE="${VAULT_NAMESPACE}"
+  export OPENSHELL_E2E_VAULT_POD="${VAULT_RELEASE_NAME}-0"
+  export OPENSHELL_E2E_VAULT_TOKEN="${VAULT_DEV_ROOT_TOKEN}"
+}
+
+cleanup_vault_fixture() {
+  [ -n "${KUBE_CONTEXT}" ] || return 0
+  [ -n "${VAULT_NAMESPACE}" ] || return 0
+
+  if command -v helm >/dev/null 2>&1; then
+    helmctl uninstall "${VAULT_RELEASE_NAME}" \
+      --namespace "${VAULT_NAMESPACE}" --wait --timeout 60s \
+      >/dev/null 2>&1 || true
+  fi
+  if command -v kubectl >/dev/null 2>&1; then
+    kctl delete namespace "${VAULT_NAMESPACE}" --wait=true --timeout=60s \
+      --ignore-not-found >/dev/null 2>&1 || true
+  fi
+  VAULT_FIXTURE_DEPLOYED=0
+}
+
 cleanup() {
   local exit_code=$?
 
@@ -170,6 +223,10 @@ cleanup() {
 
   if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ]; then
     cleanup_postgres_fixture "${EXTERNAL_PG_FIXTURE_SECRET}"
+  fi
+
+  if [ "${VAULT_FIXTURE_DEPLOYED}" = "1" ]; then
+    cleanup_vault_fixture
   fi
 
   if [ "${HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
@@ -341,6 +398,12 @@ run_scenario() {
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
+  # Kubernetes e2e runs against k3d/kind-style Docker-backed clusters. Host
+  # fixture containers must use the same Docker host so published ports and
+  # cluster host-gateway aliases line up even on machines where Podman is also
+  # installed.
+  export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+  export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
@@ -536,12 +599,33 @@ kctl apply -f "${_agent_sandbox_base}/manifest.yaml"
 kctl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=120s
 kctl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=300s
 
+ACTIVE_CREDENTIAL_DRIVER="${OPENSHELL_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
+if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
+   && [ "${ACTIVE_CREDENTIAL_DRIVER}" = "vault" ]; then
+  deploy_vault_fixture
+fi
+
 helm_extra_args=()
 if [ -n "${HOST_GATEWAY_IP}" ]; then
   helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
+if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ]; then
+  case "${ACTIVE_CREDENTIAL_DRIVER}" in
+    kubernetes-secrets)
+      helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-credential-driver-kubernetes-secrets.yaml")
+      ;;
+    vault)
+      helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-credential-driver-vault.yaml")
+      ;;
+    *)
+      echo "ERROR: OPENSHELL_E2E_CREDENTIAL_DRIVER must be kubernetes-secrets or vault, got '${ACTIVE_CREDENTIAL_DRIVER}'" >&2
+      exit 2
+      ;;
+  esac
+  export OPENSHELL_E2E_CREDENTIAL_DRIVER="${ACTIVE_CREDENTIAL_DRIVER}"
+fi
 if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
   IFS=':' read -r -a extra_values_files <<< "${OPENSHELL_E2E_KUBE_EXTRA_VALUES}"
   for values_file in "${extra_values_files[@]}"; do
@@ -666,6 +750,12 @@ else
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
+  # Kubernetes e2e runs against k3d/kind-style Docker-backed clusters. Host
+  # fixture containers must use the same Docker host so published ports and
+  # cluster host-gateway aliases line up even on machines where Podman is also
+  # installed.
+  export CONTAINER_ENGINE="${CONTAINER_ENGINE:-docker}"
+  export OPENSHELL_E2E_KUBE_CONTEXT_ACTIVE="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 

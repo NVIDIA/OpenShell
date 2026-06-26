@@ -24,6 +24,7 @@ jobs:
       run_core_e2e: ${{ steps.labels.outputs.run_core_e2e }}
       run_gpu_e2e: ${{ steps.labels.outputs.run_gpu_e2e }}
       run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
+      run_kubernetes_credential_drivers_e2e: ${{ steps.labels.outputs.run_kubernetes_credential_drivers_e2e }}
       run_any_e2e: ${{ steps.labels.outputs.run_any_e2e }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -41,12 +42,14 @@ jobs:
             run_core_e2e=true
             run_gpu_e2e=true
             run_kubernetes_ha_e2e=true
+            run_kubernetes_credential_drivers_e2e=true
           else
             run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
             run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
             run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+            run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
           fi
-          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ]; then
+          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ]; then
             run_any_e2e=true
           else
             run_any_e2e=false
@@ -55,12 +58,13 @@ jobs:
             echo "run_core_e2e=$run_core_e2e"
             echo "run_gpu_e2e=$run_gpu_e2e"
             echo "run_kubernetes_ha_e2e=$run_kubernetes_ha_e2e"
+            echo "run_kubernetes_credential_drivers_e2e=$run_kubernetes_credential_drivers_e2e"
             echo "run_any_e2e=$run_any_e2e"
           } >> "$GITHUB_OUTPUT"
 
   build-gateway:
     needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true' && (needs.pr_metadata.outputs.run_core_e2e == 'true' || needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true')
+    if: needs.pr_metadata.outputs.should_run == 'true' && (needs.pr_metadata.outputs.run_core_e2e == 'true' || needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true' || needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true')
     permissions:
       contents: read
       packages: write
@@ -135,6 +139,18 @@ jobs:
       extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
       external-postgres-secret: openshell-ha-pg
 
+  kubernetes-credential-drivers-e2e:
+    needs: [pr_metadata, build-gateway, build-supervisor]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      job-name: Kubernetes Credential Drivers E2E
+      e2e-task: e2e:kubernetes:credential-drivers
+
   core-e2e-result:
     name: Core E2E result
     needs: [pr_metadata, build-gateway, build-supervisor, e2e, kubernetes-e2e]
@@ -207,6 +223,33 @@ jobs:
             "build-gateway:$BUILD_GATEWAY_RESULT" \
             "build-supervisor:$BUILD_SUPERVISOR_RESULT" \
             "kubernetes-ha-e2e:$KUBERNETES_HA_E2E_RESULT"; do
+            name="${item%%:*}"
+            result="${item#*:}"
+            if [ "$result" != "success" ]; then
+              echo "::error::$name concluded $result"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  kubernetes-credential-drivers-e2e-result:
+    name: Kubernetes Credential Drivers E2E result
+    needs: [pr_metadata, build-gateway, build-supervisor, kubernetes-credential-drivers-e2e]
+    if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify Kubernetes credential drivers E2E jobs
+        env:
+          BUILD_GATEWAY_RESULT: ${{ needs.build-gateway.result }}
+          BUILD_SUPERVISOR_RESULT: ${{ needs.build-supervisor.result }}
+          KUBERNETES_CREDENTIAL_DRIVERS_E2E_RESULT: ${{ needs.kubernetes-credential-drivers-e2e.result }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for item in \
+            "build-gateway:$BUILD_GATEWAY_RESULT" \
+            "build-supervisor:$BUILD_SUPERVISOR_RESULT" \
+            "kubernetes-credential-drivers-e2e:$KUBERNETES_CREDENTIAL_DRIVERS_E2E_RESULT"; do
             name="${item%%:*}"
             result="${item#*:}"
             if [ "$result" != "success" ]; then

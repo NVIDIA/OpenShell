@@ -3613,7 +3613,7 @@ fn format_provider_attachment_table(providers: &[Provider], color: bool) -> Stri
     for provider in providers {
         let provider_name = provider.object_name();
         let provider_type = &provider.r#type;
-        let credential_keys = provider.credentials.len();
+        let credential_keys = provider_credential_keys(provider).len();
         let config_keys = provider.config.len();
         let _ = writeln!(
             output,
@@ -3888,6 +3888,7 @@ async fn auto_create_provider(
                 credentials: discovered.credentials.clone(),
                 config: discovered.config.clone(),
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             }),
         };
 
@@ -3930,6 +3931,7 @@ async fn auto_create_provider(
                     credentials: discovered.credentials.clone(),
                     config: discovered.config.clone(),
                     credential_expires_at_ms: HashMap::new(),
+                    credential_handles: HashMap::new(),
                 }),
             };
 
@@ -4567,7 +4569,7 @@ fn missing_credentials_error(provider_type: &str) -> miette::Report {
             "no credentials resolved for provider type '{provider_type}'. \
              Set GOOGLE_VERTEX_AI_TOKEN, VERTEX_AI_TOKEN, \
              GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN, or VERTEX_AI_SERVICE_ACCOUNT_TOKEN; \
-             or use --from-gcloud-adc / --from-existing with those env vars set."
+             or use --from-gcloud-adc or --from-existing with those env vars set."
         );
     }
 
@@ -4581,8 +4583,8 @@ fn missing_credentials_error(provider_type: &str) -> miette::Report {
 
     miette::miette!(
         "no credentials resolved for provider type '{provider_type}'. \
-         Use --credential KEY[=VALUE], --runtime-credentials for runtime-resolved profile credentials, \
-         or --from-existing with the appropriate env vars set."
+         Use --credential KEY[=VALUE], --runtime-credentials for runtime-resolved profile credentials, or --from-existing \
+         with the appropriate env vars set."
     )
 }
 
@@ -4625,7 +4627,7 @@ pub async fn provider_create_with_options(
 ) -> Result<()> {
     if from_gcloud_adc && (from_existing || !credentials.is_empty() || runtime_credentials) {
         return Err(miette::miette!(
-            "--from-gcloud-adc cannot be combined with --from-existing or --credential; it also cannot be combined with --runtime-credentials"
+            "--from-gcloud-adc cannot be combined with --from-existing, --credential, or --runtime-credentials"
         ));
     }
     if from_existing && (!credentials.is_empty() || runtime_credentials) {
@@ -4769,6 +4771,7 @@ pub async fn provider_create_with_options(
                 credentials: credential_map,
                 config: config_map,
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             }),
         })
         .await
@@ -4854,7 +4857,7 @@ pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<
         .provider
         .ok_or_else(|| miette::miette!("provider missing from response"))?;
 
-    let credential_keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
+    let credential_keys = provider_credential_keys(&provider);
     let config_keys = provider.config.keys().cloned().collect::<Vec<_>>();
 
     println!("{}", "Provider:".cyan().bold());
@@ -4901,7 +4904,7 @@ fn provider_to_json(provider: &Provider) -> serde_json::Value {
     obj.insert("type".to_string(), serde_json::json!(provider.r#type));
 
     // Credential keys (NEVER values - security)
-    let credential_keys: Vec<String> = provider.credentials.keys().cloned().collect();
+    let credential_keys = provider_credential_keys(provider);
     obj.insert(
         "credential_keys".to_string(),
         serde_json::json!(credential_keys),
@@ -4941,6 +4944,18 @@ fn provider_to_json(provider: &Provider) -> serde_json::Value {
     }
 
     serde_json::Value::Object(obj)
+}
+
+fn provider_credential_keys(provider: &Provider) -> Vec<String> {
+    let mut keys: Vec<String> = provider
+        .credentials
+        .keys()
+        .chain(provider.credential_handles.keys())
+        .cloned()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 pub async fn provider_list(
@@ -5700,6 +5715,7 @@ pub async fn provider_update(
                 credentials: credential_map,
                 config: config_map,
                 credential_expires_at_ms: HashMap::new(),
+                credential_handles: HashMap::new(),
             }),
             credential_expires_at_ms,
         })
@@ -8056,6 +8072,7 @@ mod tests {
                 ))
                 .collect(),
                 credential_expires_at_ms: std::collections::HashMap::new(),
+                credential_handles: std::collections::HashMap::new(),
             }],
             false,
         );
@@ -9491,6 +9508,7 @@ mod tests {
             credentials: std::collections::HashMap::new(),
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -9512,6 +9530,7 @@ mod tests {
             credentials,
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -9549,6 +9568,7 @@ mod tests {
             credentials: std::collections::HashMap::new(),
             config,
             credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -9579,6 +9599,7 @@ mod tests {
             credentials: std::collections::HashMap::new(),
             config: std::collections::HashMap::new(), // Empty config
             credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -9608,6 +9629,7 @@ mod tests {
             credentials: std::collections::HashMap::new(),
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -9633,6 +9655,7 @@ mod tests {
             credentials: std::collections::HashMap::new(),
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -9662,6 +9685,7 @@ mod tests {
             credentials: std::collections::HashMap::new(),
             config: std::collections::HashMap::new(),
             credential_expires_at_ms,
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);
@@ -9687,6 +9711,7 @@ mod tests {
             credentials: std::collections::HashMap::new(),
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_handles: std::collections::HashMap::new(),
         };
 
         let json = super::provider_to_json(&provider);

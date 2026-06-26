@@ -99,6 +99,18 @@ gateways. `workload.kind=statefulset` is still available for single-replica
 SQLite installs and for operators who explicitly need StatefulSet identity or
 storage semantics.
 
+### Credential storage
+
+By default, the chart uses the gateway's encrypted database credential storage.
+The gateway writes encrypted provider credential envelopes to the OpenShell
+database. The chart creates a retained Kubernetes Secret with the shared
+key-encryption key and injects that key into every gateway pod, so the same
+default works for single-replica and external database-backed HA deployments.
+
+Use `kubernetes-secrets` or `vault` instead when credentials should live in a
+cluster or external secret backend. Enabling one external credential driver
+disables the default credential-storage key-encryption key Secret and env injection.
+
 #### OpenShift
 
 Append these flags to any of the PostgreSQL commands above for OpenShift:
@@ -192,6 +204,20 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | server.appArmorProfile | string | `"Unconfined"` | Kubernetes AppArmor profile requested for sandbox agent containers. Default Unconfined avoids runtime/default AppArmor blocking the supervisor's network namespace mount setup on AppArmor-enabled nodes. Set to "" to omit the field, "RuntimeDefault" to force the runtime default profile, or "Localhost/profile-name" for an operator-managed localhost profile. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
+| server.credentialDrivers.kubernetesSecrets.allowReferenceNamespace | bool | `false` | Deprecated compatibility field. Credential storage no longer supports user-authored namespace references. |
+| server.credentialDrivers.kubernetesSecrets.enabled | bool | `false` | Enable the in-tree Kubernetes Secret credential driver. |
+| server.credentialDrivers.kubernetesSecrets.namespace | string | `""` | Namespace where OpenShell-managed provider Secret objects are stored. Empty = Helm release namespace. |
+| server.credentialDrivers.kubernetesSecrets.rbac.create | bool | `true` | Create a Role/RoleBinding granting the gateway ServiceAccount read/write access to managed provider Secrets. |
+| server.credentialDrivers.vault.address | string | `""` | Vault service base URL, for example http://vault.vault.svc.cluster.local:8200. |
+| server.credentialDrivers.vault.authMethod | string | `"kubernetes"` | Authentication method. Use "kubernetes" in-cluster or "token_file" for local/dev validation. |
+| server.credentialDrivers.vault.enabled | bool | `false` | Enable the in-tree Vault credential driver. |
+| server.credentialDrivers.vault.kubernetesAuthMount | string | `"kubernetes"` | Vault Kubernetes auth mount. |
+| server.credentialDrivers.vault.kvVersion | string | `"2"` | Default KV engine version. Use "1" or "2". |
+| server.credentialDrivers.vault.mount | string | `"secret"` | Default KV mount name. |
+| server.credentialDrivers.vault.role | string | `""` | Vault Kubernetes auth role when authMethod is kubernetes. |
+| server.credentialDrivers.vault.serviceAccountTokenPath | string | `"/var/run/secrets/kubernetes.io/serviceaccount/token"` | ServiceAccount token path used for Kubernetes auth. |
+| server.credentialDrivers.vault.timeoutSecs | string | `""` | HTTP request timeout in seconds. Empty = driver default. |
+| server.credentialDrivers.vault.tokenPath | string | `""` | Mounted token file path when authMethod is token_file. |
 | server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). |
 | server.defaultRuntimeClassName | string | `""` | Default Kubernetes runtimeClassName for sandbox pods. Applied when a CreateSandbox request does not specify one. Empty (default) = omit the field, using the cluster's default RuntimeClass. Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it to all sandboxes that don't explicitly override it. |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |

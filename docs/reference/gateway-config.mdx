@@ -31,7 +31,7 @@ Package-managed gateways do not require a TOML file. Create one at the package's
 
 ## Layout
 
-The file is rooted at `[openshell]`. Gateway-wide settings live under `[openshell.gateway]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Shared keys set at gateway scope are inherited into driver tables when not overridden.
+The file is rooted at `[openshell]`. Gateway-wide settings live under `[openshell.gateway]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Credential drivers own `[openshell.credential_drivers.<name>]` tables. Shared compute-driver keys set at gateway scope are inherited into compute driver tables when not overridden.
 
 ```toml
 [openshell]
@@ -48,6 +48,9 @@ version = 1
 
 [openshell.drivers.kubernetes]
 # ... driver-specific settings ...
+
+[openshell.credential_drivers.kubernetes-secrets]
+# ... credential-driver-specific settings ...
 ```
 
 ## Full Example
@@ -71,6 +74,10 @@ log_level             = "info"
 # When empty, the gateway auto-detects Kubernetes, then Podman, then Docker.
 # VM is never auto-detected and requires an explicit entry here.
 compute_drivers       = ["kubernetes"]
+
+# Optional external provider credential storage backend. Omit this key to use
+# the gateway's default encrypted database credential storage.
+credential_drivers        = ["kubernetes-secrets"]
 
 sandbox_namespace     = "openshell"
 ssh_session_ttl_secs  = 3600
@@ -132,6 +139,10 @@ roles_claim   = "realm_access.roles"
 admin_role    = "openshell-admin"
 user_role     = "openshell-user"
 scopes_claim  = ""
+
+[openshell.credential_drivers.kubernetes-secrets]
+namespace = "openshell"
+allow_reference_namespace = false
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
@@ -141,6 +152,83 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
+
+## Credential Drivers
+
+Set `credential_drivers` only when the gateway should store provider credentials in an external credential backend. OpenShell supports at most one enabled credential driver at a time. When `credential_drivers` is omitted, the gateway uses its default encrypted database credential storage. `credential_drivers = []` is invalid in the TOML file; omit the field for the default encrypted store, or select a backend such as `kubernetes-secrets` or `vault`.
+
+Credential driver tables are backend-owned and live under `[openshell.credential_drivers.<name>]`. Built-in drivers default to in-tree transport, so they do not need a `transport` field. Use `transport = "uds"` with an absolute `socket_path` only for a remote gRPC driver over a Unix domain socket.
+
+```toml
+[openshell.gateway.credential_storage]
+key_encryption_key_path = "/var/lib/openshell/credentials/key-encryption-key.bin"
+```
+
+For Kubernetes Secrets:
+
+```toml
+[openshell.gateway]
+credential_drivers = ["kubernetes-secrets"]
+
+[openshell.credential_drivers.kubernetes-secrets]
+namespace = "openshell"
+```
+
+For Vault instead:
+
+```toml
+[openshell.gateway]
+credential_drivers = ["vault"]
+
+[openshell.credential_drivers.vault]
+address = "http://vault.vault.svc.cluster.local:8200"
+mount = "secret"
+kv_version = "2"
+auth_method = "kubernetes"
+role = "openshell-gateway"
+service_account_token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+```
+
+For the default encrypted database store, OpenShell stores provider credentials as JSON envelopes encrypted with AES-256-GCM in the gateway database. Each credential gets a random data-encryption key; the gateway wraps that key with a local key-encryption key. By default, the key-encryption key is created at `$XDG_STATE_HOME/openshell/gateway/credentials/key-encryption-key.bin` with owner-only permissions. Use `[openshell.gateway.credential_storage] key_encryption_key_env` instead of `key_encryption_key_path` to load a base64-encoded 32-byte key-encryption key from an environment variable. Back up the database and key-encryption key together; losing either makes stored credentials unrecoverable. In Kubernetes, the Helm chart creates a retained Secret containing the shared key-encryption key, injects it as `OPENSHELL_GATEWAY_CREDENTIAL_KEY_ENCRYPTION_KEY`, and renders `key_encryption_key_env` for the gateway when no external credential driver is enabled. Multi-replica deployments need every replica to use the same database and key-encryption key; the chart default handles the key-encryption key side.
+
+For `kubernetes-secrets`, `namespace` sets where OpenShell-managed provider Secret objects are stored. When omitted, the driver uses the in-cluster ServiceAccount namespace when available, otherwise `default`.
+
+For `vault`, `address` points at the Vault service, `mount` and `kv_version` describe the KV engine where OpenShell-managed provider secrets are stored, and `auth_method = "kubernetes"` logs in with the gateway Pod's ServiceAccount token. For local or development validation, use `auth_method = "token_file"` with `token_path = "/path/to/token"`. Do not put literal Vault tokens in TOML.
+
+Provider records that already contain inline database credentials remain readable for upgrade compatibility. New provider create/update requests still submit credential values through the normal API, but the gateway stores those values through the active credential storage path and persists only handles.
+
+For remote credential drivers, set `transport = "uds"` with `socket_path`. Omit `command`, `args`, and `startup_timeout_secs` when another service manager prestarts the driver socket. Keep backend tokens out of TOML; point the driver at mounted token files or native identity mechanisms instead.
+
+The built-in `kubernetes-secrets` and `vault` drivers can also run out of
+process over UDS. Set `command` to the standalone driver binary and pass
+driver-specific settings through `args`; the gateway appends `--bind-socket
+<socket_path>` when it launches the process.
+
+```toml
+[openshell.gateway]
+credential_drivers = ["kubernetes-secrets"]
+
+[openshell.credential_drivers.kubernetes-secrets]
+transport = "uds"
+socket_path = "/run/openshell/credential-drivers/kubernetes-secrets.sock"
+command = "/usr/libexec/openshell/openshell-driver-kubernetes-secrets"
+args = ["--namespace", "openshell"]
+```
+
+```toml
+[openshell.gateway]
+credential_drivers = ["vault"]
+
+[openshell.credential_drivers.vault]
+transport = "uds"
+socket_path = "/run/openshell/credential-drivers/vault.sock"
+command = "/usr/libexec/openshell/openshell-driver-vault"
+args = [
+  "--address", "http://vault.vault.svc.cluster.local:8200",
+  "--auth-method", "kubernetes",
+  "--role", "openshell-gateway",
+]
+```
 
 ## Driver References
 

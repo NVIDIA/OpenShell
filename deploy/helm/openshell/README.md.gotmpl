@@ -99,6 +99,18 @@ gateways. `workload.kind=statefulset` is still available for single-replica
 SQLite installs and for operators who explicitly need StatefulSet identity or
 storage semantics.
 
+### Credential storage
+
+By default, the chart uses the gateway's encrypted database credential storage.
+The gateway writes encrypted provider credential envelopes to the OpenShell
+database. The chart creates a retained Kubernetes Secret with the shared
+key-encryption key and injects that key into every gateway pod, so the same
+default works for single-replica and external database-backed HA deployments.
+
+Use `kubernetes-secrets` or `vault` instead when credentials should live in a
+cluster or external secret backend. Enabling one external credential driver
+disables the default credential-storage key-encryption key Secret and env injection.
+
 #### OpenShift
 
 Append these flags to any of the PostgreSQL commands above for OpenShift:

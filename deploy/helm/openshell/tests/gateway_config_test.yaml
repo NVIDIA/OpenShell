@@ -274,6 +274,7 @@ tests:
       workload.kind: deployment
       replicaCount: 2
       server.externalDbSecret: my-pg-secret
+      server.credentialDrivers.kubernetesSecrets.enabled: true
     asserts:
       - equal:
           path: kind
@@ -321,6 +322,7 @@ tests:
       replicaCount: 2
       server.externalDbSecret: my-pg-secret
       workload.allowMultiReplicaStatefulSet: true
+      server.credentialDrivers.kubernetesSecrets.enabled: true
     asserts:
       - equal:
           path: kind
