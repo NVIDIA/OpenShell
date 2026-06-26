@@ -50,6 +50,10 @@ kubectl -n agent-sandbox-system get pods
 
 The controller pod should reach `Running` status within a few seconds. For cluster-specific setup instructions, including KinD and GKE walkthroughs, refer to the [Agent Sandbox getting started guide](https://agent-sandbox.sigs.k8s.io/docs/getting_started/).
 
+### Upgrade Agent Sandbox
+
+OpenShell detects the served Agent Sandbox `Sandbox` API when the Kubernetes gateway first needs it and caches that choice for the gateway process. If you upgrade Agent Sandbox in place, restart the OpenShell gateway after the Agent Sandbox controller and CRD rollout completes so the gateway can detect the served API versions again. Existing sandboxes keep running during the upgrade, and the restarted gateway can continue managing them.
+
 ## Install OpenShell
 
 <Steps>

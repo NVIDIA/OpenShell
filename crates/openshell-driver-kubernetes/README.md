@@ -16,10 +16,12 @@ credential injection, policy polling, logs, and the gateway relay.
 ## Sandbox Resource
 
 The driver works with the `agents.x-k8s.io` `Sandbox` custom resource. It
-detects the served Sandbox API at runtime and uses the current API before
-falling back to the `v1alpha1` API. Driver events map Kubernetes object state and
-platform events into the shared compute-driver protobuf surface used by the
-gateway.
+detects the served Sandbox API at runtime, caches the selected API version for
+the gateway process, and uses `v1beta1` when available before falling back to
+`v1alpha1`. Restart the gateway after an in-place Agent Sandbox upgrade so the
+driver can detect served API versions again. Driver events map Kubernetes object
+state and platform events into the shared compute-driver protobuf surface used
+by the gateway.
 
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
 indefinitely when the API server is slow or unavailable.

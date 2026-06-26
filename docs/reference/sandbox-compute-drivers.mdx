@@ -283,7 +283,9 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
-The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+
+If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
