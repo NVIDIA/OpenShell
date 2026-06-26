@@ -64,6 +64,7 @@ use openshell_core::denial::DenialEvent;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
+use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
 use tokio::io::copy_bidirectional;
@@ -135,6 +136,7 @@ pub async fn run_sandbox(
     }
 
     let sidecar_network_enforcement = sidecar_network_enforcement_enabled();
+    let process_enforcement_mode = process_enforcement_mode();
     let sidecar_ready_file = supervisor_ready_file();
     if process_enabled
         && !network_enabled
@@ -519,6 +521,7 @@ pub async fn run_sandbox(
             openshell_endpoint.as_deref(),
             ssh_socket_path,
             &process_policy,
+            process_enforcement_mode,
             entrypoint_pid,
             provider_credentials,
             provider_env,
@@ -582,6 +585,16 @@ async fn wait_for_shutdown_signal() {
 fn sidecar_network_enforcement_enabled() -> bool {
     std::env::var(openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE)
         .is_ok_and(|value| value == SIDECAR_NETWORK_ENFORCEMENT_MODE)
+}
+
+fn process_enforcement_mode() -> ProcessEnforcementMode {
+    match std::env::var(openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE)
+        .unwrap_or_else(|_| "full".to_string())
+        .as_str()
+    {
+        "network-only" => ProcessEnforcementMode::NetworkOnly,
+        _ => ProcessEnforcementMode::Full,
+    }
 }
 
 fn supervisor_ready_file() -> Option<String> {

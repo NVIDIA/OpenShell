@@ -1006,6 +1006,7 @@ const SIDECAR_STATE_VOLUME_NAME: &str = "openshell-sidecar-state";
 const SIDECAR_STATE_MOUNT_PATH: &str = "/run/openshell-sidecar";
 const SIDECAR_READY_FILE: &str = "/run/openshell-sidecar/supervisor.ready";
 const SIDECAR_ENTRYPOINT_PID_FILE: &str = "/run/openshell-sidecar/entrypoint.pid";
+const SIDECAR_SSH_SOCKET_FILE: &str = "/run/openshell-sidecar/ssh.sock";
 
 /// Shared TLS work directory. The network sidecar writes the proxy CA bundle
 /// here, while the agent container consumes it after the readiness file exists.
@@ -1139,8 +1140,8 @@ fn apply_supervisor_binary_source(
 ///   copies the supervisor binary from the supervisor image into that volume.
 ///
 /// In both cases, the agent container gets a command override to run the
-/// side-loaded binary and `runAsUser: 0` so it can create network namespaces,
-/// set up the proxy, and configure Landlock/seccomp.
+/// side-loaded binary as root so it can create network namespaces, set up the
+/// proxy, and configure Landlock/seccomp.
 #[allow(clippy::similar_names)]
 fn apply_supervisor_sideload(
     pod_template: &mut serde_json::Value,
@@ -1356,15 +1357,11 @@ fn supervisor_sidecar_container(
         "env": supervisor_sidecar_env(template_environment, spec_environment, params),
         "securityContext": {
             "runAsUser": params.sidecar_proxy_uid,
-            // The projected service-account token stays root-owned so the
-            // sandbox workload cannot read it after dropping privileges. The
-            // trusted network sidecar keeps a non-root UID for nftables owner
-            // matching, but uses GID 0 to read the group-readable token.
-            "runAsGroup": 0,
+            "runAsGroup": params.sandbox_gid,
+            "runAsNonRoot": true,
             "allowPrivilegeEscalation": false,
             "capabilities": {
-                "drop": ["ALL"],
-                "add": ["SYS_PTRACE", "DAC_READ_SEARCH"]
+                "drop": ["ALL"]
             }
         },
         "volumeMounts": [
@@ -1406,7 +1403,7 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
             "--sidecar-proxy-uid",
             params.sidecar_proxy_uid.to_string(),
             "--sidecar-proxy-gid",
-            params.sidecar_proxy_uid.to_string(),
+            params.sandbox_gid.to_string(),
             "--sidecar-state-dir",
             SIDECAR_STATE_MOUNT_PATH,
             "--sidecar-tls-dir",
@@ -1454,7 +1451,13 @@ fn apply_supervisor_sidecar_topology(
         return;
     };
 
-    spec.insert("shareProcessNamespace".to_string(), serde_json::json!(true));
+    let pod_security_context = spec
+        .entry("securityContext")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(sc) = pod_security_context.as_object_mut() {
+        sc.insert("fsGroup".to_string(), serde_json::json!(params.sandbox_gid));
+    }
+
     apply_supervisor_binary_source(
         spec,
         params.supervisor_image,
@@ -1510,7 +1513,15 @@ fn apply_supervisor_sidecar_topology(
             .entry("securityContext")
             .or_insert_with(|| serde_json::json!({}));
         if let Some(sc) = security_context.as_object_mut() {
-            sc.insert("runAsUser".to_string(), serde_json::json!(0));
+            sc.insert(
+                "runAsUser".to_string(),
+                serde_json::json!(params.sandbox_uid),
+            );
+            sc.insert(
+                "runAsGroup".to_string(),
+                serde_json::json!(params.sandbox_gid),
+            );
+            sc.insert("runAsNonRoot".to_string(), serde_json::json!(true));
             sc.insert(
                 "allowPrivilegeEscalation".to_string(),
                 serde_json::json!(false),
@@ -1518,8 +1529,7 @@ fn apply_supervisor_sidecar_topology(
             sc.insert(
                 "capabilities".to_string(),
                 serde_json::json!({
-                    "drop": ["ALL"],
-                    "add": ["SETUID", "SETGID", "DAC_OVERRIDE", "DAC_READ_SEARCH"]
+                    "drop": ["ALL"]
                 }),
             );
         }
@@ -1561,6 +1571,16 @@ fn apply_supervisor_sidecar_topology(
                 env,
                 openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
                 "sidecar-nftables",
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE,
+                "network-only",
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SSH_SOCKET_PATH,
+                SIDECAR_SSH_SOCKET_FILE,
             );
             upsert_env(
                 env,
@@ -2119,13 +2139,22 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
     );
 
-    // Add TLS secret volume.  Mode 0400 (owner-read) prevents the
-    // unprivileged sandbox user from reading the mTLS private key.
+    // Add TLS secret volume. Combined mode uses mode 0400 because the
+    // supervisor starts as root and drops privileges before running workload
+    // children. Sidecar mode keeps the process supervisor non-root, so it uses
+    // pod fsGroup + 0440 to preserve gateway session and SSH control behavior.
     let mut volumes: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
+        let client_tls_default_mode = match params.supervisor_topology {
+            SupervisorTopology::Combined => 0o400,
+            SupervisorTopology::Sidecar => 0o440,
+        };
         volumes.push(serde_json::json!({
             "name": "openshell-client-tls",
-            "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
+            "secret": {
+                "secretName": params.client_tls_secret_name,
+                "defaultMode": client_tls_default_mode
+            }
         }));
     }
     if params.provider_spiffe_enabled {
@@ -2140,8 +2169,8 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     // Projected ServiceAccountToken volume — kubelet writes a short-lived
     // audience-bound JWT into /var/run/secrets/openshell/token and rotates
     // it automatically. The supervisor exchanges this for a gateway-minted
-    // JWT via `IssueSandboxToken` once at startup. In sidecar topology the
-    // trusted network sidecar runs with GID 0 and needs group-read access.
+    // JWT via `IssueSandboxToken` once at startup. In sidecar topology both
+    // supervisor containers run with the sandbox GID and need group-read access.
     let sa_token_default_mode = match params.supervisor_topology {
         SupervisorTopology::Combined => 0o400,
         SupervisorTopology::Sidecar => 0o440,
@@ -3065,7 +3094,11 @@ mod tests {
             &params,
         );
 
-        assert_eq!(pod_template["spec"]["shareProcessNamespace"], true);
+        assert!(
+            pod_template["spec"]["shareProcessNamespace"].is_null(),
+            "sidecar mode no longer needs a shared process namespace when binary identity is relaxed"
+        );
+        assert_eq!(pod_template["spec"]["securityContext"]["fsGroup"], 1500);
         let containers = pod_template["spec"]["containers"].as_array().unwrap();
         assert_eq!(containers.len(), 2);
 
@@ -3080,12 +3113,13 @@ mod tests {
                 "--mode=process"
             ])
         );
-        assert_eq!(agent["securityContext"]["runAsUser"], 0);
+        assert_eq!(agent["securityContext"]["runAsUser"], 1500);
+        assert_eq!(agent["securityContext"]["runAsGroup"], 1500);
+        assert_eq!(agent["securityContext"]["runAsNonRoot"], true);
         assert_eq!(
             agent["securityContext"]["capabilities"],
             serde_json::json!({
-                "drop": ["ALL"],
-                "add": ["SETUID", "SETGID", "DAC_OVERRIDE", "DAC_READ_SEARCH"]
+                "drop": ["ALL"]
             })
         );
         assert_eq!(
@@ -3095,6 +3129,14 @@ mod tests {
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME),
             Some("openshell-gateway.openshell.svc")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE),
+            Some("network-only")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SSH_SOCKET_PATH),
+            Some(SIDECAR_SSH_SOCKET_FILE)
         );
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::SUPERVISOR_READY_FILE),
@@ -3124,12 +3166,12 @@ mod tests {
             serde_json::json!([SUPERVISOR_IMAGE_BINARY_PATH, "--mode=network"])
         );
         assert_eq!(sidecar["securityContext"]["runAsUser"], 2200);
-        assert_eq!(sidecar["securityContext"]["runAsGroup"], 0);
+        assert_eq!(sidecar["securityContext"]["runAsGroup"], 1500);
+        assert_eq!(sidecar["securityContext"]["runAsNonRoot"], true);
         assert_eq!(
             sidecar["securityContext"]["capabilities"],
             serde_json::json!({
-                "drop": ["ALL"],
-                "add": ["SYS_PTRACE", "DAC_READ_SEARCH"]
+                "drop": ["ALL"]
             })
         );
         assert_eq!(
@@ -3172,6 +3214,11 @@ mod tests {
             .find(|volume| volume["name"] == "openshell-sa-token")
             .unwrap();
         assert_eq!(sa_token["projected"]["defaultMode"], 0o440);
+        let client_tls = volumes
+            .iter()
+            .find(|volume| volume["name"] == "openshell-client-tls")
+            .unwrap();
+        assert_eq!(client_tls["secret"]["defaultMode"], 0o440);
 
         let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
         let network_init = init_containers
@@ -3188,7 +3235,7 @@ mod tests {
                 "--sidecar-proxy-uid",
                 "2200",
                 "--sidecar-proxy-gid",
-                "2200",
+                "1500",
                 "--sidecar-state-dir",
                 SIDECAR_STATE_MOUNT_PATH,
                 "--sidecar-tls-dir",

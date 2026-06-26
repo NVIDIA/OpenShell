@@ -33,7 +33,7 @@ use openshell_core::denial::DenialEvent;
 
 #[cfg(target_os = "linux")]
 use crate::managed_children;
-use crate::process::ProcessHandle;
+use crate::process::{ProcessEnforcementMode, ProcessHandle};
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
@@ -57,6 +57,7 @@ pub async fn run_process(
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<String>,
     policy: &SandboxPolicy,
+    enforcement_mode: ProcessEnforcementMode,
     entrypoint_pid: Arc<AtomicU32>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
@@ -71,13 +72,17 @@ pub async fn run_process(
     // must include a "sandbox" user for privilege dropping; failing fast here
     // beats silently running children as root.
     #[cfg(unix)]
-    crate::process::validate_sandbox_user(policy)?;
+    if enforcement_mode.enforces_process_controls() {
+        crate::process::validate_sandbox_user(policy)?;
+    }
 
     // Create read_write directories and chown newly-created ones to the
     // sandbox user/group. Runs as the supervisor (root) before the child
     // is forked so the workload sees writable paths it owns.
     #[cfg(unix)]
-    crate::process::prepare_filesystem(policy)?;
+    if enforcement_mode.enforces_process_controls() {
+        crate::process::prepare_filesystem(policy)?;
+    }
 
     // Eagerly fetch initial settings and install the agent skill if the
     // proposals flag is on at startup, rather than waiting for the policy
@@ -230,6 +235,7 @@ pub async fn run_process(
                 ca_paths,
                 provider_credentials_clone,
                 user_env_clone,
+                enforcement_mode,
             )
             .await
             {
@@ -296,6 +302,7 @@ pub async fn run_process(
         workdir,
         interactive,
         policy,
+        enforcement_mode,
         netns,
         ca_file_paths.as_ref(),
         &provider_env,
@@ -308,6 +315,7 @@ pub async fn run_process(
         workdir,
         interactive,
         policy,
+        enforcement_mode,
         ca_file_paths.as_ref(),
         &provider_env,
     )?;

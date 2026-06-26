@@ -232,7 +232,7 @@ fn copy_self(dest: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn prepare_sidecar_directory(path: &Path, uid: u32, gid: u32) -> Result<()> {
+fn prepare_sidecar_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
     use miette::Context as _;
     use nix::unistd::{Gid, Uid, chown};
     use std::os::unix::fs::PermissionsExt;
@@ -241,7 +241,7 @@ fn prepare_sidecar_directory(path: &Path, uid: u32, gid: u32) -> Result<()> {
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create sidecar directory {}", path.display()))?;
     let mut perms = std::fs::metadata(path).into_diagnostic()?.permissions();
-    perms.set_mode(0o755);
+    perms.set_mode(mode);
     std::fs::set_permissions(path, perms)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to chmod sidecar directory {}", path.display()))?;
@@ -272,7 +272,7 @@ fn copy_sidecar_client_tls_if_present(
     }
 
     let dest_dir = sidecar_tls_dir.join(SIDECAR_CLIENT_TLS_SUBDIR);
-    prepare_sidecar_directory(&dest_dir, uid, gid)?;
+    prepare_sidecar_directory(&dest_dir, uid, gid, 0o750)?;
     for file_name in CLIENT_TLS_FILES {
         let source = source_dir.join(file_name);
         if !source.exists() {
@@ -333,8 +333,13 @@ fn run_network_init(
 
     let sidecar_state_dir = Path::new(sidecar_state_dir);
     let sidecar_tls_dir = Path::new(sidecar_tls_dir);
-    prepare_sidecar_directory(sidecar_state_dir, sidecar_proxy_uid, sidecar_proxy_gid)?;
-    prepare_sidecar_directory(sidecar_tls_dir, sidecar_proxy_uid, sidecar_proxy_gid)?;
+    prepare_sidecar_directory(
+        sidecar_state_dir,
+        sidecar_proxy_uid,
+        sidecar_proxy_gid,
+        0o775,
+    )?;
+    prepare_sidecar_directory(sidecar_tls_dir, sidecar_proxy_uid, sidecar_proxy_gid, 0o755)?;
     copy_sidecar_client_tls_if_present(
         Path::new(CLIENT_TLS_DIR),
         sidecar_tls_dir,
