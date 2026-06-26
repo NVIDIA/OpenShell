@@ -4674,7 +4674,6 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
- "serde_yaml",
  "spin",
  "thiserror 2.0.18",
 ]

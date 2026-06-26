@@ -25,7 +25,7 @@ hex = "0.4"
 ipnet = "2"
 miette = { workspace = true }
 rcgen = { workspace = true }
-regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

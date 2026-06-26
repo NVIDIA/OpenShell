@@ -12,6 +12,7 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 
 // ---------------------------------------------------------------------------
 // Policy intent
@@ -60,10 +61,10 @@ struct PolicyFile {
     // Ignored fields the prover does not need.
     #[serde(default)]
     #[allow(dead_code)]
-    landlock: Option<serde_yml::Value>,
+    landlock: Option<IgnoredAny>,
     #[serde(default)]
     #[allow(dead_code)]
-    process: Option<serde_yml::Value>,
+    process: Option<IgnoredAny>,
 }
 
 #[derive(Debug, Deserialize)]
