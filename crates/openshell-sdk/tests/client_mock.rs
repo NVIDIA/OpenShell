@@ -75,7 +75,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _: tonic::Request<proto::UpdateProviderProfilesRequest>,
     ) -> Result<Response<proto::UpdateProviderProfilesResponse>, Status> {
-        Ok(Response::new(proto::UpdateProviderProfilesResponse::default()))
+        Ok(Response::new(
+            proto::UpdateProviderProfilesResponse::default(),
+        ))
     }
 
     async fn create_sandbox(

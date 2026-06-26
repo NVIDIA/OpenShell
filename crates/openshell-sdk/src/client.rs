@@ -295,7 +295,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         image,
         ..proto::SandboxTemplate::default()
     });
-    let resource_requirements = gpu.then(|| proto::ResourceRequirements {
+    let resource_requirements = gpu.then_some(proto::ResourceRequirements {
         gpu: Some(proto::GpuResourceRequirements { count: None }),
     });
     proto::CreateSandboxRequest {
