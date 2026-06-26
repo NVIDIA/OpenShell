@@ -804,6 +804,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            request_inspector: None,
         };
         let request_info = crate::l7::L7RequestInfo {
             action: req.action,

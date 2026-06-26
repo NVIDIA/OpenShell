@@ -1078,6 +1078,7 @@ async fn handle_tcp_connection(
         token_grant_resolver: dynamic_credentials
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
+        request_inspector: crate::inspection::request_inspector_from_env(),
     };
 
     if effective_tls_skip {
@@ -3365,6 +3366,7 @@ async fn handle_forward_proxy(
         token_grant_resolver: dynamic_credentials
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
+        request_inspector: crate::inspection::request_inspector_from_env(),
     };
     let mut l7_activity_pending = false;
 
@@ -4606,6 +4608,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            request_inspector: None,
         };
 
         (ctx, fixture)
@@ -4664,6 +4667,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            request_inspector: None,
         };
         (config, tunnel_engine, ctx)
     }
@@ -4832,6 +4836,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            request_inspector: None,
         };
         let query_params = std::collections::HashMap::new();
 
@@ -4875,6 +4880,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            request_inspector: None,
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);

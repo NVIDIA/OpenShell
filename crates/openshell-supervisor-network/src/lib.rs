@@ -10,6 +10,7 @@
 
 pub mod identity;
 pub mod inference_routes;
+pub mod inspection;
 pub mod l7;
 pub mod opa;
 pub mod policy_local;
