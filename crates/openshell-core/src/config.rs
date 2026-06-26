@@ -563,7 +563,6 @@ pub struct GatewayInterceptorConfig {
 pub enum GatewayInterceptorFailurePolicy {
     FailClosed,
     FailOpen,
-    Ignore,
 }
 
 /// Configured override for a manifest binding.
@@ -901,9 +900,9 @@ mod tests {
     #[cfg(unix)]
     use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket, normalize_compute_driver_name,
-        podman_socket_candidates_from_env, podman_socket_responds,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorFailurePolicy,
+        GatewayJwtConfig, detect_driver, docker_host_unix_socket_path, is_unix_socket,
+        normalize_compute_driver_name, podman_socket_candidates_from_env, podman_socket_responds,
     };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
@@ -979,6 +978,15 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, 0);
+    }
+
+    #[test]
+    fn gateway_interceptor_failure_policy_rejects_ignore() {
+        let err =
+            serde_json::from_value::<GatewayInterceptorFailurePolicy>(serde_json::json!("ignore"))
+                .unwrap_err();
+
+        assert!(err.to_string().contains("unknown variant `ignore`"));
     }
 
     #[test]

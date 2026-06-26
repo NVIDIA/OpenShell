@@ -160,7 +160,7 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 
 `[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target unary OpenShell methods that are not on the built-in supervisor, streaming, read-only, or introspection allowlist. Request bodies are exposed as protobuf JSON objects, so adding a new unary RPC does not require handler-specific interceptor code.
 
-`failure_policy` accepts `fail_closed`, `fail_open`, or `ignore`. Use `ignore` only for `post_commit` bindings. `timeout` accepts `ms` and `s` suffixes. Binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
+`failure_policy` accepts `fail_closed` or `fail_open`. `timeout` accepts `ms` and `s` suffixes. Binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
 
