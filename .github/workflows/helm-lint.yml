@@ -4,6 +4,8 @@
 name: Helm Lint
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches:
       - "pull-request/[0-9]+"
