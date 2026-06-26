@@ -1310,7 +1310,7 @@ mod tests {
 
     #[tokio::test]
     async fn inject_provider_env_sets_placeholder_values() {
-        let mut cmd = Command::new("/usr/bin/env");
+        let mut cmd = Command::new("env");
         cmd.stdin(StdStdio::null())
             .stdout(StdStdio::piped())
             .stderr(StdStdio::null());

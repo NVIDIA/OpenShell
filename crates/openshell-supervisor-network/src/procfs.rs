@@ -508,6 +508,17 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[cfg(target_os = "linux")]
+    fn find_on_path(name: &str) -> PathBuf {
+        std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(name))
+                    .find(|path| path.is_file())
+            })
+            .unwrap_or_else(|| panic!("{name} not found on PATH"))
+    }
+
     /// Block until `/proc/<pid>/exe` points at `target`. `Command::spawn` returns
     /// once the child is scheduled, not once it has completed `exec()`; on
     /// contended runners the readlink can still show the parent (test harness)
@@ -602,10 +613,12 @@ mod tests {
     fn binary_path_strips_deleted_suffix() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Copy /bin/sleep to a temp path we control so we can unlink it.
+        // Copy a shell to a temp path we control so we can unlink it. Nix
+        // coreutils dispatches by argv[0], so a copied `sleep` exits when
+        // renamed to these test filenames.
         let tmp = tempfile::TempDir::new().unwrap();
         let exe_path = tmp.path().join("deleted-sleep");
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy(find_on_path("sh"), &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Spawn a child from the temp binary, then unlink it while the
@@ -613,7 +626,7 @@ mod tests {
         // `/proc/<pid>/exe`, but readlink will now return the tainted
         // "<path> (deleted)" string.
         let mut cmd = std::process::Command::new(&exe_path);
-        cmd.arg("5");
+        cmd.args(["-c", "sleep 5; :"]);
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
         wait_for_child_exec(pid, &exe_path);
@@ -649,6 +662,7 @@ mod tests {
     /// must be returned unchanged — we only strip when `stat()` reports
     /// the raw readlink target missing. This guards against the trusted
     /// identity source misattributing a running binary to a truncated
+    ///
     /// sibling path.
     #[cfg(target_os = "linux")]
     #[test]
@@ -659,11 +673,11 @@ mod tests {
         // Basename literally ends with " (deleted)" while the file is still
         // on disk — a pathological but legal filename.
         let exe_path = tmp.path().join("sleepy (deleted)");
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy(find_on_path("sh"), &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(&exe_path);
-        cmd.arg("5");
+        cmd.args(["-c", "sleep 5; :"]);
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
         wait_for_child_exec(pid, &exe_path);
@@ -702,11 +716,11 @@ mod tests {
         raw_name.extend_from_slice(b".bin");
         let exe_path = tmp.path().join(OsString::from_vec(raw_name));
 
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy(find_on_path("sh"), &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(&exe_path);
-        cmd.arg("5");
+        cmd.args(["-c", "sleep 5; :"]);
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
         wait_for_child_exec(pid, &exe_path);

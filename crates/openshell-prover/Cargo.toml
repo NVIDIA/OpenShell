@@ -10,6 +10,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "openshell_prover"
+path = "src/lib.rs"
+
 [features]
 bundled-z3 = ["z3/bundled"]
 

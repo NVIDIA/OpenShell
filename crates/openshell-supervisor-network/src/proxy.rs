@@ -6664,9 +6664,10 @@ network_policies:
 
     #[tokio::test]
     async fn test_resolve_check_allowed_ips_rejects_outside_allowlist() {
-        // 8.8.8.8 resolves to a public IP which is NOT in 10.0.0.0/8
+        // A resolved public IP outside 10.0.0.0/8 must be rejected.
         let nets = parse_allowed_ips(&["10.0.0.0/8".to_string()]).unwrap();
-        let result = resolve_and_check_allowed_ips("dns.google", 443, &nets, 0).await;
+        let addrs = ["8.8.8.8:443".parse().unwrap()];
+        let result = validate_allowed_ips_for_resolved_addrs("dns.google", 443, &addrs, &nets);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -7330,14 +7331,13 @@ network_policies:
 
     #[tokio::test]
     async fn test_forward_public_ip_allowed_without_allowed_ips() {
-        // Public IPs (e.g. dns.google -> 8.8.8.8) should pass through
-        // resolve_and_reject_internal without needing allowed_ips.
-        let result = resolve_and_reject_internal("dns.google", 80, 0).await;
+        // Public resolved IPs should pass through without needing allowed_ips.
+        let addrs = ["8.8.8.8:80".parse().unwrap()];
+        let result = reject_internal_resolved_addrs("dns.google", &addrs);
         assert!(
             result.is_ok(),
             "Public IP should be allowed without allowed_ips: {result:?}"
         );
-        let addrs = result.unwrap();
         assert!(!addrs.is_empty(), "Should resolve to at least one address");
         // All resolved addresses should be public.
         for addr in &addrs {
