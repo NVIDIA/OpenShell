@@ -164,6 +164,17 @@ expect_output_contains() {
   fi
 }
 
+expect_log_contains() {
+  local label="$1"
+  local needle="$2"
+  local path="$3"
+  if grep -q "$needle" "$path"; then
+    pass "$label"
+  else
+    fail "$label"
+  fi
+}
+
 configure_native_build_env() {
   if [[ "$(uname -s)" == "Darwin" && "${OPENSHELL_GOVERNANCE_KEEP_CC:-0}" != "1" ]]; then
     export CC="${OPENSHELL_GOVERNANCE_CC:-clang}"
@@ -300,7 +311,7 @@ version = 1
 bind_address = "$GATEWAY_ADDR"
 health_bind_address = "$HEALTH_ADDR"
 disable_tls = true
-log_level = "warn"
+log_level = "info"
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
@@ -357,6 +368,8 @@ run_step "allows gitlab provider create" "${CLI[@]}" provider create --name gitl
 expect_failure "denies non-governed provider create" "${CLI[@]}" provider create --name bitbucket --type github --credential GITHUB_TOKEN=dummy
 
 run_step "creates governed sandbox" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --no-auto-providers --keep --no-tty -- /bin/sh -lc true
+expect_log_contains "gateway logs interceptor log annotations" "log_annotations" "$GATEWAY_LOG"
+expect_log_contains "gateway logs governance correlation id" "governance:create-sandbox:$SANDBOX_NAME" "$GATEWAY_LOG"
 expect_output_contains "sandbox has github provider" "github" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
 expect_output_contains "sandbox has gitlab provider" "gitlab" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
 

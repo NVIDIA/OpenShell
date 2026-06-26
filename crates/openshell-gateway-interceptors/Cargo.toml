@@ -26,5 +26,8 @@ tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tower = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
 [lints]
 workspace = true

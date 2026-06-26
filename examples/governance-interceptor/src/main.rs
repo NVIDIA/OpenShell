@@ -32,6 +32,7 @@ const POLICY_SIGNATURE_ANNOTATION: &str = "openshell.nvidia.com/policy-signature
 const POLICY_JWT_ISSUER: &str = "openshell-governance-interceptor";
 const POLICY_JWT_AUDIENCE: &str = "openshell-governance-policy";
 const POLICY_JWT_SUBJECT: &str = "policy.yaml";
+const CREATE_SANDBOX_CORRELATION_PREFIX: &str = "governance:create-sandbox";
 const SERVICE: &str = "openshell.v1.OpenShell";
 const GOVERNED_PROVIDERS: [&str; 2] = ["github", "gitlab"];
 
@@ -263,10 +264,14 @@ impl GovernanceInterceptorService {
 
         let mut result = allow();
         result.patches = patches;
+        result.log_annotations.insert(
+            "correlation_id".to_string(),
+            create_sandbox_correlation_id(operation),
+        );
         result
-            .audit_annotations
+            .log_annotations
             .insert("policy_hash".to_string(), self.policy_hash.clone());
-        result.audit_annotations.insert(
+        result.log_annotations.insert(
             "policy_signature_kid".to_string(),
             self.policy_signer.kid().to_string(),
         );
@@ -336,13 +341,23 @@ fn binding(id: &str, method: &str, phases: &[GatewayInterceptorPhase]) -> Interc
     }
 }
 
+fn create_sandbox_correlation_id(operation: &Value) -> String {
+    let sandbox_name = operation
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unnamed");
+    format!("{CREATE_SANDBOX_CORRELATION_PREFIX}:{sandbox_name}")
+}
+
 fn allow() -> InterceptorResult {
     InterceptorResult {
         allowed: true,
         reason: String::new(),
         status_code: String::new(),
         patches: Vec::new(),
-        audit_annotations: HashMap::new(),
+        log_annotations: HashMap::new(),
     }
 }
 
@@ -352,7 +367,7 @@ fn deny(reason: &str) -> InterceptorResult {
         reason: reason.to_string(),
         status_code: "PERMISSION_DENIED".to_string(),
         patches: Vec::new(),
-        audit_annotations: HashMap::new(),
+        log_annotations: HashMap::new(),
     }
 }
 
@@ -442,7 +457,10 @@ fn add_policy_signature_patches(
     policy_signature: &str,
 ) -> Result<(), Status> {
     let signature = Value::String(policy_signature.to_string());
-    if operation.get("annotations").is_none_or(|value| !value.is_object()) {
+    if operation
+        .get("annotations")
+        .is_none_or(|value| !value.is_object())
+    {
         patches.push(json_patch(
             "add",
             "/annotations",
@@ -913,7 +931,7 @@ mod tests {
             .evaluate_inner(&evaluation(
                 "CreateSandbox",
                 GatewayInterceptorPhase::ModifyOperation,
-                json!({"spec": {}, "labels": {"team": "platform"}}),
+                json!({"name": "demo", "spec": {}, "labels": {"team": "platform"}}),
             ))
             .unwrap();
         assert!(result.allowed);
@@ -930,13 +948,16 @@ mod tests {
         );
         let token = signature_patch_token(&result);
         assert_eq!(token.split('.').count(), 3);
-        assert!(result.audit_annotations.contains_key("policy_hash"));
-        assert!(
+        assert_eq!(
             result
-                .audit_annotations
-                .contains_key("policy_signature_kid")
+                .log_annotations
+                .get("correlation_id")
+                .map(String::as_str),
+            Some("governance:create-sandbox:demo")
         );
-        assert!(!result.audit_annotations.contains_key("policy_signature"));
+        assert!(result.log_annotations.contains_key("policy_hash"));
+        assert!(result.log_annotations.contains_key("policy_signature_kid"));
+        assert!(!result.log_annotations.contains_key("policy_signature"));
     }
 
     #[test]

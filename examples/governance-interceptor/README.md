@@ -8,6 +8,8 @@ extend OpenShell to provide advanced governance over sandbox policies.
 - every new sandbox is attached to exactly `github` and `gitlab`
 - every new sandbox gets an `openshell.nvidia.com/policy-signature` metadata annotation
   that is used to verify the policy
+- every sandbox creation evaluation adds a `correlation_id` log annotation so the
+  gateway log can be correlated with interceptor-side decisions
 - users cannot attach or detach other providers after sandbox creation
 - users cannot replace or merge sandbox policy after sandbox creation
 - users cannot create provider records other than `github` and `gitlab`
@@ -31,6 +33,13 @@ phase.
 The signing key is generated in memory on each interceptor start. This keeps the
 example self-contained. Production governance services should load managed
 signing keys, publish verifier keys, and define a rotation process.
+
+Interceptors can also attach non-secret operational metadata to
+`InterceptorResult.log_annotations`. The gateway logs that map as structured
+interceptor metadata for each successful evaluation. This example adds
+`correlation_id = "governance:create-sandbox:<sandbox-name>"` during
+`CreateSandbox` modification alongside the policy hash and signing key ID. Do
+not put secrets, tokens, or policy signatures in log annotations.
 
 Gateway TOML snippet:
 

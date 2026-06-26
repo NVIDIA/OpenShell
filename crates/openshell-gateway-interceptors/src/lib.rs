@@ -439,6 +439,7 @@ impl GatewayInterceptorRuntime {
                     result.reason.clone()
                 };
                 emit_evaluation_metrics(plan, "deny", 0);
+                emit_evaluation_log(plan, &result, "deny", 0);
                 return Err(status_from_result(&result, reason));
             }
 
@@ -448,6 +449,7 @@ impl GatewayInterceptorRuntime {
                     Ok(patched) => {
                         operation = patched;
                         emit_evaluation_metrics(plan, "allow", patch_count);
+                        emit_evaluation_log(plan, &result, "allow", patch_count);
                     }
                     Err(err) => {
                         apply_failure_policy(plan, &err)?;
@@ -455,6 +457,7 @@ impl GatewayInterceptorRuntime {
                 }
             } else {
                 emit_evaluation_metrics(plan, "allow", 0);
+                emit_evaluation_log(plan, &result, "allow", 0);
             }
         }
         Ok(operation)
@@ -895,6 +898,25 @@ fn emit_evaluation_metrics(plan: &BindingPlan, result: &str, patch_count: usize)
         )
         .increment(patch_count as u64);
     }
+}
+
+fn emit_evaluation_log(
+    plan: &BindingPlan,
+    result: &InterceptorResult,
+    decision: &str,
+    patch_count: usize,
+) {
+    info!(
+        interceptor = %plan.interceptor_name,
+        binding_id = %plan.binding_id,
+        phase = plan.phase.as_str(),
+        service = %plan.selector.service,
+        method = %plan.selector.method,
+        decision,
+        patch_count,
+        log_annotations = ?result.log_annotations,
+        "gateway interceptor evaluated"
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -1925,6 +1947,22 @@ mod tests {
     use super::*;
     use openshell_core::proto::{CreateSandboxRequest, SandboxSpec, SandboxTemplate};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone)]
+    struct TraceBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TraceBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn parses_timeout_suffixes() {
@@ -1965,6 +2003,56 @@ mod tests {
             err.to_string(),
             "invalid interceptor config: unsupported failure_policy 'ignore'"
         );
+    }
+
+    #[tokio::test]
+    async fn evaluation_log_emits_structured_log_annotations() {
+        let log_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuf(log_buf.clone());
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time();
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let plan = BindingPlan {
+            interceptor_name: "test".to_string(),
+            binding_id: "binding".to_string(),
+            selector: RpcSelector {
+                service: "openshell.v1.OpenShell".to_string(),
+                method: "CreateSandbox".to_string(),
+            },
+            phase: Phase::ModifyOperation,
+            failure_policy: FailurePolicy::FailClosed,
+            timeout: DEFAULT_TIMEOUT,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_patches: DEFAULT_MAX_PATCHES,
+            client: GatewayInterceptorClient::new(
+                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+        };
+        let result = InterceptorResult {
+            allowed: true,
+            log_annotations: HashMap::from([
+                (
+                    "correlation_id".to_string(),
+                    "governance:create-sandbox:demo".to_string(),
+                ),
+                ("policy_hash".to_string(), "abc123".to_string()),
+            ]),
+            ..InterceptorResult::default()
+        };
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            emit_evaluation_log(&plan, &result, "allow", 2);
+        });
+
+        let output = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("gateway interceptor evaluated"));
+        assert!(output.contains("log_annotations"));
+        assert!(output.contains("correlation_id"));
+        assert!(output.contains("governance:create-sandbox:demo"));
+        assert!(output.contains("policy_hash"));
     }
 
     #[test]

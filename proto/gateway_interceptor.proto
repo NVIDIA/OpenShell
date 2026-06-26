@@ -57,8 +57,8 @@ message InterceptorResult {
   string status_code = 3;
   // RFC 6902 JSON patches. Only valid during modify_operation.
   repeated JsonPatch patches = 4;
-  // Non-secret annotations included in gateway audit logs.
-  map<string, string> audit_annotations = 5;
+  // Non-secret annotations included in gateway logs.
+  map<string, string> log_annotations = 5;
 }
 
 message InterceptorManifest {
