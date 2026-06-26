@@ -916,7 +916,6 @@ mod lifecycle_tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // std::env::{set,remove}_var are unsafe under edition 2024
     fn resolve_agent_env_passthrough_and_host_lookup() {
         // Literal KEY=VALUE passes through verbatim.
         assert_eq!(
@@ -928,11 +927,13 @@ mod lifecycle_tests {
         assert!(resolve_agent_env(&["OPENSHELL_TEST_DEFINITELY_UNSET_VAR".into()]).is_empty());
 
         // Bare KEY for a set host var resolves to KEY=value from the host env.
-        let var = "OPENSHELL_TEST_AGENT_ENV_KEY";
-        unsafe { std::env::set_var(var, "secret-123") };
+        // Use PATH (guaranteed present) read-only, so the test never mutates the
+        // process environment (set_var/remove_var are unsafe + racy under
+        // parallel test execution in edition 2024).
+        let var = "PATH";
+        let expected = std::env::var(var).expect("PATH must be set in test environment");
         let resolved = resolve_agent_env(&[var.to_string()]);
-        unsafe { std::env::remove_var(var) };
-        assert_eq!(resolved, vec![format!("{var}=secret-123")]);
+        assert_eq!(resolved, vec![format!("{var}={expected}")]);
     }
 
     #[test]
