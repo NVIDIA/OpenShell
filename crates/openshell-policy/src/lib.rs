@@ -19,8 +19,8 @@ use std::path::Path;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
-    LandlockPolicy, MiddlewareEndpointSelector, NetworkBinary, NetworkEndpoint,
-    NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy, SandboxPolicy, McpOptions,
+    LandlockPolicy, McpOptions, MiddlewareEndpointSelector, NetworkBinary, NetworkEndpoint,
+    NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 

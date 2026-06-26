@@ -750,9 +750,9 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
 }
 
 #[derive(Debug, Clone)]
-struct MiddlewareContext {
-    policy_middleware: Vec<String>,
-    endpoint_middleware: Vec<String>,
+struct MatchedEndpointContext {
+    policy_name: String,
+    endpoint_index: usize,
     endpoint_path: String,
 }
 
@@ -773,19 +773,20 @@ fn query_middleware_chain_locked(
         return Ok(Vec::new());
     }
     let contexts_val = engine
-        .eval_rule("data.openshell.sandbox._matching_middleware_contexts".into())
+        .eval_rule("data.openshell.sandbox._matching_endpoint_contexts".into())
         .map_err(|e| miette::miette!("{e}"))?;
-    let contexts = parse_middleware_contexts(&contexts_val);
-    let Some(context) = select_middleware_context(&contexts, request_path) else {
+    let contexts = parse_endpoint_contexts(&contexts_val);
+    let Some(context) = select_endpoint_context(&contexts, request_path)? else {
         return global_middleware_entries(&configs, &input.host, &HashSet::new());
     };
+    let policies_val = engine
+        .eval_rule("data.network_policies".into())
+        .map_err(|e| miette::miette!("{e}"))?;
+    let (policy_middleware, endpoint_middleware) =
+        middleware_for_endpoint_identity(&policies_val, context)?;
 
     let mut explicit = Vec::new();
-    for name in context
-        .policy_middleware
-        .iter()
-        .chain(context.endpoint_middleware.iter())
-    {
+    for name in policy_middleware.iter().chain(endpoint_middleware.iter()) {
         if !explicit.contains(name) {
             explicit.push(name.clone());
         }
@@ -814,7 +815,7 @@ fn parse_middleware_configs(value: &regorus::Value) -> Result<Vec<regorus::Value
     }
 }
 
-fn parse_middleware_contexts(value: &regorus::Value) -> Vec<MiddlewareContext> {
+fn parse_endpoint_contexts(value: &regorus::Value) -> Vec<MatchedEndpointContext> {
     let regorus::Value::Array(values) = value else {
         return Vec::new();
     };
@@ -824,30 +825,87 @@ fn parse_middleware_contexts(value: &regorus::Value) -> Vec<MiddlewareContext> {
             let regorus::Value::Object(_) = value else {
                 return None;
             };
-            let endpoint = get_field(value, "endpoint")?;
-            Some(MiddlewareContext {
-                policy_middleware: get_str_array(value, "policy_middleware"),
-                endpoint_middleware: get_str_array(endpoint, "middleware"),
-                endpoint_path: get_str(endpoint, "path").unwrap_or_default(),
+            Some(MatchedEndpointContext {
+                policy_name: get_str(value, "policy").unwrap_or_default(),
+                endpoint_index: get_usize(value, "endpoint_index").unwrap_or_default(),
+                endpoint_path: get_str(value, "endpoint_path").unwrap_or_default(),
             })
         })
         .collect()
 }
 
-fn select_middleware_context<'a>(
-    contexts: &'a [MiddlewareContext],
+fn middleware_for_endpoint_identity(
+    policies: &regorus::Value,
+    context: &MatchedEndpointContext,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let policy = get_field(policies, &context.policy_name).ok_or_else(|| {
+        miette::miette!(
+            "matched endpoint policy '{}' was not found in OPA data",
+            context.policy_name
+        )
+    })?;
+    let endpoint = get_array(policy, "endpoints")
+        .and_then(|endpoints| endpoints.get(context.endpoint_index))
+        .ok_or_else(|| {
+            miette::miette!(
+                "matched endpoint {}[{}] was not found in OPA data",
+                context.policy_name,
+                context.endpoint_index
+            )
+        })?;
+    Ok((
+        get_str_array(policy, "middleware"),
+        get_str_array(endpoint, "middleware"),
+    ))
+}
+
+fn select_endpoint_context<'a>(
+    contexts: &'a [MatchedEndpointContext],
     request_path: &str,
-) -> Option<&'a MiddlewareContext> {
-    contexts
+) -> Result<Option<&'a MatchedEndpointContext>> {
+    let matching: Vec<_> = contexts
         .iter()
         .filter(|context| crate::l7::endpoint_path_matches(&context.endpoint_path, request_path))
-        .max_by_key(|context| {
-            if context.endpoint_path.is_empty() {
-                0
-            } else {
-                context.endpoint_path.chars().filter(|c| *c != '*').count()
-            }
-        })
+        .map(|context| (endpoint_path_specificity(&context.endpoint_path), context))
+        .collect();
+    let Some(max_specificity) = matching.iter().map(|(specificity, _)| *specificity).max() else {
+        return Ok(None);
+    };
+    let best: Vec<_> = matching
+        .into_iter()
+        .filter(|(specificity, _)| *specificity == max_specificity)
+        .map(|(_, context)| context)
+        .collect();
+    if best.len() > 1 {
+        let matches = best
+            .iter()
+            .map(|context| {
+                format!(
+                    "{}[{}] path={}",
+                    context.policy_name,
+                    context.endpoint_index,
+                    if context.endpoint_path.is_empty() {
+                        "<all>"
+                    } else {
+                        context.endpoint_path.as_str()
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(miette::miette!(
+            "ambiguous middleware endpoint match for request path '{request_path}': {matches}"
+        ));
+    }
+    Ok(best.into_iter().next())
+}
+
+fn endpoint_path_specificity(path: &str) -> usize {
+    if path.is_empty() {
+        0
+    } else {
+        path.chars().filter(|c| *c != '*').count()
+    }
 }
 
 fn global_middleware_entries(
@@ -916,6 +974,25 @@ fn get_field<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Valu
         regorus::Value::Object(map) => map.get(&key_val),
         _ => None,
     }
+}
+
+fn get_array<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a [regorus::Value]> {
+    let regorus::Value::Array(values) = get_field(val, key)? else {
+        return None;
+    };
+    Some(values)
+}
+
+fn get_usize(val: &regorus::Value, key: &str) -> Option<usize> {
+    let value = get_field(val, key)?;
+    let regorus::Value::Number(number) = value else {
+        return None;
+    };
+    let value = number.as_f64()?;
+    if !value.is_finite() || value.fract() != 0.0 || value < 0.0 {
+        return None;
+    }
+    format!("{value:.0}").parse::<usize>().ok()
 }
 
 fn regorus_value_to_struct(value: &regorus::Value) -> prost_types::Struct {
@@ -3305,6 +3382,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                middleware: vec![],
             },
         );
 
@@ -3323,6 +3401,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3377,6 +3456,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                middleware: vec![],
             },
         );
 
@@ -3395,6 +3475,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -6952,6 +7033,52 @@ network_policies:
         assert_eq!(
             names,
             vec!["global-redactor", "policy-redactor", "endpoint-redactor"]
+        );
+    }
+
+    #[test]
+    fn middleware_chain_rejects_ambiguous_duplicate_endpoint_identity() {
+        let data = r#"
+network_middlewares:
+  - name: first-redactor
+    middleware: openshell/secrets
+  - name: second-redactor
+    middleware: openshell/secrets
+network_policies:
+  api:
+    name: api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        middleware: ["first-redactor"]
+        access: full
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        middleware: ["second-redactor"]
+        access: full
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let err = engine
+            .query_middleware_chain_with_generation(&input, "/v1/messages")
+            .expect_err("equivalent endpoint identities should be ambiguous");
+        assert!(
+            err.to_string()
+                .contains("ambiguous middleware endpoint match"),
+            "{err:?}"
         );
     }
 

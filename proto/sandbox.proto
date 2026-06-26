@@ -202,6 +202,8 @@ message McpOptions {
   // MCP-family methods at the method layer unless a tool-name policy narrows
   // tools/call. When unset or false, explicit method rules are required.
   optional bool allow_all_known_mcp_methods = 2;
+}
+
 // Trusted GraphQL operation classification.
 message GraphqlOperation {
   // Operation type: "query", "mutation", or "subscription".
