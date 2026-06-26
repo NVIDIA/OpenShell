@@ -21,10 +21,10 @@ use openshell_core::proto::{
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     IssueSandboxTokenRequest, IssueSandboxTokenResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
-    SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
+    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PeerRelayFrame,
+    ProviderResponse, RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
+    ServiceStatus, SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -461,6 +461,15 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<tonic::Streaming<RelayFrame>>,
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type PeerRelayStream = ReceiverStream<Result<PeerRelayFrame, Status>>;
+
+    async fn peer_relay(
+        &self,
+        _request: tonic::Request<tonic::Streaming<PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

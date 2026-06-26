@@ -66,6 +66,16 @@ EOF
   chmod +x "$wrapper_dir/$tool"
 done
 
+for tool in ar ranlib; do
+  cat >"$wrapper_dir/$tool" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec "$zig" "$tool" "\$@"
+EOF
+  chmod +x "$wrapper_dir/$tool"
+done
+
 processor=${cargo_target%%-*}
 toolchain_file="$wrapper_dir/toolchain.cmake"
 cat >"$toolchain_file" <<EOF
@@ -73,15 +83,38 @@ set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR "$processor")
 set(CMAKE_C_COMPILER "$wrapper_dir/cc")
 set(CMAKE_CXX_COMPILER "$wrapper_dir/c++")
+set(CMAKE_AR "$wrapper_dir/ar")
+set(CMAKE_RANLIB "$wrapper_dir/ranlib")
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
 EOF
 
 is_stale_z3_build_dir() {
-  local build_dir=$1
+  local z3_build_dir=$1
+  local cmake_build_dir="$z3_build_dir/out/build"
+
+  if [[ ! -f "$cmake_build_dir/CMakeCache.txt" ]]; then
+    return 0
+  fi
+
+  if ! grep -q "CMAKE_AR:FILEPATH=$wrapper_dir/ar" "$cmake_build_dir/CMakeCache.txt" 2>/dev/null; then
+    return 0
+  fi
+  if ! grep -q "CMAKE_RANLIB:FILEPATH=$wrapper_dir/ranlib" "$cmake_build_dir/CMakeCache.txt" 2>/dev/null; then
+    return 0
+  fi
 
   grep -R -q -E \
     'cargo-zigbuild|zigc(c|xx)-.*unknown-linux-gnu\.[0-9]+\.[0-9]+' \
-    "$build_dir/CMakeCache.txt" "$build_dir/CMakeFiles" 2>/dev/null
+    "$cmake_build_dir/CMakeCache.txt" "$cmake_build_dir/CMakeFiles" 2>/dev/null
+}
+
+clean_z3_cargo_artifacts() {
+  local profile_dir=$1
+
+  rm -rf "$profile_dir"/build/z3-sys-*
+  rm -rf "$profile_dir"/.fingerprint/z3-sys-* "$profile_dir"/.fingerprint/z3-*
+  rm -f "$profile_dir"/deps/libz3_sys-* "$profile_dir"/deps/z3_sys-*
+  rm -f "$profile_dir"/deps/libz3-* "$profile_dir"/deps/z3-*
 }
 
 for profile in release debug; do
@@ -89,10 +122,11 @@ for profile in release debug; do
   if [[ -d $z3_build_root ]]; then
     while IFS= read -r z3_build_dir; do
       if is_stale_z3_build_dir "$z3_build_dir"; then
-        echo "Removing stale z3-sys CMake cache: $z3_build_dir" >&2
-        rm -rf "$z3_build_dir"
+        echo "Removing stale z3-sys cross-build artifacts under target/$bare_cargo_target/$profile" >&2
+        clean_z3_cargo_artifacts "target/$bare_cargo_target/$profile"
+        break
       fi
-    done < <(find "$z3_build_root" -mindepth 3 -maxdepth 3 -type d -path "*/z3-sys-*/out/build")
+    done < <(find "$z3_build_root" -mindepth 1 -maxdepth 1 -type d -name "z3-sys-*")
   fi
 done
 

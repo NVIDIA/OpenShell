@@ -26,6 +26,7 @@ mod tests {
             "/openshell.v1.OpenShell/ConnectSupervisor"
         ));
         assert!(is_sandbox_callable("/openshell.v1.OpenShell/RelayStream"));
+        assert!(!is_sandbox_callable("/openshell.v1.OpenShell/PeerRelay"));
         assert!(is_sandbox_callable(
             "/openshell.v1.OpenShell/GetSandboxConfig"
         ));

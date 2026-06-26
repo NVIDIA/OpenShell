@@ -127,3 +127,21 @@ deploy:
           image.tag: '{{.IMAGE_TAG_openshell_gateway}}'
           supervisor.image.repository: '{{.IMAGE_REPO_openshell_supervisor}}'
           supervisor.image.tag: '{{.IMAGE_TAG_openshell_supervisor}}'
+profiles:
+  - name: high-availability
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0
+        value:
+          name: envoy-gateway
+          remoteChart: oci://docker.io/envoyproxy/gateway-helm
+          version: v1.7.2
+          namespace: envoy-gateway-system
+          createNamespace: true
+          wait: true
+      - op: add
+        path: /deploy/helm/releases/1/valuesFiles/-
+        value: ci/values-high-availability.yaml
+      - op: add
+        path: /deploy/helm/releases/1/valuesFiles/-
+        value: ci/values-gateway.yaml

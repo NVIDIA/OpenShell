@@ -878,7 +878,9 @@ fn authorize_inference_bundle(
 ) -> Result<(), Status> {
     match principal {
         Some(crate::auth::principal::Principal::Sandbox(_)) => Ok(()),
-        Some(crate::auth::principal::Principal::User(_)) => Err(Status::permission_denied(
+        Some(
+            crate::auth::principal::Principal::User(_) | crate::auth::principal::Principal::Peer(_),
+        ) => Err(Status::permission_denied(
             "GetInferenceBundle requires a sandbox principal",
         )),
         Some(crate::auth::principal::Principal::Anonymous) | None => Err(Status::unauthenticated(

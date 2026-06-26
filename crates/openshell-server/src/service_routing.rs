@@ -304,17 +304,16 @@ async fn proxy_to_endpoint(
     let websocket_upgrade = is_websocket_upgrade(&req);
     let downstream_upgrade = websocket_upgrade.then(|| hyper::upgrade::on(&mut req));
 
-    let (_channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay_with_target(
-            sandbox.object_id(),
-            relay_open::Target::Tcp(TcpRelayTarget {
-                host: RELAY_TARGET_HOST.to_string(),
-                port: u32::from(target_port),
-            }),
-            endpoint.object_id().to_string(),
-            Duration::from_secs(15),
-        )
+    let (_channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
+        &state,
+        sandbox.object_id(),
+        relay_open::Target::Tcp(TcpRelayTarget {
+            host: RELAY_TARGET_HOST.to_string(),
+            port: u32::from(target_port),
+        }),
+        endpoint.object_id().to_string(),
+        Duration::from_secs(15),
+    )
         .await
         .map_err(|err| {
             warn!(error = %err, sandbox_id = %endpoint.sandbox_id, "sandbox service routing: supervisor relay unavailable");

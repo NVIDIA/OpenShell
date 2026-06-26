@@ -5,6 +5,8 @@ suite: gateway TOML config shape
 templates:
   - templates/gateway-config.yaml
   - templates/deployment.yaml
+  - templates/peer-role.yaml
+  - templates/peer-service.yaml
   - templates/statefulset.yaml
 release:
   name: openshell
@@ -50,16 +52,16 @@ tests:
       server.oidc.caConfigMapName: openshell-oidc-ca
     asserts:
       - equal:
-          path: spec.template.spec.containers[0].volumeMounts[3].name
+          path: spec.template.spec.containers[0].volumeMounts[4].name
           value: oidc-ca
       - equal:
-          path: spec.template.spec.containers[0].volumeMounts[3].mountPath
+          path: spec.template.spec.containers[0].volumeMounts[4].mountPath
           value: /etc/openshell-tls/oidc-ca
       - equal:
-          path: spec.template.spec.volumes[2].name
+          path: spec.template.spec.volumes[3].name
           value: oidc-ca
       - equal:
-          path: spec.template.spec.volumes[2].configMap.name
+          path: spec.template.spec.volumes[3].configMap.name
           value: openshell-oidc-ca
 
   # Regression for the P1 bug Drew flagged: grpc_endpoint MUST live in the
@@ -251,6 +253,102 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].args
           content: "sqlite:/var/openshell/openshell.db"
+
+  - it: configures gateway peer identity and projected peer token
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.serviceName
+          value: openshell-peer
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_SERVICE_NAME
+            value: openshell-peer
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TOKEN_AUDIENCE
+            value: openshell-gateway-peer
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-peer-token
+            mountPath: /var/run/secrets/openshell-peer
+            readOnly: true
+      - equal:
+          path: spec.template.spec.volumes[2].projected.sources[0].serviceAccountToken.audience
+          value: openshell-gateway-peer
+
+  - it: configures gateway peer identity and projected peer token for Deployment
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: my-pg-secret
+      server.disableTls: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_POD_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_ENDPOINT
+            value: http://$(OPENSHELL_POD_IP):8080
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_SERVICE_NAME
+            value: openshell-peer
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TOKEN_AUDIENCE
+            value: openshell-gateway-peer
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: gateway-peer-token
+            mountPath: /var/run/secrets/openshell-peer
+            readOnly: true
+      - equal:
+          path: spec.template.spec.volumes[2].projected.sources[0].serviceAccountToken.audience
+          value: openshell-gateway-peer
+
+  - it: renders headless gateway peer service
+    template: templates/peer-service.yaml
+    asserts:
+      - equal:
+          path: metadata.name
+          value: openshell-peer
+      - equal:
+          path: spec.clusterIP
+          value: None
+      - equal:
+          path: spec.publishNotReadyAddresses
+          value: true
+
+  - it: grants release-namespace pod lookup for gateway peer identity validation
+    template: templates/peer-role.yaml
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          path: metadata.namespace
+          value: my-namespace
+        documentIndex: 0
+      - equal:
+          path: rules[0].resources[0]
+          value: pods
+        documentIndex: 0
+      - equal:
+          path: subjects[0].name
+          value: openshell
+        documentIndex: 1
 
   - it: fails when legacy postgres.enabled is set
     template: templates/statefulset.yaml

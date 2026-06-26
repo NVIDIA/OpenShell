@@ -109,6 +109,10 @@ Name of the Secret holding gateway-minted sandbox JWT signing material.
 {{- .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) -}}
 {{- end }}
 
+{{- define "openshell.peerServiceName" -}}
+{{- printf "%s-peer" (include "openshell.fullname" .) -}}
+{{- end }}
+
 {{/*
 gRPC endpoint sandbox pods use to call back into the gateway. An explicit
 .Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
