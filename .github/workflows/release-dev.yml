@@ -679,7 +679,7 @@ jobs:
 
   smoke-linux-dev-artifacts:
     name: Smoke Linux Dev Artifacts (${{ matrix.name }})
-    needs: [build-gateway-binary-linux, build-driver-vm-linux, build-deb, build-rpm]
+    needs: [build-gateway-binary-linux, build-driver-vm-linux, build-deb, build-rpm, build-python-wheels-linux]
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -707,6 +707,18 @@ jobs:
             runner: linux-arm64-cpu8
             image: fedora:latest
             kind: rpm
+            artifact_arch: arm64
+            rpm_arch: aarch64
+          - name: python-wheel-amd64
+            runner: linux-amd64-cpu8
+            image: python:3.12-slim
+            kind: wheel
+            artifact_arch: amd64
+            rpm_arch: x86_64
+          - name: python-wheel-arm64
+            runner: linux-arm64-cpu8
+            image: python:3.12-slim
+            kind: wheel
             artifact_arch: arm64
             rpm_arch: aarch64
     runs-on: ${{ matrix.runner }}
@@ -742,6 +754,25 @@ jobs:
           set -euo pipefail
           dnf install -y ./package-input/openshell-[0-9]*.rpm ./package-input/openshell-gateway-*.rpm
           LD_BIND_NOW=1 openshell-gateway --version
+
+      - name: Download Python wheel artifact
+        if: matrix.kind == 'wheel'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-wheels-linux-${{ matrix.artifact_arch }}
+          path: wheel-input/
+
+      - name: Smoke Python wheel
+        if: matrix.kind == 'wheel'
+        run: |
+          set -euo pipefail
+          pip install --no-cache-dir wheel-input/*.whl
+          python - <<'PY'
+          import importlib
+          for name in ("openshell", "openshell._proto", "openshell.sandbox"):
+              importlib.import_module(name)
+              print(name, "OK")
+          PY
 
   # ---------------------------------------------------------------------------
   # Create / update the dev GitHub Release with CLI, gateway, driver, and wheels

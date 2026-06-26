@@ -70,6 +70,13 @@ bindings = "bin"
 manifest-path = "crates/openshell-cli/Cargo.toml"
 python-source = "python"
 module-name = "openshell"
+# _proto/ stubs are gitignored; force them into the wheel so git-aware
+# maturin builds don't drop them (package-relative paths).
+include = [
+    "openshell/_proto/*_pb2.py",
+    "openshell/_proto/*_pb2_grpc.py",
+    "openshell/_proto/*.pyi",
+]
 
 [tool.ruff]
 target-version = "py312"
