@@ -67,6 +67,7 @@ message InterceptorManifest {
   // Bindings declared by the interceptor service.
   repeated InterceptorBinding bindings = 2;
   // Optional default failure policy for bindings without their own policy.
+  // Supported values are "fail_closed" and "fail_open".
   string failure_policy = 3;
 }
 
@@ -78,6 +79,7 @@ message InterceptorBinding {
   // Phases this binding wants to evaluate.
   repeated GatewayInterceptorPhase phases = 3;
   // Optional binding-specific failure policy.
+  // Supported values are "fail_closed" and "fail_open".
   string failure_policy = 4;
 }
 

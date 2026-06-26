@@ -41,7 +41,7 @@ use tonic::codegen::http::Uri;
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 use tower::service_fn;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 pub mod routes;
 
@@ -120,7 +120,6 @@ impl From<GatewayInterceptorPhaseConfig> for Phase {
 pub enum FailurePolicy {
     FailClosed,
     FailOpen,
-    Ignore,
 }
 
 impl FailurePolicy {
@@ -129,7 +128,6 @@ impl FailurePolicy {
         match self {
             Self::FailClosed => "fail_closed",
             Self::FailOpen => "fail_open",
-            Self::Ignore => "ignore",
         }
     }
 }
@@ -139,7 +137,6 @@ impl From<GatewayInterceptorFailurePolicy> for FailurePolicy {
         match value {
             GatewayInterceptorFailurePolicy::FailClosed => Self::FailClosed,
             GatewayInterceptorFailurePolicy::FailOpen => Self::FailOpen,
-            GatewayInterceptorFailurePolicy::Ignore => Self::Ignore,
         }
     }
 }
@@ -270,10 +267,11 @@ impl GatewayInterceptorRuntime {
                         ))
                     })?
                     .into_inner();
+            let manifest_default = parse_optional_failure_policy(&manifest.failure_policy)?;
             let service_default = config
                 .failure_policy
                 .map(FailurePolicy::from)
-                .or_else(|| parse_failure_policy(manifest.failure_policy.as_str()).ok())
+                .or(manifest_default)
                 .unwrap_or(FailurePolicy::FailClosed);
             let max_response_bytes = config
                 .max_response_bytes
@@ -302,14 +300,6 @@ impl GatewayInterceptorRuntime {
                     )));
                 }
                 for phase in normalized.phases {
-                    if normalized.failure_policy == FailurePolicy::Ignore
-                        && phase != Phase::PostCommit
-                    {
-                        return Err(InterceptorError::Config(format!(
-                            "interceptor '{}' binding '{}' uses failure_policy=ignore outside post_commit",
-                            config.name, normalized.binding_id
-                        )));
-                    }
                     let plan = BindingPlan {
                         interceptor_name: config.name.clone(),
                         binding_id: normalized.binding_id.clone(),
@@ -571,7 +561,7 @@ fn normalize_binding(
     }
 
     let mut failure_policy =
-        parse_failure_policy(binding.failure_policy.as_str()).unwrap_or(service_default);
+        parse_optional_failure_policy(&binding.failure_policy)?.unwrap_or(service_default);
 
     if let Some(override_cfg) = overrides.get(binding_id, &selector) {
         if let Some(override_selector) = override_selector(override_cfg)?
@@ -667,14 +657,11 @@ fn parse_rpc_selector(value: &str) -> Result<RpcSelector> {
     Ok(RpcSelector::new(service, method))
 }
 
-fn parse_failure_policy(value: &str) -> Result<FailurePolicy> {
+fn parse_optional_failure_policy(value: &str) -> Result<Option<FailurePolicy>> {
     match value.trim() {
-        "" => Err(InterceptorError::Config(
-            "failure_policy must not be empty".to_string(),
-        )),
-        "fail_closed" => Ok(FailurePolicy::FailClosed),
-        "fail_open" => Ok(FailurePolicy::FailOpen),
-        "ignore" => Ok(FailurePolicy::Ignore),
+        "" => Ok(None),
+        "fail_closed" => Ok(Some(FailurePolicy::FailClosed)),
+        "fail_open" => Ok(Some(FailurePolicy::FailOpen)),
         other => Err(InterceptorError::Config(format!(
             "unsupported failure_policy '{other}'"
         ))),
@@ -811,16 +798,6 @@ fn apply_failure_policy(
                 "gateway interceptor failed open"
             );
             counter!("openshell_gateway_interceptor_fail_open_total").increment(1);
-            Ok(())
-        }
-        FailurePolicy::Ignore => {
-            debug!(
-                interceptor = %plan.interceptor_name,
-                binding_id = %plan.binding_id,
-                phase = plan.phase.as_str(),
-                error = %err,
-                "gateway interceptor failure ignored"
-            );
             Ok(())
         }
     }
@@ -1954,6 +1931,40 @@ mod tests {
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(parse_duration("2s").unwrap(), Duration::from_secs(2));
         assert!(parse_duration("2").is_err());
+    }
+
+    #[test]
+    fn service_default_failure_policy_rejects_ignore() {
+        let err = parse_optional_failure_policy("ignore").unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid interceptor config: unsupported failure_policy 'ignore'"
+        );
+    }
+
+    #[test]
+    fn binding_failure_policy_rejects_ignore() {
+        let overrides = Vec::new();
+        let override_index = OverrideIndex::new(&overrides).unwrap();
+        let binding = InterceptorBinding {
+            id: "binding".to_string(),
+            selector: Some(InterceptorSelector {
+                rpc: "openshell.v1.OpenShell/CreateSandbox".to_string(),
+                service: String::new(),
+                method: String::new(),
+            }),
+            phases: vec![GatewayInterceptorPhase::Validate as i32],
+            failure_policy: "ignore".to_string(),
+        };
+
+        let err = normalize_binding("test", &binding, FailurePolicy::FailClosed, &override_index)
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid interceptor config: unsupported failure_policy 'ignore'"
+        );
     }
 
     #[test]
