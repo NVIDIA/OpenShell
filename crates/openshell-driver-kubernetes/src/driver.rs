@@ -699,11 +699,11 @@ impl KubernetesComputeDriver {
 }
 
 fn should_try_next_sandbox_api_version(err: &KubeError) -> bool {
-    matches!(
-        err,
-        KubeError::Api(api)
-            if api.code == 404 && api.message.contains("could not find the requested resource")
-    )
+    // Kubernetes returns a structured 404 for some missing API resources and a
+    // raw "404 page not found" body for others. Both mean the probed
+    // group/version is unavailable and the next supported Sandbox API version
+    // should be tried.
+    matches!(err, KubeError::Api(api) if api.code == 404)
 }
 
 fn validate_gpu_request(
@@ -2067,6 +2067,34 @@ mod tests {
                 })),
             },
         }
+    }
+
+    fn kube_api_error(code: u16, message: &str) -> KubeError {
+        KubeError::Api(kube::core::ErrorResponse {
+            status: if code == 404 {
+                "404 Not Found".to_string()
+            } else {
+                "Failure".to_string()
+            },
+            message: message.to_string(),
+            reason: "Failed to parse error data".to_string(),
+            code,
+        })
+    }
+
+    #[test]
+    fn sandbox_api_version_probe_retries_on_structured_and_raw_404() {
+        let structured = kube_api_error(404, "could not find the requested resource");
+        assert!(should_try_next_sandbox_api_version(&structured));
+
+        let raw = kube_api_error(404, "404 page not found\n");
+        assert!(should_try_next_sandbox_api_version(&raw));
+    }
+
+    #[test]
+    fn sandbox_api_version_probe_keeps_non_404_errors() {
+        let err = kube_api_error(403, "sandboxes.agents.x-k8s.io is forbidden");
+        assert!(!should_try_next_sandbox_api_version(&err));
     }
 
     #[test]
