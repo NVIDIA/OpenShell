@@ -89,6 +89,11 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
 
+struct AgentSandboxApi {
+    api: Api<DynamicObject>,
+    resource: ApiResource,
+}
+
 // This POC treats the selected Struct as a driver-local typed schema. Once the
 // Kubernetes shape stabilizes, these serde structs may move to driver-local
 // protobuf definitions, but the typed decode should stay inside this driver.
@@ -261,10 +266,16 @@ impl KubernetesComputeDriver {
         &self.config.ssh_socket_path
     }
 
-    fn sandbox_api(&self, client: Client, sandbox_api_version: &str) -> Api<DynamicObject> {
+    fn agent_sandbox_api(&self, client: Client, sandbox_api_version: &str) -> AgentSandboxApi {
         let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, sandbox_api_version, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
-        Api::namespaced_with(client, &self.config.namespace, &resource)
+        let api = Api::namespaced_with(client, &self.config.namespace, &resource);
+        AgentSandboxApi { api, resource }
+    }
+
+    async fn supported_agent_sandbox_api(&self, client: Client) -> Result<AgentSandboxApi, String> {
+        let sandbox_api_version = self.supported_sandbox_api_version(client.clone()).await?;
+        Ok(self.agent_sandbox_api(client, sandbox_api_version))
     }
 
     async fn supported_sandbox_api_version(&self, client: Client) -> Result<&'static str, String> {
@@ -281,9 +292,12 @@ impl KubernetesComputeDriver {
         client: Client,
     ) -> Result<&'static str, String> {
         for sandbox_api_version in SANDBOX_VERSIONS {
-            let api = self.sandbox_api(client.clone(), sandbox_api_version);
-            match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&ListParams::default().limit(1)))
-                .await
+            let agent_sandbox_api = self.agent_sandbox_api(client.clone(), sandbox_api_version);
+            match tokio::time::timeout(
+                KUBE_API_TIMEOUT,
+                agent_sandbox_api.api.list(&ListParams::default().limit(1)),
+            )
+            .await
             {
                 Ok(Ok(_)) => {
                     debug!(
@@ -354,11 +368,10 @@ impl KubernetesComputeDriver {
             "Fetching sandbox from Kubernetes"
         );
 
-        let sandbox_api_version = self
-            .supported_sandbox_api_version(self.client.clone())
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
             .await?;
-        let api = self.sandbox_api(self.client.clone(), sandbox_api_version);
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
+        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get(name)).await {
             Ok(Ok(obj)) => sandbox_from_object(&self.config.namespace, obj).map(Some),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => {
                 debug!(sandbox_name = %name, "Sandbox not found in Kubernetes");
@@ -392,11 +405,15 @@ impl KubernetesComputeDriver {
             "Listing sandboxes from Kubernetes"
         );
 
-        let sandbox_api_version = self
-            .supported_sandbox_api_version(self.client.clone())
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
             .await?;
-        let api = self.sandbox_api(self.client.clone(), sandbox_api_version);
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&ListParams::default())).await {
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.list(&ListParams::default()),
+        )
+        .await
+        {
             Ok(Ok(list)) => {
                 let mut sandboxes = list
                     .items
@@ -450,13 +467,11 @@ impl KubernetesComputeDriver {
             "Creating sandbox in Kubernetes"
         );
 
-        let sandbox_api_version = self
-            .supported_sandbox_api_version(self.client.clone())
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
             .await
             .map_err(KubernetesDriverError::Message)?;
-        let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, sandbox_api_version, SANDBOX_KIND);
-        let resource = ApiResource::from_gvk(&gvk);
-        let mut obj = DynamicObject::new(name, &resource);
+        let mut obj = DynamicObject::new(name, &agent_sandbox_api.resource);
         obj.metadata = ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(self.config.namespace.clone()),
@@ -488,9 +503,11 @@ impl KubernetesComputeDriver {
                 .provider_spiffe_workload_api_socket_path,
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
-        let api = self.sandbox_api(self.client.clone(), sandbox_api_version);
-
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), &obj)).await
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.create(&PostParams::default(), &obj),
+        )
+        .await
         {
             Ok(Ok(_result)) => {
                 info!(
@@ -531,12 +548,14 @@ impl KubernetesComputeDriver {
             "Deleting sandbox from Kubernetes"
         );
 
-        let sandbox_api_version = self
-            .supported_sandbox_api_version(self.client.clone())
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
             .await?;
-        let api = self.sandbox_api(self.client.clone(), sandbox_api_version);
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(name, &DeleteParams::default()))
-            .await
+        match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            agent_sandbox_api.api.delete(name, &DeleteParams::default()),
+        )
+        .await
         {
             Ok(Ok(_response)) => {
                 info!(sandbox_name = %name, "Sandbox deleted from Kubernetes");
@@ -569,11 +588,10 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn sandbox_exists(&self, name: &str) -> Result<bool, String> {
-        let sandbox_api_version = self
-            .supported_sandbox_api_version(self.client.clone())
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.client.clone())
             .await?;
-        let api = self.sandbox_api(self.client.clone(), sandbox_api_version);
-        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(name)).await {
+        match tokio::time::timeout(KUBE_API_TIMEOUT, agent_sandbox_api.api.get(name)).await {
             Ok(Ok(_)) => Ok(true),
             Ok(Err(KubeError::Api(err))) if err.code == 404 => Ok(false),
             Ok(Err(err)) => Err(err.to_string()),
@@ -588,12 +606,12 @@ impl KubernetesComputeDriver {
     #[allow(clippy::unused_async)]
     pub async fn watch_sandboxes(&self) -> Result<WatchStream, String> {
         let namespace = self.config.namespace.clone();
-        let sandbox_api_version = self
-            .supported_sandbox_api_version(self.watch_client.clone())
+        let agent_sandbox_api = self
+            .supported_agent_sandbox_api(self.watch_client.clone())
             .await?;
-        let sandbox_api = self.sandbox_api(self.watch_client.clone(), sandbox_api_version);
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
-        let mut sandbox_stream = watcher::watcher(sandbox_api, watcher::Config::default()).boxed();
+        let mut sandbox_stream =
+            watcher::watcher(agent_sandbox_api.api, watcher::Config::default()).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
         let (tx, rx) = mpsc::channel(256);
 
