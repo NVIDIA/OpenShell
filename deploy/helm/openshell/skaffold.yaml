@@ -131,11 +131,6 @@ profiles:
   - name: high-availability
     patches:
       - op: add
-        path: /deploy/helm/releases/0/valuesFiles/-
-        value: ci/values-high-availability.yaml
-  - name: ha-envoy
-    patches:
-      - op: add
         path: /deploy/helm/releases/0
         value:
           name: envoy-gateway

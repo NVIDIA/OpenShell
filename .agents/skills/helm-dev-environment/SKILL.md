@@ -66,23 +66,20 @@ generates mTLS secrets on first install. Envoy Gateway opt-in; see the Optional 
 
 The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
 
-Skaffold profiles are available for HA and reverse-proxy development. Run these from
+The Skaffold profile for HA reverse-proxy development is available from
 `deploy/helm/openshell/`:
 
 ```bash
-# Two gateway replicas + external PostgreSQL Secret.
+# Two gateway replicas + external PostgreSQL Secret + Envoy Gateway + Gateway API route.
 KUBECONFIG=../../../kubeconfig skaffold run -p high-availability
-
-# Two gateway replicas + Envoy Gateway + Gateway API route.
-KUBECONFIG=../../../kubeconfig skaffold run -p ha-envoy
 ```
 
-The HA profiles expect a Secret named `openshell-ha-pg` in the `openshell`
+The `high-availability` profile expects a Secret named `openshell-ha-pg` in the `openshell`
 namespace with a `uri` key. For local manual testing, either create your own
 PostgreSQL Secret or use the e2e PostgreSQL fixture manifest in
 `e2e/kubernetes/postgres-fixture.yaml`.
 
-For the `ha-envoy` profile, return to the repository root and apply the
+For the `high-availability` profile, return to the repository root and apply the
 GatewayClass and BackendTrafficPolicy manifest after Skaffold has installed
 Envoy Gateway:
 
@@ -169,17 +166,17 @@ manual edits in the worktree.
 
 ### Envoy Gateway (Gateway API / GRPCRoute)
 
-Use the `ha-envoy` Skaffold profile for HA reverse-proxy testing:
+Use the `high-availability` Skaffold profile for HA reverse-proxy testing:
 
 ```bash
 cd deploy/helm/openshell
-KUBECONFIG=../../../kubeconfig skaffold run -p ha-envoy
+KUBECONFIG=../../../kubeconfig skaffold run -p high-availability
 cd ../../..
 KUBECONFIG=kubeconfig mise run helm:gateway:apply
 ```
 
 `values-gateway.yaml` creates a `Gateway` (listener on port 80, class `eg`) and
-`GRPCRoute` in the `openshell` namespace. The `ha-envoy` profile installs the
+`GRPCRoute` in the `openshell` namespace. The `high-availability` profile installs the
 Envoy Gateway Helm chart and layers both `values-high-availability.yaml` and
 `values-gateway.yaml` onto the OpenShell release.
 
