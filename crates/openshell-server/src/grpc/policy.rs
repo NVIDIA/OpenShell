@@ -7100,6 +7100,7 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
+            ..Default::default()
         };
         let chunk = DraftChunkRecord {
             id: "chunk-provider-prefix".to_string(),
