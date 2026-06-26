@@ -34,8 +34,9 @@ use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{OnceCell, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
@@ -192,6 +193,7 @@ const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 pub struct KubernetesComputeDriver {
     client: Client,
     watch_client: Client,
+    sandbox_api_version: Arc<OnceCell<&'static str>>,
     config: KubernetesComputeConfig,
 }
 
@@ -234,6 +236,7 @@ impl KubernetesComputeDriver {
         Ok(Self {
             client,
             watch_client,
+            sandbox_api_version: Arc::new(OnceCell::new()),
             config,
         })
     }
@@ -265,12 +268,31 @@ impl KubernetesComputeDriver {
     }
 
     async fn supported_sandbox_api_version(&self, client: Client) -> Result<&'static str, String> {
+        self.sandbox_api_version
+            .get_or_try_init(
+                || async move { self.detect_supported_sandbox_api_version(client).await },
+            )
+            .await
+            .copied()
+    }
+
+    async fn detect_supported_sandbox_api_version(
+        &self,
+        client: Client,
+    ) -> Result<&'static str, String> {
         for sandbox_api_version in SANDBOX_VERSIONS {
             let api = self.sandbox_api(client.clone(), sandbox_api_version);
             match tokio::time::timeout(KUBE_API_TIMEOUT, api.list(&ListParams::default().limit(1)))
                 .await
             {
-                Ok(Ok(_)) => return Ok(sandbox_api_version),
+                Ok(Ok(_)) => {
+                    debug!(
+                        namespace = %self.config.namespace,
+                        sandbox_api_version = %sandbox_api_version,
+                        "Selected Agent Sandbox API version"
+                    );
+                    return Ok(sandbox_api_version);
+                }
                 Ok(Err(err)) if should_try_next_sandbox_api_version(&err) => {
                     debug!(
                         namespace = %self.config.namespace,
