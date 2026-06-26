@@ -368,12 +368,11 @@ service-level gateway config, then applies any binding override.
 |---|---|
 | `fail_closed` | The gateway rejects the API operation before committing side effects. |
 | `fail_open` | The gateway continues without applying the failed gateway interceptor result and emits warning and audit events. |
-| `ignore` | The gateway records the failure without changing operation outcome. Valid only for `post_commit`. |
 
 Defaults:
 
 - `modify_operation` and `validate` bindings default to `fail_closed`.
-- `post_commit` bindings default to `ignore`.
+- `post_commit` bindings default to `fail_open`.
 
 The gateway enforces a timeout and response size limit for every gateway
 interceptor service call. Each binding also has a maximum patch count.
