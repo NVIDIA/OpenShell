@@ -3,6 +3,7 @@
 
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
+pub mod driver_config;
 pub mod lease;
 pub mod vm;
 
