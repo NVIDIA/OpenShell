@@ -2475,9 +2475,9 @@ mod tests {
         let template = SandboxTemplate {
             driver_config: Some(json_struct(serde_json::json!({
                 "volumes": [{
-                    "name": "pete-user-data",
+                    "name": "user-data",
                     "persistent_volume_claim": {
-                        "claim_name": "pvc-pete-user-123",
+                        "claim_name": "pvc-user-data-123",
                         "read_only": false
                     }
                 }],
@@ -2485,14 +2485,14 @@ mod tests {
                     "agent": {
                         "volume_mounts": [
                             {
-                                "name": "pete-user-data",
-                                "mount_path": "/sandbox/.openclaw/workspace",
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/workspace",
                                 "sub_path": "workspace",
                                 "read_only": false
                             },
                             {
-                                "name": "pete-user-data",
-                                "mount_path": "/sandbox/.openclaw/memory",
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/memory",
                                 "sub_path": "memory"
                             }
                         ]
@@ -2514,11 +2514,11 @@ mod tests {
             .expect("volumes should exist");
         let user_volume = volumes
             .iter()
-            .find(|volume| volume["name"] == "pete-user-data")
+            .find(|volume| volume["name"] == "user-data")
             .expect("user PVC volume should be rendered");
         assert_eq!(
             user_volume["persistentVolumeClaim"]["claimName"],
-            "pvc-pete-user-123"
+            "pvc-user-data-123"
         );
         assert_eq!(user_volume["persistentVolumeClaim"]["readOnly"], false);
 
@@ -2527,17 +2527,17 @@ mod tests {
             .expect("volumeMounts should exist");
         let workspace_mount = mounts
             .iter()
-            .find(|mount| mount["mountPath"] == "/sandbox/.openclaw/workspace")
+            .find(|mount| mount["mountPath"] == "/sandbox/.openshell/workspace")
             .expect("workspace subPath mount should be rendered");
-        assert_eq!(workspace_mount["name"], "pete-user-data");
+        assert_eq!(workspace_mount["name"], "user-data");
         assert_eq!(workspace_mount["subPath"], "workspace");
         assert_eq!(workspace_mount["readOnly"], false);
 
         let memory_mount = mounts
             .iter()
-            .find(|mount| mount["mountPath"] == "/sandbox/.openclaw/memory")
+            .find(|mount| mount["mountPath"] == "/sandbox/.openshell/memory")
             .expect("memory subPath mount should be rendered");
-        assert_eq!(memory_mount["name"], "pete-user-data");
+        assert_eq!(memory_mount["name"], "user-data");
         assert_eq!(memory_mount["subPath"], "memory");
         assert_eq!(memory_mount["readOnly"], true);
 
@@ -2560,16 +2560,77 @@ mod tests {
     }
 
     #[test]
+    fn driver_config_accepts_read_write_pvc_with_multiple_subpath_mounts() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "user-data",
+                    "persistent_volume_claim": {
+                        "claim_name": "pvc-user-data",
+                        "read_only": false
+                    }
+                }],
+                "containers": {
+                    "agent": {
+                        "volume_mounts": [
+                            {
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/workspace",
+                                "sub_path": "workspace",
+                                "read_only": false
+                            },
+                            {
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/memory",
+                                "sub_path": "memory",
+                                "read_only": false
+                            },
+                            {
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/sessions",
+                                "sub_path": "sessions",
+                                "read_only": false
+                            }
+                        ]
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let config = KubernetesSandboxDriverConfig::from_template(&template)
+            .expect("read-write PVC with multiple subPath mounts should validate");
+
+        assert_eq!(config.volumes.len(), 1);
+        assert_eq!(config.volumes[0].name, "user-data");
+        assert_eq!(
+            config.volumes[0].persistent_volume_claim.claim_name,
+            "pvc-user-data"
+        );
+        assert!(!config.volumes[0].persistent_volume_claim.read_only);
+        assert_eq!(config.containers.agent.volume_mounts.len(), 3);
+        assert!(
+            config
+                .containers
+                .agent
+                .volume_mounts
+                .iter()
+                .all(|mount| !mount.read_only)
+        );
+        assert!(config.has_explicit_sandbox_data_mount());
+    }
+
+    #[test]
     fn driver_config_rejects_duplicate_pvc_volume_names() {
         let template = SandboxTemplate {
             driver_config: Some(json_struct(serde_json::json!({
                 "volumes": [
                     {
-                        "name": "pete-user-data",
+                        "name": "user-data",
                         "persistent_volume_claim": {"claim_name": "pvc-a"}
                     },
                     {
-                        "name": "pete-user-data",
+                        "name": "user-data",
                         "persistent_volume_claim": {"claim_name": "pvc-b"}
                     }
                 ]
@@ -2594,7 +2655,7 @@ mod tests {
                     "agent": {
                         "volume_mounts": [{
                             "name": "missing-data",
-                            "mount_path": "/sandbox/.openclaw/workspace",
+                            "mount_path": "/sandbox/.openshell/workspace",
                             "sub_path": "workspace"
                         }]
                     }
@@ -2658,7 +2719,7 @@ mod tests {
                         "agent": {
                             "volume_mounts": [{
                                 "name": "user-data",
-                                "mount_path": "/sandbox/.openclaw/workspace",
+                                "mount_path": "/sandbox/.openshell/workspace",
                                 "sub_path": sub_path
                             }]
                         }
@@ -2687,7 +2748,7 @@ mod tests {
                     "agent": {
                         "volume_mounts": [{
                             "name": "user-data",
-                            "mount_path": "/sandbox/.openclaw/workspace",
+                            "mount_path": "/sandbox/.openshell/workspace",
                             "sub_path": "workspace"
                         }]
                     }
@@ -2716,7 +2777,7 @@ mod tests {
             .as_array()
             .expect("volumeMounts should exist")
             .iter()
-            .find(|mount| mount["mountPath"] == "/sandbox/.openclaw/workspace")
+            .find(|mount| mount["mountPath"] == "/sandbox/.openshell/workspace")
             .expect("user mount should exist");
         assert_eq!(mount["readOnly"], true);
     }
@@ -2736,7 +2797,7 @@ mod tests {
                     "agent": {
                         "volume_mounts": [{
                             "name": "user-data",
-                            "mount_path": "/sandbox/.openclaw/workspace",
+                            "mount_path": "/sandbox/.openshell/workspace",
                             "read_only": false
                         }]
                     }

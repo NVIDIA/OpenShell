@@ -129,9 +129,9 @@ openshell sandbox create \
   --driver-config-json '{
     "kubernetes": {
       "volumes": [{
-        "name": "pete-user-data",
+        "name": "user-data",
         "persistent_volume_claim": {
-          "claim_name": "pvc-pete-user-123",
+          "claim_name": "pvc-user-data-123",
           "read_only": false
         }
       }],
@@ -139,14 +139,14 @@ openshell sandbox create \
         "agent": {
           "volume_mounts": [
             {
-              "name": "pete-user-data",
-              "mount_path": "/sandbox/.openclaw/workspace",
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/workspace",
               "sub_path": "workspace",
               "read_only": false
             },
             {
-              "name": "pete-user-data",
-              "mount_path": "/sandbox/.openclaw/memory",
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/memory",
               "sub_path": "memory",
               "read_only": false
             }
