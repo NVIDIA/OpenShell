@@ -69,21 +69,11 @@ UNRESOLVED=0
 for f in "$OUTPUT_DIR"/*.cdx.json; do
   COUNT=$(uv run python -c "
 import json, sys
+sys.path.insert(0, 'deploy/sbom')
+from resolve_licenses import needs_fix
 with open('$f') as fh:
     sbom = json.load(fh)
-missing = 0
-for c in sbom.get('components', []):
-    lics = c.get('licenses', [])
-    if not lics:
-        missing += 1
-        continue
-    for e in lics:
-        lid = e.get('license', {}).get('id', '')
-        lname = e.get('license', {}).get('name', '')
-        if lid.startswith('sha256:') or lname.startswith('sha256:'):
-            missing += 1
-            break
-print(missing)
+print(sum(1 for c in sbom.get('components', []) if needs_fix(c)))
 ")
   if [ "$COUNT" -gt 0 ]; then
     echo "  $(basename "$f"): $COUNT components with unresolved licenses"
@@ -99,3 +89,7 @@ else
   echo "All licenses resolved."
 fi
 """
+
+["test:sbom"]
+description = "Run SBOM unit tests"
+run = "uv run pytest deploy/sbom/test_resolve_licenses.py -v"
