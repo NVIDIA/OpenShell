@@ -7,87 +7,94 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EXAMPLE_DIR="$ROOT/examples/governance-interceptor"
 TMPDIR="$(mktemp -d)"
-SMOKE_RUN_ID="${OPENSHELL_GOVERNANCE_RUN_ID:-governance-smoke-$$-$RANDOM}"
+LOG_DIR="$TMPDIR/logs"
+JWT_DIR="$TMPDIR/jwt"
+GATEWAY_CONFIG="$TMPDIR/gateway.toml"
+SMOKE_LOG="$LOG_DIR/smoke.log"
+GATEWAY_LOG="$LOG_DIR/gateway.log"
+INTERCEPTOR_LOG="$LOG_DIR/interceptor.log"
+RUN_ID="governance-smoke-$$-$RANDOM"
+SANDBOX_NAME="$RUN_ID-sandbox"
+
+mkdir -p "$LOG_DIR"
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+
+  if [[ -n "${INTERCEPTOR_PID:-}" ]]; then
+    kill "$INTERCEPTOR_PID" 2>/dev/null || true
+    wait "$INTERCEPTOR_PID" 2>/dev/null || true
+  fi
+
+  if [[ -n "${GATEWAY_PID:-}" ]]; then
+    kill "$GATEWAY_PID" 2>/dev/null || true
+    wait "$GATEWAY_PID" 2>/dev/null || true
+  fi
+
+  if [[ "$status" -eq 0 ]]; then
+    rm -rf "$TMPDIR"
+  else
+    echo "logs retained in $LOG_DIR" >&2
+  fi
+
+  exit "$status"
+}
+trap cleanup EXIT
+
 port_is_free() {
   local port="$1"
+
   if command -v lsof >/dev/null 2>&1; then
     ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
-  else
-    ! nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+    return
   fi
+
+  if command -v nc >/dev/null 2>&1; then
+    ! nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+    return
+  fi
+
+  return 0
 }
 
 choose_port_block() {
   local count="$1"
   local start offset ok
+
   for _ in {1..200}; do
     start=$((20000 + RANDOM % 20000))
     ok=1
+
     for ((offset = 0; offset < count; offset++)); do
       if ! port_is_free "$((start + offset))"; then
         ok=0
         break
       fi
     done
+
     if [[ "$ok" == "1" ]]; then
       printf '%s\n' "$start"
       return
     fi
   done
+
   echo "failed to find free local ports for smoke test" >&2
   exit 1
 }
 
-DEFAULT_PORT_BASE="$(choose_port_block 3)"
-JWT_DIR="$TMPDIR/jwt"
-LOG_DIR="${OPENSHELL_GOVERNANCE_LOG_DIR:-$TMPDIR/logs}"
-SMOKE_LOG="$LOG_DIR/smoke.log"
-INTERCEPTOR_LOG="$LOG_DIR/interceptor.log"
-GATEWAY_LOG="$LOG_DIR/gateway.log"
-INTERCEPTOR_ADDR="${OPENSHELL_GOVERNANCE_INTERCEPTOR_ADDR:-127.0.0.1:$DEFAULT_PORT_BASE}"
-GATEWAY_ADDR="${OPENSHELL_GOVERNANCE_GATEWAY_ADDR:-127.0.0.1:$((DEFAULT_PORT_BASE + 1))}"
-HEALTH_ADDR="${OPENSHELL_GOVERNANCE_HEALTH_ADDR:-127.0.0.1:$((DEFAULT_PORT_BASE + 2))}"
-GATEWAY_ID="${OPENSHELL_GOVERNANCE_GATEWAY_ID:-$SMOKE_RUN_ID}"
-SANDBOX_NAME="${OPENSHELL_GOVERNANCE_SANDBOX_NAME:-$SMOKE_RUN_ID-sandbox}"
-mkdir -p "$LOG_DIR"
-
-cleanup() {
-  status=$?
-  trap - EXIT
-  if [[ -n "${INTERCEPTOR_PID:-}" ]]; then kill "$INTERCEPTOR_PID" 2>/dev/null || true; fi
-  if [[ -n "${GATEWAY_PID:-}" ]]; then kill "$GATEWAY_PID" 2>/dev/null || true; fi
-  if [[ "$status" -eq 0 && "${OPENSHELL_GOVERNANCE_KEEP_LOGS:-0}" != "1" ]]; then
-    rm -rf "$TMPDIR"
-  else
-    echo "logs retained in $LOG_DIR" >&2
-  fi
-  exit "$status"
-}
-trap cleanup EXIT
-
-log() {
-  printf '%s\n' "$*" >>"$SMOKE_LOG"
-}
-
-pass() {
-  printf 'PASS %s\n' "$1"
-}
-
-fail() {
-  printf 'FAIL %s\n' "$1" >&2
-  dump_logs
-  exit 1
-}
-
-setup_fail() {
-  printf 'ERROR %s\n' "$1" >&2
-  dump_logs
-  exit 1
-}
+PORT_BASE="$(choose_port_block 3)"
+INTERCEPTOR_ADDR="127.0.0.1:$PORT_BASE"
+GATEWAY_PORT="$((PORT_BASE + 1))"
+HEALTH_PORT="$((PORT_BASE + 2))"
+GATEWAY_ADDR="127.0.0.1:$GATEWAY_PORT"
+HEALTH_ADDR="127.0.0.1:$HEALTH_PORT"
+GATEWAY_ENDPOINT="http://$GATEWAY_ADDR"
 
 dump_log_file() {
   local label="$1"
   local path="$2"
+
   printf '\n--- %s: %s ---\n' "$label" "$path" >&2
   if [[ -f "$path" ]]; then
     cat "$path" >&2
@@ -102,28 +109,44 @@ dump_logs() {
   dump_log_file "interceptor log" "$INTERCEPTOR_LOG"
 }
 
+pass() {
+  printf 'PASS %s\n' "$1"
+}
+
+fail() {
+  printf 'FAIL %s\n' "$1" >&2
+  dump_logs
+  exit 1
+}
+
+log_command() {
+  local label="$1"
+  shift
+
+  {
+    printf '\n== %s ==\n' "$label"
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+  } >>"$SMOKE_LOG"
+}
+
 run_setup_step() {
   local label="$1"
   shift
+
   printf 'INFO %s\n' "$label"
-  {
-    printf '\n== %s ==\n' "$label"
-    printf '+ %q ' "$@"
-    printf '\n'
-  } >>"$SMOKE_LOG"
+  log_command "$label" "$@"
   if ! "$@" >>"$SMOKE_LOG" 2>&1; then
-    setup_fail "$label"
+    fail "$label"
   fi
 }
 
 run_step() {
   local label="$1"
   shift
-  {
-    printf '\n== %s ==\n' "$label"
-    printf '+ %q ' "$@"
-    printf '\n'
-  } >>"$SMOKE_LOG"
+
+  log_command "$label" "$@"
   if "$@" >>"$SMOKE_LOG" 2>&1; then
     pass "$label"
   else
@@ -134,11 +157,8 @@ run_step() {
 expect_failure() {
   local label="$1"
   shift
-  {
-    printf '\n== %s ==\n' "$label"
-    printf '+ %q ' "$@"
-    printf '\n'
-  } >>"$SMOKE_LOG"
+
+  log_command "$label" "$@"
   if "$@" >>"$SMOKE_LOG" 2>&1; then
     fail "$label"
   else
@@ -151,12 +171,9 @@ expect_output_contains() {
   local needle="$2"
   shift 2
   local output_file="$LOG_DIR/${label//[^A-Za-z0-9_]/_}.out"
-  {
-    printf '\n== %s ==\n' "$label"
-    printf '+ %q ' "$@"
-    printf '\n'
-  } >>"$SMOKE_LOG"
-  if "$@" >"$output_file" 2>>"$SMOKE_LOG" && grep -q "$needle" "$output_file"; then
+
+  log_command "$label" "$@"
+  if "$@" >"$output_file" 2>>"$SMOKE_LOG" && grep -Fq -- "$needle" "$output_file"; then
     pass "$label"
   else
     cat "$output_file" >>"$SMOKE_LOG" 2>/dev/null || true
@@ -168,81 +185,32 @@ expect_log_contains() {
   local label="$1"
   local needle="$2"
   local path="$3"
-  if grep -q "$needle" "$path"; then
+
+  if grep -Fq -- "$needle" "$path"; then
     pass "$label"
   else
     fail "$label"
   fi
 }
 
-configure_native_build_env() {
-  if [[ "$(uname -s)" == "Darwin" && "${OPENSHELL_GOVERNANCE_KEEP_CC:-0}" != "1" ]]; then
-    export CC="${OPENSHELL_GOVERNANCE_CC:-clang}"
-    export CXX="${OPENSHELL_GOVERNANCE_CXX:-clang++}"
-    log "Using macOS native build compiler: CC=$CC CXX=$CXX"
-  fi
+wait_for_profile() {
+  local profile_id="$1"
+  local label="loads $profile_id provider profile"
 
-  if [[ "${OPENSHELL_GOVERNANCE_KEEP_RUSTC_WRAPPER:-0}" != "1" ]]; then
-    export RUSTC_WRAPPER="${OPENSHELL_GOVERNANCE_RUSTC_WRAPPER:-}"
-  fi
+  {
+    printf '\n== %s ==\n' "$label"
+    printf '+ wait for provider profile %q\n' "$profile_id"
+  } >>"$SMOKE_LOG"
 
-  if [[ -z "${RUSTC_WRAPPER:-}" ]]; then
-    log "Building without RUSTC_WRAPPER for reproducible smoke builds."
-  else
-    log "Using RUSTC_WRAPPER=$RUSTC_WRAPPER"
-  fi
-}
-
-docker_socket_responds() {
-  local socket="$1"
-  curl --silent --fail --unix-socket "$socket" http://localhost/_ping >/dev/null 2>&1
-}
-
-docker_context_socket() {
-  if ! command -v docker >/dev/null 2>&1; then
-    return
-  fi
-
-  local endpoint
-  endpoint="$(docker context inspect --format '{{ (index .Endpoints "docker").Host }}' 2>/dev/null || true)"
-  if [[ "$endpoint" == unix://* ]]; then
-    printf '%s\n' "${endpoint#unix://}"
-  fi
-}
-
-configure_container_runtime_env() {
-  if [[ -n "${DOCKER_HOST:-}" ]]; then
-    log "Using caller-provided DOCKER_HOST=$DOCKER_HOST"
-    return
-  fi
-
-  local candidate
-  local -a candidates=()
-
-  candidate="$(docker_context_socket)"
-  if [[ -n "$candidate" ]]; then
-    candidates+=("$candidate")
-  fi
-
-  if [[ -n "${HOME:-}" ]]; then
-    candidates+=(
-      "$HOME/.colima/default/docker.sock"
-      "$HOME/.colima/docker.sock"
-      "$HOME/.docker/run/docker.sock"
-    )
-  fi
-
-  candidates+=("/var/run/docker.sock")
-
-  for candidate in "${candidates[@]}"; do
-    if [[ -S "$candidate" ]] && docker_socket_responds "$candidate"; then
-      export DOCKER_HOST="unix://$candidate"
-      log "Using Docker socket from $DOCKER_HOST for workspace builds and gateway runtime."
+  for _ in {1..60}; do
+    if "${CLI[@]}" provider profile export "$profile_id" -o yaml >>"$SMOKE_LOG" 2>&1; then
+      pass "$label"
       return
     fi
+    sleep 1
   done
 
-  log "No reachable Docker socket detected; relying on gateway driver autodetection."
+  fail "$label"
 }
 
 generate_gateway_jwt_bundle() {
@@ -254,64 +222,13 @@ generate_gateway_jwt_bundle() {
   mkdir -p "$JWT_DIR"
   openssl genpkey -algorithm ed25519 -out "$JWT_DIR/signing.pem" >/dev/null 2>&1
   openssl pkey -in "$JWT_DIR/signing.pem" -pubout -out "$JWT_DIR/public.pem" >/dev/null 2>&1
-  printf '%s\n' "$GATEWAY_ID" > "$JWT_DIR/kid"
+  printf '%s\n' "$RUN_ID" >"$JWT_DIR/kid"
 }
 
-start_dedicated_gateway() {
-  printf 'INFO starting dedicated gateway\n'
-  log "Starting dedicated gateway id=$GATEWAY_ID endpoint=http://$GATEWAY_ADDR health=http://$HEALTH_ADDR"
-  env \
-    -u OPENSHELL_GATEWAY_CONFIG \
-    -u OPENSHELL_BIND_ADDRESS \
-    -u OPENSHELL_SERVER_PORT \
-    -u OPENSHELL_HEALTH_PORT \
-    -u OPENSHELL_METRICS_PORT \
-    -u OPENSHELL_LOG_LEVEL \
-    -u OPENSHELL_TLS_CERT \
-    -u OPENSHELL_TLS_KEY \
-    -u OPENSHELL_TLS_CLIENT_CA \
-    -u OPENSHELL_LOCAL_TLS_DIR \
-    -u OPENSHELL_DRIVERS \
-    -u OPENSHELL_DISABLE_TLS \
-    -u OPENSHELL_OIDC_ISSUER \
-    -u OPENSHELL_ENABLE_MTLS_AUTH \
-    -u OPENSHELL_OIDC_AUDIENCE \
-    -u OPENSHELL_OIDC_JWKS_TTL \
-    -u OPENSHELL_OIDC_ROLES_CLAIM \
-    -u OPENSHELL_OIDC_ADMIN_ROLE \
-    -u OPENSHELL_OIDC_USER_ROLE \
-    -u OPENSHELL_OIDC_SCOPES_CLAIM \
-    -u OPENSHELL_GRPC_RATE_LIMIT_REQUESTS \
-    -u OPENSHELL_GRPC_RATE_LIMIT_WINDOW_SECONDS \
-    -u OPENSHELL_SERVER_SAN \
-    -u OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP \
-    "OPENSHELL_DB_URL=sqlite://$TMPDIR/gateway.db" \
-    "$ROOT/target/debug/openshell-gateway" --config "$TMPDIR/gateway.toml" >"$GATEWAY_LOG" 2>&1 &
-  GATEWAY_PID=$!
-}
-
-cd "$ROOT"
-configure_native_build_env
-configure_container_runtime_env
-generate_gateway_jwt_bundle
-run_setup_step "building gateway" cargo build --quiet -p openshell-server --bin openshell-gateway
-run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
-run_setup_step "building governance interceptor" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
-
-"$EXAMPLE_DIR/target/debug/governance-interceptor" \
-  --listen "$INTERCEPTOR_ADDR" \
-  --policy "$EXAMPLE_DIR/policy.yaml" >"$INTERCEPTOR_LOG" 2>&1 &
-INTERCEPTOR_PID=$!
-
-cat > "$TMPDIR/gateway.toml" <<EOF
+write_gateway_config() {
+  cat >"$GATEWAY_CONFIG" <<EOF
 [openshell]
 version = 1
-
-[openshell.gateway]
-bind_address = "$GATEWAY_ADDR"
-health_bind_address = "$HEALTH_ADDR"
-disable_tls = true
-log_level = "info"
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
@@ -320,11 +237,11 @@ allow_unauthenticated_users = true
 signing_key_path = "$JWT_DIR/signing.pem"
 public_key_path = "$JWT_DIR/public.pem"
 kid_path = "$JWT_DIR/kid"
-gateway_id = "$GATEWAY_ID"
+gateway_id = "$RUN_ID"
 ttl_secs = 0
 
 [[openshell.gateway.interceptors]]
-name = "source-control-governance"
+name = "provider-governance"
 grpc_endpoint = "http://$INTERCEPTOR_ADDR"
 order = 10
 failure_policy = "fail_closed"
@@ -332,57 +249,113 @@ timeout = "500ms"
 max_response_bytes = 1048576
 max_patches = 32
 EOF
+}
 
-start_dedicated_gateway
+start_interceptor() {
+  printf 'INFO starting governance interceptor\n'
+  "$EXAMPLE_DIR/target/debug/governance-interceptor" \
+    --listen "$INTERCEPTOR_ADDR" \
+    --policy "$EXAMPLE_DIR/policy.yaml" \
+    --profiles "$EXAMPLE_DIR/profiles" \
+    --gateway-endpoint "$GATEWAY_ENDPOINT" >"$INTERCEPTOR_LOG" 2>&1 &
+  INTERCEPTOR_PID=$!
+}
 
-gateway_ready=0
-for _ in {1..60}; do
-  if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
-    fail "gateway starts with interceptor"
-  fi
-  if curl -fsS "http://$HEALTH_ADDR/healthz" >/dev/null 2>&1; then
-    gateway_ready=1
-    break
-  fi
-  sleep 1
-done
-if [[ "$gateway_ready" == "1" ]]; then
-  pass "gateway starts with interceptor"
-else
-  fail "gateway starts with interceptor"
-fi
+start_gateway() {
+  printf 'INFO starting gateway\n'
+  env -u OPENSHELL_DRIVERS "$ROOT/target/debug/openshell-gateway" \
+    --config "$GATEWAY_CONFIG" \
+    --bind-address 127.0.0.1 \
+    --port "$GATEWAY_PORT" \
+    --health-port "$HEALTH_PORT" \
+    --metrics-port 0 \
+    --log-level info \
+    --disable-tls \
+    --db-url "sqlite://$TMPDIR/gateway.db" >"$GATEWAY_LOG" 2>&1 &
+  GATEWAY_PID=$!
+}
 
-CLI=(
-  env
-  -u OPENSHELL_GATEWAY
-  -u OPENSHELL_GATEWAY_ENDPOINT
-  -u OPENSHELL_GATEWAY_INSECURE
-  -u OPENSHELL_SANDBOX_POLICY
-  "$ROOT/target/debug/openshell"
-  --gateway-endpoint "http://$GATEWAY_ADDR"
-)
+wait_for_gateway() {
+  local label="gateway starts with interceptor"
 
-run_step "allows github provider create" "${CLI[@]}" provider create --name github --type github --credential GITHUB_TOKEN=dummy
-run_step "allows gitlab provider create" "${CLI[@]}" provider create --name gitlab --type gitlab --credential GITLAB_TOKEN=dummy
+  for _ in {1..60}; do
+    if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+      fail "$label"
+    fi
 
-expect_failure "denies non-governed provider create" "${CLI[@]}" provider create --name bitbucket --type github --credential GITHUB_TOKEN=dummy
+    if curl -fsS "http://$HEALTH_ADDR/healthz" >/dev/null 2>&1; then
+      pass "$label"
+      return
+    fi
 
-run_step "creates governed sandbox" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --no-auto-providers --keep --no-tty -- /bin/sh -lc true
-expect_log_contains "gateway logs interceptor log annotations" "log_annotations" "$GATEWAY_LOG"
-expect_log_contains "gateway logs governance correlation id" "governance:create-sandbox:$SANDBOX_NAME" "$GATEWAY_LOG"
-expect_output_contains "sandbox has github provider" "github" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
-expect_output_contains "sandbox has gitlab provider" "gitlab" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
+    sleep 1
+  done
 
-expect_failure "denies provider attach" "${CLI[@]}" sandbox provider attach "$SANDBOX_NAME" github
+  fail "$label"
+}
 
-expect_failure "denies provider detach" "${CLI[@]}" sandbox provider detach "$SANDBOX_NAME" github
+run_suite() {
+  CLI=(
+    env
+    -u OPENSHELL_SANDBOX_POLICY
+    "$ROOT/target/debug/openshell"
+    --gateway-endpoint "$GATEWAY_ENDPOINT"
+  )
 
-expect_failure "denies policy replacement" "${CLI[@]}" policy set "$SANDBOX_NAME" --policy "$EXAMPLE_DIR/policy.yaml"
+  run_step "enables provider profile policy composition" "${CLI[@]}" settings set --global --key providers_v2_enabled --value true --yes
+  wait_for_profile "github"
+  wait_for_profile "slack"
+  expect_output_contains "lists github profile" "github" "${CLI[@]}" provider list-profiles
+  expect_output_contains "lists slack profile" "slack" "${CLI[@]}" provider list-profiles
 
-run_step "deletes governed sandbox" "${CLI[@]}" sandbox delete "$SANDBOX_NAME"
+  cat >"$TMPDIR/disallowed-profile.yaml" <<'EOF'
+id: custom-slack
+display_name: Custom Slack
+description: Profile outside the managed github/slack set used to verify interceptor import denial
+category: messaging
+credentials: []
+endpoints: []
+binaries: []
+EOF
 
-expect_failure "denies governed provider update" "${CLI[@]}" provider update gitlab --credential GITLAB_TOKEN=changed
+  expect_failure "denies provider profile delete" "${CLI[@]}" provider profile delete slack
+  expect_failure "denies disallowed provider profile import" "${CLI[@]}" provider profile import -f "$TMPDIR/disallowed-profile.yaml"
 
-expect_failure "denies governed provider delete" "${CLI[@]}" provider delete github
+  expect_failure "denies slack provider with github profile" "${CLI[@]}" provider create --name slack --type github --credential SLACK_BOT_TOKEN=dummy
+  run_step "allows github provider create" "${CLI[@]}" provider create --name github --type github --credential GITHUB_TOKEN=dummy
+  run_step "allows slack provider create" "${CLI[@]}" provider create --name slack --type slack --credential SLACK_BOT_TOKEN=dummy
+
+  expect_failure "denies disallowed provider create" "${CLI[@]}" provider create --name bitbucket --type github --credential GITHUB_TOKEN=dummy
+
+  run_step "creates governed sandbox" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --no-auto-providers --keep --no-tty -- /bin/sh -lc true
+  expect_log_contains "gateway logs interceptor log annotations" "log_annotations" "$GATEWAY_LOG"
+  expect_log_contains "gateway logs governance correlation id" "governance:create-sandbox:$SANDBOX_NAME" "$GATEWAY_LOG"
+  expect_output_contains "sandbox has github provider" "github" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
+  expect_output_contains "sandbox has slack provider" "slack" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
+  expect_output_contains "effective policy has github provider layer" "_provider_github" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
+  expect_output_contains "effective policy has slack provider layer" "_provider_slack" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
+
+  expect_failure "denies provider attach" "${CLI[@]}" sandbox provider attach "$SANDBOX_NAME" github
+  expect_failure "denies provider detach" "${CLI[@]}" sandbox provider detach "$SANDBOX_NAME" github
+  expect_failure "denies policy replacement" "${CLI[@]}" policy set "$SANDBOX_NAME" --policy "$EXAMPLE_DIR/policy.yaml"
+
+  run_step "deletes governed sandbox" "${CLI[@]}" sandbox delete "$SANDBOX_NAME"
+
+  expect_failure "denies governed provider update" "${CLI[@]}" provider update slack --credential SLACK_BOT_TOKEN=changed
+  expect_failure "denies governed provider delete" "${CLI[@]}" provider delete github
+}
+
+cd "$ROOT"
+
+run_setup_step "building gateway" cargo build --quiet -p openshell-server --bin openshell-gateway
+run_setup_step "building governance interceptor" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
+run_setup_step "building test CLI" cargo build --quiet -p openshell-cli --bin openshell
+
+generate_gateway_jwt_bundle
+write_gateway_config
+start_interceptor
+start_gateway
+wait_for_gateway
+run_suite
 
 echo "ALL PASS governance interceptor smoke"
