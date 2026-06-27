@@ -15,26 +15,4 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 
-network_policies:
-  github:
-    name: github-api-readonly
-    endpoints:
-      - host: api.github.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        access: read-only
-    binaries:
-      - { path: /usr/bin/git }
-      - { path: /usr/bin/curl }
-  gitlab:
-    name: gitlab-api-readonly
-    endpoints:
-      - host: gitlab.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        access: read-only
-    binaries:
-      - { path: /usr/bin/git }
-      - { path: /usr/bin/curl }
+network_policies: {}
