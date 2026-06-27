@@ -315,3 +315,63 @@ If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the c
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
 </Note>
+
+### Kubernetes Driver Config PVC Mounts
+
+Kubernetes driver config can mount existing PersistentVolumeClaims into the
+agent container. Use this when storage is provisioned outside OpenShell and a
+sandbox should mount selected PVC subpaths instead of using the default
+OpenShell-created `/sandbox` workspace PVC.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "pete-user-data",
+        "persistent_volume_claim": {
+          "claim_name": "pvc-pete-user-123",
+          "read_only": false
+        }
+      }],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {
+              "name": "pete-user-data",
+              "mount_path": "/sandbox/.openclaw/workspace",
+              "sub_path": "workspace",
+              "read_only": false
+            },
+            {
+              "name": "pete-user-data",
+              "mount_path": "/sandbox/.openclaw/memory",
+              "sub_path": "memory",
+              "read_only": false
+            }
+          ]
+        }
+      }
+    }
+  }' \
+  -- claude
+```
+
+Kubernetes PVC mount schema:
+
+| Field | Description |
+|---|---|
+| `volumes[].name` | Pod volume name. It must be unique and must not use OpenShell-managed volume names. |
+| `volumes[].persistent_volume_claim.claim_name` | Existing PVC name in the sandbox namespace. |
+| `volumes[].persistent_volume_claim.read_only` | Optional. Defaults to `true`. Set `false` to allow read-write mounts. |
+| `containers.agent.volume_mounts[].name` | References a volume declared in `volumes`. |
+| `containers.agent.volume_mounts[].mount_path` | Absolute, normalized container path for the agent mount. |
+| `containers.agent.volume_mounts[].sub_path` | Optional relative PVC subpath. Absolute paths and `..` are rejected. |
+| `containers.agent.volume_mounts[].read_only` | Optional. Defaults to `true`. It cannot be `false` when the PVC volume is read-only. |
+
+OpenShell rejects duplicate volume names, mounts that reference unknown volumes,
+protected mount targets, and mounts that replace OpenShell TLS, supervisor,
+ServiceAccount token, or SPIFFE paths. Any driver-config mount below
+`/sandbox/` disables the default `/sandbox` workspace PVC injection for that
+sandbox, so image-backed files outside the explicit mounts come from the current
+sandbox image.

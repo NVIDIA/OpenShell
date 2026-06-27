@@ -82,6 +82,13 @@ nested schema and currently accepts:
 - `pod.priority_class_name`
 - `containers.agent.resources.requests`
 - `containers.agent.resources.limits`
+- `volumes[].name`
+- `volumes[].persistent_volume_claim.claim_name`
+- `volumes[].persistent_volume_claim.read_only`
+- `containers.agent.volume_mounts[].name`
+- `containers.agent.volume_mounts[].mount_path`
+- `containers.agent.volume_mounts[].sub_path`
+- `containers.agent.volume_mounts[].read_only`
 
 Nested keys inside the `kubernetes` block use snake_case. The top-level
 `driver_config` envelope is keyed by driver names, so `kubernetes` is not part
@@ -104,3 +111,49 @@ driver's configured `default_runtime_class_name`; the typed public
 public `--gpu` flag for the default GPU request, pass a count to `--gpu` for
 counted GPU requests, and use `driver_config` only for additional driver-owned
 resource details.
+
+Use PVC volumes to mount existing Kubernetes PersistentVolumeClaims into the
+agent container. PVC volumes and mounts default to read-only unless
+`read_only: false` is set explicitly. A read-only PVC volume cannot be mounted
+read-write. The driver rejects duplicate volume names, mounts that reference
+unknown volumes, non-normalized or protected mount paths, and absolute or
+parent-traversing `sub_path` values.
+
+Any explicit driver-config mount under `/sandbox/` disables the driver's
+default `/sandbox` workspace PVC injection for that sandbox. This keeps image
+contents fresh while allowing selected durable data paths to come from an
+external PVC.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "pete-user-data",
+        "persistent_volume_claim": {
+          "claim_name": "pvc-pete-user-123",
+          "read_only": false
+        }
+      }],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {
+              "name": "pete-user-data",
+              "mount_path": "/sandbox/.openclaw/workspace",
+              "sub_path": "workspace",
+              "read_only": false
+            },
+            {
+              "name": "pete-user-data",
+              "mount_path": "/sandbox/.openclaw/memory",
+              "sub_path": "memory",
+              "read_only": false
+            }
+          ]
+        }
+      }
+    }
+  }' \
+  -- claude
+```
