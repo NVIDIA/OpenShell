@@ -1039,6 +1039,25 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
             }
 
+            if !access.is_empty()
+                && !has_rules
+                && !jsonrpc_family
+                && (l7_protocol.is_some() || protocol.is_empty())
+                && !is_supported_access_preset(access)
+            {
+                let effective_protocol = if protocol.is_empty() {
+                    "rest"
+                } else {
+                    protocol
+                };
+                let port = ports
+                    .first()
+                    .map_or_else(|| "unknown".to_string(), u64::to_string);
+                warnings.push(format!(
+                    "{loc}: unsupported access preset '{access}' for protocol {effective_protocol} on {host}:{port}; supported presets are read-only, read-write, and full"
+                ));
+            }
+
             if protocol == "json-rpc" && !has_rules {
                 errors.push(format!(
                     "{loc}: protocol {protocol} requires explicit rules with allow.method"
@@ -1576,6 +1595,10 @@ fn valid_methods_for_protocol(protocol: &str) -> &'static [&'static str] {
             "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "*",
         ],
     }
+}
+
+fn is_supported_access_preset(access: &str) -> bool {
+    matches!(access, "read-only" | "read-write" | "full")
 }
 
 fn graphql_rule_json(operation_type: &str) -> serde_json::Value {
@@ -2736,6 +2759,35 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0]["allow"]["method"].as_str().unwrap(), "*");
         assert_eq!(rules[0]["allow"]["path"].as_str().unwrap(), "**");
+    }
+
+    #[test]
+    fn validate_unsupported_access_preset_warns() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "protocol": "rest",
+                        "access": "allow"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(errors.is_empty(), "should not block startup: {errors:?}");
+        assert!(
+            warnings.iter().any(|w| {
+                w.contains("test.endpoints[0]")
+                    && w.contains("unsupported access preset 'allow'")
+                    && w.contains("protocol rest")
+                    && w.contains("api.example.com:443")
+            }),
+            "expected unsupported access preset warning: {warnings:?}"
+        );
     }
 
     #[test]
