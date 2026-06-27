@@ -13,6 +13,14 @@
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::path::{Path, PathBuf};
 
+/// Resolve the user's home directory in a cross-platform way.
+///
+/// Uses the `home` crate, which reads `HOME` on Unix and `USERPROFILE`
+/// (falling back to `HOMEDRIVE`+`HOMEPATH`) on Windows.
+pub fn home_dir() -> Result<PathBuf> {
+    home::home_dir().ok_or_else(|| miette::miette!("could not determine home directory"))
+}
+
 /// Resolve the XDG config base directory.
 ///
 /// Returns `$XDG_CONFIG_HOME` if set, otherwise `$HOME/.config`.
@@ -20,10 +28,9 @@ pub fn xdg_config_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
-    let home = std::env::var("HOME")
-        .into_diagnostic()
-        .wrap_err("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".config"))
+    Ok(home_dir()
+        .wrap_err("cannot resolve XDG config directory")?
+        .join(".config"))
 }
 
 /// The top-level `OpenShell` config directory: `$XDG_CONFIG_HOME/openshell/`.
@@ -38,10 +45,10 @@ pub fn xdg_state_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_STATE_HOME") {
         return Ok(PathBuf::from(path));
     }
-    let home = std::env::var("HOME")
-        .into_diagnostic()
-        .wrap_err("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local").join("state"))
+    Ok(home_dir()
+        .wrap_err("cannot resolve XDG state directory")?
+        .join(".local")
+        .join("state"))
 }
 
 /// The top-level `OpenShell` state directory: `$XDG_STATE_HOME/openshell/`.
@@ -56,10 +63,10 @@ pub fn xdg_data_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_DATA_HOME") {
         return Ok(PathBuf::from(path));
     }
-    let home = std::env::var("HOME")
-        .into_diagnostic()
-        .wrap_err("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local").join("share"))
+    Ok(home_dir()
+        .wrap_err("cannot resolve XDG data directory")?
+        .join(".local")
+        .join("share"))
 }
 
 /// Create a directory (and parents) with owner-only permissions (`0o700`) on
@@ -158,6 +165,12 @@ pub fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_dir_returns_ok() {
+        let dir = home_dir().unwrap();
+        assert!(dir.is_absolute(), "expected absolute path, got: {dir:?}");
+    }
 
     #[test]
     fn xdg_config_dir_respects_env() {

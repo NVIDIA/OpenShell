@@ -33,6 +33,7 @@ nix = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+home = { workspace = true }
 miette = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }

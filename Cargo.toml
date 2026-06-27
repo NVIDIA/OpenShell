@@ -49,6 +49,9 @@ ratatui = "0.26"
 crossterm = "0.28"
 terminal-colorsaurus = "1.0"
 
+# Home directory resolution
+home = "0.5"
+
 # Error handling
 miette = { version = "7", features = ["fancy"] }
 thiserror = "2"

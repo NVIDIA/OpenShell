@@ -735,7 +735,11 @@ fn package_managed_tls_dirs() -> Vec<PathBuf> {
 
     let state_dir = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")));
+        .or_else(|| {
+            openshell_core::paths::home_dir()
+                .ok()
+                .map(|home| home.join(".local/state"))
+        });
     if let Some(state_dir) = state_dir {
         dirs.push(state_dir.join("openshell/tls"));
     }
@@ -4351,10 +4355,10 @@ fn read_gcloud_adc() -> Result<(String, String, String)> {
     {
         PathBuf::from(config_dir).join("application_default_credentials.json")
     } else {
-        let home = std::env::var("HOME")
-            .map_err(|_| miette::miette!("HOME is not set; cannot locate gcloud ADC file"))?;
-        PathBuf::from(home)
-            .join(".config")
+        let home = openshell_core::paths::home_dir().map_err(|_| {
+            miette::miette!("could not determine home directory; cannot locate gcloud ADC file")
+        })?;
+        home.join(".config")
             .join("gcloud")
             .join("application_default_credentials.json")
     };

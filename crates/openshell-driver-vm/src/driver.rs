@@ -3229,8 +3229,8 @@ async fn connect_local_container_engine() -> Option<Docker> {
 fn podman_socket_path() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
+        let home = home::home_dir().unwrap_or_default();
+        home.join(".local/share/containers/podman/machine/podman.sock")
     }
     #[cfg(target_os = "linux")]
     {
