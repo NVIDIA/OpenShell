@@ -10,17 +10,22 @@
 //! for the desktop browser flow, in `openshell-sdk-node` for a JS callback.
 //!
 //! The trait is intentionally minimal. Single-flight coalescing (one refresh
-//! in flight at a time, with all waiters sharing the result) is the SDK's
-//! responsibility, not the implementer's; see [`TokenSource`].
+//! in flight at a time, with all waiters sharing the result — success or
+//! failure) is the SDK's responsibility, not the implementer's; see
+//! [`TokenSource`].
 //!
-//! TODO(rfc-0004): plumb [`TokenSource`] into the gRPC auth interceptor so
-//! refreshes happen automatically before each request. Today the napi
-//! binding exposes [`TokenSource::refresh_now`] / [`TokenSource::current`]
-//! directly to JS callers, which can rotate the token by calling
-//! `set_oidc_token` on a future iteration of the SDK client.
+//! [`crate::OpenShellClient`] drives the source automatically: proactively
+//! before a unary request when the token is near expiry
+//! ([`TokenSource::current`]) and reactively on an `Unauthenticated` response
+//! ([`TokenSource::refresh_now`]), writing the new token into the
+//! interceptor's live bearer slot so rotation reaches an already-connected
+//! client. Language bindings can also drive the source directly.
 
 use crate::error::{Result, SdkError};
+use futures::future::{FutureExt, Shared};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
@@ -100,25 +105,49 @@ pub trait Refresh: Send + Sync + 'static {
 
 /// Mutable token state shared between the auth interceptor and the
 /// background refresh task.
+///
+/// `generation` increments on every successful refresh. Coalescing waiters
+/// compare the generation they observed before queueing against the current
+/// value to decide whether another caller already refreshed for them.
 #[derive(Debug)]
 struct TokenState {
     token: String,
     expires_at: Option<u64>,
+    generation: u64,
+}
+
+/// Cloneable outcome of a single refresh attempt, shared across all waiters
+/// that joined it. `Err` carries the rendered message (so the type stays
+/// `Clone` for [`Shared`]); the SDK remaps it to [`SdkError::Auth`].
+type RefreshOutcome = std::result::Result<String, String>;
+type RefreshFuture = Shared<Pin<Box<dyn Future<Output = RefreshOutcome> + Send>>>;
+
+/// In-flight refresh attempt, if any. `epoch` lets the leader that started an
+/// attempt clear it on completion without clobbering a newer attempt.
+#[derive(Default)]
+struct Flight {
+    epoch: u64,
+    future: Option<RefreshFuture>,
 }
 
 /// A bearer-token source with single-flight refresh coalescing.
 ///
 /// Wraps a [`Refresh`] implementation and tracks the current token + its
-/// advertised expiry. Phase 3 of the RFC plumbs this into the auth path; for
-/// now language bindings hand it out directly so JS/Python code can drive
-/// refreshes externally.
+/// advertised expiry. The high-level [`crate::OpenShellClient`] drives it
+/// proactively (before requests, via [`TokenSource::current`]) and reactively
+/// (on `Unauthenticated`, via [`TokenSource::refresh_now`]); language bindings
+/// can also hand it out directly.
+///
+/// Single-flight: concurrent callers share one in-flight attempt and observe
+/// the same outcome — success *or* failure — so a failing `IdP` is hit once
+/// per attempt, not once per waiter.
 #[derive(Clone)]
 pub struct TokenSource {
     state: Arc<RwLock<TokenState>>,
     refresher: Arc<dyn Refresh>,
-    in_flight: Arc<Mutex<()>>,
-    /// Refresh `skew` seconds before the advertised `expires_at`. Tokens
-    /// without `expires_at` are not auto-refreshed.
+    flight: Arc<Mutex<Flight>>,
+    /// Refresh `skew` before the advertised `expires_at`. Tokens without
+    /// `expires_at` are not auto-refreshed by [`TokenSource::current`].
     skew: Duration,
 }
 
@@ -130,9 +159,10 @@ impl TokenSource {
             state: Arc::new(RwLock::new(TokenState {
                 token: initial.access_token,
                 expires_at: initial.expires_at,
+                generation: 0,
             })),
             refresher,
-            in_flight: Arc::new(Mutex::new(())),
+            flight: Arc::new(Mutex::new(Flight::default())),
             skew: Duration::from_secs(60),
         }
     }
@@ -148,54 +178,112 @@ impl TokenSource {
 
     /// Async-fetch the current token, refreshing if it's within `skew` of
     /// expiry. Single-flight: concurrent callers share one refresh.
+    ///
+    /// This is the *proactive* path. Tokens with no advertised `expires_at`
+    /// are returned as-is (never proactively refreshed).
     pub async fn current(&self) -> Result<String> {
-        if !self.needs_refresh().await {
+        let (generation, near_expiry) = {
+            let state = self.state.read().await;
+            (state.generation, is_near_expiry(&state, self.skew))
+        };
+        if !near_expiry {
             return Ok(self.state.read().await.token.clone());
         }
-        self.refresh_now().await
+        self.coalesced_refresh(generation).await
     }
 
     /// Force a refresh regardless of expiry. Used on `Unauthenticated`
-    /// responses from the gateway.
+    /// responses from the gateway (token revoked / rejected even though it
+    /// still looks valid).
+    ///
+    /// Unlike [`TokenSource::current`] this never short-circuits on expiry:
+    /// it always performs a refresh unless a *concurrent* caller's refresh
+    /// already advanced the generation while this call was queued.
     pub async fn refresh_now(&self) -> Result<String> {
-        // Single-flight: only one refresh in flight at a time. Other waiters
-        // block here and then see the updated state on re-check.
-        let _guard = self.in_flight.lock().await;
-
-        // Re-check inside the critical section: another caller may have just
-        // refreshed while we were waiting on the lock.
-        if !self.needs_refresh().await {
-            return Ok(self.state.read().await.token.clone());
-        }
-
-        let refreshed = self.refresher.refresh().await?;
-        let mut state = self.state.write().await;
-        state.token.clone_from(&refreshed.access_token);
-        state.expires_at = refreshed.expires_at;
-        Ok(refreshed.access_token)
+        let generation = self.state.read().await.generation;
+        self.coalesced_refresh(generation).await
     }
 
-    async fn needs_refresh(&self) -> bool {
-        let state = self.state.read().await;
-        let Some(expires_at) = state.expires_at else {
-            return false;
+    /// Shared refresh primitive. `expected_generation` is the generation the
+    /// caller observed before queueing; if the current generation already
+    /// moved past it, another caller refreshed and we return that token
+    /// without invoking [`Refresh::refresh`] again.
+    async fn coalesced_refresh(&self, expected_generation: u64) -> Result<String> {
+        let (shared, is_leader, epoch) = {
+            let mut flight = self.flight.lock().await;
+            // Re-check under the flight lock: a refresh may have completed
+            // between our generation read and acquiring this lock.
+            {
+                let state = self.state.read().await;
+                if state.generation != expected_generation {
+                    return Ok(state.token.clone());
+                }
+            }
+            if let Some(existing) = flight.future.as_ref() {
+                // Join the attempt already in flight.
+                (existing.clone(), false, flight.epoch)
+            } else {
+                // Become the leader for a fresh attempt.
+                let refresher = Arc::clone(&self.refresher);
+                let state = Arc::clone(&self.state);
+                let future: RefreshFuture = async move {
+                    match refresher.refresh().await {
+                        Ok(token) => {
+                            let mut state = state.write().await;
+                            state.token.clone_from(&token.access_token);
+                            state.expires_at = token.expires_at;
+                            state.generation = state.generation.wrapping_add(1);
+                            Ok(token.access_token)
+                        }
+                        Err(err) => Err(SdkError::from(err).to_string()),
+                    }
+                }
+                .boxed()
+                .shared();
+                flight.epoch = flight.epoch.wrapping_add(1);
+                flight.future = Some(future.clone());
+                (future, true, flight.epoch)
+            }
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        now + self.skew.as_secs() >= expires_at
+
+        let outcome = shared.await;
+
+        // Only the leader clears the slot, and only if no newer attempt has
+        // replaced it, so a fresh attempt can start once this one resolves.
+        if is_leader {
+            let mut flight = self.flight.lock().await;
+            if flight.epoch == epoch {
+                flight.future = None;
+            }
+        }
+
+        outcome.map_err(SdkError::auth)
     }
 
     /// Replace the current token without invoking the refresher.
     ///
     /// Used by callers that manage refresh externally (e.g. the napi
-    /// binding's JS-side timer) or for testing.
+    /// binding's JS-side timer) or for testing. Advances the generation so
+    /// any queued coalescing waiters observe the new token.
     pub async fn replace(&self, token: RefreshedToken) {
         let mut state = self.state.write().await;
         state.token = token.access_token;
         state.expires_at = token.expires_at;
+        state.generation = state.generation.wrapping_add(1);
     }
+}
+
+/// Whether `state`'s token is within `skew` of its advertised expiry. Tokens
+/// without an advertised expiry are never near expiry.
+fn is_near_expiry(state: &TokenState, skew: Duration) -> bool {
+    let Some(expires_at) = state.expires_at else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now + skew.as_secs() >= expires_at
 }
 
 impl fmt::Debug for TokenSource {
@@ -231,28 +319,87 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn refresh_now_coalesces_concurrent_callers() {
+    /// Refresher that blocks inside [`Refresh::refresh`] until the test
+    /// releases it, so we can deterministically force multiple callers to be
+    /// in flight simultaneously. Signals `entered` once the leader is inside.
+    struct GatedRefresher {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Refresh for GatedRefresher {
+        async fn refresh(&self) -> std::result::Result<RefreshedToken, RefreshError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.entered.notify_one();
+            self.release.notified().await;
+            if self.fail {
+                Err(RefreshError::Transient("idp unavailable".to_string()))
+            } else {
+                Ok(RefreshedToken::new(format!("token-{n}")).with_expires_at(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        + 3600,
+                ))
+            }
+        }
+    }
+
+    /// Drive one leader into the refresher, then queue `followers` more
+    /// callers that must join the in-flight attempt rather than start their
+    /// own. Returns the refresher call count and per-caller outcomes.
+    async fn run_coalesced(fail: bool) -> (usize, Vec<Result<String>>) {
         let calls = Arc::new(AtomicUsize::new(0));
-        let refresher = Arc::new(CountingRefresher {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let refresher = Arc::new(GatedRefresher {
             calls: Arc::clone(&calls),
-            delay: Duration::from_millis(50),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            fail,
         });
         let source = TokenSource::new(RefreshedToken::new("initial").with_expires_at(0), refresher);
 
-        let tasks = (0..5).map(|_| {
+        let leader = {
             let src = source.clone();
             tokio::spawn(async move { src.refresh_now().await })
-        });
-        for t in tasks {
-            t.await.unwrap().unwrap();
-        }
+        };
+        // Wait until the leader is blocked inside the refresher.
+        entered.notified().await;
 
+        let followers: Vec<_> = (0..4)
+            .map(|_| {
+                let src = source.clone();
+                tokio::spawn(async move { src.refresh_now().await })
+            })
+            .collect();
+        // Let the followers reach the shared in-flight future before release.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        release.notify_waiters();
+
+        let mut outcomes = vec![leader.await.unwrap()];
+        for f in followers {
+            outcomes.push(f.await.unwrap());
+        }
+        (calls.load(Ordering::SeqCst), outcomes)
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_share_one_refresh() {
+        let (calls, outcomes) = run_coalesced(false).await;
         assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "single-flight should have collapsed 5 concurrent calls into 1 refresh"
+            calls, 1,
+            "single-flight should collapse 5 concurrent calls into 1 refresh"
         );
+        for outcome in &outcomes {
+            assert_eq!(outcome.as_ref().unwrap(), "token-1");
+        }
     }
 
     #[tokio::test]
@@ -297,5 +444,45 @@ mod tests {
         let token = source.current().await.unwrap();
         assert_eq!(token, "token-1");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_now_forces_even_for_unexpired_token() {
+        // A token whose advertised expiry is far in the future. `current()`
+        // would short-circuit, but `refresh_now()` must still refresh — this
+        // is the revoked-but-unexpired recovery path.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::clone(&calls),
+            delay: Duration::from_millis(0),
+        });
+        let far_future = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let source = TokenSource::new(
+            RefreshedToken::new("revoked").with_expires_at(far_future),
+            refresher,
+        );
+
+        let token = source.refresh_now().await.unwrap();
+        assert_eq!(token, "token-1", "forced refresh must mint a new token");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(source.snapshot(), "token-1", "slot must observe new token");
+    }
+
+    #[tokio::test]
+    async fn concurrent_forced_refresh_shares_one_failure() {
+        // A failing IdP must be hit once per attempt, not once per waiter.
+        let (calls, outcomes) = run_coalesced(true).await;
+        assert_eq!(
+            calls, 1,
+            "single-flight should collapse 5 concurrent failed calls into 1 refresh"
+        );
+        assert_eq!(outcomes.len(), 5);
+        for outcome in &outcomes {
+            assert!(outcome.is_err(), "every waiter should observe the failure");
+        }
     }
 }

@@ -11,8 +11,8 @@
 use openshell_core::proto;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_sdk::{
-    ClientConfig, ExecOptions, ListOptions, OpenShellClient, SandboxPhase, SandboxSpec,
-    ServiceStatus as SdkServiceStatus,
+    AuthConfig, ClientConfig, ExecOptions, ListOptions, OpenShellClient, Refresh, RefreshError,
+    RefreshedToken, SandboxPhase, SandboxSpec, ServiceStatus as SdkServiceStatus,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -35,6 +35,11 @@ struct MockState {
     phase_sequence: Vec<proto::SandboxPhase>,
     get_returns_not_found: bool,
     not_found_after: Option<u32>,
+    /// When set, `health` rejects any request whose `authorization` header
+    /// does not match this exact value (e.g. `"Bearer fresh-token"`).
+    require_bearer: Option<String>,
+    /// Count of requests rejected by the `require_bearer` gate.
+    unauth_hits: AtomicU32,
 }
 
 #[derive(Clone)]
@@ -63,8 +68,18 @@ fn sandbox_with_phase(name: &str, phase: proto::SandboxPhase) -> proto::Sandbox 
 impl OpenShell for TestOpenShell {
     async fn health(
         &self,
-        _request: tonic::Request<proto::HealthRequest>,
+        request: tonic::Request<proto::HealthRequest>,
     ) -> Result<Response<proto::HealthResponse>, Status> {
+        if let Some(expected) = &self.state.require_bearer {
+            let got = request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok());
+            if got != Some(expected.as_str()) {
+                self.state.unauth_hits.fetch_add(1, Ordering::SeqCst);
+                return Err(Status::unauthenticated("invalid or missing bearer token"));
+            }
+        }
         Ok(Response::new(proto::HealthResponse {
             status: proto::ServiceStatus::Healthy.into(),
             version: "test-1.2.3".to_string(),
@@ -777,4 +792,89 @@ async fn exec_buffers_stdout_stderr_and_exit() {
     );
     assert_eq!(observed.workdir, "/work");
     assert_eq!(observed.timeout_seconds, 10);
+}
+
+/// Refresher that hands out a fixed "fresh-token" and counts invocations.
+struct OneShotRefresher {
+    calls: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl Refresh for OneShotRefresher {
+    async fn refresh(&self) -> Result<RefreshedToken, RefreshError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        Ok(RefreshedToken::new("fresh-token").with_expires_at(far_future))
+    }
+}
+
+/// A request rejected with `Unauthenticated` (revoked token that still looks
+/// valid) must trigger a forced refresh and a single retry that succeeds.
+#[tokio::test]
+async fn reactive_refresh_recovers_from_unauthenticated() {
+    let far_future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let state = Arc::new(MockState {
+        require_bearer: Some("Bearer fresh-token".to_string()),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let refresher = Arc::new(OneShotRefresher {
+        calls: Arc::clone(&calls),
+    });
+
+    // Seed a stale-but-unexpired token: the proactive path won't refresh it
+    // (expiry is far off), so only the reactive Unauthenticated path can.
+    let mut config = ClientConfig::new(&endpoint);
+    config.auth = Some(AuthConfig::Oidc {
+        token: "stale-token".to_string(),
+        expires_at: Some(far_future),
+        refresh: Some(refresher),
+    });
+    let client = OpenShellClient::connect(config).await.unwrap();
+
+    let health = client.health().await.unwrap();
+    assert_eq!(health.status, SdkServiceStatus::Healthy);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "forced refresh should fire exactly once on Unauthenticated"
+    );
+    assert_eq!(
+        state.unauth_hits.load(Ordering::SeqCst),
+        1,
+        "first request rejected with stale token, retry accepted with fresh token"
+    );
+}
+
+/// Without a refresher, an `Unauthenticated` response is surfaced as an auth
+/// error rather than retried in a loop.
+#[tokio::test]
+async fn unauthenticated_without_refresher_surfaces_error() {
+    let state = Arc::new(MockState {
+        require_bearer: Some("Bearer never-matches".to_string()),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+
+    let mut config = ClientConfig::new(&endpoint);
+    config.auth = Some(AuthConfig::oidc("static-token"));
+    let client = OpenShellClient::connect(config).await.unwrap();
+
+    let err = client.health().await.unwrap_err();
+    assert_eq!(err.code(), "auth", "expected an auth error, got: {err:?}");
+    assert_eq!(
+        state.unauth_hits.load(Ordering::SeqCst),
+        1,
+        "exactly one attempt; no retry without a refresher"
+    );
 }

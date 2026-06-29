@@ -8,16 +8,19 @@
 //! policy, logs, settings, SSH, forwarding) are reachable via
 //! [`OpenShellClient::raw_grpc`] / [`OpenShellClient::raw_inference`].
 
-use crate::auth::EdgeAuthInterceptor;
+use crate::auth::{BearerSlot, EdgeAuthInterceptor, bearer_metadata};
 use crate::config::{AuthConfig, ClientConfig};
 use crate::error::{Result, SdkError};
 use crate::raw::{AuthedGrpcClient, AuthedInferenceClient};
+use crate::refresh::{RefreshedToken, TokenSource};
 use crate::transport;
 use crate::types::{
     ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
 };
 use futures::StreamExt;
 use openshell_core::proto;
+use std::future::Future;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tonic::transport::Channel;
 
@@ -30,6 +33,12 @@ use tonic::transport::Channel;
 pub struct OpenShellClient {
     channel: Channel,
     interceptor: EdgeAuthInterceptor,
+    /// Drives OIDC token rotation. `None` when auth is static (edge token,
+    /// anonymous, or an OIDC token with no refresher).
+    token_source: Option<TokenSource>,
+    /// Live bearer slot the interceptor reads; refreshed tokens are written
+    /// here so rotation reaches in-flight requests. `None` for non-OIDC auth.
+    bearer_slot: Option<BearerSlot>,
 }
 
 impl OpenShellClient {
@@ -40,20 +49,28 @@ impl OpenShellClient {
     pub async fn connect(config: ClientConfig) -> Result<Self> {
         let channel = transport::build_channel(&config).await?;
         let interceptor = interceptor_from_config(&config)?;
+        let bearer_slot = interceptor.bearer_slot();
+        let token_source = token_source_from_config(&config);
         Ok(Self {
             channel,
             interceptor,
+            token_source,
+            bearer_slot,
         })
     }
 
     /// Construct from an already-built [`Channel`] and interceptor.
     ///
     /// Use when the caller needs to customize channel construction beyond
-    /// what [`ClientConfig`] exposes.
+    /// what [`ClientConfig`] exposes. The resulting client does not perform
+    /// OIDC refresh; drive rotation externally via the interceptor's slot.
     pub fn from_parts(channel: Channel, interceptor: EdgeAuthInterceptor) -> Self {
+        let bearer_slot = interceptor.bearer_slot();
         Self {
             channel,
             interceptor,
+            token_source: None,
+            bearer_slot,
         }
     }
 
@@ -83,12 +100,9 @@ impl OpenShellClient {
 
     /// Gateway health snapshot.
     pub async fn health(&self) -> Result<Health> {
-        let mut grpc = self.raw_grpc();
-        let resp = grpc
-            .health(proto::HealthRequest {})
-            .await
-            .map_err(map_status)?
-            .into_inner();
+        let resp = self
+            .unary(|mut grpc| async move { grpc.health(proto::HealthRequest {}).await })
+            .await?;
         Ok(Health {
             status: resp.status.into(),
             version: resp.version,
@@ -98,40 +112,40 @@ impl OpenShellClient {
     /// Create a new sandbox from a curated [`SandboxSpec`].
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
         let request = create_sandbox_request(spec);
-        let mut grpc = self.raw_grpc();
-        let response = grpc
-            .create_sandbox(request)
-            .await
-            .map_err(map_status)?
-            .into_inner();
+        let response = self
+            .unary(|mut grpc| {
+                let request = request.clone();
+                async move { grpc.create_sandbox(request).await }
+            })
+            .await?;
         sandbox_from_response(response.sandbox)
     }
 
     /// Fetch a sandbox by name.
     pub async fn get_sandbox(&self, name: &str) -> Result<SandboxRef> {
-        let mut grpc = self.raw_grpc();
-        let response = grpc
-            .get_sandbox(proto::GetSandboxRequest {
-                name: name.to_string(),
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::GetSandboxRequest {
+                    name: name.to_string(),
+                };
+                async move { grpc.get_sandbox(request).await }
             })
-            .await
-            .map_err(map_status)?
-            .into_inner();
+            .await?;
         sandbox_from_response(response.sandbox)
     }
 
     /// List sandboxes.
     pub async fn list_sandboxes(&self, opts: ListOptions) -> Result<Vec<SandboxRef>> {
-        let mut grpc = self.raw_grpc();
-        let response = grpc
-            .list_sandboxes(proto::ListSandboxesRequest {
-                limit: opts.limit,
-                offset: opts.offset,
-                label_selector: opts.label_selector.unwrap_or_default(),
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::ListSandboxesRequest {
+                    limit: opts.limit,
+                    offset: opts.offset,
+                    label_selector: opts.label_selector.clone().unwrap_or_default(),
+                };
+                async move { grpc.list_sandboxes(request).await }
             })
-            .await
-            .map_err(map_status)?
-            .into_inner();
+            .await?;
         Ok(response
             .sandboxes
             .into_iter()
@@ -146,14 +160,14 @@ impl OpenShellClient {
     /// [`SandboxPhase::Deleting`] when this returns — pair with
     /// [`OpenShellClient::wait_deleted`] when you need a terminal guarantee.
     pub async fn delete_sandbox(&self, name: &str) -> Result<bool> {
-        let mut grpc = self.raw_grpc();
-        let response = grpc
-            .delete_sandbox(proto::DeleteSandboxRequest {
-                name: name.to_string(),
+        let response = self
+            .unary(|mut grpc| {
+                let request = proto::DeleteSandboxRequest {
+                    name: name.to_string(),
+                };
+                async move { grpc.delete_sandbox(request).await }
             })
-            .await
-            .map_err(map_status)?
-            .into_inner();
+            .await?;
         Ok(response.deleted)
     }
 
@@ -217,12 +231,25 @@ impl OpenShellClient {
             rows: 0,
         };
 
-        let mut grpc = self.raw_grpc();
-        let mut stream = grpc
-            .exec_sandbox(request)
-            .await
-            .map_err(map_status)?
-            .into_inner();
+        // Proactively refresh, then open the stream. On `Unauthenticated` at
+        // open time, force-refresh and retry once; mid-stream rotation is out
+        // of scope (streaming retry is tracked separately).
+        self.ensure_fresh().await?;
+        let mut stream = match self.raw_grpc().exec_sandbox(request.clone()).await {
+            Ok(resp) => resp.into_inner(),
+            Err(status) if status.code() == tonic::Code::Unauthenticated => {
+                if self.refresh_on_unauthorized().await? {
+                    self.raw_grpc()
+                        .exec_sandbox(request)
+                        .await
+                        .map_err(map_status)?
+                        .into_inner()
+                } else {
+                    return Err(map_status(status));
+                }
+            }
+            Err(status) => return Err(map_status(status)),
+        };
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -251,6 +278,56 @@ impl OpenShellClient {
         })
     }
 
+    /// Run a unary RPC with OIDC-aware auth: refresh proactively before the
+    /// call (if the token is near expiry) and, on an `Unauthenticated`
+    /// response, force a refresh and retry exactly once. No-op auth behaves
+    /// as a plain single call.
+    async fn unary<T, F, Fut>(&self, call: F) -> Result<T>
+    where
+        F: Fn(AuthedGrpcClient) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    {
+        self.ensure_fresh().await?;
+        match call(self.raw_grpc()).await {
+            Ok(resp) => Ok(resp.into_inner()),
+            Err(status) if status.code() == tonic::Code::Unauthenticated => {
+                if self.refresh_on_unauthorized().await? {
+                    call(self.raw_grpc())
+                        .await
+                        .map(tonic::Response::into_inner)
+                        .map_err(map_status)
+                } else {
+                    Err(map_status(status))
+                }
+            }
+            Err(status) => Err(map_status(status)),
+        }
+    }
+
+    /// Proactive refresh: if a token source is wired and the token is within
+    /// the refresh skew of expiry, mint a new one and store it in the live
+    /// bearer slot. Tokens with no advertised expiry are left untouched.
+    async fn ensure_fresh(&self) -> Result<()> {
+        if let (Some(source), Some(slot)) = (&self.token_source, &self.bearer_slot) {
+            let token = source.current().await?;
+            store_bearer(slot, &token);
+        }
+        Ok(())
+    }
+
+    /// Reactive refresh: force a new token (used on `Unauthenticated`) and
+    /// store it in the live slot. Returns `false` when no refresher is wired,
+    /// signalling the caller to surface the original error.
+    async fn refresh_on_unauthorized(&self) -> Result<bool> {
+        if let (Some(source), Some(slot)) = (&self.token_source, &self.bearer_slot) {
+            let token = source.refresh_now().await?;
+            store_bearer(slot, &token);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn wait_for<F>(&self, name: &str, timeout: Duration, mut decide: F) -> Result<SandboxRef>
     where
         F: FnMut(SandboxPhase) -> Option<Result<()>>,
@@ -277,8 +354,37 @@ impl OpenShellClient {
 fn interceptor_from_config(config: &ClientConfig) -> Result<EdgeAuthInterceptor> {
     match &config.auth {
         None => Ok(EdgeAuthInterceptor::noop()),
-        Some(AuthConfig::Oidc(token)) => EdgeAuthInterceptor::new(Some(token), None),
+        Some(AuthConfig::Oidc { token, .. }) => EdgeAuthInterceptor::new(Some(token), None),
         Some(AuthConfig::EdgeJwt(token)) => EdgeAuthInterceptor::new(None, Some(token)),
+    }
+}
+
+/// Build a [`TokenSource`] when the config carries an OIDC refresher. Returns
+/// `None` for static OIDC tokens, edge tokens, and anonymous auth.
+fn token_source_from_config(config: &ClientConfig) -> Option<TokenSource> {
+    let Some(AuthConfig::Oidc {
+        token,
+        expires_at,
+        refresh: Some(refresher),
+    }) = &config.auth
+    else {
+        return None;
+    };
+    let mut initial = RefreshedToken::new(token.clone());
+    if let Some(exp) = expires_at {
+        initial = initial.with_expires_at(*exp);
+    }
+    Some(TokenSource::new(initial, Arc::clone(refresher)))
+}
+
+/// Overwrite the live bearer slot with a freshly minted token. A malformed
+/// token value is dropped (the slot keeps its previous value); the next
+/// request then fails auth and surfaces a clear error.
+fn store_bearer(slot: &BearerSlot, token: &str) {
+    if let Ok(value) = bearer_metadata(token)
+        && let Ok(mut guard) = slot.write()
+    {
+        *guard = Some(value);
     }
 }
 

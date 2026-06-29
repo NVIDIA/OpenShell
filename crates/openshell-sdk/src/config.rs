@@ -7,6 +7,9 @@
 //! The CLI keeps its own filesystem-aware `TlsOptions` for plumbing; it
 //! converts to a `ClientConfig` at the moment of dialing the gateway.
 
+use crate::refresh::Refresh;
+use std::sync::Arc;
+
 /// Authentication mode for outgoing gRPC requests.
 ///
 /// The two variants are functionally distinct in the transport layer:
@@ -24,7 +27,31 @@ pub enum AuthConfig {
     /// Cloudflare Access JWT — routes through the edge WebSocket tunnel.
     EdgeJwt(String),
     /// OIDC bearer token — direct HTTPS, `authorization` header.
-    Oidc(String),
+    ///
+    /// `expires_at` (Unix seconds, when known) lets the client refresh
+    /// proactively before expiry. `refresh`, when supplied, lets the client
+    /// rotate the token in place — proactively before expiry and reactively
+    /// on an `Unauthenticated` response. `None` keeps the token static for
+    /// the connection's lifetime.
+    Oidc {
+        /// Current OIDC access token.
+        token: String,
+        /// Advertised expiry (Unix seconds), if known.
+        expires_at: Option<u64>,
+        /// Optional refresher driving live token rotation.
+        refresh: Option<Arc<dyn Refresh>>,
+    },
+}
+
+impl AuthConfig {
+    /// Convenience constructor for a static OIDC bearer token (no refresh).
+    pub fn oidc(token: impl Into<String>) -> Self {
+        Self::Oidc {
+            token: token.into(),
+            expires_at: None,
+            refresh: None,
+        }
+    }
 }
 
 /// Configuration for opening a gRPC channel to an `OpenShell` gateway.

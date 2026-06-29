@@ -133,7 +133,7 @@ impl TlsOptions {
             .as_ref()
             .and_then(|ca_path| std::fs::read(ca_path).ok());
         let auth = match (&resolved.oidc_token, &resolved.edge_token) {
-            (Some(token), _) => Some(openshell_sdk::AuthConfig::Oidc(token.clone())),
+            (Some(token), _) => Some(openshell_sdk::AuthConfig::oidc(token.clone())),
             (None, Some(token)) => Some(openshell_sdk::AuthConfig::EdgeJwt(token.clone())),
             (None, None) => None,
         };
