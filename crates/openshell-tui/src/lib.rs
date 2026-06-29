@@ -3,6 +3,7 @@
 
 mod app;
 mod clipboard;
+mod edge_tunnel;
 mod event;
 pub mod theme;
 mod ui;
@@ -18,7 +19,9 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use miette::{IntoDiagnostic, Result};
-use openshell_bootstrap::list_gateways_with_source;
+use openshell_bootstrap::{
+    GatewayMetadata, edge_token::load_edge_token, list_gateways_with_source,
+};
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName};
 use openshell_core::proto::SandboxPhase;
@@ -494,6 +497,24 @@ async fn handle_gateway_switch(app: &mut App) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GatewayChannelMode {
+    Oidc,
+    Edge,
+    Plaintext,
+    Mtls,
+}
+
+fn gateway_channel_mode(meta: Option<&GatewayMetadata>, endpoint: &str) -> GatewayChannelMode {
+    match meta.and_then(|m| m.auth_mode.as_deref()) {
+        Some("oidc") => GatewayChannelMode::Oidc,
+        Some("cloudflare_jwt") => GatewayChannelMode::Edge,
+        Some("plaintext") => GatewayChannelMode::Plaintext,
+        _ if endpoint.starts_with("http://") => GatewayChannelMode::Plaintext,
+        _ => GatewayChannelMode::Mtls,
+    }
+}
+
 /// Build a gRPC channel and auth interceptor for a gateway.
 ///
 /// Checks gateway metadata for the auth mode and loads the appropriate
@@ -501,26 +522,64 @@ async fn handle_gateway_switch(app: &mut App) {
 async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<(Channel, EdgeAuthInterceptor)> {
     let meta = openshell_bootstrap::get_gateway_metadata(name);
 
-    if meta.as_ref().and_then(|m| m.auth_mode.as_deref()) == Some("oidc") {
-        let bundle = openshell_bootstrap::oidc_token::load_oidc_token(name).ok_or_else(|| {
-            miette::miette!(
-                "No OIDC token for gateway '{name}'.\n\
+    match gateway_channel_mode(meta.as_ref(), endpoint) {
+        GatewayChannelMode::Oidc => {
+            let bundle =
+                openshell_bootstrap::oidc_token::load_oidc_token(name).ok_or_else(|| {
+                    miette::miette!(
+                        "No OIDC token for gateway '{name}'.\n\
                      Authenticate with: openshell gateway login"
-            )
-        })?;
-        if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
-            miette::bail!(
-                "OIDC token for gateway '{name}' has expired.\n\
-                 Re-authenticate with: openshell gateway login"
-            );
+                    )
+                })?;
+            if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
+                miette::bail!(
+                    "OIDC token for gateway '{name}' has expired.\n\
+                     Re-authenticate with: openshell gateway login"
+                );
+            }
+            let interceptor = EdgeAuthInterceptor::new(Some(&bundle.access_token), None)?;
+            let channel = build_oidc_channel(name, endpoint).await?;
+            Ok((channel, interceptor))
         }
-        let interceptor = EdgeAuthInterceptor::new(Some(&bundle.access_token), None)?;
-        let channel = build_oidc_channel(name, endpoint).await?;
-        Ok((channel, interceptor))
-    } else {
-        let channel = build_mtls_channel(name, endpoint).await?;
-        Ok((channel, EdgeAuthInterceptor::noop()))
+        GatewayChannelMode::Edge => {
+            let token = load_edge_token(name).ok_or_else(|| {
+                miette::miette!(
+                    "No edge token for gateway '{name}'.\n\
+                     Authenticate with: openshell gateway login"
+                )
+            })?;
+            let interceptor = EdgeAuthInterceptor::new(None, Some(&token))?;
+            let channel = build_edge_channel(endpoint, &token).await?;
+            Ok((channel, interceptor))
+        }
+        GatewayChannelMode::Plaintext => {
+            let channel = build_plaintext_channel(endpoint).await?;
+            Ok((channel, EdgeAuthInterceptor::noop()))
+        }
+        GatewayChannelMode::Mtls => {
+            let channel = build_mtls_channel(name, endpoint).await?;
+            Ok((channel, EdgeAuthInterceptor::noop()))
+        }
     }
+}
+
+async fn build_edge_channel(endpoint: &str, token: &str) -> Result<Channel> {
+    if endpoint.starts_with("https://") {
+        let proxy = edge_tunnel::start_tunnel_proxy(endpoint, token).await?;
+        return build_plaintext_channel(&format!("http://{}", proxy.local_addr)).await;
+    }
+    build_plaintext_channel(endpoint).await
+}
+
+async fn build_plaintext_channel(endpoint: &str) -> Result<Channel> {
+    Endpoint::from_shared(endpoint.to_string())
+        .into_diagnostic()?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .connect()
+        .await
+        .into_diagnostic()
 }
 
 /// Build an HTTPS channel for OIDC-authenticated gateways.
@@ -2509,4 +2568,54 @@ fn days_to_ymd(days: i64) -> (i64, i64, i64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GatewayChannelMode, gateway_channel_mode};
+    use openshell_bootstrap::GatewayMetadata;
+
+    #[test]
+    fn gateway_channel_mode_uses_plaintext_auth_mode() {
+        let meta = GatewayMetadata {
+            auth_mode: Some("plaintext".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            gateway_channel_mode(Some(&meta), "https://gateway.example.com"),
+            GatewayChannelMode::Plaintext
+        );
+    }
+
+    #[test]
+    fn gateway_channel_mode_prefers_edge_metadata() {
+        let meta = GatewayMetadata {
+            auth_mode: Some("cloudflare_jwt".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            gateway_channel_mode(Some(&meta), "https://gateway.example.com"),
+            GatewayChannelMode::Edge
+        );
+    }
+
+    #[test]
+    fn gateway_channel_mode_uses_http_endpoint_fallback() {
+        assert_eq!(
+            gateway_channel_mode(None, "http://127.0.0.1:17670"),
+            GatewayChannelMode::Plaintext
+        );
+    }
+
+    #[test]
+    fn gateway_channel_mode_prefers_oidc_metadata() {
+        let meta = GatewayMetadata {
+            auth_mode: Some("oidc".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            gateway_channel_mode(Some(&meta), "https://gateway.example.com"),
+            GatewayChannelMode::Oidc
+        );
+    }
 }
