@@ -116,9 +116,10 @@ Kubernetes garbage collection removes it when the sandbox is deleted. The
 Deployment recreates the supervisor pod if the pod is deleted independently.
 
 <Warning>
-Proxy-pod topology requires NetworkPolicy enforcement. In local k3s/k3d testing,
-keep the k3s network policy controller enabled or install a policy-enforcing CNI
-before deploying the proxy-pod Skaffold profile. Without enforcement, the
+Proxy-pod topology requires NetworkPolicy enforcement to work as OpenShell
+expects. The target cluster must have a policy-enforcing CNI or equivalent
+NetworkPolicy controller before deploying this topology. Without enforcement,
+the agent pod is not forced through its paired supervisor proxy, so the
 agent-to-supervisor isolation policy is only declarative.
 </Warning>
 
