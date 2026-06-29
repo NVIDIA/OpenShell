@@ -3538,7 +3538,7 @@ mod tests {
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("update would create ambiguous dynamic token grants")
+                .contains("update would create ambiguous provider credential bindings")
         }));
     }
 

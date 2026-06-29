@@ -7186,7 +7186,7 @@ network_policies:
              Host: api.example.test:8080\r\n\
              Authorization: Bearer {}MY_API_TOKEN\r\n\
              Connection: close\r\n\r\n",
-            openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC,
+            secrets::PLACEHOLDER_PREFIX_PUBLIC,
         )
         .into_bytes();
 
