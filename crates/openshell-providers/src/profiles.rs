@@ -450,7 +450,6 @@ impl ProviderTypeProfile {
         NetworkPolicyRule {
             name: rule_name.to_string(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
-            middleware: Vec::new(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
     }
@@ -788,7 +787,6 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
         advisor_proposed: false,
         persisted_queries: endpoint.persisted_queries.clone(),
-        middleware: Vec::new(),
         graphql_persisted_queries: endpoint
             .graphql_persisted_queries
             .iter()

@@ -7,34 +7,28 @@ mod builtins;
 mod service;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use miette::{Result, miette};
 pub use service::InProcessMiddlewareService;
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HttpRequestEvaluation, HttpRequestTarget, NetworkMiddlewareConfig,
-    RequestContext,
+    Decision, Finding, HttpRequestEvaluation, HttpRequestTarget, MiddlewareBinding,
+    MiddlewareManifest, NetworkMiddlewareConfig, RequestContext,
 };
+use tokio::sync::OnceCell;
 use tonic::Request;
 
 pub const API_VERSION: &str = "openshell.middleware.v1";
-pub const HTTP_REQUEST_OPERATION: &str = "HttpRequest";
-pub const PRE_CREDENTIALS_PHASE: &str = "pre_credentials";
-pub const BUILTIN_SECRETS: &str = "openshell/secrets";
+pub const BUILTIN_SECRETS: &str = builtins::secrets::BINDING_ID;
 
 /// Validate the configuration for an in-process middleware implementation.
 ///
 /// Policy admission uses this same implementation-specific validation before a
 /// configuration can reach the request path.
 pub fn validate_builtin_config(implementation: &str, config: &prost_types::Struct) -> Result<()> {
-    match implementation {
-        BUILTIN_SECRETS => builtins::secrets::validate_config(config),
-        other => Err(miette!(
-            "middleware implementation '{other}' is not available in phase 1"
-        )),
-    }
+    builtins::validate_config(implementation, config)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +76,26 @@ impl TryFrom<&NetworkMiddlewareConfig> for ChainEntry {
             config: value.config.clone().unwrap_or_default(),
             on_error: OnError::parse(&value.on_error)?,
         })
+    }
+}
+
+/// A policy-selected middleware config joined with metadata reported by its
+/// service's `Describe` call. A missing binding is retained so `on_error` can
+/// decide whether the request fails open or closed.
+#[derive(Debug, Clone)]
+pub struct DescribedChainEntry {
+    entry: ChainEntry,
+    binding: Option<MiddlewareBinding>,
+    max_body_bytes: usize,
+}
+
+impl DescribedChainEntry {
+    pub fn max_body_bytes(&self) -> usize {
+        self.max_body_bytes
+    }
+
+    pub fn on_error(&self) -> OnError {
+        self.entry.on_error
     }
 }
 
@@ -138,15 +152,15 @@ enum OnErrorAction {
 /// Apply a middleware entry's `on_error` policy after a failure (service error or
 /// malformed response). Records a `failed` invocation for telemetry in both cases.
 fn apply_on_error(
-    entry: &ChainEntry,
+    entry: &DescribedChainEntry,
     reason: &str,
     applied: &mut Vec<MiddlewareInvocation>,
 ) -> OnErrorAction {
-    match entry.on_error {
+    match entry.entry.on_error {
         OnError::FailOpen => {
             applied.push(MiddlewareInvocation {
-                name: entry.name.clone(),
-                implementation: entry.implementation.clone(),
+                name: entry.entry.name.clone(),
+                implementation: entry.entry.implementation.clone(),
                 decision: Decision::Allow,
                 transformed: false,
                 failed: true,
@@ -155,8 +169,8 @@ fn apply_on_error(
         }
         OnError::FailClosed => {
             applied.push(MiddlewareInvocation {
-                name: entry.name.clone(),
-                implementation: entry.implementation.clone(),
+                name: entry.entry.name.clone(),
+                implementation: entry.entry.implementation.clone(),
                 decision: Decision::Deny,
                 transformed: false,
                 failed: true,
@@ -168,23 +182,101 @@ fn apply_on_error(
 
 #[derive(Clone)]
 pub struct ChainRunner {
-    service: Arc<dyn SupervisorMiddleware>,
+    state: Arc<MiddlewareServiceState>,
 }
+
+struct MiddlewareServiceState {
+    service: Arc<dyn SupervisorMiddleware>,
+    manifest: OnceCell<MiddlewareManifest>,
+}
+
+static IN_PROCESS_SERVICE: LazyLock<Arc<MiddlewareServiceState>> = LazyLock::new(|| {
+    Arc::new(MiddlewareServiceState {
+        service: Arc::new(InProcessMiddlewareService),
+        manifest: OnceCell::new(),
+    })
+});
 
 impl Default for ChainRunner {
     fn default() -> Self {
-        Self::new(Arc::new(InProcessMiddlewareService))
+        Self {
+            state: Arc::clone(&IN_PROCESS_SERVICE),
+        }
     }
 }
 
 impl ChainRunner {
     pub fn new(service: Arc<dyn SupervisorMiddleware>) -> Self {
-        Self { service }
+        Self {
+            state: Arc::new(MiddlewareServiceState {
+                service,
+                manifest: OnceCell::new(),
+            }),
+        }
+    }
+
+    async fn manifest(&self) -> Result<&MiddlewareManifest> {
+        self.state
+            .manifest
+            .get_or_try_init(|| async {
+                self.state
+                    .service
+                    .describe(Request::new(()))
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|error| {
+                        miette!(
+                            "middleware Describe failed: {}",
+                            safe_reason(&error.to_string())
+                        )
+                    })
+            })
+            .await
+    }
+
+    pub async fn describe_chain(&self, entries: &[ChainEntry]) -> Result<Vec<DescribedChainEntry>> {
+        let manifest = self.manifest().await?;
+        entries
+            .iter()
+            .map(|entry| {
+                let binding = manifest
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.id == entry.implementation)
+                    .cloned();
+                let max_body_bytes = binding
+                    .as_ref()
+                    .map(|binding| {
+                        usize::try_from(binding.max_body_bytes).map_err(|_| {
+                            miette!(
+                                "middleware binding '{}' reports a body limit too large for this platform",
+                                binding.id
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                Ok(DescribedChainEntry {
+                    entry: entry.clone(),
+                    binding,
+                    max_body_bytes,
+                })
+            })
+            .collect()
     }
 
     pub async fn evaluate(
         &self,
         entries: &[ChainEntry],
+        input: HttpRequestInput,
+    ) -> Result<ChainOutcome> {
+        let entries = self.describe_chain(entries).await?;
+        self.evaluate_described(&entries, input).await
+    }
+
+    pub async fn evaluate_described(
+        &self,
+        entries: &[DescribedChainEntry],
         input: HttpRequestInput,
     ) -> Result<ChainOutcome> {
         let mut headers = input.headers.clone();
@@ -195,8 +287,41 @@ impl ChainRunner {
         let mut applied = Vec::new();
 
         for entry in entries {
-            let evaluation = build_evaluation(entry, &input, &headers, &body);
+            let Some(binding) = entry.binding.as_ref() else {
+                match apply_on_error(entry, "binding_not_described", &mut applied) {
+                    OnErrorAction::FailOpen => continue,
+                    OnErrorAction::FailClosed(reason) => {
+                        return Ok(ChainOutcome {
+                            allowed: false,
+                            reason,
+                            body,
+                            added_headers,
+                            findings,
+                            metadata,
+                            applied,
+                        });
+                    }
+                }
+            };
+            if body.len() > entry.max_body_bytes {
+                match apply_on_error(entry, "request_body_over_capacity", &mut applied) {
+                    OnErrorAction::FailOpen => continue,
+                    OnErrorAction::FailClosed(reason) => {
+                        return Ok(ChainOutcome {
+                            allowed: false,
+                            reason,
+                            body,
+                            added_headers,
+                            findings,
+                            metadata,
+                            applied,
+                        });
+                    }
+                }
+            }
+            let evaluation = build_evaluation(entry, binding, &input, &headers, &body);
             let result = match self
+                .state
                 .service
                 .evaluate_http_request(Request::new(evaluation))
                 .await
@@ -240,6 +365,23 @@ impl ChainRunner {
                 }
             };
 
+            if result.has_body && result.body.len() > entry.max_body_bytes {
+                match apply_on_error(entry, "response_body_over_capacity", &mut applied) {
+                    OnErrorAction::FailOpen => continue,
+                    OnErrorAction::FailClosed(reason) => {
+                        return Ok(ChainOutcome {
+                            allowed: false,
+                            reason,
+                            body,
+                            added_headers,
+                            findings,
+                            metadata,
+                            applied,
+                        });
+                    }
+                }
+            }
+
             // A result proposing unsafe header mutations is a malformed response:
             // route it through `on_error` instead of applying any of it.
             if validate_header_mutations(&headers, &result.add_headers).is_err() {
@@ -268,19 +410,19 @@ impl ChainRunner {
             }
             for finding in result.findings {
                 findings.push(NamespacedFinding {
-                    middleware: entry.name.clone(),
+                    middleware: entry.entry.name.clone(),
                     finding,
                 });
             }
             if !result.metadata.is_empty() {
                 metadata.insert(
-                    entry.name.clone(),
+                    entry.entry.name.clone(),
                     result.metadata.clone().into_iter().collect(),
                 );
             }
             applied.push(MiddlewareInvocation {
-                name: entry.name.clone(),
-                implementation: entry.implementation.clone(),
+                name: entry.entry.name.clone(),
+                implementation: entry.entry.implementation.clone(),
                 decision,
                 transformed,
                 failed: false,
@@ -311,21 +453,22 @@ impl ChainRunner {
 }
 
 fn build_evaluation(
-    entry: &ChainEntry,
+    entry: &DescribedChainEntry,
+    binding: &MiddlewareBinding,
     input: &HttpRequestInput,
     headers: &BTreeMap<String, String>,
     body: &[u8],
 ) -> HttpRequestEvaluation {
     HttpRequestEvaluation {
         api_version: API_VERSION.into(),
-        binding_id: entry.implementation.clone(),
-        phase: PRE_CREDENTIALS_PHASE.into(),
+        binding_id: binding.id.clone(),
+        phase: binding.phase.clone(),
         context: Some(RequestContext {
             request_id: input.request_id.clone(),
             sandbox_id: input.sandbox_id.clone(),
             originating_process: None,
         }),
-        config: Some(entry.config.clone()),
+        config: Some(entry.entry.config.clone()),
         target: Some(HttpRequestTarget {
             scheme: input.scheme.clone(),
             host: input.host.clone(),
@@ -436,11 +579,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn phase_one_evaluation_omits_originating_process() {
-        let entry = entry("redact", OnError::FailClosed);
+    #[tokio::test]
+    async fn phase_one_evaluation_omits_originating_process() {
+        let entries = ChainRunner::default()
+            .describe_chain(&[entry("redact", OnError::FailClosed)])
+            .await
+            .expect("describe chain");
+        let entry = &entries[0];
+        let binding = entry.binding.as_ref().expect("described binding");
         let input = input("payload");
-        let evaluation = build_evaluation(&entry, &input, &BTreeMap::new(), b"payload");
+        let evaluation = build_evaluation(entry, binding, &input, &BTreeMap::new(), b"payload");
 
         assert!(
             evaluation
@@ -527,8 +675,9 @@ mod tests {
             .into_inner();
         assert_eq!(manifest.api_version, API_VERSION);
         assert_eq!(manifest.bindings[0].id, BUILTIN_SECRETS);
-        assert_eq!(manifest.bindings[0].operation, HTTP_REQUEST_OPERATION);
-        assert_eq!(manifest.bindings[0].phase, PRE_CREDENTIALS_PHASE);
+        assert_eq!(manifest.bindings[0].operation, "HttpRequest");
+        assert_eq!(manifest.bindings[0].phase, "pre_credentials");
+        assert_eq!(manifest.bindings[0].max_body_bytes, 256 * 1024);
     }
 
     #[test]
@@ -561,6 +710,8 @@ mod tests {
     /// evaluation. Used to exercise chain behavior the built-in cannot produce
     /// (explicit deny, metadata, findings, unsafe header mutations).
     struct ScriptedService {
+        binding_id: String,
+        max_body_bytes: u64,
         result: openshell_core::proto::HttpRequestResult,
     }
 
@@ -569,13 +720,18 @@ mod tests {
         async fn describe(
             &self,
             _request: Request<()>,
-        ) -> std::result::Result<
-            tonic::Response<openshell_core::proto::MiddlewareManifest>,
-            tonic::Status,
-        > {
-            Ok(tonic::Response::new(
-                openshell_core::proto::MiddlewareManifest::default(),
-            ))
+        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            Ok(tonic::Response::new(MiddlewareManifest {
+                api_version: API_VERSION.into(),
+                name: "test/middleware".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    id: self.binding_id.clone(),
+                    operation: "HttpRequest".into(),
+                    phase: "pre_credentials".into(),
+                    max_body_bytes: self.max_body_bytes,
+                }],
+            }))
         }
 
         async fn validate_config(
@@ -604,6 +760,14 @@ mod tests {
         }
     }
 
+    fn scripted_service(result: openshell_core::proto::HttpRequestResult) -> ScriptedService {
+        ScriptedService {
+            binding_id: BUILTIN_SECRETS.into(),
+            max_body_bytes: 256 * 1024,
+            result,
+        }
+    }
+
     fn allow_result() -> openshell_core::proto::HttpRequestResult {
         openshell_core::proto::HttpRequestResult {
             decision: Decision::Allow as i32,
@@ -617,14 +781,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deny_decision_short_circuits_chain() {
+    async fn descriptors_are_resolved_from_any_middleware_service() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            result: openshell_core::proto::HttpRequestResult {
+            binding_id: "example/redactor".into(),
+            max_body_bytes: 4096,
+            result: allow_result(),
+        }));
+        let entry = ChainEntry {
+            name: "external".into(),
+            implementation: "example/redactor".into(),
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+
+        let described = runner
+            .describe_chain(std::slice::from_ref(&entry))
+            .await
+            .expect("describe external middleware");
+        assert_eq!(described[0].max_body_bytes(), 4096);
+        assert_eq!(
+            described[0]
+                .binding
+                .as_ref()
+                .expect("described binding")
+                .phase,
+            "pre_credentials"
+        );
+
+        let outcome = runner
+            .evaluate_described(&described, input("hello"))
+            .await
+            .expect("evaluate external middleware");
+        assert!(outcome.allowed);
+    }
+
+    #[tokio::test]
+    async fn deny_decision_short_circuits_chain() {
+        let runner = ChainRunner::new(Arc::new(scripted_service(
+            openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
                 reason: "blocked_by_policy".into(),
                 ..allow_result()
             },
-        }));
+        )));
         let outcome = runner
             .evaluate(
                 &[
@@ -645,8 +844,8 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_and_findings_are_namespaced_per_config() {
-        let runner = ChainRunner::new(Arc::new(ScriptedService {
-            result: openshell_core::proto::HttpRequestResult {
+        let runner = ChainRunner::new(Arc::new(scripted_service(
+            openshell_core::proto::HttpRequestResult {
                 findings: vec![Finding {
                     r#type: "pii.email".into(),
                     label: "email address".into(),
@@ -658,7 +857,7 @@ mod tests {
                     .collect(),
                 ..allow_result()
             },
-        }));
+        )));
         let outcome = runner
             .evaluate(
                 &[
@@ -683,16 +882,14 @@ mod tests {
     }
 
     fn unsafe_header_service() -> ScriptedService {
-        ScriptedService {
-            result: openshell_core::proto::HttpRequestResult {
-                add_headers: std::iter::once((
-                    "x-openshell-middleware-inject".to_string(),
-                    "ok\r\nHost: evil".to_string(),
-                ))
-                .collect(),
-                ..allow_result()
-            },
-        }
+        scripted_service(openshell_core::proto::HttpRequestResult {
+            add_headers: std::iter::once((
+                "x-openshell-middleware-inject".to_string(),
+                "ok\r\nHost: evil".to_string(),
+            ))
+            .collect(),
+            ..allow_result()
+        })
     }
 
     #[tokio::test]
@@ -724,13 +921,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unspecified_decision_uses_fail_closed() {
+    async fn oversized_replacement_body_honors_on_error() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
+            binding_id: BUILTIN_SECRETS.into(),
+            max_body_bytes: 4,
             result: openshell_core::proto::HttpRequestResult {
-                decision: Decision::Unspecified as i32,
+                body: b"too large".to_vec(),
+                has_body: true,
                 ..allow_result()
             },
         }));
+        let fail_open = entry("small", OnError::FailOpen);
+        let mut fail_closed = fail_open.clone();
+        fail_closed.on_error = OnError::FailClosed;
+
+        let open_outcome = runner
+            .evaluate(&[fail_open], input("safe"))
+            .await
+            .expect("fail-open evaluation");
+        assert!(open_outcome.allowed);
+        assert_eq!(open_outcome.body, b"safe");
+        assert!(open_outcome.applied[0].failed);
+
+        let closed_outcome = runner
+            .evaluate(&[fail_closed], input("safe"))
+            .await
+            .expect("fail-closed evaluation");
+        assert!(!closed_outcome.allowed);
+        assert_eq!(
+            closed_outcome.reason,
+            "middleware_failed: response_body_over_capacity"
+        );
+        assert!(closed_outcome.applied[0].failed);
+    }
+
+    #[tokio::test]
+    async fn oversized_request_body_honors_on_error() {
+        let runner = ChainRunner::new(Arc::new(ScriptedService {
+            binding_id: BUILTIN_SECRETS.into(),
+            max_body_bytes: 4,
+            result: allow_result(),
+        }));
+        let fail_open = entry("small", OnError::FailOpen);
+        let mut fail_closed = fail_open.clone();
+        fail_closed.on_error = OnError::FailClosed;
+
+        let open_outcome = runner
+            .evaluate(&[fail_open], input("hello"))
+            .await
+            .expect("fail-open evaluation");
+        assert!(open_outcome.allowed);
+        assert_eq!(open_outcome.body, b"hello");
+        assert!(open_outcome.applied[0].failed);
+
+        let closed_outcome = runner
+            .evaluate(&[fail_closed], input("hello"))
+            .await
+            .expect("fail-closed evaluation");
+        assert!(!closed_outcome.allowed);
+        assert_eq!(
+            closed_outcome.reason,
+            "middleware_failed: request_body_over_capacity"
+        );
+        assert!(closed_outcome.applied[0].failed);
+    }
+
+    #[tokio::test]
+    async fn unspecified_decision_uses_fail_closed() {
+        let runner = ChainRunner::new(Arc::new(scripted_service(
+            openshell_core::proto::HttpRequestResult {
+                decision: Decision::Unspecified as i32,
+                ..allow_result()
+            },
+        )));
 
         let outcome = runner
             .evaluate(&[entry("redact", OnError::FailClosed)], input("hello"))

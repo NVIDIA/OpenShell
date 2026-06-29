@@ -27,7 +27,19 @@ const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 /// Maximum body bytes for `SigV4` body-signing mode. Larger than the credential
 /// rewrite limit because Bedrock payloads can be several megabytes.
 const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
-pub(crate) const MAX_MIDDLEWARE_BODY_BYTES: usize = MAX_REWRITE_BODY_BYTES;
+#[cfg(test)]
+async fn max_middleware_body_bytes() -> usize {
+    let chain = openshell_supervisor_middleware::ChainRunner::default()
+        .describe_chain(&[openshell_supervisor_middleware::ChainEntry {
+            name: "test".into(),
+            implementation: openshell_supervisor_middleware::BUILTIN_SECRETS.into(),
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }])
+        .await
+        .expect("describe built-in middleware");
+    chain[0].max_body_bytes()
+}
 const RELAY_BUF_SIZE: usize = 8192;
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
     b"GET ",
@@ -820,6 +832,7 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
     req: &L7Request,
     client: &mut C,
     generation_guard: Option<&PolicyGenerationGuard>,
+    max_body_bytes: usize,
 ) -> Result<BufferResult> {
     let header_end = req
         .raw_header
@@ -840,7 +853,7 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
             let Ok(len) = usize::try_from(len) else {
                 return Ok(BufferResult::OverCapacity { recoverable: true });
             };
-            if len > MAX_MIDDLEWARE_BODY_BYTES {
+            if len > max_body_bytes {
                 return Ok(BufferResult::OverCapacity { recoverable: true });
             }
             let initial_len = already_read.len().min(len);
@@ -869,14 +882,18 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
         }
         BodyLength::Chunked => {
             // Chunked bodies are decoded incrementally into the payload bytes
-            // middleware expects. On overflow, we have already consumed wire
-            // bytes from the client stream and cannot re-enter the normal raw
-            // relay path without a separate splice-through buffer.
-            Ok(collect_chunked_body(client, already_read, generation_guard)
-                .await
-                .map_or(BufferResult::OverCapacity { recoverable: false }, |body| {
-                    BufferResult::Buffered(BufferedRequestBody { headers, body })
-                }))
+            // middleware expects, but the middleware cap counts the complete
+            // wire representation, including framing and trailers. On overflow,
+            // we have already consumed wire bytes from the client stream and
+            // cannot re-enter the normal raw relay path without a separate
+            // splice-through buffer.
+            Ok(
+                collect_chunked_body(client, already_read, generation_guard, Some(max_body_bytes))
+                    .await
+                    .map_or(BufferResult::OverCapacity { recoverable: false }, |body| {
+                        BufferResult::Buffered(BufferedRequestBody { headers, body })
+                    }),
+            )
         }
     }
 }
@@ -953,7 +970,7 @@ async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
             Ok(PreparedRequestBody { headers, body })
         }
         BodyLength::Chunked => {
-            let body = collect_chunked_body(client, already_read, generation_guard).await?;
+            let body = collect_chunked_body(client, already_read, generation_guard, None).await?;
             let (mut headers, body) =
                 rewrite_buffered_body(rewritten_headers, original_header_str, body, resolver)?;
             headers = set_content_length(&headers, body.len())?;
@@ -1125,15 +1142,19 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
     client: &mut C,
     already_read: &[u8],
     generation_guard: Option<&PolicyGenerationGuard>,
+    max_wire_bytes: Option<usize>,
 ) -> Result<Vec<u8>> {
-    let mut buffered_pos = 0usize;
+    let mut read_state = ChunkedReadState {
+        buffered_pos: 0,
+        wire_bytes: 0,
+        max_wire_bytes,
+    };
     let mut body = Vec::new();
 
     loop {
-        let size_line =
-            read_chunked_line(client, already_read, &mut buffered_pos, generation_guard)
-                .await
-                .map_err(|e| miette!("Chunked body ended before chunk-size line: {e}"))?;
+        let size_line = read_chunked_line(client, already_read, &mut read_state, generation_guard)
+            .await
+            .map_err(|e| miette!("Chunked body ended before chunk-size line: {e}"))?;
         let size_line = std::str::from_utf8(&size_line)
             .into_diagnostic()
             .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
@@ -1149,7 +1170,7 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
         if chunk_size == 0 {
             loop {
                 let trailer_line =
-                    read_chunked_line(client, already_read, &mut buffered_pos, generation_guard)
+                    read_chunked_line(client, already_read, &mut read_state, generation_guard)
                         .await
                         .map_err(|e| {
                             miette!("Chunked body ended before trailer terminator: {e}")
@@ -1168,7 +1189,7 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
         read_buffered_exact(
             client,
             already_read,
-            &mut buffered_pos,
+            &mut read_state,
             chunk_size,
             &mut body,
             generation_guard,
@@ -1180,7 +1201,7 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
         read_buffered_exact(
             client,
             already_read,
-            &mut buffered_pos,
+            &mut read_state,
             2,
             &mut chunk_crlf,
             generation_guard,
@@ -1193,15 +1214,21 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
     }
 }
 
+struct ChunkedReadState {
+    buffered_pos: usize,
+    wire_bytes: usize,
+    max_wire_bytes: Option<usize>,
+}
+
 async fn read_chunked_line<C: AsyncRead + Unpin>(
     client: &mut C,
     already_read: &[u8],
-    buffered_pos: &mut usize,
+    state: &mut ChunkedReadState,
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<Vec<u8>> {
     let mut line = Vec::new();
     loop {
-        let byte = read_buffered_byte(client, already_read, buffered_pos, generation_guard).await?;
+        let byte = read_buffered_byte(client, already_read, state, generation_guard).await?;
         line.push(byte);
         if line.len() > MAX_REWRITE_BODY_BYTES {
             return Err(miette!(
@@ -1218,13 +1245,13 @@ async fn read_chunked_line<C: AsyncRead + Unpin>(
 async fn read_buffered_exact<C: AsyncRead + Unpin>(
     client: &mut C,
     already_read: &[u8],
-    buffered_pos: &mut usize,
+    state: &mut ChunkedReadState,
     len: usize,
     out: &mut Vec<u8>,
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<()> {
     for _ in 0..len {
-        let byte = read_buffered_byte(client, already_read, buffered_pos, generation_guard).await?;
+        let byte = read_buffered_byte(client, already_read, state, generation_guard).await?;
         out.push(byte);
     }
     Ok(())
@@ -1233,18 +1260,30 @@ async fn read_buffered_exact<C: AsyncRead + Unpin>(
 async fn read_buffered_byte<C: AsyncRead + Unpin>(
     client: &mut C,
     already_read: &[u8],
-    buffered_pos: &mut usize,
+    state: &mut ChunkedReadState,
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<u8> {
-    if *buffered_pos < already_read.len() {
-        let byte = already_read[*buffered_pos];
-        *buffered_pos += 1;
-        return Ok(byte);
+    if state
+        .max_wire_bytes
+        .is_some_and(|max| state.wire_bytes >= max)
+    {
+        return Err(miette!(
+            "chunked body wire representation exceeds middleware buffer limit"
+        ));
     }
-    let byte = client.read_u8().await.into_diagnostic()?;
-    if let Some(guard) = generation_guard {
-        guard.ensure_current()?;
-    }
+
+    let byte = if state.buffered_pos < already_read.len() {
+        let byte = already_read[state.buffered_pos];
+        state.buffered_pos += 1;
+        byte
+    } else {
+        let byte = client.read_u8().await.into_diagnostic()?;
+        if let Some(guard) = generation_guard {
+            guard.ensure_current()?;
+        }
+        byte
+    };
+    state.wire_bytes += 1;
     Ok(byte)
 }
 
@@ -3264,11 +3303,46 @@ mod tests {
             &mut client,
             b"5\r\nhello\r\n6;ext=value\r\n world\r\n0\r\nx-checksum: abc\r\n\r\n",
             None,
+            None,
         )
         .await
         .expect("chunked body should decode");
 
         assert_eq!(body, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn middleware_chunked_wire_body_at_cap_is_allowed() {
+        let max_body_bytes = max_middleware_body_bytes().await;
+        let payload_len = max_body_bytes - 14;
+        let mut wire = format!("{payload_len:x}\r\n").into_bytes();
+        wire.extend(std::iter::repeat_n(b'x', payload_len));
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert_eq!(wire.len(), max_body_bytes);
+
+        let body = collect_chunked_body(&mut tokio::io::empty(), &wire, None, Some(max_body_bytes))
+            .await
+            .expect("wire representation at the cap should be allowed");
+
+        assert_eq!(body.len(), payload_len);
+    }
+
+    #[tokio::test]
+    async fn middleware_chunked_wire_body_over_cap_is_rejected() {
+        let max_body_bytes = max_middleware_body_bytes().await;
+        let payload_len = max_body_bytes - 13;
+        let mut wire = format!("{payload_len:x}\r\n").into_bytes();
+        wire.extend(std::iter::repeat_n(b'x', payload_len));
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert_eq!(wire.len(), max_body_bytes + 1);
+        assert!(payload_len < max_body_bytes);
+
+        let error =
+            collect_chunked_body(&mut tokio::io::empty(), &wire, None, Some(max_body_bytes))
+                .await
+                .expect_err("wire framing over the cap must be rejected");
+
+        assert!(error.to_string().contains("wire representation"));
     }
 
     /// SEC-009: Bare LF in headers enables header injection.

@@ -453,8 +453,7 @@ where
         let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
-            let chain =
-                engine.query_middleware_chain(&middleware_network_input(ctx), &req.target)?;
+            let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let req =
                 match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
                     .await?
@@ -773,6 +772,15 @@ pub(crate) enum MiddlewareApplyResult {
     Denied(String),
 }
 
+fn middleware_chain_body_limit(
+    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
+) -> Option<usize> {
+    chain
+        .iter()
+        .map(openshell_supervisor_middleware::DescribedChainEntry::max_body_bytes)
+        .min()
+}
+
 pub(crate) async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
     client: &mut C,
@@ -780,13 +788,29 @@ pub(crate) async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + S
     chain: Vec<openshell_supervisor_middleware::ChainEntry>,
     generation_guard: &PolicyGenerationGuard,
 ) -> Result<MiddlewareApplyResult> {
+    apply_middleware_chain_for_scheme(req, client, ctx, "https", chain, generation_guard).await
+}
+
+pub(crate) async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin + Send>(
+    req: crate::l7::provider::L7Request,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    scheme: &str,
+    chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    generation_guard: &PolicyGenerationGuard,
+) -> Result<MiddlewareApplyResult> {
     if chain.is_empty() {
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
+    let runner = openshell_supervisor_middleware::ChainRunner::default();
+    let chain = runner.describe_chain(&chain).await?;
+    let max_body_bytes =
+        middleware_chain_body_limit(&chain).expect("non-empty middleware chain has a body limit");
     let buffered = match crate::l7::rest::buffer_request_body_for_middleware(
         &req,
         client,
         Some(generation_guard),
+        max_body_bytes,
     )
     .await?
     {
@@ -797,21 +821,8 @@ pub(crate) async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + S
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
-    let input = openshell_supervisor_middleware::HttpRequestInput {
-        request_id: uuid::Uuid::new_v4().to_string(),
-        sandbox_id: openshell_ocsf::ctx::ctx().sandbox_id.clone(),
-        scheme: "https".into(),
-        host: ctx.host.clone(),
-        port: ctx.port,
-        method: req.action.clone(),
-        path: req.target.clone(),
-        query,
-        headers,
-        body: buffered.body,
-    };
-    let outcome = openshell_supervisor_middleware::ChainRunner::default()
-        .evaluate(&chain, input)
-        .await?;
+    let input = middleware_request_input(scheme, &req, ctx, headers, query, buffered.body);
+    let outcome = runner.evaluate_described(&chain, input).await?;
     emit_middleware_events(ctx, &req, &outcome);
     let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
         &req,
@@ -823,6 +834,28 @@ pub(crate) async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + S
         Ok(MiddlewareApplyResult::Allowed(rebuilt))
     } else {
         Ok(MiddlewareApplyResult::Denied(outcome.reason))
+    }
+}
+
+fn middleware_request_input(
+    scheme: &str,
+    req: &crate::l7::provider::L7Request,
+    ctx: &L7EvalContext,
+    headers: BTreeMap<String, String>,
+    query: String,
+    body: Vec<u8>,
+) -> openshell_supervisor_middleware::HttpRequestInput {
+    openshell_supervisor_middleware::HttpRequestInput {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        sandbox_id: openshell_ocsf::ctx::ctx().sandbox_id.clone(),
+        scheme: scheme.into(),
+        host: ctx.host.clone(),
+        port: ctx.port,
+        method: req.action.clone(),
+        path: req.target.clone(),
+        query,
+        headers,
+        body,
     }
 }
 
@@ -846,12 +879,12 @@ fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
 fn resolve_unbuffered_body(
     ctx: &L7EvalContext,
     req: crate::l7::provider::L7Request,
-    chain: &[openshell_supervisor_middleware::ChainEntry],
+    chain: &[openshell_supervisor_middleware::DescribedChainEntry],
     recoverable: bool,
 ) -> MiddlewareApplyResult {
     let all_fail_open = chain
         .iter()
-        .all(|entry| entry.on_error == openshell_supervisor_middleware::OnError::FailOpen);
+        .all(|entry| entry.on_error() == openshell_supervisor_middleware::OnError::FailOpen);
     if recoverable && all_fail_open {
         emit_middleware_body_unavailable(ctx, false);
         return MiddlewareApplyResult::Allowed(req);
@@ -1187,8 +1220,7 @@ where
         let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
-            let chain =
-                engine.query_middleware_chain(&middleware_network_input(ctx), &req.target)?;
+            let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let req =
                 match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
                     .await?
@@ -1457,8 +1489,7 @@ where
         }
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
-            let chain =
-                engine.query_middleware_chain(&middleware_network_input(ctx), &req.target)?;
+            let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let req =
                 match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
                     .await?
@@ -1682,8 +1713,7 @@ where
         let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
-            let chain =
-                engine.query_middleware_chain(&middleware_network_input(ctx), &req.target)?;
+            let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
             let req =
                 match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
                     .await?
@@ -2136,8 +2166,7 @@ where
 
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
-            let (chain, generation) =
-                engine.query_middleware_chain_with_generation(&input, &req.target)?;
+            let (chain, generation) = engine.query_middleware_chain_with_generation(&input)?;
             if generation != generation_guard.captured_generation() {
                 return Ok(());
             }
@@ -2326,10 +2355,11 @@ network_middlewares:
   - name: request-middleware
     middleware: {middleware_impl}
     on_error: {on_error}
+    endpoints:
+      include: ["api.example.test"]
 network_policies:
   rest_api:
     name: rest_api
-    middleware: ["request-middleware"]
     endpoints:
       - host: api.example.test
         port: 8080
@@ -2785,10 +2815,11 @@ network_middlewares:
   - name: request-middleware
     middleware: example/unavailable
     on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
 network_policies:
   jsonrpc_api:
     name: jsonrpc_api
-    middleware: ["request-middleware"]
     endpoints:
       - host: api.example.test
         port: 443
@@ -2929,8 +2960,8 @@ network_policies:
             .unwrap();
     }
 
-    #[test]
-    fn over_capacity_resolution_honors_on_error() {
+    #[tokio::test]
+    async fn over_capacity_resolution_honors_on_error() {
         use openshell_supervisor_middleware::{ChainEntry, OnError};
 
         let ctx = L7EvalContext {
@@ -2963,21 +2994,31 @@ network_policies:
             ..fail_open.clone()
         };
 
+        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let open_chain = runner
+            .describe_chain(std::slice::from_ref(&fail_open))
+            .await
+            .expect("describe fail-open chain");
+        let mixed_chain = runner
+            .describe_chain(&[fail_open.clone(), fail_closed])
+            .await
+            .expect("describe mixed chain");
+
         // Recoverable (Content-Length over cap, nothing consumed) + all fail-open
         // -> stream through unprocessed.
         assert!(matches!(
-            resolve_unbuffered_body(&ctx, req(), std::slice::from_ref(&fail_open), true),
+            resolve_unbuffered_body(&ctx, req(), &open_chain, true),
             MiddlewareApplyResult::Allowed(_)
         ));
         // Any fail-closed entry -> deny.
         assert!(matches!(
-            resolve_unbuffered_body(&ctx, req(), &[fail_open.clone(), fail_closed], true),
+            resolve_unbuffered_body(&ctx, req(), &mixed_chain, true),
             MiddlewareApplyResult::Denied(_)
         ));
         // Not recoverable (chunked overflow already consumed bytes) -> deny even
         // when every entry is fail-open.
         assert!(matches!(
-            resolve_unbuffered_body(&ctx, req(), &[fail_open], false),
+            resolve_unbuffered_body(&ctx, req(), &open_chain, false),
             MiddlewareApplyResult::Denied(_)
         ));
     }
@@ -2990,6 +3031,40 @@ network_policies:
         .expect("query from request headers");
 
         assert_eq!(query, "token=a%2Bb&scope=private");
+    }
+
+    #[test]
+    fn middleware_request_input_preserves_plain_http_scheme() {
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/messages".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 80,
+            policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+
+        let input = middleware_request_input(
+            "http",
+            &req,
+            &ctx,
+            BTreeMap::new(),
+            String::new(),
+            Vec::new(),
+        );
+
+        assert_eq!(input.scheme, "http");
     }
 
     /// Tracing layer that captures emitted `OcsfEvent`s for assertions.
@@ -3096,16 +3171,17 @@ network_policies:
     #[tokio::test]
     async fn passthrough_relay_runs_middleware_redaction() {
         // A no-protocol endpoint takes the credential-injection passthrough path;
-        // policy-level middleware must still inspect and redact its body.
+        // host-selected middleware must still inspect and redact its body.
         let data = r#"
 network_middlewares:
   - name: request-middleware
     middleware: openshell/secrets
     on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
 network_policies:
   passthrough_api:
     name: passthrough_api
-    middleware: ["request-middleware"]
     endpoints:
       - host: api.example.test
         port: 8080
@@ -3197,10 +3273,11 @@ network_middlewares:
   - name: request-middleware
     middleware: example/unavailable
     on_error: fail_closed
+    endpoints:
+      include: ["gateway.example.test"]
 network_policies:
   ws_api:
     name: ws_api
-    middleware: ["request-middleware"]
     endpoints:
       - host: gateway.example.test
         port: 443

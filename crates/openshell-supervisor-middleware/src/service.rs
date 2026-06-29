@@ -3,15 +3,12 @@
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding, MiddlewareManifest,
-    ValidateConfigRequest, ValidateConfigResponse,
+    HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
+    ValidateConfigResponse,
 };
 use tonic::{Request, Response, Status};
 
-use crate::{
-    API_VERSION, BUILTIN_SECRETS, HTTP_REQUEST_OPERATION, PRE_CREDENTIALS_PHASE, builtins,
-    safe_reason, validate_builtin_config,
-};
+use crate::{API_VERSION, builtins, safe_reason, validate_builtin_config};
 
 #[derive(Debug, Default)]
 pub struct InProcessMiddlewareService;
@@ -26,11 +23,7 @@ impl SupervisorMiddleware for InProcessMiddlewareService {
             api_version: API_VERSION.into(),
             name: "openshell/in-process".into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
-            bindings: vec![MiddlewareBinding {
-                id: BUILTIN_SECRETS.into(),
-                operation: HTTP_REQUEST_OPERATION.into(),
-                phase: PRE_CREDENTIALS_PHASE.into(),
-            }],
+            bindings: builtins::describe(),
         }))
     }
 
@@ -58,13 +51,8 @@ impl SupervisorMiddleware for InProcessMiddlewareService {
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status> {
         let request = request.into_inner();
-        let result = match request.binding_id.as_str() {
-            BUILTIN_SECRETS => builtins::secrets::evaluate_http_request(&request),
-            other => Err(miette::miette!(
-                "middleware implementation '{other}' is not available in phase 1"
-            )),
-        }
-        .map_err(|err| Status::invalid_argument(safe_reason(&err.to_string())))?;
+        let result = builtins::evaluate_http_request(&request)
+            .map_err(|err| Status::invalid_argument(safe_reason(&err.to_string())))?;
         Ok(Response::new(result))
     }
 }

@@ -989,7 +989,6 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1008,7 +1007,6 @@ mod tests {
                 path: "/usr/bin/gh".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let result = merge_policy(
@@ -1037,7 +1035,6 @@ mod tests {
                 name: "existing".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
                 binaries: vec![advisor_binary("/usr/bin/curl")],
-                ..Default::default()
             },
         );
 
@@ -1048,7 +1045,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let result = merge_policy(
@@ -1080,7 +1076,6 @@ mod tests {
                     ..Default::default()
                 },
             ],
-            ..Default::default()
         };
 
         let result = merge_policy(
@@ -1112,7 +1107,6 @@ mod tests {
                     path: "/usr/bin/python".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1126,7 +1120,6 @@ mod tests {
                 ..Default::default()
             }],
             binaries: vec![advisor_binary("/usr/bin/python")],
-            ..Default::default()
         };
 
         let result = merge_policy(
@@ -1454,7 +1447,6 @@ mod tests {
                     path: "/usr/bin/gh".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1479,7 +1471,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let merged = merge_policy(
@@ -1503,7 +1494,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         // Merge an *unrelated* rule for a different host. The proposed rule
@@ -1534,7 +1524,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let mut policy = restrictive_default_policy();
@@ -1547,7 +1536,6 @@ mod tests {
                     path: "/usr/bin/git".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1579,7 +1567,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         // Endpoint exists in the policy but with a *different* binary. The
@@ -1595,7 +1582,6 @@ mod tests {
                     path: "/usr/bin/git".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1632,7 +1618,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let mut policy = restrictive_default_policy();
@@ -1652,7 +1637,6 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1680,7 +1664,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let mut policy = restrictive_default_policy();
@@ -1703,7 +1686,6 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1727,7 +1709,6 @@ mod tests {
                 path: "/usr/bin/git".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let merged = merge_policy(
@@ -1752,7 +1733,6 @@ mod tests {
             name: "any_binary_rule".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
             binaries: vec![],
-            ..Default::default()
         };
 
         let mut policy = restrictive_default_policy();
@@ -1765,7 +1745,6 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1823,7 +1802,6 @@ mod tests {
                 path: "/usr/bin/gh".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let composed = compose_effective_policy(
             &SandboxPolicy::default(),
@@ -1855,7 +1833,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let result = merge_policy(
             composed,
@@ -1924,7 +1901,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let result = merge_policy(
             policy,

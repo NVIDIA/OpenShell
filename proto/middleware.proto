@@ -25,6 +25,8 @@ message MiddlewareBinding {
   string id = 1;
   string operation = 2;
   string phase = 3;
+  // Maximum request or replacement body this binding can process.
+  uint64 max_body_bytes = 4;
 }
 
 message ValidateConfigRequest {

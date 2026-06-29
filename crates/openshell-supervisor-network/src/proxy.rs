@@ -4194,7 +4194,7 @@ async fn handle_forward_proxy(
         cmdline_paths: decision.cmdline_paths.clone(),
     };
     let (chain, generation) =
-        opa_engine.query_middleware_chain_with_generation(&middleware_input, middleware_path)?;
+        opa_engine.query_middleware_chain_with_generation(&middleware_input)?;
     if generation != forward_generation_guard.captured_generation() {
         emit_l7_tunnel_close_after_policy_change(
             &host_lc,
@@ -4224,10 +4224,11 @@ async fn handle_forward_proxy(
             &upstream_target,
             forward_request_bytes,
         )?;
-        forward_request_bytes = match crate::l7::relay::apply_middleware_chain(
+        forward_request_bytes = match crate::l7::relay::apply_middleware_chain_for_scheme(
             request,
             client,
             &l7_ctx,
+            &scheme,
             chain,
             &forward_generation_guard,
         )

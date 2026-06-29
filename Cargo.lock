@@ -3767,6 +3767,7 @@ dependencies = [
 name = "openshell-policy"
 version = "0.0.0"
 dependencies = [
+ "glob",
  "miette",
  "openshell-core",
  "openshell-supervisor-middleware",

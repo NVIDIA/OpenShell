@@ -5746,7 +5746,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let submit = handle_submit_policy_analysis(
@@ -5960,7 +5959,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let submit = handle_submit_policy_analysis(
@@ -6077,7 +6075,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6183,7 +6180,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let mechanistic_submit = handle_submit_policy_analysis(
             &state,
@@ -6261,7 +6257,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let agent_submit = handle_submit_policy_analysis(
             &state,
@@ -6389,7 +6384,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6490,7 +6484,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6591,7 +6584,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6685,7 +6677,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6770,7 +6761,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6859,7 +6849,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -6951,7 +6940,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -7038,7 +7026,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let response = handle_submit_policy_analysis(
@@ -7100,7 +7087,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let chunk = DraftChunkRecord {
             id: "chunk-provider-prefix".to_string(),
@@ -7215,7 +7201,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -7312,7 +7297,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -7398,7 +7382,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -7540,7 +7523,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -7666,7 +7648,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let step1 = handle_submit_policy_analysis(
             &state,
@@ -7708,7 +7689,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let step2 = handle_submit_policy_analysis(
             &state,
@@ -7840,7 +7820,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let submit_one = |rule_name: &str, rule: NetworkPolicyRule| {
@@ -7949,7 +7928,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let submit_one = || {
             let state = state.clone();
@@ -8050,7 +8028,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let submit = handle_submit_policy_analysis(
@@ -8182,7 +8159,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         handle_submit_policy_analysis(
@@ -8381,7 +8357,6 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         };
 
@@ -8410,7 +8385,6 @@ mod tests {
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         };
 
@@ -8439,7 +8413,6 @@ mod tests {
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         };
 
@@ -8467,7 +8440,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let chunk = DraftChunkRecord {
             id: "chunk-1".to_string(),
@@ -8536,7 +8508,6 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
-                    ..Default::default()
                 },
             ))
             .collect(),
@@ -8565,7 +8536,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let chunk = DraftChunkRecord {
             id: "chunk-merge".to_string(),
@@ -8639,7 +8609,6 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
-                    ..Default::default()
                 },
             ))
             .collect(),
@@ -8668,7 +8637,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         };
         let chunk = DraftChunkRecord {
             id: "chunk-new".to_string(),

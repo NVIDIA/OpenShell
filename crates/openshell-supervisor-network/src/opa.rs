@@ -135,17 +135,13 @@ impl TunnelPolicyEngine {
         &self.engine
     }
 
-    /// Query the ordered middleware chain for a request path within this tunnel.
-    pub fn query_middleware_chain(
-        &self,
-        input: &NetworkInput,
-        request_path: &str,
-    ) -> Result<Vec<ChainEntry>> {
+    /// Query the ordered middleware chain for a destination within this tunnel.
+    pub fn query_middleware_chain(&self, input: &NetworkInput) -> Result<Vec<ChainEntry>> {
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        query_middleware_chain_locked(&mut engine, input, request_path)
+        query_middleware_chain_locked(&mut engine, input)
     }
 }
 
@@ -208,20 +204,20 @@ impl OpaEngine {
     /// gap between user-specified symlink paths (e.g., `/usr/bin/python3`) and
     /// kernel-resolved canonical paths (e.g., `/usr/bin/python3.11`).
     pub fn from_proto_with_pid(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> Result<Self> {
+        if let Err(violations) = openshell_policy::validate_sandbox_policy(proto) {
+            let errors = violations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(miette::miette!("policy validation failed:\n{errors}"));
+        }
+
         let data_json_str = proto_to_opa_data_json(proto, entrypoint_pid);
 
         // Parse back to Value for preprocessing, then re-serialize
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
             .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
-
-        // Validate BEFORE expanding presets
-        let middleware_errors = validate_middleware_policies(&data);
-        if !middleware_errors.is_empty() {
-            return Err(miette::miette!(
-                "middleware policy validation failed:\n{}",
-                middleware_errors.join("\n")
-            ));
-        }
 
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
         for w in &warnings {
@@ -571,18 +567,17 @@ impl OpaEngine {
         }
     }
 
-    /// Query the ordered middleware chain for a parsed HTTP request path.
+    /// Query the ordered middleware chain for an admitted destination.
     pub fn query_middleware_chain_with_generation(
         &self,
         input: &NetworkInput,
-        request_path: &str,
     ) -> Result<(Vec<ChainEntry>, u64)> {
         let mut engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
-        let chain = query_middleware_chain_locked(&mut engine, input, request_path)?;
+        let chain = query_middleware_chain_locked(&mut engine, input)?;
         Ok((chain, generation))
     }
 
@@ -749,17 +744,9 @@ fn network_input_json(input: &NetworkInput) -> serde_json::Value {
     })
 }
 
-#[derive(Debug, Clone)]
-struct MatchedEndpointContext {
-    policy_name: String,
-    endpoint_index: usize,
-    endpoint_path: String,
-}
-
 fn query_middleware_chain_locked(
     engine: &mut regorus::Engine,
     input: &NetworkInput,
-    request_path: &str,
 ) -> Result<Vec<ChainEntry>> {
     engine
         .set_input_json(&network_input_json(input).to_string())
@@ -772,37 +759,7 @@ fn query_middleware_chain_locked(
     if configs.is_empty() {
         return Ok(Vec::new());
     }
-    let contexts_val = engine
-        .eval_rule("data.openshell.sandbox._matching_endpoint_contexts".into())
-        .map_err(|e| miette::miette!("{e}"))?;
-    let contexts = parse_endpoint_contexts(&contexts_val);
-    let policies_val = engine
-        .eval_rule("data.openshell.sandbox.network_policies".into())
-        .map_err(|e| miette::miette!("{e}"))?;
-    let Some(context) = select_endpoint_context(&contexts, request_path, &policies_val)? else {
-        return global_middleware_entries(&configs, &input.host, &HashSet::new());
-    };
-    let (policy_middleware, endpoint_middleware) =
-        middleware_for_endpoint_identity(&policies_val, context)?;
-
-    let mut explicit = Vec::new();
-    for name in policy_middleware.iter().chain(endpoint_middleware.iter()) {
-        if !explicit.contains(name) {
-            explicit.push(name.clone());
-        }
-    }
-    let explicit_set: HashSet<String> = explicit.iter().cloned().collect();
-    let mut ordered = global_middleware_entries(&configs, &input.host, &explicit_set)?;
-    for name in explicit {
-        if !ordered.iter().any(|entry| entry.name == name) {
-            let config = configs
-                .iter()
-                .find(|config| get_str(config, "name").as_deref() == Some(name.as_str()))
-                .ok_or_else(|| miette::miette!("unknown middleware config '{name}'"))?;
-            ordered.push(chain_entry_from_value(config)?);
-        }
-    }
-    Ok(ordered)
+    global_middleware_entries(&configs, &input.host)
 }
 
 fn parse_middleware_configs(value: &regorus::Value) -> Result<Vec<regorus::Value>> {
@@ -815,169 +772,37 @@ fn parse_middleware_configs(value: &regorus::Value) -> Result<Vec<regorus::Value
     }
 }
 
-fn parse_endpoint_contexts(value: &regorus::Value) -> Vec<MatchedEndpointContext> {
-    let regorus::Value::Array(values) = value else {
-        return Vec::new();
-    };
-    values
-        .iter()
-        .filter_map(|value| {
-            let regorus::Value::Object(_) = value else {
-                return None;
-            };
-            Some(MatchedEndpointContext {
-                policy_name: get_str(value, "policy").unwrap_or_default(),
-                endpoint_index: get_usize(value, "endpoint_index").unwrap_or_default(),
-                endpoint_path: get_str(value, "endpoint_path").unwrap_or_default(),
-            })
-        })
-        .collect()
-}
-
-fn middleware_for_endpoint_identity(
-    policies: &regorus::Value,
-    context: &MatchedEndpointContext,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let policy = get_field(policies, &context.policy_name).ok_or_else(|| {
-        miette::miette!(
-            "matched endpoint policy '{}' was not found in OPA data",
-            context.policy_name
-        )
-    })?;
-    let endpoint = get_array(policy, "endpoints")
-        .and_then(|endpoints| endpoints.get(context.endpoint_index))
-        .ok_or_else(|| {
-            miette::miette!(
-                "matched endpoint {}[{}] was not found in OPA data",
-                context.policy_name,
-                context.endpoint_index
-            )
-        })?;
-    Ok((
-        get_str_array(policy, "middleware"),
-        get_str_array(endpoint, "middleware"),
-    ))
-}
-
-fn select_endpoint_context<'a>(
-    contexts: &'a [MatchedEndpointContext],
-    request_path: &str,
-    policies: &regorus::Value,
-) -> Result<Option<&'a MatchedEndpointContext>> {
-    let matching: Vec<_> = contexts
-        .iter()
-        .filter(|context| crate::l7::endpoint_path_matches(&context.endpoint_path, request_path))
-        .map(|context| (endpoint_path_specificity(&context.endpoint_path), context))
-        .collect();
-    let Some(max_specificity) = matching.iter().map(|(specificity, _)| *specificity).max() else {
-        return Ok(None);
-    };
-    let best: Vec<_> = matching
-        .into_iter()
-        .filter(|(specificity, _)| *specificity == max_specificity)
-        .map(|(_, context)| context)
-        .collect();
-    if let Some((first, rest)) = best.split_first() {
-        let first_middleware = explicit_middleware_for_endpoint_identity(policies, first)?;
-        for context in rest {
-            if explicit_middleware_for_endpoint_identity(policies, context)? != first_middleware {
-                let matches = best
-                    .iter()
-                    .map(|context| {
-                        format!(
-                            "{}[{}] path={}",
-                            context.policy_name,
-                            context.endpoint_index,
-                            if context.endpoint_path.is_empty() {
-                                "<all>"
-                            } else {
-                                context.endpoint_path.as_str()
-                            }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(miette::miette!(
-                    "ambiguous middleware endpoint match for request path '{request_path}': {matches}"
-                ));
-            }
-        }
-    }
-    Ok(best.into_iter().next())
-}
-
-fn explicit_middleware_for_endpoint_identity(
-    policies: &regorus::Value,
-    context: &MatchedEndpointContext,
-) -> Result<Vec<String>> {
-    let (policy_middleware, endpoint_middleware) =
-        middleware_for_endpoint_identity(policies, context)?;
-    Ok(dedup_middleware_names(
-        policy_middleware.iter().chain(endpoint_middleware.iter()),
-    ))
-}
-
-fn dedup_middleware_names<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<String> {
-    let mut deduped = Vec::new();
-    for name in names {
-        if !deduped.contains(name) {
-            deduped.push(name.clone());
-        }
-    }
-    deduped
-}
-
-fn endpoint_path_specificity(path: &str) -> usize {
-    if path.is_empty() {
-        0
-    } else {
-        path.chars().filter(|c| *c != '*').count()
-    }
-}
-
-fn global_middleware_entries(
-    configs: &[regorus::Value],
-    host: &str,
-    explicit: &HashSet<String>,
-) -> Result<Vec<ChainEntry>> {
+fn global_middleware_entries(configs: &[regorus::Value], host: &str) -> Result<Vec<ChainEntry>> {
     let mut entries = Vec::new();
     for config in configs {
-        let name = get_str(config, "name").unwrap_or_default();
-        if explicit.contains(&name) {
-            continue;
-        }
-        if middleware_selector_matches(config, host) {
+        if middleware_selector_matches(config, host)? {
             entries.push(chain_entry_from_value(config)?);
         }
     }
     Ok(entries)
 }
 
-fn middleware_selector_matches(config: &regorus::Value, host: &str) -> bool {
+fn middleware_selector_matches(config: &regorus::Value, host: &str) -> Result<bool> {
     let Some(selector) = get_field(config, "endpoints") else {
-        return false;
+        return Ok(false);
     };
     let include_patterns = get_str_array(selector, "include");
     let exclude_patterns = get_str_array(selector, "exclude");
-    let matches_include = !include_patterns.is_empty()
-        && include_patterns
-            .iter()
-            .any(|pattern| host_matches(pattern, host));
+    let matches_include = include_patterns
+        .iter()
+        .try_fold(false, |matched, pattern| {
+            openshell_policy::middleware_host_matches(pattern, host)
+                .map(|matches| matched || matches)
+                .map_err(|error| miette::miette!(error))
+        })?;
     let matches_exclude = exclude_patterns
         .iter()
-        .any(|pattern| host_matches(pattern, host));
-    matches_include && !matches_exclude
-}
-
-fn host_matches(pattern: &str, host: &str) -> bool {
-    if pattern == "*" || pattern == "**" {
-        return true;
-    }
-    if !pattern.contains('*') {
-        return pattern.eq_ignore_ascii_case(host);
-    }
-    glob::Pattern::new(&pattern.to_ascii_lowercase())
-        .is_ok_and(|pattern| pattern.matches(&host.to_ascii_lowercase()))
+        .try_fold(false, |matched, pattern| {
+            openshell_policy::middleware_host_matches(pattern, host)
+                .map(|matches| matched || matches)
+                .map_err(|error| miette::miette!(error))
+        })?;
+    Ok(matches_include && !matches_exclude)
 }
 
 fn chain_entry_from_value(value: &regorus::Value) -> Result<ChainEntry> {
@@ -1001,25 +826,6 @@ fn get_field<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Valu
         regorus::Value::Object(map) => map.get(&key_val),
         _ => None,
     }
-}
-
-fn get_array<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a [regorus::Value]> {
-    let regorus::Value::Array(values) = get_field(val, key)? else {
-        return None;
-    };
-    Some(values)
-}
-
-fn get_usize(val: &regorus::Value, key: &str) -> Option<usize> {
-    let value = get_field(val, key)?;
-    let regorus::Value::Number(number) = value else {
-        return None;
-    };
-    let value = number.as_f64()?;
-    if !value.is_finite() || value.fract() != 0.0 || value < 0.0 {
-        return None;
-    }
-    format!("{value:.0}").parse::<usize>().ok()
 }
 
 fn regorus_value_to_struct(value: &regorus::Value) -> prost_types::Struct {
@@ -1383,6 +1189,29 @@ fn validate_middleware_policies(data: &serde_json::Value) -> Vec<String> {
                 "middleware config '{name}' has invalid on_error '{on_error}'"
             ));
         }
+
+        let Some(selector) = mw.get("endpoints") else {
+            errors.push(format!(
+                "middleware config '{name}' requires an endpoint selector"
+            ));
+            continue;
+        };
+        let includes = json_string_array(selector.get("include"));
+        let excludes = json_string_array(selector.get("exclude"));
+        if includes.is_empty() {
+            errors.push(format!(
+                "middleware config '{name}' endpoint selector must include at least one host pattern"
+            ));
+        }
+        for pattern in includes.iter().chain(&excludes) {
+            if let Err(error) =
+                openshell_policy::middleware_host_matches(pattern, "validation.invalid")
+            {
+                errors.push(format!(
+                    "middleware config '{name}' has invalid endpoint selector pattern '{pattern}': {error}"
+                ));
+            }
+        }
     }
 
     let Some(policies) = data
@@ -1393,125 +1222,23 @@ fn validate_middleware_policies(data: &serde_json::Value) -> Vec<String> {
     };
 
     for (policy_name, policy) in policies {
-        let policy_middleware = json_string_array(policy.get("middleware"));
-        for name in &policy_middleware {
-            if !names.contains(name) {
-                errors.push(format!(
-                    "network policy '{policy_name}' references unknown middleware config '{name}'"
-                ));
-            }
-        }
         for endpoint in policy
             .get("endpoints")
             .and_then(serde_json::Value::as_array)
             .map_or(&[][..], Vec::as_slice)
         {
-            let endpoint_middleware = json_string_array(endpoint.get("middleware"));
-            for name in &endpoint_middleware {
-                if !names.contains(name) {
-                    errors.push(format!(
-                        "network policy '{policy_name}' endpoint references unknown middleware config '{name}'"
-                    ));
-                }
-            }
             let tls_skip = endpoint
                 .get("tls")
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|tls| tls == "skip");
-            if tls_skip && (!policy_middleware.is_empty() || !endpoint_middleware.is_empty()) {
-                errors.push(format!(
-                    "network policy '{policy_name}' attaches middleware to a tls: skip endpoint"
-                ));
-            }
             if tls_skip && global_selector_matches_any_middleware(middlewares, endpoint) {
                 errors.push(format!(
                     "network policy '{policy_name}' tls: skip endpoint matches a global middleware selector"
                 ));
             }
         }
-        validate_ambiguous_middleware_endpoints(
-            policy_name,
-            policy,
-            &policy_middleware,
-            &mut errors,
-        );
     }
     errors
-}
-
-fn validate_ambiguous_middleware_endpoints(
-    policy_name: &str,
-    policy: &serde_json::Value,
-    policy_middleware: &[String],
-    errors: &mut Vec<String>,
-) {
-    let endpoints = policy
-        .get("endpoints")
-        .and_then(serde_json::Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    let mut seen: Vec<(usize, MiddlewareEndpointKey, Vec<String>)> = Vec::new();
-    for (index, endpoint) in endpoints.iter().enumerate() {
-        let key = middleware_endpoint_key(endpoint);
-        let endpoint_middleware = json_string_array(endpoint.get("middleware"));
-        let chain =
-            dedup_middleware_names(policy_middleware.iter().chain(endpoint_middleware.iter()));
-        for (previous_index, previous_key, previous_chain) in &seen {
-            if previous_key == &key && previous_chain != &chain {
-                errors.push(format!(
-                    "network policy '{policy_name}' endpoints[{previous_index}] and endpoints[{index}] have equivalent middleware selection keys ({key}) but different middleware chains"
-                ));
-            }
-        }
-        seen.push((index, key, chain));
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct MiddlewareEndpointKey {
-    host: String,
-    ports: Vec<u64>,
-    path: String,
-}
-
-impl std::fmt::Display for MiddlewareEndpointKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "host={} ports={:?} path={}",
-            if self.host.is_empty() {
-                "<any>"
-            } else {
-                self.host.as_str()
-            },
-            self.ports,
-            if self.path.is_empty() {
-                "<all>"
-            } else {
-                self.path.as_str()
-            }
-        )
-    }
-}
-
-fn middleware_endpoint_key(endpoint: &serde_json::Value) -> MiddlewareEndpointKey {
-    let host = endpoint
-        .get("host")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let mut ports: Vec<u64> = endpoint
-        .get("ports")
-        .and_then(serde_json::Value::as_array)
-        .map(|ports| ports.iter().filter_map(serde_json::Value::as_u64).collect())
-        .unwrap_or_default();
-    ports.sort_unstable();
-    ports.dedup();
-    let path = endpoint
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    MiddlewareEndpointKey { host, ports, path }
 }
 
 fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
@@ -1542,8 +1269,12 @@ fn global_selector_matches_any_middleware(
         let includes = json_string_array(selector.get("include"));
         let excludes = json_string_array(selector.get("exclude"));
         !includes.is_empty()
-            && includes.iter().any(|pattern| host_matches(pattern, host))
-            && !excludes.iter().any(|pattern| host_matches(pattern, host))
+            && includes.iter().any(|pattern| {
+                openshell_policy::middleware_host_matches(pattern, host).unwrap_or(false)
+            })
+            && !excludes.iter().any(|pattern| {
+                openshell_policy::middleware_host_matches(pattern, host).unwrap_or(false)
+            })
     })
 }
 
@@ -1908,9 +1639,6 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                 allow_all_known_mcp_methods.into();
                         }
                     }
-                    if !e.middleware.is_empty() {
-                        ep["middleware"] = e.middleware.clone().into();
-                    }
                     ep
                 })
                 .collect();
@@ -1936,14 +1664,11 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     entries
                 })
                 .collect();
-            let mut policy = serde_json::json!({
+            let policy = serde_json::json!({
                 "name": rule.name,
                 "endpoints": endpoints,
                 "binaries": binaries,
             });
-            if !rule.middleware.is_empty() {
-                policy["middleware"] = rule.middleware.clone().into();
-            }
             (key.clone(), policy)
         })
         .collect();
@@ -2058,7 +1783,6 @@ mod tests {
                     path: "/usr/local/bin/claude".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         network_policies.insert(
@@ -2074,7 +1798,6 @@ mod tests {
                     path: "/usr/bin/glab".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         ProtoSandboxPolicy {
@@ -3417,7 +3140,6 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -3490,7 +3212,6 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                middleware: vec![],
             },
         );
 
@@ -3564,7 +3285,6 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                middleware: vec![],
             },
         );
 
@@ -4443,7 +4163,6 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4502,7 +4221,6 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4562,7 +4280,6 @@ network_policies:
                     path: "/usr/local/bin/claude".to_string(),
                     ..Default::default()
                 }],
-                middleware: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4624,7 +4341,6 @@ network_policies:
                     path: "/usr/local/bin/aws".to_string(),
                     ..Default::default()
                 }],
-                middleware: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4685,7 +4401,6 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5636,7 +5351,6 @@ process:
                     ..Default::default()
                 }],
                 binaries: vec![proposal_binary],
-                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5692,7 +5406,6 @@ process:
                     path: "/usr/bin/python".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5764,7 +5477,6 @@ process:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5996,7 +5708,6 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -6701,7 +6412,6 @@ network_policies:
                     path: "/usr/bin/python3".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -7099,7 +6809,7 @@ network_policies:
     }
 
     #[test]
-    fn middleware_chain_orders_global_policy_endpoint_once() {
+    fn middleware_chain_uses_matching_selector_declaration_order() {
         let data = r#"
 network_middlewares:
   - name: global-redactor
@@ -7108,18 +6818,20 @@ network_middlewares:
       include: ["api.example.com"]
   - name: policy-redactor
     middleware: openshell/secrets
+    endpoints:
+      include: ["api.example.com"]
   - name: endpoint-redactor
     middleware: openshell/secrets
+    endpoints:
+      include: ["api.example.com"]
 network_policies:
   api:
     name: api
-    middleware: ["global-redactor", "policy-redactor"]
     endpoints:
       - host: api.example.com
         port: 443
         protocol: rest
         enforcement: enforce
-        middleware: ["policy-redactor", "endpoint-redactor"]
         rules:
           - allow: { method: POST, path: "/v1/**" }
     binaries:
@@ -7135,7 +6847,7 @@ network_policies:
             cmdline_paths: vec![],
         };
         let (chain, _) = engine
-            .query_middleware_chain_with_generation(&input, "/v1/messages")
+            .query_middleware_chain_with_generation(&input)
             .unwrap();
         let names: Vec<_> = chain.iter().map(|entry| entry.name.as_str()).collect();
         assert_eq!(
@@ -7145,62 +6857,8 @@ network_policies:
     }
 
     #[test]
-    fn middleware_validation_rejects_ambiguous_duplicate_endpoint_middleware() {
-        let data = r#"
-network_middlewares:
-  - name: first-redactor
-    middleware: openshell/secrets
-  - name: second-redactor
-    middleware: openshell/secrets
-network_policies:
-  api:
-    name: api
-    endpoints:
-      - host: api.example.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        middleware: ["first-redactor"]
-        access: full
-      - host: api.example.com
-        port: 443
-        protocol: rest
-        enforcement: enforce
-        middleware: ["second-redactor"]
-        access: full
-    binaries:
-      - { path: /usr/bin/curl }
-"#;
-        let err = match OpaEngine::from_strings(TEST_POLICY, data) {
-            Ok(_) => panic!("equivalent endpoints with different middleware should be invalid"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("equivalent middleware selection keys"),
-            "{err:?}"
-        );
-    }
-
-    #[test]
     fn middleware_policy_validation_rejects_bad_configs() {
         let cases = [
-            (
-                "missing reference",
-                r#"
-network_middlewares:
-  - name: redactor
-    middleware: openshell/secrets
-network_policies:
-  api:
-    middleware: ["missing"]
-    endpoints:
-      - { host: api.example.com, port: 443 }
-    binaries:
-      - { path: /usr/bin/curl }
-"#,
-                "unknown middleware config 'missing'",
-            ),
             (
                 "invalid on_error",
                 r#"
@@ -7208,6 +6866,8 @@ network_middlewares:
   - name: redactor
     middleware: openshell/secrets
     on_error: maybe
+    endpoints:
+      include: ["api.example.com"]
 "#,
                 "invalid on_error",
             ),
@@ -7217,8 +6877,12 @@ network_middlewares:
 network_middlewares:
   - name: redactor
     middleware: openshell/secrets
+    endpoints:
+      include: ["api.example.com"]
   - name: redactor
     middleware: openshell/secrets
+    endpoints:
+      include: ["api.example.com"]
 "#,
                 "duplicate middleware config 'redactor'",
             ),
@@ -7228,22 +6892,45 @@ network_middlewares:
 network_middlewares:
   - name: sigv4
     middleware: openshell/sigv4
+    endpoints:
+      include: ["api.example.com"]
 "#,
                 "unsupported built-in",
             ),
             (
-                "tls skip attachment",
+                "missing selector",
                 r#"
 network_middlewares:
   - name: redactor
     middleware: openshell/secrets
+"#,
+                "requires an endpoint selector",
+            ),
+            (
+                "malformed selector",
+                r#"
+network_middlewares:
+  - name: redactor
+    middleware: openshell/secrets
+    endpoints:
+      include: ["api[.example.com"]
+"#,
+                "invalid host pattern",
+            ),
+            (
+                "tls skip selector",
+                r#"
+network_middlewares:
+  - name: redactor
+    middleware: openshell/secrets
+    endpoints:
+      include: ["api.example.com"]
 network_policies:
   api:
     endpoints:
       - host: api.example.com
         port: 443
         tls: skip
-        middleware: ["redactor"]
     binaries:
       - { path: /usr/bin/curl }
 "#,
@@ -7261,6 +6948,29 @@ network_policies:
                 "{name}: expected {expected:?} in {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn from_proto_revalidates_middleware_policy() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy
+            .network_middlewares
+            .push(openshell_core::proto::NetworkMiddlewareConfig {
+                name: "redactor".into(),
+                middleware: "openshell/secrets".into(),
+                endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
+                    include: vec!["api[.example.com".into()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            });
+
+        let error = OpaEngine::from_proto(&policy)
+            .err()
+            .expect("supervisor must reject invalid effective middleware policy")
+            .to_string();
+        assert!(error.contains("policy validation failed"), "{error}");
+        assert!(error.contains("invalid host pattern"), "{error}");
     }
 
     #[test]

@@ -16,10 +16,8 @@ openshell-core = { path = "../openshell-core" }
 miette = { workspace = true }
 prost-types = { workspace = true }
 regex = { workspace = true }
-tonic = { workspace = true }
-
-[dev-dependencies]
 tokio = { workspace = true }
+tonic = { workspace = true }
 
 [lints]
 workspace = true

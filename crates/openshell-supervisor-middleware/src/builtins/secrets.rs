@@ -5,10 +5,24 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use miette::{Result, miette};
-use openshell_core::proto::{Decision, Finding, HttpRequestEvaluation, HttpRequestResult};
+use openshell_core::proto::{
+    Decision, Finding, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
+};
 use regex::Regex;
 
-use crate::BUILTIN_SECRETS;
+pub const BINDING_ID: &str = "openshell/secrets";
+const OPERATION: &str = "HttpRequest";
+const PHASE: &str = "pre_credentials";
+const MAX_BODY_BYTES: u64 = 256 * 1024;
+
+pub fn describe() -> MiddlewareBinding {
+    MiddlewareBinding {
+        id: BINDING_ID.into(),
+        operation: OPERATION.into(),
+        phase: PHASE.into(),
+        max_body_bytes: MAX_BODY_BYTES,
+    }
+}
 
 /// A named secret-detection pattern. The `kind` is an audit-safe label that
 /// flows into findings so operators can see *what* matched without seeing the
@@ -51,7 +65,7 @@ pub fn validate_config(config: &prost_types::Struct) -> Result<()> {
     if mode != "redact" {
         return Err(miette!(
             "{} only supports config.secrets: redact in phase 1",
-            BUILTIN_SECRETS
+            BINDING_ID
         ));
     }
     Ok(())
@@ -61,7 +75,7 @@ pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpR
     let default_config = prost_types::Struct::default();
     validate_config(evaluation.config.as_ref().unwrap_or(&default_config))?;
     let text = String::from_utf8(evaluation.body.clone())
-        .map_err(|_| miette!("{} requires UTF-8 request bodies", BUILTIN_SECRETS))?;
+        .map_err(|_| miette!("{} requires UTF-8 request bodies", BINDING_ID))?;
     let (body, matches) = redact_common_secrets(&text);
     let total: u32 = matches
         .iter()

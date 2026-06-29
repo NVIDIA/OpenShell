@@ -115,7 +115,6 @@ mod tests {
                 ..Default::default()
             }],
             binaries: Vec::new(),
-            middleware: Vec::new(),
         }
     }
 

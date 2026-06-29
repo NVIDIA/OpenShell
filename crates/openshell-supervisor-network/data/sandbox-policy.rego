@@ -842,23 +842,6 @@ _policy_endpoint_configs(policy) := [ep |
 	endpoint_has_extended_config(ep)
 ]
 
-# Collect matching endpoint identities across all policies.  Iterates over
-# _matching_policy_names (a set, safe from regorus variable collisions) then
-# returns the selected policy name plus endpoint index/path. Rust uses that
-# identity to look up middleware attachment from policy data.
-_matching_endpoint_contexts := [ctx |
-	some pname
-	_matching_policy_names[pname]
-	policy := data.network_policies[pname]
-	ep := policy.endpoints[i]
-	endpoint_matches_request(ep, input.network)
-	ctx := {
-		"policy": pname,
-		"endpoint_index": i,
-		"endpoint_path": object.get(ep, "path", ""),
-	}
-]
-
 _matching_endpoint_configs := [cfg |
 	some pname
 	_matching_policy_names[pname]
@@ -870,8 +853,6 @@ _matching_endpoint_configs := [cfg |
 matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }
-
-network_policies := object.get(data, "network_policies", {})
 
 network_middlewares := object.get(data, "network_middlewares", [])
 

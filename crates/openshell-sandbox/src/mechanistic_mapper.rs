@@ -162,7 +162,6 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
             name: rule_name.clone(),
             endpoints: vec![endpoint],
             binaries,
-            middleware: Vec::new(),
         };
 
         // Compute confidence.

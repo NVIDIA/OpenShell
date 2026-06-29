@@ -63,11 +63,9 @@ message NetworkPolicyRule {
   repeated NetworkEndpoint endpoints = 2;
   // Allowed binary identities.
   repeated NetworkBinary binaries = 3;
-  // Ordered middleware configs applied to every endpoint in this policy.
-  repeated string middleware = 4;
 }
 
-// A reusable middleware config referenced by network policies/endpoints.
+// A reusable middleware config selected for admitted egress by host.
 message NetworkMiddlewareConfig {
   // Policy-local config name.
   string name = 1;
@@ -77,7 +75,7 @@ message NetworkMiddlewareConfig {
   google.protobuf.Struct config = 3;
   // Failure behavior: "fail_closed" (default) or "fail_open".
   string on_error = 4;
-  // Optional global endpoint selector for this config.
+  // Host selector controlling which admitted destinations use this config.
   MiddlewareEndpointSelector endpoints = 5;
 }
 
@@ -168,8 +166,6 @@ message NetworkEndpoint {
   uint32 json_rpc_max_body_bytes = 22;
   // MCP-only policy and inspection options. Only used when protocol is "mcp".
   McpOptions mcp = 23;
-  // Ordered middleware configs applied to this endpoint after policy-level middleware.
-  repeated string middleware = 24;
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more

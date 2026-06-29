@@ -1047,7 +1047,6 @@ fn network_rule_from_json(
         name: rule.name.unwrap_or_default(),
         endpoints,
         binaries,
-        middleware: Vec::new(),
     })
 }
 
@@ -1134,7 +1133,6 @@ fn network_endpoint_from_json(
         credential_signing: String::new(),
         signing_service: String::new(),
         signing_region: String::new(),
-        middleware: Vec::new(),
     })
 }
 
@@ -1831,7 +1829,6 @@ mod tests {
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1856,7 +1853,6 @@ mod tests {
                 path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
-            ..Default::default()
         }
     }
 
@@ -1920,7 +1916,6 @@ mod tests {
                         path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
-                    ..Default::default()
                 }));
             })
         };
