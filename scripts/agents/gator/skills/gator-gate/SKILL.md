@@ -11,7 +11,7 @@ This skill is a gating workflow. It can start from any issue or PR state, inspec
 
 ## Skill Location
 
-Codex and other agent harnesses should load this skill from the repository path `.agents/skills/gator-gate/SKILL.md`. After this branch is merged, the canonical GitHub location is <https://github.com/NVIDIA/OpenShell/blob/main/.agents/skills/gator-gate/SKILL.md>.
+Codex and other agent harnesses should load this skill from the repository path `scripts/agents/gator/skills/gator-gate/SKILL.md`. After this branch is merged, the canonical GitHub location is <https://github.com/NVIDIA/OpenShell/blob/main/scripts/agents/gator/skills/gator-gate/SKILL.md>.
 
 ## Prerequisites
 

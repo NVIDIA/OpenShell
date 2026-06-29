@@ -177,13 +177,6 @@ impl SecretResolver {
         let mut by_placeholder = HashMap::with_capacity(provider_env.len());
 
         for (key, value) in provider_env {
-            if uses_reserved_revision_namespace(&key) {
-                tracing::warn!(
-                    provider_env_key = %key,
-                    "skipping provider credential env var in reserved placeholder namespace"
-                );
-                continue;
-            }
             let placeholder = placeholder_for_env_key_for_revision(&key, revision);
             let secret = SecretValue {
                 value,
@@ -199,11 +192,7 @@ impl SecretResolver {
             }
         }
 
-        if by_placeholder.is_empty() {
-            (child_env, None)
-        } else {
-            (child_env, Some(Self { by_placeholder }))
-        }
+        (child_env, Some(Self { by_placeholder }))
     }
 
     pub fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
@@ -226,7 +215,7 @@ impl SecretResolver {
         let secret = if let Some(secret) = self.by_placeholder.get(value) {
             secret
         } else {
-            let key = revisioned_placeholder_env_key(value).or_else(|| alias_env_key(value))?;
+            let key = alias_env_key(value)?;
             let canonical = placeholder_for_env_key(key);
             self.by_placeholder.get(&canonical)?
         };
@@ -484,34 +473,6 @@ fn alias_env_key(token: &str) -> Option<&str> {
         .position(|b| !is_env_key_char(b))
         .map_or(token.len(), |p| key_start + p);
     (key_end == token.len() && key_end > key_start).then_some(&token[key_start..key_end])
-}
-
-fn revisioned_placeholder_env_key(token: &str) -> Option<&str> {
-    let suffix = token.strip_prefix(PLACEHOLDER_PREFIX)?;
-    let suffix = suffix.strip_prefix('v')?;
-    let underscore = suffix.find('_')?;
-    let (revision, key) = suffix.split_at(underscore);
-    if revision.is_empty() || !revision.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let key = &key[1..];
-    if key.is_empty() || !key.bytes().all(is_env_key_char) {
-        return None;
-    }
-    Some(key)
-}
-
-fn uses_reserved_revision_namespace(key: &str) -> bool {
-    let Some(suffix) = key.strip_prefix('v') else {
-        return false;
-    };
-    let Some((revision, key)) = suffix.split_once('_') else {
-        return false;
-    };
-    !revision.is_empty()
-        && revision.bytes().all(|b| b.is_ascii_digit())
-        && !key.is_empty()
-        && key.bytes().all(is_env_key_char)
 }
 
 fn token_boundary_ok(text: &str, abs_start: usize, token_end: usize, token: &str) -> bool {
@@ -1090,18 +1051,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_env_rejects_revision_namespace_keys() {
-        let (child_env, resolver) = SecretResolver::from_provider_env(
-            [("v10_GITHUB_TOKEN".to_string(), "ambiguous".to_string())]
-                .into_iter()
-                .collect(),
-        );
-
-        assert!(child_env.is_empty());
-        assert!(resolver.is_none());
-    }
-
-    #[test]
     fn rewrites_exact_placeholder_header_values() {
         let (_, resolver) = SecretResolver::from_provider_env(
             [("CUSTOM_TOKEN".to_string(), "secret-token".to_string())]
@@ -1131,28 +1080,6 @@ mod tests {
                 &resolver,
             ),
             "Authorization: Bearer sk-test"
-        );
-    }
-
-    #[test]
-    fn rewrites_stale_revisioned_bearer_placeholder_to_current_alias() {
-        let (_, resolver) = SecretResolver::from_provider_env_for_revision_with_current_aliases(
-            [("GITHUB_TOKEN".to_string(), "ghp-current".to_string())]
-                .into_iter()
-                .collect(),
-            HashMap::new(),
-            42,
-            true,
-        );
-        let resolver = resolver.expect("resolver");
-
-        assert_eq!(
-            rewrite_header_line_checked(
-                "Authorization: Bearer openshell:resolve:env:v10_GITHUB_TOKEN",
-                &resolver,
-            )
-            .expect("stale revision should fall back to current alias"),
-            "Authorization: Bearer ghp-current"
         );
     }
 

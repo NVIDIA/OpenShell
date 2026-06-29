@@ -79,8 +79,8 @@ providers:
 
 skills:
   - id: gator-gate
-    source: repo://.agents/skills/gator-gate/SKILL.md
-    destination: .agents/skills/gator-gate/SKILL.md
+    source: agent://skills/gator-gate/SKILL.md
+    destination: skills/gator-gate/SKILL.md
 
 subagents:
   - id: principal-engineer-reviewer
