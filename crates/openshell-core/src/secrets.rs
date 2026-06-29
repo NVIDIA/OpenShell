@@ -1105,6 +1105,7 @@ mod tests {
         assert!(uses_reserved_revision_namespace("v999999_very_unlikely"));
         assert!(!uses_reserved_revision_namespace("v_GITHUB_TOKEN"));
         assert!(!uses_reserved_revision_namespace("v10_"));
+        assert!(!uses_reserved_revision_namespace("very_unlikely"));
         assert!(!uses_reserved_revision_namespace("GITHUB_TOKEN"));
     }
 
