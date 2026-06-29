@@ -13,7 +13,7 @@ use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 
@@ -108,7 +108,7 @@ enum PodmanDriverMountConfig {
     Bind {
         source: String,
         target: String,
-        #[serde(default = "default_true")]
+        #[serde(default = "driver_mounts::default_true")]
         read_only: bool,
         #[serde(default)]
         selinux_label: Option<SelinuxLabel>,
@@ -116,7 +116,7 @@ enum PodmanDriverMountConfig {
     Volume {
         source: String,
         target: String,
-        #[serde(default = "default_true")]
+        #[serde(default = "driver_mounts::default_true")]
         read_only: bool,
         #[serde(default)]
         subpath: Option<String>,
@@ -133,15 +133,11 @@ enum PodmanDriverMountConfig {
     Image {
         source: String,
         target: String,
-        #[serde(default = "default_true")]
+        #[serde(default = "driver_mounts::default_true")]
         read_only: bool,
         #[serde(default)]
         subpath: Option<String>,
     },
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Build a Podman container name from the sandbox name.
@@ -664,7 +660,7 @@ fn validate_podman_driver_mounts(
     mounts: &[PodmanDriverMountConfig],
     enable_bind_mounts: bool,
 ) -> Result<(), String> {
-    let mut targets = HashSet::new();
+    let mut targets = Vec::with_capacity(mounts.len());
     for mount in mounts {
         let target = match mount {
             PodmanDriverMountConfig::Bind { source, target, .. } => {
@@ -710,14 +706,9 @@ fn validate_podman_driver_mounts(
             }
         };
         driver_mounts::validate_container_mount_target(target)?;
-        let normalized_target = driver_mounts::normalize_mount_target(target);
-        if !targets.insert(normalized_target.clone()) {
-            return Err(format!(
-                "duplicate podman driver_config mount target '{normalized_target}'"
-            ));
-        }
+        targets.push(driver_mounts::normalize_mount_target(target));
     }
-    Ok(())
+    driver_mounts::validate_unique_mount_targets(targets.iter().map(String::as_str), "podman")
 }
 
 fn reject_subpath(subpath: Option<&str>, mount_type: &str) -> Result<(), String> {
@@ -2000,6 +1991,40 @@ mod tests {
                     options.iter().any(|option| option.as_str() == Some("rw"))
                 })
         }));
+    }
+
+    #[test]
+    fn driver_config_rejects_duplicate_mount_targets() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [
+                        {
+                            "type": "volume",
+                            "source": "work-nfs",
+                            "target": "/sandbox/work"
+                        },
+                        {
+                            "type": "tmpfs",
+                            "target": "/sandbox/work"
+                        }
+                    ]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("duplicate podman driver_config mount target")
+        );
     }
 
     #[test]

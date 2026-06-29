@@ -3,6 +3,7 @@
 
 //! Shared validation helpers for driver-config mounts.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 /// `SELinux` relabelling mode for bind mounts.
@@ -31,6 +32,11 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/etc/openshell-tls",
     "/run/netns",
 ];
+
+/// Serde default helper for mount options that default to read-only.
+pub fn default_true() -> bool {
+    true
+}
 
 /// Validate a non-empty driver mount source.
 pub fn validate_mount_source(source: &str, field: &str) -> Result<(), String> {
@@ -122,8 +128,25 @@ pub fn normalize_mount_target(target: &str) -> String {
     target.trim_end_matches('/').to_string()
 }
 
-fn path_is_or_under(path: &Path, parent: &Path) -> bool {
+/// Return true when `path` is exactly `parent` or is contained below it.
+pub fn path_is_or_under(path: &Path, parent: &Path) -> bool {
     path == parent || path.starts_with(parent)
+}
+
+/// Validate that already-normalized driver mount targets are unique.
+pub fn validate_unique_mount_targets<'a>(
+    targets: impl IntoIterator<Item = &'a str>,
+    driver_name: &str,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for target in targets {
+        if !seen.insert(target) {
+            return Err(format!(
+                "duplicate {driver_name} driver_config mount target '{target}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -160,6 +183,33 @@ mod tests {
     #[test]
     fn container_target_does_not_prefix_match_unrelated_paths() {
         validate_container_mount_target("/etc/openshell-tools").unwrap();
+    }
+
+    #[test]
+    fn path_is_or_under_matches_boundaries() {
+        assert!(path_is_or_under(
+            Path::new("/sandbox"),
+            Path::new("/sandbox")
+        ));
+        assert!(path_is_or_under(
+            Path::new("/sandbox/work"),
+            Path::new("/sandbox")
+        ));
+        assert!(!path_is_or_under(
+            Path::new("/sandbox-work"),
+            Path::new("/sandbox")
+        ));
+    }
+
+    #[test]
+    fn unique_mount_targets_rejects_duplicates() {
+        let err =
+            validate_unique_mount_targets(["/sandbox/work", "/sandbox/work"], "test").unwrap_err();
+
+        assert_eq!(
+            err,
+            "duplicate test driver_config mount target '/sandbox/work'"
+        );
     }
 
     #[test]

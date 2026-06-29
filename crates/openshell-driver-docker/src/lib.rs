@@ -49,7 +49,7 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_core::{Config, Error, Result as CoreResult};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -262,7 +262,7 @@ enum DockerDriverMountConfig {
     Bind {
         source: String,
         target: String,
-        #[serde(default = "default_true")]
+        #[serde(default = "driver_mounts::default_true")]
         read_only: bool,
         #[serde(default)]
         selinux_label: Option<SelinuxLabel>,
@@ -270,7 +270,7 @@ enum DockerDriverMountConfig {
     Volume {
         source: String,
         target: String,
-        #[serde(default = "default_true")]
+        #[serde(default = "driver_mounts::default_true")]
         read_only: bool,
         #[serde(default)]
         subpath: Option<String>,
@@ -287,15 +287,11 @@ enum DockerDriverMountConfig {
     Image {
         source: String,
         target: String,
-        #[serde(default = "default_true")]
+        #[serde(default = "driver_mounts::default_true")]
         read_only: bool,
         #[serde(default)]
         subpath: Option<String>,
     },
-}
-
-fn default_true() -> bool {
-    true
 }
 
 type WatchStream =
@@ -1845,7 +1841,7 @@ fn validate_docker_driver_mounts(
     mounts: &[DockerDriverMountConfig],
     enable_bind_mounts: bool,
 ) -> Result<(), Status> {
-    let mut targets = HashSet::new();
+    let mut targets = Vec::with_capacity(mounts.len());
     for mount in mounts {
         let target = match mount {
             DockerDriverMountConfig::Bind { source, target, .. } => {
@@ -1899,14 +1895,10 @@ fn validate_docker_driver_mounts(
         };
         driver_mounts::validate_container_mount_target(target)
             .map_err(Status::failed_precondition)?;
-        let normalized_target = driver_mounts::normalize_mount_target(target);
-        if !targets.insert(normalized_target.clone()) {
-            return Err(Status::failed_precondition(format!(
-                "duplicate docker driver_config mount target '{normalized_target}'"
-            )));
-        }
+        targets.push(driver_mounts::normalize_mount_target(target));
     }
-    Ok(())
+    driver_mounts::validate_unique_mount_targets(targets.iter().map(String::as_str), "docker")
+        .map_err(Status::failed_precondition)
 }
 
 fn validate_optional_positive_integral_i64(
