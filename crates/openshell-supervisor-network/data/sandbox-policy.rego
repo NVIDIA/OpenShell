@@ -871,6 +871,8 @@ matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }
 
+network_policies := object.get(data, "network_policies", {})
+
 network_middlewares := object.get(data, "network_middlewares", [])
 
 _policy_has_exact_declared_endpoint(policy) if {

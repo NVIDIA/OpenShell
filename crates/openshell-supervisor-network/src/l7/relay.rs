@@ -768,12 +768,12 @@ fn jsonrpc_engine_type(protocol: L7Protocol) -> &'static str {
     }
 }
 
-enum MiddlewareApplyResult {
+pub(crate) enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
     Denied(String),
 }
 
-async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
+pub(crate) async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     req: crate::l7::provider::L7Request,
     client: &mut C,
     ctx: &L7EvalContext,
@@ -796,18 +796,16 @@ async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
         }
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
+    let query = raw_query_from_request_headers(&buffered.headers)?;
     let input = openshell_supervisor_middleware::HttpRequestInput {
         request_id: uuid::Uuid::new_v4().to_string(),
-        sandbox_id: String::new(),
-        binary: ctx.binary_path.clone(),
-        pid: 0,
-        ancestors: ctx.ancestors.clone(),
+        sandbox_id: openshell_ocsf::ctx::ctx().sandbox_id.clone(),
         scheme: "https".into(),
         host: ctx.host.clone(),
         port: ctx.port,
         method: req.action.clone(),
         path: req.target.clone(),
-        query: String::new(),
+        query,
         headers,
         body: buffered.body,
     };
@@ -826,6 +824,19 @@ async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
     } else {
         Ok(MiddlewareApplyResult::Denied(outcome.reason))
     }
+}
+
+fn raw_query_from_request_headers(headers: &[u8]) -> Result<String> {
+    let header_str =
+        std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let target = header_str
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| miette!("HTTP request line is missing a target"))?;
+    Ok(target
+        .split_once('?')
+        .map_or_else(String::new, |(_, query)| query.to_string()))
 }
 
 /// Apply the chain's `on_error` policy when the request body cannot be buffered
@@ -1446,6 +1457,37 @@ where
         }
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+            let chain =
+                engine.query_middleware_chain(&middleware_network_input(ctx), &req.target)?;
+            let req =
+                match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
+                    .await?
+                {
+                    MiddlewareApplyResult::Allowed(req) => req,
+                    MiddlewareApplyResult::Denied(reason) => {
+                        crate::l7::rest::RestProvider::default()
+                            .deny_with_redacted_target(
+                                &crate::l7::provider::L7Request {
+                                    action: request_info.action.clone(),
+                                    target: redacted_target.clone(),
+                                    query_params: request_info.query_params.clone(),
+                                    raw_header: Vec::new(),
+                                    body_length: crate::l7::provider::BodyLength::None,
+                                },
+                                &ctx.policy_name,
+                                &reason,
+                                client,
+                                Some(&redacted_target),
+                                Some(crate::l7::rest::DenyResponseContext {
+                                    host: Some(&ctx.host),
+                                    port: Some(ctx.port),
+                                    binary: Some(&ctx.binary_path),
+                                }),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                };
             // Future MCP response/SSE introspection or rewrite would hook here
             // before returning upstream bytes. The current policy schema has no
             // trusted-annotations or version-profile field, so MCP responses and
@@ -2737,6 +2779,104 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn jsonrpc_middleware_fail_closed_does_not_reach_upstream() {
+        let data = r#"
+network_middlewares:
+  - name: request-middleware
+    middleware: example/unavailable
+    on_error: fail_closed
+network_policies:
+  jsonrpc_api:
+    name: jsonrpc_api
+    middleware: ["request-middleware"]
+    endpoints:
+      - host: api.example.test
+        port: 443
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow:
+              method: reports.list
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .expect("endpoint config");
+        let config = crate::l7::parse_l7_config(&endpoint_config.expect("json-rpc config"))
+            .expect("parse JSON-RPC config");
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "jsonrpc_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_jsonrpc(
+                &config,
+                &tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"reports.list"}"#;
+        let request = format!(
+            "POST /rpc HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"));
+        assert!(response.contains("middleware_failed"));
+
+        let mut upstream_request = [0u8; 32];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_request),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "upstream should not receive request bytes"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn l7_rest_middleware_over_capacity_fails_closed() {
         let (config, tunnel_engine, ctx) =
             middleware_relay_context("openshell/secrets", "fail_closed");
@@ -2840,6 +2980,16 @@ network_policies:
             resolve_unbuffered_body(&ctx, req(), &[fail_open], false),
             MiddlewareApplyResult::Denied(_)
         ));
+    }
+
+    #[test]
+    fn middleware_keeps_the_raw_request_query() {
+        let query = raw_query_from_request_headers(
+            b"POST /v1/messages?token=a%2Bb&scope=private HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+        )
+        .expect("query from request headers");
+
+        assert_eq!(query, "token=a%2Bb&scope=private");
     }
 
     /// Tracing layer that captures emitted `OcsfEvent`s for assertions.

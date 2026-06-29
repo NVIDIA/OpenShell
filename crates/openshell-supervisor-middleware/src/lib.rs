@@ -14,7 +14,7 @@ pub use service::InProcessMiddlewareService;
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HttpRequestEvaluation, HttpRequestTarget, NetworkMiddlewareConfig, Process,
+    Decision, Finding, HttpRequestEvaluation, HttpRequestTarget, NetworkMiddlewareConfig,
     RequestContext,
 };
 use tonic::Request;
@@ -23,6 +23,19 @@ pub const API_VERSION: &str = "openshell.middleware.v1";
 pub const HTTP_REQUEST_OPERATION: &str = "HttpRequest";
 pub const PRE_CREDENTIALS_PHASE: &str = "pre_credentials";
 pub const BUILTIN_SECRETS: &str = "openshell/secrets";
+
+/// Validate the configuration for an in-process middleware implementation.
+///
+/// Policy admission uses this same implementation-specific validation before a
+/// configuration can reach the request path.
+pub fn validate_builtin_config(implementation: &str, config: &prost_types::Struct) -> Result<()> {
+    match implementation {
+        BUILTIN_SECRETS => builtins::secrets::validate_config(config),
+        other => Err(miette!(
+            "middleware implementation '{other}' is not available in phase 1"
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnError {
@@ -76,9 +89,6 @@ impl TryFrom<&NetworkMiddlewareConfig> for ChainEntry {
 pub struct HttpRequestInput {
     pub request_id: String,
     pub sandbox_id: String,
-    pub binary: String,
-    pub pid: u32,
-    pub ancestors: Vec<String>,
     pub scheme: String,
     pub host: String,
     pub port: u16,
@@ -210,6 +220,26 @@ impl ChainRunner {
                 }
             };
 
+            let decision = match Decision::try_from(result.decision) {
+                Ok(decision @ (Decision::Allow | Decision::Deny)) => decision,
+                Ok(Decision::Unspecified) | Err(_) => {
+                    match apply_on_error(entry, "invalid_response_decision", &mut applied) {
+                        OnErrorAction::FailOpen => continue,
+                        OnErrorAction::FailClosed(reason) => {
+                            return Ok(ChainOutcome {
+                                allowed: false,
+                                reason,
+                                body,
+                                added_headers,
+                                findings,
+                                metadata,
+                                applied,
+                            });
+                        }
+                    }
+                }
+            };
+
             // A result proposing unsafe header mutations is a malformed response:
             // route it through `on_error` instead of applying any of it.
             if validate_header_mutations(&headers, &result.add_headers).is_err() {
@@ -251,11 +281,11 @@ impl ChainRunner {
             applied.push(MiddlewareInvocation {
                 name: entry.name.clone(),
                 implementation: entry.implementation.clone(),
-                decision: Decision::try_from(result.decision).unwrap_or(Decision::Unspecified),
+                decision,
                 transformed,
                 failed: false,
             });
-            if result.decision == Decision::Deny as i32 {
+            if decision == Decision::Deny {
                 return Ok(ChainOutcome {
                     allowed: false,
                     reason: safe_reason(&result.reason),
@@ -293,11 +323,7 @@ fn build_evaluation(
         context: Some(RequestContext {
             request_id: input.request_id.clone(),
             sandbox_id: input.sandbox_id.clone(),
-            originating_process: Some(Process {
-                binary: input.binary.clone(),
-                pid: input.pid,
-                ancestors: input.ancestors.clone(),
-            }),
+            originating_process: None,
         }),
         config: Some(entry.config.clone()),
         target: Some(HttpRequestTarget {
@@ -399,9 +425,6 @@ mod tests {
         HttpRequestInput {
             request_id: "req".into(),
             sandbox_id: "sbx".into(),
-            binary: "/usr/bin/curl".into(),
-            pid: 42,
-            ancestors: vec![],
             scheme: "https".into(),
             host: "api.example.com".into(),
             port: 443,
@@ -411,6 +434,21 @@ mod tests {
             headers: BTreeMap::new(),
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn phase_one_evaluation_omits_originating_process() {
+        let entry = entry("redact", OnError::FailClosed);
+        let input = input("payload");
+        let evaluation = build_evaluation(&entry, &input, &BTreeMap::new(), b"payload");
+
+        assert!(
+            evaluation
+                .context
+                .expect("request context")
+                .originating_process
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -682,6 +720,28 @@ mod tests {
         assert_eq!(outcome.body, b"hello");
         assert!(outcome.added_headers.is_empty());
         assert_eq!(outcome.applied.len(), 1);
+        assert!(outcome.applied[0].failed);
+    }
+
+    #[tokio::test]
+    async fn unspecified_decision_uses_fail_closed() {
+        let runner = ChainRunner::new(Arc::new(ScriptedService {
+            result: openshell_core::proto::HttpRequestResult {
+                decision: Decision::Unspecified as i32,
+                ..allow_result()
+            },
+        }));
+
+        let outcome = runner
+            .evaluate(&[entry("redact", OnError::FailClosed)], input("hello"))
+            .await
+            .expect("evaluate");
+
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.reason,
+            "middleware_failed: invalid_response_decision"
+        );
         assert!(outcome.applied[0].failed);
     }
 }

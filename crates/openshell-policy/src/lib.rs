@@ -1218,6 +1218,8 @@ pub enum PolicyViolation {
     },
     /// `credential_signing` and `request_body_credential_rewrite` are both set.
     CredentialSigningWithBodyRewrite { policy_name: String, host: String },
+    /// A built-in middleware configuration is invalid.
+    InvalidBuiltinMiddlewareConfig { name: String, reason: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -1278,6 +1280,9 @@ impl fmt::Display for PolicyViolation {
                     "network policy '{policy_name}': endpoint '{host}' has both credential_signing \
                      and request_body_credential_rewrite set; these options are mutually exclusive"
                 )
+            }
+            Self::InvalidBuiltinMiddlewareConfig { name, reason } => {
+                write!(f, "middleware config '{name}' is invalid: {reason}")
             }
         }
     }
@@ -1405,6 +1410,21 @@ pub fn validate_sandbox_policy(
                 violations.push(PolicyViolation::CredentialSigningWithBodyRewrite {
                     policy_name: name.clone(),
                     host: ep.host.clone(),
+                });
+            }
+        }
+    }
+
+    for middleware in &policy.network_middlewares {
+        if middleware.middleware.starts_with("openshell/") {
+            let config = middleware.config.as_ref().cloned().unwrap_or_default();
+            if let Err(error) = openshell_supervisor_middleware::validate_builtin_config(
+                &middleware.middleware,
+                &config,
+            ) {
+                violations.push(PolicyViolation::InvalidBuiltinMiddlewareConfig {
+                    name: middleware.name.clone(),
+                    reason: error.to_string(),
                 });
             }
         }
@@ -1843,6 +1863,33 @@ network_policies:
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_builtin_middleware_config() {
+        let mut policy = restrictive_default_policy();
+        policy.network_middlewares.push(NetworkMiddlewareConfig {
+            name: "redact-secrets".into(),
+            middleware: "openshell/secrets".into(),
+            config: Some(prost_types::Struct {
+                fields: std::iter::once((
+                    "secrets".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue("allow".into())),
+                    },
+                ))
+                .collect(),
+            }),
+            on_error: String::new(),
+            endpoints: None,
+        });
+
+        let violations = validate_sandbox_policy(&policy).expect_err("invalid config");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidBuiltinMiddlewareConfig { name, .. }
+                if name == "redact-secrets"
+        )));
     }
 
     #[test]

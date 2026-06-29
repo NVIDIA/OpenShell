@@ -776,12 +776,12 @@ fn query_middleware_chain_locked(
         .eval_rule("data.openshell.sandbox._matching_endpoint_contexts".into())
         .map_err(|e| miette::miette!("{e}"))?;
     let contexts = parse_endpoint_contexts(&contexts_val);
-    let Some(context) = select_endpoint_context(&contexts, request_path)? else {
+    let policies_val = engine
+        .eval_rule("data.openshell.sandbox.network_policies".into())
+        .map_err(|e| miette::miette!("{e}"))?;
+    let Some(context) = select_endpoint_context(&contexts, request_path, &policies_val)? else {
         return global_middleware_entries(&configs, &input.host, &HashSet::new());
     };
-    let policies_val = engine
-        .eval_rule("data.network_policies".into())
-        .map_err(|e| miette::miette!("{e}"))?;
     let (policy_middleware, endpoint_middleware) =
         middleware_for_endpoint_identity(&policies_val, context)?;
 
@@ -862,6 +862,7 @@ fn middleware_for_endpoint_identity(
 fn select_endpoint_context<'a>(
     contexts: &'a [MatchedEndpointContext],
     request_path: &str,
+    policies: &regorus::Value,
 ) -> Result<Option<&'a MatchedEndpointContext>> {
     let matching: Vec<_> = contexts
         .iter()
@@ -876,28 +877,54 @@ fn select_endpoint_context<'a>(
         .filter(|(specificity, _)| *specificity == max_specificity)
         .map(|(_, context)| context)
         .collect();
-    if best.len() > 1 {
-        let matches = best
-            .iter()
-            .map(|context| {
-                format!(
-                    "{}[{}] path={}",
-                    context.policy_name,
-                    context.endpoint_index,
-                    if context.endpoint_path.is_empty() {
-                        "<all>"
-                    } else {
-                        context.endpoint_path.as_str()
-                    }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(miette::miette!(
-            "ambiguous middleware endpoint match for request path '{request_path}': {matches}"
-        ));
+    if let Some((first, rest)) = best.split_first() {
+        let first_middleware = explicit_middleware_for_endpoint_identity(policies, first)?;
+        for context in rest {
+            if explicit_middleware_for_endpoint_identity(policies, context)? != first_middleware {
+                let matches = best
+                    .iter()
+                    .map(|context| {
+                        format!(
+                            "{}[{}] path={}",
+                            context.policy_name,
+                            context.endpoint_index,
+                            if context.endpoint_path.is_empty() {
+                                "<all>"
+                            } else {
+                                context.endpoint_path.as_str()
+                            }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(miette::miette!(
+                    "ambiguous middleware endpoint match for request path '{request_path}': {matches}"
+                ));
+            }
+        }
     }
     Ok(best.into_iter().next())
+}
+
+fn explicit_middleware_for_endpoint_identity(
+    policies: &regorus::Value,
+    context: &MatchedEndpointContext,
+) -> Result<Vec<String>> {
+    let (policy_middleware, endpoint_middleware) =
+        middleware_for_endpoint_identity(policies, context)?;
+    Ok(dedup_middleware_names(
+        policy_middleware.iter().chain(endpoint_middleware.iter()),
+    ))
+}
+
+fn dedup_middleware_names<'a>(names: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut deduped = Vec::new();
+    for name in names {
+        if !deduped.contains(name) {
+            deduped.push(name.clone());
+        }
+    }
+    deduped
 }
 
 fn endpoint_path_specificity(path: &str) -> usize {
@@ -1402,8 +1429,89 @@ fn validate_middleware_policies(data: &serde_json::Value) -> Vec<String> {
                 ));
             }
         }
+        validate_ambiguous_middleware_endpoints(
+            policy_name,
+            policy,
+            &policy_middleware,
+            &mut errors,
+        );
     }
     errors
+}
+
+fn validate_ambiguous_middleware_endpoints(
+    policy_name: &str,
+    policy: &serde_json::Value,
+    policy_middleware: &[String],
+    errors: &mut Vec<String>,
+) {
+    let endpoints = policy
+        .get("endpoints")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let mut seen: Vec<(usize, MiddlewareEndpointKey, Vec<String>)> = Vec::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        let key = middleware_endpoint_key(endpoint);
+        let endpoint_middleware = json_string_array(endpoint.get("middleware"));
+        let chain =
+            dedup_middleware_names(policy_middleware.iter().chain(endpoint_middleware.iter()));
+        for (previous_index, previous_key, previous_chain) in &seen {
+            if previous_key == &key && previous_chain != &chain {
+                errors.push(format!(
+                    "network policy '{policy_name}' endpoints[{previous_index}] and endpoints[{index}] have equivalent middleware selection keys ({key}) but different middleware chains"
+                ));
+            }
+        }
+        seen.push((index, key, chain));
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MiddlewareEndpointKey {
+    host: String,
+    ports: Vec<u64>,
+    path: String,
+}
+
+impl std::fmt::Display for MiddlewareEndpointKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "host={} ports={:?} path={}",
+            if self.host.is_empty() {
+                "<any>"
+            } else {
+                self.host.as_str()
+            },
+            self.ports,
+            if self.path.is_empty() {
+                "<all>"
+            } else {
+                self.path.as_str()
+            }
+        )
+    }
+}
+
+fn middleware_endpoint_key(endpoint: &serde_json::Value) -> MiddlewareEndpointKey {
+    let host = endpoint
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut ports: Vec<u64> = endpoint
+        .get("ports")
+        .and_then(serde_json::Value::as_array)
+        .map(|ports| ports.iter().filter_map(serde_json::Value::as_u64).collect())
+        .unwrap_or_default();
+    ports.sort_unstable();
+    ports.dedup();
+    let path = endpoint
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    MiddlewareEndpointKey { host, ports, path }
 }
 
 fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
@@ -7037,7 +7145,7 @@ network_policies:
     }
 
     #[test]
-    fn middleware_chain_rejects_ambiguous_duplicate_endpoint_identity() {
+    fn middleware_validation_rejects_ambiguous_duplicate_endpoint_middleware() {
         let data = r#"
 network_middlewares:
   - name: first-redactor
@@ -7063,21 +7171,13 @@ network_policies:
     binaries:
       - { path: /usr/bin/curl }
 "#;
-        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
-        let input = NetworkInput {
-            host: "api.example.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
+        let err = match OpaEngine::from_strings(TEST_POLICY, data) {
+            Ok(_) => panic!("equivalent endpoints with different middleware should be invalid"),
+            Err(err) => err,
         };
-        let err = engine
-            .query_middleware_chain_with_generation(&input, "/v1/messages")
-            .expect_err("equivalent endpoint identities should be ambiguous");
         assert!(
             err.to_string()
-                .contains("ambiguous middleware endpoint match"),
+                .contains("equivalent middleware selection keys"),
             "{err:?}"
         );
     }

@@ -4184,6 +4184,73 @@ async fn handle_forward_proxy(
     }
     emit_forward_success_activity(activity_tx, l7_activity_pending);
 
+    let middleware_path = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
+    let middleware_input = crate::opa::NetworkInput {
+        host: host_lc.clone(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+    let (chain, generation) =
+        opa_engine.query_middleware_chain_with_generation(&middleware_input, middleware_path)?;
+    if generation != forward_generation_guard.captured_generation() {
+        emit_l7_tunnel_close_after_policy_change(
+            &host_lc,
+            port,
+            miette::miette!(
+                "policy changed before forward middleware evaluation [expected_generation:{} current_generation:{}]",
+                forward_generation_guard.captured_generation(),
+                generation,
+            ),
+        );
+        respond(
+            client,
+            &build_json_error_response(
+                403,
+                "Forbidden",
+                "policy_denied",
+                &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    if !chain.is_empty() {
+        let request = crate::l7::rest::request_from_buffered_http(
+            method,
+            middleware_path,
+            &upstream_target,
+            forward_request_bytes,
+        )?;
+        forward_request_bytes = match crate::l7::relay::apply_middleware_chain(
+            request,
+            client,
+            &l7_ctx,
+            chain,
+            &forward_generation_guard,
+        )
+        .await?
+        {
+            crate::l7::relay::MiddlewareApplyResult::Allowed(request) => request.raw_header,
+            crate::l7::relay::MiddlewareApplyResult::Denied(reason) => {
+                emit_activity_simple(activity_tx, true, "middleware");
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "middleware_denied",
+                        &format!("{method} {host_lc}:{port}{path} denied by middleware: {reason}"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+    }
+
     forward_request_bytes = match inject_token_grant_for_forward_request(
         method,
         &upstream_target,

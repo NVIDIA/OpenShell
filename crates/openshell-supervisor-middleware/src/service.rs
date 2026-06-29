@@ -10,7 +10,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     API_VERSION, BUILTIN_SECRETS, HTTP_REQUEST_OPERATION, PRE_CREDENTIALS_PHASE, builtins,
-    safe_reason,
+    safe_reason, validate_builtin_config,
 };
 
 #[derive(Debug, Default)]
@@ -40,12 +40,7 @@ impl SupervisorMiddleware for InProcessMiddlewareService {
     ) -> Result<Response<ValidateConfigResponse>, Status> {
         let request = request.into_inner();
         let config = request.config.unwrap_or_default();
-        let validation = match request.binding_id.as_str() {
-            BUILTIN_SECRETS => builtins::secrets::validate_config(&config),
-            other => Err(miette::miette!(
-                "middleware implementation '{other}' is not available in phase 1"
-            )),
-        };
+        let validation = validate_builtin_config(&request.binding_id, &config);
         Ok(Response::new(match validation {
             Ok(()) => ValidateConfigResponse {
                 valid: true,

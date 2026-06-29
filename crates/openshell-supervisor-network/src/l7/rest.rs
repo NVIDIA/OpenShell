@@ -246,6 +246,36 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     }))
 }
 
+/// Build an L7 request from a request already buffered by another proxy path.
+///
+/// The forward proxy needs this after it has consumed the incoming HTTP/1
+/// headers itself. Keep the framing and query parsing here so it matches the
+/// stream-based REST parser rather than growing another local parser.
+pub(crate) fn request_from_buffered_http(
+    action: impl Into<String>,
+    target: impl Into<String>,
+    query_target: &str,
+    raw_header: Vec<u8>,
+) -> Result<L7Request> {
+    let header_end = raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| miette!("HTTP request headers are missing the CRLF terminator"))?
+        + 4;
+    let header_str = std::str::from_utf8(&raw_header[..header_end])
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let body_length = parse_body_length(header_str)?;
+    let (_, query_params) = parse_target_query(query_target)?;
+
+    Ok(L7Request {
+        action: action.into(),
+        target: target.into(),
+        query_params,
+        raw_header,
+        body_length,
+    })
+}
+
 /// Rebuild the request line in a raw HTTP header block with a canonicalized
 /// target. Called when the canonical path differs from what the client sent,
 /// so the upstream dispatches on the exact bytes the policy engine evaluated.
@@ -3013,6 +3043,39 @@ mod tests {
             BodyLength::ContentLength(42) => {}
             other => panic!("Expected ContentLength(42), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn buffered_request_parser_uses_shared_framing_and_query_parsing() {
+        let request = request_from_buffered_http(
+            "POST",
+            "/v1/items",
+            "/v1/items?tag=first&tag=second",
+            b"POST /v1/items?tag=first&tag=second HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 3\r\n\r\nabc"
+                .to_vec(),
+        )
+        .expect("parse buffered request");
+
+        assert_eq!(request.action, "POST");
+        assert_eq!(request.target, "/v1/items");
+        assert_eq!(
+            request.query_params.get("tag"),
+            Some(&vec!["first".to_string(), "second".to_string()])
+        );
+        assert!(matches!(request.body_length, BodyLength::ContentLength(3)));
+    }
+
+    #[test]
+    fn buffered_request_parser_rejects_missing_header_terminator() {
+        let err = request_from_buffered_http(
+            "GET",
+            "/v1/items",
+            "/v1/items",
+            b"GET /v1/items HTTP/1.1\r\nHost: api.example.com\r\n".to_vec(),
+        )
+        .expect_err("unterminated headers must be rejected");
+
+        assert!(err.to_string().contains("missing the CRLF terminator"));
     }
 
     #[test]
