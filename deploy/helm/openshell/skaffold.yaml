@@ -63,8 +63,7 @@ deploy:
       # when you want cert-manager to manage TLS while certgen handles JWT.
       # Requires cert-manager CRDs to be installed in the cluster first.
       #- name: cert-manager
-      #  repo: https://charts.jetstack.io
-      #  remoteChart: cert-manager
+      #  remoteChart: oci://quay.io/jetstack/charts/cert-manager
       #  version: v1.20.2
       #  namespace: cert-manager
       #  createNamespace: true

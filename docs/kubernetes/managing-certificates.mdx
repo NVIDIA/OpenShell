@@ -26,12 +26,11 @@ cert-manager precedence applies even if `pkiInitJob.enabled` remains true.
 
 ## Install cert-manager
 
-Add the Jetstack Helm repository and install cert-manager with CRD support enabled:
+Install cert-manager from the OCI registry with CRD support enabled:
 
 ```shell
-helm repo add jetstack https://charts.jetstack.io
-helm repo update
-helm upgrade --install cert-manager jetstack/cert-manager \
+helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+  --version v1.20.2 \
   --namespace cert-manager \
   --create-namespace \
   --set crds.enabled=true \
