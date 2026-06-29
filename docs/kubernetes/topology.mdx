@@ -136,14 +136,18 @@ acceptable for your deployment.
 
 ## RuntimeClass Isolation
 
-Sidecar topology pairs well with runtime classes such as gVisor or Kata
-Containers when the cluster supports them. A sandboxed runtime strengthens the
-container boundary while OpenShell focuses on network policy enforcement from
-the sidecar.
+RuntimeClass isolation can add a stronger container boundary, but support
+depends on the topology and runtime:
+
+- `proxy-pod` has been tested with Kata Containers and gVisor and is functional
+  when the cluster enforces NetworkPolicies.
+- `sidecar` is experimental with Kata Containers and is known to fail with
+  gVisor because sidecar mode depends on pod-local network rule setup.
 
 Runtime classes do not re-enable the OpenShell filesystem and process controls
-that sidecar mode relaxes. Use them as an additional workload boundary, not as a
-replacement for the combined topology's full supervisor controls.
+that sidecar and proxy-pod modes relax. Use them as an additional workload
+boundary, not as a replacement for the combined topology's full supervisor
+controls.
 
 You can set a default runtime class in the Kubernetes driver configuration or
 override it per sandbox with driver config:
