@@ -92,6 +92,15 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"sidecar"'
 
+  - it: renders split-pod supervisor topology under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.topology: split-pod
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"split-pod"'
+
   - it: renders sidecar proxy uid under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:

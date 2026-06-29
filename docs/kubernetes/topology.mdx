@@ -3,14 +3,15 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Kubernetes Sandbox Topology"
 sidebar-title: "Topology"
-description: "Choose between combined and sidecar supervisor topology for Kubernetes sandbox pods."
+description: "Choose between combined, sidecar, and split-pod supervisor topology for Kubernetes sandbox pods."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Sandboxing, Sidecar, Network Policy, RuntimeClass"
 position: 2
 ---
 
-Kubernetes sandbox pods can run the OpenShell supervisor in `combined` or
-`sidecar` topology. Choose the topology based on which controls you need inside
-the pod and how much privilege your cluster allows on the agent container.
+Kubernetes sandbox pods can run the OpenShell supervisor in `combined`,
+`sidecar`, or `split-pod` topology. Choose the topology based on which controls
+you need inside the pod, how much privilege your cluster allows on the agent
+container, and whether the cluster enforces Kubernetes NetworkPolicies.
 
 ## Choose a Topology
 
@@ -22,6 +23,29 @@ lower-privilege agent container.
 |---|---|---|
 | `combined` | You need OpenShell network, filesystem, and process controls in the sandbox workload. | The agent container carries the Linux capabilities the supervisor needs. |
 | `sidecar` | You need the agent container to run as non-root without added Linux capabilities, and network policy is the primary control. | Filesystem policy, process privilege dropping, and process/binary identity checks are not applied by the process supervisor. |
+| `split-pod` | You need network enforcement to run outside the agent pod and your cluster enforces Kubernetes NetworkPolicies. | Requires a NetworkPolicy-enforcing CNI or controller; process/filesystem enforcement stays network-only. |
+
+## Privilege Model
+
+The long-running container permissions differ by topology:
+
+| Topology | Pod or container | UID/GID | Privilege escalation | Capabilities | Result |
+|---|---|---|---|---|---|
+| `combined` | Agent container, which also runs the supervisor | Not forced by topology | Not explicitly disabled by the driver | Adds `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG`; adds `SETUID`, `SETGID`, and `DAC_READ_SEARCH` when user namespaces are enabled | Full supervisor controls run in the agent container. |
+| `sidecar` | Agent container, process-only supervisor | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
+| `sidecar` | Network supervisor sidecar | `sidecarProxyUid:sandbox_gid` | `false` | Drops `ALL` | Long-running proxy sidecar is also non-root without added capabilities. |
+| `split-pod` | Agent pod container, process-only supervisor | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities in their own pod. |
+| `split-pod` | Supervisor pod container, network proxy only | `sidecarProxyUid:sandbox_gid` | `false` | Drops `ALL` | Long-running proxy runs outside the agent pod without added capabilities. |
+
+Short-lived setup containers still have the permissions needed to prepare the
+pod:
+
+| Topology | Setup container | UID/GID | Privilege escalation | Capabilities | Purpose |
+|---|---|---|---|---|---|
+| `combined` | Supervisor install init container | `0` | Not set | Not set | Copies the supervisor binary into the agent container volume. |
+| `sidecar` | Network init container | `0` | `false` | Drops `ALL`; adds `NET_ADMIN`, `NET_RAW`, `CHOWN`, and `FOWNER` | Installs pod-local nftables rules and prepares shared sidecar state. |
+| `split-pod` | Supervisor install init container | `0` | Not set | Not set | Copies the supervisor binary into the agent pod volume. |
+| `split-pod` | Proxy CA install init container | `0:sandbox_gid` | `false` | Drops `ALL` | Copies proxy CA material into the agent pod TLS volume. |
 
 ## Combined Topology
 
@@ -72,12 +96,37 @@ supervisor does not apply Landlock filesystem policy, process privilege
 dropping, or process/binary identity checks.
 </Warning>
 
+## Split-Pod Topology
+
+Split-pod topology moves network enforcement and gateway forwarding into a
+separate supervisor pod. The agent pod runs the process supervisor and reaches
+the supervisor through a per-sandbox headless Service.
+
+OpenShell creates these per-sandbox resources:
+
+- Agent pod labeled `openshell.ai/sandbox-role=agent`.
+- Supervisor pod labeled `openshell.ai/sandbox-role=supervisor`.
+- Headless Service for the supervisor pod.
+- Proxy CA Secret shared through mounts.
+- NetworkPolicy that limits agent egress to the supervisor pod and DNS.
+- NetworkPolicy that accepts supervisor ingress only from the paired agent pod.
+
+The supervisor pod has a controlling `Sandbox` ownerReference so Kubernetes
+garbage collection removes the companion resources when the sandbox is deleted.
+
+<Warning>
+Split-pod topology requires NetworkPolicy enforcement. In local k3s/k3d testing,
+keep the k3s network policy controller enabled or install a policy-enforcing CNI
+before deploying the split-pod Skaffold profile. Without enforcement, the
+agent-to-supervisor isolation policy is only declarative.
+</Warning>
+
 ## Credential Exposure
 
-Sidecar topology uses pod `fsGroup` and group-readable projected credentials so
-the non-root process supervisor can authenticate to the gateway. This includes
-the projected ServiceAccount token used for sandbox token bootstrap and the
-sandbox client TLS secret.
+Sidecar and split-pod topologies use pod `fsGroup` and group-readable projected
+credentials so the non-root process supervisor can authenticate to the gateway.
+This includes the projected ServiceAccount token used for sandbox token
+bootstrap and the sandbox client TLS secret.
 
 Treat the agent container as trusted with respect to those in-pod gateway
 credentials. Use `combined` topology when that credential exposure is not
@@ -103,7 +152,7 @@ openshell sandbox create \
   -- claude
 ```
 
-## Enable Sidecar Mode
+## Enable Alternate Topologies
 
 Set `supervisor.topology=sidecar` in the Helm chart values:
 
@@ -116,6 +165,17 @@ supervisor:
 `sidecarProxyUid` must be a non-root UID and must not match the sandbox UID.
 The network init container exempts this UID from proxy redirection so the
 sidecar can reach the gateway.
+
+Set `supervisor.topology=split-pod` to use split-pod mode:
+
+```yaml
+supervisor:
+  topology: split-pod
+  sidecarProxyUid: 1337
+```
+
+The same `sidecarProxyUid` value is used as the non-root UID for the split
+supervisor pod and must not match the sandbox UID.
 
 For direct gateway TOML configuration, set the equivalent Kubernetes driver
 fields:

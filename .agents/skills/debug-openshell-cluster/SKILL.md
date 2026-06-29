@@ -284,6 +284,18 @@ workload entrypoint PID to `OPENSHELL_ENTRYPOINT_PID_FILE`
 (`/run/openshell-sidecar/entrypoint.pid` by default), and the network sidecar
 should read it for binary-scoped policy decisions; if allowed network rules are
 all denied, inspect that file and the network sidecar logs.
+
+If `supervisor_topology = "split-pod"` is rendered, each sandbox should have a
+separate supervisor pod, a headless supervisor Service, a proxy CA Secret, and
+two per-sandbox NetworkPolicies. The agent pod should have
+`openshell.ai/sandbox-role=agent`; the supervisor pod should have
+`openshell.ai/sandbox-role=supervisor`; both should share the same
+`openshell.ai/sandbox-id`. The supervisor pod must have a controlling
+`Sandbox` ownerReference and the `openshell.io/sandbox-id` annotation so the
+TokenReview bootstrap path can mint a sandbox JWT. If the agent cannot reach
+the gateway, check DNS to the headless Service, the agent egress NetworkPolicy
+DNS exception for kube-dns/CoreDNS, and the supervisor ingress NetworkPolicy
+allowing only that agent pod on ports `3128` and `18080`.
 Inspect all three when sandbox registration or egress enforcement fails:
 
 ```bash

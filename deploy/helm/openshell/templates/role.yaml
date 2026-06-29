@@ -41,4 +41,31 @@ rules:
     resources:
       - pods
     verbs:
+      - create
+      - delete
       - get
+      - list
+      - watch
+  # Split-pod topology creates one supervisor Service and one CA Secret per
+  # sandbox. Both are owner-referenced to the Sandbox CR for garbage collection.
+  - apiGroups:
+      - ""
+    resources:
+      - services
+      - secrets
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - networking.k8s.io
+    resources:
+      - networkpolicies
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - watch

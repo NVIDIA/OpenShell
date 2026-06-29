@@ -65,6 +65,9 @@ pub enum SupervisorTopology {
     /// Run network supervision in a privileged sidecar and process supervision
     /// as a low-capability wrapper in the agent container.
     Sidecar,
+    /// Run network supervision in a separate supervisor pod and process
+    /// supervision as a low-capability wrapper in the agent pod.
+    SplitPod,
 }
 
 impl std::fmt::Display for SupervisorTopology {
@@ -72,6 +75,7 @@ impl std::fmt::Display for SupervisorTopology {
         match self {
             Self::Combined => f.write_str("combined"),
             Self::Sidecar => f.write_str("sidecar"),
+            Self::SplitPod => f.write_str("split-pod"),
         }
     }
 }
@@ -83,8 +87,9 @@ impl FromStr for SupervisorTopology {
         match s {
             "combined" => Ok(Self::Combined),
             "sidecar" => Ok(Self::Sidecar),
+            "split-pod" => Ok(Self::SplitPod),
             other => Err(format!(
-                "unknown supervisor topology '{other}'; expected 'combined' or 'sidecar'"
+                "unknown supervisor topology '{other}'; expected 'combined', 'sidecar', or 'split-pod'"
             )),
         }
     }
@@ -483,6 +488,16 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.supervisor_topology, SupervisorTopology::Sidecar);
+    }
+
+    #[test]
+    fn serde_override_supervisor_topology_split_pod() {
+        let json = serde_json::json!({
+            "supervisor_topology": "split-pod"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.supervisor_topology, SupervisorTopology::SplitPod);
+        assert_eq!(cfg.supervisor_topology.to_string(), "split-pod");
     }
 
     #[test]

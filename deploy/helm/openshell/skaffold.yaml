@@ -121,6 +121,11 @@ deploy:
           #- ci/values-spire.yaml
           # To exercise the Kubernetes supervisor sidecar topology:
           #- ci/values-sidecar.yaml
+          # To exercise split-pod topology, use the split-pod Skaffold profile
+          # against a cluster with NetworkPolicy enforcement enabled. Stock k3s
+          # includes its embedded network policy controller; if you replace the
+          # CNI, install a policy-enforcing CNI before deploying this profile.
+          #- ci/values-split-pod.yaml
           # To test multi-replica external PostgreSQL behavior:
           #- ci/values-high-availability.yaml
         setValueTemplates:
@@ -134,3 +139,8 @@ profiles:
       - op: add
         path: /deploy/helm/releases/0/valuesFiles/-
         value: ci/values-sidecar.yaml
+  - name: split-pod
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-split-pod.yaml

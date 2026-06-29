@@ -48,9 +48,12 @@ supervisor:
   # "combined" runs the current single supervisor container in the agent pod.
   # "sidecar" runs network enforcement in a dedicated sidecar and the process
   # supervisor as a low-capability wrapper in the agent container.
+  # "split-pod" runs network enforcement in a separate supervisor pod and
+  # restricts the agent pod to that supervisor through NetworkPolicy.
   topology: "combined"
-  # -- UID for the long-running network sidecar in sidecar topology. The
-  # network init container installs nftables rules that exempt this UID.
+  # -- UID for the long-running network sidecar/split supervisor. In sidecar
+  # topology, the network init container installs nftables rules that exempt
+  # this UID.
   sidecarProxyUid: 1337
 
 # -- Image pull secrets attached to gateway and helper pods.

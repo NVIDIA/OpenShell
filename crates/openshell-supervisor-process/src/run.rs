@@ -404,6 +404,13 @@ fn ssh_proxy_url_for_policy(
         return None;
     }
 
+    if let Ok(proxy_url) = std::env::var(openshell_core::sandbox_env::PROXY_URL) {
+        let trimmed = proxy_url.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
     let proxy = policy.network.proxy.as_ref()?;
     if let Some(host) = netns_proxy_host {
         let port = proxy.http_addr.map_or(3128, |addr| addr.port());
@@ -517,5 +524,21 @@ mod tests {
         let policy = policy(NetworkMode::Allow, Some(([127, 0, 0, 1], 3128).into()));
 
         assert_eq!(ssh_proxy_url_for_policy(&policy, None), None);
+    }
+
+    #[test]
+    fn ssh_proxy_url_prefers_env_override() {
+        temp_env::with_var(
+            openshell_core::sandbox_env::PROXY_URL,
+            Some("http://openshell-supervisor.default.svc:3128"),
+            || {
+                let policy = policy(NetworkMode::Proxy, Some(([127, 0, 0, 1], 8080).into()));
+
+                assert_eq!(
+                    ssh_proxy_url_for_policy(&policy, Some([10, 200, 0, 1].into())).as_deref(),
+                    Some("http://openshell-supervisor.default.svc:3128")
+                );
+            },
+        );
     }
 }

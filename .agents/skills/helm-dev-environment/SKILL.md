@@ -65,10 +65,20 @@ mise run helm:skaffold:run
 mise run helm:skaffold:run:sidecar
 ```
 
-Both commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
+**Supervisor split-pod topology** (build once and leave running):
+```bash
+mise run helm:skaffold:run:split-pod
+```
+
+All Skaffold commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
 chart. The sidecar profile renders an `openshell-network-init` init container for
 nftables setup and a non-root `openshell-supervisor-network` runtime sidecar for
-proxying. The `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway
+proxying. The split-pod profile renders network supervision in a separate
+supervisor pod and relies on Kubernetes NetworkPolicy enforcement so the agent
+pod can reach only its paired supervisor plus DNS. The default local k3s/k3d
+cluster keeps k3s's embedded NetworkPolicy controller enabled; if you replace
+the CNI, install a policy-enforcing CNI before using split-pod. The
+`pkiInitJob` hook (a pre-install Job that runs `openshell-gateway
 generate-certs`) generates mTLS secrets on first install. Envoy Gateway opt-in;
 see the Optional Add-ons section below.
 
@@ -78,6 +88,31 @@ The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or
 `#- ci/values-high-availability.yaml` in `deploy/helm/openshell/skaffold.yaml`,
 create the Secret named `openshell-ha-pg` with a `uri` key, then run
 `mise run helm:skaffold:run` or `mise run helm:skaffold:dev`.
+
+### Kubernetes e2e profiles
+
+Run the default Kubernetes e2e environment:
+
+```bash
+mise run e2e:kubernetes
+```
+
+Run the sidecar topology e2e environment:
+
+```bash
+mise run e2e:kubernetes:sidecar
+```
+
+Run the split-pod topology e2e environment:
+
+```bash
+mise run e2e:kubernetes:split-pod
+```
+
+The split-pod e2e task applies `ci/values-split-pod.yaml` through
+`OPENSHELL_E2E_KUBE_EXTRA_VALUES`. Use an existing cluster with NetworkPolicy
+enforcement, or let the wrapper create the default local k3d/k3s cluster with
+k3s's embedded NetworkPolicy controller enabled.
 
 ### TLS behaviour
 
@@ -138,6 +173,12 @@ For a sidecar-profile deployment:
 
 ```bash
 mise run helm:skaffold:delete:sidecar
+```
+
+For a split-pod-profile deployment:
+
+```bash
+mise run helm:skaffold:delete:split-pod
 ```
 
 ### Delete the cluster entirely
@@ -265,6 +306,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-sidecar.yaml` | Supervisor sidecar topology overlay for Kubernetes e2e/dev |
+| `deploy/helm/openshell/ci/values-split-pod.yaml` | Supervisor split-pod topology overlay for Kubernetes e2e/dev; requires NetworkPolicy enforcement |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |

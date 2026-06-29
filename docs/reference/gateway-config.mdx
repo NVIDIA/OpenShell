@@ -179,12 +179,15 @@ supervisor_image_pull_policy   = "IfNotPresent"
 supervisor_sideload_method     = "image-volume"
 # "combined" runs the existing single supervisor container with full process,
 # filesystem, and network enforcement in the agent container. "sidecar" moves
-# pod-level network enforcement and gateway forwarding into a network sidecar;
-# the agent container runs non-root with no added Linux capabilities and keeps
-# SSH/session behavior, but process/filesystem enforcement is network-only.
+# pod-level network enforcement and gateway forwarding into a network sidecar.
+# "split-pod" moves network enforcement and gateway forwarding into a separate
+# supervisor pod and uses NetworkPolicy to force agent egress through it. In
+# sidecar and split-pod modes, the agent container runs non-root with no added
+# Linux capabilities and process/filesystem enforcement is network-only.
 supervisor_topology            = "combined"
-# UID used by the long-running network sidecar. In sidecar topology the
-# network init container installs nftables rules that exempt this UID.
+# UID used by the long-running network sidecar or split supervisor pod. In
+# sidecar topology, the network init container installs nftables rules that
+# exempt this UID.
 sidecar_proxy_uid              = 1337
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"

@@ -55,6 +55,10 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::TLS_CERT,
     openshell_core::sandbox_env::TLS_KEY,
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+    openshell_core::sandbox_env::PROXY_URL,
+    openshell_core::sandbox_env::PROXY_BIND_ADDR,
+    openshell_core::sandbox_env::PROXY_CA_CERT_PATH,
+    openshell_core::sandbox_env::PROXY_CA_KEY_PATH,
 ];
 
 pub fn is_supervisor_only_env_var(key: &str) -> bool {
@@ -74,6 +78,35 @@ fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>
         }
         cmd.env(key, value);
     }
+}
+
+fn configured_proxy_url(
+    policy: &SandboxPolicy,
+    netns_proxy_enabled: bool,
+) -> Result<Option<String>> {
+    if !matches!(policy.network.mode, NetworkMode::Proxy) {
+        return Ok(None);
+    }
+
+    if let Ok(proxy_url) = std::env::var(openshell_core::sandbox_env::PROXY_URL) {
+        let trimmed = proxy_url.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+
+    let proxy = policy.network.proxy.as_ref().ok_or_else(|| {
+        miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
+    })?;
+
+    if netns_proxy_enabled {
+        let port = proxy.http_addr.map_or(3128, |addr| addr.port());
+        return Ok(Some(format!("http://10.200.0.1:{port}")));
+    }
+
+    Ok(proxy
+        .http_addr
+        .map(|http_addr| format!("http://{http_addr}")))
 }
 
 #[cfg(unix)]
@@ -545,27 +578,11 @@ impl ProcessHandle {
             cmd.current_dir(dir);
         }
 
-        if matches!(policy.network.mode, NetworkMode::Proxy) {
-            let proxy = policy.network.proxy.as_ref().ok_or_else(|| {
-                miette::miette!(
-                    "Network mode is set to proxy but no proxy configuration was provided"
-                )
-            })?;
-            // When using network namespace, set proxy URL to the veth host IP
-            if netns_fd.is_some() {
-                // The proxy is on 10.200.0.1:3128 (or configured port)
-                let port = proxy.http_addr.map_or(3128, |addr| addr.port());
-                let proxy_url = format!("http://10.200.0.1:{port}");
-                // Both uppercase and lowercase variants: curl/wget use uppercase,
-                // gRPC C-core (libgrpc) checks lowercase http_proxy/https_proxy.
-                for (key, value) in child_env::proxy_env_vars(&proxy_url) {
-                    cmd.env(key, value);
-                }
-            } else if let Some(http_addr) = proxy.http_addr {
-                let proxy_url = format!("http://{http_addr}");
-                for (key, value) in child_env::proxy_env_vars(&proxy_url) {
-                    cmd.env(key, value);
-                }
+        if let Some(proxy_url) = configured_proxy_url(policy, netns_fd.is_some())? {
+            // Both uppercase and lowercase variants: curl/wget use uppercase,
+            // gRPC C-core (libgrpc) checks lowercase http_proxy/https_proxy.
+            for (key, value) in child_env::proxy_env_vars(&proxy_url) {
+                cmd.env(key, value);
             }
         }
 
@@ -700,17 +717,9 @@ impl ProcessHandle {
             cmd.current_dir(dir);
         }
 
-        if matches!(policy.network.mode, NetworkMode::Proxy) {
-            let proxy = policy.network.proxy.as_ref().ok_or_else(|| {
-                miette::miette!(
-                    "Network mode is set to proxy but no proxy configuration was provided"
-                )
-            })?;
-            if let Some(http_addr) = proxy.http_addr {
-                let proxy_url = format!("http://{http_addr}");
-                for (key, value) in child_env::proxy_env_vars(&proxy_url) {
-                    cmd.env(key, value);
-                }
+        if let Some(proxy_url) = configured_proxy_url(policy, false)? {
+            for (key, value) in child_env::proxy_env_vars(&proxy_url) {
+                cmd.env(key, value);
             }
         }
 
