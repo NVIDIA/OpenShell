@@ -1,9 +1,10 @@
 ---
 authors:
   - "@jganoff"
-state: draft
+state: review
 links:
   - https://github.com/NVIDIA/OpenShell/issues/1737
+  - https://github.com/NVIDIA/OpenShell/pull/2048
   - https://github.com/NVIDIA/OpenShell/issues/899
   - https://github.com/NVIDIA/OpenShell/issues/981
   - https://github.com/NVIDIA/OpenShell/issues/1511
@@ -71,8 +72,8 @@ graph TB
         Supervisor -->|drives runtime contract| Runtime
     end
 
-    Driver ==>|establishes the boundary| Boundary
-    Runtime -->|checks and operates| Boundary
+    Driver ==>|provisions resources + descriptor| Boundary
+    Runtime -->|establishes, confirms, operates| Boundary
 
     style Boundary fill:none,stroke:#9575cd,color:#00084D
     style Gateway fill:#b39ddb,stroke:#9575cd,color:#fff
@@ -95,7 +96,7 @@ Provisioning runs at sandbox creation, on the control plane, in a fixed order:
 2. **The driver provisions the compute resource:** whatever must exist before the supervisor runs, such as the agent container and the supervisor, a sidecar, a separate supervisor pod, a microVM, or a claim on a node daemon.
 3. **The named backend establishes the boundary before the agent runs.** Backends vary on one axis: where. The in-pod backend establishes in the supervisor's process, lazily, when the supervisor attaches to it. A backend that moves privilege out of the agent's container establishes at the control plane, before the supervisor boots: a node daemon installs the netns routing and rules, a VM driver brings up the guest. Either way the supervisor only drives the contract; it never establishes the boundary itself.
 
-The driver and supervisor meet at two points: the driver provisions the resource and sets the descriptor; the supervisor reads the descriptor and drives the contract. Any driver and any backend plug in there without the supervisor changing.
+The driver and supervisor meet at two points: the driver provisions the resource and sets the descriptor; the supervisor reads the descriptor and drives the contract. Any driver and any backend plug in there without the supervisor changing. One establishment rule holds across placements: wherever a backend's preparation runs, during provisioning or during `attach`, it completes before the boundary is `Ready` and before any untrusted execution.
 
 How a backend establishes its boundary is the part the contract does not cover, because that is where placements differ; each backend settles its own establishment in the RFC that introduces it. For a backend that establishes off-supervisor, that RFC also carries the security-critical work outside this interface: for a node daemon serving many sandboxes, admitting requests, isolating one sandbox's boundary from another, and reclaiming a boundary whose supervisor died.
 
@@ -111,9 +112,9 @@ struct BoundaryDescriptor {
 }
 ```
 
-The supervisor matches `backend_id` to admission and the registered factory and verifies the descriptor before readiness. Payload integrity, sandbox binding, authentication, freshness, and replay protection belong to the design that introduces each delegated backend.
+Admission supplies the trusted expectations: the backend id, the contract version, a policy digest, and the required capabilities. The supervisor checks the descriptor and the factory against them, and a backend's self-reported capabilities may only match or exceed them, never lower them. The supervisor runs the common envelope and admission checks (the envelope `version`, the `backend_id`, integrity, and binding to what admission approved), and only that verification mints a `VerifiedBoundaryDescriptor`, which has no public constructor, so an unverified descriptor cannot reach a factory; the factory runs the backend-specific payload and endpoint checks. The envelope `version` is distinct from the contract version the backend speaks (a field of `BackendCapabilities`). Payload integrity, sandbox binding, authentication, freshness, and replay protection belong to the design that introduces each delegated backend.
 
-The supervisor does not re-check the boundary's contents; a backend may build it where the supervisor cannot read. Where a backend can expose it, the supervisor SHOULD confirm before the agent runs and fail closed if confirmation fails, a SHOULD rather than a MUST because some backends cannot expose their internal state across a kernel boundary, and structural enforcement carries those cases. A deployment that needs more for a sensitive workload class requires a confirming backend through admission, which fails closed the same way selection does. A backend whose boundary can change after startup SHOULD monitor for drift and fail the sandbox on it.
+The supervisor does not re-check the boundary's contents directly; a backend may build it where the supervisor cannot read. But every backend MUST confirm the boundary before returning `Ready`, and fail closed if it cannot. What varies is the evidence, not whether confirmation happens: a backend that shares the supervisor's kernel reads the installed enforcement back; one that does not returns an attestation the supervisor verifies. `ConfirmationCapability` names that mechanism. A backend whose boundary can change after startup MUST keep confirming for the boundary's lifetime and fail the sandbox on drift.
 
 The descriptor settles **boundary attachment** (how the supervisor attaches to the boundary) but not **identity binding**, which sandbox this is (the `sandbox_id`). They are different exchanges, and warm pooling pulls them apart. A warm-pooled pod is created before any sandbox exists (#1892): its boundary is established at boot against the image's baseline policy, identity-free, before any claim. The supervisor learns its `sandbox_id` later, when a claim binds, through a separate control-plane handoff: in the Kubernetes flow it presents its projected ServiceAccount token to the gateway, which re-anchors it through the pod's owning records and mints the sandbox JWT. That handoff is local while the supervisor shares the pod, and it is the exchange that must cross the boundary when the supervisor is delegated. Because the baseline policy is fixed at boot, a workload needing a custom policy cannot be served from the pool; it takes the cold path.
 
@@ -127,19 +128,19 @@ A backend registers a factory under a `backend_id`. The supervisor resolves the 
 
 ```rust
 #[async_trait]
-trait IsolationBackendFactory {
+trait IsolationBackendFactory: Send + Sync {
     fn backend_id(&self) -> &str;
     fn capabilities(&self) -> BackendCapabilities;
-    async fn attach(&self, descriptor: VerifiedBoundaryDescriptor, intent: BoundaryIntent)
+    async fn attach(&self, descriptor: VerifiedBoundaryDescriptor)
         -> Result<Box<dyn AttachedBoundary>, BackendError>;
 }
 
 #[async_trait]
-trait AttachedBoundary {              // the exact admitted boundary; no workload
+trait AttachedBoundary: Send {        // the admitted boundary; no claimed or untrusted workload
     async fn claim(self: Box<Self>, claim: ClaimContext) -> Result<Box<dyn ClaimedBoundary>, BackendError>;
 }
 #[async_trait]
-trait ClaimedBoundary {               // bound to sandbox identity, policy, agent, resources
+trait ClaimedBoundary: Send {         // bound to sandbox identity, policy, agent, resources
     async fn bind(self: Box<Self>) -> Result<Box<dyn BoundBoundary>, BackendError>;
 }
 #[async_trait]
@@ -149,36 +150,67 @@ trait BoundBoundary: Send {           // mediation interfaces connected
     async fn confirm(self: Box<Self>) -> Result<Box<dyn ReadyBoundary>, BackendError>;
 }
 #[async_trait]
-trait ReadyBoundary {                 // enforcement and mediation confirmed
+trait ReadyBoundary: Send {           // enforcement and mediation confirmed
     async fn start_agent(self: Box<Self>) -> Result<Box<dyn RunningBoundary>, BackendError>;
 }
+#[async_trait]
 trait RunningBoundary: Send + Sync {  // the agent is running behind the boundary
     fn agent(&self) -> Arc<dyn BoundaryProcess>;
     fn identity_source(&self) -> Arc<dyn IdentitySource>;
     fn exec(&self) -> Arc<dyn BoundaryExec>;
     fn port_forward(&self) -> Arc<dyn BoundaryPortForward>;
     fn events(&self) -> Arc<dyn EventSource>;
+    async fn wait_terminated(&self) -> Result<(), BackendError>; // boundary-level termination, distinct from agent exit
+    async fn shutdown(&self) -> Result<(), BackendError>;        // idempotent release of delegated resources
 }
 
 #[async_trait]
 trait BoundaryProcess: Send + Sync {  // the agent, or a process started via exec
-    async fn wait(&self) -> Result<ExitStatus, BackendError>;
+    async fn wait(&self) -> Result<ExitStatus, BackendError>;   // one stable result across repeated calls
     async fn signal(&self, signal: Signal) -> Result<(), BackendError>;
-    async fn terminate(&self) -> Result<(), BackendError>;
+    async fn terminate(&self) -> Result<(), BackendError>;      // owns the whole descendant tree
 }
 ```
 
 | State | Meaning | Permitted workload operations |
 |---|---|---|
-| **Attached** | the exact admitted boundary is attached | none |
+| **Attached** | the admitted boundary is attached; no claimed or untrusted workload | none |
 | **Claimed** | bound to sandbox identity, policy, agent spec, and resources | none |
 | **Bound** | mediation interfaces are connected | identity and events only |
 | **Ready** | enforcement and mediation are confirmed | agent start only |
 | **Running** | the agent is started behind the boundary | `exec`, `connect`, `wait`, `signal` |
 
-The ordering is the contract's security property, held by construction. The cold path claims immediately; a warm-pooled boundary may sit `Attached` until a claim binds (the attachment-versus-identity split above). `start_agent` always returns a running process handle once the agent has started, and `wait` returns its exit status, identically for every backend; `exec` and `connect` do not exist before `Running`. A delegated backend answers these calls over its own transport, but the transport cannot change their meaning.
+The ordering is the contract's security property, held by construction. `attach` resolves the admitted boundary without binding a sandbox; `claim` is the only transition that introduces sandbox identity, policy, agent spec, and resources, and a pooled boundary rejects a claim incompatible with its baseline policy. The cold path claims immediately; a warm-pooled boundary may sit `Attached` until a claim binds (the attachment-versus-identity split above). `start_agent` always returns a running process handle once the agent has started, and `wait` returns its exit status, identically for every backend; `exec` and `connect` do not exist before `Running`. A delegated backend answers these calls over its own transport, but the transport cannot change their meaning.
 
-The accessors return owned `Arc` handles on purpose: the supervisor keeps a runtime interface while the state object is consumed by the next transition. Those interfaces keep their roles: `IdentitySource` resolves who is behind a connection for the proxy (see Identity); `BoundaryExec` and `BoundaryPortForward` run `exec` and `connect` (loopback-scoped, since a non-loopback target opens an egress the proxy would otherwise mediate) for the SSH server and supervisor sessions; `EventSource` is one stream the orchestrator drains for denials, activity, bypass, and termination, and security events must not be dropped silently under backpressure. A denial event carries the connection's attribution at `Evidence` fidelity (the binary, its ancestor chain, and the cmdline and L7 paths), not just host and port, because the orchestrator's policy-proposal path consumes it. The event payload and the identity model share one attribution shape, so a delegated backend forwarding events preserves that fidelity rather than collapsing a denial to an endpoint.
+The accessors return owned `Arc` handles on purpose: the supervisor keeps a runtime interface while the state object is consumed by the next transition. Those interfaces keep their roles: `IdentitySource` resolves who is behind a connection for the proxy (see Identity); `BoundaryExec` and `BoundaryPortForward` run `exec` and `connect` (loopback-scoped, since a non-loopback target opens an egress the proxy would otherwise mediate) for the SSH server and supervisor sessions; `EventSource` is one stream the orchestrator drains for denials, activity, bypass, and termination, and security events must not be dropped silently under backpressure. A denial event carries the connection's attribution at `Evidence` fidelity (the binary, its ancestor chain, and cmdline paths) plus the request's L7 method and path, not just host and port, because the orchestrator's policy-proposal path consumes it. The event payload and the identity model share one attribution shape, so a delegated backend forwarding events preserves that fidelity rather than collapsing a denial to an endpoint.
+
+The three runtime-operated interfaces are small and owned:
+
+```rust
+#[async_trait]
+trait BoundaryExec: Send + Sync {
+    async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError>;
+}
+
+struct ExecSession {                              // owned; outlives the exec call
+    process: Arc<dyn BoundaryProcess>,
+    stdin: Option<BoundaryInput>,
+    stdout: BoundaryOutput,                       // distinct from stderr for non-PTY exec
+    stderr: Option<BoundaryOutput>,
+    terminal: Option<Arc<dyn BoundaryTerminal>>,  // present when a PTY was requested
+}
+
+#[async_trait]
+trait BoundaryPortForward: Send + Sync {
+    async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError>;
+}
+
+trait EventSource: Send + Sync {
+    fn subscribe(&self) -> Result<BoundaryEventStream, BackendError>;
+}
+```
+
+`ExecSpec` carries the command, args, environment, working directory, and a PTY request; `BoundaryTerminal` resizes a requested PTY; stdin, stdout, and stderr are owned async byte streams, and stdout and stderr stay distinct for non-PTY exec. `LoopbackTarget` is a validated loopback address, since a non-loopback target opens an egress the proxy would otherwise mediate. An `EventSource` is single-consumer: a second `subscribe` returns an error rather than a silently empty stream, and event loss and boundary termination are explicit, never silent. As in `BoundaryProcess`, exit status and signals are placement-neutral, so a local PID is never the process handle and a repeated `wait` returns one stable result.
 
 The claim carries only the common content every backend needs:
 
@@ -191,7 +223,7 @@ struct ClaimContext {
 }
 ```
 
-`ResourceBinding` is opaque common data naming the compute driver's execution and device domain: the cgroup, runtime security context, and device allocation. The agent and every `exec` process run within it; allocating those resources stays the compute driver's job. A backend's placement feeds admission and audit, never per-connection policy, so a policy decision is identical across placements.
+`ResourceBinding` is versioned, opaque data the compute driver issues and binds to this backend, boundary, sandbox, and allocation: the cgroup, runtime security context, and device set. `claim` validates it; the agent and every `exec` process run within it and cannot widen it; allocating those resources stays the compute driver's job. The claim itself is single-use and carries a generation the backend checks, so a stale or replayed claim is rejected. A backend's placement feeds admission and audit, never per-connection policy, so a policy decision is identical across placements.
 
 A backend swap replaces the factory and the state implementations; the consumer code above them (the proxy, the SSH server, and the orchestrator) does not change, because each depends on a runtime interface, not on the backend.
 
@@ -240,20 +272,25 @@ A failure is any case where the supervisor cannot obtain or apply a valid result
 | Confirmation failed | Do not start workload code; surface the failure for cleanup |
 | Boundary terminates after start | Stop new `exec` and `connect`, and fail the sandbox |
 
+Only attachment is automatically retryable, and a retry reuses the same backend and boundary. Later mutating transitions are not blindly retried: a backend reconciles a lost response against stable operation and claim identities, so a lost `start_agent` reply returns the already-started process rather than launching a second agent, and an outcome it cannot reconcile fails closed. A partially completed transition leaves the boundary cleanable and any delegated resource reclaimable. `wait_terminated` reports boundary-level termination distinct from agent exit, and `shutdown` is an idempotent release. Boundary failure disables new `exec` and `connect`, drains the workload execution domain, and permits delegated-resource reclamation; terminating the agent terminates its whole descendant tree, and an `exec` session owns the subprocess tree it starts.
+
 ### Backend invariants
 
-These define what it means to be a backend; a backend that cannot hold all four is not valid.
+These define what it means to be a backend; a backend that cannot hold all five is not valid.
 
 1. **No unguarded workload egress before Ready.** Before the boundary is `Ready`, the workload reaches no egress but the proxy. A backend enforces this with an effective default-deny across every protocol the platform supports (IPv4 and IPv6, all L4, raw and packet sockets, and ingress), not a default-accept ruleset that names a few protocols, and it confirms the effective behavior rather than the mere presence of rules. It must not assume the platform provides the deny: a NetworkPolicy is inert without an enforcing CNI, and the in-pod case holds only while the host does not forward the sandbox subnet. The in-pod backend does not satisfy this today (a known gap, see Risks) and does not ship until it does.
 2. **No untrusted workload execution before Ready.** No workload process runs inside the boundary until it is `Ready`. Workload code is defined by provenance, not lifecycle position: it includes the agent image, the workspace, mounted volumes, and anything an init step runs from them. Only digest-pinned, OpenShell-controlled content may run before the claim binds and the boundary is `Ready`. `start_agent` is gated structurally by the `Ready` state; the supervisor opens `exec` and `connect` only in `Running`, a path-level guarantee rather than a type-state one.
 3. **No unattributed workload execution.** Every agent, `exec`, and `connect` requires a bound claim and the corresponding lifecycle state, so no untrusted process runs without a sandbox identity. This keeps warm pooling safe: a pooled boundary holds an OpenShell-controlled placeholder, never untrusted code, until a claim binds. Like the ordering above, this rests on the supervisor refusing the operation before a claim, not on the type-state; threading the claim into `exec` to make it structural is a candidate refinement, not built now.
 4. **Preserve the compute driver's execution domain.** The agent and every `exec` process run within the admitted cgroup, runtime security context, and device allocation; a backend's privileged helpers do not inherit the workload's devices without backend-specific justification. The contract carries this as `ResourceBinding`; allocating the domain stays the compute driver's responsibility.
+5. **No silent weakening of policy.** A backend implements the admitted semantics of every `SandboxPolicy` field across all four dimensions, or it rejects the workload at admission or claim. It never silently drops or weakens a network, filesystem, syscall, identity, or resource requirement; admission, not the backend, is the source of truth for what must hold.
+
+These invariants hold for the boundary's lifetime, not just up to `Ready`: once confirmed, enforcement stays in effect until the execution domain is drained, either immutable and fenced (the in-pod netns, Landlock, and seccomp cannot be relaxed without ending the process) or actively monitored. If enforcement, identity, the event stream, or the backend control channel is lost, the supervisor rejects new `exec` and `connect`, stops or quarantines the workload, and fails the sandbox.
 
 These invariants hold against application-level escapes, not kernel-level ones: in a shared-kernel placement a kernel exploit reaches the enforcement itself (see Representative topologies on how far enforcement sits from the agent). They describe what a contained agent cannot do; they do not promise survival of a kernel compromise.
 
 ### Identity
 
-`IdentitySource::resolve(flow)` answers who is behind a connection, so policy can scope rules to a binary. It is an interface injected into the proxy at `bind`, not a method the orchestrator calls: the proxy is the only consumer, and it calls `resolve` on every connection. It is capability-gated: a backend that cannot provide identity returns `Unsupported`, and admission rejects any policy that needs a level the backend cannot meet.
+`IdentitySource::resolve(flow)` answers who is behind a connection, so policy can scope rules to a binary. It is an interface injected into the proxy at `bind`, not a method the orchestrator calls: the proxy is the only consumer, and it calls `resolve` on every connection. It is capability-gated: a backend that cannot provide identity returns `Unsupported`, and admission rejects any policy that needs a level the backend cannot meet. `Unsupported` is a declared capability, the backend provides no identity for this boundary at all, distinct from a per-connection failure, which is a `ResolveError` that fails closed.
 
 ```rust
 trait IdentitySource {                       // the proxy's per-connection resolver
@@ -276,11 +313,11 @@ struct Evidence {
 enum Assurance { None, Claimed, Observed, Attested }
 ```
 
-`Observed` is the backend reading and hashing the binary itself, which it can do via procfs while it shares the agent's kernel. `Attested` is narrower than a signature alone: it is fresh evidence, bound to this boundary and flow, cryptographically verified against an observer and trust root outside the agent's adversary domain. A signed statement produced inside a compromised guest does not meet that bar and is not `Attested`. The `Evidence` schema is stable, so the source can change (procfs today, attestation later) without touching the policy layer; the first cross-kernel backend defines the concrete attestation producer and its verification.
+`Observed` is the backend reading and hashing the binary itself, which it can do via procfs while it shares the agent's kernel. `Attested` is narrower than a signature alone: it is fresh evidence, bound to this boundary and flow, cryptographically verified against an observer and trust root outside the agent's adversary domain. A signed statement produced inside a compromised guest does not meet that bar and is not `Attested`. `Observed` and `Attested` both require a binary digest; without one the resolver returns an error or a lower assurance rather than asserting a level it cannot support. The `Evidence` schema is stable, so the source can change (procfs today, attestation later) without touching the policy layer; the first cross-kernel backend defines the concrete attestation producer and its verification.
 
 The backend provides the resolver, injected at `bind`; the proxy is its only consumer. When the backend shares the agent's kernel (in-pod, sidecar, node enforcer) the resolver reads procfs; when it does not, the resolver answers from across the guest boundary. The proxy calls `resolve` the same way in both, so where identity comes from never reaches the proxy. The call is on the per-connection hot path, so a slow or failed lookup fails closed (deny the binary-scoped rule), and a remote resolver bounds it with a timeout. Today the proxy reads procfs inline; routing it through the backend's injected `IdentitySource` is a behavior-preserving step (impl-plan step 1). The contract is fixed now so that step, and later backends, do not reshape it.
 
-The `flow` argument is an opaque, versioned token the backend issues per connection and resolves to the owning process; the supervisor never interprets it. The in-pod backend keys it on the workload-side TCP peer port; a backend that carries identity across a kernel boundary defines its own token, bound to the attachment, namespace, and connection, including who may forge a reference. New token shapes arrive under the contract version, not by widening a shared type.
+Every backend-mediated accepted connection hands the proxy an owned stream together with the `flow` token it passes to `resolve`; how the backend carries that token over its private transport is the backend's design. The `flow` argument is an opaque, versioned token the backend issues per connection and resolves to the owning process; the supervisor never interprets it. The in-pod backend keys it on the workload-side TCP peer port; a backend that carries identity across a kernel boundary defines its own token, bound to the attachment, namespace, and connection, including who may forge a reference. New token shapes arrive under the contract version, not by widening a shared type.
 
 ### Representative topologies
 
@@ -304,13 +341,13 @@ A [selection matrix](./topology-matrix.md) maps a deployment's starting point to
 
 Backends arrive incrementally behind one contract, behavior-preserving first. The supervisor's runtime calls do not change between steps; only the backend behind them does.
 
-1. **Land the contract and the supervisor refactor.** Define the contract, the `backend_id` registry, and route the supervisor through it, with no change in behavior or privilege, validated by the existing test suite.
-2. **Put the in-pod reference backend behind it.** Register today's in-pod path as a backend and repair the readiness gaps invariant 1 names (see Risks); it ships only once it confirms its own boundary.
-3. **Move the privilege off the agent container (separate design).** Design and implement the sidecar backend against the unchanged contract, dropping `NET_ADMIN` from the agent container. This is the first real privilege reduction.
+1. **Land the contract, registry, in-pod adapter, and supervisor selection together.** Define the contract and the `backend_id` registry, put today's in-pod path behind it as the reference backend, and route supervisor selection through the registry, with no change in behavior or privilege, validated by the existing test suite.
+2. **Repair the in-pod release gates, then enable it.** Close the egress-confirmation gap (invariant 1) and the trusted-init window (see Risks) so the in-pod backend confirms its own boundary; it ships only once it does.
+3. **Move the privilege off the agent container (separate design).** Design and implement the sidecar-assisted backend against the unchanged contract, dropping `NET_ADMIN` from the agent container. This is the first real privilege reduction.
 4. **Validate a different placement (separate design).** Design and implement a node or split-pod backend, exercising the same contract from a placement that establishes off-supervisor.
 5. **Add kernel-separated backends (separate designs).** microVM, outer gVisor, and a future node runtime that runs the supervisor outside the agent's kernel, each with its own attestation and cross-kernel identity, prioritized by demand.
 
-The supervisor stays 1:1 with the agent (a node-level backend may still serve many sandboxes on its node; that is expected), and a backend is admission-validated config, so each step lands without a breaking change. RFC acceptance approves the contract and this sequence; it does not assert that every backend exists. The RFC becomes `implemented` once the supervisor uses the contract and the reference in-pod backend has landed; the other backends may remain follow-on work.
+Drivers emit an explicit in-pod descriptor before any supervisor requires one, so the rollout never breaks an existing sandbox and there is never a silent default backend. The supervisor stays 1:1 with the agent (a node-level backend may still serve many sandboxes on its node; that is expected), and a backend is admission-validated config, so each step lands without a breaking change. RFC acceptance approves the contract and this sequence; it does not assert that every backend exists. The RFC becomes `implemented` once the supervisor uses the contract and the reference in-pod backend has landed; the other backends may remain follow-on work.
 
 Every backend passes one shared conformance check: backend and contract-version agreement, lifecycle ordering, no agent, `exec`, or `connect` before `Running`, uniform start and `wait` semantics, fail-closed on a missing or unconfirmed boundary, identity-resolution failure handling, execution-domain preservation, and boundary-termination propagation.
 
@@ -318,7 +355,7 @@ Every backend passes one shared conformance check: backend and contract-version 
 
 - **The in-pod boundary is not self-confirming today.** Its egress confinement holds only while the host does not forward the sandbox subnet, and its nftables backstop is accept-by-default and covers only TCP and UDP, so reading the rules back proves nothing about other protocols or raw sockets; the backstop also disappears silently when `nft` is absent (`install_bypass_rules` returns `Ok`). Closing this, with a default-deny ceiling across all protocols (invariant 1) confirmed by effective behavior, is step 2 of the implementation plan; invariant 1 blocks shipping the in-pod backend until it does.
 - **Runtime control endpoints are a container escape independent of the boundary.** For any container-based backend, admission must apply a positive policy to what the agent container may reach: rejecting a couple of named sockets is not enough, because a container runtime socket (Docker, Podman, containerd, CRI-O, or the kubelet), a remote daemon endpoint, a host namespace, or a sensitive host path or device is a full escape regardless of how tight the network boundary is. A correct network boundary around a container that can still reach the runtime is not a contained sandbox.
-- **Init-path exposure.** A `workspace-init` step runs the agent's image as root after the pod netns exists but before egress confinement is installed, so it has an unmediated egress window, and its executable bytes come from the agent image (untrusted, by invariant 2). This is a deployment choice of the Kubernetes driver, not an interface requirement. Same-pod topologies cannot close the window; backends that establish the boundary before the pod's containers run can. For the same-pod case, the in-pod backend does not ship until the init path runs only OpenShell-controlled content (a trusted seed image, not the agent's) or the boundary already exists before any container starts. This is a release gate, not a recommendation.
+- **Init-path exposure.** A `workspace-init` step runs the agent's image as root after the pod netns exists but before egress confinement is installed, so it has an unmediated egress window, and its executable bytes come from the agent image (untrusted, by invariant 2). This is a deployment choice of the Kubernetes driver, not an interface requirement. The plain in-pod path cannot close the window, but a backend that establishes the boundary before the agent container starts can, including same-pod ones: a trusted native sidecar (an init container with `restartPolicy: Always`) placed first and gated by a startup probe brings the boundary up before the kubelet starts the agent container. For the plain in-pod case, the backend does not ship until the init path runs only OpenShell-controlled content (a trusted seed image, not the agent's) or the boundary already exists before any container starts. This is a release gate, not a recommendation.
 - **Delegated backends must earn their containment, not just satisfy the contract.** The interface provides the call sites and the structural-containment requirement, but a delegated backend's containment comes from where it places enforcement: cross-pod gate release, handle proxying, the runtime endpoint, and drift monitoring are all new construction it must deliver and prove. A backend that satisfies the contract but places enforcement where the agent can reach it is not contained. This RFC states those requirements; it does not meet them.
 - **Cross-kernel identity may not be cheap enough for binary-scoped policy.** When `resolve` is a remote call into a guest, an inbound proxy connection must resolve its flow on the hot path, and a slow or failed lookup fails closed to deny-all egress. Whether a cheap correlation path exists decides whether a kernel-separated backend can do binary-scoped policy at all. This is unproven; a future kernel-separated backend must establish it, and the in-pod and shared-kernel backends (where identity is a local procfs read) do not depend on it.
 - **The refactor spans several entry paths.** Moving namespace plumbing out of the supervisor's call sites (agent launch, SSH, supervisor sessions) and behind the runtime contract is real work, and the in-pod backend must come out behaviorally identical with the existing tests intact.
@@ -390,4 +427,4 @@ A backend's separate design covers, at minimum: its backend ID and registered fa
 
 The claims this RFC makes about the current system are verified, with file:line
 references, in the supporting file [codebase-grounding.md](./codebase-grounding.md)
-(against `origin/main` at commit `4ee27d99`).
+(against `origin/main` at commit `ba21bb32`, the RFC's parent).
