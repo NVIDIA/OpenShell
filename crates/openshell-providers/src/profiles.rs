@@ -1135,6 +1135,15 @@ pub fn validate_profile_set(
                         "credentials.env_vars",
                         "credential env var must not be empty",
                     ));
+                } else if uses_reserved_placeholder_revision_namespace(env_var.trim()) {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.env_vars",
+                        format!(
+                            "credential env var '{env_var}' uses reserved OpenShell placeholder revision namespace"
+                        ),
+                    ));
                 } else if !env_vars.insert(env_var.trim().to_string()) {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
@@ -1652,6 +1661,19 @@ fn is_kubernetes_service_host(host: &str) -> bool {
     let is_cluster_local_service =
         labels.len() == 5 && labels[2] == "svc" && labels[3] == "cluster" && labels[4] == "local";
     (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
+}
+
+fn uses_reserved_placeholder_revision_namespace(key: &str) -> bool {
+    let Some(suffix) = key.strip_prefix('v') else {
+        return false;
+    };
+    let Some((revision, key)) = suffix.split_once('_') else {
+        return false;
+    };
+    !revision.is_empty()
+        && revision.bytes().all(|b| b.is_ascii_digit())
+        && !key.is_empty()
+        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 static DEFAULT_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
@@ -2454,7 +2476,7 @@ credentials:
     env_vars: [BROKEN_TOKEN]
     auth_style: query
   - name: api_key
-    env_vars: [BROKEN_TOKEN, ""]
+    env_vars: [BROKEN_TOKEN, "", v10_GITHUB_TOKEN]
     auth_style: unknown
   - name: path_key
     env_vars: [PATH_TOKEN]
@@ -2482,6 +2504,11 @@ binaries: ["", /usr/bin/broken]
         assert!(messages.contains(&"duplicate credential name: api_key"));
         assert!(messages.contains(&"duplicate credential env var 'BROKEN_TOKEN'"));
         assert!(messages.contains(&"credential env var must not be empty"));
+        assert!(
+            messages.iter().any(
+                |message| message.contains("reserved OpenShell placeholder revision namespace")
+            )
+        );
         assert!(messages.contains(&"query_param is required for query auth"));
         assert!(messages.contains(&"path_template is required for path auth"));
         assert!(messages.iter().any(|message| {

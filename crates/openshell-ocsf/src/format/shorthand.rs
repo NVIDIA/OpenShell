@@ -169,12 +169,13 @@ impl OcsfEvent {
                     (false, true) => format!(" {action}"),
                     (false, false) => format!(" {action}{arrow}"),
                 };
-                let message_ctx =
-                    if detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty() {
-                        message_tag(&e.base)
-                    } else {
-                        String::new()
-                    };
+                let include_message = activity == "FAIL"
+                    || (detail.is_empty() && rule_ctx.is_empty() && reason_ctx.is_empty());
+                let message_ctx = if include_message {
+                    message_tag(&e.base)
+                } else {
+                    String::new()
+                };
                 format!("NET:{activity} {sev}{detail}{rule_ctx}{reason_ctx}{message_ctx}")
             }
 
@@ -592,6 +593,34 @@ mod tests {
         assert!(
             !shorthand.contains("[reason:"),
             "allowed shorthand should NOT contain [reason:]: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_network_activity_shorthand_fail_shows_message_with_destination() {
+        let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
+            base: {
+                let mut b = base(4001, "Network Activity", 4, "Network Activity", 6, "Fail");
+                b.severity = crate::enums::SeverityId::Low;
+                b.set_message("TLS relay error: unexpected eof");
+                b
+            },
+            src_endpoint: None,
+            dst_endpoint: Some(Endpoint::from_domain("api.github.com", 443)),
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: None,
+            connection_info: None,
+            action: None,
+            disposition: None,
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "NET:FAIL [LOW] api.github.com:443 [msg:TLS relay error: unexpected eof]"
         );
     }
 
