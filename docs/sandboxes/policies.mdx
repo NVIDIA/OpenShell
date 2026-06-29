@@ -72,6 +72,10 @@ Raw streams are connection-scoped and outside L7 live-reload guarantees. This in
 
 ## Supervisor Middleware
 
+<Warning title="Research Preview Feature">
+Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware, not for production or long-lived integrations.
+</Warning>
+
 Supervisor middleware can inspect, deny, or replace admitted HTTP request bodies before provider credentials are injected. Middleware selection is independent of the `network_policies` rule that admitted the request: each `network_middlewares` entry matches the destination host through `endpoints.include` and `endpoints.exclude`.
 
 ```yaml
@@ -88,7 +92,7 @@ network_middlewares:
 
 Matching entries run once each in top-level declaration order. Config names must be unique. Different config names may use the same implementation and run as distinct stages. `exclude` takes precedence over `include`.
 
-`openshell/secrets` is built into the supervisor. External binding IDs must be registered by the gateway operator before a policy can reference them; see [External Supervisor Middleware](/reference/gateway-config#external-supervisor-middleware). The gateway calls the implementation's `ValidateConfig` before accepting the policy.
+`openshell/secrets` is built into the supervisor. Operator-provided binding IDs must be registered before a policy can reference them; see [Supervisor Middleware Services](/reference/gateway-config#supervisor-middleware-services). The gateway calls the implementation's `ValidateConfig` before accepting the policy.
 
 `on_error` defaults to `fail_closed`. Use `fail_open` only when skipping a failed middleware is acceptable. Middleware applies only to HTTP traffic the supervisor can parse and inspect; policy validation rejects a required selector that can cover a `tls: skip` endpoint.
 

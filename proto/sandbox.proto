@@ -352,14 +352,14 @@ message GetSandboxConfigResponse {
   // Fingerprint for provider credential inputs attached to this sandbox.
   // Changes when attached provider names or attached provider records change.
   uint64 provider_env_revision = 8;
-  // Operator-registered external middleware services required by the effective
-  // policy. Built-in middleware is not included.
-  repeated ExternalMiddlewareService external_middleware = 9;
+  // Operator-registered supervisor middleware services required by the
+  // effective policy. Built-in middleware is not included.
+  repeated SupervisorMiddlewareService supervisor_middleware_services = 9;
 }
 
-// Connection details for one operator-registered external middleware service.
+// Connection details for one operator-registered supervisor middleware service.
 // V1 supports only explicitly enabled plaintext gRPC for local development.
-message ExternalMiddlewareService {
+message SupervisorMiddlewareService {
   // Operator-facing registration name used for diagnostics.
   string name = 1;
   // gRPC endpoint reachable from the sandbox supervisor.

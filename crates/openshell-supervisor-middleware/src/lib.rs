@@ -15,9 +15,9 @@ pub use service::InProcessMiddlewareService;
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, ExternalMiddlewareService, Finding, HttpRequestEvaluation, HttpRequestTarget,
-    MiddlewareBinding, MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
-    ValidateConfigRequest,
+    Decision, Finding, HttpRequestEvaluation, HttpRequestTarget, MiddlewareBinding,
+    MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
+    SupervisorMiddlewareService, ValidateConfigRequest,
 };
 use tokio::sync::OnceCell;
 use tonic::Request;
@@ -206,13 +206,13 @@ static IN_PROCESS_SERVICE: LazyLock<Arc<MiddlewareServiceState>> = LazyLock::new
 
 /// Validated middleware services available to a gateway or one supervisor.
 ///
-/// The registry always contains the in-process built-ins. External services
-/// are connected and described before construction succeeds, so callers never
+/// The registry always contains the in-process built-ins. Operator-registered
+/// services are connected and described before construction succeeds, so callers never
 /// observe a partially registered service set.
 #[derive(Clone)]
 pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
-    external: Arc<Vec<RegisteredExternalService>>,
+    registered_services: Arc<Vec<RegisteredMiddlewareService>>,
 }
 
 impl std::fmt::Debug for MiddlewareRegistry {
@@ -220,14 +220,14 @@ impl std::fmt::Debug for MiddlewareRegistry {
         formatter
             .debug_struct("MiddlewareRegistry")
             .field("service_count", &self.services.len())
-            .field("external_count", &self.external.len())
+            .field("registered_service_count", &self.registered_services.len())
             .finish()
     }
 }
 
 #[derive(Clone)]
-struct RegisteredExternalService {
-    registration: ExternalMiddlewareService,
+struct RegisteredMiddlewareService {
+    registration: SupervisorMiddlewareService,
     binding_ids: Vec<String>,
 }
 
@@ -235,15 +235,15 @@ impl Default for MiddlewareRegistry {
     fn default() -> Self {
         Self {
             services: Arc::new(vec![Arc::clone(&IN_PROCESS_SERVICE)]),
-            external: Arc::new(Vec::new()),
+            registered_services: Arc::new(Vec::new()),
         }
     }
 }
 
-fn validate_registration(registration: &ExternalMiddlewareService) -> Result<()> {
+fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<()> {
     if registration.name.trim().is_empty() {
         return Err(miette!(
-            "external middleware registration name cannot be empty"
+            "supervisor middleware registration name cannot be empty"
         ));
     }
     if !registration.allow_insecure {
@@ -268,7 +268,7 @@ fn validate_registration(registration: &ExternalMiddlewareService) -> Result<()>
 }
 
 fn validate_external_manifest(
-    registration: &ExternalMiddlewareService,
+    registration: &SupervisorMiddlewareService,
     manifest: &MiddlewareManifest,
     operator_max_body_bytes: usize,
     known_binding_ids: &mut HashSet<String>,
@@ -339,10 +339,10 @@ fn validate_external_manifest(
 }
 
 impl MiddlewareRegistry {
-    /// Connect and validate every external service registration.
-    pub async fn connect_external(registrations: Vec<ExternalMiddlewareService>) -> Result<Self> {
+    /// Connect and validate every operator-provided service registration.
+    pub async fn connect_services(registrations: Vec<SupervisorMiddlewareService>) -> Result<Self> {
         let mut services = vec![Arc::clone(&IN_PROCESS_SERVICE)];
-        let mut external = Vec::with_capacity(registrations.len());
+        let mut registered_services = Vec::with_capacity(registrations.len());
         let mut registration_names = HashSet::new();
         let mut binding_ids = HashSet::from([BUILTIN_SECRETS.to_string()]);
 
@@ -350,7 +350,7 @@ impl MiddlewareRegistry {
             validate_registration(&registration)?;
             if !registration_names.insert(registration.name.clone()) {
                 return Err(miette!(
-                    "duplicate external middleware registration name '{}'",
+                    "duplicate supervisor middleware registration name '{}'",
                     registration.name
                 ));
             }
@@ -395,7 +395,7 @@ impl MiddlewareRegistry {
                 manifest: manifest_cell,
                 operator_max_body_bytes: Some(operator_max_body_bytes),
             }));
-            external.push(RegisteredExternalService {
+            registered_services.push(RegisteredMiddlewareService {
                 registration,
                 binding_ids: described_ids,
             });
@@ -403,7 +403,7 @@ impl MiddlewareRegistry {
 
         Ok(Self {
             services: Arc::new(services),
-            external: Arc::new(external),
+            registered_services: Arc::new(registered_services),
         })
     }
 
@@ -433,7 +433,7 @@ impl MiddlewareRegistry {
     pub fn ensure_policy_bindings_registered(&self, policy: &SandboxPolicy) -> Result<()> {
         for config in &policy.network_middlewares {
             let registered = config.middleware == BUILTIN_SECRETS
-                || self.external.iter().any(|service| {
+                || self.registered_services.iter().any(|service| {
                     service
                         .binding_ids
                         .iter()
@@ -450,11 +450,11 @@ impl MiddlewareRegistry {
         Ok(())
     }
 
-    /// Return only external services referenced by the effective policy.
-    pub fn required_external_services(
+    /// Return only operator-registered services referenced by the effective policy.
+    pub fn required_services(
         &self,
         policy: Option<&SandboxPolicy>,
-    ) -> Vec<ExternalMiddlewareService> {
+    ) -> Vec<SupervisorMiddlewareService> {
         let Some(policy) = policy else {
             return Vec::new();
         };
@@ -463,7 +463,7 @@ impl MiddlewareRegistry {
             .iter()
             .map(|config| config.middleware.as_str())
             .collect();
-        self.external
+        self.registered_services
             .iter()
             .filter(|service| {
                 service
@@ -491,7 +491,7 @@ impl ChainRunner {
                     manifest: OnceCell::new(),
                     operator_max_body_bytes: None,
                 })]),
-                external: Arc::new(Vec::new()),
+                registered_services: Arc::new(Vec::new()),
             }),
         }
     }
@@ -1126,8 +1126,8 @@ mod tests {
         }
     }
 
-    fn external_registration(max_body_bytes: u64) -> ExternalMiddlewareService {
-        ExternalMiddlewareService {
+    fn external_registration(max_body_bytes: u64) -> SupervisorMiddlewareService {
+        SupervisorMiddlewareService {
             name: "local-guard-service".into(),
             endpoint: "http://127.0.0.1:50051".into(),
             allow_insecure: true,
@@ -1137,7 +1137,7 @@ mod tests {
 
     async fn registry_with_external(
         service: Arc<dyn SupervisorMiddleware>,
-        registration: ExternalMiddlewareService,
+        registration: SupervisorMiddlewareService,
     ) -> MiddlewareRegistry {
         let manifest = service
             .describe(Request::new(()))
@@ -1164,7 +1164,7 @@ mod tests {
                     operator_max_body_bytes: Some(operator_max_body_bytes),
                 }),
             ]),
-            external: Arc::new(vec![RegisteredExternalService {
+            registered_services: Arc::new(vec![RegisteredMiddlewareService {
                 registration,
                 binding_ids,
             }]),
@@ -1294,7 +1294,7 @@ mod tests {
 
         let mut registration = external_registration(1024);
         registration.endpoint = format!("http://{address}");
-        let registry = MiddlewareRegistry::connect_external(vec![registration.clone()])
+        let registry = MiddlewareRegistry::connect_services(vec![registration.clone()])
             .await
             .expect("connect external middleware");
         let policy = SandboxPolicy {
@@ -1313,7 +1313,7 @@ mod tests {
             .await
             .expect("remote config validates");
         assert_eq!(
-            registry.required_external_services(Some(&policy)),
+            registry.required_services(Some(&policy)),
             vec![registration]
         );
 

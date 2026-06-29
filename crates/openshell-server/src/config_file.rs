@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
-use openshell_core::proto::ExternalMiddlewareService;
+use openshell_core::proto::SupervisorMiddlewareService;
 use openshell_core::{GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig, TlsConfig};
 use serde::{Deserialize, Serialize};
 
@@ -153,7 +153,7 @@ pub struct GatewayFileSection {
     pub gateway_jwt: Option<GatewayJwtConfig>,
 
     // ── Supervisor middleware ─────────────────────────────────────────────
-    /// Statically registered external middleware services. Registration is
+    /// Statically registered supervisor middleware services. Registration is
     /// operator-owned and changes require a gateway restart.
     #[serde(default)]
     pub middleware: Vec<MiddlewareServiceFileConfig>,
@@ -167,7 +167,7 @@ pub struct GatewayFileSection {
     pub database_url: Option<String>,
 }
 
-/// One `[[openshell.gateway.middleware]]` external middleware registration.
+/// One `[[openshell.gateway.middleware]]` supervisor middleware registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MiddlewareServiceFileConfig {
@@ -182,7 +182,7 @@ pub struct MiddlewareServiceFileConfig {
     pub max_body_bytes: u64,
 }
 
-impl From<&MiddlewareServiceFileConfig> for ExternalMiddlewareService {
+impl From<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
     fn from(config: &MiddlewareServiceFileConfig) -> Self {
         Self {
             name: config.name.clone(),
@@ -435,7 +435,7 @@ allow_unauthenticated_users = true
     }
 
     #[test]
-    fn parses_external_middleware_registration() {
+    fn parses_supervisor_middleware_registration() {
         let toml = r#"
 [[openshell.gateway.middleware]]
 name = "local-guard"

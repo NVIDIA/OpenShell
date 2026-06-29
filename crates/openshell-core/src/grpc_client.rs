@@ -728,7 +728,7 @@ pub struct SettingsPollResult {
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
     pub provider_env_revision: u64,
-    pub external_middleware: Vec<crate::proto::ExternalMiddlewareService>,
+    pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
 }
 
 pub struct ProviderEnvironmentResult {
@@ -773,7 +773,7 @@ impl CachedOpenShellClient {
             settings: inner.settings,
             global_policy_version: inner.global_policy_version,
             provider_env_revision: inner.provider_env_revision,
-            external_middleware: inner.external_middleware,
+            supervisor_middleware_services: inner.supervisor_middleware_services,
         })
     }
 

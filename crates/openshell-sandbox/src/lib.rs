@@ -1450,8 +1450,8 @@ async fn load_policy(
         info!("Creating OPA engine from proto policy data");
         let engine = OpaEngine::from_proto(&proto_policy)?;
         let middleware_registry =
-            openshell_supervisor_middleware::MiddlewareRegistry::connect_external(
-                sandbox_config.external_middleware,
+            openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+                sandbox_config.supervisor_middleware_services,
             )
             .await?;
         engine.replace_middleware_registry(middleware_registry)?;
@@ -1605,7 +1605,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     let mut current_config_revision: u64 = 0;
     let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
     let mut current_policy_hash = String::new();
-    let mut current_external_middleware = Vec::new();
+    let mut current_middleware_services = Vec::new();
     let mut current_settings: std::collections::HashMap<
         String,
         openshell_core::proto::EffectiveSetting,
@@ -1617,7 +1617,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
             current_config_revision = result.config_revision;
             current_policy_hash = result.policy_hash.clone();
-            current_external_middleware = result.external_middleware;
+            current_middleware_services = result.supervisor_middleware_services;
             current_settings = result.settings;
             debug!(
                 config_revision = current_config_revision,
@@ -1647,7 +1647,8 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         }
 
         let policy_changed = result.policy_hash != current_policy_hash;
-        let middleware_changed = result.external_middleware != current_external_middleware;
+        let middleware_changed =
+            result.supervisor_middleware_services != current_middleware_services;
 
         // Log which settings changed.
         log_setting_changes(&current_settings, &result.settings);
@@ -1707,26 +1708,26 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         }
 
         if middleware_changed {
-            match openshell_supervisor_middleware::MiddlewareRegistry::connect_external(
-                result.external_middleware.clone(),
+            match openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+                result.supervisor_middleware_services.clone(),
             )
             .await
             .and_then(|registry| ctx.opa_engine.replace_middleware_registry(registry))
             {
                 Ok(()) => {
-                    current_external_middleware = result.external_middleware.clone();
+                    current_middleware_services = result.supervisor_middleware_services.clone();
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
                             .status(StatusId::Success)
                             .state(StateId::Enabled, "loaded")
                             .unmapped(
-                                "external_middleware_count",
-                                serde_json::json!(current_external_middleware.len())
+                                "supervisor_middleware_service_count",
+                                serde_json::json!(current_middleware_services.len())
                             )
                             .message(format!(
-                                "External middleware registry reloaded [service_count:{}]",
-                                current_external_middleware.len()
+                                "Supervisor middleware registry reloaded [service_count:{}]",
+                                current_middleware_services.len()
                             ))
                             .build()
                     );
@@ -1738,7 +1739,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                             .status(StatusId::Failure)
                             .state(StateId::Other, "failed")
                             .message(format!(
-                                "External middleware registry reload failed, keeping last-known-good registry [error:{error}]"
+                                "Supervisor middleware registry reload failed, keeping last-known-good registry [error:{error}]"
                             ))
                             .build()
                     );

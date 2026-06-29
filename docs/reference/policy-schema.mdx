@@ -472,6 +472,10 @@ Identifies an executable that is permitted to use the associated endpoints.
 
 ## Network Middleware
 
+<Warning title="Research Preview Feature">
+Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware, not for production or long-lived integrations.
+</Warning>
+
 **Category:** Dynamic
 
 An ordered list of middleware configs selected after network and L7 policy admit an HTTP request. Middleware selection is independent of the network policy entry that admitted the request. Every matching config runs once in list order before provider credential injection.

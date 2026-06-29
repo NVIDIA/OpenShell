@@ -242,7 +242,7 @@ pub(crate) async fn run_server(
         })
         .unwrap_or_default();
     let middleware_registry = Arc::new(
-        MiddlewareRegistry::connect_external(middleware_registrations)
+        MiddlewareRegistry::connect_services(middleware_registrations)
             .await
             .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
     );

@@ -148,9 +148,13 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
-## External Supervisor Middleware
+## Supervisor Middleware Services
 
-Register external supervisor middleware with one or more `[[openshell.gateway.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
+<Warning title="Research Preview Feature">
+Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware, not for production or long-lived integrations.
+</Warning>
+
+Register operator-run supervisor middleware services with one or more `[[openshell.gateway.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
 
 ```toml
 [[openshell.gateway.middleware]]
@@ -160,13 +164,13 @@ allow_insecure = true
 max_body_bytes = 262144
 ```
 
-Each service implements the supervisor middleware gRPC contract and may expose multiple binding IDs through `Describe`. Policies reference those binding IDs, not the registration `name`. The gateway rejects duplicate binding IDs across services and prevents external services from claiming the reserved `openshell/` namespace.
+Each service implements the supervisor middleware gRPC contract and may expose multiple binding IDs through `Describe`. Policies reference those binding IDs, not the registration `name`. The gateway rejects duplicate binding IDs across services and prevents operator-run services from claiming the reserved `openshell/` namespace.
 
 The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
 
 `max_body_bytes` is the operator limit for every binding exposed by the service. It must be greater than zero and no larger than each binding's advertised limit. OpenShell rejects an oversized value instead of silently clamping it.
 
-External middleware is a local-development preview. The endpoint must use plaintext `http://`, and `allow_insecure = true` is required as an explicit acknowledgement that inspected request content is sent without transport encryption or peer authentication. TLS, authentication, health checks, and runtime registration are not supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address when both runtimes resolve it.
+The service endpoint must use plaintext `http://`, and `allow_insecure = true` is required as an explicit acknowledgement that inspected request content is sent without transport encryption or peer authentication. TLS, authentication, health checks, and runtime registration are not supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address when both runtimes resolve it.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
 

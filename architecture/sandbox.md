@@ -69,7 +69,7 @@ are relayed but are not currently parsed for policy enforcement.
 For admitted HTTP requests, the proxy can run an ordered supervisor middleware
 chain before credential injection. Host selectors choose the chain independently
 of the network rule that admitted the request. Built-ins run in-process;
-operator-registered external services are called directly from the supervisor
+operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
 service capabilities and policy-owned config before delivery. Supervisors keep
 the last-known-good service registry when a live config reload fails.
@@ -184,7 +184,7 @@ quickly.
 - If gateway config polling fails, the sandbox keeps its last-known-good policy.
 - If a live policy update is invalid, the supervisor rejects it and keeps the
   current policy.
-- If an external middleware call fails, the selected config's `on_error`
+- If an operator-run middleware call fails, the selected config's `on_error`
   behavior decides whether to deny the request or continue without that stage.
 - Existing raw byte streams are connection scoped. Dynamic policy changes apply
   to new connections or the next parsed HTTP request where the proxy can safely

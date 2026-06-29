@@ -1230,14 +1230,13 @@ pub(super) async fn handle_get_sandbox_config(
     }
 
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
-    let external_middleware = state
-        .middleware_registry
-        .required_external_services(policy.as_ref());
+    let supervisor_middleware_services =
+        state.middleware_registry.required_services(policy.as_ref());
     let config_revision = compute_config_revision(
         policy.as_ref(),
         &settings,
         policy_source,
-        &external_middleware,
+        &supervisor_middleware_services,
     );
     let provider_env_revision =
         compute_provider_env_revision(state.store.as_ref(), &sandbox_provider_names).await?;
@@ -1251,7 +1250,7 @@ pub(super) async fn handle_get_sandbox_config(
         policy_source: policy_source.into(),
         global_policy_version,
         provider_env_revision,
-        external_middleware,
+        supervisor_middleware_services,
     }))
 }
 
@@ -3144,7 +3143,7 @@ fn compute_config_revision(
     policy: Option<&ProtoSandboxPolicy>,
     settings: &HashMap<String, EffectiveSetting>,
     policy_source: PolicySource,
-    external_middleware: &[openshell_core::proto::ExternalMiddlewareService],
+    supervisor_middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
 ) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update((policy_source as i32).to_le_bytes());
@@ -3177,7 +3176,7 @@ fn compute_config_revision(
             }
         }
     }
-    let mut middleware = external_middleware.iter().collect::<Vec<_>>();
+    let mut middleware = supervisor_middleware_services.iter().collect::<Vec<_>>();
     middleware.sort_by(|left, right| left.name.cmp(&right.name));
     for service in middleware {
         hasher.update(service.encode_to_vec());
@@ -9327,10 +9326,10 @@ mod tests {
     }
 
     #[test]
-    fn config_revision_changes_when_external_middleware_changes() {
+    fn config_revision_changes_when_supervisor_middleware_services_change() {
         let policy = ProtoSandboxPolicy::default();
         let settings = HashMap::new();
-        let service = openshell_core::proto::ExternalMiddlewareService {
+        let service = openshell_core::proto::SupervisorMiddlewareService {
             name: "local-guard".into(),
             endpoint: "http://127.0.0.1:50051".into(),
             allow_insecure: true,
