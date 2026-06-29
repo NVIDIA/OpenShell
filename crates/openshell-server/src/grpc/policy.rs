@@ -71,7 +71,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, source_matches, validate_no_reserved_provider_policy_keys,
+    level_matches, source_matches, validate_annotations, validate_no_reserved_provider_policy_keys,
     validate_policy_safety, validate_static_fields_unchanged,
 };
 use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
@@ -1077,6 +1077,61 @@ fn validate_sandbox_caller_update(req: &UpdateConfigRequest) -> Result<(), Statu
     Ok(())
 }
 
+fn sandbox_metadata_annotations(sandbox: &Sandbox) -> HashMap<String, String> {
+    sandbox
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.annotations.clone())
+        .unwrap_or_default()
+}
+
+fn update_config_response(
+    version: u32,
+    policy_hash: impl Into<String>,
+    settings_revision: u64,
+    deleted: bool,
+    annotations: HashMap<String, String>,
+) -> Response<UpdateConfigResponse> {
+    Response::new(UpdateConfigResponse {
+        version,
+        policy_hash: policy_hash.into(),
+        settings_revision,
+        deleted,
+        annotations,
+    })
+}
+
+async fn persist_update_config_annotations(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    expected_resource_version: u64,
+    annotations: &HashMap<String, String>,
+    current_annotations: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, Status> {
+    if annotations.is_empty() {
+        return Ok(current_annotations.clone());
+    }
+    if annotations
+        .iter()
+        .all(|(key, value)| current_annotations.get(key) == Some(value))
+    {
+        return Ok(current_annotations.clone());
+    }
+
+    let annotations = annotations.clone();
+    let updated = state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
+            if let Some(metadata) = sandbox.metadata.as_mut() {
+                metadata.annotations.extend(annotations.clone());
+            }
+        })
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "store update annotations"))?;
+
+    Ok(sandbox_metadata_annotations(&updated))
+}
+
 async fn resolve_sandbox_by_name_for_principal(
     store: &Store,
     principal: &Principal,
@@ -1486,6 +1541,7 @@ async fn handle_update_config_inner(
     sandbox_caller: bool,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let req = request.into_inner();
+    validate_annotations(&req.annotations, "annotations")?;
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
         resolve_sandbox_by_name_for_principal(
@@ -1518,6 +1574,11 @@ async fn handle_update_config_inner(
     }
 
     if req.global {
+        if !req.annotations.is_empty() {
+            return Err(Status::invalid_argument(
+                "annotations are only supported for sandbox-scoped updates",
+            ));
+        }
         let _settings_guard = state.settings_mutex.lock().await;
 
         if has_merge_ops {
@@ -1563,12 +1624,13 @@ async fn handle_update_config_inner(
                     global_settings.revision = global_settings.revision.wrapping_add(1);
                     save_global_settings(state.store.as_ref(), &global_settings).await?;
                 }
-                return Ok(Response::new(UpdateConfigResponse {
-                    version: u32::try_from(current.version).unwrap_or(0),
-                    policy_hash: hash,
-                    settings_revision: global_settings.revision,
-                    deleted: false,
-                }));
+                return Ok(update_config_response(
+                    u32::try_from(current.version).unwrap_or(0),
+                    hash,
+                    global_settings.revision,
+                    false,
+                    HashMap::new(),
+                ));
             }
 
             let next_version = latest.map_or(1, |r| r.version + 1);
@@ -1618,12 +1680,13 @@ async fn handle_update_config_inner(
                 save_global_settings(state.store.as_ref(), &global_settings).await?;
             }
 
-            return Ok(Response::new(UpdateConfigResponse {
-                version: u32::try_from(next_version).unwrap_or(0),
-                policy_hash: hash,
-                settings_revision: global_settings.revision,
-                deleted: false,
-            }));
+            return Ok(update_config_response(
+                u32::try_from(next_version).unwrap_or(0),
+                hash,
+                global_settings.revision,
+                false,
+                HashMap::new(),
+            ));
         }
 
         // Global setting mutation.
@@ -1666,12 +1729,13 @@ async fn handle_update_config_inner(
             save_global_settings(state.store.as_ref(), &global_settings).await?;
         }
 
-        return Ok(Response::new(UpdateConfigResponse {
-            version: 0,
-            policy_hash: String::new(),
-            settings_revision: global_settings.revision,
-            deleted: req.delete_setting && changed,
-        }));
+        return Ok(update_config_response(
+            0,
+            String::new(),
+            global_settings.revision,
+            req.delete_setting && changed,
+            HashMap::new(),
+        ));
     }
 
     if req.name.is_empty() {
@@ -1688,6 +1752,7 @@ async fn handle_update_config_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
@@ -1721,12 +1786,22 @@ async fn handle_update_config_inner(
                 .await?;
             }
 
-            return Ok(Response::new(UpdateConfigResponse {
-                version: 0,
-                policy_hash: String::new(),
-                settings_revision: sandbox_settings.revision,
-                deleted: removed,
-            }));
+            response_annotations = persist_update_config_annotations(
+                state,
+                &sandbox_id,
+                req.expected_resource_version,
+                &req.annotations,
+                &response_annotations,
+            )
+            .await?;
+
+            return Ok(update_config_response(
+                0,
+                String::new(),
+                sandbox_settings.revision,
+                removed,
+                response_annotations,
+            ));
         }
 
         if globally_managed {
@@ -1754,12 +1829,22 @@ async fn handle_update_config_inner(
             .await?;
         }
 
-        return Ok(Response::new(UpdateConfigResponse {
-            version: 0,
-            policy_hash: String::new(),
-            settings_revision: sandbox_settings.revision,
-            deleted: false,
-        }));
+        response_annotations = persist_update_config_annotations(
+            state,
+            &sandbox_id,
+            req.expected_resource_version,
+            &req.annotations,
+            &response_annotations,
+        )
+        .await?;
+
+        return Ok(update_config_response(
+            0,
+            String::new(),
+            sandbox_settings.revision,
+            false,
+            response_annotations,
+        ));
     }
 
     if has_merge_ops {
@@ -1781,6 +1866,14 @@ async fn handle_update_config_inner(
             &sandbox_id,
             spec.policy.as_ref(),
             &merge_ops,
+        )
+        .await?;
+        response_annotations = persist_update_config_annotations(
+            state,
+            &sandbox_id,
+            req.expected_resource_version,
+            &req.annotations,
+            &response_annotations,
         )
         .await?;
 
@@ -1818,12 +1911,13 @@ async fn handle_update_config_inner(
         );
         emit_config_update_policy_success(sandbox_caller);
 
-        return Ok(Response::new(UpdateConfigResponse {
-            version: u32::try_from(version).unwrap_or(0),
-            policy_hash: hash,
-            settings_revision: 0,
-            deleted: false,
-        }));
+        return Ok(update_config_response(
+            u32::try_from(version).unwrap_or(0),
+            hash,
+            0,
+            false,
+            response_annotations,
+        ));
     }
 
     // Sandbox-scoped policy update.
@@ -1863,7 +1957,8 @@ async fn handle_update_config_inner(
         let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
         let sandbox_id = sandbox.object_id().to_string();
         let new_policy_clone = new_policy.clone();
-        state
+        let annotations = req.annotations.clone();
+        let updated_sandbox = state
             .store
             .update_message_cas::<Sandbox, _>(
                 &sandbox_id,
@@ -1874,10 +1969,16 @@ async fn handle_update_config_inner(
                     {
                         spec.policy = Some(new_policy_clone.clone());
                     }
+                    if !annotations.is_empty()
+                        && let Some(metadata) = sandbox.metadata.as_mut()
+                    {
+                        metadata.annotations.extend(annotations.clone());
+                    }
                 },
             )
             .await
             .map_err(|e| super::persistence_error_to_status(e, "backfill spec.policy"))?;
+        response_annotations = sandbox_metadata_annotations(&updated_sandbox);
         info!(
             sandbox_id = %sandbox_id,
             "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
@@ -1896,12 +1997,22 @@ async fn handle_update_config_inner(
     if let Some(ref current) = latest
         && current.policy_hash == hash
     {
-        return Ok(Response::new(UpdateConfigResponse {
-            version: u32::try_from(current.version).unwrap_or(0),
-            policy_hash: hash,
-            settings_revision: 0,
-            deleted: false,
-        }));
+        response_annotations = persist_update_config_annotations(
+            state,
+            &sandbox_id,
+            req.expected_resource_version,
+            &req.annotations,
+            &response_annotations,
+        )
+        .await?;
+
+        return Ok(update_config_response(
+            u32::try_from(current.version).unwrap_or(0),
+            hash,
+            0,
+            false,
+            response_annotations,
+        ));
     }
 
     let next_version = latest.map_or(1, |r| r.version + 1);
@@ -1918,6 +2029,15 @@ async fn handle_update_config_inner(
         .supersede_older_policies(&sandbox_id, next_version)
         .await;
 
+    response_annotations = persist_update_config_annotations(
+        state,
+        &sandbox_id,
+        req.expected_resource_version,
+        &req.annotations,
+        &response_annotations,
+    )
+    .await?;
+
     state.sandbox_watch_bus.notify(&sandbox_id);
 
     info!(
@@ -1928,12 +2048,13 @@ async fn handle_update_config_inner(
     );
     emit_full_policy_update_success(sandbox_caller, next_version);
 
-    Ok(Response::new(UpdateConfigResponse {
-        version: u32::try_from(next_version).unwrap_or(0),
-        policy_hash: hash,
-        settings_revision: 0,
-        deleted: false,
-    }))
+    Ok(update_config_response(
+        u32::try_from(next_version).unwrap_or(0),
+        hash,
+        0,
+        false,
+        response_annotations,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -10110,6 +10231,7 @@ mod tests {
                 global: false,
                 merge_operations: vec![],
                 expected_resource_version: current_version,
+                annotations: HashMap::new(),
             }),
         )
         .await
@@ -10135,6 +10257,424 @@ mod tests {
             updated_sandbox.spec.as_ref().unwrap().policy.is_some(),
             "policy should be backfilled"
         );
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_persists_and_returns_annotations() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-annotated-backfill".to_string(),
+                name: "annotated-backfill".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::from([(
+                    "openshell.nvidia.com/existing".to_string(),
+                    "keep".to_string(),
+                )]),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("annotated-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+        let annotations = HashMap::from([
+            (
+                "openshell.nvidia.com/policy-signature".to_string(),
+                "signed-policy".to_string(),
+            ),
+            (
+                "openshell.nvidia.com/policy-provenance".to_string(),
+                "governance-interceptor".to_string(),
+            ),
+        ]);
+
+        let response = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                name: "annotated-backfill".to_string(),
+                policy: Some(ProtoSandboxPolicy::default()),
+                setting_key: String::new(),
+                setting_value: None,
+                delete_setting: false,
+                global: false,
+                merge_operations: vec![],
+                expected_resource_version: current_version,
+                annotations: annotations.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.version, 1);
+        assert_eq!(
+            response.annotations.get("openshell.nvidia.com/existing"),
+            Some(&"keep".to_string())
+        );
+        for (key, value) in &annotations {
+            assert_eq!(response.annotations.get(key), Some(value));
+        }
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("annotated-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_annotations = &stored.metadata.as_ref().unwrap().annotations;
+        assert_eq!(
+            stored_annotations.get("openshell.nvidia.com/existing"),
+            Some(&"keep".to_string())
+        );
+        for (key, value) in &annotations {
+            assert_eq!(stored_annotations.get(key), Some(value));
+        }
+        assert!(
+            stored.spec.as_ref().unwrap().policy.is_some(),
+            "policy should still be backfilled"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_same_policy_hash_persists_and_returns_annotations() {
+        let state = test_server_state().await;
+        let mut policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut policy);
+        let hash = deterministic_policy_hash(&policy);
+        let sandbox = test_sandbox("sb-same-hash", "same-hash", policy.clone(), Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "policy-same-hash-v1",
+                "sb-same-hash",
+                1,
+                &policy.encode_to_vec(),
+                &hash,
+            )
+            .await
+            .unwrap();
+
+        let response = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                name: "same-hash".to_string(),
+                policy: Some(policy),
+                annotations: HashMap::from([(
+                    "openshell.nvidia.com/policy-signature".to_string(),
+                    "same-hash-signature".to_string(),
+                )]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.version, 1);
+        assert_eq!(
+            response
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("same-hash-signature")
+        );
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("same-hash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("same-hash-signature")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_full_policy_empty_annotations_preserves_existing_annotations() {
+        let state = test_server_state().await;
+        let mut baseline = test_policy_with_rule("sandbox_only", "old.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut baseline);
+        let mut sandbox = test_sandbox(
+            "sb-preserve-full",
+            "preserve-full",
+            baseline.clone(),
+            Vec::new(),
+        );
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            "openshell.nvidia.com/policy-signature".to_string(),
+            "keep".to_string(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "policy-preserve-full-v1",
+                "sb-preserve-full",
+                1,
+                &baseline.encode_to_vec(),
+                &deterministic_policy_hash(&baseline),
+            )
+            .await
+            .unwrap();
+
+        let mut updated = test_policy_with_rule("sandbox_only", "new.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut updated);
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "preserve-full".to_string(),
+                policy: Some(updated),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("keep")
+        );
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("preserve-full")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("keep")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_merge_empty_annotations_preserves_existing_annotations() {
+        let state = test_server_state().await;
+        let mut baseline = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut baseline);
+        let mut sandbox = test_sandbox("sb-preserve-merge", "preserve-merge", baseline, Vec::new());
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            "openshell.nvidia.com/policy-provenance".to_string(),
+            "keep".to_string(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "preserve-merge".to_string(),
+                merge_operations: vec![PolicyMergeOperation {
+                    operation: Some(policy_merge_operation::Operation::AddRule(
+                        openshell_core::proto::AddNetworkRule {
+                            rule_name: "allow_api_example".to_string(),
+                            rule: Some(NetworkPolicyRule {
+                                name: "allow_api_example".to_string(),
+                                endpoints: vec![NetworkEndpoint {
+                                    host: "api.example.com".to_string(),
+                                    port: 443,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }),
+                        },
+                    )),
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response
+                .annotations
+                .get("openshell.nvidia.com/policy-provenance")
+                .map(String::as_str),
+            Some("keep")
+        );
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("preserve-merge")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get("openshell.nvidia.com/policy-provenance")
+                .map(String::as_str),
+            Some("keep")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_backfill_empty_annotations_preserves_existing_annotations() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-preserve-backfill".to_string(),
+                name: "preserve-backfill".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::from([(
+                    "openshell.nvidia.com/policy-signature".to_string(),
+                    "keep".to_string(),
+                )]),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("preserve-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        let response = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                name: "preserve-backfill".to_string(),
+                policy: Some(ProtoSandboxPolicy::default()),
+                expected_resource_version: current_version,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("keep")
+        );
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("preserve-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("keep")
+        );
+        assert!(
+            stored.spec.as_ref().unwrap().policy.is_some(),
+            "policy should still be backfilled"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_global_rejects_annotations() {
+        let state = test_server_state().await;
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::StringValue("auto".to_string())),
+                }),
+                annotations: HashMap::from([(
+                    "openshell.nvidia.com/policy-signature".to_string(),
+                    "global".to_string(),
+                )]),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("sandbox-scoped"));
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_invalid_annotations() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-invalid-annotation",
+                "invalid-annotation",
+                ProtoSandboxPolicy::default(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "invalid-annotation".to_string(),
+                policy: Some(ProtoSandboxPolicy::default()),
+                annotations: HashMap::from([("bad key".to_string(), "value".to_string())]),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("label key"));
     }
 
     #[tokio::test]
@@ -10182,6 +10722,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -10320,6 +10861,7 @@ mod tests {
                 global: false,
                 merge_operations: vec![],
                 expected_resource_version: 99, // stale version
+                annotations: HashMap::new(),
             }),
         )
         .await
@@ -10406,6 +10948,7 @@ mod tests {
                         global: false,
                         merge_operations: vec![],
                         expected_resource_version: initial_version,
+                        annotations: HashMap::new(),
                     }),
                 )
                 .await

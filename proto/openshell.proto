@@ -1228,6 +1228,9 @@ message UpdateConfigRequest {
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   // Ignored for global-scoped updates.
   uint64 expected_resource_version = 8;
+  // Optional annotations to merge into sandbox metadata after a successful
+  // sandbox-scoped update. Intended for non-secret provenance metadata.
+  map<string, string> annotations = 9;
 }
 
 message PolicyMergeOperation {
@@ -1283,6 +1286,8 @@ message UpdateConfigResponse {
   uint64 settings_revision = 3;
   // True when a setting delete operation removed an existing key.
   bool deleted = 4;
+  // Sandbox metadata annotations after the update. Empty for global updates.
+  map<string, string> annotations = 5;
 }
 
 // Get sandbox policy status request.

@@ -1945,7 +1945,9 @@ fn json_u32(value: &Value, field: &str) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{CreateSandboxRequest, SandboxSpec, SandboxTemplate};
+    use openshell_core::proto::{
+        CreateSandboxRequest, SandboxSpec, SandboxTemplate, UpdateConfigRequest,
+    };
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tracing_subscriber::layer::SubscriberExt;
@@ -2078,6 +2080,33 @@ mod tests {
             .encode_json_to_message("openshell.v1.CreateSandboxRequest", &json)
             .unwrap();
         let decoded = CreateSandboxRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn dynamic_update_config_round_trip_preserves_annotations() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let request = UpdateConfigRequest {
+            name: "demo".to_string(),
+            annotations: HashMap::from([(
+                "openshell.nvidia.com/policy-signature".to_string(),
+                "signed".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let bytes = request.encode_to_vec();
+        let json = descriptors
+            .decode_message_to_json("openshell.v1.UpdateConfigRequest", &bytes)
+            .unwrap();
+        assert_eq!(
+            json["annotations"]["openshell.nvidia.com/policy-signature"],
+            "signed"
+        );
+        let encoded = descriptors
+            .encode_json_to_message("openshell.v1.UpdateConfigRequest", &json)
+            .unwrap();
+        let decoded = UpdateConfigRequest::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded, request);
     }
 

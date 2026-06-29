@@ -231,7 +231,7 @@ modes:
   write. Client-facing operations that carry an `expected_resource_version`
   field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
   `UpdateProvider`, `UpdateProviderProfiles`, and `UpdateConfig` (policy
-  backfill path).
+  backfill and sandbox annotation updates).
 
 **Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
 protobuf payloads from list results and hydrate `resource_version` from the
