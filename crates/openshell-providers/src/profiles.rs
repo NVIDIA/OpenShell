@@ -11,6 +11,7 @@ use openshell_core::proto::{
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCategory,
     ProviderProfileCredential, ProviderProfileDiscovery,
 };
+use openshell_core::secrets::uses_reserved_revision_namespace;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
@@ -1135,7 +1136,7 @@ pub fn validate_profile_set(
                         "credentials.env_vars",
                         "credential env var must not be empty",
                     ));
-                } else if uses_reserved_placeholder_revision_namespace(env_var.trim()) {
+                } else if uses_reserved_revision_namespace(env_var.trim()) {
                     diagnostics.push(ProfileValidationDiagnostic::error(
                         source,
                         profile_id,
@@ -1661,19 +1662,6 @@ fn is_kubernetes_service_host(host: &str) -> bool {
     let is_cluster_local_service =
         labels.len() == 5 && labels[2] == "svc" && labels[3] == "cluster" && labels[4] == "local";
     (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
-}
-
-fn uses_reserved_placeholder_revision_namespace(key: &str) -> bool {
-    let Some(suffix) = key.strip_prefix('v') else {
-        return false;
-    };
-    let Some((revision, key)) = suffix.split_once('_') else {
-        return false;
-    };
-    !revision.is_empty()
-        && revision.bytes().all(|b| b.is_ascii_digit())
-        && !key.is_empty()
-        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 static DEFAULT_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();

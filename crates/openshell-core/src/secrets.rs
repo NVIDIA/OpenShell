@@ -226,6 +226,9 @@ impl SecretResolver {
         let secret = if let Some(secret) = self.by_placeholder.get(value) {
             secret
         } else {
+            // Once an old generation ages out, the revision number is only a
+            // namespace marker. Fall back by key to the current credential so
+            // long-running child processes survive provider credential refresh.
             let key = revisioned_placeholder_env_key(value).or_else(|| alias_env_key(value))?;
             let canonical = placeholder_for_env_key(key);
             self.by_placeholder.get(&canonical)?
@@ -488,30 +491,25 @@ fn alias_env_key(token: &str) -> Option<&str> {
 
 fn revisioned_placeholder_env_key(token: &str) -> Option<&str> {
     let suffix = token.strip_prefix(PLACEHOLDER_PREFIX)?;
-    let suffix = suffix.strip_prefix('v')?;
-    let underscore = suffix.find('_')?;
-    let (revision, key) = suffix.split_at(underscore);
-    if revision.is_empty() || !revision.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let key = &key[1..];
-    if key.is_empty() || !key.bytes().all(is_env_key_char) {
-        return None;
-    }
+    let (_, key) = split_revisioned_env_key(suffix)?;
     Some(key)
 }
 
-fn uses_reserved_revision_namespace(key: &str) -> bool {
-    let Some(suffix) = key.strip_prefix('v') else {
-        return false;
-    };
-    let Some((revision, key)) = suffix.split_once('_') else {
-        return false;
-    };
-    !revision.is_empty()
-        && revision.bytes().all(|b| b.is_ascii_digit())
-        && !key.is_empty()
-        && key.bytes().all(is_env_key_char)
+pub fn uses_reserved_revision_namespace(key: &str) -> bool {
+    split_revisioned_env_key(key).is_some()
+}
+
+fn split_revisioned_env_key(key: &str) -> Option<(&str, &str)> {
+    let suffix = key.strip_prefix('v')?;
+    let (revision, env_key) = suffix.split_once('_')?;
+    if revision.is_empty()
+        || !revision.bytes().all(|b| b.is_ascii_digit())
+        || env_key.is_empty()
+        || !env_key.bytes().all(is_env_key_char)
+    {
+        return None;
+    }
+    Some((revision, env_key))
 }
 
 fn token_boundary_ok(text: &str, abs_start: usize, token_end: usize, token: &str) -> bool {
@@ -1102,6 +1100,15 @@ mod tests {
     }
 
     #[test]
+    fn reserved_revision_namespace_requires_version_and_key() {
+        assert!(uses_reserved_revision_namespace("v10_GITHUB_TOKEN"));
+        assert!(uses_reserved_revision_namespace("v999999_very_unlikely"));
+        assert!(!uses_reserved_revision_namespace("v_GITHUB_TOKEN"));
+        assert!(!uses_reserved_revision_namespace("v10_"));
+        assert!(!uses_reserved_revision_namespace("GITHUB_TOKEN"));
+    }
+
+    #[test]
     fn rewrites_exact_placeholder_header_values() {
         let (_, resolver) = SecretResolver::from_provider_env(
             [("CUSTOM_TOKEN".to_string(), "secret-token".to_string())]
@@ -1153,6 +1160,27 @@ mod tests {
             )
             .expect("stale revision should fall back to current alias"),
             "Authorization: Bearer ghp-current"
+        );
+    }
+
+    #[test]
+    fn stale_revisioned_placeholder_fails_when_key_is_unknown() {
+        let (_, resolver) = SecretResolver::from_provider_env_for_revision_with_current_aliases(
+            [("GITHUB_TOKEN".to_string(), "ghp-current".to_string())]
+                .into_iter()
+                .collect(),
+            HashMap::new(),
+            42,
+            true,
+        );
+        let resolver = resolver.expect("resolver");
+
+        assert!(
+            rewrite_header_line_checked(
+                "Authorization: Bearer openshell:resolve:env:v999999_very_unlikely",
+                &resolver,
+            )
+            .is_err()
         );
     }
 
