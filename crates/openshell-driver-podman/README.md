@@ -42,7 +42,7 @@ The container spec in `container.rs` sets these security-critical fields:
 |---|---|---|
 | `user` | `0:0` | The supervisor needs root inside the container for namespace creation, proxy setup, Landlock, seccomp, and filesystem preparation. |
 | `cap_drop` | Selected unneeded defaults | Podman's default capability set is already restricted. The driver drops capabilities the supervisor does not need. |
-| `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`, `DAC_READ_SEARCH` | Grants supervisor-only capabilities required for namespace setup, process identity, and bypass diagnostics. |
+| `cap_add` | `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYSLOG`, `DAC_READ_SEARCH`, `SETPCAP` | Grants supervisor-only capabilities required for namespace setup, process identity, bypass diagnostics, and child bounding-set cleanup. |
 | `no_new_privileges` | `true` | Prevents privilege escalation after exec. |
 | `seccomp_profile_path` | `unconfined` | The supervisor installs its own policy-aware BPF filter. A container-level profile can block Landlock/seccomp syscalls during setup. |
 | `mounts` | Private tmpfs at `/run/netns` | Lets the supervisor create named network namespaces in rootless Podman. |
@@ -98,12 +98,15 @@ openshell sandbox create \
 | `SYS_PTRACE` | Reading `/proc/<pid>/exe` and walking process ancestry for binary identity. |
 | `SYSLOG` | Reading `/dev/kmsg` for bypass-detection diagnostics. |
 | `DAC_READ_SEARCH` | Reading `/proc/<pid>/fd/` across UIDs so the proxy can resolve the binary responsible for a connection. |
+| `SETPCAP` | Clearing the restricted child process capability bounding set before exec. |
 
 The driver intentionally keeps Podman's default `SETUID`, `SETGID`, `CHOWN`,
 and `FOWNER` capabilities because the supervisor needs them to drop privileges
-and prepare writable sandbox directories. It drops unneeded defaults such as
+and prepare writable sandbox directories. It also keeps `SETPCAP` until child
+setup so `drop_privileges()` can clear the child capability bounding set before
+exec. It drops unneeded defaults such as
 `DAC_OVERRIDE`, `FSETID`, `KILL`, `NET_BIND_SERVICE`, `NET_RAW`, `SETFCAP`,
-`SETPCAP`, and `SYS_CHROOT`.
+and `SYS_CHROOT`.
 
 ## Supervisor Sideloading
 

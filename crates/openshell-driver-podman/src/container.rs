@@ -877,8 +877,6 @@ pub fn build_container_spec_with_token_and_gpu_devices(
             "NET_RAW".into(),
             // Not needed: the supervisor does not manipulate file capabilities.
             "SETFCAP".into(),
-            // Not needed: the supervisor does not manage its own capability bounding set.
-            "SETPCAP".into(),
             // Not needed: the supervisor does not call chroot().
             "SYS_CHROOT".into(),
         ],
@@ -899,13 +897,18 @@ pub fn build_container_spec_with_token_and_gpu_devices(
             // Without it the proxy cannot determine which binary made each outbound
             // connection and all traffic is denied.
             "DAC_READ_SEARCH".into(),
+            // Child setup clears the capability bounding set before exec, which
+            // requires CAP_SETPCAP in the supervisor until drop_privileges().
+            "SETPCAP".into(),
         ],
-        // SETUID, SETGID, CHOWN, and FOWNER are intentionally kept from Podman's
-        // default set and not dropped:
+        // SETUID, SETGID, SETPCAP, CHOWN, and FOWNER are intentionally kept from
+        // Podman's default set and not dropped:
         //   SETUID/SETGID – drop_privileges(): setuid()/setgid()/initgroups() to the
         //                   sandbox user. In rootless Podman cap_drop:ALL removes them
         //                   from the bounding set even though uid=0 owns the user
         //                   namespace — so we keep them by not dropping them explicitly.
+        //   SETPCAP       – drop_privileges(): clears the child capability
+        //                   bounding set before the sandbox user execs.
         //   CHOWN         – prepare_filesystem(): chown(path, uid, gid) on newly
         //                   created read_write directories so the sandbox user can
         //                   write to them.
@@ -1451,12 +1454,14 @@ mod tests {
             added.contains(&"DAC_READ_SEARCH"),
             "missing DAC_READ_SEARCH"
         );
+        assert!(added.contains(&"SETPCAP"), "missing SETPCAP");
 
         // SETUID and SETGID are NOT in cap_add — they remain available from the
         // default bounding set because we no longer use cap_drop:ALL. Verify they
-        // are also not explicitly dropped. Similarly CHOWN and FOWNER must not be
-        // dropped because prepare_filesystem() calls chown() on newly created
-        // read_write directories before the supervisor drops privileges.
+        // are also not explicitly dropped. Similarly SETPCAP, CHOWN and FOWNER
+        // must not be dropped because child setup clears the bounding set and
+        // prepare_filesystem() calls chown() on newly created read_write
+        // directories before the supervisor drops privileges.
         let dropped: Vec<&str> = spec["cap_drop"]
             .as_array()
             .expect("cap_drop should be an array")
@@ -1472,6 +1477,10 @@ mod tests {
         assert!(
             !dropped.contains(&"FOWNER"),
             "FOWNER must not be dropped (needed for chown on non-owned files)"
+        );
+        assert!(
+            !dropped.contains(&"SETPCAP"),
+            "SETPCAP must not be dropped (needed for child bounding-set clear)"
         );
         assert!(
             !dropped.contains(&"ALL"),

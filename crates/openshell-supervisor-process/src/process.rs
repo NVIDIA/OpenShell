@@ -155,6 +155,46 @@ fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn drop_capability_bounding_set() -> Result<()> {
+    let clear_result = capctl::caps::bounding::clear();
+    let remaining = capctl::caps::bounding::probe();
+
+    validate_capability_bounding_set_clear(
+        clear_result,
+        remaining,
+        capctl::caps::bounding::clear_unknown,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn validate_capability_bounding_set_clear(
+    clear_result: capctl::Result<()>,
+    remaining: capctl::caps::CapSet,
+    clear_unknown: impl FnOnce() -> capctl::Result<()>,
+) -> Result<()> {
+    match clear_result {
+        Ok(()) if remaining.is_empty() => Ok(()),
+        Ok(()) => Err(miette::miette!(
+            "Failed to clear child capability bounding set: capabilities remain raised: {remaining:?}"
+        )),
+        Err(err) if err.code() == libc::EPERM && remaining.is_empty() => match clear_unknown() {
+            Ok(()) => {
+                debug!(
+                    "CAP_SETPCAP is unavailable, but the child capability bounding set is already empty"
+                );
+                Ok(())
+            }
+            Err(unknown_err) => Err(miette::miette!(
+                "Failed to clear unknown child capability bounding set entries: {unknown_err}"
+            )),
+        },
+        Err(err) => Err(miette::miette!(
+            "Failed to clear child capability bounding set: {err}"
+        )),
+    }
+}
+
 // Pins the pre-seccomp child mount namespace where supervisor identity sockets
 // are shadowed. Children enter it with setns before dropping privileges.
 #[cfg(target_os = "linux")]
@@ -969,6 +1009,9 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         ));
     }
 
+    #[cfg(target_os = "linux")]
+    drop_capability_bounding_set()?;
+
     if user_name.is_some() {
         nix::unistd::setuid(user.uid).into_diagnostic()?;
 
@@ -1083,6 +1126,101 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_available() -> bool {
+        capctl::caps::CapState::get_current()
+            .is_ok_and(|state| state.effective.has(capctl::caps::Cap::SETPCAP))
+            || capctl::caps::bounding::probe().is_empty()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_accepts_empty_eperm() {
+        let remaining = capctl::caps::CapSet::empty();
+
+        assert!(
+            validate_capability_bounding_set_clear(
+                Err(capctl::Error::from_code(libc::EPERM)),
+                remaining,
+                || Ok(()),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_rejects_nonempty_eperm() {
+        let mut remaining = capctl::caps::CapSet::empty();
+        remaining.add(capctl::caps::Cap::CHOWN);
+
+        let result = validate_capability_bounding_set_clear(
+            Err(capctl::Error::from_code(libc::EPERM)),
+            remaining,
+            || panic!("unknown capabilities should not be checked when known caps remain"),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to clear child capability bounding set")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_rejects_nonempty_success() {
+        let mut remaining = capctl::caps::CapSet::empty();
+        remaining.add(capctl::caps::Cap::CHOWN);
+
+        let result = validate_capability_bounding_set_clear(Ok(()), remaining, || {
+            panic!("unknown capabilities should not be checked when known caps remain")
+        });
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("capabilities remain raised")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_bounding_set_clear_rejects_unknown_eperm() {
+        let remaining = capctl::caps::CapSet::empty();
+
+        let result = validate_capability_bounding_set_clear(
+            Err(capctl::Error::from_code(libc::EPERM)),
+            remaining,
+            || Err(capctl::Error::from_code(libc::EPERM)),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to clear unknown child capability bounding set entries")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn capability_probe_child() {
+        if std::env::var_os("OPENSHELL_TEST_PROBE_CHILD_CAPS").is_none() {
+            return;
+        }
+
+        assert!(
+            capctl::caps::bounding::probe().is_empty(),
+            "child CapBnd should be empty after exec"
+        );
+    }
+
     #[test]
     fn drop_privileges_noop_when_no_user_or_group() {
         let policy = policy_with_process(ProcessPolicy {
@@ -1130,7 +1268,67 @@ mod tests {
             run_as_group: Some(current_group.name),
         });
 
-        assert!(drop_privileges(&policy).is_ok());
+        let result = drop_privileges(&policy);
+
+        #[cfg(target_os = "linux")]
+        {
+            if capability_bounding_set_clear_available() {
+                assert!(result.is_ok(), "drop_privileges failed: {result:?}");
+            } else {
+                let msg = format!("{}", result.unwrap_err());
+                assert!(
+                    msg.contains("Failed to clear child capability bounding set"),
+                    "unexpected failure: {msg}"
+                );
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn drop_privileges_clears_bounding_set_for_spawned_child_when_permitted() {
+        use std::os::unix::process::CommandExt;
+
+        if !capability_bounding_set_clear_available() {
+            eprintln!(
+                "skipping: CAP_SETPCAP is not effective and the capability bounding set is nonempty"
+            );
+            return;
+        }
+
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("getgrgid")
+            .expect("current group entry");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: Some(current_group.name),
+        });
+
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
+        cmd.arg("capability_probe_child")
+            .arg("--nocapture")
+            .env("OPENSHELL_TEST_PROBE_CHILD_CAPS", "1")
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped());
+
+        unsafe {
+            cmd.pre_exec(move || {
+                drop_privileges(&policy).map_err(|err| std::io::Error::other(err.to_string()))
+            });
+        }
+
+        let output = cmd.output().expect("spawn child status probe");
+        assert!(
+            output.status.success(),
+            "status probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

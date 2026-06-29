@@ -14,7 +14,12 @@ Each sandbox workload has two trust levels:
 | Agent child | Runs as an unprivileged user with filesystem, process, and network restrictions applied. |
 
 The supervisor keeps enough privilege to manage the sandbox, but the agent child
-loses that privilege before user code runs.
+loses that privilege before user code runs. On Linux, child setup clears the
+capability bounding set during privilege drop so later execs cannot regain
+container-granted capabilities. This is fail-closed: the supervisor retains
+`CAP_SETPCAP` solely to perform the clear, and spawning the workload or SSH shell
+aborts unless the bounding set ends up empty. A `setpcap` `EPERM` is tolerated
+only when the set is already empty; any other outcome fails the spawn.
 
 ## Startup Flow
 
