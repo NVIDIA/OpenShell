@@ -1,16 +1,10 @@
 # Codebase grounding (supporting material for RFC 0012)
 
-This file backs the claims [RFC 0012](./README.md) makes about the current
-system, so a reviewer can verify them. It is supporting material, not part of the
-normative RFC.
+This non-normative file grounds RFC 0012's claims about the current system.
 
-Verified against the RFC's parent commit `a5161d0` (`origin/main` has since
-advanced; these references are pinned to that parent). Form a permalink as
-`https://github.com/NVIDIA/OpenShell/blob/a5161d0/<path>#L<line>`. After #1650
-the supervisor split into `openshell-supervisor-network` (proxy, OPA, procfs
-identity) and `openshell-supervisor-process` (spawn, SSH, netns creation,
-seccomp/Landlock). References are line-pinned and will drift; the `rg` patterns
-let a reviewer re-locate them.
+References are pinned to the RFC's parent, `a5161d0`. Permalinks use
+`https://github.com/NVIDIA/OpenShell/blob/a5161d0/<path>#L<line>`; the `rg`
+patterns locate the same code on newer revisions.
 
 | Claim | Reference |
 |---|---|
@@ -26,4 +20,4 @@ let a reviewer re-locate them.
 | Agent command via CLI/`SANDBOX_COMMAND`; no admission-bound spec field today; the `sleep infinity` placeholder resolves `sleep` from the agent image's own filesystem | `crates/openshell-sandbox/src/main.rs:331`; K8s driver sets `sleep infinity` at `driver.rs:1886` (`rg -n "sleep infinity" crates/openshell-driver-kubernetes/src`) |
 | Init containers: `copy-self` (trusted, the OpenShell binary) and `workspace-init` (runs as root from the agent's own image, so its executables are image-provided); no native sidecars today | `driver.rs:191` (`WORKSPACE_INIT_CONTAINER_NAME`), `:993` (`copy-self` invocation), `:1185` (workspace-init container); `rg -n "restart_policy|workspace-init" crates/openshell-driver-kubernetes/src` |
 | Network policy is OPA per-CONNECT, not the boundary; identity via procfs | `crates/openshell-supervisor-network/src/opa.rs` (`NetworkInput`: `binary_path`/`binary_sha256`/`ancestors`/`cmdline_paths`), `procfs.rs`, glued in `proxy.rs:1611` (`NetworkInput` built in `evaluate_opa_tcp`) |
-| Static privilege ceiling on every spawned process; OPA never evaluates exec | `process.rs:440` (`ProcessHandle::spawn` applies the pre-exec ceiling: `drop_privileges` at `:932`, seccomp/Landlock `enforce` from `SandboxPolicy`; SSH reaches the same `enter_netns_and_sandbox`) |
+| Static privilege ceiling on every spawned process; OPA never evaluates exec | `process.rs:440` (`ProcessHandle::spawn`), `:603`/`:700` (`drop_privileges` call sites), `:613`/`:705` (sandbox enforcement); SSH reaches the same `enter_netns_and_sandbox` path |
