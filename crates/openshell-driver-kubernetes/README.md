@@ -114,15 +114,16 @@ resource details.
 
 Use PVC volumes to mount existing Kubernetes PersistentVolumeClaims into the
 agent container. PVC volumes and mounts default to read-only unless
-`read_only: false` is set explicitly. A read-only PVC volume cannot be mounted
-read-write. The driver rejects duplicate volume names, mounts that reference
-unknown volumes, non-normalized or protected mount paths, and absolute or
-parent-traversing `sub_path` values.
+`read_only: false` is set explicitly. Read-write access requires
+`read_only: false` on both the PVC volume and each writable mount. The driver
+rejects duplicate volume names, invalid DNS-1123 volume or PVC claim names,
+mounts that reference unknown volumes, non-normalized or protected mount paths,
+and absolute or parent-traversing `sub_path` values.
 
-Any explicit driver-config mount under `/sandbox/` disables the driver's
-default `/sandbox` workspace PVC injection for that sandbox. This keeps image
-contents fresh while allowing selected durable data paths to come from an
-external PVC.
+Any explicit driver-config mount under `/sandbox` disables the driver's
+default `/sandbox` workspace PVC injection for that sandbox. Only the explicit
+mount paths persist through the external PVC; other `/sandbox` paths come from
+the current sandbox image.
 
 ```shell
 openshell sandbox create \

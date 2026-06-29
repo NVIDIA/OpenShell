@@ -3,6 +3,7 @@
 
 //! Shared validation helpers for driver-config mounts.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 const RESERVED_MOUNT_TARGETS: &[&str] = &[
@@ -11,6 +12,11 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/etc/openshell-tls",
     "/run/netns",
 ];
+
+/// Serde default helper for mount options that default to read-only.
+pub fn default_true() -> bool {
+    true
+}
 
 /// Validate a non-empty driver mount source.
 pub fn validate_mount_source(source: &str, field: &str) -> Result<String, String> {
@@ -96,11 +102,28 @@ fn normalize_container_mount_target(target: &str) -> String {
     target.trim_end_matches('/').to_string()
 }
 
-fn path_is_or_under(path: &str, parent: &str) -> bool {
+/// Return true when `path` is exactly `parent` or is contained below it.
+pub fn path_is_or_under(path: &str, parent: &str) -> bool {
     path == parent
         || path
             .strip_prefix(parent)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Validate that already-normalized driver mount targets are unique.
+pub fn validate_unique_mount_targets<'a>(
+    targets: impl IntoIterator<Item = &'a str>,
+    driver_name: &str,
+) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for target in targets {
+        if !seen.insert(target) {
+            return Err(format!(
+                "duplicate {driver_name} driver_config mount target '{target}'"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -141,6 +164,24 @@ mod tests {
         assert_eq!(
             validate_container_mount_target("/etc/openshell-tools").unwrap(),
             "/etc/openshell-tools"
+        );
+    }
+
+    #[test]
+    fn path_is_or_under_matches_boundaries() {
+        assert!(path_is_or_under("/sandbox", "/sandbox"));
+        assert!(path_is_or_under("/sandbox/work", "/sandbox"));
+        assert!(!path_is_or_under("/sandbox-work", "/sandbox"));
+    }
+
+    #[test]
+    fn unique_mount_targets_rejects_duplicates() {
+        let err =
+            validate_unique_mount_targets(["/sandbox/work", "/sandbox/work"], "test").unwrap_err();
+
+        assert_eq!(
+            err,
+            "duplicate test driver_config mount target '/sandbox/work'"
         );
     }
 
