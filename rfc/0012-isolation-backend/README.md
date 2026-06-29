@@ -228,8 +228,6 @@ trait BoundaryTerminal: Send + Sync {
 
 `MediationIngress` is the proxy's backend-neutral source of workload connections. In-pod wraps the proxy's local listener; delegated backends use their private transport. `ExecSpec` carries command, arguments, environment, working directory, and PTY settings. Streams are owned, non-PTY stdout and stderr remain separate, and PTYs support resize. Port forwarding accepts only validated loopback targets. Event loss, exit status, and signals are explicit and placement-neutral; a local PID is never the process handle. `BoundaryControl::wait_terminated` reports boundary loss separately from agent exit.
 
-`MediationIngress`, `BoundaryControl`, and admission binding are contract additions not yet present in the in-pod reference implementation. Adopting them there is behavior-preserving refactor work.
-
 The claim carries only the common content every backend needs:
 
 ```rust
@@ -303,7 +301,7 @@ Only `Unavailable` from `attach` is automatically retryable, always against the 
 
 Every backend satisfies these invariants:
 
-1. **No unguarded workload egress.** Before untrusted execution and until the execution domain is drained, the workload reaches no egress but the proxy. Enforcement is effective default-deny across every protocol the platform supports, including IPv4, IPv6, raw and packet sockets, and ingress. The backend confirms behavior, not merely installed rules, and does not assume a CNI or host route provides the deny. The current in-pod backend does not yet satisfy this release gate (see Risks).
+1. **No unguarded workload egress.** Before untrusted execution and until the execution domain is drained, the workload reaches no egress but the proxy. Enforcement is effective default-deny across every protocol the platform supports, including IPv4, IPv6, raw and packet sockets, and ingress. The backend confirms behavior, not merely installed rules, and does not assume a CNI or host route provides the deny.
 2. **No untrusted workload execution before `Ready`.** Workload code includes the agent image, workspace, mounts, and image-provided init code. Only digest-pinned OpenShell content may run before claim and `Ready`. Typestate enforces ordering before `Running`; calls made after dynamic termination fail closed.
 3. **No unattributed workload execution.** Agent start, `exec`, and `connect` require a bound claim. A warm pool runs only its trusted placeholder before claim. Supervisor adoption removes direct launch paths that bypass the contract.
 4. **Preserve the driver's execution domain.** Every workload descendant remains within the admitted cgroup, runtime security context, and device allocation carried by `ResourceBinding`. A privileged helper sees workload devices only through an admission-visible, audited authorization.
