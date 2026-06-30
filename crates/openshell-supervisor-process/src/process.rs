@@ -26,7 +26,7 @@ use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use tokio::process::{Child, Command};
-use tracing::debug;
+use tracing::{debug, warn};
 
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::SANDBOX_TOKEN,
@@ -189,6 +189,14 @@ fn validate_capability_bounding_set_clear(
                 "Failed to clear unknown child capability bounding set entries: {unknown_err}"
             )),
         },
+        Err(err) if err.code() == libc::EPERM => {
+            warn!(
+                ?remaining,
+                "CAP_SETPCAP is unavailable and the child capability bounding set is non-empty; \
+                 the child process relies on seccomp and Landlock for confinement"
+            );
+            Ok(())
+        }
         Err(err) => Err(miette::miette!(
             "Failed to clear child capability bounding set: {err}"
         )),
@@ -1150,22 +1158,17 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn capability_bounding_set_clear_rejects_nonempty_eperm() {
+    fn capability_bounding_set_clear_tolerates_nonempty_eperm() {
         let mut remaining = capctl::caps::CapSet::empty();
         remaining.add(capctl::caps::Cap::CHOWN);
 
-        let result = validate_capability_bounding_set_clear(
-            Err(capctl::Error::from_code(libc::EPERM)),
-            remaining,
-            || panic!("unknown capabilities should not be checked when known caps remain"),
-        );
-
-        assert!(result.is_err());
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to clear child capability bounding set")
+            validate_capability_bounding_set_clear(
+                Err(capctl::Error::from_code(libc::EPERM)),
+                remaining,
+                || panic!("unknown capabilities should not be checked when known caps remain"),
+            )
+            .is_ok()
         );
     }
 
