@@ -39,6 +39,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "loggi
 rustls-pemfile = "2"
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
 webpki-roots = "1"
+rustls-native-certs = "0.8"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -79,7 +80,7 @@ tower-mcp-types = "0.12.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 
 # WebSocket
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 
 # Clipboard (OSC 52)
 base64 = "0.22"
@@ -106,10 +107,10 @@ protobuf-src = "1.1.0"
 url = "2"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "migrate"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "sqlite", "migrate", "macros"] }
 
 # Kubernetes
-kube = { version = "0.90", features = ["runtime", "derive"] }
+kube = { version = "0.90", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
 kube-runtime = "0.90"
 k8s-openapi = { version = "0.21.1", features = ["v1_26"] }
 
@@ -117,7 +118,7 @@ k8s-openapi = { version = "0.21.1", features = ["v1_26"] }
 uuid = { version = "1.10", features = ["v4"] }
 
 # SMT solver (uses system libz3; enable z3/bundled via the prover's bundled-z3 feature for local dev without system z3)
-z3 = "0.19"
+z3 = "0.20"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

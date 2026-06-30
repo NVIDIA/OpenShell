@@ -18,7 +18,7 @@ path = "src/main.rs"
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
-openshell-supervisor-network = { path = "../openshell-supervisor-network" }
+openshell-supervisor-network = { path = "../openshell-supervisor-network", default-features = false }
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 # Async runtime
@@ -45,11 +45,13 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
 [features]
-default = ["telemetry"]
+default = ["telemetry", "bundled-ca-roots"]
 ## Compile in telemetry activity collection (forwards to openshell-core/telemetry).
 ## On by default; build with `--no-default-features` for a telemetry-free sandbox
 ## supervisor that never collects or forwards activity summaries.
 telemetry = ["openshell-core/telemetry"]
+bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
+system-ca-roots = ["openshell-supervisor-network/system-ca-roots"]
 
 [dev-dependencies]
 openshell-core = { path = "../openshell-core", features = ["test-helpers"] }

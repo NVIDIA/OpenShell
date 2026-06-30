@@ -8,7 +8,7 @@
 //! store, terminates TLS from the client (presenting dynamic certs per hostname),
 //! inspects the plaintext HTTP, then re-encrypts to upstream using real root CAs.
 
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, miette};
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ServerConfig};
@@ -19,6 +19,12 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+#[cfg(all(feature = "bundled-ca-roots", feature = "system-ca-roots"))]
+compile_error!("features bundled-ca-roots and system-ca-roots are mutually exclusive");
+
+#[cfg(not(any(feature = "bundled-ca-roots", feature = "system-ca-roots")))]
+compile_error!("one of bundled-ca-roots or system-ca-roots must be enabled");
 
 const MAX_CACHED_CERTS: usize = 256;
 
@@ -180,7 +186,7 @@ pub async fn tls_terminate_client(
     Ok(tls_stream)
 }
 
-/// Connect TLS to an upstream server, verifying against webpki-roots.
+/// Connect TLS to an upstream server, verifying against the configured CA roots.
 ///
 /// Returns a TLS stream for re-encrypted upstream communication.
 pub async fn tls_connect_upstream(
@@ -197,34 +203,75 @@ pub async fn tls_connect_upstream(
     Ok(tls_stream)
 }
 
-/// Build a rustls `ClientConfig` with Mozilla + system root CAs for upstream connections.
+/// Build a rustls `ClientConfig` using the configured CA root source.
 ///
-/// `system_ca_bundle` is the pre-read PEM contents of the system CA bundle
-/// (from [`read_system_ca_bundle`]). Pass the same string to [`write_ca_files`]
-/// to avoid reading the bundle from disk twice.
-pub fn build_upstream_client_config(system_ca_bundle: &str) -> Arc<ClientConfig> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    // System bundles typically overlap with webpki-roots (Mozilla roots);
-    // duplicates are harmless and ensure we also pick up any custom/corporate CAs.
-    let (added, ignored) = load_pem_certs_into_store(&mut root_store, system_ca_bundle);
-    if added > 0 {
-        tracing::debug!(added, "Loaded system CA certificates for upstream TLS");
-    }
-    if ignored > 0 {
-        tracing::warn!(
-            ignored,
-            "Some system CA certificates could not be parsed and were ignored"
-        );
-    }
-
+/// In `bundled-ca-roots` mode this uses Mozilla roots from `webpki-roots` overlaid
+/// with any locally-installed CAs from `system_ca_bundle` (e.g. corporate or private
+/// CAs added to `/etc/pki/ca-trust`). Duplicates with the Mozilla bundle are harmless.
+///
+/// In `system-ca-roots` mode this uses the platform/native trust store exclusively;
+/// `system_ca_bundle` is ignored because the native store already reflects all
+/// operator-installed trust anchors.
+pub fn build_upstream_client_config(system_ca_bundle: &str) -> Result<Arc<ClientConfig>> {
     let mut config = ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .with_root_certificates(build_upstream_root_store(system_ca_bundle)?)
         .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
-    Arc::new(config)
+    Ok(Arc::new(config))
+}
+
+fn build_upstream_root_store(system_ca_bundle: &str) -> Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore::empty();
+
+    #[cfg(feature = "bundled-ca-roots")]
+    {
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Overlay system/corporate CAs so custom trust anchors are honoured in
+        // default upstream builds. Duplicates with webpki-roots are harmless.
+        let (added, ignored) = load_pem_certs_into_store(&mut root_store, system_ca_bundle);
+        if added > 0 {
+            tracing::debug!(added, "loaded system CA certificates for upstream TLS");
+        }
+        if ignored > 0 {
+            tracing::warn!(
+                ignored,
+                "some system CA certificates could not be parsed and were ignored"
+            );
+        }
+    }
+
+    #[cfg(feature = "system-ca-roots")]
+    {
+        let _ = system_ca_bundle; // native store already includes operator-installed CAs
+        add_native_roots(&mut root_store)?;
+    }
+
+    if root_store.is_empty() {
+        return Err(miette!("no TLS root certificates available"));
+    }
+
+    Ok(root_store)
+}
+
+#[cfg(feature = "system-ca-roots")]
+fn add_native_roots(root_store: &mut rustls::RootCertStore) -> Result<()> {
+    let native_certs = rustls_native_certs::load_native_certs();
+    let cert_count = native_certs.certs.len();
+    let (added, ignored) = root_store.add_parsable_certificates(native_certs.certs);
+    let ignored = ignored + native_certs.errors.len();
+
+    if ignored > 0 {
+        tracing::debug!(ignored, "ignored unparsable native root certificates");
+    }
+
+    if added == 0 {
+        return Err(miette!(
+            "no usable native TLS root certificates found ({cert_count} loaded, {ignored} ignored)"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Write CA certificate files for the sandbox trust store.
@@ -234,8 +281,7 @@ pub fn build_upstream_client_config(system_ca_bundle: &str) -> Arc<ClientConfig>
 /// 2. Combined bundle: system CAs + sandbox CA (for `SSL_CERT_FILE` which replaces default)
 ///
 /// `system_ca_bundle` is the pre-read PEM contents of the system CA bundle
-/// (from [`read_system_ca_bundle`]). Pass the same string to
-/// [`build_upstream_client_config`] to avoid reading the bundle from disk twice.
+/// (from [`read_system_ca_bundle`]).
 ///
 /// Returns `(ca_cert_path, combined_bundle_path)`.
 pub fn write_ca_files(
@@ -266,6 +312,7 @@ pub fn write_ca_files(
 /// Returns `(added, ignored)` counts. Invalid or unparseable certificates
 /// are silently ignored, matching the behavior of
 /// `RootCertStore::add_parsable_certificates`.
+#[cfg_attr(feature = "system-ca-roots", allow(dead_code))]
 fn load_pem_certs_into_store(
     root_store: &mut rustls::RootCertStore,
     pem_data: &str,
@@ -289,7 +336,7 @@ fn load_pem_certs_into_store(
 ///
 /// Returns the PEM contents of the first non-empty bundle found, or an empty
 /// string if none of the well-known paths exist. Call once and pass the result
-/// to both [`write_ca_files`] and [`build_upstream_client_config`].
+/// to [`write_ca_files`].
 pub fn read_system_ca_bundle() -> String {
     for path in SYSTEM_CA_PATHS {
         if let Ok(contents) = std::fs::read_to_string(path)
@@ -299,7 +346,6 @@ pub fn read_system_ca_bundle() -> String {
         }
     }
     // No system bundle found — combined file will contain only the sandbox CA.
-    // This is acceptable since the proxy uses webpki-roots independently.
     String::new()
 }
 
@@ -426,7 +472,7 @@ mod tests {
     #[test]
     fn upstream_config_alpn() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let config = build_upstream_client_config("");
+        let config = build_upstream_client_config("").unwrap();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 
