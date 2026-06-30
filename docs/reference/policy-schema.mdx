@@ -296,7 +296,7 @@ Use `rules` for MCP allow rules and `deny_rules` for MCP deny rules. Deny rules 
 | `tool` | string or matcher | No | Convenience matcher for `tools/call` `params.name`. Supports a glob string or `{ any: [...] }`. Requires `method: tools/call` unless `mcp.allow_all_known_mcp_methods` is `true`; validation fails otherwise. Omit to match every tool. |
 | `params` | map | No | MCP currently accepts only `params.name` as a lower-level tool-name matcher. Requires `method: tools/call` unless `mcp.allow_all_known_mcp_methods` is `true`; validation fails otherwise. Tool argument matching is not supported yet; allowed tools accept all argument payloads by default. |
 
-Example MCP rules:
+An MCP client first sends `initialize`. After the server returns a successful response, the client sends `notifications/initialized`. After initialization completes and the server advertises the `tools` capability, the client can call an advertised tool. The response does not need an allow rule because these rules inspect messages sent from the client to the server. This example adds both client initialization messages to the existing tool rules. It omits `tools/list` because it assumes the client already knows the tool names; add that method when the client performs discovery.
 
 ```yaml showLineNumbers={false}
 endpoints:
@@ -308,6 +308,10 @@ endpoints:
     mcp:
       max_body_bytes: 131072
     rules:
+      - allow:
+          method: initialize
+      - allow:
+          method: notifications/initialized
       - allow:
           method: tools/call
           tool: search_web
