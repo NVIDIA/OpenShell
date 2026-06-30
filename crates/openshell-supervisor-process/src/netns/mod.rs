@@ -470,7 +470,7 @@ pub fn create_netns_for_proxy(
 /// Install pod-network bypass enforcement for Kubernetes sidecar topology.
 ///
 /// This runs in the current network namespace, not in a per-workload netns.
-/// The rules allow loopback and the sidecar proxy UID, then reject direct
+/// The rules allow loopback and the proxy UID, then reject direct
 /// TCP/UDP egress from other UIDs so traffic must use the sidecar's local
 /// proxy.
 ///

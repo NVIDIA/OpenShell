@@ -57,6 +57,49 @@ tests:
           path: metadata.namespace
           value: other-ns
 
+  - it: grants only pod get for sandbox token bootstrap
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - pods
+            verbs:
+              - get
+
+  - it: grants sandbox RBAC for proxy-pod supervisor Deployments
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - deployments
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - watch
+
+  - it: grants ReplicaSet get for proxy-pod supervisor token bootstrap
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - replicasets
+            verbs:
+              - get
+
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml
     set:

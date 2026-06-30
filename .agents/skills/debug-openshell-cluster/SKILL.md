@@ -274,8 +274,8 @@ If `supervisor_topology = "sidecar"` is rendered, sandbox pods should have an
 `openshell-supervisor-network` container running `--mode=network`. The init
 container owns nftables setup and should be the only sidecar topology container
 with `NET_ADMIN`. It also needs `CHOWN`/`FOWNER` to hand shared emptyDir state
-to `sidecar_proxy_uid`. The long-running network sidecar runs as
-`sidecar_proxy_uid` with primary GID `0` so it can read the root-owned,
+to `proxy_uid`. The long-running network sidecar runs as
+`proxy_uid` with primary GID `0` so it can read the root-owned,
 group-readable projected service-account token. In sidecar topology the
 `openshell-sa-token` projected volume should render `defaultMode: 288` (`0440`);
 if the proxy logs `failed to read K8s SA token`, verify this token mode and the
@@ -284,6 +284,21 @@ workload entrypoint PID to `OPENSHELL_ENTRYPOINT_PID_FILE`
 (`/run/openshell-sidecar/entrypoint.pid` by default), and the network sidecar
 should read it for binary-scoped policy decisions; if allowed network rules are
 all denied, inspect that file and the network sidecar logs.
+
+If `supervisor_topology = "proxy-pod"` is rendered, each sandbox should have a
+separate supervisor Deployment with one supervisor pod, a headless supervisor
+Service, a proxy CA Secret, and two per-sandbox NetworkPolicies. The agent pod
+should have `openshell.ai/sandbox-role=agent`; the supervisor pod should have
+`openshell.ai/sandbox-role=supervisor`; both should share the same
+`openshell.ai/sandbox-id`. The supervisor Deployment must have a controlling
+`Sandbox` ownerReference. The Deployment pod template must carry the
+`openshell.io/sandbox-id` annotation so the TokenReview bootstrap path can mint
+a sandbox JWT. For supervisor pods, the gateway validates the
+`Pod -> ReplicaSet -> Deployment -> Sandbox` owner chain, so missing
+`apps/replicasets get` RBAC can also break bootstrap. If the agent cannot reach
+the gateway, check DNS to the headless Service, the agent egress NetworkPolicy
+DNS exception for kube-dns/CoreDNS, and the supervisor ingress NetworkPolicy
+allowing only that agent pod on ports `3128` and `18080`.
 Inspect all three when sandbox registration or egress enforcement fails:
 
 ```bash

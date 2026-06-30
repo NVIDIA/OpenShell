@@ -63,6 +63,28 @@ impl SandboxCa {
         })
     }
 
+    /// Load an existing CA certificate and private key from PEM.
+    pub fn from_pem(ca_cert_pem: &str, ca_key_pem: &str) -> Result<Self> {
+        let ca_key = KeyPair::from_pem(ca_key_pem).into_diagnostic()?;
+        let ca_cert = CertificateParams::from_ca_cert_pem(ca_cert_pem)
+            .into_diagnostic()?
+            .self_signed(&ca_key)
+            .into_diagnostic()?;
+
+        Ok(Self {
+            ca_cert,
+            ca_key,
+            ca_cert_pem: ca_cert_pem.to_string(),
+        })
+    }
+
+    /// Load an existing CA certificate and private key from files.
+    pub fn from_files(cert_path: &Path, key_path: &Path) -> Result<Self> {
+        let ca_cert_pem = std::fs::read_to_string(cert_path).into_diagnostic()?;
+        let ca_key_pem = std::fs::read_to_string(key_path).into_diagnostic()?;
+        Self::from_pem(&ca_cert_pem, &ca_key_pem)
+    }
+
     /// Returns the CA certificate in PEM format.
     pub fn cert_pem(&self) -> &str {
         &self.ca_cert_pem
@@ -517,6 +539,20 @@ mod tests {
         assert!(
             rustls_pemfile::certs(&mut reader).any(|r| r.is_ok()),
             "bundle should contain at least one cert",
+        );
+    }
+
+    #[test]
+    fn sandbox_ca_loads_from_pem() {
+        let ca = SandboxCa::generate().unwrap();
+        let key_pem = ca.ca_key.serialize_pem();
+        let loaded = SandboxCa::from_pem(ca.cert_pem(), &key_pem).unwrap();
+
+        assert_eq!(loaded.cert_pem(), ca.cert_pem());
+        assert!(
+            CertCache::new(loaded)
+                .get_or_generate("example.com")
+                .is_ok()
         );
     }
 }

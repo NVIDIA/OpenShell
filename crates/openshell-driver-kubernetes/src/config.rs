@@ -15,7 +15,7 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
-/// Default UID for the long-running Kubernetes network supervisor sidecar.
+/// Default UID for the long-running Kubernetes network proxy.
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 
 /// How the supervisor binary is delivered into sandbox pods.
@@ -65,6 +65,9 @@ pub enum SupervisorTopology {
     /// Run network supervision in a privileged sidecar and process supervision
     /// as a low-capability wrapper in the agent container.
     Sidecar,
+    /// Run network supervision in a separate supervisor pod and process
+    /// supervision as a low-capability wrapper in the agent pod.
+    ProxyPod,
 }
 
 impl std::fmt::Display for SupervisorTopology {
@@ -72,6 +75,7 @@ impl std::fmt::Display for SupervisorTopology {
         match self {
             Self::Combined => f.write_str("combined"),
             Self::Sidecar => f.write_str("sidecar"),
+            Self::ProxyPod => f.write_str("proxy-pod"),
         }
     }
 }
@@ -83,22 +87,23 @@ impl FromStr for SupervisorTopology {
         match s {
             "combined" => Ok(Self::Combined),
             "sidecar" => Ok(Self::Sidecar),
+            "proxy-pod" => Ok(Self::ProxyPod),
             other => Err(format!("unknown supervisor topology '{other}'")),
         }
     }
 }
 
-/// Process/filesystem controls applied by the process supervisor in split
-/// Kubernetes topologies.
+/// Process/filesystem controls applied by the process supervisor in
+/// non-combined Kubernetes topologies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProcessEnforcementMode {
-    /// Preserve process launch and session relay behavior, but leave
-    /// filesystem/process guards to the network supervisor topology.
+    /// Preserve process launch and session relay behavior while network
+    /// enforcement is handled by the sidecar or proxy pod.
     #[default]
     NetworkOnly,
-    /// Run the process supervisor with the same process/filesystem controls as
-    /// combined topology.
+    /// Run the process supervisor with combined-mode process/filesystem
+    /// controls.
     Full,
 }
 
@@ -255,9 +260,10 @@ pub struct KubernetesComputeConfig {
     /// non-combined topologies. `network-only` keeps the low-permission agent
     /// shape; `full` grants the agent supervisor combined-mode controls.
     pub process_enforcement: ProcessEnforcementMode,
-    /// UID used by the long-running network sidecar in `sidecar` topology.
-    /// The network init container installs nftables rules that exempt this
-    /// UID, so it must not match the sandbox workload UID.
+    /// UID used by the long-running network proxy in sidecar and proxy-pod
+    /// topologies. In sidecar topology, the network init container installs
+    /// nftables rules that exempt this UID, so it must not match the sandbox
+    /// workload UID.
     pub proxy_uid: u32,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
@@ -538,6 +544,16 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.supervisor_topology, SupervisorTopology::Combined);
+    }
+
+    #[test]
+    fn serde_override_supervisor_topology_proxy_pod() {
+        let json = serde_json::json!({
+            "supervisor_topology": "proxy-pod"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.supervisor_topology, SupervisorTopology::ProxyPod);
+        assert_eq!(cfg.supervisor_topology.to_string(), "proxy-pod");
     }
 
     #[test]

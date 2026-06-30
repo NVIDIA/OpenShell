@@ -74,6 +74,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
 const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
+const PROXY_POD_NETWORK_ENFORCEMENT_MODE: &str = "proxy-pod";
 const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
 const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
 const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
@@ -135,14 +136,22 @@ pub async fn run_sandbox(
         }
     }
 
+    let external_network_enforcement = external_network_enforcement_enabled();
     let sidecar_network_enforcement = sidecar_network_enforcement_enabled();
     let process_enforcement_mode = process_enforcement_mode();
     let sidecar_ready_file = supervisor_ready_file();
+    let supervisor_ready_addr = supervisor_ready_addr();
     if process_enabled
         && !network_enabled
         && let Some(path) = sidecar_ready_file.as_deref()
     {
         wait_for_supervisor_ready(path).await?;
+    }
+    if process_enabled
+        && !network_enabled
+        && let Some(addr) = supervisor_ready_addr.as_deref()
+    {
+        wait_for_supervisor_ready_addr(addr).await?;
     }
 
     // Load policy and initialize OPA engine
@@ -251,7 +260,7 @@ pub async fn run_sandbox(
     // it via setns(). The RAII handle lives in this frame for the duration
     // of the sandbox.
     #[cfg(target_os = "linux")]
-    let netns = if network_enabled && !sidecar_network_enforcement {
+    let netns = if network_enabled && !external_network_enforcement {
         openshell_supervisor_process::netns::create_netns_for_proxy(&policy)?
     } else {
         None
@@ -321,9 +330,9 @@ pub async fn run_sandbox(
         None
     };
 
-    let _gateway_forward = if network_enabled && sidecar_network_enforcement {
+    let _gateway_forward = if network_enabled && external_network_enforcement {
         let endpoint = openshell_endpoint_for_proxy.as_deref().ok_or_else(|| {
-            miette::miette!("sidecar network enforcement requires an OpenShell gateway endpoint")
+            miette::miette!("external network enforcement requires an OpenShell gateway endpoint")
         })?;
         Some(start_gateway_forward_from_env(endpoint).await?)
     } else {
@@ -331,10 +340,10 @@ pub async fn run_sandbox(
     };
 
     #[cfg(target_os = "linux")]
-    if network_enabled && sidecar_network_enforcement {
+    if network_enabled && external_network_enforcement {
         if !matches!(policy.network.mode, NetworkMode::Proxy) {
             return Err(miette::miette!(
-                "sidecar network enforcement requires proxy network mode"
+                "external network enforcement requires proxy network mode"
             ));
         }
         if let Some(path) = sidecar_ready_file.as_deref() {
@@ -343,9 +352,9 @@ pub async fn run_sandbox(
     }
 
     #[cfg(not(target_os = "linux"))]
-    if network_enabled && sidecar_network_enforcement {
+    if network_enabled && external_network_enforcement {
         return Err(miette::miette!(
-            "sidecar network enforcement is only supported on Linux"
+            "external network enforcement is only supported on Linux"
         ));
     }
 
@@ -506,7 +515,7 @@ pub async fn run_sandbox(
             .as_ref()
             .and_then(|n| n.ca_file_paths.clone())
             .or_else(|| {
-                sidecar_network_enforcement
+                external_network_enforcement
                     .then(sidecar_ca_file_paths)
                     .flatten()
             });
@@ -587,6 +596,15 @@ fn sidecar_network_enforcement_enabled() -> bool {
         .is_ok_and(|value| value == SIDECAR_NETWORK_ENFORCEMENT_MODE)
 }
 
+fn external_network_enforcement_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE).is_ok_and(|value| {
+        matches!(
+            value.as_str(),
+            SIDECAR_NETWORK_ENFORCEMENT_MODE | PROXY_POD_NETWORK_ENFORCEMENT_MODE
+        )
+    })
+}
+
 fn process_enforcement_mode() -> ProcessEnforcementMode {
     match std::env::var(openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE)
         .unwrap_or_else(|_| "full".to_string())
@@ -599,6 +617,12 @@ fn process_enforcement_mode() -> ProcessEnforcementMode {
 
 fn supervisor_ready_file() -> Option<String> {
     std::env::var(openshell_core::sandbox_env::SUPERVISOR_READY_FILE)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn supervisor_ready_addr() -> Option<String> {
+    std::env::var(openshell_core::sandbox_env::SUPERVISOR_READY_ADDR)
         .ok()
         .filter(|value| !value.is_empty())
 }
@@ -648,6 +672,26 @@ async fn wait_for_supervisor_ready(path: &str) -> Result<()> {
             ));
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_supervisor_ready_addr(addr: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS);
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(_) => {
+                info!(addr, "Network supervisor TCP endpoint is ready");
+                return Ok(());
+            }
+            Err(err) if tokio::time::Instant::now() >= deadline => {
+                return Err(miette::miette!(
+                    "timed out waiting for network supervisor TCP endpoint {addr}: {err}"
+                ));
+            }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
     }
 }
 

@@ -172,8 +172,9 @@ struct Args {
     #[arg(long, default_value = DEFAULT_MODE)]
     mode: Mode,
 
-    /// UID that the long-running Kubernetes network sidecar will run as.
-    /// `--mode=network-init` installs nftables rules that exempt this UID.
+    /// UID that the long-running Kubernetes network proxy will run as.
+    /// In sidecar topology, `--mode=network-init` installs nftables rules
+    /// that exempt this UID.
     #[arg(long, env = "OPENSHELL_PROXY_UID", default_value_t = 1337)]
     proxy_uid: u32,
 
