@@ -27,14 +27,13 @@ Add the service registration to your local gateway TOML:
 ```toml
 [[openshell.gateway.middleware]]
 name = "content-guard-example"
-endpoint = "http://host.openshell.internal:50051"
-allow_insecure = true
+grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
 ```
 
 The gateway calls `Describe` during startup and fails to start if the service is unavailable. Both the gateway and sandbox supervisors must resolve and reach the configured endpoint. Change the hostname when `host.openshell.internal` is not the shared host address for your local driver.
 
-The plaintext endpoint has no transport encryption or peer authentication. `allow_insecure = true` is an explicit acknowledgement of that limitation.
+The `http://` gRPC endpoint uses plaintext without peer authentication.
 
 ## Apply the example policy
 
