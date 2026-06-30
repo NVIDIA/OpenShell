@@ -1273,21 +1273,7 @@ mod tests {
 
         let result = drop_privileges(&policy);
 
-        #[cfg(target_os = "linux")]
-        {
-            if capability_bounding_set_clear_available() {
-                assert!(result.is_ok(), "drop_privileges failed: {result:?}");
-            } else {
-                let msg = format!("{}", result.unwrap_err());
-                assert!(
-                    msg.contains("Failed to clear child capability bounding set"),
-                    "unexpected failure: {msg}"
-                );
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "drop_privileges failed: {result:?}");
     }
 
     #[test]
