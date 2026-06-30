@@ -381,10 +381,8 @@ pub(crate) async fn run_server(
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
 
-    let mut extra_listener_addresses = config.extra_bind_addresses.clone();
-    extra_listener_addresses.extend_from_slice(state.compute.gateway_bind_addresses());
     let gateway_listener_addresses =
-        gateway_listener_addresses(config.bind_address, &extra_listener_addresses);
+        gateway_listener_addresses(config.bind_address, state.compute.gateway_bind_addresses());
     let mut gateway_listeners = Vec::with_capacity(gateway_listener_addresses.len());
     for address in gateway_listener_addresses {
         let listener = TcpListener::bind(address)

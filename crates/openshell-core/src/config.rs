@@ -340,14 +340,6 @@ pub struct Config {
     /// When `None`, the dedicated metrics listener is disabled.
     pub metrics_bind_address: Option<SocketAddr>,
 
-    /// Additional bind addresses that serve the same multiplexed gRPC/HTTP
-    /// surface as `bind_address`.
-    ///
-    /// Compute drivers may register extra listeners during startup so that
-    /// sandbox workloads can call back into the gateway over an interface
-    /// that the operator-supplied `bind_address` does not expose.
-    pub extra_bind_addresses: Vec<SocketAddr>,
-
     /// Log level (trace, debug, info, warn, error).
     pub log_level: String,
 
@@ -579,7 +571,6 @@ impl Config {
             bind_address: default_bind_address(),
             health_bind_address: None,
             metrics_bind_address: None,
-            extra_bind_addresses: Vec::new(),
             log_level: default_log_level(),
             tls,
             oidc: None,
@@ -612,19 +603,6 @@ impl Config {
     #[must_use]
     pub const fn with_metrics_bind_address(mut self, addr: SocketAddr) -> Self {
         self.metrics_bind_address = Some(addr);
-        self
-    }
-
-    /// Append an extra listener address to the multiplex service.
-    ///
-    /// Duplicate entries (matching `bind_address` or any existing entry) are
-    /// silently dropped so callers can naively push driver-derived addresses
-    /// without checking for collisions.
-    #[must_use]
-    pub fn with_extra_bind_address(mut self, addr: SocketAddr) -> Self {
-        if addr != self.bind_address && !self.extra_bind_addresses.contains(&addr) {
-            self.extra_bind_addresses.push(addr);
-        }
         self
     }
 
