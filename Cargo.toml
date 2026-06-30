@@ -76,7 +76,7 @@ apollo-parser = "0.8.5"
 tower-mcp-types = "0.12.0"
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "hickory-dns"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
