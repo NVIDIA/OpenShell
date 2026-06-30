@@ -55,7 +55,6 @@ mod ws_tunnel;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use openshell_supervisor_middleware::MiddlewareRegistry;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
