@@ -51,7 +51,8 @@ The feature flag controls provider-derived policy layers. OpenShell still suppor
 
 Providers v2 currently includes these user-facing features:
 
-- Built-in provider profiles stored in the `providers/` directory of the GitHub repository.
+- Built-in provider profiles loaded by the gateway by default.
+- Gateway interceptors can vend append or authoritative provider profile catalogs for governed deployments.
 - `openshell provider list-profiles` with table, YAML, and JSON output.
 - `openshell provider profile export`, `import`, `update`, `lint`, and `delete` for custom profiles.
 - Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
@@ -88,6 +89,13 @@ List available profiles:
 ```shell
 openshell provider list-profiles
 ```
+
+By default the gateway lists built-in profiles plus custom profiles imported
+through the profile APIs. When a configured gateway interceptor vends an
+authoritative provider profile catalog, that catalog becomes the visible source
+of truth: list, export, provider creation, policy composition, and sandbox
+provider environment resolution use the interceptor-vended profiles instead of
+built-in or user-imported profiles.
 
 Built-in Providers v2 profiles currently include:
 
@@ -138,7 +146,7 @@ openshell provider profile update github-profile -f github-profile.yaml
 
 Exported custom profiles include `resource_version`. OpenShell requires that version during update so stale files cannot silently overwrite newer profile definitions. The target ID in the command must match the profile ID in the file. Update accepts one file at a time. If an update would make dynamic token grants ambiguous for an attached sandbox, OpenShell rejects it before changing the profile.
 
-Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in profiles are read-only, and OpenShell rejects updating or deleting a built-in profile. OpenShell also rejects deleting a custom profile while a sandbox-attached provider uses it.
+Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in and interceptor-managed profiles are read-only through the profile APIs. OpenShell also rejects deleting a custom profile while a sandbox-attached provider uses it.
 
 ### Category Enum
 

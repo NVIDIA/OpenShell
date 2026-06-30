@@ -4726,13 +4726,14 @@ pub async fn provider_create_with_options(
     };
 
     let adc_credential_key = if from_gcloud_adc {
-        let profile =
-            openshell_providers::get_default_profile(&provider_type).ok_or_else(|| {
+        let profile = fetch_provider_profile(&mut client, &provider_type)
+            .await
+            .map_err(|err| {
                 miette::miette!(
-                    "--from-gcloud-adc requires a built-in provider profile, \
-                 but '{provider_type}' has none"
+                    "--from-gcloud-adc is not supported for '{provider_type}' providers ({err})"
                 )
             })?;
+        let profile = ProviderTypeProfile::from_proto(&profile);
         let adc_cred = profile.adc_credential().ok_or_else(|| {
             miette::miette!(
                 "--from-gcloud-adc is not supported for '{provider_type}' providers \

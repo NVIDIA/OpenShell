@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{
@@ -13,13 +13,12 @@ use jsonwebtoken::{
 use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
     InterceptorManifest, InterceptorResult, InterceptorSelector, JsonPatch,
+    ProviderProfileCatalog, ProviderProfileCatalogMode,
     gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
 };
 use openshell_core::proto::{
-    GetProviderProfileRequest, GraphqlOperation, ImportProviderProfilesRequest, L7Allow,
-    L7DenyRule, L7Rule, NetworkEndpoint, NetworkPolicyRule, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, SandboxPolicy,
-    UpdateProviderProfilesRequest, open_shell_client::OpenShellClient,
+    GraphqlOperation, L7Allow, L7DenyRule, L7Rule, NetworkEndpoint, NetworkPolicyRule,
+    ProviderProfile, SandboxPolicy,
 };
 use openshell_policy::parse_sandbox_policy;
 use openshell_providers::{ProviderTypeProfile, normalize_profile_id};
@@ -28,8 +27,7 @@ use rcgen::{KeyPair, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
-use tonic::Code;
-use tonic::transport::{Channel, Server};
+use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 const POLICY_SIGNATURE_ANNOTATION: &str = "openshell.nvidia.com/policy-signature";
@@ -38,8 +36,7 @@ const POLICY_JWT_AUDIENCE: &str = "openshell-governance-policy";
 const POLICY_JWT_SUBJECT: &str = "policy.yaml";
 const CREATE_SANDBOX_CORRELATION_PREFIX: &str = "governance:create-sandbox";
 const SERVICE: &str = "openshell.v1.OpenShell";
-const PROFILE_RECONCILE_ATTEMPTS: usize = 60;
-const PROFILE_RECONCILE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const PROFILE_CATALOG_SOURCE_ID: &str = "interceptor/provider-governance";
 
 #[derive(Clone)]
 struct PolicySigner {
@@ -139,19 +136,24 @@ struct GovernanceInterceptorService {
     policy_signature: String,
     policy_signer: PolicySigner,
     managed_profile_ids: Vec<String>,
+    managed_profiles: Vec<ProviderProfile>,
 }
 
 #[derive(Clone, Debug)]
 struct LoadedProviderProfile {
-    source: String,
     profile: ProviderProfile,
 }
 
 impl GovernanceInterceptorService {
-    fn from_yaml(policy_yaml: &str, managed_profile_ids: Vec<String>) -> Result<Self, String> {
-        if managed_profile_ids.is_empty() {
+    fn from_yaml(policy_yaml: &str, profiles: Vec<LoadedProviderProfile>) -> Result<Self, String> {
+        if profiles.is_empty() {
             return Err("at least one provider profile must be loaded".to_string());
         }
+        let managed_profile_ids = loaded_profile_ids(&profiles);
+        let managed_profiles = profiles
+            .into_iter()
+            .map(|loaded| loaded.profile)
+            .collect::<Vec<_>>();
         let policy = parse_sandbox_policy(policy_yaml)
             .map_err(|err| format!("failed to parse policy YAML: {err}"))?;
         let policy = sandbox_policy_to_proto_json(&policy);
@@ -165,13 +167,19 @@ impl GovernanceInterceptorService {
             policy_signature,
             policy_signer,
             managed_profile_ids,
+            managed_profiles,
         })
     }
 
-    fn manifest() -> InterceptorManifest {
+    fn manifest(&self) -> InterceptorManifest {
         InterceptorManifest {
             name: "provider-governance".to_string(),
             failure_policy: "fail_closed".to_string(),
+            provider_profile_catalog: Some(ProviderProfileCatalog {
+                source_id: PROFILE_CATALOG_SOURCE_ID.to_string(),
+                mode: ProviderProfileCatalogMode::Authoritative as i32,
+                profiles: self.managed_profiles.clone(),
+            }),
             bindings: vec![
                 binding(
                     "govern-create-sandbox",
@@ -443,7 +451,7 @@ impl GatewayInterceptor for GovernanceInterceptorService {
         &self,
         _request: Request<DescribeRequest>,
     ) -> Result<Response<InterceptorManifest>, Status> {
-        Ok(Response::new(Self::manifest()))
+        Ok(Response::new(self.manifest()))
     }
 
     async fn evaluate(
@@ -591,10 +599,7 @@ fn load_provider_profile_source(
     let profile = serde_yml::from_value::<ProviderTypeProfile>(value)
         .map_err(|err| format!("failed to decode provider profile {source}: {err}"))?
         .to_proto();
-    Ok(LoadedProviderProfile {
-        source: source.to_string(),
-        profile,
-    })
+    Ok(LoadedProviderProfile { profile })
 }
 
 fn profile_id_from_file_name(path: &Path) -> Result<String, String> {
@@ -658,126 +663,6 @@ fn loaded_profile_ids(profiles: &[LoadedProviderProfile]) -> Vec<String> {
 
 fn format_id_list(ids: &[String]) -> String {
     ids.join(", ")
-}
-
-fn spawn_profile_reconciler(gateway_endpoint: String, profiles: Vec<LoadedProviderProfile>) {
-    tokio::spawn(async move {
-        let mut last_error = String::new();
-        for attempt in 1..=PROFILE_RECONCILE_ATTEMPTS {
-            match reconcile_provider_profiles(&gateway_endpoint, &profiles).await {
-                Ok(()) => {
-                    println!("provider profiles reconciled with gateway {gateway_endpoint}");
-                    return;
-                }
-                Err(err) => {
-                    last_error = err;
-                    eprintln!(
-                        "provider profile reconcile attempt {attempt}/{PROFILE_RECONCILE_ATTEMPTS} failed: {last_error}"
-                    );
-                    tokio::time::sleep(PROFILE_RECONCILE_RETRY_DELAY).await;
-                }
-            }
-        }
-        eprintln!(
-            "provider profile reconcile failed after {PROFILE_RECONCILE_ATTEMPTS} attempts: {last_error}"
-        );
-    });
-}
-
-async fn reconcile_provider_profiles(
-    gateway_endpoint: &str,
-    profiles: &[LoadedProviderProfile],
-) -> Result<(), String> {
-    let mut client = OpenShellClient::connect(gateway_endpoint.to_string())
-        .await
-        .map_err(|err| format!("connect gateway: {err}"))?;
-    for loaded in profiles {
-        reconcile_provider_profile(&mut client, loaded).await?;
-    }
-    Ok(())
-}
-
-async fn reconcile_provider_profile(
-    client: &mut OpenShellClient<Channel>,
-    loaded: &LoadedProviderProfile,
-) -> Result<(), String> {
-    let id = loaded.profile.id.clone();
-    match client
-        .get_provider_profile(GetProviderProfileRequest { id: id.clone() })
-        .await
-    {
-        Ok(response) => {
-            let current = response
-                .into_inner()
-                .profile
-                .ok_or_else(|| format!("provider profile '{id}' missing from get response"))?;
-            if current.resource_version == 0 {
-                println!("provider profile '{id}' is built in; using gateway copy");
-                return Ok(());
-            }
-            let mut profile = loaded.profile.clone();
-            profile.resource_version = current.resource_version;
-            let response = client
-                .update_provider_profiles(UpdateProviderProfilesRequest {
-                    id: id.clone(),
-                    expected_resource_version: profile.resource_version,
-                    profile: Some(ProviderProfileImportItem {
-                        source: loaded.source.clone(),
-                        profile: Some(profile),
-                    }),
-                })
-                .await
-                .map_err(|status| format!("update provider profile '{id}': {status}"))?
-                .into_inner();
-            if response.updated {
-                println!("updated provider profile '{id}'");
-                Ok(())
-            } else {
-                Err(format!(
-                    "update provider profile '{id}' rejected: {}",
-                    format_profile_diagnostics(&response.diagnostics)
-                ))
-            }
-        }
-        Err(status) if status.code() == Code::NotFound => {
-            let response = client
-                .import_provider_profiles(ImportProviderProfilesRequest {
-                    profiles: vec![ProviderProfileImportItem {
-                        source: loaded.source.clone(),
-                        profile: Some(loaded.profile.clone()),
-                    }],
-                })
-                .await
-                .map_err(|status| format!("import provider profile '{id}': {status}"))?
-                .into_inner();
-            if response.imported {
-                println!("imported provider profile '{id}'");
-                Ok(())
-            } else {
-                Err(format!(
-                    "import provider profile '{id}' rejected: {}",
-                    format_profile_diagnostics(&response.diagnostics)
-                ))
-            }
-        }
-        Err(status) => Err(format!("get provider profile '{id}': {status}")),
-    }
-}
-
-fn format_profile_diagnostics(diagnostics: &[ProviderProfileDiagnostic]) -> String {
-    if diagnostics.is_empty() {
-        return "no diagnostics returned".to_string();
-    }
-    diagnostics
-        .iter()
-        .map(|diagnostic| {
-            format!(
-                "{}:{}:{}:{}",
-                diagnostic.source, diagnostic.profile_id, diagnostic.field, diagnostic.message
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 fn providers_are_managed(value: Option<&Value>, managed_profile_ids: &[String]) -> bool {
@@ -1194,21 +1079,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let profiles_path = profiles_path.unwrap_or_else(default_profiles_path);
     let profiles = load_provider_profiles(&profiles_path)?;
-    let profile_ids = loaded_profile_ids(&profiles);
-    let service = GovernanceInterceptorService::from_yaml(&policy_yaml, profile_ids)?;
+    let service = GovernanceInterceptorService::from_yaml(&policy_yaml, profiles)?;
 
     if let Some(endpoint) = gateway_endpoint {
-        spawn_profile_reconciler(endpoint, profiles);
-    } else {
         println!(
-            "loaded provider profiles: {}",
-            profiles
-                .iter()
-                .map(|profile| profile.profile.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "--gateway-endpoint is ignored; provider profiles are vended through the interceptor manifest ({endpoint})"
         );
     }
+    println!(
+        "loaded provider profiles: {}",
+        service.managed_profile_ids.join(", ")
+    );
 
     println!("governance interceptor listening on {listen}");
     Server::builder()
@@ -1228,11 +1109,7 @@ mod tests {
 
     fn service() -> GovernanceInterceptorService {
         let profiles = load_provider_profiles(&default_profiles_path()).unwrap();
-        GovernanceInterceptorService::from_yaml(
-            include_str!("../policy.yaml"),
-            loaded_profile_ids(&profiles),
-        )
-        .unwrap()
+        GovernanceInterceptorService::from_yaml(include_str!("../policy.yaml"), profiles).unwrap()
     }
 
     fn evaluation(
@@ -1309,7 +1186,8 @@ mod tests {
 
     #[test]
     fn manifest_declares_governance_bindings() {
-        let manifest = GovernanceInterceptorService::manifest();
+        let service = service();
+        let manifest = service.manifest();
         let ids: Vec<_> = manifest
             .bindings
             .iter()
@@ -1322,6 +1200,17 @@ mod tests {
         assert!(ids.contains(&"govern-update-provider-profiles"));
         assert!(ids.contains(&"govern-delete-provider-profile"));
         assert_eq!(manifest.failure_policy, "fail_closed");
+        let catalog = manifest
+            .provider_profile_catalog
+            .expect("manifest includes provider catalog");
+        assert_eq!(catalog.source_id, PROFILE_CATALOG_SOURCE_ID);
+        assert_eq!(catalog.mode, ProviderProfileCatalogMode::Authoritative as i32);
+        let profile_ids = catalog
+            .profiles
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(profile_ids, vec!["github", "slack"]);
     }
 
     #[test]

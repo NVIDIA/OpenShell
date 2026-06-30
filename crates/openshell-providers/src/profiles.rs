@@ -1696,11 +1696,11 @@ fn is_kubernetes_service_host(host: &str) -> bool {
     (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
 }
 
-static DEFAULT_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
+static BUILTIN_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
 
 #[must_use]
-pub fn default_profiles() -> &'static [ProviderTypeProfile] {
-    DEFAULT_PROFILES
+pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
+    BUILTIN_PROFILES
         .get_or_init(|| {
             parse_profile_catalog_yamls(BUILT_IN_PROFILE_YAMLS)
                 .expect("built-in provider profiles must be valid YAML")
@@ -1708,26 +1708,26 @@ pub fn default_profiles() -> &'static [ProviderTypeProfile] {
         .as_slice()
 }
 
-#[must_use]
-pub fn get_default_profile(id: &str) -> Option<&'static ProviderTypeProfile> {
-    default_profiles()
-        .iter()
-        .find(|profile| profile.id.eq_ignore_ascii_case(id))
-}
-
 #[cfg(test)]
 mod tests {
     use openshell_core::proto::ProviderProfileCategory;
 
     use super::{
-        DiscoveryProfile, ProfileError, ProviderTypeProfile, default_profiles, get_default_profile,
+        DiscoveryProfile, ProfileError, ProviderTypeProfile, builtin_profiles,
         normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
         profile_to_json, profile_to_yaml, validate_profile_set,
     };
 
+    fn builtin_profile(id: &str) -> &'static ProviderTypeProfile {
+        builtin_profiles()
+            .iter()
+            .find(|profile| profile.id == id)
+            .unwrap_or_else(|| panic!("built-in profile {id} should exist"))
+    }
+
     #[test]
-    fn default_profiles_are_sorted_by_id() {
-        let ids = default_profiles()
+    fn builtin_profiles_are_sorted_by_id() {
+        let ids = builtin_profiles()
             .iter()
             .map(|profile| profile.id.as_str())
             .collect::<Vec<_>>();
@@ -1738,7 +1738,7 @@ mod tests {
 
     #[test]
     fn github_profile_materializes_policy_metadata() {
-        let profile = get_default_profile("github").expect("github profile");
+        let profile = builtin_profile("github");
         let proto = profile.to_proto();
 
         assert_eq!(proto.id, "github");
@@ -1768,7 +1768,7 @@ mod tests {
 
     #[test]
     fn credential_env_vars_are_deduplicated_in_profile_order() {
-        let profile = get_default_profile("claude-code").expect("claude-code profile");
+        let profile = builtin_profile("claude-code");
         assert_eq!(
             profile.credential_env_vars(),
             vec!["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
@@ -1777,7 +1777,7 @@ mod tests {
 
     #[test]
     fn vertex_profile_declares_discovery_and_fallback_token_env_vars() {
-        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
+        let profile = builtin_profile("google-vertex-ai");
         let service_account_token = profile
             .credentials
             .iter()
@@ -1875,13 +1875,13 @@ credentials:
 
     #[test]
     fn adc_credential_returns_oauth2_refresh_token_credential_with_adc_material() {
-        let profile = get_default_profile("google-cloud").expect("google-cloud profile");
+        let profile = builtin_profile("google-cloud");
         let adc = profile
             .adc_credential()
             .expect("google-cloud should have an ADC credential");
         assert_eq!(adc.env_vars[0], "GCP_ADC_ACCESS_TOKEN");
 
-        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
+        let profile = builtin_profile("google-vertex-ai");
         let adc = profile
             .adc_credential()
             .expect("vertex should have an ADC credential");
@@ -1890,10 +1890,10 @@ credentials:
 
     #[test]
     fn adc_credential_returns_none_for_profiles_without_adc() {
-        let profile = get_default_profile("github").expect("github profile");
+        let profile = builtin_profile("github");
         assert!(profile.adc_credential().is_none());
 
-        let profile = get_default_profile("claude-code").expect("claude-code profile");
+        let profile = builtin_profile("claude-code");
         assert!(profile.adc_credential().is_none());
     }
 
@@ -2433,7 +2433,7 @@ endpoints:
 
     #[test]
     fn profile_json_round_trip_preserves_compact_dto_shape() {
-        let profile = get_default_profile("github").expect("github profile");
+        let profile = builtin_profile("github");
         let json = profile_to_json(profile).expect("profile should serialize");
         let parsed = parse_profile_json(&json).expect("profile should parse");
 

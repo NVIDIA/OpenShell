@@ -6,14 +6,51 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EXAMPLE_DIR="$ROOT/examples/governance-interceptor"
+RUN_TEST_SUITE=0
+
+usage() {
+  cat <<EOF
+usage: $0 [--test-suite|--test]
+
+Without flags, starts a local gateway with the governance interceptor attached
+and keeps it running for interactive use.
+
+Options:
+  --test-suite, --test  Run the governance smoke test suite, then stop.
+  -h, --help            Show this help.
+EOF
+}
+
+while [[ "$#" -gt 0 ]]; do
+  case "$1" in
+    --test-suite | --test)
+      RUN_TEST_SUITE=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
 TMPDIR="$(mktemp -d)"
 LOG_DIR="$TMPDIR/logs"
 JWT_DIR="$TMPDIR/jwt"
 GATEWAY_CONFIG="$TMPDIR/gateway.toml"
-SMOKE_LOG="$LOG_DIR/smoke.log"
+SETUP_LOG="$LOG_DIR/setup.log"
 GATEWAY_LOG="$LOG_DIR/gateway.log"
 INTERCEPTOR_LOG="$LOG_DIR/interceptor.log"
-RUN_ID="governance-smoke-$$-$RANDOM"
+if [[ "$RUN_TEST_SUITE" -eq 1 ]]; then
+  RUN_ID="governance-smoke-$$-$RANDOM"
+else
+  RUN_ID="governance-interactive-$$-$RANDOM"
+fi
 SANDBOX_NAME="$RUN_ID-sandbox"
 
 mkdir -p "$LOG_DIR"
@@ -79,7 +116,7 @@ choose_port_block() {
     fi
   done
 
-  echo "failed to find free local ports for smoke test" >&2
+  echo "failed to find free local ports for governance interceptor launcher" >&2
   exit 1
 }
 
@@ -104,7 +141,7 @@ dump_log_file() {
 }
 
 dump_logs() {
-  dump_log_file "smoke log" "$SMOKE_LOG"
+  dump_log_file "setup log" "$SETUP_LOG"
   dump_log_file "gateway log" "$GATEWAY_LOG"
   dump_log_file "interceptor log" "$INTERCEPTOR_LOG"
 }
@@ -128,7 +165,7 @@ log_command() {
     printf '+'
     printf ' %q' "$@"
     printf '\n'
-  } >>"$SMOKE_LOG"
+  } >>"$SETUP_LOG"
 }
 
 run_setup_step() {
@@ -137,7 +174,7 @@ run_setup_step() {
 
   printf 'INFO %s\n' "$label"
   log_command "$label" "$@"
-  if ! "$@" >>"$SMOKE_LOG" 2>&1; then
+  if ! "$@" >>"$SETUP_LOG" 2>&1; then
     fail "$label"
   fi
 }
@@ -147,7 +184,7 @@ run_step() {
   shift
 
   log_command "$label" "$@"
-  if "$@" >>"$SMOKE_LOG" 2>&1; then
+  if "$@" >>"$SETUP_LOG" 2>&1; then
     pass "$label"
   else
     fail "$label"
@@ -159,7 +196,7 @@ expect_failure() {
   shift
 
   log_command "$label" "$@"
-  if "$@" >>"$SMOKE_LOG" 2>&1; then
+  if "$@" >>"$SETUP_LOG" 2>&1; then
     fail "$label"
   else
     pass "$label"
@@ -173,10 +210,25 @@ expect_output_contains() {
   local output_file="$LOG_DIR/${label//[^A-Za-z0-9_]/_}.out"
 
   log_command "$label" "$@"
-  if "$@" >"$output_file" 2>>"$SMOKE_LOG" && grep -Fq -- "$needle" "$output_file"; then
+  if "$@" >"$output_file" 2>>"$SETUP_LOG" && grep -Fq -- "$needle" "$output_file"; then
     pass "$label"
   else
-    cat "$output_file" >>"$SMOKE_LOG" 2>/dev/null || true
+    cat "$output_file" >>"$SETUP_LOG" 2>/dev/null || true
+    fail "$label"
+  fi
+}
+
+expect_output_not_contains() {
+  local label="$1"
+  local needle="$2"
+  shift 2
+  local output_file="$LOG_DIR/${label//[^A-Za-z0-9_]/_}.out"
+
+  log_command "$label" "$@"
+  if "$@" >"$output_file" 2>>"$SETUP_LOG" && ! grep -Fq -- "$needle" "$output_file"; then
+    pass "$label"
+  else
+    cat "$output_file" >>"$SETUP_LOG" 2>/dev/null || true
     fail "$label"
   fi
 }
@@ -195,16 +247,16 @@ expect_log_contains() {
 
 wait_for_profile() {
   local profile_id="$1"
-  local label="loads $profile_id provider profile"
+  local label="loading $profile_id provider profile"
 
   {
     printf '\n== %s ==\n' "$label"
     printf '+ wait for provider profile %q\n' "$profile_id"
-  } >>"$SMOKE_LOG"
+  } >>"$SETUP_LOG"
 
   for _ in {1..60}; do
-    if "${CLI[@]}" provider profile export "$profile_id" -o yaml >>"$SMOKE_LOG" 2>&1; then
-      pass "$label"
+    if "${CLI[@]}" provider profile export "$profile_id" -o yaml >>"$SETUP_LOG" 2>&1; then
+      printf 'INFO %s\n' "$label"
       return
     fi
     sleep 1
@@ -256,8 +308,7 @@ start_interceptor() {
   "$EXAMPLE_DIR/target/debug/governance-interceptor" \
     --listen "$INTERCEPTOR_ADDR" \
     --policy "$EXAMPLE_DIR/policy.yaml" \
-    --profiles "$EXAMPLE_DIR/profiles" \
-    --gateway-endpoint "$GATEWAY_ENDPOINT" >"$INTERCEPTOR_LOG" 2>&1 &
+    --profiles "$EXAMPLE_DIR/profiles" >"$INTERCEPTOR_LOG" 2>&1 &
   INTERCEPTOR_PID=$!
 }
 
@@ -284,7 +335,7 @@ wait_for_gateway() {
     fi
 
     if curl -fsS "http://$HEALTH_ADDR/healthz" >/dev/null 2>&1; then
-      pass "$label"
+      printf 'INFO %s\n' "$label"
       return
     fi
 
@@ -294,7 +345,7 @@ wait_for_gateway() {
   fail "$label"
 }
 
-run_suite() {
+configure_gateway() {
   CLI=(
     env
     -u OPENSHELL_SANDBOX_POLICY
@@ -302,11 +353,16 @@ run_suite() {
     --gateway-endpoint "$GATEWAY_ENDPOINT"
   )
 
-  run_step "enables provider profile policy composition" "${CLI[@]}" settings set --global --key providers_v2_enabled --value true --yes
+  run_setup_step "enabling provider profile policy composition" "${CLI[@]}" settings set --global --key providers_v2_enabled --value true --yes
   wait_for_profile "github"
   wait_for_profile "slack"
+}
+
+run_suite() {
   expect_output_contains "lists github profile" "github" "${CLI[@]}" provider list-profiles
   expect_output_contains "lists slack profile" "slack" "${CLI[@]}" provider list-profiles
+  expect_output_not_contains "hides codex profile" "codex" "${CLI[@]}" provider list-profiles
+  expect_output_not_contains "hides google cloud profile" "google-cloud" "${CLI[@]}" provider list-profiles
 
   cat >"$TMPDIR/disallowed-profile.yaml" <<'EOF'
 id: custom-slack
@@ -345,17 +401,56 @@ EOF
   expect_failure "denies governed provider delete" "${CLI[@]}" provider delete github
 }
 
+print_ready() {
+  cat <<EOF
+
+READY governance interceptor gateway
+
+Gateway endpoint:     $GATEWAY_ENDPOINT
+Gateway health check: http://$HEALTH_ADDR/healthz
+Gateway config:       $GATEWAY_CONFIG
+Setup log:            $SETUP_LOG
+Gateway log:          $GATEWAY_LOG
+Interceptor log:      $INTERCEPTOR_LOG
+
+Example CLI:
+  env -u OPENSHELL_SANDBOX_POLICY "$ROOT/target/debug/openshell" --gateway-endpoint "$GATEWAY_ENDPOINT" sandbox list
+
+Press Ctrl-C to stop the gateway and interceptor.
+EOF
+}
+
+wait_until_stopped() {
+  while true; do
+    if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+      fail "gateway process exited"
+    fi
+
+    if ! kill -0 "$INTERCEPTOR_PID" 2>/dev/null; then
+      fail "governance interceptor process exited"
+    fi
+
+    sleep 1
+  done
+}
+
 cd "$ROOT"
 
 run_setup_step "building gateway" cargo build --quiet -p openshell-server --bin openshell-gateway
 run_setup_step "building governance interceptor" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
-run_setup_step "building test CLI" cargo build --quiet -p openshell-cli --bin openshell
+run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
 
 generate_gateway_jwt_bundle
 write_gateway_config
 start_interceptor
 start_gateway
 wait_for_gateway
-run_suite
+configure_gateway
 
-echo "ALL PASS governance interceptor smoke"
+if [[ "$RUN_TEST_SUITE" -eq 1 ]]; then
+  run_suite
+  echo "ALL PASS governance interceptor smoke"
+else
+  print_ready
+  wait_until_stopped
+fi

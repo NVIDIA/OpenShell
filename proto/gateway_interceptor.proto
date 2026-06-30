@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.gateway_interceptor.v1;
 
 import "google/protobuf/struct.proto";
+import "openshell.proto";
 
 // GatewayInterceptor lets an external governance service evaluate gateway
 // control-plane operations after OpenShell admission and before or after the
@@ -69,6 +70,23 @@ message InterceptorManifest {
   // Optional default failure policy for bindings without their own policy.
   // Supported values are "fail_closed" and "fail_open".
   string failure_policy = 3;
+  // Optional profile catalog vended by this interceptor.
+  ProviderProfileCatalog provider_profile_catalog = 4;
+}
+
+enum ProviderProfileCatalogMode {
+  PROVIDER_PROFILE_CATALOG_MODE_UNSPECIFIED = 0;
+  PROVIDER_PROFILE_CATALOG_MODE_APPEND = 1;
+  PROVIDER_PROFILE_CATALOG_MODE_AUTHORITATIVE = 2;
+}
+
+message ProviderProfileCatalog {
+  // Stable source id, for example "interceptor/provider-governance".
+  string source_id = 1;
+  // Merge behavior for this source.
+  ProviderProfileCatalogMode mode = 2;
+  // Complete profile snapshot vended by this source.
+  repeated openshell.v1.ProviderProfile profiles = 3;
 }
 
 message InterceptorBinding {

@@ -52,6 +52,13 @@ phases, and re-encoded before the handler sees the request. This keeps
 interception centralized: adding an interceptable unary RPC does not require
 method-specific gateway instrumentation.
 
+Interceptor manifests can also vend provider profile catalogs. The gateway
+always starts with the in-tree built-in catalog source, then merges any
+interceptor-declared sources. An authoritative interceptor catalog becomes the
+visible provider profile source of truth for that gateway and hides built-in
+and user-imported profiles from profile resolution, while append catalogs add
+static profiles alongside the built-in/user catalog.
+
 Supported auth modes:
 
 | Mode | Use |

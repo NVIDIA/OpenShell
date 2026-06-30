@@ -19,9 +19,8 @@ pub use context::{DiscoveryContext, RealDiscoveryContext};
 pub use discovery::{discover_from_profile, discover_with_spec};
 pub use profiles::{
     CredentialRefreshProfile, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
-    default_profiles, get_default_profile, normalize_profile_id, parse_profile_json,
-    parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
-    validate_profile_set,
+    builtin_profiles, normalize_profile_id, parse_profile_json, parse_profile_yaml,
+    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml, validate_profile_set,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -152,12 +151,14 @@ impl ProviderRegistry {
 
     #[must_use]
     pub fn profile(&self, id: &str) -> Option<&'static ProviderTypeProfile> {
-        get_default_profile(id)
+        builtin_profiles()
+            .iter()
+            .find(|profile| profile.id.eq_ignore_ascii_case(id))
     }
 
     #[must_use]
     pub fn profiles(&self) -> Vec<&'static ProviderTypeProfile> {
-        default_profiles().iter().collect()
+        builtin_profiles().iter().collect()
     }
 
     /// Inject provider-specific env vars via the registered plugin.

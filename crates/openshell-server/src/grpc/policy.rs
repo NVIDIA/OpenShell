@@ -14,6 +14,7 @@ use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
+use crate::provider_profile_catalog::ProviderProfileCatalog;
 use openshell_core::net::is_internal_ip;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
@@ -61,7 +62,7 @@ use openshell_prover::{
     registry::load_embedded_binary_registry,
     report::finding_shorthand,
 };
-use openshell_providers::{get_default_profile, normalize_provider_type};
+use openshell_providers::normalize_provider_type;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -517,8 +518,9 @@ fn run_prover_findings(
 /// a `warn!` — the merged policy already excludes them at compose time, so
 /// silently treating them as absent here keeps the credential set consistent
 /// with the merged policy the prover validates against.
-async fn build_credential_set_for_sandbox(
+async fn build_credential_set_for_sandbox_with_catalog(
     store: &Store,
+    catalog: &ProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<CredentialSet, Status> {
     let mut credentials = Vec::new();
@@ -534,28 +536,17 @@ async fn build_credential_set_for_sandbox(
         };
 
         let provider_type = provider.r#type.trim();
-        let profile = if let Some(canonical_type) = normalize_provider_type(provider_type) {
-            let Some(profile) = get_default_profile(canonical_type) else {
-                warn!(
-                    provider_name = %name,
-                    provider_type,
-                    "legacy provider type has no profile; skipping credential entry"
-                );
-                continue;
-            };
-            profile.clone()
-        } else {
-            let Some(profile) =
-                super::provider::get_provider_type_profile(store, provider_type).await?
-            else {
-                warn!(
-                    provider_name = %name,
-                    provider_type,
-                    "provider type has no profile; skipping credential entry"
-                );
-                continue;
-            };
-            profile
+        let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
+        let Some(profile) =
+            super::provider::get_provider_type_profile_with_catalog(store, catalog, profile_id)
+                .await?
+        else {
+            warn!(
+                provider_name = %name,
+                provider_type,
+                "provider type has no profile; skipping credential entry"
+            );
+            continue;
         };
 
         let target_hosts: Vec<String> = profile
@@ -1023,8 +1014,12 @@ async fn current_effective_policy_for_sandbox(
             .as_ref()
             .map(|spec| spec.providers.clone())
             .unwrap_or_default();
-        let provider_layers =
-            profile_provider_policy_layers(state.store.as_ref(), &provider_names).await?;
+        let provider_layers = profile_provider_policy_layers_with_catalog(
+            state.store.as_ref(),
+            &state.provider_profile_catalog,
+            &provider_names,
+        )
+        .await?;
         if !provider_layers.is_empty() {
             policy = compose_effective_policy(&policy, &provider_layers);
         }
@@ -1292,8 +1287,12 @@ pub(super) async fn handle_get_sandbox_config(
         && !matches!(policy_source, PolicySource::Global)
         && let Some(source_policy) = policy.as_ref()
     {
-        let provider_layers =
-            profile_provider_policy_layers(state.store.as_ref(), &sandbox_provider_names).await?;
+        let provider_layers = profile_provider_policy_layers_with_catalog(
+            state.store.as_ref(),
+            &state.provider_profile_catalog,
+            &sandbox_provider_names,
+        )
+        .await?;
         if !provider_layers.is_empty() {
             let effective_policy = compose_effective_policy(source_policy, &provider_layers);
             policy_hash = deterministic_policy_hash(&effective_policy);
@@ -1303,8 +1302,12 @@ pub(super) async fn handle_get_sandbox_config(
 
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
     let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
-    let provider_env_revision =
-        compute_provider_env_revision(state.store.as_ref(), &sandbox_provider_names).await?;
+    let provider_env_revision = compute_provider_env_revision_with_catalog(
+        state.store.as_ref(),
+        &state.provider_profile_catalog,
+        &sandbox_provider_names,
+    )
+    .await?;
 
     Ok(Response::new(GetSandboxConfigResponse {
         policy,
@@ -1318,8 +1321,22 @@ pub(super) async fn handle_get_sandbox_config(
     }))
 }
 
-pub(super) async fn compute_provider_env_revision(
+#[cfg(test)]
+async fn compute_provider_env_revision(
     store: &Store,
+    provider_names: &[String],
+) -> Result<u64, Status> {
+    compute_provider_env_revision_with_catalog(
+        store,
+        &ProviderProfileCatalog::with_builtin_profiles(),
+        provider_names,
+    )
+    .await
+}
+
+pub(super) async fn compute_provider_env_revision_with_catalog(
+    store: &Store,
+    catalog: &ProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
@@ -1341,7 +1358,8 @@ pub(super) async fn compute_provider_env_revision(
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
                 hasher.update(provider.r#type.as_bytes());
-                hash_provider_profile_revision(store, &provider.r#type, &mut hasher).await?;
+                hash_provider_profile_revision(store, catalog, &provider.r#type, &mut hasher)
+                    .await?;
 
                 let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
                 credential_keys.sort();
@@ -1369,41 +1387,32 @@ pub(super) async fn compute_provider_env_revision(
 
 async fn hash_provider_profile_revision(
     store: &Store,
+    catalog: &ProviderProfileCatalog,
     provider_type: &str,
     hasher: &mut Sha256,
 ) -> Result<(), Status> {
-    if let Some(profile) = get_default_profile(provider_type) {
-        hasher.update(b"builtin-profile");
-        hasher.update(profile.to_proto().encode_to_vec());
-        return Ok(());
-    }
-
-    hasher.update(b"custom-profile");
-    match store
-        .get_by_name(
-            openshell_core::proto::StoredProviderProfile::object_type(),
-            provider_type,
-        )
+    let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
+    catalog
+        .hash_profile_revision(store, profile_id, hasher)
         .await
-        .map_err(|e| {
-            Status::internal(format!(
-                "fetch provider profile '{provider_type}' failed: {e}"
-            ))
-        })? {
-        Some(record) => {
-            hasher.update(record.id.as_bytes());
-            hasher.update(record.updated_at_ms.to_le_bytes());
-            hasher.update(record.payload.as_slice());
-        }
-        None => {
-            hasher.update(b"missing");
-        }
-    }
-    Ok(())
 }
 
+#[cfg(test)]
 async fn profile_provider_policy_layers(
     store: &Store,
+    provider_names: &[String],
+) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    profile_provider_policy_layers_with_catalog(
+        store,
+        &ProviderProfileCatalog::with_builtin_profiles(),
+        provider_names,
+    )
+    .await
+}
+
+async fn profile_provider_policy_layers_with_catalog(
+    store: &Store,
+    catalog: &ProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
     let mut layers = Vec::new();
@@ -1416,28 +1425,17 @@ async fn profile_provider_policy_layers(
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
         let provider_type = provider.r#type.trim();
-        let profile = if let Some(canonical_type) = normalize_provider_type(provider_type) {
-            let Some(profile) = get_default_profile(canonical_type) else {
-                warn!(
-                    provider_name = %name,
-                    provider_type,
-                    "legacy provider type has no profile; skipping provider policy layer"
-                );
-                continue;
-            };
-            profile.clone()
-        } else {
-            let Some(profile) =
-                super::provider::get_provider_type_profile(store, provider_type).await?
-            else {
-                warn!(
-                    provider_name = %name,
-                    provider_type,
-                    "provider type has no profile; skipping provider policy layer"
-                );
-                continue;
-            };
-            profile
+        let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
+        let Some(profile) =
+            super::provider::get_provider_type_profile_with_catalog(store, catalog, profile_id)
+                .await?
+        else {
+            warn!(
+                provider_name = %name,
+                provider_type,
+                "provider type has no profile; skipping provider policy layer"
+            );
+            continue;
         };
 
         let rule_name = openshell_policy::provider_rule_name(provider.object_name());
@@ -1492,11 +1490,18 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
     let provider_names = spec.providers;
-    let provider_env_revision =
-        compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
-    let provider_environment =
-        super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
-            .await?;
+    let provider_env_revision = compute_provider_env_revision_with_catalog(
+        state.store.as_ref(),
+        &state.provider_profile_catalog,
+        &provider_names,
+    )
+    .await?;
+    let provider_environment = super::provider::resolve_provider_environment_with_catalog(
+        state.store.as_ref(),
+        &state.provider_profile_catalog,
+        &provider_names,
+    )
+    .await?;
 
     info!(
         sandbox_id = %sandbox_id,
@@ -2403,8 +2408,12 @@ pub(super) async fn handle_submit_policy_analysis(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
-    let credential_set =
-        build_credential_set_for_sandbox(state.store.as_ref(), &provider_names_for_creds).await?;
+    let credential_set = build_credential_set_for_sandbox_with_catalog(
+        state.store.as_ref(),
+        &state.provider_profile_catalog,
+        &provider_names_for_creds,
+    )
+    .await?;
 
     let current_version = state
         .store
@@ -4613,7 +4622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_policy_layers_skip_custom_profile_for_legacy_provider_type() {
+    async fn provider_policy_layers_resolve_user_profile_for_normalized_provider_type() {
         let store = test_store().await;
         store
             .put_message(&test_provider("custom-provider", "generic"))
@@ -4653,7 +4662,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(layers.is_empty());
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rule.endpoints[0].host, "backdoor.example");
     }
 
     #[tokio::test]

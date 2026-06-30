@@ -18,8 +18,7 @@ extend OpenShell to provide advanced governance over sandbox policies.
 - users cannot replace or merge sandbox policy after sandbox creation
 - users cannot create provider records other than `github` and `slack`
 - users cannot update or delete the governed `github` or `slack` provider records
-- users cannot import or update provider profiles other than `github` and
-  `slack`
+- users cannot import or update provider profiles outside the governed set
 - provider profile deletion is blocked by the interceptor
 
 Run the interceptor:
@@ -28,8 +27,7 @@ Run the interceptor:
 cargo run -- \
   --listen 127.0.0.1:18081 \
   --policy policy.yaml \
-  --profiles profiles \
-  --gateway-endpoint http://127.0.0.1:8080
+  --profiles profiles
 ```
 
 At startup the example parses `policy.yaml`, converts it to the protobuf JSON
@@ -45,15 +43,14 @@ profile from its filename without the extension: `profiles/github.yaml` becomes
 profile ID `github`, and `profiles/slack.yaml` becomes profile ID `slack`. The
 YAML files do not need an `id` field; if one is present, the filename still wins.
 
-When `--gateway-endpoint` is set, the interceptor reconciles the loaded profiles
-through the gateway's normal provider profile APIs. GitHub is already a built-in
-read-only profile, so the interceptor accepts the exported built-in `github`
-profile as present; the gateway still rejects importing or updating that
-built-in ID. Slack is a custom profile: the interceptor uses
-`ImportProviderProfiles` for first-time vending and `UpdateProviderProfiles` for
-ongoing changes. It exports the current profile to read `resource_version`,
-injects that version into the loaded YAML payload, and submits
-`UpdateProviderProfiles`. It never deletes governed profiles.
+The interceptor vends the loaded profiles through
+`InterceptorManifest.provider_profile_catalog` with authoritative mode. While
+the interceptor is attached, the gateway treats that catalog as the profile
+source of truth: `provider list-profiles` shows only `github` and `slack`, and
+the built-in/user profile catalog is hidden. The normal import, update, and
+delete profile APIs remain available for gateways without an authoritative
+catalog, but profiles managed by this interceptor cannot be changed through
+those APIs.
 
 The signing key is generated in memory on each interceptor start. This keeps the
 example self-contained. Production governance services should load managed
@@ -79,9 +76,16 @@ max_response_bytes = 1048576
 max_patches        = 32
 ```
 
-Run the smoke test script to automatically start the gateway, interceptor, and test the
-governance controls
+Run the launcher script to start a local gateway with the interceptor attached.
+The script prints the gateway endpoint and log paths, then keeps the gateway and
+interceptor running until you press Ctrl-C:
 
 ```shell
 ./smoke.sh
+```
+
+To run the governance smoke test suite and stop the gateway when it completes:
+
+```shell
+./smoke.sh --test-suite
 ```

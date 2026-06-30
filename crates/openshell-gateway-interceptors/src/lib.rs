@@ -200,6 +200,7 @@ impl std::fmt::Debug for BindingPlan {
 #[derive(Debug, Clone)]
 pub struct GatewayInterceptorRuntime {
     bindings: Arc<BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>>>,
+    profile_catalog_sources: Arc<Vec<ProfileCatalogSource>>,
     routes: Arc<routes::OpenShellRouteIndex>,
     descriptors: Arc<ProtoDescriptors>,
 }
@@ -215,6 +216,19 @@ pub struct InterceptedRequest {
     pub body: Vec<u8>,
     selector: RpcSelector,
     operation: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileCatalogMode {
+    Append,
+    Authoritative,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileCatalogSource {
+    pub source_id: String,
+    pub mode: ProfileCatalogMode,
+    pub profiles: Vec<openshell_core::proto::ProviderProfile>,
 }
 
 /// Return `None` when no interceptors are configured.
@@ -237,6 +251,8 @@ impl GatewayInterceptorRuntime {
         let descriptors =
             ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET)?;
         let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
+        let mut profile_catalog_sources = Vec::new();
+        let mut profile_catalog_source_ids = BTreeSet::new();
 
         for config in configs {
             validate_service_config(&config)?;
@@ -318,15 +334,37 @@ impl GatewayInterceptorRuntime {
                         .push(plan);
                 }
             }
+
+            if let Some(source) =
+                normalize_profile_catalog_source(&config.name, manifest.provider_profile_catalog)?
+            {
+                if !profile_catalog_source_ids.insert(source.source_id.clone()) {
+                    return Err(InterceptorError::Config(format!(
+                        "duplicate provider profile catalog source id '{}'",
+                        source.source_id
+                    )));
+                }
+                profile_catalog_sources.push(source);
+            }
         }
 
         let count: usize = bindings.values().map(Vec::len).sum();
-        info!(bindings = count, "gateway interceptors initialized");
+        info!(
+            bindings = count,
+            profile_catalog_sources = profile_catalog_sources.len(),
+            "gateway interceptors initialized"
+        );
         Ok(Self {
             bindings: Arc::new(bindings),
+            profile_catalog_sources: Arc::new(profile_catalog_sources),
             routes: Arc::new(routes),
             descriptors: Arc::new(descriptors),
         })
+    }
+
+    #[must_use]
+    pub fn profile_catalog_sources(&self) -> &[ProfileCatalogSource] {
+        self.profile_catalog_sources.as_ref()
     }
 
     #[must_use]
@@ -600,6 +638,57 @@ fn normalize_binding(
         selector,
         phases,
         failure_policy,
+    }))
+}
+
+fn normalize_profile_catalog_source(
+    interceptor_name: &str,
+    catalog: Option<openshell_core::proto::gateway_interceptor::v1::ProviderProfileCatalog>,
+) -> Result<Option<ProfileCatalogSource>> {
+    let Some(catalog) = catalog else {
+        return Ok(None);
+    };
+
+    let source_id = catalog.source_id.trim();
+    if source_id.is_empty() {
+        return Err(InterceptorError::Config(format!(
+            "interceptor '{interceptor_name}' provider profile catalog source_id must not be empty"
+        )));
+    }
+
+    let mode =
+        openshell_core::proto::gateway_interceptor::v1::ProviderProfileCatalogMode::try_from(
+            catalog.mode,
+        )
+        .map_err(|_| {
+            InterceptorError::Config(format!(
+                "interceptor '{interceptor_name}' provider profile catalog has unknown mode"
+            ))
+        })?;
+    let mode = match mode {
+        openshell_core::proto::gateway_interceptor::v1::ProviderProfileCatalogMode::Append => {
+            ProfileCatalogMode::Append
+        }
+        openshell_core::proto::gateway_interceptor::v1::ProviderProfileCatalogMode::Authoritative => {
+            ProfileCatalogMode::Authoritative
+        }
+        openshell_core::proto::gateway_interceptor::v1::ProviderProfileCatalogMode::Unspecified => {
+            return Err(InterceptorError::Config(format!(
+                "interceptor '{interceptor_name}' provider profile catalog mode must not be unspecified"
+            )));
+        }
+    };
+
+    if mode == ProfileCatalogMode::Authoritative && catalog.profiles.is_empty() {
+        return Err(InterceptorError::Config(format!(
+            "interceptor '{interceptor_name}' authoritative provider profile catalog must not be empty"
+        )));
+    }
+
+    Ok(Some(ProfileCatalogSource {
+        source_id: source_id.to_string(),
+        mode,
+        profiles: catalog.profiles,
     }))
 }
 

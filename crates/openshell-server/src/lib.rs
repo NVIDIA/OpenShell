@@ -35,6 +35,7 @@ mod inference;
 mod multiplex;
 mod persistence;
 pub(crate) mod policy_store;
+mod provider_profile_catalog;
 mod provider_refresh;
 mod readiness;
 mod sandbox_index;
@@ -151,6 +152,10 @@ pub struct ServerState {
     /// Immutable gateway interceptor execution plan. `None` when disabled.
     pub(crate) gateway_interceptors:
         Option<openshell_gateway_interceptors::GatewayInterceptorRuntime>,
+
+    /// Gateway-local provider profile catalog assembled from built-ins and
+    /// profile-vending interceptors. User-imported profiles are read on demand.
+    pub(crate) provider_profile_catalog: provider_profile_catalog::ProviderProfileCatalog,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -202,6 +207,8 @@ impl ServerState {
             k8s_sa_authenticator: None,
             grpc_rate_limiter,
             gateway_interceptors: None,
+            provider_profile_catalog:
+                provider_profile_catalog::ProviderProfileCatalog::with_builtin_profiles(),
         }
     }
 }
@@ -274,6 +281,17 @@ pub(crate) async fn run_server(
             .map_err(|e| {
                 Error::config(format!("gateway interceptor initialization failed: {e}"))
             })?;
+    let provider_profile_catalog =
+        provider_profile_catalog::ProviderProfileCatalog::from_interceptor_sources(
+            gateway_interceptors
+                .as_ref()
+                .map_or(&[][..], |runtime| runtime.profile_catalog_sources()),
+        )
+        .map_err(|e| {
+            Error::config(format!(
+                "provider profile catalog initialization failed: {e}"
+            ))
+        })?;
     let mut state = ServerState::new(
         config.clone(),
         store.clone(),
@@ -285,6 +303,7 @@ pub(crate) async fn run_server(
         oidc_cache,
     );
     state.gateway_interceptors = gateway_interceptors;
+    state.provider_profile_catalog = provider_profile_catalog;
 
     // Load the gateway-minted sandbox JWT signing key when configured.
     // Optional so single-driver dev deployments without certgen continue
