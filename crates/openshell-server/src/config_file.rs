@@ -174,10 +174,7 @@ pub struct MiddlewareServiceFileConfig {
     /// Operator-facing name used for diagnostics.
     pub name: String,
     /// Plaintext gRPC endpoint reachable by the gateway and supervisors.
-    pub endpoint: String,
-    /// Required explicit opt-in to the local-development-only insecure mode.
-    #[serde(default)]
-    pub allow_insecure: bool,
+    pub grpc_endpoint: String,
     /// Operator-owned body limit for every binding exposed by this service.
     pub max_body_bytes: u64,
 }
@@ -186,8 +183,7 @@ impl From<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
     fn from(config: &MiddlewareServiceFileConfig) -> Self {
         Self {
             name: config.name.clone(),
-            endpoint: config.endpoint.clone(),
-            allow_insecure: config.allow_insecure,
+            grpc_endpoint: config.grpc_endpoint.clone(),
             max_body_bytes: config.max_body_bytes,
         }
     }
@@ -439,8 +435,7 @@ allow_unauthenticated_users = true
         let toml = r#"
 [[openshell.gateway.middleware]]
 name = "local-guard"
-endpoint = "http://127.0.0.1:50051"
-allow_insecure = true
+grpc_endpoint = "http://127.0.0.1:50051"
 max_body_bytes = 262144
 "#;
         let tmp = write_tmp(toml);
@@ -449,8 +444,7 @@ max_body_bytes = 262144
             file.openshell.gateway.middleware,
             vec![MiddlewareServiceFileConfig {
                 name: "local-guard".into(),
-                endpoint: "http://127.0.0.1:50051".into(),
-                allow_insecure: true,
+                grpc_endpoint: "http://127.0.0.1:50051".into(),
                 max_body_bytes: 262_144,
             }]
         );

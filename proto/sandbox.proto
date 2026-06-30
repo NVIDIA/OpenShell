@@ -79,8 +79,12 @@ message NetworkMiddlewareConfig {
   MiddlewareEndpointSelector endpoints = 5;
 }
 
+// Host selector controlling which admitted destinations use a middleware config.
 message MiddlewareEndpointSelector {
+  // Exact host or DNS glob patterns included in the selection.
   repeated string include = 1;
+  // Exact host or DNS glob patterns removed from the selection.
+  // Exclusions take precedence over inclusions.
   repeated string exclude = 2;
 }
 
@@ -358,14 +362,12 @@ message GetSandboxConfigResponse {
 }
 
 // Connection details for one operator-registered supervisor middleware service.
-// V1 supports only explicitly enabled plaintext gRPC for local development.
+// V1 supports plaintext and server-authenticated TLS gRPC.
 message SupervisorMiddlewareService {
   // Operator-facing registration name used for diagnostics.
   string name = 1;
   // gRPC endpoint reachable from the sandbox supervisor.
-  string endpoint = 2;
-  // Explicit acknowledgement that request content is sent without TLS.
-  bool allow_insecure = 3;
+  string grpc_endpoint = 2;
   // Operator-owned body limit applied to every binding exposed by the service.
   uint64 max_body_bytes = 4;
 }

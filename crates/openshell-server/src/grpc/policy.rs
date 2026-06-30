@@ -9331,8 +9331,7 @@ mod tests {
         let settings = HashMap::new();
         let service = openshell_core::proto::SupervisorMiddlewareService {
             name: "local-guard".into(),
-            endpoint: "http://127.0.0.1:50051".into(),
-            allow_insecure: true,
+            grpc_endpoint: "http://127.0.0.1:50051".into(),
             max_body_bytes: 1024,
         };
 

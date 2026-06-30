@@ -8,90 +8,156 @@ package openshell.middleware.v1;
 import "google/protobuf/empty.proto";
 import "google/protobuf/struct.proto";
 
+// SupervisorMiddleware lets an operator-run service inspect and transform
+// sandbox HTTP egress before OpenShell injects credentials.
 service SupervisorMiddleware {
+  // Describe returns the service manifest and declared bindings.
   rpc Describe(google.protobuf.Empty) returns (MiddlewareManifest);
+
+  // ValidateConfig checks service-specific configuration for one binding.
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
+
+  // EvaluateHttpRequest returns an allow, deny, or mutation decision for one
+  // buffered HTTP request.
   rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
 }
 
+// MiddlewareManifest describes one service and the bindings it exposes.
 message MiddlewareManifest {
+  // Middleware protocol version implemented by the service.
   string api_version = 1;
+  // Human-readable service name used for diagnostics.
   string name = 2;
+  // Service-defined version string used for diagnostics.
   string service_version = 3;
+  // Bindings exposed by this service.
   repeated MiddlewareBinding bindings = 4;
 }
 
+// MiddlewareBinding declares one operation and phase supported by a service.
 message MiddlewareBinding {
+  // Stable binding id used by policy configuration and audit logs.
   string id = 1;
+  // Supported operation name. V1 supports "HttpRequest".
   string operation = 2;
+  // Supported evaluation phase. V1 supports "pre_credentials".
   string phase = 3;
   // Maximum request or replacement body this binding can process.
   uint64 max_body_bytes = 4;
 }
 
+// ValidateConfigRequest contains one policy configuration to validate.
 message ValidateConfigRequest {
+  // Middleware protocol version selected by OpenShell.
   string api_version = 1;
+  // Manifest binding id associated with this configuration.
   string binding_id = 2;
+  // Service-specific policy configuration.
   google.protobuf.Struct config = 3;
 }
 
+// ValidateConfigResponse reports whether a policy configuration is accepted.
 message ValidateConfigResponse {
+  // True when the service accepts the configuration.
   bool valid = 1;
+  // Human-readable validation failure reason. Empty when valid is true.
   string reason = 2;
 }
 
+// HttpRequestEvaluation contains one buffered HTTP request to evaluate.
 message HttpRequestEvaluation {
+  // Middleware protocol version selected by OpenShell.
   string api_version = 1;
+  // Manifest binding id selected for this evaluation.
   string binding_id = 2;
+  // Evaluation phase selected for this request.
   string phase = 3;
+  // Sandbox and request identity available to the supervisor.
   RequestContext context = 4;
+  // Validated service-specific policy configuration.
   google.protobuf.Struct config = 5;
+  // Destination and HTTP request target.
   HttpRequestTarget target = 6;
+  // HTTP request headers before OpenShell injects credentials.
   map<string, string> headers = 7;
+  // Buffered request body. Empty for a bodyless request.
   bytes body = 8;
 }
 
+// RequestContext identifies the sandbox request being evaluated.
 message RequestContext {
+  // Request id used to correlate middleware and supervisor logs.
   string request_id = 1;
+  // Sandbox id that originated the request.
   string sandbox_id = 2;
+  // Workload process that originated the request, when available.
   Process originating_process = 3;
 }
 
+// HttpRequestTarget describes the admitted HTTP destination and request target.
 message HttpRequestTarget {
+  // Request scheme, such as "http" or "https".
   string scheme = 1;
+  // Destination hostname selected by network policy.
   string host = 2;
+  // Destination TCP port.
   uint32 port = 3;
+  // HTTP request method.
   string method = 4;
+  // Request path without the query string.
   string path = 5;
+  // Raw request query string without the leading question mark.
   string query = 6;
 }
 
+// Process identifies a workload process and its executable ancestry.
 message Process {
+  // Executable path for the originating process.
   string binary = 1;
+  // Process id within the sandbox.
   uint32 pid = 2;
+  // Executable paths for ancestor processes, nearest parent first.
   repeated string ancestors = 3;
 }
 
+// Decision controls whether OpenShell continues processing the request.
 enum Decision {
+  // Invalid response value handled according to the policy failure mode.
   DECISION_UNSPECIFIED = 0;
+  // Continue processing the request and apply any returned mutations.
   DECISION_ALLOW = 1;
+  // Deny the request before credentials are injected or data is sent upstream.
   DECISION_DENY = 2;
 }
 
+// Finding is an audit-safe observation produced during evaluation.
 message Finding {
+  // Stable, service-defined finding type.
   string type = 1;
+  // Human-readable finding label that does not contain request content.
   string label = 2;
+  // Number of matching observations represented by this finding.
   uint32 count = 3;
+  // Service-defined confidence level.
   string confidence = 4;
+  // Service-defined severity level.
   string severity = 5;
 }
 
+// HttpRequestResult contains the decision and optional request mutations.
 message HttpRequestResult {
+  // Allow or deny decision for this request.
   Decision decision = 1;
+  // Human-readable reason used for diagnostics and denied responses.
   string reason = 2;
+  // Replacement request body when has_body is true.
   bytes body = 3;
+  // True when body should replace the request body, including with an empty body.
   bool has_body = 4;
+  // Request headers to add before forwarding. Protected headers are rejected.
   map<string, string> add_headers = 5;
+  // Audit-safe findings produced during evaluation.
   repeated Finding findings = 6;
+  // Non-secret service-defined metadata included in diagnostics.
   map<string, string> metadata = 7;
 }

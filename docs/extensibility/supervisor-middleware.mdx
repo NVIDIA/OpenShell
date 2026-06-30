@@ -41,16 +41,14 @@ Start an operator-run service before starting the gateway, then add a registrati
 ```toml
 [[openshell.gateway.middleware]]
 name = "local-content-guard"
-endpoint = "http://host.openshell.internal:50051"
-allow_insecure = true
+grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
 ```
 
 | Field | Description |
 | --- | --- |
 | `name` | Operator-facing registration name used in diagnostics. Policies do not reference this value. |
-| `endpoint` | Service address reachable from both the gateway and sandbox supervisors. |
-| `allow_insecure` | Required acknowledgement for the currently supported plaintext endpoint. |
+| `grpc_endpoint` | Service address reachable from both the gateway and sandbox supervisors. Supports plaintext `http://` and TLS `https://` with platform trust roots. |
 | `max_body_bytes` | Operator limit applied to every binding exposed by the service. |
 
 The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes a binding ID already owned by another service. Operator-run services cannot claim the reserved `openshell/` namespace.
@@ -135,7 +133,7 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 - The supported operation and phase are `HttpRequest/pre_credentials`.
 - Selection uses destination host include and exclude patterns.
 - Required middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic.
-- Operator-run services currently use explicitly enabled plaintext `http://` endpoints.
-- TLS, service authentication, health checks, and runtime registration are not available.
+- Operator-run services support plaintext `http://` and TLS `https://` endpoints. HTTPS certificates must chain to a CA in the platform trust store.
+- Custom trust roots, client authentication, health checks, and runtime registration are not available.
 
 For a runnable operator workflow, see the [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard).
