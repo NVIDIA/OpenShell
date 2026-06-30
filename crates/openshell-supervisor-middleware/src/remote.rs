@@ -10,7 +10,7 @@ use openshell_core::proto::{
     HttpRequestEvaluation, HttpRequestResult, MiddlewareManifest, ValidateConfigRequest,
     ValidateConfigResponse,
 };
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -23,19 +23,30 @@ pub struct RemoteMiddlewareService {
 }
 
 impl RemoteMiddlewareService {
-    pub async fn connect(registration_name: &str, endpoint: &str) -> Result<Self> {
-        let channel = Endpoint::from_shared(endpoint.to_string())
+    pub async fn connect(registration_name: &str, grpc_endpoint: &str) -> Result<Self> {
+        let mut endpoint = Endpoint::from_shared(grpc_endpoint.to_string())
             .into_diagnostic()
             .wrap_err_with(|| {
-                format!("middleware registration '{registration_name}' has an invalid endpoint")
-            })?
+                format!(
+                    "middleware registration '{registration_name}' has an invalid grpc_endpoint"
+                )
+            })?;
+        if grpc_endpoint.starts_with("https://") {
+            endpoint = endpoint
+                .tls_config(ClientTlsConfig::new().with_enabled_roots())
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("middleware registration '{registration_name}' could not configure TLS")
+                })?;
+        }
+        let channel = endpoint
             .connect_timeout(CONNECT_TIMEOUT)
             .connect()
             .await
             .into_diagnostic()
             .wrap_err_with(|| {
                 format!(
-                    "middleware registration '{registration_name}' could not connect to {endpoint}"
+                    "middleware registration '{registration_name}' could not connect to {grpc_endpoint}"
                 )
             })?;
         Ok(Self {

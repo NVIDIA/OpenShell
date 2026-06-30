@@ -103,12 +103,11 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 grpc_rate_limit_requests       = 120
 grpc_rate_limit_window_seconds = 60
 
-# Local-development-only external supervisor middleware. The endpoint must be
-# reachable from both the gateway and sandbox supervisors.
+# Operator-run supervisor middleware. The gRPC endpoint must be reachable from
+# both the gateway and sandbox supervisors.
 [[openshell.gateway.middleware]]
 name = "local-content-guard"
-endpoint = "http://host.openshell.internal:50051"
-allow_insecure = true
+grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
 
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
@@ -155,8 +154,7 @@ Register operator-run supervisor middleware services with one or more `[[openshe
 ```toml
 [[openshell.gateway.middleware]]
 name = "local-content-guard"
-endpoint = "http://host.openshell.internal:50051"
-allow_insecure = true
+grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
 ```
 
@@ -166,7 +164,7 @@ The gateway connects to every registered service and validates `Describe` before
 
 `max_body_bytes` is the operator limit for every binding exposed by the service. It must be greater than zero and no larger than each binding's advertised limit. OpenShell rejects an oversized value instead of silently clamping it.
 
-The service endpoint must use plaintext `http://`, and `allow_insecure = true` is required as an explicit acknowledgement that inspected request content is sent without transport encryption or peer authentication. TLS, authentication, health checks, and runtime registration are not supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address when both runtimes resolve it.
+The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
 
 See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, body-limit, and operational guidance.
 

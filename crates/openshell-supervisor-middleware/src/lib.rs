@@ -246,15 +246,11 @@ fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<(
             "supervisor middleware registration name cannot be empty"
         ));
     }
-    if !registration.allow_insecure {
+    if !registration.grpc_endpoint.starts_with("http://")
+        && !registration.grpc_endpoint.starts_with("https://")
+    {
         return Err(miette!(
-            "middleware registration '{}' must set allow_insecure = true; TLS is not supported in V1",
-            registration.name
-        ));
-    }
-    if !registration.endpoint.starts_with("http://") {
-        return Err(miette!(
-            "middleware registration '{}' endpoint must use http:// in the local-development-only V1",
+            "middleware registration '{}' grpc_endpoint must use http:// or https://",
             registration.name
         ));
     }
@@ -365,7 +361,7 @@ impl MiddlewareRegistry {
             let service = Arc::new(
                 remote::RemoteMiddlewareService::connect(
                     &registration.name,
-                    &registration.endpoint,
+                    &registration.grpc_endpoint,
                 )
                 .await?,
             );
@@ -1129,8 +1125,7 @@ mod tests {
     fn external_registration(max_body_bytes: u64) -> SupervisorMiddlewareService {
         SupervisorMiddlewareService {
             name: "local-guard-service".into(),
-            endpoint: "http://127.0.0.1:50051".into(),
-            allow_insecure: true,
+            grpc_endpoint: "http://127.0.0.1:50051".into(),
             max_body_bytes,
         }
     }
@@ -1267,11 +1262,23 @@ mod tests {
     }
 
     #[test]
-    fn external_registration_requires_explicit_insecure_opt_in() {
+    fn external_registration_accepts_http_and_https_grpc_endpoints() {
+        for grpc_endpoint in [
+            "http://127.0.0.1:50051",
+            "https://middleware.example.com:443",
+        ] {
+            let mut registration = external_registration(4096);
+            registration.grpc_endpoint = grpc_endpoint.into();
+            validate_registration(&registration).expect("supported gRPC endpoint scheme");
+        }
+    }
+
+    #[test]
+    fn external_registration_rejects_unsupported_grpc_endpoint_scheme() {
         let mut registration = external_registration(4096);
-        registration.allow_insecure = false;
-        let error = validate_registration(&registration).expect_err("opt-in required");
-        assert!(error.to_string().contains("allow_insecure"));
+        registration.grpc_endpoint = "ftp://middleware.example.com".into();
+        let error = validate_registration(&registration).expect_err("unsupported scheme");
+        assert!(error.to_string().contains("http:// or https://"));
     }
 
     #[tokio::test]
@@ -1293,7 +1300,7 @@ mod tests {
         let server_task = tokio::spawn(server);
 
         let mut registration = external_registration(1024);
-        registration.endpoint = format!("http://{address}");
+        registration.grpc_endpoint = format!("http://{address}");
         let registry = MiddlewareRegistry::connect_services(vec![registration.clone()])
             .await
             .expect("connect external middleware");
