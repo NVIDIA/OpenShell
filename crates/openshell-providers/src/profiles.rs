@@ -1315,6 +1315,16 @@ pub fn validate_profile_set(
                     message,
                 ));
             }
+            if credential.token_grant.is_none()
+                && let Err(message) = validate_static_credential_header_name(credential)
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.header_name",
+                    message,
+                ));
+            }
         }
 
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
@@ -1617,6 +1627,22 @@ fn validate_token_grant_header_name(credential: &CredentialProfile) -> Result<()
         "" | "bearer" | "header" => credential.header_name.trim(),
         _ => return Ok(()),
     };
+    validate_credential_header_name(header_name, "token_grant")
+}
+
+fn validate_static_credential_header_name(credential: &CredentialProfile) -> Result<(), String> {
+    let header_name = match credential.auth_style.trim().to_ascii_lowercase().as_str() {
+        "bearer" if credential.header_name.trim().is_empty() => "Authorization",
+        "header" if credential.header_name.trim().is_empty() => {
+            return Err("credential auth_style header requires header_name".to_string());
+        }
+        "bearer" | "header" => credential.header_name.trim(),
+        _ => return Ok(()),
+    };
+    validate_credential_header_name(header_name, "credential")
+}
+
+fn validate_credential_header_name(header_name: &str, label: &str) -> Result<(), String> {
     if header_name.is_empty() {
         return Ok(());
     }
@@ -1641,13 +1667,14 @@ fn validate_token_grant_header_name(credential: &CredentialProfile) -> Result<()
             )
     });
     if !valid {
-        return Err("token_grant header_name is not a valid HTTP header name".to_string());
+        return Err(format!(
+            "{label} header_name is not a valid HTTP header name"
+        ));
     }
     match header_name.to_ascii_lowercase().as_str() {
-        "host" | "content-length" | "transfer-encoding" | "connection" => Err(
-            "token_grant header_name may not override HTTP framing or connection headers"
-                .to_string(),
-        ),
+        "host" | "content-length" | "transfer-encoding" | "connection" => Err(format!(
+            "{label} header_name may not override HTTP framing or connection headers"
+        )),
         _ => Ok(()),
     }
 }
@@ -2345,6 +2372,120 @@ credentials:
         assert_eq!(
             diagnostic.message,
             "token_grant header_name may not override HTTP framing or connection headers"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_static_credential_framing_header_name() {
+        let profile = parse_profile_yaml(
+            r"
+id: framing-header-static
+display_name: Framing Header Static
+credentials:
+  - name: api_token
+    env_vars: [API_TOKEN]
+    auth_style: header
+    header_name: Host
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("framing-static.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.field == "credentials.header_name"
+                    && diagnostic.message.contains("HTTP framing")
+            })
+            .expect("framing header diagnostic should be reported for static credentials");
+
+        assert_eq!(
+            diagnostic.message,
+            "credential header_name may not override HTTP framing or connection headers"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_static_credential_invalid_header_name() {
+        let profile = parse_profile_yaml(
+            r"
+id: invalid-header-static
+display_name: Invalid Header Static
+credentials:
+  - name: api_token
+    env_vars: [API_TOKEN]
+    auth_style: header
+    header_name: 'Invalid Header'
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics =
+            validate_profile_set(&[("invalid-header-static.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.field == "credentials.header_name"
+                    && diagnostic.message.contains("not a valid HTTP header name")
+            })
+            .expect("invalid header name diagnostic should be reported for static credentials");
+
+        assert_eq!(
+            diagnostic.message,
+            "credential header_name is not a valid HTTP header name"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_accepts_static_credential_valid_header_name() {
+        let profile = parse_profile_yaml(
+            r"
+id: valid-header-static
+display_name: Valid Header Static
+credentials:
+  - name: api_token
+    env_vars: [API_TOKEN]
+    auth_style: header
+    header_name: X-Api-Key
+endpoints:
+  - host: api.example.com
+    port: 443
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics =
+            validate_profile_set(&[("valid-header-static.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.is_empty(),
+            "valid static credential header should produce no diagnostics, got: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_static_credential_header_style_missing_header_name() {
+        let profile = parse_profile_yaml(
+            r"
+id: header-style-no-name
+display_name: Header Style No Name
+credentials:
+  - name: api_token
+    env_vars: [API_TOKEN]
+    auth_style: header
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("header-no-name.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| {
+                d.field == "credentials.header_name" && d.message.contains("requires header_name")
+            })
+            .expect("empty header_name with auth_style header should be rejected");
+        assert_eq!(
+            diagnostic.message,
+            "credential auth_style header requires header_name"
         );
     }
 

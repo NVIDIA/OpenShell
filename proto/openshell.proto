@@ -1185,9 +1185,10 @@ message GetSandboxProviderEnvironmentResponse {
   uint64 provider_env_revision = 2;
   // Expiration timestamps for returned environment variables.
   map<string, int64> credential_expires_at_ms = 3;
-  // Dynamic credentials that require token grants or other runtime injection.
-  // Maps endpoint-bound provider metadata to credential metadata.
-  // Supervisor uses this to inject Authorization headers for token grant credentials.
+  // Endpoint-bound provider credentials for proxy-side injection.
+  // Maps endpoint keys to credential metadata. Entries with a token_grant
+  // use SPIFFE-backed runtime exchange; entries without resolve credential
+  // values from the environment map above.
   map<string, ProviderProfileCredential> dynamic_credentials = 4;
 }
 
