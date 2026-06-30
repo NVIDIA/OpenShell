@@ -68,6 +68,11 @@ description = "Run skaffold dev with the Kubernetes supervisor sidecar topology 
 dir = "deploy/helm/openshell"
 run = "skaffold dev -p sidecar-mtls"
 
+["helm:skaffold:dev:cni-sidecar"]
+description = "Run skaffold dev with CNI sidecar topology; requires OpenShell CNI installer permissions on nodes"
+dir = "deploy/helm/openshell"
+run = "skaffold dev -p cni-sidecar"
+
 ["helm:skaffold:run"]
 description = "Run skaffold run for deploy/helm/openshell (one-shot deploy)"
 dir = "deploy/helm/openshell"
@@ -83,6 +88,11 @@ description = "Run skaffold run with the Kubernetes supervisor sidecar topology 
 dir = "deploy/helm/openshell"
 run = "skaffold run -p sidecar-mtls"
 
+["helm:skaffold:run:cni-sidecar"]
+description = "Run skaffold run with CNI sidecar topology; requires OpenShell CNI installer permissions on nodes"
+dir = "deploy/helm/openshell"
+run = "skaffold run -p cni-sidecar"
+
 ["helm:skaffold:delete"]
 description = "Run skaffold delete for deploy/helm/openshell"
 dir = "deploy/helm/openshell"
@@ -97,6 +107,11 @@ run = "skaffold delete -p sidecar"
 description = "Run skaffold delete for the Kubernetes supervisor sidecar topology with TLS/mTLS enabled"
 dir = "deploy/helm/openshell"
 run = "skaffold delete -p sidecar-mtls"
+
+["helm:skaffold:delete:cni-sidecar"]
+description = "Run skaffold delete for the Kubernetes CNI sidecar topology"
+dir = "deploy/helm/openshell"
+run = "skaffold delete -p cni-sidecar"
 
 ["helm:skaffold:diagnose"]
 description = "Run skaffold diagnose for deploy/helm/openshell"

@@ -283,6 +283,14 @@ already unprivileged. Sidecar pods use a shared process namespace so the
 network sidecar can resolve workload process and binary identity through
 `/proc/<entrypoint-pid>`.
 
+The cni-sidecar topology keeps the sidecar runtime model and its shared-state
+boundary, but removes the privileged `openshell-network-init` init container.
+Instead, the privileged OpenShell CNI DaemonSet installs the pod-network
+bypass-prevention rules during CNI `ADD` using nftables or iptables. The driver
+annotates sandbox pods so the chained CNI plugin can read the proxy UID and
+enforcement mode, and both the agent container and long-running network sidecar
+stay non-root with no added Linux capabilities.
+
 ## Images
 
 The gateway image and Helm chart are built from this repository. Sandbox images

@@ -10,6 +10,13 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: labels gateway pods as gateway component
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/component"]
+          value: gateway
+
   - it: mounts the server TLS secret ca.crt as client CA for built-in PKI
     template: templates/statefulset.yaml
     set:

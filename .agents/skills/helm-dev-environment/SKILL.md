@@ -70,13 +70,20 @@ mise run helm:skaffold:run:sidecar
 mise run helm:skaffold:run:sidecar-mtls
 ```
 
-Both commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
+**Supervisor CNI-sidecar topology** (build once and leave running):
+```bash
+mise run helm:skaffold:run:cni-sidecar
+```
+
+These commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
 chart. The sidecar profile renders an `openshell-network-init` init container for
 nftables setup and an `openshell-supervisor-network` runtime sidecar for proxying.
 Binary-aware policy mode runs that sidecar as UID 0 with `SYS_PTRACE` and
 `DAC_READ_SEARCH`; relaxed mode can run it as the configured proxy UID. The
 sidecar-mTLS profile reuses `ci/values-sidecar.yaml` and restores
-`server.disableTls=false` inline for Skaffold. The `pkiInitJob` hook (a pre-install
+`server.disableTls=false` inline for Skaffold. The cni-sidecar profile enables
+the privileged OpenShell CNI DaemonSet and uses the sidecar runtime model
+without the pod-local network init container. The `pkiInitJob` hook (a pre-install
 Job that runs `openshell-gateway generate-certs`) generates mTLS secrets on first
 install. Envoy Gateway opt-in; see the Optional Add-ons section below.
 
@@ -86,6 +93,30 @@ The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or
 `#- ci/values-high-availability.yaml` in `deploy/helm/openshell/skaffold.yaml`,
 create the Secret named `openshell-ha-pg` with a `uri` key, then run
 `mise run helm:skaffold:run` or `mise run helm:skaffold:dev`.
+
+### Kubernetes e2e profiles
+
+Run the default Kubernetes e2e environment:
+
+```bash
+mise run e2e:kubernetes
+```
+
+Run the sidecar topology e2e environment:
+
+```bash
+mise run e2e:kubernetes:sidecar
+```
+
+Run the CNI-sidecar topology e2e environment:
+
+```bash
+mise run e2e:kubernetes:cni-sidecar
+```
+
+The cni-sidecar e2e task applies `ci/values-cni-sidecar.yaml` through
+`OPENSHELL_E2E_KUBE_EXTRA_VALUES` and requires OpenShell CNI installer
+permissions on the target cluster's nodes.
 
 ### TLS behaviour
 
@@ -147,6 +178,12 @@ For a sidecar-profile deployment:
 
 ```bash
 mise run helm:skaffold:delete:sidecar
+```
+
+For a cni-sidecar-profile deployment:
+
+```bash
+mise run helm:skaffold:delete:cni-sidecar
 ```
 
 ### Delete the cluster entirely
@@ -274,6 +311,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-sidecar.yaml` | Supervisor sidecar topology overlay for Kubernetes e2e/dev |
+| `deploy/helm/openshell/ci/values-cni-sidecar.yaml` | Supervisor CNI-sidecar topology overlay for Kubernetes e2e/dev; enables the OpenShell CNI DaemonSet |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
