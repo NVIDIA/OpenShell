@@ -494,6 +494,10 @@ supervisor_sideload_method     = "image-volume"
 # "combined" runs the existing single supervisor container with full process,
 # filesystem, and network enforcement in the agent container. "sidecar" moves
 # pod-level network enforcement and gateway session handling into a network sidecar.
+# "cni-sidecar" keeps the sidecar runtime model but expects an OpenShell CNI
+# plugin to install the pod-network rules before the workload starts. In sidecar
+# and cni-sidecar modes, the agent container runs non-root with no added Linux
+# capabilities and process/filesystem enforcement is network-only.
 topology                       = "combined"
 # Optional corporate HTTP forward proxy for policy-approved TLS egress. The
 # sandbox workload cannot select or override these settings. Only http:// proxy
@@ -565,7 +569,8 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
 # sidecars run as UID 0 so Kubernetes grants the required /proc inspection
 # capabilities into the effective set. In sidecar topology the network init
-# container installs nftables rules that exempt the effective sidecar UID, so
+# container installs nftables rules that exempt the effective sidecar UID, and
+# in cni-sidecar topology the OpenShell CNI plugin installs equivalent rules, so
 # this dedicated infrastructure UID must remain at least 1000 and must not
 # match the sandbox workload UID.
 proxy_uid                      = 1337

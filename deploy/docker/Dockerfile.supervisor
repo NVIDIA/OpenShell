@@ -3,8 +3,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# The static sandbox binary is staged at:
+# The static sandbox binary and the chained CNI plugin are staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-sandbox
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-cni
 #
 # Alpine supplies nftables and iptables for pod-namespace egress enforcement.
 
@@ -12,10 +13,11 @@ FROM alpine:3.22 AS supervisor
 
 ARG TARGETARCH
 
-RUN apk add --no-cache nftables iptables iptables-legacy
+RUN apk add --no-cache nftables iptables iptables-legacy jq
 
 # Keep the binary root-owned for Podman image-volume mounts and executable by
 # the Kubernetes network sidecar's non-root proxy UID.
 COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
+COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-cni /openshell-cni
 
 ENTRYPOINT ["/openshell-sandbox"]

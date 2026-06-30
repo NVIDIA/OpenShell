@@ -543,12 +543,28 @@ The shared state directory should preserve `sandbox_gid` inheritance
 `@openshell-sidecar-ssh`; the network sidecar verifies its peer PID before
 bridging gateway relay requests. No `ssh.sock` file should appear in the shared
 state directory.
+
+If `topology = "cni-sidecar"` is rendered, the gateway should render
+the same process container and long-running network sidecar as sidecar mode, but
+there should be no `openshell-network-init` init container in sandbox pods.
+Instead, the chart must install the privileged `openshell-cni` DaemonSet and the
+sandbox pod should carry `openshell.ai/cni=enabled`,
+`openshell.ai/network-enforcement-mode=cni-sidecar`, and
+`openshell.ai/proxy-uid=<uid>` annotations. The CNI DaemonSet copies
+`/openshell-cni` into the host CNI binary directory and patches an existing CNI
+`.conflist`; if sandbox pods bypass network enforcement or fail during pod
+network setup, inspect the DaemonSet logs, the host CNI config, and whether the
+cluster actually invokes chained CNI plugins for the sandbox runtime class.
+
 Inspect all three when sandbox registration or egress enforcement fails:
 
 ```bash
 kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E '^\[openshell\.drivers\.kubernetes\]|^topology\s*='
 kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.initContainers[*]}{.name}{" "}{.command}{"\n"}{end}'
 kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}'
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{.metadata.annotations}'
+kubectl -n openshell get daemonset,pod -l app.kubernetes.io/component=cni
+kubectl -n openshell logs daemonset/openshell-cni -c install-cni --tail=200
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-network-init --tail=200
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-network --tail=200
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
@@ -703,6 +719,7 @@ configuration — check that the gateway spawned the driver binary you expect
 | Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or selected name does not match its endpoint/config key | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
+| CNI-sidecar sandbox pods fail network setup | OpenShell CNI DaemonSet did not patch the node CNI conflist, cannot read pods, or the runtime class does not invoke the chained plugin | `kubectl -n openshell logs daemonset/openshell-cni -c install-cni`, chart `cni.*` values, host CNI config |
 | Gateway API resources fail with `the server could not find the requested resource` | Optional Gateway API resources were applied without Envoy Gateway CRDs | Install Envoy Gateway and enable `grpcRoute` before applying the optional ingress resources |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |

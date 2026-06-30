@@ -53,6 +53,22 @@ runs:
         INPUTS_BINARY: ${{ inputs.binary }}
         INPUTS_ARCH: ${{ inputs.arch }}
 
+    # The supervisor image also carries the chained CNI plugin, which the CNI
+    # installer DaemonSet copies onto each node for the cni-sidecar topology.
+    - name: Download openshell-cni
+      if: ${{ inputs.component == 'supervisor' }}
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: openshell-cni-${{ inputs.triple }}
+        path: artifact-cni
+
+    - name: Stage openshell-cni
+      if: ${{ inputs.component == 'supervisor' }}
+      shell: bash
+      run: install -Dm0755 artifact-cni/openshell-cni deploy/docker/.build/prebuilt-binaries/${INPUTS_ARCH}/openshell-cni
+      env:
+        INPUTS_ARCH: ${{ inputs.arch }}
+
     - name: Build ${{ inputs.component }} image
       shell: bash
       env:
