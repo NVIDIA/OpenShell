@@ -1,0 +1,141 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Supervisor Middleware"
+sidebar-title: "Supervisor Middleware"
+description: "Configure and operate built-in and operator-run middleware for sandbox HTTP requests."
+keywords: "Generative AI, Cybersecurity, AI Agents, Supervisor Middleware, Extensibility, Request Filtering"
+---
+
+Supervisor middleware adds ordered request-processing stages to allowed HTTP egress. Middleware runs after network and L7 policy admit a request and before OpenShell injects provider credentials. A stage can allow or deny the request, replace its body, add approved headers, and report audit-safe findings.
+
+Middleware selection is independent of the network policy rule that admitted the request. OpenShell matches middleware by destination host, so the same middleware applies consistently across broad, specific, user-authored, and provider-derived network policies.
+
+## Request Flow
+
+For each inspected HTTP request, the supervisor:
+
+1. Evaluates network and L7 policy.
+2. Selects middleware whose host selectors match the admitted destination.
+3. Buffers the request body using the smallest body limit in the selected chain.
+4. Runs matching middleware in policy declaration order.
+5. Applies allowed transformations, injects provider credentials, and forwards the request.
+
+Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials.
+
+## Choose a Middleware Type
+
+| Type | Registration | Body limit | Deployment |
+| --- | --- | --- | --- |
+| Built-in | None | Defined by OpenShell | Runs inside the supervisor |
+| Operator-run service | Required in gateway TOML | Set by the operator, up to the service capability | Runs as a separate service reachable by the gateway and supervisors |
+
+`openshell/secrets` is the built-in middleware currently available. It identifies common secret patterns in UTF-8 request bodies and replaces matched values before the request leaves the sandbox.
+
+Operator-run services expose one or more binding IDs. Policies reference a binding ID, such as `example/content-guard`, rather than the gateway registration name.
+
+## Register a Middleware Service
+
+Start an operator-run service before starting the gateway, then add a registration to the local gateway TOML:
+
+```toml
+[[openshell.gateway.middleware]]
+name = "local-content-guard"
+endpoint = "http://host.openshell.internal:50051"
+allow_insecure = true
+max_body_bytes = 262144
+```
+
+| Field | Description |
+| --- | --- |
+| `name` | Operator-facing registration name used in diagnostics. Policies do not reference this value. |
+| `endpoint` | Service address reachable from both the gateway and sandbox supervisors. |
+| `allow_insecure` | Required acknowledgement for the currently supported plaintext endpoint. |
+| `max_body_bytes` | Operator limit applied to every binding exposed by the service. |
+
+The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes a binding ID already owned by another service. Operator-run services cannot claim the reserved `openshell/` namespace.
+
+Registration is static. Restart the gateway after adding, removing, or changing a service. See [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) for the complete gateway TOML context.
+
+## Apply Middleware with Policy
+
+Add middleware configs to the top-level `network_middlewares` list:
+
+```yaml
+network_middlewares:
+  - name: redact-secrets
+    middleware: openshell/secrets
+    config:
+      secrets: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["*.example.com"]
+      exclude: ["trusted.example.com"]
+```
+
+Each config has a policy-local `name`, a built-in or operator-provided binding ID in `middleware`, implementation-owned `config`, failure behavior, and host selectors.
+
+`include` selects destination hosts. `exclude` takes precedence and removes hosts from that selection. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints.
+
+Matching configs run once each in top-level declaration order. Different config names may reference the same binding and run as separate stages. Config names must be unique.
+
+See [Policy Schema](/reference/policy-schema#network-middleware) for the complete field reference.
+
+## Configure Failure Behavior
+
+`on_error` controls what happens when middleware is unavailable, rejects its configuration, returns an invalid result, or exceeds a body limit.
+
+| Value | Behavior |
+| --- | --- |
+| `fail_closed` | Denies the request when the middleware stage fails. This is the default. |
+| `fail_open` | Skips the failed stage and continues the request through the remaining chain. |
+
+Use `fail_open` only when bypassing the middleware preserves the intended security policy. OpenShell emits a detection finding when a failed stage is bypassed.
+
+An explicit deny decision always stops the chain and denies the request, regardless of `on_error`.
+
+## Set Body Limits
+
+Every middleware binding declares the largest request or replacement body it supports.
+
+- Built-in middleware uses its OpenShell-defined limit.
+- Each operator-run registration sets `max_body_bytes` no higher than the service capability.
+- A selected chain buffers using its smallest stage limit.
+- The same per-stage limit applies to request bodies and replacement bodies.
+
+The gateway rejects a registration whose operator limit exceeds the service capability instead of silently clamping it. At request time, exceeding a selected stage's limit is a middleware failure and follows that config's `on_error` behavior.
+
+## Operate Middleware Services
+
+Plan startup and updates around these boundaries:
+
+- Start registered services before the gateway. The gateway validates every registration during startup.
+- Keep service endpoints reachable from both the gateway and sandbox supervisors. The supervisors call operator-run services directly on the request path.
+- Restart the gateway after changing registrations.
+- Keep required services available before creating or updating policies. The gateway validates implementation-owned config before persisting a policy.
+- Treat `fail_open` as an explicit availability-over-enforcement decision.
+
+When the effective sandbox configuration changes, a running supervisor validates the new service registry before installing it. If the reload fails, the supervisor keeps its last-known-good registry and emits a configuration failure event.
+
+## Observe Middleware
+
+Middleware activity is emitted through OpenShell's OCSF logging:
+
+- Each invocation records its policy-local middleware name, binding, decision, transformation state, and failure state.
+- A bypass under `fail_open` emits a detection finding.
+- A required stage that fails closed emits a high-severity detection finding.
+- Findings include the service-provided type and label plus aggregate counts. Middleware services should keep those fields audit-safe and omit request content or matched values.
+- Registry reload success and failure are emitted as configuration state changes.
+
+See [Logging](/observability/logging) for log access and [OCSF JSON Export](/observability/ocsf-json-export) for structured export.
+
+## Current Limitations
+
+- Middleware applies only to HTTP requests parsed by the supervisor.
+- The supported operation and phase are `HttpRequest/pre_credentials`.
+- Selection uses destination host include and exclude patterns.
+- Required middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic.
+- Operator-run services currently use explicitly enabled plaintext `http://` endpoints.
+- TLS, service authentication, health checks, and runtime registration are not available.
+
+For a runnable operator workflow, see the [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard).

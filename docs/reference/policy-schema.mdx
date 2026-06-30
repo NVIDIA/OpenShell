@@ -472,10 +472,6 @@ Identifies an executable that is permitted to use the associated endpoints.
 
 ## Network Middleware
 
-<Warning title="Research Preview Feature">
-Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
-</Warning>
-
 **Category:** Dynamic
 
 An ordered list of middleware configs selected after network and L7 policy admit an HTTP request. Middleware selection is independent of the network policy entry that admitted the request. Every matching config runs once in list order before provider credential injection.
@@ -501,6 +497,8 @@ network_middlewares:
 | `endpoints` | object | Yes | Host selector with required non-empty `include` and optional `exclude` lists. Exclusions take precedence. |
 
 Host selectors use the same case-insensitive exact and DNS glob semantics as network endpoints. Middleware runs only on HTTP requests the supervisor parses. A selector that can require middleware on a `tls: skip` endpoint is rejected because OpenShell cannot inspect that traffic.
+
+See [Supervisor Middleware](/extensibility/supervisor-middleware) for registration, failure behavior, body limits, and operational guidance.
 
 ## Full Example
 
