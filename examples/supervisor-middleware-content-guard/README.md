@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 
 <!-- markdownlint-disable MD033 -->
 <Warning title="Research Preview Feature">
-Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware, not for production or long-lived integrations.
+Supervisor middleware is a research preview. Its policy and service contracts may change without compatibility guarantees. Use it only to prototype and evaluate middleware integrations.
 </Warning>
 <!-- markdownlint-enable MD033 -->
 
