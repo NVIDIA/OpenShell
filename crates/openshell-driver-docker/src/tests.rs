@@ -1897,36 +1897,31 @@ fn configured_supervisor_image_takes_precedence_over_local_binaries() {
 
 #[test]
 fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
+    use openshell_core::config::resolve_supervisor_image_tag;
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(Some("1.2.3"), Some("sha"), "0.0.0"),
+        resolve_supervisor_image_tag(Some("1.2.3"), Some("sha"), "0.0.0"),
         "1.2.3",
     );
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(None, Some("sha"), "0.0.0"),
+        resolve_supervisor_image_tag(None, Some("sha"), "0.0.0"),
         "sha",
     );
+    assert_eq!(resolve_supervisor_image_tag(None, None, "1.2.3"), "1.2.3",);
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(None, None, "1.2.3"),
-        "1.2.3",
-    );
-    assert_eq!(
-        resolve_default_docker_supervisor_image_tag(Some(""), Some(""), "0.0.0"),
+        resolve_supervisor_image_tag(Some(""), Some(""), "0.0.0"),
         "dev",
     );
 }
 
 #[test]
 fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
+    use openshell_core::config::resolve_supervisor_image_tag;
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(None, None, "0.0.37-dev.156+g1d3b741ee"),
+        resolve_supervisor_image_tag(None, None, "0.0.37-dev.156+g1d3b741ee"),
         "0.0.37-dev.156-g1d3b741ee",
     );
     assert_eq!(
-        resolve_default_docker_supervisor_image_tag(
-            Some("0.0.37-dev.156+g1d3b741ee"),
-            None,
-            "0.0.0",
-        ),
+        resolve_supervisor_image_tag(Some("0.0.37-dev.156+g1d3b741ee"), None, "0.0.0",),
         "0.0.37-dev.156-g1d3b741ee",
     );
 }

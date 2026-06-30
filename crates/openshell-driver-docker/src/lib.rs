@@ -78,53 +78,22 @@ const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
 
-/// Default image holding the Linux `openshell-sandbox` binary. The gateway
-/// pulls this image and extracts the binary to a host-side cache when no
-/// explicit `supervisor_bin`, configured `supervisor_image`, sibling binary,
-/// or local build is available.
-const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
-
 /// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
 /// used when no supervisor binary override is provided.
 pub fn default_docker_supervisor_image() -> String {
     format!(
-        "{DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO}:{}",
+        "{}:{}",
+        openshell_core::config::DEFAULT_SUPERVISOR_IMAGE_REPO,
         default_docker_supervisor_image_tag()
     )
 }
 
-/// Image tag baked in at compile time to pair the gateway with a matching
-/// supervisor image.
-///
-/// Build pipelines pass `OPENSHELL_IMAGE_TAG` explicitly. The `IMAGE_TAG`
-/// fallback covers image build wrappers that already tag the gateway and
-/// supervisor together. Standalone release binaries also patch the Cargo
-/// package version, so use it when it has been set to a real release value.
 fn default_docker_supervisor_image_tag() -> String {
-    resolve_default_docker_supervisor_image_tag(
+    openshell_core::config::resolve_supervisor_image_tag(
         option_env!("OPENSHELL_IMAGE_TAG"),
         option_env!("IMAGE_TAG"),
         env!("CARGO_PKG_VERSION"),
     )
-}
-
-fn resolve_default_docker_supervisor_image_tag(
-    openshell_image_tag: Option<&'static str>,
-    image_tag: Option<&'static str>,
-    cargo_pkg_version: &'static str,
-) -> String {
-    let tag = openshell_image_tag
-        .filter(|tag| !tag.is_empty())
-        .or_else(|| image_tag.filter(|tag| !tag.is_empty()))
-        .unwrap_or_else(|| {
-            if cargo_pkg_version.is_empty() || cargo_pkg_version == "0.0.0" {
-                "dev"
-            } else {
-                cargo_pkg_version
-            }
-        });
-
-    tag.replace('+', "-")
 }
 
 /// Queried by the Docker driver to decide when a sandbox's supervisor

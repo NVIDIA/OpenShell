@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_core::config::{DEFAULT_STOP_TIMEOUT_SECS, DEFAULT_SUPERVISOR_IMAGE};
+use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -255,7 +255,7 @@ impl Default for PodmanComputeConfig {
             network_name: DEFAULT_NETWORK_NAME.to_string(),
             host_gateway_ip: Self::default_host_gateway_ip(),
             stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
-            supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
+            supervisor_image: openshell_core::config::default_supervisor_image(),
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
