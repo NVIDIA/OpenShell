@@ -48,6 +48,26 @@ Combined topology is the original Kubernetes mode and remains the default. The
 agent container starts the OpenShell supervisor, and the supervisor launches the
 workload after applying sandbox setup.
 
+```mermaid
+flowchart TB
+  Sandbox["agents.x-k8s.io Sandbox"]
+
+  subgraph Pod["Sandbox pod"]
+    subgraph Agent["agent container"]
+      Supervisor["OpenShell supervisor<br/>network + process + filesystem"]
+      Workload["Agent workload"]
+    end
+  end
+
+  Gateway["OpenShell Gateway"]
+  External["External services"]
+
+  Sandbox --> Pod
+  Supervisor --> Workload
+  Supervisor -->|"gateway callback / SSH relay"| Gateway
+  Supervisor -->|"policy-enforced egress"| External
+```
+
 Combined topology keeps these controls in one supervisor path:
 
 - Network endpoint and L7 policy enforcement.
@@ -65,6 +85,36 @@ contract and your cluster policy permits those capabilities.
 
 Sidecar topology splits the supervisor into a network sidecar and a
 low-privilege process supervisor in the agent container.
+
+```mermaid
+flowchart TB
+  Sandbox["agents.x-k8s.io Sandbox"]
+
+  subgraph Pod["Sandbox pod"]
+    Init["network init container<br/>root setup capabilities"]
+    State["shared state + TLS volumes"]
+    NetNS["pod network namespace"]
+
+    subgraph Agent["agent container"]
+      ProcessSupervisor["process supervisor<br/>network-only by default"]
+      Workload["Agent workload"]
+    end
+
+    NetworkSidecar["network supervisor sidecar<br/>proxyUid"]
+  end
+
+  Gateway["OpenShell Gateway"]
+  External["External services"]
+
+  Sandbox --> Pod
+  Init -->|"installs nftables rules"| NetNS
+  ProcessSupervisor --> Workload
+  Workload -->|"egress redirected on loopback"| NetworkSidecar
+  NetworkSidecar -->|"gateway forwarding"| Gateway
+  NetworkSidecar -->|"policy-enforced egress"| External
+  ProcessSupervisor --- State
+  NetworkSidecar --- State
+```
 
 The pod contains these OpenShell-managed pieces:
 
