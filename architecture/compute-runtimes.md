@@ -89,19 +89,23 @@ Driver-controlled environment variables must override sandbox image or template
 values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
 paths, and command metadata.
 
-Kubernetes can run the supervisor in the default combined topology or in a
-sidecar topology. Combined mode keeps network and process supervision in the
+Kubernetes can run the supervisor in combined, sidecar, cni-sidecar, or
+proxy-pod topology. Combined mode keeps network and process supervision in the
 agent container. Sidecar mode runs network enforcement, the proxy, and gateway
 loopback forwarding in a dedicated sidecar, while the agent container runs only
 the process-supervision leaf and launches the user workload after the sidecar
 signals readiness. In sidecar mode, an init container performs the privileged
 pod-network nftables setup with `NET_ADMIN` and hands shared state ownership to
 the configured proxy UID; the long-running network sidecar runs as that UID and
-does not keep `NET_ADMIN`. The agent container runs as the resolved sandbox
-UID/GID with no added Linux capabilities. Sidecar mode preserves gateway session
-and SSH behavior, but treats the process leaf as network-only: Landlock
-filesystem policy, process privilege dropping, and process/binary identity
-checks are not applied there.
+does not keep `NET_ADMIN`. CNI-sidecar mode keeps the sidecar runtime model but
+requires the privileged OpenShell CNI DaemonSet to install the pod-network rules
+during CNI `ADD` using nftables or iptables. Proxy-pod mode moves network
+enforcement into a paired supervisor Deployment and requires NetworkPolicy
+enforcement. The agent container runs as the resolved sandbox UID/GID with no
+added Linux capabilities in the alternate topologies. They preserve gateway
+session and SSH behavior, but
+treat the process leaf as network-only: Landlock filesystem policy, process
+privilege dropping, and process/binary identity checks are not applied there.
 
 ## Images
 

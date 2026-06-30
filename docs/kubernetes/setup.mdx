@@ -163,6 +163,9 @@ The most commonly changed values are:
 | `supervisor.topology` | Sandbox pod topology. Refer to [Topology](/kubernetes/topology). |
 | `supervisor.processEnforcement` | Process/filesystem controls for non-combined topologies. Leave as `network-only` for the low-permission agent shape, or set `full` to keep combined-mode process/filesystem guards with added agent-container permissions. |
 | `supervisor.proxyUid` | Non-root UID for the long-running network sidecar or proxy supervisor pod. The UID must not match the sandbox UID. |
+| `cni.enabled` | Install the privileged OpenShell CNI DaemonSet. Required when `supervisor.topology=cni-sidecar`. |
+| `cni.configFile` | Existing host CNI conflist to patch. Leave empty to patch the first non-OpenShell `.conflist` in `cni.confDir`. |
+| `cni.logFile` | Host log file written by the OpenShell CNI plugin and tailed by the installer DaemonSet. Defaults to `/var/log/openshell-cni.log`. |
 
 Use a values file for repeatable deployments:
 
@@ -250,7 +253,7 @@ The gateway exposes `/healthz` for process liveness and `/readyz` for dependency
 
 ## Next Steps
 
-- To choose between combined, sidecar, and proxy-pod sandbox topology, refer to [Topology](/kubernetes/topology).
+- To choose between combined, sidecar, cni-sidecar, and proxy-pod sandbox topology, refer to [Topology](/kubernetes/topology).
 - To enable automatic certificate rotation with cert-manager, refer to [Managing Certificates](/kubernetes/managing-certificates).
 - To expose the gateway externally without port-forwarding, refer to [Ingress](/kubernetes/ingress).
 - To configure OIDC or reverse-proxy authentication, refer to [Access Control](/kubernetes/access-control).

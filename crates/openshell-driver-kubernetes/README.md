@@ -66,6 +66,13 @@ process supervisor defaults to network-only mode and does not apply Landlock
 filesystem policy, process privilege dropping, or process/binary identity
 checks. Network endpoint and L7 policy remain enforced by the network sidecar.
 
+The `cni-sidecar` supervisor topology keeps the sidecar runtime model, but
+removes the pod-local network init container. The driver annotates sandbox pods
+for the OpenShell chained CNI plugin, and the privileged OpenShell CNI
+DaemonSet installs the sidecar bypass-prevention rules during CNI `ADD` before
+the workload starts. The agent container and long-running network sidecar remain
+non-root with no added Linux capabilities.
+
 The `proxy-pod` supervisor topology runs network enforcement and gateway
 forwarding in a separate supervisor Deployment with one pod. The agent pod runs
 only the process-mode supervisor and reaches the supervisor through a
@@ -78,11 +85,11 @@ Set `process_enforcement = "full"` in sidecar or proxy-pod topology only when
 you want combined-mode process/filesystem guards and accept the added
 agent-container permissions.
 
-Sidecar mode uses the pod `fsGroup` to make the projected service-account token
-and sandbox client TLS secret group-readable so the non-root process supervisor
-can authenticate to the gateway. Treat the agent container as trusted with
-respect to those in-pod gateway credentials until a narrower credential handoff
-exists.
+Sidecar, cni-sidecar, and proxy-pod modes use the pod `fsGroup` to make the
+projected service-account token and sandbox client TLS secret group-readable so
+the non-root process supervisor can authenticate to the gateway. Treat the agent
+container as trusted with respect to those in-pod gateway credentials until a
+narrower credential handoff exists.
 
 The driver can request a Kubernetes AppArmor profile through
 `app_armor_profile`.

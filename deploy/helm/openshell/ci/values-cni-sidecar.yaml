@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI/dev overlay for exercising the Kubernetes CNI sidecar topology.
+# This topology requires the OpenShell chained CNI plugin to be installed on
+# every node before sandbox pods are created.
+
+cni:
+  enabled: true
+  # k3s configures containerd with k3s-specific CNI paths.
+  binDir: /bin
+  confDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+
+supervisor:
+  topology: cni-sidecar

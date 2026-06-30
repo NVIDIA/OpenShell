@@ -87,6 +87,20 @@ the supervisor and gateway images stay in sync across releases.
 {{- end }}
 
 {{/*
+CNI installer image reference. Defaults to the supervisor image because the
+supervisor image carries both openshell-sandbox and openshell-cni.
+*/}}
+{{- define "openshell.cniImage" -}}
+{{- $repository := .Values.cni.image.repository | default .Values.supervisor.image.repository -}}
+{{- $tag := .Values.cni.image.tag | default .Values.supervisor.image.tag | default .Chart.AppVersion -}}
+{{- printf "%s:%s" $repository $tag }}
+{{- end }}
+
+{{- define "openshell.cniImagePullPolicy" -}}
+{{- .Values.cni.image.pullPolicy | default .Values.supervisor.image.pullPolicy | default .Values.image.pullPolicy -}}
+{{- end }}
+
+{{/*
 Namespaced Issuer (selfSigned) for cert-manager CA bootstrap.
 */}}
 {{- define "openshell.issuerSelfSigned" -}}

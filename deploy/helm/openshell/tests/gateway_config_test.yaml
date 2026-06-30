@@ -25,6 +25,9 @@ tests:
       - equal:
           path: kind
           value: StatefulSet
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: gateway
 
   - it: treats a null workload map as the default StatefulSet
     template: templates/statefulset.yaml
@@ -116,6 +119,16 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?process_enforcement\s*=\s*"network-only"'
+
+  - it: renders cni-sidecar supervisor topology under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      cni.enabled: true
+      supervisor.topology: cni-sidecar
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"cni-sidecar"'
 
   - it: renders proxy uid under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
@@ -324,6 +337,9 @@ tests:
       - equal:
           path: spec.replicas
           value: 2
+      - equal:
+          path: spec.selector.matchLabels["app.kubernetes.io/component"]
+          value: gateway
       - equal:
           path: spec.template.spec.containers[0].name
           value: openshell-gateway

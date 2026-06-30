@@ -285,6 +285,18 @@ workload entrypoint PID to `OPENSHELL_ENTRYPOINT_PID_FILE`
 should read it for binary-scoped policy decisions; if allowed network rules are
 all denied, inspect that file and the network sidecar logs.
 
+If `supervisor_topology = "cni-sidecar"` is rendered, the gateway should render
+the same process container and long-running network sidecar as sidecar mode, but
+there should be no `openshell-network-init` init container in sandbox pods.
+Instead, the chart must install the privileged `openshell-cni` DaemonSet and the
+sandbox pod should carry `openshell.ai/cni=enabled`,
+`openshell.ai/network-enforcement-mode=cni-sidecar`, and
+`openshell.ai/proxy-uid=<uid>` annotations. The CNI DaemonSet copies
+`/openshell-cni` into the host CNI binary directory and patches an existing CNI
+`.conflist`; if sandbox pods bypass network enforcement or fail during pod
+network setup, inspect the DaemonSet logs, the host CNI config, and whether the
+cluster actually invokes chained CNI plugins for the sandbox runtime class.
+
 If `supervisor_topology = "proxy-pod"` is rendered, each sandbox should have a
 separate supervisor Deployment with one supervisor pod, a headless supervisor
 Service, a proxy CA Secret, and two per-sandbox NetworkPolicies. The agent pod
@@ -305,6 +317,9 @@ Inspect all three when sandbox registration or egress enforcement fails:
 kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep supervisor_topology
 kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.initContainers[*]}{.name}{" "}{.command}{"\n"}{end}'
 kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}'
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{.metadata.annotations}'
+kubectl -n openshell get daemonset,pod -l app.kubernetes.io/component=cni
+kubectl -n openshell logs daemonset/openshell-cni -c install-cni --tail=200
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-network-init --tail=200
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-network --tail=200
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
@@ -338,6 +353,7 @@ openshell logs <sandbox-name>
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
+| CNI-sidecar sandbox pods fail network setup | OpenShell CNI DaemonSet did not patch the node CNI conflist, cannot read pods, or the runtime class does not invoke the chained plugin | `kubectl -n openshell logs daemonset/openshell-cni -c install-cni`, chart `cni.*` values, host CNI config |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
 
 ## Reporting
