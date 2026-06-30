@@ -157,6 +157,44 @@ Proxy-pod topology moves network enforcement and gateway forwarding into a
 separate supervisor Deployment with one pod. The agent pod runs the process
 supervisor and reaches the supervisor through a per-sandbox headless Service.
 
+```mermaid
+flowchart TB
+  Sandbox["agents.x-k8s.io Sandbox"]
+
+  subgraph Namespace["Sandbox namespace"]
+    subgraph AgentPod["Agent pod"]
+      ProcessSupervisor["process supervisor<br/>network-only by default"]
+      Workload["Agent workload"]
+    end
+
+    SupervisorDeployment["Supervisor Deployment<br/>1 replica"]
+    subgraph SupervisorPod["Supervisor pod"]
+      NetworkProxy["network supervisor proxy<br/>proxyUid"]
+    end
+
+    Service["Headless Service"]
+    ProxyCA["Proxy CA Secret"]
+    AgentEgressPolicy["NetworkPolicy<br/>agent egress to supervisor + DNS"]
+    SupervisorIngressPolicy["NetworkPolicy<br/>supervisor ingress from paired agent"]
+  end
+
+  Gateway["OpenShell Gateway"]
+  External["External services"]
+
+  Sandbox --> AgentPod
+  Sandbox --> SupervisorDeployment
+  SupervisorDeployment --> SupervisorPod
+  ProcessSupervisor --> Workload
+  AgentPod -->|"egress allowed by NetworkPolicy"| Service
+  Service --> NetworkProxy
+  NetworkProxy -->|"gateway forwarding"| Gateway
+  NetworkProxy -->|"policy-enforced egress"| External
+  ProxyCA -. mounted .- AgentPod
+  ProxyCA -. mounted .- SupervisorPod
+  AgentEgressPolicy -. selects .- AgentPod
+  SupervisorIngressPolicy -. selects .- SupervisorPod
+```
+
 OpenShell creates these per-sandbox resources:
 
 - Agent pod labeled `openshell.ai/sandbox-role=agent`.
