@@ -808,7 +808,7 @@ fn process_enforcement_mode() -> ProcessEnforcementMode {
         .ok()
         .as_deref()
     {
-        Some("sidecar") => ProcessEnforcementMode::NetworkOnly,
+        Some("sidecar" | "cni-sidecar") => ProcessEnforcementMode::NetworkOnly,
         _ => ProcessEnforcementMode::Full,
     }
 }

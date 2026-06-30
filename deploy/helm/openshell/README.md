@@ -148,6 +148,19 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | certManager.enabled | bool | `false` | Create cert-manager Issuer and Certificate resources. When enabled, cert-manager owns TLS and the chart runs a JWT-only certgen hook to create the sandbox JWT signing Secret that cert-manager does not manage. |
 | certManager.serverDnsNames | list | `["openshell","openshell.openshell.svc","openshell.openshell.svc.cluster.local","localhost","openshell.localhost","*.openshell.localhost","host.docker.internal"]` | DNS SANs on the cert-manager-issued server certificate. |
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
+| cni.affinity | object | `{}` |  |
+| cni.binDir | string | `"/opt/cni/bin"` | Host CNI binary directory. |
+| cni.confDir | string | `"/etc/cni/net.d"` | Host CNI config directory. |
+| cni.configFile | string | `""` | Host CNI conflist filename patched by the installer. Empty selects the first non-OpenShell .conflist. |
+| cni.enabled | bool | `false` | Install the OpenShell chained CNI plugin with a privileged node DaemonSet. Required when supervisor.topology is "cni-sidecar". |
+| cni.image.pullPolicy | string | `""` | CNI installer image pull policy. Empty uses supervisor.image.pullPolicy, then image.pullPolicy. |
+| cni.image.repository | string | `""` | CNI installer image repository. Empty uses supervisor.image.repository. |
+| cni.image.tag | string | `""` | CNI installer image tag. Empty uses supervisor.image.tag, then chart appVersion. |
+| cni.logFile | string | `"/var/log/openshell-cni.log"` | Host log file written by the OpenShell CNI plugin and tailed by the installer DaemonSet. |
+| cni.logLevel | string | `"info"` | Log level passed to the OpenShell CNI plugin. |
+| cni.nodeSelector | object | `{}` |  |
+| cni.resources | object | `{}` |  |
+| cni.tolerations | list | `[]` |  |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
 | grpcRoute.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
 | grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
@@ -242,9 +255,9 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set. |
 | supervisor.image.tag | string | `""` | Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
 | supervisor.sidecar.processBinaryAwareNetworkPolicy | bool | `true` | Keep process/binary-aware network policy enabled in sidecar topology. When false, the network sidecar runs as proxyUid, drops the extra /proc inspection capabilities, and enforces endpoint/L7 policy without matching policy.binaries. |
-| supervisor.sidecar.proxyUid | int | `1337` | UID for relaxed long-running network sidecars in sidecar topology. Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants the required /proc inspection capabilities into the effective set. The network init container installs nftables rules that exempt the effective sidecar UID. |
+| supervisor.sidecar.proxyUid | int | `1337` | UID for relaxed long-running network sidecars in sidecar and cni-sidecar topologies. Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants the required /proc inspection capabilities into the effective set. In sidecar topology the network init container installs nftables rules that exempt the effective sidecar UID; in cni-sidecar topology the CNI plugin installs equivalent nftables or iptables rules. |
 | supervisor.sideloadMethod | string | `""` | How the supervisor binary is delivered into sandbox pods. Empty (default) = auto-detect from cluster version:   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)   K8s < v1.35 -> "init-container" (copies via init container + emptyDir) On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled, set this to "image-volume" explicitly. |
-| supervisor.topology | string | `"combined"` | Supervisor pod topology for Kubernetes sandboxes. "combined" runs the current single supervisor container in the agent pod. "sidecar" runs network enforcement in a dedicated sidecar and the process supervisor as a low-capability wrapper in the agent container. |
+| supervisor.topology | string | `"combined"` | Supervisor pod topology for Kubernetes sandboxes. "combined" runs the current single supervisor container in the agent pod. "sidecar" runs network enforcement in a dedicated sidecar and the process supervisor as a low-capability wrapper in the agent container. "cni-sidecar" keeps the sidecar runtime model but installs pod-network rules through the OpenShell CNI plugin. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | workload.allowMultiReplicaStatefulSet | bool | `false` | Allow replicaCount > 1 while rendering a StatefulSet. Prefer workload.kind=deployment for external database-backed multi-replica gateways; this override exists for operators who explicitly require StatefulSet identity or storage semantics. |
 | workload.kind | string | `"statefulset"` | Gateway workload controller kind. Use `statefulset` for the default SQLite database, or `deployment` when server.externalDbSecret points at an external database. |

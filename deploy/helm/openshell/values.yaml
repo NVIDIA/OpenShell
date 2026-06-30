@@ -48,19 +48,48 @@ supervisor:
   # "combined" runs the current single supervisor container in the agent pod.
   # "sidecar" runs network enforcement in a dedicated sidecar and the process
   # supervisor as a low-capability wrapper in the agent container.
+  # "cni-sidecar" keeps the sidecar runtime model but installs pod-network rules
+  # through the OpenShell CNI plugin.
   topology: "combined"
   sidecar:
-    # -- UID for relaxed long-running network sidecars in sidecar topology.
-    # Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants
-    # the required /proc inspection capabilities into the effective set. The
-    # network init container installs nftables rules that exempt the effective
-    # sidecar UID.
+    # -- UID for relaxed long-running network sidecars in sidecar and cni-sidecar
+    # topologies. Strict process/binary-aware sidecars run as UID 0 so Kubernetes
+    # grants the required /proc inspection capabilities into the effective set. In
+    # sidecar topology the network init container installs nftables rules that
+    # exempt the effective sidecar UID; in cni-sidecar topology the CNI plugin
+    # installs equivalent nftables or iptables rules.
     proxyUid: 1337
     # -- Keep process/binary-aware network policy enabled in sidecar topology.
     # When false, the network sidecar runs as proxyUid, drops the extra /proc
     # inspection capabilities, and enforces endpoint/L7 policy without matching
     # policy.binaries.
     processBinaryAwareNetworkPolicy: true
+
+cni:
+  # -- Install the OpenShell chained CNI plugin with a privileged node DaemonSet.
+  # Required when supervisor.topology is "cni-sidecar".
+  enabled: false
+  image:
+    # -- CNI installer image repository. Empty uses supervisor.image.repository.
+    repository: ""
+    # -- CNI installer image pull policy. Empty uses supervisor.image.pullPolicy, then image.pullPolicy.
+    pullPolicy: ""
+    # -- CNI installer image tag. Empty uses supervisor.image.tag, then chart appVersion.
+    tag: ""
+  # -- Host CNI binary directory.
+  binDir: /opt/cni/bin
+  # -- Host CNI config directory.
+  confDir: /etc/cni/net.d
+  # -- Log level passed to the OpenShell CNI plugin.
+  logLevel: info
+  # -- Host log file written by the OpenShell CNI plugin and tailed by the installer DaemonSet.
+  logFile: /var/log/openshell-cni.log
+  # -- Host CNI conflist filename patched by the installer. Empty selects the first non-OpenShell .conflist.
+  configFile: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []
