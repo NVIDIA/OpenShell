@@ -103,6 +103,10 @@ spec:
             {{- end }}
             - --jwt-secret-name={{ include "openshell.sandboxJwtSecretName" . }}
             {{- if and .Values.pkiInitJob.enabled (not .Values.certManager.enabled) }}
+            {{- range (include "openshell.defaultServerDnsNames" . | fromYamlArray) }}
+            - --server-san={{ . }}
+            {{- end }}
+            - --server-san=127.0.0.1
             {{- range .Values.pkiInitJob.serverDnsNames }}
             - --server-san={{ . }}
             {{- end }}
