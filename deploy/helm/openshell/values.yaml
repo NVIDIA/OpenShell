@@ -44,6 +44,9 @@ supervisor:
   # On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled,
   # set this to "image-volume" explicitly.
   sideloadMethod: ""
+  # -- Supervisor pod topology for Kubernetes sandboxes.
+  # "combined" runs networking and process supervision in the agent container.
+  topology: "combined"
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []

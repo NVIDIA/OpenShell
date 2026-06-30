@@ -1,0 +1,102 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Kubernetes Sandbox Topology"
+sidebar-title: "Topology"
+description: "Review the default combined supervisor topology for Kubernetes sandbox pods."
+keywords: "Generative AI, Cybersecurity, Kubernetes, Sandboxing, RuntimeClass"
+position: 2
+---
+
+Kubernetes sandbox pods run the OpenShell supervisor in `combined` topology by
+default. Combined topology keeps network, filesystem, and process controls in
+the agent pod so the supervisor can enforce the complete OpenShell sandbox
+contract before launching the workload.
+
+## Choose a Topology
+
+The default `combined` topology preserves the full OpenShell enforcement model.
+Use it when you need OpenShell to apply all sandbox controls inside the workload
+pod and your cluster policy permits the required Linux capabilities.
+
+| Topology | Use when | Main tradeoff |
+|---|---|---|
+| `combined` | You need OpenShell network, filesystem, and process controls in the sandbox workload. | The agent container carries the Linux capabilities the supervisor needs. |
+
+Additional Kubernetes sandbox topologies are still being designed. Until they
+are documented as supported configuration values, `combined` is the only
+supported value for `supervisor.topology`.
+
+## Privilege Model
+
+The long-running container permissions for `combined` topology are:
+
+| Topology | Pod or container | UID/GID | Privilege escalation | Capabilities | Result |
+|---|---|---|---|---|---|
+| `combined` | Agent container, which also runs the supervisor | Not forced by topology | Not explicitly disabled by the driver | Adds `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG`; adds `SETUID`, `SETGID`, and `DAC_READ_SEARCH` when user namespaces are enabled | Full supervisor controls run in the agent container. |
+
+Short-lived setup containers still have the permissions needed to prepare the
+pod:
+
+| Topology | Setup container | UID/GID | Privilege escalation | Capabilities | Purpose |
+|---|---|---|---|---|---|
+| `combined` | Supervisor install init container | `0` | Not set | Not set | Copies the supervisor binary into the agent container volume. |
+
+## Combined Topology
+
+Combined topology is the original Kubernetes mode and remains the default. The
+agent container starts the OpenShell supervisor, and the supervisor launches the
+workload after applying sandbox setup.
+
+Combined topology keeps these controls in one supervisor path:
+
+- Network endpoint and L7 policy enforcement.
+- Filesystem policy enforcement.
+- Process and binary identity checks.
+- Privilege drop into the sandbox user.
+- Gateway relay, SSH sessions, exec, and file sync.
+
+Because the supervisor performs network namespace setup and process/filesystem
+controls from the agent container, Kubernetes grants that container elevated
+Linux capabilities. Use this mode when you need the complete OpenShell sandbox
+contract and your cluster policy permits those capabilities.
+
+## RuntimeClass Isolation
+
+RuntimeClass isolation can add a stronger container boundary for the sandbox
+workload when the cluster supports it. Runtime classes do not replace the
+combined topology's supervisor controls; they add another isolation boundary
+around the same supervised workload.
+
+You can set a default runtime class in the Kubernetes driver configuration or
+override it per sandbox with driver config:
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers"}}}' \
+  -- claude
+```
+
+## Configure Combined Mode
+
+For direct gateway TOML configuration, leave `supervisor_topology` unset, or
+set it to `combined`, to use the default single-container supervisor path:
+
+```toml
+[openshell.drivers.kubernetes]
+supervisor_topology = "combined"
+```
+
+When the Helm chart renders `gateway.toml`, leave `supervisor.topology` unset,
+or set it to `combined`, to produce the same driver configuration:
+
+```yaml
+supervisor:
+  topology: combined
+```
+
+## Next Steps
+
+- To install OpenShell on Kubernetes, refer to [Setup](/kubernetes/setup).
+- To configure gateway authentication, refer to [Access Control](/kubernetes/access-control).
+- To review the driver fields, refer to [Gateway Configuration File](/reference/gateway-config).
