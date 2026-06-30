@@ -75,9 +75,7 @@ impl FromStr for SupervisorTopology {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "combined" => Ok(Self::Combined),
-            other => Err(format!(
-                "unknown supervisor topology '{other}'; expected 'combined'"
-            )),
+            other => Err(format!("unknown supervisor topology '{other}'")),
         }
     }
 }
@@ -206,8 +204,7 @@ pub struct KubernetesComputeConfig {
     pub supervisor_image_pull_policy: String,
     /// How the supervisor binary is delivered into sandbox pods.
     pub supervisor_sideload_method: SupervisorSideloadMethod,
-    /// Supervisor pod topology. `combined` preserves the existing single
-    /// supervisor container path.
+    /// How the supervisor is arranged for Kubernetes sandbox pods.
     pub supervisor_topology: SupervisorTopology,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
@@ -386,7 +383,7 @@ mod tests {
     #[test]
     fn serde_rejects_invalid_supervisor_topology() {
         let json = serde_json::json!({
-            "supervisor_topology": "sidecar"
+            "supervisor_topology": "unsupported"
         });
         let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
         assert!(err.to_string().contains("unknown variant"));

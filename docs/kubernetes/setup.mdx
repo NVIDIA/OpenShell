@@ -160,7 +160,7 @@ The most commonly changed values are:
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
 | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect based on cluster version: clusters running Kubernetes 1.35 or later use `image-volume` (ImageVolume GA in 1.36); older clusters use `init-container`. Set explicitly to `image-volume` on Kubernetes 1.33 or 1.34 with the ImageVolume feature gate enabled, or to `init-container` to force the legacy path on any version. |
-| `supervisor.topology` | Sandbox pod topology. Leave as `combined` for the default full-enforcement path. Refer to [Topology](/kubernetes/topology). |
+| `supervisor.topology` | Sandbox pod topology. Refer to [Topology](/kubernetes/topology). |
 
 Use a values file for repeatable deployments:
 
