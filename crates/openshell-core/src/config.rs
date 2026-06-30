@@ -37,8 +37,50 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
-/// Default OCI image for the openshell-sandbox supervisor binary.
-pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
+/// Default OCI repository for the supervisor image (no tag).
+pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
+
+/// Return the default supervisor image reference with a version-pinned tag.
+#[must_use]
+pub fn default_supervisor_image() -> String {
+    format!(
+        "{DEFAULT_SUPERVISOR_IMAGE_REPO}:{}",
+        default_supervisor_image_tag()
+    )
+}
+
+fn default_supervisor_image_tag() -> String {
+    resolve_supervisor_image_tag(
+        option_env!("OPENSHELL_IMAGE_TAG"),
+        option_env!("IMAGE_TAG"),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// Resolve the supervisor image tag from build-time inputs.
+///
+/// Priority: `OPENSHELL_IMAGE_TAG` > `IMAGE_TAG` > `CARGO_PKG_VERSION`.
+/// Falls back to `"dev"` when the Cargo version is empty or `"0.0.0"`.
+/// Replaces `+` with `-` for OCI tag compatibility.
+#[must_use]
+pub fn resolve_supervisor_image_tag(
+    openshell_image_tag: Option<&str>,
+    image_tag: Option<&str>,
+    cargo_pkg_version: &str,
+) -> String {
+    let tag = openshell_image_tag
+        .filter(|tag| !tag.is_empty())
+        .or_else(|| image_tag.filter(|tag| !tag.is_empty()))
+        .unwrap_or_else(|| {
+            if cargo_pkg_version.is_empty() || cargo_pkg_version == "0.0.0" {
+                "dev"
+            } else {
+                cargo_pkg_version
+            }
+        });
+
+    tag.replace('+', "-")
+}
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
@@ -1063,5 +1105,49 @@ mod tests {
                 None => std::env::remove_var("KUBERNETES_SERVICE_HOST"),
             }
         }
+    }
+
+    #[test]
+    fn supervisor_image_tag_prefers_explicit_build_tags() {
+        use super::resolve_supervisor_image_tag;
+        assert_eq!(
+            resolve_supervisor_image_tag(Some("1.2.3"), Some("sha"), "0.0.0"),
+            "1.2.3",
+        );
+        assert_eq!(
+            resolve_supervisor_image_tag(None, Some("sha"), "0.0.0"),
+            "sha",
+        );
+        assert_eq!(resolve_supervisor_image_tag(None, None, "1.2.3"), "1.2.3",);
+        assert_eq!(
+            resolve_supervisor_image_tag(Some(""), Some(""), "0.0.0"),
+            "dev",
+        );
+        assert_eq!(
+            resolve_supervisor_image_tag(Some("latest"), None, "1.2.3"),
+            "latest",
+        );
+    }
+
+    #[test]
+    fn supervisor_image_tag_sanitizes_build_metadata_for_oci() {
+        use super::resolve_supervisor_image_tag;
+        assert_eq!(
+            resolve_supervisor_image_tag(None, None, "0.0.37-dev.156+g1d3b741ee"),
+            "0.0.37-dev.156-g1d3b741ee",
+        );
+        assert_eq!(
+            resolve_supervisor_image_tag(Some("0.0.37-dev.156+g1d3b741ee"), None, "0.0.0"),
+            "0.0.37-dev.156-g1d3b741ee",
+        );
+    }
+
+    #[test]
+    fn default_supervisor_image_is_version_pinned() {
+        use super::default_supervisor_image;
+        let image = default_supervisor_image();
+        assert!(image.starts_with("ghcr.io/nvidia/openshell/supervisor:"));
+        let tag = image.rsplit_once(':').unwrap().1;
+        assert!(!tag.is_empty());
     }
 }
