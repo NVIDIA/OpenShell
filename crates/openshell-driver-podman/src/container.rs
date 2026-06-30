@@ -839,9 +839,8 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         // Side-load the supervisor binary from a standalone OCI image.
         // Podman resolves image_volumes at the libpod layer, mounting the
         // image's filesystem at the destination path without starting a
-        // container from it. The supervisor image is FROM scratch with just
-        // the binary at /openshell-sandbox, so it appears at
-        // /opt/openshell/bin/openshell-sandbox.
+        // container from it. The supervisor image exposes the binary at
+        // /openshell-sandbox, so it appears at /opt/openshell/bin/openshell-sandbox.
         image_volumes,
         hostname: format!("sandbox-{}", sandbox.name),
         // Override the image's ENTRYPOINT so the supervisor binary runs

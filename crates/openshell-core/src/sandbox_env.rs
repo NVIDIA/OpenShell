@@ -29,6 +29,47 @@ pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
 /// Deployment-controlled telemetry toggle propagated to the sandbox supervisor.
 pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
 
+/// Supervisor pod/runtime topology. Kubernetes sidecar mode sets this to
+/// `"sidecar"`; the default combined supervisor path omits it.
+pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
+
+/// Network enforcement backend selected by the compute driver.
+pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
+
+/// Process enforcement mode selected by the compute driver.
+///
+/// The default when unset is `"full"`, where the process supervisor enforces
+/// filesystem/process policy before spawning workloads. Kubernetes sidecar
+/// topology sets this to `"network-only"` so the process wrapper can run as
+/// the sandbox UID without Linux capabilities while preserving SSH/session
+/// behavior.
+pub const PROCESS_ENFORCEMENT_MODE: &str = "OPENSHELL_PROCESS_ENFORCEMENT_MODE";
+
+/// Whether network policy evaluation must bind requests to the peer binary.
+///
+/// The default when unset is `"required"`. Kubernetes sidecar experiments may
+/// set this to `"relaxed"` to enforce endpoint and L7 policy without per-binary
+/// `/proc` identity binding.
+pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
+
+/// File written by the network supervisor when sidecar networking is ready.
+pub const SUPERVISOR_READY_FILE: &str = "OPENSHELL_SUPERVISOR_READY_FILE";
+
+/// File written by the process supervisor with the workload entrypoint PID and
+/// read by the network sidecar for process/binary-bound network policy checks.
+pub const ENTRYPOINT_PID_FILE: &str = "OPENSHELL_ENTRYPOINT_PID_FILE";
+
+/// Loopback address where the network sidecar forwards gateway gRPC traffic.
+pub const GATEWAY_FORWARD_ADDR: &str = "OPENSHELL_GATEWAY_FORWARD_ADDR";
+
+/// Optional TLS server name used when the process supervisor reaches the
+/// gateway through a loopback TCP forward.
+pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
+
+/// Directory where the network supervisor writes the proxy CA files consumed
+/// by workload child processes.
+pub const PROXY_TLS_DIR: &str = "OPENSHELL_PROXY_TLS_DIR";
+
 /// Path to the CA certificate for mTLS communication with the gateway.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";
 

@@ -268,6 +268,33 @@ kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\
 kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
 ```
 
+If `supervisor_topology = "sidecar"` is rendered, sandbox pods should have an
+`openshell-network-init` init container running `--mode=network-init`, an
+`agent` container running `openshell-sandbox --mode=process`, and an
+`openshell-supervisor-network` container running `--mode=network`. The init
+container owns nftables setup and should be the only sidecar topology container
+with `NET_ADMIN`. It also needs `CHOWN`/`FOWNER` to hand shared emptyDir state
+to `sidecar_proxy_uid`. The long-running network sidecar runs as
+`sidecar_proxy_uid` with primary GID `0` so it can read the root-owned,
+group-readable projected service-account token. In sidecar topology the
+`openshell-sa-token` projected volume should render `defaultMode: 288` (`0440`);
+if the proxy logs `failed to read K8s SA token`, verify this token mode and the
+network sidecar security context. The process container should also publish the
+workload entrypoint PID to `OPENSHELL_ENTRYPOINT_PID_FILE`
+(`/run/openshell-sidecar/entrypoint.pid` by default), and the network sidecar
+should read it for binary-scoped policy decisions; if allowed network rules are
+all denied, inspect that file and the network sidecar logs.
+Inspect all three when sandbox registration or egress enforcement fails:
+
+```bash
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep supervisor_topology
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.initContainers[*]}{.name}{" "}{.command}{"\n"}{end}'
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}'
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-network-init --tail=200
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-network --tail=200
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
+```
+
 ### Step 6: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:

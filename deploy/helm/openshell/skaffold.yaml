@@ -119,6 +119,8 @@ deploy:
           # To enable SPIFFE/SPIRE provider token grants (requires the
           # spire-crds and spire releases above):
           #- ci/values-spire.yaml
+          # To exercise the Kubernetes supervisor sidecar topology:
+          #- ci/values-sidecar.yaml
           # To test multi-replica external PostgreSQL behavior:
           #- ci/values-high-availability.yaml
         setValueTemplates:
@@ -126,3 +128,9 @@ deploy:
           image.tag: '{{.IMAGE_TAG_openshell_gateway}}'
           supervisor.image.repository: '{{.IMAGE_REPO_openshell_supervisor}}'
           supervisor.image.tag: '{{.IMAGE_TAG_openshell_supervisor}}'
+profiles:
+  - name: sidecar
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-sidecar.yaml

@@ -81,13 +81,27 @@ The supervisor must be available inside each sandbox workload:
 |---|---|
 | Docker | Bind-mounted local supervisor binary, or a binary extracted from the configured supervisor image. |
 | Podman | Read-only OCI image volume containing the supervisor binary. |
-| Kubernetes | Sandbox pod image or pod template configuration. |
+| Kubernetes | Supervisor image side-loaded into the sandbox pod by image volume or init container. |
 | VM | Embedded in the guest rootfs bundle. |
 | Extension | Defined by the out-of-tree driver. |
 
 Driver-controlled environment variables must override sandbox image or template
 values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
 paths, and command metadata.
+
+Kubernetes can run the supervisor in the default combined topology or in a
+sidecar topology. Combined mode keeps network and process supervision in the
+agent container. Sidecar mode runs network enforcement, the proxy, and gateway
+loopback forwarding in a dedicated sidecar, while the agent container runs only
+the process-supervision leaf and launches the user workload after the sidecar
+signals readiness. In sidecar mode, an init container performs the privileged
+pod-network nftables setup with `NET_ADMIN` and hands shared state ownership to
+the configured proxy UID; the long-running network sidecar runs as that UID and
+does not keep `NET_ADMIN`. The agent container runs as the resolved sandbox
+UID/GID with no added Linux capabilities. Sidecar mode preserves gateway session
+and SSH behavior, but treats the process leaf as network-only: Landlock
+filesystem policy, process privilege dropping, and process/binary identity
+checks are not applied there.
 
 ## Images
 

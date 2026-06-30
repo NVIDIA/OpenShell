@@ -100,23 +100,34 @@ impl BinaryIdentityCache {
     ///   Returns `Ok(hash)` if it matches, `Err` if the hash changed (binary tampered).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn verify_or_cache(&self, path: &Path) -> Result<String> {
-        self.verify_or_cache_with_hasher(path, procfs::file_sha256)
+        self.verify_or_cache_with_paths(path, path, procfs::file_sha256)
     }
 
-    fn verify_or_cache_with_hasher<F>(&self, path: &Path, mut hash_file: F) -> Result<String>
+    #[cfg(target_os = "linux")]
+    pub fn verify_or_cache_process_exe(&self, display_path: &Path, pid: u32) -> Result<String> {
+        let proc_exe = PathBuf::from(format!("/proc/{pid}/exe"));
+        self.verify_or_cache_with_paths(display_path, &proc_exe, procfs::file_sha256)
+    }
+
+    fn verify_or_cache_with_paths<F>(
+        &self,
+        cache_path: &Path,
+        access_path: &Path,
+        mut hash_file: F,
+    ) -> Result<String>
     where
         F: FnMut(&Path) -> Result<String>,
     {
         let start = std::time::Instant::now();
-        let metadata = std::fs::metadata(path)
-            .map_err(|error| miette::miette!("Failed to stat {}: {error}", path.display()))?;
+        let metadata = std::fs::metadata(access_path)
+            .map_err(|error| miette::miette!("Failed to stat {}: {error}", cache_path.display()))?;
         let fingerprint = FileFingerprint::from_metadata(&metadata);
 
         let cached = self
             .hashes
             .lock()
             .map_err(|_| miette::miette!("Binary identity cache lock poisoned"))?
-            .get(path)
+            .get(cache_path)
             .cloned();
 
         if let Some(cached_binary) = &cached
@@ -125,7 +136,7 @@ impl BinaryIdentityCache {
             debug!(
                 "      verify_or_cache: {}ms CACHE HIT path={}",
                 start.elapsed().as_millis(),
-                path.display()
+                cache_path.display()
             );
             return Ok(cached_binary.hash.clone());
         }
@@ -133,29 +144,29 @@ impl BinaryIdentityCache {
         debug!(
             "      verify_or_cache: CACHE MISS size={} path={}",
             metadata.len(),
-            path.display()
+            cache_path.display()
         );
 
-        let current_hash = hash_file(path)?;
+        let current_hash = hash_file(access_path)?;
 
         let mut hashes = self
             .hashes
             .lock()
             .map_err(|_| miette::miette!("Binary identity cache lock poisoned"))?;
 
-        if let Some(existing) = hashes.get(path)
+        if let Some(existing) = hashes.get(cache_path)
             && existing.hash != current_hash
         {
             return Err(miette::miette!(
                 "Binary integrity violation: {} hash changed (cached: {}, current: {})",
-                path.display(),
+                cache_path.display(),
                 existing.hash,
                 current_hash
             ));
         }
 
         hashes.insert(
-            path.to_path_buf(),
+            cache_path.to_path_buf(),
             CachedBinary {
                 hash: current_hash.clone(),
                 fingerprint,
@@ -165,7 +176,7 @@ impl BinaryIdentityCache {
         debug!(
             "      verify_or_cache TOTAL (cold): {}ms path={}",
             start.elapsed().as_millis(),
-            path.display()
+            cache_path.display()
         );
 
         Ok(current_hash)
@@ -212,13 +223,13 @@ mod tests {
         let mut hash_calls = 0;
 
         let hash1 = cache
-            .verify_or_cache_with_hasher(tmp.path(), |path| {
+            .verify_or_cache_with_paths(tmp.path(), tmp.path(), |path| {
                 hash_calls += 1;
                 procfs::file_sha256(path)
             })
             .unwrap();
         let hash2 = cache
-            .verify_or_cache_with_hasher(tmp.path(), |path| {
+            .verify_or_cache_with_paths(tmp.path(), tmp.path(), |path| {
                 hash_calls += 1;
                 procfs::file_sha256(path)
             })
@@ -238,7 +249,7 @@ mod tests {
         let mut hash_calls = 0;
 
         let hash1 = cache
-            .verify_or_cache_with_hasher(tmp.path(), |path| {
+            .verify_or_cache_with_paths(tmp.path(), tmp.path(), |path| {
                 hash_calls += 1;
                 procfs::file_sha256(path)
             })
@@ -254,7 +265,7 @@ mod tests {
             .unwrap();
 
         let hash2 = cache
-            .verify_or_cache_with_hasher(tmp.path(), |path| {
+            .verify_or_cache_with_paths(tmp.path(), tmp.path(), |path| {
                 hash_calls += 1;
                 procfs::file_sha256(path)
             })
@@ -275,7 +286,7 @@ mod tests {
         let mut hash_calls = 0;
 
         cache
-            .verify_or_cache_with_hasher(&path, |path| {
+            .verify_or_cache_with_paths(&path, &path, |path| {
                 hash_calls += 1;
                 procfs::file_sha256(path)
             })
@@ -292,13 +303,35 @@ mod tests {
             .set_modified(original_mtime)
             .unwrap();
 
-        let result = cache.verify_or_cache_with_hasher(&path, |path| {
+        let result = cache.verify_or_cache_with_paths(&path, &path, |path| {
             hash_calls += 1;
             procfs::file_sha256(path)
         });
 
         assert!(result.is_err());
         assert_eq!(hash_calls, 2);
+    }
+
+    #[test]
+    fn display_path_can_differ_from_access_path() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"binary content").unwrap();
+        tmp.flush().unwrap();
+        let display_path = Path::new("/usr/bin/python3");
+
+        let cache = BinaryIdentityCache::new();
+        let hash = cache
+            .verify_or_cache_with_paths(display_path, tmp.path(), procfs::file_sha256)
+            .unwrap();
+
+        assert!(!hash.is_empty());
+        assert!(
+            cache
+                .hashes
+                .lock()
+                .unwrap()
+                .contains_key(Path::new("/usr/bin/python3"))
+        );
     }
 
     #[test]

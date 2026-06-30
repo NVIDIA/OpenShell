@@ -177,9 +177,17 @@ supervisor_image_pull_policy   = "IfNotPresent"
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method     = "image-volume"
-# "combined" runs networking and process supervision in the sandbox agent
-# container and preserves the existing Kubernetes sandbox behavior.
+# "combined" runs the existing single supervisor container with full process,
+# filesystem, and network enforcement in the agent container. "sidecar" moves
+# pod-level network enforcement and gateway forwarding into a network sidecar.
 supervisor_topology            = "combined"
+# Process/filesystem controls for non-combined topologies. "network-only"
+# keeps the low-permission agent shape; "full" grants combined-mode
+# process/filesystem controls to the agent process supervisor.
+process_enforcement            = "network-only"
+# UID used by the long-running network sidecar. In sidecar topology the
+# network init container installs nftables rules that exempt this UID.
+proxy_uid                      = 1337
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"

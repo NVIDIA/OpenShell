@@ -83,21 +83,39 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
 
-  - it: renders combined supervisor topology by default under [openshell.drivers.kubernetes]
-    template: templates/gateway-config.yaml
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"combined"'
-
-  - it: renders explicit combined supervisor topology under [openshell.drivers.kubernetes]
+  - it: renders supervisor topology under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:
-      supervisor.topology: combined
+      supervisor.topology: sidecar
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"combined"'
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"sidecar"'
+
+  - it: renders process enforcement under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.processEnforcement: full
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?process_enforcement\s*=\s*"full"'
+
+  - it: renders default process enforcement under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?process_enforcement\s*=\s*"network-only"'
+
+  - it: renders proxy uid under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.proxyUid: 2200
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?proxy_uid\s*=\s*2200'
 
   - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml

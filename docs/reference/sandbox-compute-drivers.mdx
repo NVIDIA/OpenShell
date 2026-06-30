@@ -304,9 +304,29 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Set the supervisor image that provides the `openshell-sandbox` binary. |
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
+| `supervisor_topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, or `sidecar` to move pod-level network enforcement and gateway forwarding into a dedicated sidecar. |
+| `process_enforcement` | `supervisor.processEnforcement` | Process/filesystem controls for non-combined topologies. `network-only` keeps the low-permission agent shape. `full` grants combined-mode process/filesystem controls to the agent process supervisor. |
+| `proxy_uid` | `supervisor.proxyUid` | UID used by the long-running network sidecar in `sidecar` topology. The network init container exempts this UID from proxy redirection. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
+
+In `combined` topology, the agent container carries the Linux capabilities
+needed by the supervisor for network namespace setup, Landlock filesystem
+policy, process privilege changes, and network policy enforcement. In `sidecar`
+topology, the agent container runs as the resolved sandbox UID/GID with no added
+Linux capabilities. A root init container performs the nftables setup, and the
+long-running sidecar runs non-root with no added Linux capabilities. Sidecar
+mode keeps gateway session and SSH behavior, but the process supervisor runs in
+`network-only` mode by default: filesystem policy, process privilege dropping,
+and process/binary identity checks are not applied by the process container.
+Set `process_enforcement = "full"` only when you want those combined-mode
+process/filesystem guards and accept the added agent-container permissions.
+
+Sidecar mode uses pod `fsGroup` so the non-root process supervisor can read the
+projected ServiceAccount token and sandbox client TLS secret required for
+gateway authentication. Treat the workload container as trusted with respect to
+those in-pod gateway credentials.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 
@@ -331,6 +351,7 @@ The Kubernetes driver auto-detects the sandbox UID from OpenShift SCC namespace 
 You can override autodetection with explicit `sandbox_uid` / `sandbox_gid` config in `[openshell.drivers.kubernetes]`. When set, the driver skips namespace annotation lookup entirely.
 
 The resolved UID/GID appear in:
+
 - Supervisor container environment variables (`OPENSHELL_SANDBOX_UID`, `OPENSHELL_SANDBOX_GID`) for direct kernel-level privilege dropping without `/etc/passwd` lookups.
 - PVC init container `securityContext.runAsUser/runAsGroup/fsGroup` for workspace ownership operations.
 

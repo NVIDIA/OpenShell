@@ -393,6 +393,46 @@ require_cmd() {
   fi
 }
 
+configure_fixture_container_engine() {
+  local selected_engine=""
+
+  if [ -n "${CONTAINER_ENGINE:-}" ]; then
+    selected_engine="$(printf '%s' "${CONTAINER_ENGINE}" | tr '[:upper:]' '[:lower:]')"
+    case "${selected_engine}" in
+      docker|podman)
+        export CONTAINER_ENGINE="${selected_engine}"
+        return
+        ;;
+      *)
+        echo "ERROR: CONTAINER_ENGINE=${CONTAINER_ENGINE} is invalid; expected docker or podman" >&2
+        exit 2
+        ;;
+    esac
+  fi
+
+  case "${KUBE_CONTEXT}" in
+    k3d-*)
+      selected_engine="docker"
+      ;;
+    kind-*)
+      case "$(printf '%s' "${KIND_EXPERIMENTAL_PROVIDER:-}" | tr '[:upper:]' '[:lower:]')" in
+        podman)
+          selected_engine="podman"
+          ;;
+        *)
+          selected_engine="docker"
+          ;;
+      esac
+      ;;
+    *)
+      return
+      ;;
+  esac
+
+  export CONTAINER_ENGINE="${selected_engine}"
+  echo "Using ${CONTAINER_ENGINE} for Kubernetes e2e host-side fixture containers."
+}
+
 require_cmd helm
 require_cmd kubectl
 require_cmd curl
@@ -422,6 +462,8 @@ else
   export KUBECONFIG="${WORKDIR}/kubeconfig"
   KUBE_CONTEXT="k3d-${CLUSTER_NAME}"
 fi
+
+configure_fixture_container_engine
 
 if [ -z "${OPENSHELL_E2E_KUBE_BUILD_IMAGES+x}" ]; then
   if [ "${CLUSTER_CREATED_BY_US}" = "1" ]; then
