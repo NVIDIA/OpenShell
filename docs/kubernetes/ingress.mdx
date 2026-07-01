@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Ingress"
 sidebar-title: "Ingress"
-description: "Expose the OpenShell gateway externally using the Kubernetes Gateway API and a GRPCRoute."
-keywords: "Generative AI, Cybersecurity, Kubernetes, Gateway API, Envoy Gateway, GRPCRoute, Ingress, External Access"
+description: "Expose the OpenShell gateway externally using Kubernetes Gateway API routes."
+keywords: "Generative AI, Cybersecurity, Kubernetes, Gateway API, Envoy Gateway, GRPCRoute, TLSRoute, TLS Passthrough, Ingress, External Access"
 position: 3
 ---
 
 By default, the OpenShell gateway is only reachable inside the cluster. To let CLI clients connect without a `kubectl port-forward`, expose the gateway through an ingress.
 
-OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. This page uses [Envoy Gateway](https://gateway.envoyproxy.io), which the chart is tested with.
+OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart can create a `GRPCRoute` for plaintext traffic or a `TLSRoute` for TLS passthrough to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill these routes. This page uses [Envoy Gateway](https://gateway.envoyproxy.io), which the chart is tested with.
 
 ## Install Envoy Gateway
 
@@ -57,9 +57,9 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set grpcRoute.enabled=true \
-  --set grpcRoute.gateway.create=true \
-  --set grpcRoute.gateway.className=eg
+  --set gatewayApi.routes.grpc.enabled=true \
+  --set gatewayApi.gateway.create=true \
+  --set gatewayApi.gateway.className=eg
 ```
 
 ## Get the external address
@@ -77,63 +77,39 @@ openshell gateway add http://<external-ip> --name production
 openshell status
 ```
 
-This setup is plaintext end-to-end and is intended for development. For external access, terminate TLS at the gateway as shown below.
+This setup is plaintext end-to-end and is intended for development.
 
-## HTTPS (TLS termination)
+## Enable TLS passthrough
 
-Envoy Gateway can terminate TLS at the listener and forward plaintext to the OpenShell gateway pod:
+TLS passthrough keeps the connection encrypted from the client to the OpenShell gateway server. Envoy Gateway reads the TLS Server Name Indication (SNI) to select the route but does not terminate TLS:
 
 ```text
-client → HTTPS → Envoy Gateway (terminate TLS) → plaintext → openshell gateway pod
+client → TLS → Envoy Gateway (SNI routing) → TLS → OpenShell gateway
 ```
 
-Envoy Gateway only terminates TLS here — it does not perform OIDC. Do not enable an Envoy Gateway OIDC `SecurityPolicy` in front of the gateway: that flow relies on browser redirects and cookies and cannot work with the OpenShell CLI or headless agents. Instead, the OpenShell gateway validates an OIDC bearer token that the client sends in the gRPC `authorization` metadata, which Envoy forwards untouched.
-
-Because Envoy terminates TLS, the OpenShell gateway never sees a client certificate, so client mTLS cannot provide identity on this path. Use OIDC bearer tokens for client identity instead.
-
-For headless agents and CI, the CLI obtains the token via the OAuth2 client-credentials grant (no browser): set `OPENSHELL_OIDC_CLIENT_SECRET` to the OAuth client secret before running `openshell gateway add`. The client id comes from `--oidc-client-id` (default `openshell-cli`); pass it explicitly if your IdP client uses a different id. Interactive human users get the browser-based Authorization Code + PKCE flow by default.
-
-### Provide a TLS certificate
-
-Create a `kubernetes.io/tls` Secret in the `openshell` namespace with the certificate for your external hostname:
-
-```shell
-kubectl -n openshell create secret tls openshell-ingress-tls \
-  --cert=tls.crt --key=tls.key
-```
-
-The Secret may also be issued by cert-manager, or you can reference the chart's existing `openshell-server-tls` Secret if its SANs include the external hostname.
-
-### Install with HTTPS termination
-
-Enable an HTTPS listener, point it at the Secret, disable gateway-pod TLS so Envoy forwards plaintext, and configure an OIDC issuer for client identity:
+Enable TLSRoute and let the chart add a port 443 TLS listener to its Gateway:
 
 ```shell
 helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set grpcRoute.enabled=true \
-  --set grpcRoute.gateway.create=true \
-  --set grpcRoute.gateway.className=eg \
-  --set grpcRoute.gateway.listener.protocol=HTTPS \
-  --set grpcRoute.gateway.listener.port=443 \
-  --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
-  --set server.disableTls=true \
-  --set server.oidc.issuer=https://<issuer> \
-  --set 'grpcRoute.hostnames[0]=<external-hostname>'
+  --set gatewayApi.gateway.create=true \
+  --set gatewayApi.gateway.className=eg \
+  --set gatewayApi.routes.tls.enabled=true \
+  --set 'gatewayApi.routes.tls.hostnames[0]=openshell.example.com' \
+  --set 'pkiInitJob.serverDnsNames[0]=openshell.example.com'
 ```
 
-Keep the certificate Secret in the release namespace. Referencing a Secret in another namespace requires a `ReferenceGrant`.
+The generated Gateway listener uses protocol `TLS` and mode `Passthrough`. It does not reference a certificate Secret because the OpenShell gateway server completes the TLS handshake.
 
-### Register over HTTPS
+Configure `pkiInitJob.serverDnsNames` before the built-in certificate generator creates the server Secret. The generator leaves an existing Secret unchanged during upgrades. For an existing installation, ensure `server.tls.certSecretName` contains a certificate whose SAN covers the external hostname. When cert-manager owns the certificate, add the hostname to `certManager.serverDnsNames` instead.
 
-```shell
-openshell gateway add https://<external-hostname> --name production --oidc-issuer https://<issuer>
-openshell status
-```
+TLS passthrough preserves the gateway's existing authentication mode, including mTLS. Clients must have the corresponding client certificate when `server.tls.clientCaSecretName` is configured. To use OIDC without client certificates, set `server.tls.clientCaSecretName` to an empty string and configure the server OIDC settings.
 
-See [Authentication](/kubernetes/setup) for OIDC issuer, audience, and roles configuration.
+To create only TLSRoute for a pre-existing Gateway, leave `gatewayApi.gateway.create=false` and set `gatewayApi.gateway.name` and `gatewayApi.gateway.namespace`. The existing Gateway must provide a compatible TLS passthrough listener and allow routes from the OpenShell release namespace.
+
+After the route is accepted and the external DNS record resolves to the Envoy Gateway address, register the HTTPS endpoint using the authentication mode configured for the server.
 
 ## SSH Relay
 

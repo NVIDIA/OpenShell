@@ -352,44 +352,33 @@ certManager:
   serverIpAddresses:
     - 127.0.0.1
 
-# Kubernetes Gateway API - HTTPRoute and Gateway resources.
+# Kubernetes Gateway API resources.
 # Requires a Gateway API controller in the cluster. Install Envoy Gateway via
 # the skaffold.yaml releases or independently:
 #   helm install eg oci://docker.io/envoyproxy/gateway-helm \
-#     --version v1.4.1 -n envoy-gateway-system --create-namespace
-grpcRoute:
-  # -- Create a Gateway API GRPCRoute for the gateway service.
-  enabled: false
-  # -- Hostnames the GRPCRoute matches on. Leave empty to match all hosts.
-  hostnames: []
+#     --version v1.8.1 -n envoy-gateway-system --create-namespace
+gatewayApi:
   gateway:
-    # -- When true, a Gateway resource is created in the release namespace.
+    # -- When true, a Gateway resource is created.
     # Set to false and provide name/namespace to attach to a pre-existing Gateway.
     create: false
     # -- GatewayClass to reference. Envoy Gateway installs one named "eg".
     className: "eg"
     # -- Name of the Gateway resource. Defaults to the chart fullname.
     name: ""
-    # -- Namespace of the Gateway referenced by the GRPCRoute parentRef.
-    # Defaults to the release namespace.
+    # -- Namespace of a pre-existing Gateway referenced by routes. Defaults to
+    # the release namespace. Chart-created Gateways always use the release namespace.
     namespace: ""
-    # Listener settings (only used when gateway.create is true).
-    listener:
-      # -- Listener port for the generated Gateway resource. Use 443 with protocol HTTPS.
-      port: 80
-      # -- Listener protocol for the generated Gateway resource: HTTP or HTTPS.
-      # HTTPS terminates TLS at the Envoy Gateway listener; pair it with
-      # server.disableTls=true so Envoy forwards plaintext to the gateway pod,
-      # and use OIDC for client identity (the gateway never sees the client cert).
-      protocol: HTTP
-      # -- "Same" restricts attached routes to the release namespace; "All" allows any namespace.
-      allowedRoutes: Same
-      # TLS settings for the listener. Used only when protocol is HTTPS
-      # (mode is always Terminate).
-      tls:
-        # -- certificateRefs for the HTTPS listener. Required when protocol is
-        # HTTPS. Each entry needs a `name` pointing at a kubernetes.io/tls Secret
-        # in the Gateway's namespace. May reference a cert-manager-issued Secret
-        # or the existing openshell-server-tls Secret (its SANs must include the
-        # external hostname).
-        certificateRefs: []
+  routes:
+    grpc:
+      # -- Create a Gateway API GRPCRoute for the gateway service.
+      enabled: false
+      # -- Hostnames the GRPCRoute matches on. Leave empty to match all hosts.
+      hostnames: []
+    tls:
+      # -- Create a Gateway API TLSRoute that passes encrypted traffic through
+      # to the gateway service. When gatewayApi.gateway.create is true, the
+      # generated Gateway also gets a TLS listener on port 443 in Passthrough mode.
+      enabled: false
+      # -- SNI hostnames the TLSRoute matches on. Leave empty to match all hosts.
+      hostnames: []

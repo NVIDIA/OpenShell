@@ -53,7 +53,8 @@ The `dev` tags are intended for testing changes ahead of a release. Production d
 
 See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 
-- [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
+- [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - Gateway API configuration
+- [`ci/values-gateway-tls.yaml`](ci/values-gateway-tls.yaml) - Gateway API TLS passthrough configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
@@ -147,16 +148,14 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | certManager.serverDnsNames | list | `["openshell","openshell.openshell.svc","openshell.openshell.svc.cluster.local","localhost","openshell.localhost","*.openshell.localhost","host.docker.internal"]` | DNS SANs on the cert-manager-issued server certificate. |
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
-| grpcRoute.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
-| grpcRoute.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
-| grpcRoute.gateway.create | bool | `false` | When true, a Gateway resource is created in the release namespace. Set to false and provide name/namespace to attach to a pre-existing Gateway. |
-| grpcRoute.gateway.listener.allowedRoutes | string | `"Same"` | "Same" restricts attached routes to the release namespace; "All" allows any namespace. |
-| grpcRoute.gateway.listener.port | int | `80` | Listener port for the generated Gateway resource. Use 443 with protocol HTTPS. |
-| grpcRoute.gateway.listener.protocol | string | `"HTTP"` | Listener protocol for the generated Gateway resource: HTTP or HTTPS. HTTPS terminates TLS at the Envoy Gateway listener; pair it with server.disableTls=true so Envoy forwards plaintext to the gateway pod, and use OIDC for client identity (the gateway never sees the client cert). |
-| grpcRoute.gateway.listener.tls.certificateRefs | list | `[]` | certificateRefs for the HTTPS listener. Required when protocol is HTTPS. Each entry needs a `name` pointing at a kubernetes.io/tls Secret in the Gateway's namespace. May reference a cert-manager-issued Secret or the existing openshell-server-tls Secret (its SANs must include the external hostname). |
-| grpcRoute.gateway.name | string | `""` | Name of the Gateway resource. Defaults to the chart fullname. |
-| grpcRoute.gateway.namespace | string | `""` | Namespace of the Gateway referenced by the GRPCRoute parentRef. Defaults to the release namespace. |
-| grpcRoute.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
+| gatewayApi.gateway.className | string | `"eg"` | GatewayClass to reference. Envoy Gateway installs one named "eg". |
+| gatewayApi.gateway.create | bool | `false` | When true, a Gateway resource is created. Set to false and provide name/namespace to attach to a pre-existing Gateway. |
+| gatewayApi.gateway.name | string | `""` | Name of the Gateway resource. Defaults to the chart fullname. |
+| gatewayApi.gateway.namespace | string | `""` | Namespace of a pre-existing Gateway referenced by routes. Defaults to the release namespace. Chart-created Gateways always use the release namespace. |
+| gatewayApi.routes.grpc.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
+| gatewayApi.routes.grpc.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
+| gatewayApi.routes.tls.enabled | bool | `false` | Create a Gateway API TLSRoute that passes encrypted traffic through to the gateway service. When gatewayApi.gateway.create is true, the generated Gateway also gets a TLS listener on port 443 in Passthrough mode. |
+| gatewayApi.routes.tls.hostnames | list | `[]` | SNI hostnames the TLSRoute matches on. Leave empty to match all hosts. |
 | image.pullPolicy | string | `"IfNotPresent"` | Gateway image pull policy. |
 | image.repository | string | `"ghcr.io/nvidia/openshell/gateway"` | Gateway image repository. |
 | image.tag | string | `""` | Gateway image tag. Defaults to the chart appVersion when empty. |
