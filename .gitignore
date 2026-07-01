@@ -223,6 +223,9 @@ rfc.md
 *.snap
 *.comp
 
+# Spread reuse files
+.spread-reuse.*.yaml
+
 # Markdown/mermaid lint tooling deps
 scripts/lint-mermaid/node_modules/
 

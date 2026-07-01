@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+summary: Smoke test for creating a sandbox
+details: |
+    This test verifies that the openshell snap is properly installed
+    and that the openshell command is available and functional.
+    A test sandbox is created on the selected gateway. A hello world program is
+    then invoked in the sandbox.
+
+prepare: |
+    snap run openshell sandbox list | MATCH "No sandboxes found."
+
+execute: |
+    snap run openshell sandbox create -- echo "Hello, OpenShell!" | MATCH "Hello, OpenShell!"
+    snap run openshell sandbox list | MATCH ".*Ready"
+
+restore: |
+    snap run openshell sandbox delete --all | MATCH ".*Deleted.*"
+    snap run openshell sandbox list | MATCH "No sandboxes found."
