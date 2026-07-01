@@ -10,13 +10,43 @@ permissions:
   actions: read
   contents: read
 
+env:
+  STABLE_INSTALL_SH_URL: https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh
+  DEV_INSTALL_SH_URL: https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event_name == 'workflow_run' && 'dev' || github.ref_name }}/install.sh
+
 defaults:
   run:
     shell: bash
 
 jobs:
   macos:
-    name: macOS Homebrew
+    name: macOS Homebrew Upgrade
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: macos-latest-xlarge
+    timeout-minutes: 30
+    steps:
+      - name: Ensure VM driver
+        run: |
+          launchctl setenv OPENSHELL_DRIVERS vm
+
+      - name: Clean install latest release and check status
+        run: |
+          set -euo pipefail
+          curl -LsSf "$STABLE_INSTALL_SH_URL" | sh
+          openshell --version
+          openshell status
+
+      - name: Upgrade to dev release and check status
+        run: |
+          set -euo pipefail
+          before_version="$(openshell --version)"
+          curl -LsSf "$DEV_INSTALL_SH_URL" | OPENSHELL_VERSION=dev sh
+          after_version="$(openshell --version)"
+          echo "Upgraded OpenShell from ${before_version} to ${after_version}"
+          openshell status
+
+  macos-dev-clean:
+    name: macOS Homebrew Clean Install
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: macos-latest-xlarge
     timeout-minutes: 20
@@ -25,13 +55,48 @@ jobs:
         run: |
           launchctl setenv OPENSHELL_DRIVERS vm
 
-      - name: Install and check status
+      - name: Clean install and check status
         run: |
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          set -euo pipefail
+          curl -LsSf "$DEV_INSTALL_SH_URL" | OPENSHELL_VERSION=dev sh
+          openshell --version
           openshell status
 
   ubuntu:
-    name: Ubuntu Docker
+    name: Ubuntu Docker Upgrade
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Ensure Docker
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y docker.io
+          fi
+          sudo systemctl start docker || sudo service docker start
+          mkdir -p "${HOME}/.config/openshell"
+          printf 'OPENSHELL_DRIVERS=docker\n' > "${HOME}/.config/openshell/gateway.env"
+          docker info
+
+      - name: Clean install latest release and check status
+        run: |
+          set -euo pipefail
+          curl -LsSf "$STABLE_INSTALL_SH_URL" | sh
+          openshell --version
+          openshell status
+
+      - name: Upgrade to dev release and check status
+        run: |
+          set -euo pipefail
+          before_version="$(openshell --version)"
+          curl -LsSf "$DEV_INSTALL_SH_URL" | OPENSHELL_VERSION=dev sh
+          after_version="$(openshell --version)"
+          echo "Upgraded OpenShell from ${before_version} to ${after_version}"
+          openshell status
+
+  ubuntu-dev-clean:
+    name: Ubuntu Docker Clean Install
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -47,13 +112,47 @@ jobs:
           printf 'OPENSHELL_DRIVERS=docker\n' > "${HOME}/.config/openshell/gateway.env"
           docker info
 
-      - name: Install and check status
+      - name: Clean install and check status
         run: |
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          set -euo pipefail
+          curl -LsSf "$DEV_INSTALL_SH_URL" | OPENSHELL_VERSION=dev sh
+          openshell --version
           openshell status
 
   fedora:
-    name: Fedora RPM
+    name: Fedora RPM Upgrade
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    container:
+      image: fedora:latest
+      options: --privileged
+    steps:
+      - name: Ensure Podman
+        run: |
+          dnf install -y curl podman
+          mkdir -p "${HOME}/.config/openshell"
+          printf 'OPENSHELL_DRIVERS=podman\n' > "${HOME}/.config/openshell/gateway.env"
+          podman info
+
+      - name: Clean install latest release and check status
+        run: |
+          set -euo pipefail
+          curl -LsSf "$STABLE_INSTALL_SH_URL" | sh
+          openshell --version
+          openshell status
+
+      - name: Upgrade to dev release and check status
+        run: |
+          set -euo pipefail
+          before_version="$(openshell --version)"
+          curl -LsSf "$DEV_INSTALL_SH_URL" | OPENSHELL_VERSION=dev sh
+          after_version="$(openshell --version)"
+          echo "Upgraded OpenShell from ${before_version} to ${after_version}"
+          openshell status
+
+  fedora-dev-clean:
+    name: Fedora RPM Clean Install
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
@@ -122,7 +221,7 @@ jobs:
           fi
           EOF
 
-      - name: Install and check status
+      - name: Clean install and check status
         run: |
           set -euo pipefail
 
@@ -130,13 +229,14 @@ jobs:
             HOME=/root \
             XDG_RUNTIME_DIR=/run/user/0 \
             DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
-            INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh" \
+            DEV_INSTALL_SH_URL="${DEV_INSTALL_SH_URL}" \
             bash -s <<'EOF'
           set -euo pipefail
           mkdir -p "${HOME}/.config/openshell"
           printf 'OPENSHELL_DRIVERS=podman\n' > "${HOME}/.config/openshell/gateway.env"
           podman info
-          curl -LsSf "${INSTALL_SH_URL}" | sh
+          curl -LsSf "${DEV_INSTALL_SH_URL}" | OPENSHELL_VERSION=dev sh
+          openshell --version
           openshell status
           EOF
 
@@ -146,8 +246,70 @@ jobs:
           docker rm -f "${FEDORA_CANARY_CONTAINER}" >/dev/null 2>&1 || true
 
   ubuntu-snap:
-    name: Ubuntu Snap
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    name: Ubuntu Snap Upgrade
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install snapd
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y snapd
+          sudo systemctl enable --now snapd.socket
+          sudo systemctl start snapd
+          sudo snap wait system seed.loaded
+
+      - name: Install Docker snap
+        run: |
+          set -euo pipefail
+          sudo snap install docker
+
+      - name: Clean install latest stable snap and check status
+        run: |
+          set -euo pipefail
+          sudo snap install openshell --channel latest/stable
+
+      - name: Connect interfaces
+        run: |
+          set -euo pipefail
+          sudo snap connect openshell:docker docker:docker-daemon
+          sudo snap connect openshell:log-observe
+          sudo snap connect openshell:system-observe
+          sudo snap connect openshell:ssh-keys
+
+      - name: Check clean snap install status
+        run: |
+          set -euo pipefail
+          openshell --version
+          sudo snap services openshell
+          openshell gateway add http://127.0.0.1:17670 --local --name snap-docker
+          openshell gateway select snap-docker
+          openshell status
+
+      - name: Download snap from release-dev artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+          pattern: snap-linux-amd64
+          path: release/
+          merge-multiple: true
+
+      - name: Upgrade to release-dev snap artifact and check status
+        run: |
+          set -euo pipefail
+          before_version="$(openshell --version)"
+          sudo snap install ./release/*.snap --dangerous
+          sudo snap restart openshell.gateway
+          after_version="$(openshell --version)"
+          echo "Upgraded OpenShell snap from ${before_version} to ${after_version}"
+          sudo snap services openshell
+          openshell status
+
+  ubuntu-snap-dev-clean:
+    name: Ubuntu Snap Clean Install
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -174,7 +336,7 @@ jobs:
           path: release/
           merge-multiple: true
 
-      - name: Install snap (dangerous — from release, not store)
+      - name: Install snap from release-dev artifact
         run: |
           set -euo pipefail
           sudo snap install ./release/*.snap --dangerous
@@ -197,10 +359,10 @@ jobs:
           openshell status
 
   kubernetes:
-    name: Kubernetes Helm (kind)
+    name: Kubernetes Helm Upgrade (kind)
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       KIND_CLUSTER_NAME: release-canary-${{ github.run_id }}
       RELEASE_NAME: openshell
@@ -216,16 +378,62 @@ jobs:
           cluster_name: ${{ env.KIND_CLUSTER_NAME }}
           wait: 120s
 
-      - name: Install OpenShell Helm chart from GHCR OCI
+      - name: Resolve latest public chart version
+        run: |
+          set -euo pipefail
+          OCI_CHART="oci://ghcr.io/nvidia/openshell/helm-chart"
+          latest_url="$(curl -fLsS -o /dev/null -w '%{url_effective}' https://github.com/NVIDIA/OpenShell/releases/latest)"
+          latest_tag="${latest_url##*/}"
+          latest_version="${latest_tag#v}"
+          if [ -z "$latest_version" ] || [ "$latest_version" = "latest" ]; then
+            echo "Could not resolve latest public release from ${latest_url}" >&2
+            exit 1
+          fi
+
+          candidates=("$latest_version")
+          if [ "$latest_tag" != "$latest_version" ]; then
+            candidates+=("$latest_tag")
+          fi
+
+          for candidate in "${candidates[@]}"; do
+            if helm show chart "$OCI_CHART" --version "$candidate" >/dev/null 2>&1; then
+              echo "LATEST_CHART_VERSION=${candidate}" >> "$GITHUB_ENV"
+              echo "Resolved latest public chart version ${candidate} from release ${latest_tag}"
+              exit 0
+            fi
+          done
+
+          echo "Latest public release ${latest_tag} has no installable Helm chart at ${OCI_CHART}." >&2
+          echo "Tried chart versions: ${candidates[*]}" >&2
+          exit 1
+
+      - name: Clean install latest public Helm chart from GHCR OCI
         run: |
           set -euo pipefail
           helm install "$RELEASE_NAME" oci://ghcr.io/nvidia/openshell/helm-chart \
-            --version 0.0.0-dev \
+            --version "$LATEST_CHART_VERSION" \
             --namespace "$RELEASE_NAMESPACE" --create-namespace \
             --set server.disableTls=true \
             --wait --timeout 5m
 
-      - name: Verify gateway pod is Ready
+      - name: Verify clean install gateway pod is Ready
+        run: |
+          set -euo pipefail
+          kubectl wait --namespace "$RELEASE_NAMESPACE" \
+            --for=condition=Ready pod \
+            --selector="app.kubernetes.io/name=openshell,app.kubernetes.io/instance=${RELEASE_NAME}" \
+            --timeout=300s
+
+      - name: Upgrade to dev Helm chart
+        run: |
+          set -euo pipefail
+          helm upgrade "$RELEASE_NAME" oci://ghcr.io/nvidia/openshell/helm-chart \
+            --version 0.0.0-dev \
+            --namespace "$RELEASE_NAMESPACE" \
+            --set server.disableTls=true \
+            --wait --timeout 5m
+
+      - name: Verify upgraded gateway pod is Ready
         run: |
           set -euo pipefail
           kubectl wait --namespace "$RELEASE_NAMESPACE" \
@@ -256,7 +464,7 @@ jobs:
           set -euo pipefail
           mkdir -p "${HOME}/.config/openshell"
           printf 'OPENSHELL_DRIVERS=docker\n' > "${HOME}/.config/openshell/gateway.env"
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          curl -LsSf "$STABLE_INSTALL_SH_URL" | sh
 
       - name: Register kind gateway and check status
         run: |
@@ -282,6 +490,97 @@ jobs:
             --tail=200 --all-containers --prefix
           echo "--- port-forward log ---"
           cat port-forward.log 2>/dev/null
+          echo "--- openshell gateway list ---"
+          openshell gateway list 2>/dev/null
+          echo "--- openshell version ---"
+          openshell --version 2>/dev/null
+
+  kubernetes-dev-clean:
+    name: Kubernetes Helm Clean Install (kind)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      KIND_CLUSTER_NAME: release-canary-dev-${{ github.run_id }}
+      RELEASE_NAME: openshell
+      RELEASE_NAMESPACE: openshell
+      KIND_GATEWAY_NAME: kind-dev
+    steps:
+      - name: Install Helm
+        uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
+
+      - name: Create kind cluster
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          wait: 120s
+
+      - name: Clean install Helm chart from GHCR OCI
+        run: |
+          set -euo pipefail
+          helm install "$RELEASE_NAME" oci://ghcr.io/nvidia/openshell/helm-chart \
+            --version 0.0.0-dev \
+            --namespace "$RELEASE_NAMESPACE" --create-namespace \
+            --set server.disableTls=true \
+            --wait --timeout 5m
+
+      - name: Verify clean install gateway pod is Ready
+        run: |
+          set -euo pipefail
+          kubectl wait --namespace "$RELEASE_NAMESPACE" \
+            --for=condition=Ready pod \
+            --selector="app.kubernetes.io/name=openshell,app.kubernetes.io/instance=${RELEASE_NAME}" \
+            --timeout=300s
+
+      - name: Port-forward gateway service
+        run: |
+          set -euo pipefail
+          nohup kubectl port-forward --namespace "$RELEASE_NAMESPACE" \
+            "svc/${RELEASE_NAME}" 8080:8080 \
+            > port-forward-dev.log 2>&1 &
+          echo $! > port-forward-dev.pid
+          for _ in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/8080) >/dev/null 2>&1; then
+              echo "port-forward is reachable"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "port-forward did not become reachable" >&2
+          cat port-forward-dev.log >&2
+          exit 1
+
+      - name: Install OpenShell CLI
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.config/openshell"
+          printf 'OPENSHELL_DRIVERS=docker\n' > "${HOME}/.config/openshell/gateway.env"
+          curl -LsSf "$DEV_INSTALL_SH_URL" | OPENSHELL_VERSION=dev sh
+
+      - name: Register kind gateway and check status
+        run: |
+          set -euo pipefail
+          openshell gateway add http://127.0.0.1:8080 --local --name "$KIND_GATEWAY_NAME"
+          openshell status
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          echo "--- helm status ---"
+          helm status "$RELEASE_NAME" --namespace "$RELEASE_NAMESPACE"
+          echo "--- helm get manifest ---"
+          helm get manifest "$RELEASE_NAME" --namespace "$RELEASE_NAMESPACE"
+          echo "--- get all ---"
+          kubectl get all --namespace "$RELEASE_NAMESPACE"
+          echo "--- describe pods ---"
+          kubectl describe pods --namespace "$RELEASE_NAMESPACE"
+          echo "--- pod logs ---"
+          kubectl logs --namespace "$RELEASE_NAMESPACE" \
+            --selector="app.kubernetes.io/name=openshell,app.kubernetes.io/instance=${RELEASE_NAME}" \
+            --tail=200 --all-containers --prefix
+          echo "--- port-forward log ---"
+          cat port-forward-dev.log 2>/dev/null
           echo "--- openshell gateway list ---"
           openshell gateway list 2>/dev/null
           echo "--- openshell version ---"
