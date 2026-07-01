@@ -22,9 +22,9 @@ fn opencode_config_path() -> Option<PathBuf> {
         .ok()
         .map(PathBuf::from)
         .or_else(|| {
-            std::env::var("HOME")
+            openshell_core::paths::home_dir()
                 .ok()
-                .map(|h| PathBuf::from(h).join(".config"))
+                .map(|h| h.join(".config"))
         })?;
     Some(config_home.join("opencode").join("opencode.json"))
 }

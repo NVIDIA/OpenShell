@@ -3630,6 +3630,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "home",
  "ipnet",
  "miette",
  "prost",
@@ -3699,6 +3700,7 @@ version = "0.0.0"
 dependencies = [
  "clap",
  "futures",
+ "home",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -3726,6 +3728,7 @@ dependencies = [
  "clap",
  "flate2",
  "futures",
+ "home",
  "libc",
  "libloading",
  "miette",

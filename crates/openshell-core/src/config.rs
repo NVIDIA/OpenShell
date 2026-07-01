@@ -161,7 +161,7 @@ fn podman_socket_candidates() -> Vec<PathBuf> {
     podman_socket_candidates_from_env(
         socket,
         std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        crate::paths::home_dir().ok(),
     )
 }
 
@@ -216,8 +216,8 @@ fn docker_socket_candidates() -> Vec<PathBuf> {
 
     candidates.push(PathBuf::from("/var/run/docker.sock"));
 
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
+    if let Ok(home) = crate::paths::home_dir() {
+        candidates.push(home.join(".docker/run/docker.sock"));
     }
 
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {

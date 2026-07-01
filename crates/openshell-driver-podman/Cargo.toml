@@ -33,6 +33,7 @@ rustix = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
+home = { workspace = true }
 miette = { workspace = true }
 
 [dev-dependencies]
