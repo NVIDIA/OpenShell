@@ -5391,6 +5391,7 @@ fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefresh
         "google_service_account_jwt" => {
             Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
+        "aws_sts_assume_role" => Ok(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
         _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
     }
 }
@@ -5443,6 +5444,7 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }

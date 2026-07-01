@@ -1367,7 +1367,7 @@ async fn profile_provider_policy_layers(
     Ok(layers)
 }
 
-fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
+pub(super) fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
     match settings.settings.get(key) {
         None => Ok(false),
         Some(StoredSettingValue::Bool(value)) => Ok(*value),

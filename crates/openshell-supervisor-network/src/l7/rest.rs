@@ -560,11 +560,21 @@ where
                         // route chunked requests to the streaming path, but
                         // guard here as defense-in-depth.
                         let body_length = parse_body_length(header_str)?;
-                        if matches!(body_length, BodyLength::Chunked) {
-                            return Err(miette!(
-                                "SigV4 body signing requires Content-Length; \
-                                 chunked transfer encoding is not supported in this mode"
-                            ));
+                        match body_length {
+                            BodyLength::ContentLength(_) | BodyLength::None => {
+                                // ContentLength: buffer and sign the body.
+                                // None: no body (e.g. GET/HEAD/DELETE) — sign
+                                // with the empty-body hash. boto3 sends
+                                // x-amz-content-sha256 set to the SHA-256 of
+                                // "" on all requests, which routes here via
+                                // detect_payload_mode's catch-all.
+                            }
+                            BodyLength::Chunked => {
+                                return Err(miette!(
+                                    "SigV4 body signing requires Content-Length; \
+                                     chunked transfer encoding is not supported in this mode"
+                                ));
+                            }
                         }
                         // NOTE(defense-in-depth): Build the full request from
                         // rewritten headers + body. `rewrite_result.rewritten`
@@ -5413,6 +5423,83 @@ mod tests {
             "Non-secret query params should be preserved, got: {forwarded}"
         );
         assert!(!forwarded.contains("openshell:resolve:env:"));
+    }
+
+    #[tokio::test]
+    async fn relay_sigv4_body_signing_signs_empty_body_without_content_length() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [
+                ("AWS_ACCESS_KEY_ID".to_string(), "AKIATESTKEY".to_string()),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "test-secret-key".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        let raw_header =
+            b"GET /?list-type=2 HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n".to_vec();
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/".to_string(),
+            query_params: HashMap::from([("list-type".to_string(), vec!["2".to_string()])]),
+            raw_header,
+            body_length: BodyLength::None,
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    upstream_side
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .await
+                        .unwrap();
+                    upstream_side.flush().await.unwrap();
+                    break;
+                }
+            }
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        let relay_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_http_request_with_options_guarded(
+                &req,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                RelayRequestOptions {
+                    resolver: Some(&resolver),
+                    credential_signing: crate::l7::CredentialSigning::SigV4Body,
+                    signing_service: "s3",
+                    signing_region: "us-east-1",
+                    host: "s3.us-east-1.amazonaws.com",
+                    port: 443,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("relay must not deadlock");
+        drop(proxy_to_upstream);
+        let forwarded = upstream_task.await.expect("upstream task should complete");
+
+        relay_result.expect("bodyless GET with SigV4Body should succeed");
+        assert!(
+            forwarded.contains("authorization:"),
+            "forwarded request should have SigV4 authorization header: {forwarded}"
+        );
     }
 
     #[tokio::test]

@@ -5575,6 +5575,88 @@ network_policies:
     }
 
     #[test]
+    fn wildcard_host_middle_label_matches_one_region_label() {
+        let data = r#"
+network_policies:
+  s3:
+    name: s3
+    endpoints:
+      - { host: "*.s3.*.amazonaws.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "my-bucket.s3.us-east-1.amazonaws.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "*.s3.*.amazonaws.com should match one regional S3 label: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn wildcard_host_middle_label_does_not_match_missing_bucket_label() {
+        let data = r#"
+network_policies:
+  s3:
+    name: s3
+    endpoints:
+      - { host: "*.s3.*.amazonaws.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "s3.us-east-1.amazonaws.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            !decision.allowed,
+            "*.s3.*.amazonaws.com should not match path-style S3 host"
+        );
+    }
+
+    #[test]
+    fn wildcard_host_middle_label_does_not_skip_dualstack_label() {
+        let data = r#"
+network_policies:
+  s3:
+    name: s3
+    endpoints:
+      - { host: "*.s3.*.amazonaws.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "my-bucket.s3.dualstack.us-east-1.amazonaws.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            !decision.allowed,
+            "*.s3.*.amazonaws.com should not match the extra dualstack label"
+        );
+    }
+
+    #[test]
     fn wildcard_host_multi_port() {
         let data = r#"
 network_policies:

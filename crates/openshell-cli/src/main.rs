@@ -692,6 +692,7 @@ enum CliProviderRefreshStrategy {
     Oauth2RefreshToken,
     Oauth2ClientCredentials,
     GoogleServiceAccountJwt,
+    AwsStsAssumeRole,
 }
 
 impl CliProviderRefreshStrategy {
@@ -700,6 +701,7 @@ impl CliProviderRefreshStrategy {
             Self::Oauth2RefreshToken => "oauth2_refresh_token",
             Self::Oauth2ClientCredentials => "oauth2_client_credentials",
             Self::GoogleServiceAccountJwt => "google_service_account_jwt",
+            Self::AwsStsAssumeRole => "aws_sts_assume_role",
         }
     }
 }

@@ -135,9 +135,9 @@ Use `0` as the timestamp to clear expiry for a credential key.
 
 Provider refresh stores non-injectable refresh material separately from the
 provider's current credential values. The gateway can mint OAuth2 refresh-token
-tokens, OAuth2 client credentials tokens, and Google service account JWT tokens,
-then write the current access token back to the provider record for sandbox
-injection.
+tokens, OAuth2 client credentials tokens, Google service account JWT tokens, and
+AWS STS temporary credentials, then write the current access token back to the
+provider record for sandbox injection.
 
 Configure refresh metadata for one injectable credential key:
 
@@ -170,6 +170,46 @@ Force a gateway-managed refresh for one credential:
 ```shell
 openshell provider refresh rotate my-graph --credential-key MS_GRAPH_ACCESS_TOKEN
 ```
+
+### AWS STS
+
+AWS STS refresh requires `providers_v2_enabled=true`. The gateway calls
+`sts:AssumeRole` and writes three short-lived credentials (`AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) to the provider record atomically.
+
+```shell
+openshell settings set --global --key providers_v2_enabled --value true --yes
+
+openshell provider create --name my-aws --type aws-s3
+
+openshell provider refresh configure my-aws \
+  --credential-key AWS_ACCESS_KEY_ID \
+  --strategy aws-sts-assume-role \
+  --material role_arn="arn:aws:iam::123456789012:role/SandboxS3Writer" \
+  --material session_name="openshell-sandbox"
+
+openshell provider refresh rotate my-aws --credential-key AWS_ACCESS_KEY_ID
+```
+
+The gateway resolves its own AWS credentials using the default credential chain
+(instance role, IRSA, ECS task role, environment variables). For gateways not
+running on AWS, provide explicit IAM keys via refresh material:
+
+```shell
+openshell provider refresh configure my-aws \
+  --credential-key AWS_ACCESS_KEY_ID \
+  --strategy aws-sts-assume-role \
+  --material role_arn="arn:aws:iam::123456789012:role/SandboxS3Writer" \
+  --material aws_access_key_id="$AWS_ACCESS_KEY_ID" \
+  --material aws_secret_access_key="$AWS_SECRET_ACCESS_KEY" \
+  --secret-material-key aws_secret_access_key
+```
+
+Use the generic `aws` profile type for multi-service access and scope endpoints
+via sandbox network policy. Use `aws-s3` for S3-specific endpoint rules.
+
+The proxy re-signs requests using SigV4 before forwarding to AWS. Both curl and
+Python boto3 are supported.
 
 External refresh systems should continue to push new current credentials through
 `openshell provider update`. The `--credential-expires-at` option works for

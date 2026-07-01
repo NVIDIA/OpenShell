@@ -1996,6 +1996,18 @@ pub(super) async fn handle_configure_provider_refresh(
             crate::provider_refresh::refresh_strategy_name(strategy as i32)
         )));
     }
+    if strategy == ProviderCredentialRefreshStrategy::AwsStsAssumeRole {
+        let global_settings =
+            crate::grpc::policy::load_global_settings(state.store.as_ref()).await?;
+        if !crate::grpc::policy::bool_setting_enabled(
+            &global_settings,
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+        )? {
+            return Err(Status::failed_precondition(
+                "aws_sts_assume_role requires providers_v2_enabled=true",
+            ));
+        }
+    }
     if request.material.len() > MAX_PROVIDER_CONFIG_ENTRIES {
         return Err(Status::invalid_argument(format!(
             "material exceeds maximum entries ({} > {MAX_PROVIDER_CONFIG_ENTRIES})",
@@ -2064,6 +2076,16 @@ pub(super) async fn handle_configure_provider_refresh(
         credential_key,
     )
     .await?;
+    if strategy == ProviderCredentialRefreshStrategy::AwsStsAssumeRole {
+        for additional_key in ["AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"] {
+            validate_provider_credential_key_available_for_attached_sandboxes(
+                state.store.as_ref(),
+                &provider,
+                additional_key,
+            )
+            .await?;
+        }
+    }
     let refresh_defaults =
         provider_refresh_defaults(state.store.as_ref(), &provider, credential_key).await?;
     validate_refresh_material(&request.material, refresh_defaults.as_ref())?;
@@ -3142,7 +3164,9 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "aws",
                 "aws-bedrock",
+                "aws-s3",
                 "claude-code",
                 "codex",
                 "copilot",
@@ -6027,6 +6051,230 @@ mod tests {
             .filter(|i| final_provider.credentials.contains_key(&format!("KEY_{i}")))
             .count();
         assert_eq!(new_keys_count, 1);
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_requires_v2_enabled() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "my-aws".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "aws".to_string(),
+                credentials: std::iter::once((
+                    "AWS_ACCESS_KEY_ID".to_string(),
+                    "placeholder".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "my-aws".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("providers_v2_enabled"));
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_succeeds_with_v2_enabled() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "my-aws-v2".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "aws".to_string(),
+                credentials: std::iter::once((
+                    "AWS_ACCESS_KEY_ID".to_string(),
+                    "placeholder".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "my-aws-v2".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .expect("status");
+
+        assert_eq!(response.credential_key, "AWS_ACCESS_KEY_ID");
+        assert_eq!(
+            response.strategy,
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_validates_additional_credential_key_collision() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        let mut existing_provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "existing-aws-provider".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "aws".to_string(),
+            credentials: HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+        };
+        existing_provider.credentials.insert(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "existing-key".to_string(),
+        );
+        create_provider_record(state.store.as_ref(), existing_provider)
+            .await
+            .unwrap();
+
+        let new_provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "new-aws-provider".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "aws".to_string(),
+            credentials: std::iter::once((
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "placeholder".to_string(),
+            ))
+            .collect(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+        };
+        create_provider_record(state.store.as_ref(), new_provider)
+            .await
+            .unwrap();
+
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-aws-configure-collision".to_string(),
+                    name: "aws-configure-collision".to_string(),
+                    created_at_ms: 1,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec![
+                        "existing-aws-provider".to_string(),
+                        "new-aws-provider".to_string(),
+                    ],
+                    ..SandboxSpec::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "new-aws-provider".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("AWS_SECRET_ACCESS_KEY"));
     }
 
     fn google_cloud_provider(config: HashMap<String, String>) -> Provider {

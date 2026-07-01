@@ -1074,6 +1074,8 @@ pub enum PolicyViolation {
     TooManyPaths { count: usize },
     /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
     TldWildcard { policy_name: String, host: String },
+    /// A network endpoint uses a wildcard shape that does not match runtime semantics.
+    InvalidHostWildcard { policy_name: String, host: String },
     /// `credential_signing` is set but `signing_service` is missing.
     MissingSigningService { policy_name: String, host: String },
     /// `credential_signing` has an unrecognized value.
@@ -1118,6 +1120,14 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
                      use subdomain wildcards like '*.example.com' instead"
+                )
+            }
+            Self::InvalidHostWildcard { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': invalid host wildcard '{host}'; \
+                     middle DNS label wildcards must be the entire label '*' and recursive '**' \
+                     is only allowed as the entire first label"
                 )
             }
             Self::MissingSigningService { policy_name, host } => {
@@ -1249,6 +1259,12 @@ pub fn validate_sandbox_policy(
                     });
                 }
             }
+            if host_wildcard_shape_invalid(&ep.host) {
+                violations.push(PolicyViolation::InvalidHostWildcard {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
             if !ep.credential_signing.is_empty()
                 && !matches!(
                     ep.credential_signing.as_str(),
@@ -1281,6 +1297,25 @@ pub fn validate_sandbox_policy(
     } else {
         Err(violations)
     }
+}
+
+fn host_wildcard_shape_invalid(host: &str) -> bool {
+    if host == "*" || host == "**" {
+        return true;
+    }
+    if !host.contains('*') {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let first_label = labels.first().copied().unwrap_or_default();
+    if first_label.contains("**") && first_label != "**" {
+        return true;
+    }
+    labels
+        .iter()
+        .skip(1)
+        .copied()
+        .any(|label| label.contains("**") || (label.contains('*') && label != "*"))
 }
 
 /// Truncate a string for safe inclusion in error messages.
@@ -1810,6 +1845,33 @@ network_policies:
     }
 
     #[test]
+    fn validate_rejects_all_host_star_wildcards() {
+        for host in ["*", "**"] {
+            let mut policy = restrictive_default_policy();
+            policy.network_policies.insert(
+                "bad".into(),
+                NetworkPolicyRule {
+                    name: "bad-rule".into(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.into(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+
+            let violations = validate_sandbox_policy(&policy).unwrap_err();
+            assert!(
+                violations
+                    .iter()
+                    .any(|v| matches!(v, PolicyViolation::InvalidHostWildcard { .. })),
+                "expected bare host wildcard {host:?} to be rejected, got {violations:?}"
+            );
+        }
+    }
+
+    #[test]
     fn validate_accepts_subdomain_wildcard() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
@@ -1825,6 +1887,47 @@ network_policies:
             },
         );
         assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_middle_label_star_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.s3.*.amazonaws.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_partial_middle_label_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.s3.us-*.amazonaws.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidHostWildcard { .. }))
+        );
     }
 
     #[test]

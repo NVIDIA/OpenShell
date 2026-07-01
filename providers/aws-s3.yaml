@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: aws-s3
+display_name: AWS S3
+description: AWS S3 storage via STS temporary credentials
+category: other
+credentials:
+  - name: access_key_id
+    description: AWS access key ID (gateway-minted via STS)
+    env_vars: [AWS_ACCESS_KEY_ID]
+    required: true
+    refresh:
+      strategy: aws_sts_assume_role
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      material:
+        - name: role_arn
+          description: ARN of the IAM role to assume
+          required: true
+          secret: false
+        - name: session_name
+          description: Session name for CloudTrail attribution
+          required: false
+          secret: false
+        - name: external_id
+          description: External ID for cross-account role assumption
+          required: false
+          secret: false
+        - name: aws_region
+          description: AWS region for STS endpoint
+          required: false
+          secret: false
+        - name: aws_access_key_id
+          description: Long-lived IAM access key (only needed if gateway lacks ambient AWS credentials)
+          required: false
+          secret: false
+        - name: aws_secret_access_key
+          description: Long-lived IAM secret key (only needed if gateway lacks ambient AWS credentials)
+          required: false
+          secret: true
+  - name: secret_access_key
+    description: AWS secret access key (co-managed with access_key_id)
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+  - name: session_token
+    description: AWS session token (co-managed with access_key_id)
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true
+endpoints:
+  # S3 regional endpoints. `*` matches exactly one DNS label, so the region
+  # wildcard does not cover extra labels like dualstack unless listed.
+  # us-east-1 uses the global endpoint without a region label.
+  - host: "*.s3.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4
+    signing_service: s3
+    signing_region: us-east-1
+  - host: "s3.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4
+    signing_service: s3
+    signing_region: us-east-1
+  - host: "*.s3.*.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4
+    signing_service: s3
+  - host: "s3.*.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4
+    signing_service: s3
+  - host: "*.s3.dualstack.*.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4
+    signing_service: s3
+  - host: "s3.dualstack.*.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4
+    signing_service: s3
+binaries:
+  - /sandbox/.venv/bin/python
+  - /sandbox/.venv/bin/python3
+  - /sandbox/.uv/python/**
+  - /usr/bin/python3
+  - /usr/bin/python3.*
+  - /usr/bin/curl
+  - /usr/local/bin/aws
+  - /bin/bash
