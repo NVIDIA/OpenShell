@@ -22,6 +22,7 @@ pub mod gpu;
 pub mod grpc_client;
 pub mod image;
 pub mod inference;
+pub mod jwt;
 pub mod metadata;
 pub mod net;
 pub mod paths;

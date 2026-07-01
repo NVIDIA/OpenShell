@@ -3843,6 +3843,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-sdk"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "miette",
+ "oauth2",
+ "openshell-core",
+ "reqwest 0.12.28",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-tungstenite 0.26.2",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
+]
+
+[[package]]
 name = "openshell-server"
 version = "0.0.0"
 dependencies = [

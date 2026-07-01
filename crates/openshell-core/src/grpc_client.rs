@@ -439,16 +439,7 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
 /// Returns the expiry in milliseconds since the Unix epoch, or `None` if
 /// the token is not a parseable JWT.
 fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
-    use base64::Engine;
-    let mut parts = jwt.splitn(3, '.');
-    let _header = parts.next()?;
-    let payload_b64 = parts.next()?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    let exp_secs = value.get("exp")?.as_i64()?;
-    exp_secs.checked_mul(1000)
+    crate::jwt::parse_exp_secs(jwt)?.checked_mul(1000)
 }
 
 #[cfg(test)]
