@@ -125,6 +125,9 @@ jobs:
       - name: Verify telemetry can be compiled out
         run: mise run rust:verify:telemetry-off
 
+      - name: Verify system-ca-roots feature compiles and excludes bundled Mozilla roots
+        run: mise run rust:verify:system-ca-roots
+
       - name: sccache stats
         if: always()
         run: |

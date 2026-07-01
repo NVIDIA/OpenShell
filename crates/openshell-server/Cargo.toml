@@ -108,7 +108,7 @@ bundled-z3 = ["openshell-prover/bundled-z3"]
 test-support = []
 
 [dev-dependencies]
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring", "webpki-tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring"] }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"

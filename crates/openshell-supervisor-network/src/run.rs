@@ -209,7 +209,7 @@ pub async fn run_networking(
                         // path injected by enrich_*_baseline_paths(), so no
                         // explicit Landlock entry is needed here.
 
-                        let upstream_config = build_upstream_client_config(&system_ca_bundle);
+                        let upstream_config = build_upstream_client_config(&system_ca_bundle)?;
                         let cert_cache = CertCache::new(ca);
                         let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
                         ocsf_emit!(
