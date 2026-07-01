@@ -33,18 +33,48 @@ struct FileFingerprint {
 
 impl FileFingerprint {
     fn from_metadata(metadata: &Metadata) -> Self {
+        #[cfg(unix)]
+        let (mtime_sec, mtime_nsec, ctime_sec, ctime_nsec) = (
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        );
+        #[cfg(not(unix))]
+        let (mtime_sec, mtime_nsec, ctime_sec, ctime_nsec) = {
+            let (mtime_sec, mtime_nsec) = metadata
+                .modified()
+                .ok()
+                .and_then(system_time_parts)
+                .unwrap_or_default();
+            let (ctime_sec, ctime_nsec) = metadata
+                .created()
+                .ok()
+                .and_then(system_time_parts)
+                .unwrap_or_default();
+            (mtime_sec, mtime_nsec, ctime_sec, ctime_nsec)
+        };
         Self {
             len: metadata.len(),
-            mtime_sec: metadata.mtime(),
-            mtime_nsec: metadata.mtime_nsec(),
-            ctime_sec: metadata.ctime(),
-            ctime_nsec: metadata.ctime_nsec(),
+            mtime_sec,
+            mtime_nsec,
+            ctime_sec,
+            ctime_nsec,
             #[cfg(unix)]
             dev: metadata.dev(),
             #[cfg(unix)]
             ino: metadata.ino(),
         }
     }
+}
+
+#[cfg(not(unix))]
+fn system_time_parts(time: std::time::SystemTime) -> Option<(i64, i64)> {
+    let duration = time.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some((
+        duration.as_secs() as i64,
+        i64::from(duration.subsec_nanos()),
+    ))
 }
 
 impl PartialEq for FileFingerprint {

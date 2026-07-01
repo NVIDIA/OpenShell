@@ -4174,6 +4174,7 @@ dependencies = [
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-supervisor-network",
  "serde",
  "serde_json",
  "tempfile",
@@ -5790,6 +5791,7 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "serde_yaml",
  "spin",
  "thiserror 2.0.18",
 ]
