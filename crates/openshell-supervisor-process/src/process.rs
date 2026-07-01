@@ -27,6 +27,8 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use tokio::process::{Child, Command};
 use tracing::debug;
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::SANDBOX_TOKEN,
@@ -189,10 +191,82 @@ fn validate_capability_bounding_set_clear(
                 "Failed to clear unknown child capability bounding set entries: {unknown_err}"
             )),
         },
+        Err(err) if err.code() == libc::EPERM => {
+            warn!(
+                ?remaining,
+                "CAP_SETPCAP is unavailable and the child capability bounding set is non-empty; \
+                 the child process relies on seccomp for confinement"
+            );
+            Ok(())
+        }
         Err(err) => Err(miette::miette!(
             "Failed to clear child capability bounding set: {err}"
         )),
     }
+}
+
+/// Probe capability bounding-set availability and emit an OCSF
+/// `DetectionFinding` from the parent process when `bounding::clear()`
+/// would fail and the bounding set is non-empty. Called once before
+/// `pre_exec`/`fork()` so the event reaches the tracing subscriber.
+///
+/// The probe tries a non-destructive `bounding::drop()` on a capability
+/// that is already absent from the bounding set. This triggers the same
+/// `prctl(PR_CAPBSET_DROP)` syscall that `bounding::clear()` uses, so
+/// `AppArmor` restrictions that block the syscall are detected even when
+/// `CAP_SETPCAP` is nominally present in the effective set.
+#[cfg(target_os = "linux")]
+fn log_capability_bounding_set_readiness() {
+    use std::sync::Once;
+    static PROBED: Once = Once::new();
+    let mut already_probed = true;
+    PROBED.call_once(|| already_probed = false);
+    if already_probed {
+        return;
+    }
+
+    let bounding = capctl::caps::bounding::probe();
+    if bounding.is_empty() {
+        return;
+    }
+
+    // Find a capability NOT in the bounding set so that drop() is a no-op
+    // when the syscall is permitted.  If every known capability is raised
+    // (unusual), skip the probe — clear() will be attempted in the child
+    // and the warn!() path handles failure there.
+    let probe_cap = capctl::caps::Cap::iter().find(|cap| !bounding.has(*cap));
+    let clear_blocked = probe_cap.is_some_and(|cap| {
+        capctl::caps::bounding::drop(cap).is_err_and(|e| e.code() == libc::EPERM)
+    });
+
+    if !clear_blocked {
+        return;
+    }
+
+    openshell_ocsf::ocsf_emit!(
+        openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(openshell_ocsf::ActivityId::Open)
+            .severity(openshell_ocsf::SeverityId::High)
+            .confidence(openshell_ocsf::ConfidenceId::High)
+            .is_alert(true)
+            .finding_info(
+                openshell_ocsf::FindingInfo::new(
+                    "bounding-set-clear-blocked",
+                    "Capability Bounding Set Clear Blocked",
+                )
+                .with_desc(
+                    "The supervisor cannot clear the child capability bounding set \
+                     because PR_CAPBSET_DROP returns EPERM. \
+                     The child process will rely on seccomp for confinement. \
+                     This is expected in rootless container runtimes with \
+                     AppArmor user-namespace restrictions.",
+                ),
+            )
+            .message(format!(
+                "PR_CAPBSET_DROP blocked, capability bounding set non-empty: {bounding:?}"
+            ))
+            .build()
+    );
 }
 
 // Pins the pre-seccomp child mount namespace where supervisor identity sockets
@@ -548,11 +622,14 @@ impl ProcessHandle {
             }
         }
 
-        // Probe Landlock availability and emit OCSF logs from the parent
-        // process where the tracing subscriber is functional. The child's
-        // pre_exec context cannot reliably emit structured logs.
+        // Probe Landlock and capability bounding-set availability and emit
+        // OCSF logs from the parent process where the tracing subscriber is
+        // functional. The child's pre_exec context cannot reliably emit
+        // structured logs.
         #[cfg(target_os = "linux")]
         sandbox::linux::log_sandbox_readiness(policy, workdir);
+        #[cfg(target_os = "linux")]
+        log_capability_bounding_set_readiness();
 
         // Phase 1 (as root): Prepare Landlock ruleset by opening PathFds.
         // This MUST happen before drop_privileges() so that root-only paths
@@ -1150,22 +1227,17 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn capability_bounding_set_clear_rejects_nonempty_eperm() {
+    fn capability_bounding_set_clear_tolerates_nonempty_eperm() {
         let mut remaining = capctl::caps::CapSet::empty();
         remaining.add(capctl::caps::Cap::CHOWN);
 
-        let result = validate_capability_bounding_set_clear(
-            Err(capctl::Error::from_code(libc::EPERM)),
-            remaining,
-            || panic!("unknown capabilities should not be checked when known caps remain"),
-        );
-
-        assert!(result.is_err());
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to clear child capability bounding set")
+            validate_capability_bounding_set_clear(
+                Err(capctl::Error::from_code(libc::EPERM)),
+                remaining,
+                || panic!("unknown capabilities should not be checked when known caps remain"),
+            )
+            .is_ok()
         );
     }
 
@@ -1270,21 +1342,7 @@ mod tests {
 
         let result = drop_privileges(&policy);
 
-        #[cfg(target_os = "linux")]
-        {
-            if capability_bounding_set_clear_available() {
-                assert!(result.is_ok(), "drop_privileges failed: {result:?}");
-            } else {
-                let msg = format!("{}", result.unwrap_err());
-                assert!(
-                    msg.contains("Failed to clear child capability bounding set"),
-                    "unexpected failure: {msg}"
-                );
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "drop_privileges failed: {result:?}");
     }
 
     #[test]
