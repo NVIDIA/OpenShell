@@ -92,6 +92,15 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"sidecar"'
 
+  - it: renders proxy-pod supervisor topology under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.topology: proxy-pod
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"proxy-pod"'
+
   - it: renders process enforcement under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:

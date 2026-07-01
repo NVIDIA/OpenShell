@@ -54,6 +54,38 @@ pub struct Networking {
     pub policy_local_ctx: Arc<PolicyLocalContext>,
 }
 
+fn sandbox_ca_for_proxy() -> Result<SandboxCa> {
+    let cert_path = std::env::var(openshell_core::sandbox_env::PROXY_CA_CERT_PATH).ok();
+    let key_path = std::env::var(openshell_core::sandbox_env::PROXY_CA_KEY_PATH).ok();
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => SandboxCa::from_files(
+            std::path::Path::new(&cert_path),
+            std::path::Path::new(&key_path),
+        ),
+        (None, None) => SandboxCa::generate(),
+        _ => Err(miette::miette!(
+            "{} and {} must be set together",
+            openshell_core::sandbox_env::PROXY_CA_CERT_PATH,
+            openshell_core::sandbox_env::PROXY_CA_KEY_PATH
+        )),
+    }
+}
+
+fn explicit_proxy_bind_addr() -> Result<Option<SocketAddr>> {
+    let Some(value) = std::env::var(openshell_core::sandbox_env::PROXY_BIND_ADDR)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    value.parse::<SocketAddr>().map(Some).map_err(|err| {
+        miette::miette!(
+            "invalid {} value {value:?}: {err}",
+            openshell_core::sandbox_env::PROXY_BIND_ADDR
+        )
+    })
+}
+
 /// Set up the networking stack: ephemeral CA + TLS state, proxy server,
 /// and the SSH-side proxy URL / netns FD.
 ///
@@ -196,10 +228,10 @@ pub async fn run_networking(
     // the proxy, so it's owned here.
     let identity_cache = opa_engine.map(|_| Arc::new(BinaryIdentityCache::new()));
 
-    // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
-    // The CA cert is written to disk so sandbox processes can trust it.
+    // Generate or load a CA and TLS state for HTTPS L7 inspection. The CA cert
+    // is written to disk so sandbox processes can trust it.
     let (tls_state, ca_file_paths) = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        match SandboxCa::generate() {
+        match sandbox_ca_for_proxy() {
             Ok(ca) => {
                 let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
                     .unwrap_or_else(|_| "/etc/openshell-tls".to_string());
@@ -219,7 +251,7 @@ pub async fn run_networking(
                                 .severity(SeverityId::Informational)
                                 .status(StatusId::Success)
                                 .state(StateId::Enabled, "enabled")
-                                .message("TLS termination enabled: ephemeral CA generated")
+                                .message("TLS termination enabled")
                                 .build()
                         );
                         (Some(state), Some(paths))
@@ -246,7 +278,7 @@ pub async fn run_networking(
                         .status(StatusId::Failure)
                         .state(StateId::Disabled, "disabled")
                         .message(format!(
-                            "Failed to generate ephemeral CA, TLS termination disabled: {e}"
+                            "Failed to initialize proxy CA, TLS termination disabled: {e}"
                         ))
                         .build()
                 );
@@ -275,9 +307,11 @@ pub async fn run_networking(
         // originating inside the namespace can reach the proxy. Otherwise the
         // proxy falls back to the policy-declared http_addr (loopback in
         // tests, etc.).
-        let bind_addr = proxy_bind_ip.map(|ip| {
-            let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
-            SocketAddr::new(ip, port)
+        let bind_addr = explicit_proxy_bind_addr()?.or_else(|| {
+            proxy_bind_ip.map(|ip| {
+                let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
+                SocketAddr::new(ip, port)
+            })
         });
 
         // Build inference context for local routing of intercepted inference calls.

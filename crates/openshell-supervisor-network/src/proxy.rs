@@ -1470,25 +1470,25 @@ fn resolve_owner_identity(
 }
 
 #[cfg(target_os = "linux")]
-fn collect_ancestor_identities(pid: u32, stop_pid: u32) -> Vec<(u32, PathBuf)> {
+fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathBuf)> {
     const MAX_DEPTH: usize = 64;
     let mut ancestors = Vec::new();
-    let mut current = pid;
+    let mut current = start_pid;
 
     for _ in 0..MAX_DEPTH {
-        let ppid = match crate::procfs::read_ppid(current) {
-            Some(p) if p > 0 && p != current => p,
+        let parent_pid = match crate::procfs::read_ppid(current) {
+            Some(parent) if parent > 0 && parent != current => parent,
             _ => break,
         };
 
-        if let Ok(path) = crate::procfs::binary_path(ppid.cast_signed()) {
-            ancestors.push((ppid, path));
+        if let Ok(path) = crate::procfs::binary_path(parent_pid.cast_signed()) {
+            ancestors.push((parent_pid, path));
         }
 
-        if ppid == stop_pid || ppid == 1 {
+        if parent_pid == stop_pid || parent_pid == 1 {
             break;
         }
-        current = ppid;
+        current = parent_pid;
     }
 
     ancestors
@@ -7985,8 +7985,10 @@ network_policies:
     /// was now bound to a *different* binary on disk than the one that was
     /// TOFU-cached. After the strip, `binary_path()` returns a path that
     /// stats fine, the cache rehashes the new bytes, and the hash mismatch
-    /// surfaces as a `Binary integrity violation` error — the contract this
-    /// PR is trying to establish.
+    /// either surfaces as a `Binary integrity violation` error or continues
+    /// verifying the original process image through `/proc/<pid>/exe`. The
+    /// stable contract is that the old `"Failed to stat ... (deleted)"`
+    /// failure mode does not leak out of identity resolution.
     ///
     /// Test shape (from the review comment on the initial PR):
     /// 1. Start a `TcpListener` in the test process.
@@ -8002,14 +8004,14 @@ network_policies:
     ///    executes from its in-memory image), but `/proc/<child>/exe` will
     ///    now readlink to `" (deleted)"` OR the overwritten file, depending
     ///    on whether the filesystem reused the inode.
-    /// 7. Call `resolve_process_identity` and assert:
-    ///    - the error reason contains `"Binary integrity violation"` (the
-    ///      cache detected the tampered on-disk bytes), and
-    ///    - the error reason does NOT contain `"Failed to stat"` or
-    ///      `"(deleted)"` (the old pre-strip failure mode).
+    /// 7. Call `resolve_process_identity` and assert the old pre-strip
+    ///    failure mode does not return `"Failed to stat"` or a `"(deleted)"`
+    ///    path. Depending on kernel/filesystem behavior, the process image
+    ///    may still verify against the deleted executable inode, or the
+    ///    replacement bytes may surface as a binary-integrity violation.
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_process_identity_surfaces_binary_integrity_violation_on_hot_swap() {
+    fn resolve_process_identity_handles_hot_swap_without_deleted_path_leak() {
         use crate::identity::BinaryIdentityCache;
         use std::io::Read;
         use std::net::TcpListener;
@@ -8041,9 +8043,10 @@ network_policies:
         assert!(!v1_hash.is_empty());
 
         // 4. Spawn the temp bash with a /dev/tcp one-liner that opens a real
-        //    connection to the listener and sleeps to keep it open. The
-        //    `read -t` blocks on stdin so the shell stays resident.
-        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; sleep 30 <&3");
+        //    connection to the listener. The `read -t` built-in blocks on
+        //    FD 3 so the shell stays resident without forking an external
+        //    process that would inherit the socket.
+        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; read -r -t 30 _ <&3");
         let mut child = Command::new(&bash_v1)
             .arg("-c")
             .arg(&script)
@@ -8086,9 +8089,8 @@ network_policies:
         let tampered_bytes = b"#!/bin/sh\n# tampered bash v2 from hotswap test\nexit 0\n";
         std::fs::write(&bash_v1, tampered_bytes).expect("write replacement bytes");
 
-        // 7. Resolve identity through the real helper and assert the
-        //    contract: we want "Binary integrity violation", not
-        //    "Failed to stat ... (deleted)".
+        // 7. Resolve identity through the real helper and assert the stable
+        //    contract: never return "Failed to stat ... (deleted)".
         let test_pid = std::process::id();
         let result = resolve_process_identity(test_pid, peer_port, &cache);
 
@@ -8098,10 +8100,17 @@ network_policies:
         let _ = child.wait();
 
         match result {
-            Ok(_) => panic!(
-                "resolve_process_identity unexpectedly succeeded after hot-swap; \
-                 the cache should have detected the tampered on-disk bytes"
-            ),
+            Ok(identity) => {
+                assert_eq!(
+                    identity.bin_hash, v1_hash,
+                    "successful hot-swap resolution should still verify the original process image"
+                );
+                assert!(
+                    !identity.bin_path.to_string_lossy().contains("(deleted)"),
+                    "resolved binary path still tainted: {}",
+                    identity.bin_path.display()
+                );
+            }
             Err(err) => {
                 assert!(
                     err.reason.contains("Binary integrity violation"),
