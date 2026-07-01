@@ -878,3 +878,58 @@ async fn unauthenticated_without_refresher_surfaces_error() {
         "exactly one attempt; no retry without a refresher"
     );
 }
+
+/// Regression (P1): raw RPCs do not drive refresh. A call through the plain
+/// `raw_grpc()` accessor keeps sending the seeded token, while
+/// `raw_grpc_fresh()` proactively refreshes a near-expiry token into the
+/// shared slot so the subsequent raw call is accepted.
+#[tokio::test]
+async fn raw_grpc_fresh_refreshes_before_raw_call() {
+    let state = Arc::new(MockState {
+        require_bearer: Some("Bearer fresh-token".to_string()),
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+
+    let calls = Arc::new(AtomicU32::new(0));
+    let refresher = Arc::new(OneShotRefresher {
+        calls: Arc::clone(&calls),
+    });
+
+    // Near-expiry token so the proactive path will refresh it.
+    let near = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 5;
+    let mut config = ClientConfig::new(&endpoint);
+    config.auth = Some(AuthConfig::Oidc {
+        token: "stale-token".to_string(),
+        expires_at: Some(near),
+        refresh: Some(refresher),
+    });
+    let client = OpenShellClient::connect(config).await.unwrap();
+
+    // Plain raw accessor does not refresh: the seeded token is rejected.
+    let err = client
+        .raw_grpc()
+        .health(proto::HealthRequest {})
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "raw_grpc must not trigger a refresh"
+    );
+
+    // _fresh accessor refreshes the near-expiry token first; the raw call is
+    // then accepted with the fresh bearer.
+    let mut grpc = client.raw_grpc_fresh().await.unwrap();
+    grpc.health(proto::HealthRequest {}).await.unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "raw_grpc_fresh must refresh the near-expiry token exactly once"
+    );
+}

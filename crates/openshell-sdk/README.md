@@ -15,6 +15,13 @@ Designed in [RFC 0008](../../rfc/0008-shared-sdk-core-and-ts-binding/README.md).
   surface doesn't yet cover (inference, providers, policy, logs, settings, SSH,
   forwarding).
 
+The curated surface drives OIDC refresh automatically (proactively before a
+request and reactively on `Unauthenticated`). The plain `raw_grpc`/
+`raw_inference` accessors do not: they return a client bound to the current
+token. When a refresher is wired, use `raw_grpc_fresh`/`raw_inference_fresh`
+for a proactive refresh before the call, and `force_refresh` to recover after
+a raw RPC returns `Unauthenticated`.
+
 ## Responsibilities
 
 - Construct the gRPC channel and select the transport (plaintext vs TLS).

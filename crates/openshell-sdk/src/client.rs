@@ -83,6 +83,15 @@ impl OpenShellClient {
     ///
     /// Use this when the curated surface below doesn't expose the RPC or
     /// field you need.
+    ///
+    /// This does **not** drive OIDC refresh: it returns a client bound to
+    /// the interceptor's current bearer slot without checking expiry or
+    /// retrying on `Unauthenticated`. A client that only ever issues raw
+    /// RPCs keeps sending the initial token until it expires. When a
+    /// refresher is wired, prefer [`OpenShellClient::raw_grpc_fresh`] (or
+    /// interleave a curated call) so rotation reaches the shared slot, and
+    /// call [`OpenShellClient::force_refresh`] to recover on a rejected
+    /// token.
     pub fn raw_grpc(&self) -> AuthedGrpcClient {
         proto::open_shell_client::OpenShellClient::with_interceptor(
             self.channel.clone(),
@@ -90,12 +99,43 @@ impl OpenShellClient {
         )
     }
 
+    /// Like [`OpenShellClient::raw_grpc`], but proactively refreshes the
+    /// bearer token first when a refresher is wired and the token is within
+    /// the refresh skew of expiry. The returned client reads the same live
+    /// slot, so the refreshed token applies to every RPC issued through it.
+    ///
+    /// Reactive retry on `Unauthenticated` remains the caller's
+    /// responsibility for raw RPCs: on a rejected token, call
+    /// [`OpenShellClient::force_refresh`] and reissue.
+    pub async fn raw_grpc_fresh(&self) -> Result<AuthedGrpcClient> {
+        self.ensure_fresh().await?;
+        Ok(self.raw_grpc())
+    }
+
     /// Authenticated gRPC client for the inference service.
+    ///
+    /// Like [`OpenShellClient::raw_grpc`], this does not drive OIDC refresh;
+    /// use [`OpenShellClient::raw_inference_fresh`] when a refresher is wired.
     pub fn raw_inference(&self) -> AuthedInferenceClient {
         proto::inference_client::InferenceClient::with_interceptor(
             self.channel.clone(),
             self.interceptor.clone(),
         )
+    }
+
+    /// Like [`OpenShellClient::raw_inference`], but proactively refreshes the
+    /// bearer token first (see [`OpenShellClient::raw_grpc_fresh`]).
+    pub async fn raw_inference_fresh(&self) -> Result<AuthedInferenceClient> {
+        self.ensure_fresh().await?;
+        Ok(self.raw_inference())
+    }
+
+    /// Force an OIDC refresh and write the new token into the live bearer
+    /// slot, regardless of expiry. Returns `true` when a refresher is wired
+    /// and a fresh token was minted, `false` for static auth. Use after a
+    /// raw RPC returns `Unauthenticated` to recover before reissuing it.
+    pub async fn force_refresh(&self) -> Result<bool> {
+        self.refresh_on_unauthorized().await
     }
 
     /// Gateway health snapshot.
@@ -451,7 +491,110 @@ fn map_status(status: tonic::Status) -> SdkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::refresh::{Refresh, RefreshError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, RwLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tonic::transport::Channel;
+
+    struct StubRefresher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Refresh for StubRefresher {
+        async fn refresh(&self) -> std::result::Result<RefreshedToken, RefreshError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(RefreshedToken::new(format!("token-{n}")).with_expires_at(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600,
+            ))
+        }
+    }
+
+    /// Build an OIDC client wired to a refresher, with a near-expiry initial
+    /// token, over a lazy channel that never actually connects (no RPC is
+    /// issued in these tests).
+    fn oidc_client_with_refresher(calls: Arc<AtomicUsize>) -> OpenShellClient {
+        let interceptor = EdgeAuthInterceptor::new(Some("initial"), None).unwrap();
+        let bearer_slot = interceptor.bearer_slot();
+        let near = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 5;
+        let source = TokenSource::new(
+            RefreshedToken::new("initial").with_expires_at(near),
+            Arc::new(StubRefresher { calls }),
+        );
+        let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        OpenShellClient {
+            channel,
+            interceptor,
+            token_source: Some(source),
+            bearer_slot,
+        }
+    }
+
+    fn slot_token(slot: &BearerSlot) -> String {
+        slot.read()
+            .unwrap()
+            .clone()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn raw_grpc_does_not_refresh() {
+        // Regression (P1): the plain raw accessor must not be relied on for
+        // rotation — it hands back a client bound to the current token.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = oidc_client_with_refresher(Arc::clone(&calls));
+        let _raw = client.raw_grpc();
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "raw_grpc must not refresh");
+        assert_eq!(
+            slot_token(client.bearer_slot.as_ref().unwrap()),
+            "Bearer initial"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_grpc_fresh_refreshes_near_expiry() {
+        // Regression (P1): the _fresh accessor proactively rotates a
+        // near-expiry token into the shared slot before returning a client.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = oidc_client_with_refresher(Arc::clone(&calls));
+        let _raw = client.raw_grpc_fresh().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "raw_grpc_fresh must refresh a near-expiry token"
+        );
+        assert_eq!(
+            slot_token(client.bearer_slot.as_ref().unwrap()),
+            "Bearer token-1",
+            "refreshed token must reach the live slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_refresh_rotates_and_reports_wired() {
+        // Regression (P1): reactive recovery path for raw callers.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = oidc_client_with_refresher(Arc::clone(&calls));
+        let refreshed = client.force_refresh().await.unwrap();
+        assert!(refreshed, "force_refresh reports a wired refresher");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            slot_token(client.bearer_slot.as_ref().unwrap()),
+            "Bearer token-1"
+        );
+    }
 
     #[test]
     fn store_bearer_rejects_malformed_token_and_keeps_previous() {

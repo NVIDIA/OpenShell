@@ -177,15 +177,6 @@ impl TokenSource {
         }
     }
 
-    /// Current token without checking expiry. Used by the sync gRPC
-    /// interceptor, which can't await.
-    pub fn snapshot(&self) -> String {
-        self.state
-            .try_read()
-            .map(|s| s.token.clone())
-            .unwrap_or_default()
-    }
-
     /// Async-fetch the current token, refreshing if it's within `skew` of
     /// expiry. Single-flight: concurrent callers share one refresh.
     ///
@@ -246,14 +237,25 @@ impl TokenSource {
                 let state = Arc::clone(&self.state);
                 let flight_slot = Arc::clone(&self.flight);
                 let epoch = flight.epoch.wrapping_add(1);
+                // Generation this attempt refreshes *from*. If it advances
+                // while the refresh is in flight, an external `replace()`
+                // installed a newer token and this result must not clobber it.
+                let start_generation = expected_generation;
                 let future: RefreshFuture = async move {
                     let outcome = match refresher.refresh().await {
                         Ok(token) => {
                             let mut state = state.write().await;
-                            state.token.clone_from(&token.access_token);
-                            state.expires_at = token.expires_at;
-                            state.generation = state.generation.wrapping_add(1);
-                            Ok(token.access_token)
+                            if state.generation == start_generation {
+                                state.token.clone_from(&token.access_token);
+                                state.expires_at = token.expires_at;
+                                state.generation = state.generation.wrapping_add(1);
+                                Ok(token.access_token)
+                            } else {
+                                // A concurrent `replace()` (or newer token)
+                                // landed mid-flight; honor it rather than
+                                // regressing to this now-stale result.
+                                Ok(state.token.clone())
+                            }
                         }
                         Err(err) => Err(SdkError::from(err).to_string()),
                     };
@@ -373,6 +375,12 @@ mod tests {
     /// Drive one leader into the refresher, then queue `followers` more
     /// callers that must join the in-flight attempt rather than start their
     /// own. Returns the refresher call count and per-caller outcomes.
+    /// Read the committed token straight from state, bypassing any refresh
+    /// logic. Test-only inspection helper.
+    async fn state_token(source: &TokenSource) -> String {
+        source.state.read().await.token.clone()
+    }
+
     async fn run_coalesced(fail: bool) -> (usize, Vec<Result<String>>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -551,7 +559,64 @@ mod tests {
         let token = source.refresh_now().await.unwrap();
         assert_eq!(token, "token-1", "forced refresh must mint a new token");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(source.snapshot(), "token-1", "slot must observe new token");
+        assert_eq!(
+            state_token(&source).await,
+            "token-1",
+            "state must observe new token"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_refresh_preserves_external_replace() {
+        // Regression (P2b): a `replace()` that lands while a refresh is in
+        // flight must survive. The in-flight refresh started from an older
+        // generation, so its result is discarded in favor of the externally
+        // installed token instead of clobbering it.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let refresher = Arc::new(GatedRefresher {
+            calls: Arc::clone(&calls),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            fail: false,
+        });
+        let source = TokenSource::new(RefreshedToken::new("initial").with_expires_at(0), refresher);
+
+        // Leader starts a refresh and blocks inside refresher.refresh().
+        let leader = {
+            let src = source.clone();
+            tokio::spawn(async move { src.refresh_now().await })
+        };
+        entered.notified().await;
+
+        // External rotation installs an authoritative token mid-flight.
+        source
+            .replace(
+                RefreshedToken::new("external-rotation").with_expires_at(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        + 3600,
+                ),
+            )
+            .await;
+
+        // Release the in-flight refresh; it must yield to the replacement.
+        release.notify_waiters();
+        let leader_token = leader.await.unwrap().unwrap();
+
+        assert_eq!(
+            leader_token, "external-rotation",
+            "leader must observe the external replacement, not its own result"
+        );
+        assert_eq!(
+            state_token(&source).await,
+            "external-rotation",
+            "replace() must survive the in-flight refresh"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
