@@ -10,7 +10,6 @@
 //! - Build version metadata
 
 pub mod activity;
-pub mod auth;
 pub mod config;
 pub mod denial;
 pub mod driver_mounts;

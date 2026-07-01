@@ -9,9 +9,9 @@ use openshell_bootstrap::edge_token::load_edge_token;
 use openshell_bootstrap::oidc_token::{is_token_expired, load_oidc_token, store_oidc_token};
 use openshell_bootstrap::{list_gateways, load_active_gateway, load_gateway_metadata};
 use openshell_core::ObjectName;
-use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{ListProvidersRequest, ListSandboxesRequest};
+use openshell_sdk::EdgeAuthInterceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
