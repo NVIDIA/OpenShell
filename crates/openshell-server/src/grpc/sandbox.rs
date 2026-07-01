@@ -128,11 +128,9 @@ async fn handle_create_sandbox_inner(
     // Validate field sizes before any I/O (fail fast on oversized payloads).
     validate_sandbox_spec(&request.name, &spec)?;
 
-    // Validate labels (keys and values must meet Kubernetes requirements).
-    for (key, value) in &request.labels {
-        crate::grpc::validation::validate_label_key(key)?;
-        crate::grpc::validation::validate_label_value(value)?;
-    }
+    // Validate labels (count, keys, and values). Bounding the count here keeps
+    // the merge onto `template.labels` below within the template map limit.
+    crate::grpc::validation::validate_labels(&request.labels)?;
 
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
@@ -156,6 +154,14 @@ async fn handle_create_sandbox_inner(
     let template = spec.template.get_or_insert_with(SandboxTemplate::default);
     if template.image.is_empty() {
         template.image = state.compute.default_image().to_string();
+    }
+
+    // Propagate request labels onto the template
+    for (key, value) in &request.labels {
+        template
+            .labels
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
     }
 
     // Ensure process identity defaults to "sandbox" when missing or
@@ -2724,6 +2730,108 @@ mod tests {
         assert_eq!(
             response.sandbox.unwrap().spec.unwrap().providers,
             vec!["work-github".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_propagates_labels_to_pod_template() {
+        let state = test_server_state().await;
+
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "labeled".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
+                labels: std::iter::once(("team".to_string(), "platform".to_string())).collect(),
+            }),
+        )
+        .await
+        .expect("create should succeed")
+        .into_inner();
+
+        let sandbox = response.sandbox.unwrap();
+        // Stored as sandbox metadata (used for CLI filtering).
+        assert_eq!(
+            sandbox
+                .metadata
+                .as_ref()
+                .unwrap()
+                .labels
+                .get("team")
+                .map(String::as_str),
+            Some("platform"),
+        );
+        // Propagated to the template so the driver applies it to the pod.
+        assert_eq!(
+            sandbox
+                .spec
+                .unwrap()
+                .template
+                .unwrap()
+                .labels
+                .get("team")
+                .map(String::as_str),
+            Some("platform"),
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_reserved_label_namespace() {
+        let state = test_server_state().await;
+
+        let status = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "reserved-label".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
+                labels: std::iter::once((
+                    "openshell.ai/sandbox-id".to_string(),
+                    "spoofed".to_string(),
+                ))
+                .collect(),
+            }),
+        )
+        .await
+        .expect_err("reserved label namespace should be rejected");
+
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_template_labels_take_precedence_over_request_labels() {
+        let state = test_server_state().await;
+
+        let template = SandboxTemplate {
+            labels: std::iter::once(("team".to_string(), "explicit".to_string())).collect(),
+            ..Default::default()
+        };
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "labeled-precedence".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    template: Some(template),
+                    ..Default::default()
+                }),
+                labels: std::iter::once(("team".to_string(), "platform".to_string())).collect(),
+            }),
+        )
+        .await
+        .expect("create should succeed")
+        .into_inner();
+
+        assert_eq!(
+            response
+                .sandbox
+                .unwrap()
+                .spec
+                .unwrap()
+                .template
+                .unwrap()
+                .labels
+                .get("team")
+                .map(String::as_str),
+            Some("explicit"),
         );
     }
 
