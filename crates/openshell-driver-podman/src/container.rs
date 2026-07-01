@@ -5,6 +5,7 @@
 
 use crate::config::PodmanComputeConfig;
 use openshell_core::ComputeDriverError;
+use openshell_core::driver_mounts::SelinuxLabel;
 #[cfg(test)]
 use openshell_core::gpu::{driver_gpu_requirements, validate_specific_gpu_device_request};
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
@@ -105,6 +106,8 @@ enum PodmanDriverMountConfig {
         target: String,
         #[serde(default = "default_true")]
         read_only: bool,
+        #[serde(default)]
+        selinux_label: Option<SelinuxLabel>,
     },
     Volume {
         source: String,
@@ -540,17 +543,24 @@ fn podman_user_mounts(
                 source,
                 target,
                 read_only,
+                selinux_label,
             } => {
+                let mut options = vec![
+                    if read_only { "ro" } else { "rw" }.to_string(),
+                    "rbind".to_string(),
+                ];
+                match selinux_label {
+                    Some(SelinuxLabel::Shared) => options.push("z".to_string()),
+                    Some(SelinuxLabel::Private) => options.push("Z".to_string()),
+                    None => {}
+                }
                 driver_mounts::validate_absolute_mount_source(&source, "bind source")?;
                 driver_mounts::validate_container_mount_target(&target)?;
                 result.mounts.push(Mount {
                     kind: "bind".into(),
                     source,
-                    destination: target,
-                    options: vec![
-                        if read_only { "ro" } else { "rw" }.to_string(),
-                        "rbind".to_string(),
-                    ],
+                    destination: driver_mounts::normalize_mount_target(&target),
+                    options,
                 });
             }
             PodmanDriverMountConfig::Volume {
@@ -2095,6 +2105,84 @@ mod tests {
             err.to_string()
                 .contains("bind source must be an absolute host path")
         );
+    }
+
+    #[test]
+    fn container_spec_bind_mount_selinux_shared_label() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/data/shared",
+                        "target": "/sandbox/data",
+                        "read_only": true,
+                        "selinux_label": "shared"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let spec = build_container_spec(&sandbox, &config);
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+
+        assert!(mounts.iter().any(|mount| {
+            mount["type"].as_str() == Some("bind")
+                && mount["source"].as_str() == Some("/data/shared")
+                && mount["destination"].as_str() == Some("/sandbox/data")
+                && mount["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|o| o.as_str() == Some("ro"))
+                        && options.iter().any(|o| o.as_str() == Some("z"))
+                })
+        }));
+    }
+
+    #[test]
+    fn container_spec_bind_mount_selinux_private_label() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/data/exclusive",
+                        "target": "/sandbox/data",
+                        "read_only": false,
+                        "selinux_label": "private"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let spec = build_container_spec(&sandbox, &config);
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+
+        assert!(mounts.iter().any(|mount| {
+            mount["type"].as_str() == Some("bind")
+                && mount["source"].as_str() == Some("/data/exclusive")
+                && mount["destination"].as_str() == Some("/sandbox/data")
+                && mount["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|o| o.as_str() == Some("rw"))
+                        && options.iter().any(|o| o.as_str() == Some("Z"))
+                })
+        }));
     }
 
     #[test]

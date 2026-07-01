@@ -303,6 +303,8 @@ impl DockerSandboxDriverConfig {
     }
 }
 
+use openshell_core::driver_mounts::SelinuxLabel;
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum DockerDriverMountConfig {
@@ -311,6 +313,8 @@ enum DockerDriverMountConfig {
         target: String,
         #[serde(default = "default_true")]
         read_only: bool,
+        #[serde(default)]
+        selinux_label: Option<SelinuxLabel>,
     },
     Volume {
         source: String,
@@ -1761,23 +1765,76 @@ fn docker_driver_config(
     Ok(config)
 }
 
+/// Collect user-supplied bind mounts as string-format binds.
+///
+/// Bind mounts use the legacy `Binds` field (`-v` syntax) rather than the
+/// structured `Mount` API because the Docker Engine Mount object does not
+/// support `SELinux` relabelling (`:z` / `:Z`).  The string format does.
+fn docker_driver_bind_strings(config: &DockerSandboxDriverConfig) -> Result<Vec<String>, Status> {
+    config
+        .mounts
+        .iter()
+        .filter_map(|m| match m {
+            DockerDriverMountConfig::Bind {
+                source,
+                target,
+                read_only,
+                selinux_label,
+            } => Some(docker_bind_string(
+                source,
+                target,
+                *read_only,
+                *selinux_label,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn docker_bind_string(
+    source: &str,
+    target: &str,
+    read_only: bool,
+    selinux_label: Option<SelinuxLabel>,
+) -> Result<String, Status> {
+    driver_mounts::validate_absolute_mount_source(source, "bind source")
+        .map_err(Status::failed_precondition)?;
+    driver_mounts::validate_container_mount_target(target).map_err(Status::failed_precondition)?;
+    let normalized_target = driver_mounts::normalize_mount_target(target);
+
+    let mut opts = Vec::new();
+    if read_only {
+        opts.push("ro");
+    }
+    match selinux_label {
+        Some(SelinuxLabel::Shared) => opts.push("z"),
+        Some(SelinuxLabel::Private) => opts.push("Z"),
+        None => {}
+    }
+
+    if opts.is_empty() {
+        Ok(format!("{source}:{normalized_target}"))
+    } else {
+        Ok(format!("{source}:{normalized_target}:{}", opts.join(",")))
+    }
+}
+
+/// Collect user-supplied non-bind mounts as structured `Mount` objects.
 fn docker_driver_mounts(config: &DockerSandboxDriverConfig) -> Result<Vec<Mount>, Status> {
-    config.mounts.iter().map(docker_mount_from_config).collect()
+    config
+        .mounts
+        .iter()
+        .filter(|m| !matches!(m, DockerDriverMountConfig::Bind { .. }))
+        .map(docker_mount_from_config)
+        .collect()
 }
 
 fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, Status> {
     match config {
-        DockerDriverMountConfig::Bind {
-            source,
-            target,
-            read_only,
-        } => Ok(Mount {
-            typ: Some(MountTypeEnum::BIND),
-            source: Some(source.clone()),
-            target: Some(target.clone()),
-            read_only: Some(*read_only),
-            ..Default::default()
-        }),
+        DockerDriverMountConfig::Bind { .. } => {
+            // Bind mounts are handled via docker_driver_bind_strings.
+            unreachable!("bind mounts are filtered out before reaching docker_mount_from_config")
+        }
         DockerDriverMountConfig::Volume {
             source,
             target,
@@ -2261,6 +2318,7 @@ fn build_container_create_body_with_gpu_devices(
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
     let user_mounts = docker_driver_mounts(driver_config)?;
+    let user_bind_strings = docker_driver_bind_strings(driver_config)?;
     let device_requests = gpu_device_ids.map(|device_ids| {
         vec![DeviceRequest {
             driver: Some("cdi".to_string()),
@@ -2298,7 +2356,11 @@ fn build_container_create_body_with_gpu_devices(
             memory: resource_limits.memory_bytes,
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
             device_requests,
-            binds: Some(build_binds(sandbox, config)?),
+            binds: {
+                let mut binds = build_binds(sandbox, config)?;
+                binds.extend(user_bind_strings);
+                Some(binds)
+            },
             mounts: Some(user_mounts),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),

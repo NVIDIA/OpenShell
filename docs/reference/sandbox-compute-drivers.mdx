@@ -162,7 +162,7 @@ Docker mount schema:
 
 | Type | Fields |
 |---|---|
-| `bind` | `source`, `target`, optional `read_only` (`true` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
+| `bind` | `source`, `target`, optional `read_only` (`true` by default), optional `selinux_label` (`shared` for `:z` or `private` for `:Z`). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
 | `volume` | `source`, `target`, optional `read_only` (`true` by default), optional `subpath`. The named volume must already exist. Docker local-driver bind-backed volumes require `enable_bind_mounts = true`. |
 | `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
 
@@ -227,7 +227,7 @@ Podman mount schema:
 
 | Type | Fields |
 |---|---|
-| `bind` | `source`, `target`, optional `read_only` (`true` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
+| `bind` | `source`, `target`, optional `read_only` (`true` by default), optional `selinux_label` (`shared` for `:z` or `private` for `:Z`). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
 | `volume` | `source`, `target`, optional `read_only` (`true` by default). The named volume must already exist. Podman local-driver bind-backed volumes require `enable_bind_mounts = true`. |
 | `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
 | `image` | `source`, `target`, optional `read_only` (`true` by default). |
