@@ -11,6 +11,9 @@ use crate::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
 // Sandbox container/pod label keys (openshell.ai/ namespace)
 // ---------------------------------------------------------------------------
 
+/// Reserved label key namespace owned by `OpenShell`.
+pub const LABEL_RESERVED_PREFIX: &str = "openshell.ai/";
+
 /// Container/pod label that identifies this resource as managed by `OpenShell`.
 /// Value should be `"openshell"`.
 pub const LABEL_MANAGED_BY: &str = "openshell.ai/managed-by";

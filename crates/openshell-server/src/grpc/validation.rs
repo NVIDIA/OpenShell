@@ -396,6 +396,13 @@ pub(super) fn validate_label_key(key: &str) -> Result<(), Status> {
         return Err(Status::invalid_argument("label key cannot be empty"));
     }
 
+    if key.starts_with(openshell_core::driver_utils::LABEL_RESERVED_PREFIX) {
+        return Err(Status::invalid_argument(format!(
+            "label key '{key}' uses the reserved '{}' namespace",
+            openshell_core::driver_utils::LABEL_RESERVED_PREFIX
+        )));
+    }
+
     if key.len() > 253 {
         return Err(Status::invalid_argument(format!(
             "label key exceeds 253 characters: '{key}'"
@@ -537,6 +544,24 @@ pub(super) fn validate_label_value(value: &str) -> Result<(), Status> {
         )));
     }
 
+    Ok(())
+}
+
+/// Validate a label map: entry count (bounded by [`MAX_TEMPLATE_MAP_ENTRIES`]),
+/// then each key and value.
+pub(super) fn validate_labels(
+    labels: &std::collections::HashMap<String, String>,
+) -> Result<(), Status> {
+    if labels.len() > MAX_TEMPLATE_MAP_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "labels exceeds maximum entries ({} > {MAX_TEMPLATE_MAP_ENTRIES})",
+            labels.len()
+        )));
+    }
+    for (key, value) in labels {
+        validate_label_key(key)?;
+        validate_label_value(value)?;
+    }
     Ok(())
 }
 
@@ -1272,6 +1297,30 @@ mod tests {
         let err = validate_label_key("").unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn validate_label_key_rejects_reserved_namespace() {
+        let err = validate_label_key("openshell.ai/sandbox-id").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("reserved"));
+    }
+
+    #[test]
+    fn validate_labels_accepts_valid_map() {
+        let labels: HashMap<String, String> =
+            std::iter::once(("team".to_string(), "platform".to_string())).collect();
+        assert!(validate_labels(&labels).is_ok());
+    }
+
+    #[test]
+    fn validate_labels_rejects_too_many_entries() {
+        let labels: HashMap<String, String> = (0..=MAX_TEMPLATE_MAP_ENTRIES)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        let err = validate_labels(&labels).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("labels"));
     }
 
     #[test]
