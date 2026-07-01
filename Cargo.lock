@@ -4003,6 +4003,7 @@ name = "openshell-tui"
 version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "crossterm 0.28.1",
  "miette",
  "openshell-bootstrap",

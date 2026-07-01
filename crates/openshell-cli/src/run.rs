@@ -165,49 +165,22 @@ fn provisioning_timeout_message(
     message
 }
 
-/// Format milliseconds since Unix epoch as a `YYYY-MM-DD HH:MM:SS` UTC string.
+/// Format milliseconds since Unix epoch as a `YYYY-MM-DD HH:MM:SS` local-time string.
 fn format_epoch_ms(ms: i64) -> String {
-    use std::time::UNIX_EPOCH;
-
-    let Ok(ms_u64) = u64::try_from(ms) else {
-        return "-".to_string();
-    };
-    let Ok(time) = UNIX_EPOCH
-        .checked_add(Duration::from_millis(ms_u64))
-        .ok_or(())
-    else {
-        return "-".to_string();
-    };
-    let Ok(dur) = time.duration_since(UNIX_EPOCH) else {
-        return "-".to_string();
-    };
-
-    let secs = dur.as_secs();
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-
-    // Convert days since epoch to year-month-day using a basic civil calendar algorithm.
-    let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02} {hours:02}:{minutes:02}:{seconds:02}")
+    use chrono::{Local, MappedLocalTime, TimeZone};
+    match Local.timestamp_millis_opt(ms) {
+        MappedLocalTime::Single(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        _ => "-".to_string(),
+    }
 }
 
-/// Convert days since 1970-01-01 to (year, month, day).
-/// Algorithm from Howard Hinnant's `chrono`-compatible date library.
-fn civil_from_days(days: u64) -> (i64, u64, u64) {
-    let z = days.cast_signed() + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097).cast_unsigned();
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe.cast_signed() + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+/// Format milliseconds since Unix epoch as an ISO 8601 local-time string with offset.
+fn format_epoch_ms_iso8601(ms: i64) -> String {
+    use chrono::{Local, MappedLocalTime, TimeZone};
+    match Local.timestamp_millis_opt(ms) {
+        MappedLocalTime::Single(dt) => dt.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+        _ => "-".to_string(),
+    }
 }
 
 /// Known provisioning steps derived from Kubernetes events and sandbox lifecycle.
@@ -3432,7 +3405,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "name": sandbox.object_name(),
         "labels": labels,
         "resource_version": meta.map_or(0, |m| m.resource_version),
-        "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
+        "created_at": format_epoch_ms_iso8601(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
     })
@@ -4927,7 +4900,7 @@ fn provider_to_json(provider: &Provider) -> serde_json::Value {
         if meta.created_at_ms != 0 {
             obj.insert(
                 "created_at".to_string(),
-                serde_json::json!(format_epoch_ms(meta.created_at_ms)),
+                serde_json::json!(format_epoch_ms_iso8601(meta.created_at_ms)),
             );
         }
     }
@@ -7819,19 +7792,15 @@ fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     if value.is_empty() { fallback } else { value }
 }
 
-/// Format a millisecond timestamp into a readable string.
+/// Format a millisecond epoch timestamp as a `YYYY-MM-DD HH:MM` local-time string.
 fn format_timestamp_ms(ms: i64) -> String {
+    use chrono::{Local, MappedLocalTime, TimeZone};
     if ms <= 0 {
         return "-".to_string();
     }
-    let secs = ms / 1000;
-    let mins = (secs / 60) % 60;
-    let hours = (secs / 3600) % 24;
-    let days = secs / 86400;
-    if days > 0 {
-        format!("{days}d {hours:02}:{mins:02}")
-    } else {
-        format!("{hours:02}:{mins:02}")
+    match Local.timestamp_millis_opt(ms) {
+        MappedLocalTime::Single(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        _ => "-".to_string(),
     }
 }
 
@@ -8111,7 +8080,14 @@ mod tests {
         assert!(row.contains("MS_GRAPH_ACCESS_TOKEN"));
         assert!(row.contains("oauth2_client_credentials"));
         assert!(row.contains("error"));
-        assert!(row.contains("2026-01-01 00:00:00"));
+        use chrono::TimeZone as _;
+        let expected_ts = chrono::Local
+            .timestamp_millis_opt(1_767_225_600_000)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert!(row.contains(&expected_ts));
         assert!(row.contains("..."));
     }
 
@@ -9613,7 +9589,14 @@ mod tests {
         let json = super::provider_to_json(&provider);
 
         assert_eq!(json["resource_version"], 42);
-        assert_eq!(json["created_at"], "2009-02-13 23:31:30");
+        use chrono::TimeZone as _;
+        let expected = chrono::Local
+            .timestamp_millis_opt(1_234_567_890_000)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%:z")
+            .to_string();
+        assert_eq!(json["created_at"], expected);
         assert_eq!(json["labels"]["env"], "prod");
     }
 
@@ -9691,8 +9674,15 @@ mod tests {
 
         let json = super::provider_to_json(&provider);
 
-        // Should format as human-readable datetime, not raw milliseconds
-        assert_eq!(json["created_at"], "2021-01-01 00:00:00");
+        // Should format as ISO 8601 local-time datetime, not raw milliseconds
+        use chrono::TimeZone as _;
+        let expected = chrono::Local
+            .timestamp_millis_opt(1_609_459_200_000)
+            .single()
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%S%:z")
+            .to_string();
+        assert_eq!(json["created_at"], expected);
         assert!(
             json.get("created_at_ms").is_none(),
             "raw milliseconds field should not exist"
