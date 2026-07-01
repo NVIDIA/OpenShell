@@ -47,6 +47,8 @@ tests:
     set:
       server.disableTls: true
       server.oidc.issuer: https://issuer.example.com
+      server.oidc.adminRole: openshell-admin
+      server.oidc.userRole: openshell-user
       server.oidc.caConfigMapName: openshell-oidc-ca
     asserts:
       - equal:
@@ -216,6 +218,48 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: "server.grpcRateLimit.requests and server.grpcRateLimit.windowSeconds must not be negative; they map to unsigned gateway settings"
+
+  - it: fails OIDC authentication-only mode without explicit opt-in
+    template: templates/statefulset.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+    asserts:
+      - failedTemplate:
+          errorPattern: "OIDC authentication-only mode authorizes any valid issuer token"
+
+  - it: fails OIDC configuration with only one role set
+    template: templates/statefulset.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.adminRole: openshell-admin
+    asserts:
+      - failedTemplate:
+          errorPattern: "server.oidc.adminRole and server.oidc.userRole must either both be set"
+
+  - it: renders OIDC RBAC roles when configured
+    template: templates/gateway-config.yaml
+    set:
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.rolesClaim: realm_access.roles
+      server.oidc.adminRole: openshell-admin
+      server.oidc.userRole: openshell-user
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?roles_claim\s*=\s*"realm_access\.roles".*?admin_role\s*=\s*"openshell-admin".*?user_role\s*=\s*"openshell-user"'
+
+  - it: renders explicit OIDC authentication-only mode when opted in
+    template: templates/gateway-config.yaml
+    set:
+      server.auth.allowOidcAuthOnly: true
+      server.oidc.issuer: https://issuer.example.com
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.auth\].*?allow_oidc_auth_only\s*=\s*true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?admin_role\s*=\s*"".*?user_role\s*=\s*""'
 
   - it: uses the configured existing sandbox service account name
     template: templates/gateway-config.yaml

@@ -76,10 +76,15 @@ data:
     client_ca_path        = "/etc/openshell-tls/client-ca/ca.crt"
     {{- end }}
 
-    {{- if .Values.server.auth.allowUnauthenticatedUsers }}
+    {{- if or .Values.server.auth.allowUnauthenticatedUsers .Values.server.auth.allowOidcAuthOnly }}
 
     [openshell.gateway.auth]
+    {{- if .Values.server.auth.allowUnauthenticatedUsers }}
     allow_unauthenticated_users = true
+    {{- end }}
+    {{- if .Values.server.auth.allowOidcAuthOnly }}
+    allow_oidc_auth_only = true
+    {{- end }}
     {{- end }}
 
     [openshell.gateway.gateway_jwt]
@@ -98,10 +103,10 @@ data:
     {{- if .Values.server.oidc.rolesClaim }}
     roles_claim   = {{ .Values.server.oidc.rolesClaim | quote }}
     {{- end }}
-    {{- if .Values.server.oidc.adminRole }}
+    {{- if or .Values.server.oidc.adminRole .Values.server.auth.allowOidcAuthOnly }}
     admin_role    = {{ .Values.server.oidc.adminRole | quote }}
     {{- end }}
-    {{- if .Values.server.oidc.userRole }}
+    {{- if or .Values.server.oidc.userRole .Values.server.auth.allowOidcAuthOnly }}
     user_role     = {{ .Values.server.oidc.userRole | quote }}
     {{- end }}
     {{- if .Values.server.oidc.scopesClaim }}

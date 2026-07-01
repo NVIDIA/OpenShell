@@ -226,6 +226,10 @@ server:
     # principal. Intended only for trusted local Skaffold/k3d development or a
     # fully trusted fronting proxy. Leave false for shared or production clusters.
     allowUnauthenticatedUsers: false
+    # -- UNSAFE: allow OIDC authentication-only mode when adminRole and userRole
+    # are both empty. In this mode any valid token from the issuer can call user
+    # and admin APIs. Leave false for shared or production clusters.
+    allowOidcAuthOnly: false
   tls:
     # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
     certSecretName: openshell-server-tls
@@ -281,10 +285,11 @@ server:
     # -- Dot-separated path to the roles array in the JWT claims.
     # Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups".
     rolesClaim: ""
-    # -- Role name for admin access. Leave empty (with userRole also empty) for
-    # authentication-only mode. Both must be set or both empty.
+    # -- Role name for admin access. Set with userRole for RBAC mode. Leaving
+    # both empty enables authentication-only mode only when
+    # server.auth.allowOidcAuthOnly=true.
     adminRole: ""
-    # -- Role name for standard user access.
+    # -- Role name for standard user access. Set with adminRole for RBAC mode.
     userRole: ""
     # -- Dot-separated path to the scopes array in the JWT claims.
     scopesClaim: ""

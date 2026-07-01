@@ -469,8 +469,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         && prepared.config.gateway_jwt.is_none()
     {
         warn!(
-            "Neither mTLS user auth nor OIDC nor sandbox JWT auth is configured — \
-             the gateway has no authentication mechanism"
+            "No gateway authentication path is configured; non-loopback or shared deployments will fail startup"
         );
     }
 

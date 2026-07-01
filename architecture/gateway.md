@@ -29,6 +29,11 @@ gateway maps the verified certificate subject to a user principal. Kubernetes
 deployments use mTLS for transport only and require OIDC or a trusted access
 proxy for user authentication unless the explicit unsafe local-development
 `allow_unauthenticated_users` switch is enabled.
+OIDC deployments normally enforce RBAC roles for user and admin APIs. Shared
+gateways reject OIDC authentication-only mode unless
+`allow_oidc_auth_only` is set explicitly, and authenticated gRPC methods fail
+closed when no user, sandbox, mTLS, or explicit local-dev principal can be
+derived.
 When that service port is bound to loopback, the listener can also accept
 plaintext HTTP on the same port for sandbox service subdomains only. That local
 browser path is enabled by default and disabled with

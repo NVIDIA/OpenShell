@@ -191,6 +191,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | server.appArmorProfile | string | `"Unconfined"` | Kubernetes AppArmor profile requested for sandbox agent containers. Default Unconfined avoids runtime/default AppArmor blocking the supervisor's network namespace mount setup on AppArmor-enabled nodes. Set to "" to omit the field, "RuntimeDefault" to force the runtime default profile, or "Localhost/profile-name" for an operator-managed localhost profile. |
+| server.auth.allowOidcAuthOnly | bool | `false` | UNSAFE: allow OIDC authentication-only mode when adminRole and userRole are both empty. In this mode any valid token from the issuer can call user and admin APIs. Leave false for shared or production clusters. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
 | server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). |
 | server.defaultRuntimeClassName | string | `""` | Default Kubernetes runtimeClassName for sandbox pods. Applied when a CreateSandbox request does not specify one. Empty (default) = omit the field, using the cluster's default RuntimeClass. Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it to all sandboxes that don't explicitly override it. |
@@ -203,14 +204,14 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.grpcRateLimit.windowSeconds | int | `0` | gRPC rate-limit window length in seconds. Must be positive (alongside requests) to enable rate limiting; 0 (default) disables it. |
 | server.hostGatewayIP | string | `""` | Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get hostAliases entries mapping host.docker.internal and host.openshell.internal to this IP, allowing them to reach services running on the Docker host. Auto-detected by the cluster entrypoint script. |
 | server.logLevel | string | `"info"` | Gateway log level. |
-| server.oidc.adminRole | string | `""` | Role name for admin access. Leave empty (with userRole also empty) for authentication-only mode. Both must be set or both empty. |
+| server.oidc.adminRole | string | `""` | Role name for admin access. Set with userRole for RBAC mode. Leaving both empty enables authentication-only mode only when server.auth.allowOidcAuthOnly=true. |
 | server.oidc.audience | string | `"openshell-cli"` | Expected audience claim for the API resource server. This should match the server's --oidc-audience, NOT the CLI client ID. |
 | server.oidc.caConfigMapName | string | `""` | Name of a ConfigMap containing a CA certificate bundle (key: ca.crt) for verifying the OIDC issuer's TLS certificate. Required when the issuer uses a non-public CA (e.g. OpenShift ingress, private PKI). |
 | server.oidc.issuer | string | `""` | OIDC issuer URL (e.g. https://keycloak.example.com/realms/openshell). |
 | server.oidc.jwksTtl | int | `3600` | JWKS key cache TTL in seconds. |
 | server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
-| server.oidc.userRole | string | `""` | Role name for standard user access. |
+| server.oidc.userRole | string | `""` | Role name for standard user access. Set with adminRole for RBAC mode. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants. |
 | server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into sandbox pods. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |
