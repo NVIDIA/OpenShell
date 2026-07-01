@@ -314,18 +314,18 @@ fn copy_sidecar_client_tls_if_present(
 
 #[cfg(target_os = "linux")]
 fn run_network_init(
-    proxy_uid: u32,
-    proxy_gid: u32,
+    proxy_user_id: u32,
+    proxy_group_id: u32,
     sidecar_state_dir: &str,
     sidecar_tls_dir: &str,
 ) -> Result<()> {
-    if proxy_uid < openshell_policy::MIN_SANDBOX_UID {
+    if proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
         return Err(miette::miette!(
             "--proxy-uid must be at least {}",
             openshell_policy::MIN_SANDBOX_UID
         ));
     }
-    if proxy_gid < openshell_policy::MIN_SANDBOX_UID {
+    if proxy_group_id < openshell_policy::MIN_SANDBOX_UID {
         return Err(miette::miette!(
             "--proxy-gid must be at least {}",
             openshell_policy::MIN_SANDBOX_UID
@@ -334,15 +334,15 @@ fn run_network_init(
 
     let sidecar_state_dir = Path::new(sidecar_state_dir);
     let sidecar_tls_dir = Path::new(sidecar_tls_dir);
-    prepare_sidecar_directory(sidecar_state_dir, proxy_uid, proxy_gid, 0o775)?;
-    prepare_sidecar_directory(sidecar_tls_dir, proxy_uid, proxy_gid, 0o755)?;
+    prepare_sidecar_directory(sidecar_state_dir, proxy_user_id, proxy_group_id, 0o775)?;
+    prepare_sidecar_directory(sidecar_tls_dir, proxy_user_id, proxy_group_id, 0o755)?;
     copy_sidecar_client_tls_if_present(
         Path::new(CLIENT_TLS_DIR),
         sidecar_tls_dir,
-        proxy_uid,
-        proxy_gid,
+        proxy_user_id,
+        proxy_group_id,
     )?;
-    openshell_supervisor_process::netns::install_sidecar_bypass_rules(proxy_uid)
+    openshell_supervisor_process::netns::install_sidecar_bypass_rules(proxy_user_id)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -386,10 +386,10 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.mode.network_init {
-        let proxy_gid = args.proxy_gid.unwrap_or(args.proxy_uid);
+        let proxy_group_id = args.proxy_gid.unwrap_or(args.proxy_uid);
         return run_network_init(
             args.proxy_uid,
-            proxy_gid,
+            proxy_group_id,
             &args.sidecar_state_dir,
             &args.sidecar_tls_dir,
         );
