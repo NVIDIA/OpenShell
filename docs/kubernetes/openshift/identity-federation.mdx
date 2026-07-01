@@ -1,0 +1,138 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "OpenShift Identity Federation"
+sidebar-title: "Identity Federation"
+slug: "kubernetes/openshift/identity-federation"
+description: "Optionally configure Keycloak to delegate authentication to the OpenShift OAuth server so cluster users can log in with their existing credentials."
+keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, Keycloak, Identity Federation, OAuth, SSO"
+position: 4
+---
+
+If your organisation wants OpenShell users to authenticate with their existing OpenShift cluster credentials instead of managing separate Keycloak accounts, you can configure Keycloak to federate to the OpenShift OAuth server. This is optional — the [OIDC with Keycloak](/kubernetes/openshift/oidc-keycloak) setup works standalone with its own user directory.
+
+When federation is configured, users are auto-imported into the Keycloak realm on first login.
+
+## Prerequisites
+
+- [OIDC with Keycloak](/kubernetes/openshift/oidc-keycloak) configured and working
+- `cluster-admin` access to create `OAuthClient` resources
+
+## Create an OAuthClient in OpenShift
+
+Generate a client secret and create the `OAuthClient` that Keycloak uses to initiate the OAuth flow:
+
+```shell
+OCP_SECRET=$(openssl rand -hex 32)
+KC_URL=https://keycloak.example.com
+
+cat <<EOF | oc apply -f -
+apiVersion: oauth.openshift.io/v1
+kind: OAuthClient
+metadata:
+  name: keycloak-openshell
+secret: "${OCP_SECRET}"
+grantMethod: auto
+redirectURIs:
+  - "${KC_URL}/realms/openshell/broker/openshift/endpoint"
+EOF
+```
+
+## Add OpenShift as a Keycloak identity provider
+
+<Tabs>
+<Tab title="kcadm.sh">
+
+```shell
+KC_POD="oc exec keycloak-0 -n keycloak --"
+KC_ADM="/opt/keycloak/bin/kcadm.sh --config /tmp/kcadm.config"
+
+$KC_POD $KC_ADM create identity-provider/instances -r openshell \
+  -s alias=openshift \
+  -s displayName=OpenShift \
+  -s providerId=openshift-v4 \
+  -s enabled=true \
+  -s trustEmail=true \
+  -s "firstBrokerLoginFlowAlias=first broker login" \
+  -s "config.clientId=keycloak-openshell" \
+  -s "config.clientSecret=${OCP_SECRET}" \
+  -s "config.baseUrl=$(oc whoami --show-server)" \
+  -s "config.defaultScope=user:info" \
+  -s "config.syncMode=IMPORT"
+```
+
+</Tab>
+<Tab title="REST API">
+
+```shell
+TOKEN=$(curl -sk "${KC_URL}/realms/master/protocol/openid-connect/token" \
+  -d "client_id=admin-cli" \
+  -d "username=<admin-user>" \
+  -d "password=<admin-password>" \
+  -d "grant_type=password" | jq -r .access_token)
+
+curl -sk -X POST "${KC_URL}/admin/realms/openshell/identity-provider/instances" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"alias\": \"openshift\",
+    \"displayName\": \"OpenShift\",
+    \"providerId\": \"openshift-v4\",
+    \"enabled\": true,
+    \"trustEmail\": true,
+    \"firstBrokerLoginFlowAlias\": \"first broker login\",
+    \"config\": {
+      \"clientId\": \"keycloak-openshell\",
+      \"clientSecret\": \"${OCP_SECRET}\",
+      \"baseUrl\": \"$(oc whoami --show-server)\",
+      \"defaultScope\": \"user:info\",
+      \"syncMode\": \"IMPORT\"
+    }
+  }"
+```
+
+</Tab>
+</Tabs>
+
+<Note>
+**ROSA HCP**: set `baseUrl` to the API server URL (`https://api.<cluster>:443`), not the OAuth route (`oauth.<cluster>`). On ROSA HCP, the OAuth metadata endpoint (`/.well-known/oauth-authorization-server`) is served by the API server. The OAuth route returns 404.
+</Note>
+
+## Assign roles to federated users
+
+Users imported from OpenShift do not receive the `openshell-user` or `openshell-admin` realm roles automatically. After a user's first login through the "OpenShift" button, assign the appropriate role through the Keycloak admin console:
+
+**Keycloak Admin Console → Users → select user → Role Mappings → Assign role → openshell-user**
+
+Or via the CLI/API:
+
+<Tabs>
+<Tab title="kcadm.sh">
+
+```shell
+$KC_POD $KC_ADM add-roles -r openshell \
+  --uusername <openshift-username> \
+  --rolename openshell-user
+```
+
+</Tab>
+<Tab title="REST API">
+
+```shell
+USER_ID=$(curl -sk "${KC_URL}/admin/realms/openshell/users?username=<openshift-username>&exact=true" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[0].id')
+
+ROLE_ID=$(curl -sk "${KC_URL}/admin/realms/openshell/roles/openshell-user" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.id')
+
+curl -sk -X POST "${KC_URL}/admin/realms/openshell/users/${USER_ID}/role-mappings/realm" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "[{\"id\":\"${ROLE_ID}\",\"name\":\"openshell-user\"}]"
+```
+
+</Tab>
+</Tabs>
+
+## Result
+
+The Keycloak login page shows a "Login with OpenShift" button below the standard username/password form. Clicking it redirects to the OpenShift login page. After authentication, Keycloak issues an OIDC token with the user's identity and assigned roles, and the CLI stores the token.

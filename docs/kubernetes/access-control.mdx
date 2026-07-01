@@ -82,6 +82,131 @@ Both `adminRole` and `userRole` must be set, or both must be empty. Setting only
 | Microsoft Entra ID | `roles` |
 | Okta | `groups` |
 
+### Keycloak setup
+
+Keycloak public clients do not include `sub`, `aud`, or realm roles in access tokens by default. Without these claims, the gateway rejects tokens with errors like `missing field 'sub'`, audience mismatch, or `role 'openshell-user' required`.
+
+After creating a realm and a public client (with PKCE S256, redirect URIs `http://localhost:*` and `http://127.0.0.1:*`), add these protocol mappers to the client:
+
+| Mapper name | Mapper type | Key config |
+|---|---|---|
+| `sub` | Subject (sub) | access.token.claim: true |
+| `openshell-audience` | Audience | included.client.audience: `openshell-cli` |
+| `realm-roles` | User Realm Role | claim.name: `realm_access.roles`, multivalued: true |
+
+Add these via the Keycloak admin console under **Clients → openshell-cli → Client scopes → Dedicated scope → Add mapper**, or via the CLI:
+
+<Tabs>
+<Tab title="kcadm.sh">
+
+```shell
+KC_ADM="kcadm.sh --config /tmp/kcadm.config"
+
+$KC_ADM config credentials \
+  --server http://localhost:8080 \
+  --realm master \
+  --user <admin-user> \
+  --password <admin-password>
+
+$KC_ADM create realms \
+  -s realm=openshell \
+  -s enabled=true
+
+$KC_ADM create clients -r openshell \
+  -s clientId=openshell-cli \
+  -s enabled=true \
+  -s publicClient=true \
+  -s directAccessGrantsEnabled=true \
+  -s standardFlowEnabled=true \
+  -s 'redirectUris=["http://localhost:*","http://127.0.0.1:*"]' \
+  -s 'webOrigins=["http://localhost","http://127.0.0.1"]' \
+  -s 'attributes={"pkce.code.challenge.method":"S256"}'
+
+CLIENT_UUID=$($KC_ADM get clients -r openshell \
+  -q clientId=openshell-cli --fields id --format csv --noquotes)
+
+$KC_ADM create clients/$CLIENT_UUID/protocol-mappers/models -r openshell \
+  -s name=sub \
+  -s protocol=openid-connect \
+  -s protocolMapper=oidc-sub-mapper \
+  -s 'config={"access.token.claim":"true","id.token.claim":"true"}'
+
+$KC_ADM create clients/$CLIENT_UUID/protocol-mappers/models -r openshell \
+  -s name=openshell-audience \
+  -s protocol=openid-connect \
+  -s protocolMapper=oidc-audience-mapper \
+  -s 'config={"included.client.audience":"openshell-cli","access.token.claim":"true","id.token.claim":"true"}'
+
+$KC_ADM create clients/$CLIENT_UUID/protocol-mappers/models -r openshell \
+  -s name=realm-roles \
+  -s protocol=openid-connect \
+  -s protocolMapper=oidc-usermodel-realm-role-mapper \
+  -s 'config={"claim.name":"realm_access.roles","jsonType.label":"String","multivalued":"true","access.token.claim":"true","id.token.claim":"true","userinfo.token.claim":"true"}'
+
+$KC_ADM create roles -r openshell -s name=openshell-user
+$KC_ADM create roles -r openshell -s name=openshell-admin
+```
+
+</Tab>
+<Tab title="REST API">
+
+```shell
+KC_URL=https://keycloak.example.com
+
+TOKEN=$(curl -sk "${KC_URL}/realms/master/protocol/openid-connect/token" \
+  -d "client_id=admin-cli" \
+  -d "username=<admin-user>" \
+  -d "password=<admin-password>" \
+  -d "grant_type=password" | jq -r .access_token)
+
+curl -sk -X POST "${KC_URL}/admin/realms" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"realm":"openshell","enabled":true}'
+
+curl -sk -X POST "${KC_URL}/admin/realms/openshell/clients" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clientId": "openshell-cli",
+    "enabled": true,
+    "publicClient": true,
+    "directAccessGrantsEnabled": true,
+    "standardFlowEnabled": true,
+    "redirectUris": ["http://localhost:*", "http://127.0.0.1:*"],
+    "webOrigins": ["http://localhost", "http://127.0.0.1"],
+    "attributes": {"pkce.code.challenge.method": "S256"}
+  }'
+
+CLIENT_UUID=$(curl -sk "${KC_URL}/admin/realms/openshell/clients?clientId=openshell-cli" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[0].id')
+
+for MAPPER in \
+  '{"name":"sub","protocol":"openid-connect","protocolMapper":"oidc-sub-mapper","config":{"access.token.claim":"true","id.token.claim":"true"}}' \
+  '{"name":"openshell-audience","protocol":"openid-connect","protocolMapper":"oidc-audience-mapper","config":{"included.client.audience":"openshell-cli","access.token.claim":"true","id.token.claim":"true"}}' \
+  '{"name":"realm-roles","protocol":"openid-connect","protocolMapper":"oidc-usermodel-realm-role-mapper","config":{"claim.name":"realm_access.roles","jsonType.label":"String","multivalued":"true","access.token.claim":"true","id.token.claim":"true","userinfo.token.claim":"true"}}'; do
+  curl -sk -X POST "${KC_URL}/admin/realms/openshell/clients/${CLIENT_UUID}/protocol-mappers/models" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d "$MAPPER"
+done
+
+curl -sk -X POST "${KC_URL}/admin/realms/openshell/roles" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"openshell-user"}'
+
+curl -sk -X POST "${KC_URL}/admin/realms/openshell/roles" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"name":"openshell-admin"}'
+```
+
+</Tab>
+</Tabs>
+
+Assign `openshell-user` to users who need sandbox access and `openshell-admin` to administrators.
+
+<Note>
+On Kubernetes, run `kcadm.sh` via `kubectl exec` into the Keycloak pod. The `--config /tmp/kcadm.config` flag is required when the container runs as non-root. On OpenShift, see [OIDC on OpenShift](/kubernetes/openshift/oidc-keycloak) for the `oc exec` variant and OpenShift-specific details.
+</Note>
+
 ## Reverse-Proxy Auth Termination
 
 When an access proxy, such as Cloudflare Access, ngrok, or a corporate SSO gateway, handles authentication in front of the OpenShell gateway, you can explicitly allow unauthenticated user calls at the gateway:

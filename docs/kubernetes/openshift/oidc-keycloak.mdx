@@ -1,0 +1,62 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "OIDC on OpenShift"
+sidebar-title: "OIDC on OpenShift"
+slug: "kubernetes/openshift/oidc-keycloak"
+description: "Connect the OpenShell CLI to a Keycloak-authenticated gateway on OpenShift."
+keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, OIDC, Keycloak, Authentication, JWT"
+position: 3
+---
+
+This page covers the OpenShift-specific steps for connecting the CLI to a Keycloak-authenticated gateway. For the full Keycloak setup (realm, client, protocol mappers, roles), refer to the [Keycloak setup](/kubernetes/access-control#keycloak-setup) section of the Access Control guide.
+
+## Prerequisites
+
+- OpenShell [installed on OpenShift](/kubernetes/openshift/install) with TLS enabled
+- Gateway [exposed externally](/kubernetes/openshift/gateway-connection)
+- Keycloak realm and client configured per the [Keycloak setup](/kubernetes/access-control#keycloak-setup) guide
+
+## Configure the gateway
+
+Upgrade the Helm release with OIDC values:
+
+```shell
+helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --reuse-values \
+  --set server.oidc.issuer=https://keycloak.example.com/realms/openshell \
+  --set server.oidc.audience=openshell-cli \
+  --set server.oidc.rolesClaim=realm_access.roles \
+  --set server.oidc.adminRole=openshell-admin \
+  --set server.oidc.userRole=openshell-user
+```
+
+Verify the gateway logs show OIDC is enabled:
+
+```shell
+oc logs -f statefulset/openshell -n openshell | grep -i oidc
+```
+
+## Connect the CLI
+
+<Warning>
+Always pass `--oidc-issuer` when registering the gateway. Without it, the CLI defaults to the Cloudflare Access edge-auth flow, which hangs indefinitely on non-Cloudflare deployments.
+</Warning>
+
+```shell
+openshell gateway add https://<gateway-endpoint> \
+  --gateway-insecure \
+  --name openshift \
+  --oidc-issuer https://keycloak.example.com/realms/openshell \
+  --oidc-client-id openshell-cli \
+  --oidc-audience openshell-cli
+```
+
+The browser opens to the Keycloak login page. After authentication, the CLI stores the OIDC token.
+
+## Next steps
+
+- [Identity federation](/kubernetes/openshift/identity-federation) (optional) — if you want cluster users to log in with their OpenShift credentials instead of separate Keycloak accounts.
+- [Access Control](/kubernetes/access-control) — OIDC values reference, auth-only vs. RBAC mode, and provider-specific `rolesClaim` paths.

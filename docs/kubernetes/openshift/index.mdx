@@ -1,0 +1,40 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "OpenShift"
+sidebar-title: "OpenShift"
+slug: "kubernetes/openshift"
+description: "Deploy the OpenShell gateway on OpenShift with TLS, external access, and OIDC authentication."
+keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation, OIDC, Keycloak"
+position: 5
+---
+
+<Warning>
+The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC. Use only for evaluation on a private network.
+</Warning>
+
+Deploy the OpenShell gateway on OpenShift with Security Context Constraints, external access via Routes or Gateway API, and OIDC authentication with Keycloak.
+
+<Cards>
+
+<Card title="Install" href="/kubernetes/openshift/install">
+
+Install the gateway with TLS enabled, configure the SCC binding, and verify the deployment.
+</Card>
+
+<Card title="Gateway Connection" href="/kubernetes/openshift/gateway-connection">
+
+Connect the CLI to the gateway using port forwarding, a reencrypt Route, or the Gateway API.
+</Card>
+
+<Card title="OIDC on OpenShift" href="/kubernetes/openshift/oidc-keycloak">
+
+Configure the gateway and CLI for Keycloak OIDC authentication on OpenShift.
+</Card>
+
+<Card title="Identity Federation (Optional)" href="/kubernetes/openshift/identity-federation">
+
+Optionally let cluster users log in with their OpenShift credentials via Keycloak identity federation.
+</Card>
+
+</Cards>

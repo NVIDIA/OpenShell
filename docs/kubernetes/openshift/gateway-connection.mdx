@@ -1,0 +1,169 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Gateway Connection"
+sidebar-title: "Gateway Connection"
+slug: "kubernetes/openshift/gateway-connection"
+description: "Connect the OpenShell CLI to a gateway running on OpenShift using port forwarding, a reencrypt Route, or the Kubernetes Gateway API."
+keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, Route, Gateway API, Istio, gRPC, Ingress, CLI"
+position: 2
+---
+
+After the gateway is installed, register it with the CLI so you can create and manage sandboxes. The gateway is only reachable inside the cluster by default. How you connect depends on whether you need local-only access or external access for your team.
+
+| Method | Use case |
+|---|---|
+| [Port forward](#local-access) | Local evaluation from your workstation |
+| [Route](#remote-access-with-routes) | Shared or production access using OpenShift-native routing |
+| [Gateway API](#remote-access-with-gateway-api) | Shared or production access using the standard Kubernetes Gateway API |
+
+## Local access
+
+For quick evaluation, forward the gateway port to your workstation:
+
+```shell
+oc -n openshell port-forward svc/openshell 8080:8080
+```
+
+Register the gateway with the CLI:
+
+```shell
+openshell gateway add http://127.0.0.1:8080 --local --name openshift
+openshell status
+```
+
+## Remote access
+
+In shared and production environments, the gateway is exposed externally so that team members and CI systems can connect from outside the cluster. On OpenShift, there are two options: native Routes or the Kubernetes Gateway API.
+
+The gateway multiplexes gRPC and HTTP on a single port. Both options must preserve HTTP/2 for gRPC to work.
+
+### Remote access with Routes
+
+OpenShift Routes are the simplest way to expose the gateway externally. However, not all route types support gRPC:
+
+| Route type | gRPC support | Issue |
+|---|---|---|
+| Edge | Broken | Terminates TLS and forces HTTP/1.1 to the backend, which drops gRPC frames. |
+| Passthrough | Broken | Preserves HTTP/2 but exposes the gateway's mTLS client certificate requirement to browsers, causing `ERR_BAD_SSL_CLIENT_AUTH_CERT`. |
+| **Reencrypt** | **Works** | Terminates external TLS at the router, re-establishes TLS to the backend, and supports HTTP/2 with the `backend-protocol=h2` annotation. |
+
+Create a reencrypt route using the gateway's CA certificate for the backend TLS connection:
+
+```shell
+DEST_CA=$(oc get secret openshell-server-tls -n openshell \
+  -o jsonpath='{.data.ca\.crt}' | base64 -d)
+
+oc create route reencrypt openshell \
+  --service=openshell --port=8080 \
+  --dest-ca-cert=<(echo "$DEST_CA") \
+  -n openshell
+
+oc annotate route openshell -n openshell \
+  haproxy.router.openshift.io/backend-protocol=h2 --overwrite
+```
+
+Register the gateway with the CLI using the route hostname:
+
+```shell
+oc get route openshell -n openshell -o jsonpath='{.spec.host}'
+openshell gateway add https://<route-hostname> --gateway-insecure --name openshift
+```
+
+### Remote access with Gateway API
+
+The Kubernetes [Gateway API](https://gateway-api.sigs.k8s.io) provides native gRPC routing via `GRPCRoute` resources, without needing HTTP/2 annotations.
+
+On OpenShift, the Ingress Operator manages Gateway API CRDs. The standard [Envoy Gateway](/kubernetes/ingress) cannot be installed because the Ingress Operator rejects third-party CRD installations. Instead, use the Istio-based Gateway controller that OpenShift provides.
+
+<Steps>
+
+## Identify the GatewayClass
+
+```shell
+oc get gatewayclass
+```
+
+Look for a class with an Istio-based controller (e.g. `istio` or `data-science-gateway-class`). The class must show `ACCEPTED: True`.
+
+## Create the Gateway and GRPCRoute
+
+```shell
+kubectl apply -f - <<'EOF'
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: openshell-gateway
+  namespace: openshell
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: grpc
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: openshell-server-tls
+            kind: Secret
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: openshell
+  namespace: openshell
+spec:
+  parentRefs:
+    - name: openshell-gateway
+      namespace: openshell
+  rules:
+    - backendRefs:
+        - name: openshell
+          port: 8080
+EOF
+```
+
+## Configure TLS to the backend
+
+The Istio envoy proxy terminates external TLS at the Gateway, then connects to the backend in plaintext by default. Since the OpenShell gateway expects TLS, create a `DestinationRule` for TLS origination:
+
+```shell
+kubectl apply -f - <<'EOF'
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: openshell-tls-origination
+  namespace: openshell
+spec:
+  host: openshell.openshell.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: SIMPLE
+      insecureSkipVerify: true
+EOF
+```
+
+## Get the external address
+
+The Gateway controller creates a LoadBalancer service. Wait for the external address:
+
+```shell
+oc get gateway openshell-gateway -n openshell \
+  -o jsonpath='{.status.addresses[0].value}'
+```
+
+
+## Register the gateway
+
+```shell
+openshell gateway add https://<external-address> --gateway-insecure --name openshift
+```
+
+</Steps>
+
+## Next steps
+
+- [OIDC with Keycloak](/kubernetes/openshift/oidc-keycloak) — add `--oidc-issuer` to the `gateway add` command for authenticated access.

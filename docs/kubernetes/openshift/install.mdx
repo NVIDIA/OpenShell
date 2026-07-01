@@ -1,0 +1,74 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Install on OpenShift"
+sidebar-title: "Install"
+slug: "kubernetes/openshift/install"
+description: "Install the OpenShell Helm chart on OpenShift with TLS enabled and the required SCC overrides."
+keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Helm, Gateway, Installation, TLS"
+position: 1
+---
+
+OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, granting the `privileged` SCC to the sandbox service account, and overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself.
+
+## Prerequisites
+
+- OpenShift 4.x cluster with `oc` configured
+- Helm 3.x
+- [Agent Sandbox](/kubernetes/setup#install-agent-sandbox) controller and CRDs installed
+
+## Install
+
+<Steps>
+
+## Create the namespace
+
+Pre-create the namespace so the SCC binding can be applied before the chart installs:
+
+```shell
+oc create ns openshell
+```
+
+## Grant the privileged SCC to sandbox pods
+
+Sandbox pods run under the `openshell-sandbox` service account in the `openshell` namespace and require the `privileged` SCC:
+
+```shell
+oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
+```
+
+## Install the chart
+
+```shell
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null
+```
+
+| Override | Reason |
+|---|---|
+| `podSecurityContext.fsGroup=null` | Clear the hardcoded fsGroup so OpenShift's SCC admission can assign it. |
+| `securityContext.runAsUser=null` | Clear the hardcoded UID so OpenShift's SCC admission can assign it. |
+
+TLS and the PKI init job remain enabled by default. The certgen hook generates a self-signed CA, server certificate, and client certificate for mTLS between the gateway and sandbox supervisors.
+
+## Wait for the gateway to be ready
+
+```shell
+oc -n openshell rollout status statefulset/openshell
+```
+
+If you set `workload.kind=deployment`, use
+`oc -n openshell rollout status deployment/openshell` instead.
+
+</Steps>
+
+## Next steps
+
+- [Gateway connection](/kubernetes/openshift/gateway-connection) — connect the CLI to the gateway.
+- [OIDC with Keycloak](/kubernetes/openshift/oidc-keycloak) — add user authentication.
+- [Identity federation](/kubernetes/openshift/identity-federation) (optional) — if you want cluster users to log in with their OpenShift credentials instead of separate Keycloak accounts.
+- For TLS certificate management with cert-manager, refer to [Managing Certificates](/kubernetes/managing-certificates).
+- For the generic OIDC configuration reference, refer to [Access Control](/kubernetes/access-control).
