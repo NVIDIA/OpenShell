@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod policy_hash;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
 };
@@ -18,11 +19,13 @@ use openshell_core::proto::gateway_interceptor::v1::{
     gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
 };
 use openshell_core::proto::{
-    GraphqlOperation, L7Allow, L7DenyRule, L7Rule, NetworkEndpoint, NetworkPolicyRule,
-    ProviderProfile, SandboxPolicy,
+    ListSandboxesRequest, ProviderProfile, Sandbox, SandboxPhase, SandboxPolicy,
+    UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
+use openshell_gateway_interceptors::ProtoJsonCodec;
 use openshell_policy::parse_sandbox_policy;
 use openshell_providers::{ProviderTypeProfile, normalize_profile_id};
+use policy_hash::deterministic_policy_hash;
 use prost::Message as _;
 use prost_types::ListValue;
 use prost_types::{Struct, Value as ProtoValue, value::Kind};
@@ -30,15 +33,28 @@ use rcgen::{KeyPair, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
-use tonic::transport::Server;
+use tonic::Code;
+use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status};
 
 const POLICY_SIGNATURE_ANNOTATION: &str = "openshell.nvidia.com/policy-signature";
+const POLICY_HASH_ANNOTATION: &str = "openshell.nvidia.com/policy-hash";
+const POLICY_SIGNATURE_KID_ANNOTATION: &str = "openshell.nvidia.com/policy-signature-kid";
+const POLICY_RELOAD_CORRELATION_ANNOTATION: &str =
+    "openshell.nvidia.com/policy-reload-correlation-id";
+const PROFILE_SIGNATURE_ANNOTATION: &str = "openshell.nvidia.com/profile-signature";
+const PROFILE_HASH_ANNOTATION: &str = "openshell.nvidia.com/profile-hash";
+const PROFILE_SIGNATURE_KID_ANNOTATION: &str = "openshell.nvidia.com/profile-signature-kid";
 const POLICY_JWT_ISSUER: &str = "openshell-governance-interceptor";
 const POLICY_JWT_AUDIENCE: &str = "openshell-governance-policy";
 const POLICY_JWT_SUBJECT: &str = "policy.yaml";
+const PROFILE_JWT_AUDIENCE: &str = "openshell-governance-profile";
+const PROFILE_JWT_SUBJECT_PREFIX: &str = "provider-profile:";
 const CREATE_SANDBOX_CORRELATION_PREFIX: &str = "governance:create-sandbox";
+const RELOAD_CORRELATION_PREFIX: &str = "governance:reload-policy";
 const SERVICE: &str = "openshell.v1.OpenShell";
+const SANDBOX_POLICY_TYPE: &str = "openshell.sandbox.v1.SandboxPolicy";
+const DEFAULT_POLICY_WATCH_INTERVAL_MS: u64 = 1_000;
 
 #[derive(Clone)]
 struct PolicySigner {
@@ -63,6 +79,17 @@ struct PolicySignatureClaims {
     iat: i64,
     exp: i64,
     policy_sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProfileSignatureClaims {
+    sub: String,
+    iss: String,
+    aud: String,
+    iat: i64,
+    exp: i64,
+    profile_id: String,
+    profile_sha256: String,
 }
 
 impl PolicySigner {
@@ -102,6 +129,22 @@ impl PolicySigner {
             .map_err(|err| format!("failed to sign policy JWT: {err}"))
     }
 
+    fn sign_profile(&self, profile_id: &str, profile_hash: &str) -> Result<String, String> {
+        let claims = ProfileSignatureClaims {
+            sub: format!("{PROFILE_JWT_SUBJECT_PREFIX}{profile_id}"),
+            iss: POLICY_JWT_ISSUER.to_string(),
+            aud: PROFILE_JWT_AUDIENCE.to_string(),
+            iat: 0,
+            exp: 0,
+            profile_id: profile_id.to_string(),
+            profile_sha256: profile_hash.to_string(),
+        };
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(self.kid.clone());
+        encode(&header, &claims, &self.encoding_key)
+            .map_err(|err| format!("failed to sign provider profile JWT: {err}"))
+    }
+
     fn verify_policy_signature(&self, token: &str, policy_hash: &str) -> Result<(), String> {
         let header = decode_header(token)
             .map_err(|err| format!("failed to decode policy JWT header: {err}"))?;
@@ -129,16 +172,60 @@ impl PolicySigner {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    fn verify_profile_signature(
+        &self,
+        token: &str,
+        profile_id: &str,
+        profile_hash: &str,
+    ) -> Result<(), String> {
+        let header = decode_header(token)
+            .map_err(|err| format!("failed to decode provider profile JWT header: {err}"))?;
+        if header.kid.as_deref() != Some(self.kid.as_str()) {
+            return Err("unexpected provider profile signing key id".to_string());
+        }
+        if header.alg != Algorithm::EdDSA {
+            return Err("unexpected provider profile signing algorithm".to_string());
+        }
+
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.algorithms = vec![Algorithm::EdDSA];
+        validation.set_issuer(&[POLICY_JWT_ISSUER]);
+        validation.set_audience(&[PROFILE_JWT_AUDIENCE]);
+        validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
+        validation.validate_exp = false;
+
+        let data = decode::<ProfileSignatureClaims>(token, &self.decoding_key, &validation)
+            .map_err(|err| format!("failed to verify provider profile JWT: {err}"))?;
+        if data.claims.sub != format!("{PROFILE_JWT_SUBJECT_PREFIX}{profile_id}") {
+            return Err("unexpected provider profile JWT subject".to_string());
+        }
+        if data.claims.profile_id != profile_id {
+            return Err("unexpected provider profile id".to_string());
+        }
+        if data.claims.profile_sha256 != profile_hash {
+            return Err("signed provider profile hash does not match profile".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
 struct GovernanceInterceptorService {
-    policy: Value,
-    policy_hash: String,
-    policy_signature: String,
     policy_signer: PolicySigner,
+    policy_state: Arc<RwLock<PolicyState>>,
     profiles_path: Option<PathBuf>,
     profile_state: Arc<RwLock<ProviderProfileState>>,
+}
+
+#[derive(Clone, Debug)]
+struct PolicyState {
+    policy: Value,
+    policy_proto: SandboxPolicy,
+    policy_hash: String,
+    policy_signature: String,
+    policy_signature_kid: String,
 }
 
 #[derive(Clone, Debug)]
@@ -172,19 +259,12 @@ impl GovernanceInterceptorService {
         if profiles.is_empty() {
             return Err("at least one provider profile must be loaded".to_string());
         }
-        let profile_state = profile_state_from_loaded(profiles);
-        let policy = parse_sandbox_policy(policy_yaml)
-            .map_err(|err| format!("failed to parse policy YAML: {err}"))?;
-        let policy = sandbox_policy_to_proto_json(&policy);
-        let policy = normalize_for_struct(policy)?;
-        let policy_hash = policy_hash(&policy)?;
         let policy_signer = PolicySigner::generate()?;
-        let policy_signature = policy_signer.sign_policy(&policy_hash)?;
+        let profile_state = profile_state_from_loaded(profiles, &policy_signer)?;
+        let policy_state = load_policy_state(policy_yaml, &policy_signer)?;
         Ok(Self {
-            policy,
-            policy_hash,
-            policy_signature,
             policy_signer,
+            policy_state: Arc::new(RwLock::new(policy_state)),
             profiles_path,
             profile_state: Arc::new(RwLock::new(profile_state)),
         })
@@ -238,6 +318,7 @@ impl GovernanceInterceptorService {
         evaluation: &InterceptorEvaluation,
     ) -> Result<InterceptorResult, Status> {
         let profile_state = self.current_profile_state();
+        let policy_state = self.current_policy_state();
         let phase = GatewayInterceptorPhase::try_from(evaluation.phase)
             .map_err(|_| Status::invalid_argument("unknown interceptor phase"))?;
         let operation = evaluation
@@ -248,17 +329,23 @@ impl GovernanceInterceptorService {
 
         match (evaluation.method.as_str(), phase) {
             ("CreateSandbox", GatewayInterceptorPhase::ModifyOperation) => {
-                self.patch_create_sandbox(&operation, &profile_state.ids)
+                Self::patch_create_sandbox(&operation, &policy_state)
             }
-            ("CreateSandbox", GatewayInterceptorPhase::Validate) => {
-                Ok(self.validate_create_sandbox(&operation, &profile_state.ids))
-            }
+            ("CreateSandbox", GatewayInterceptorPhase::Validate) => Ok(validate_create_sandbox(
+                &operation,
+                &profile_state.ids,
+                &policy_state,
+                &self.policy_signer,
+            )),
             ("CreateProvider", GatewayInterceptorPhase::Validate) => {
                 Ok(self.validate_create_provider(&operation, &profile_state.ids))
             }
-            ("UpdateConfig", GatewayInterceptorPhase::Validate) => {
-                Ok(validate_update_config(&operation, &evaluation.principal))
-            }
+            ("UpdateConfig", GatewayInterceptorPhase::Validate) => Ok(validate_update_config(
+                &operation,
+                &evaluation.principal,
+                &policy_state,
+                &self.policy_signer,
+            )),
             ("ImportProviderProfiles", GatewayInterceptorPhase::Validate) => {
                 Ok(self.validate_import_provider_profiles(&operation, &profile_state.ids))
             }
@@ -273,30 +360,27 @@ impl GovernanceInterceptorService {
     }
 
     fn patch_create_sandbox(
-        &self,
         operation: &Value,
-        managed_profile_ids: &[String],
+        policy_state: &PolicyState,
     ) -> Result<InterceptorResult, Status> {
         let mut patches = Vec::new();
         if operation.get("spec").is_some_and(Value::is_object) {
-            patches.push(json_patch("add", "/spec/policy", self.policy.clone())?);
             patches.push(json_patch(
                 "add",
-                "/spec/providers",
-                json!(managed_profile_ids),
+                "/spec/policy",
+                policy_state.policy.clone(),
             )?);
         } else {
             patches.push(json_patch(
                 "add",
                 "/spec",
                 json!({
-                    "policy": self.policy,
-                    "providers": managed_profile_ids,
+                    "policy": policy_state.policy.clone(),
                 }),
             )?);
         }
 
-        add_policy_signature_patches(operation, &mut patches, &self.policy_signature)?;
+        add_policy_signature_patches(operation, &mut patches, &policy_state.policy_signature)?;
 
         let mut result = allow();
         result.patches = patches;
@@ -306,58 +390,20 @@ impl GovernanceInterceptorService {
         );
         result
             .log_annotations
-            .insert("policy_hash".to_string(), self.policy_hash.clone());
+            .insert("policy_hash".to_string(), policy_state.policy_hash.clone());
         result.log_annotations.insert(
             "policy_signature_kid".to_string(),
-            self.policy_signer.kid().to_string(),
+            policy_state.policy_signature_kid.clone(),
         );
         Ok(result)
     }
 
-    fn validate_create_sandbox(
-        &self,
-        operation: &Value,
-        managed_profile_ids: &[String],
-    ) -> InterceptorResult {
-        let Some(policy) = operation.pointer("/spec/policy") else {
-            return deny("sandbox policy must match the provider governance baseline");
-        };
-        let sandbox_policy_hash = match policy_hash(policy) {
-            Ok(hash) => hash,
-            Err(err) => return deny(&format!("sandbox policy cannot be hashed: {err}")),
-        };
-        let Some(signature) = operation
-            .pointer(&format!(
-                "/annotations/{}",
-                json_pointer_escape(POLICY_SIGNATURE_ANNOTATION)
-            ))
-            .and_then(Value::as_str)
-        else {
-            return deny("sandbox is missing the governance policy signature");
-        };
-        if let Err(err) = self
-            .policy_signer
-            .verify_policy_signature(signature, &sandbox_policy_hash)
-        {
-            return deny(&format!("sandbox policy signature is invalid: {err}"));
-        }
-        if sandbox_policy_hash != self.policy_hash || policy != &self.policy {
-            return deny("sandbox policy must match the provider governance baseline");
-        }
-        if !providers_are_managed(operation.pointer("/spec/providers"), managed_profile_ids) {
-            return deny(&format!(
-                "sandbox providers must be exactly {}",
-                format_id_list(managed_profile_ids)
-            ));
-        }
-        allow()
-    }
-
     fn current_profile_state(&self) -> ProviderProfileState {
         if let Some(path) = &self.profiles_path {
-            match load_provider_profiles(path) {
-                Ok(profiles) => {
-                    let state = profile_state_from_loaded(profiles);
+            match load_provider_profiles(path)
+                .and_then(|profiles| profile_state_from_loaded(profiles, &self.policy_signer))
+            {
+                Ok(state) => {
                     if let Ok(mut guard) = self.profile_state.write() {
                         *guard = state.clone();
                     }
@@ -374,6 +420,26 @@ impl GovernanceInterceptorService {
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    fn current_policy_state(&self) -> PolicyState {
+        self.policy_state
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    fn reload_policy_from_yaml(&self, policy_yaml: &str) -> Result<Option<PolicyState>, String> {
+        let next = load_policy_state(policy_yaml, &self.policy_signer)?;
+        let mut guard = self
+            .policy_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.policy_hash == next.policy_hash {
+            return Ok(None);
+        }
+        *guard = next.clone();
+        Ok(Some(next))
     }
 
     fn validate_create_provider(
@@ -513,9 +579,62 @@ fn deny(reason: &str) -> InterceptorResult {
     }
 }
 
+fn validate_create_sandbox(
+    operation: &Value,
+    managed_profile_ids: &[String],
+    policy_state: &PolicyState,
+    policy_signer: &PolicySigner,
+) -> InterceptorResult {
+    let Some(policy) = operation.pointer("/spec/policy") else {
+        return deny("sandbox policy must match the provider governance baseline");
+    };
+    let Some(signature) = operation
+        .pointer(&format!(
+            "/annotations/{}",
+            json_pointer_escape(POLICY_SIGNATURE_ANNOTATION)
+        ))
+        .and_then(Value::as_str)
+    else {
+        return deny("sandbox is missing the governance policy signature");
+    };
+    let signature_validation =
+        validate_signed_policy_payload(policy, signature, policy_state, policy_signer);
+    if let Err(reason) = signature_validation {
+        return deny(&reason);
+    }
+    if !providers_are_managed(operation.pointer("/spec/providers"), managed_profile_ids) {
+        return deny(&format!(
+            "sandbox providers may only use vended provider profiles: {}",
+            format_id_list(managed_profile_ids)
+        ));
+    }
+    allow()
+}
+
+fn validate_signed_policy_payload(
+    policy: &Value,
+    signature: &str,
+    policy_state: &PolicyState,
+    policy_signer: &PolicySigner,
+) -> Result<(), String> {
+    let sandbox_policy = sandbox_policy_from_interceptor_json(policy)?;
+    let sandbox_policy_hash = deterministic_policy_hash(&sandbox_policy);
+    policy_signer
+        .verify_policy_signature(signature, &sandbox_policy_hash)
+        .map_err(|err| format!("sandbox policy signature is invalid: {err}"))?;
+    if sandbox_policy_hash != policy_state.policy_hash
+        || sandbox_policy != policy_state.policy_proto
+    {
+        return Err("sandbox policy must match the provider governance baseline".to_string());
+    }
+    Ok(())
+}
+
 fn validate_update_config(
     operation: &Value,
     principal: &HashMap<String, String>,
+    policy_state: &PolicyState,
+    policy_signer: &PolicySigner,
 ) -> InterceptorResult {
     if principal.get("kind").is_some_and(|kind| kind == "sandbox") {
         return allow();
@@ -532,15 +651,77 @@ fn validate_update_config(
         .or_else(|| operation.get("merge_operations"))
         .and_then(Value::as_array)
         .is_some_and(|operations| !operations.is_empty());
-    if !is_global && (has_policy || has_merge_operations) {
+    if !is_global && has_policy {
+        return validate_update_config_policy(operation, policy_state, policy_signer);
+    }
+    if !is_global && has_merge_operations {
         deny("sandbox policy updates are blocked by provider profile governance")
     } else {
         allow()
     }
 }
 
+fn validate_update_config_policy(
+    operation: &Value,
+    policy_state: &PolicyState,
+    policy_signer: &PolicySigner,
+) -> InterceptorResult {
+    let Some(policy) = operation.get("policy") else {
+        return deny("sandbox policy updates must include a policy payload");
+    };
+    let Some(annotations) = operation.get("annotations").and_then(Value::as_object) else {
+        return deny("sandbox policy updates must include governance annotations");
+    };
+    let Some(signature) = annotations
+        .get(POLICY_SIGNATURE_ANNOTATION)
+        .and_then(Value::as_str)
+    else {
+        return deny("sandbox policy update is missing the governance policy signature");
+    };
+    let Some(policy_hash) = annotations
+        .get(POLICY_HASH_ANNOTATION)
+        .and_then(Value::as_str)
+    else {
+        return deny("sandbox policy update is missing the governance policy hash");
+    };
+    let Some(policy_signature_kid) = annotations
+        .get(POLICY_SIGNATURE_KID_ANNOTATION)
+        .and_then(Value::as_str)
+    else {
+        return deny("sandbox policy update is missing the governance policy signing key id");
+    };
+    if policy_hash != policy_state.policy_hash
+        || policy_signature_kid != policy_state.policy_signature_kid
+    {
+        return deny("sandbox policy update governance annotations are stale");
+    }
+    match validate_signed_policy_payload(policy, signature, policy_state, policy_signer) {
+        Ok(()) => allow(),
+        Err(reason) => deny(&reason),
+    }
+}
+
 fn validate_delete_provider_profile() -> InterceptorResult {
     deny("provider profile deletes are blocked by provider governance")
+}
+
+fn load_policy_state(
+    policy_yaml: &str,
+    policy_signer: &PolicySigner,
+) -> Result<PolicyState, String> {
+    let policy_proto = parse_sandbox_policy(policy_yaml)
+        .map_err(|err| format!("failed to parse policy YAML: {err}"))?;
+    let policy = sandbox_policy_to_proto_json(&policy_proto)?;
+    let policy = normalize_for_struct(policy)?;
+    let policy_hash = deterministic_policy_hash(&policy_proto);
+    let policy_signature = policy_signer.sign_policy(&policy_hash)?;
+    Ok(PolicyState {
+        policy,
+        policy_proto,
+        policy_hash,
+        policy_signature,
+        policy_signature_kid: policy_signer.kid().to_string(),
+    })
 }
 
 fn provider_type(operation: &Value) -> &str {
@@ -672,17 +853,43 @@ fn loaded_profile_ids(profiles: &[LoadedProviderProfile]) -> Vec<String> {
         .collect()
 }
 
-fn profile_state_from_loaded(profiles: Vec<LoadedProviderProfile>) -> ProviderProfileState {
+fn profile_state_from_loaded(
+    profiles: Vec<LoadedProviderProfile>,
+    policy_signer: &PolicySigner,
+) -> Result<ProviderProfileState, String> {
     let ids = loaded_profile_ids(&profiles);
     let profiles = profiles
         .into_iter()
-        .map(|loaded| loaded.profile)
-        .collect::<Vec<_>>();
-    ProviderProfileState {
+        .map(|loaded| sign_provider_profile(loaded.profile, policy_signer))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ProviderProfileState {
         revision: provider_profile_revision(&profiles),
         ids,
         profiles,
-    }
+    })
+}
+
+fn sign_provider_profile(
+    mut profile: ProviderProfile,
+    policy_signer: &PolicySigner,
+) -> Result<ProviderProfile, String> {
+    profile.annotations.remove(PROFILE_SIGNATURE_ANNOTATION);
+    profile.annotations.remove(PROFILE_HASH_ANNOTATION);
+    profile.annotations.remove(PROFILE_SIGNATURE_KID_ANNOTATION);
+
+    let profile_hash = deterministic_profile_hash(&profile);
+    let profile_signature = policy_signer.sign_profile(&profile.id, &profile_hash)?;
+    profile
+        .annotations
+        .insert(PROFILE_HASH_ANNOTATION.to_string(), profile_hash);
+    profile.annotations.insert(
+        PROFILE_SIGNATURE_KID_ANNOTATION.to_string(),
+        policy_signer.kid().to_string(),
+    );
+    profile
+        .annotations
+        .insert(PROFILE_SIGNATURE_ANNOTATION.to_string(), profile_signature);
+    Ok(profile)
 }
 
 fn provider_profile_revision(profiles: &[ProviderProfile]) -> String {
@@ -696,6 +903,17 @@ fn provider_profile_revision(profiles: &[ProviderProfile]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+fn deterministic_profile_hash(profile: &ProviderProfile) -> String {
+    let mut profile = profile.clone();
+    profile.annotations.remove(PROFILE_SIGNATURE_ANNOTATION);
+    profile.annotations.remove(PROFILE_HASH_ANNOTATION);
+    profile.annotations.remove(PROFILE_SIGNATURE_KID_ANNOTATION);
+    let mut hasher = Sha256::new();
+    hasher.update(b"openshell-governance-provider-profile-v1");
+    hasher.update(profile.encode_to_vec());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
 fn is_managed_profile_id(managed_profile_ids: &[String], id: &str) -> bool {
     managed_profile_ids.iter().any(|managed| managed == id)
 }
@@ -705,16 +923,16 @@ fn format_id_list(ids: &[String]) -> String {
 }
 
 fn providers_are_managed(value: Option<&Value>, managed_profile_ids: &[String]) -> bool {
-    let Some(Value::Array(providers)) = value else {
+    let Some(value) = value else {
+        return true;
+    };
+    let Value::Array(providers) = value else {
         return false;
     };
-    if providers.len() != managed_profile_ids.len() {
-        return false;
-    }
-    managed_profile_ids.iter().all(|provider| {
-        providers
-            .iter()
-            .any(|value| value.as_str() == Some(provider.as_str()))
+    providers.iter().all(|provider| {
+        provider
+            .as_str()
+            .is_some_and(|provider| is_managed_profile_id(managed_profile_ids, provider))
     })
 }
 
@@ -765,14 +983,6 @@ fn normalize_for_struct(value: Value) -> Result<Value, String> {
     json_to_proto_value(&value).map(|value| proto_value_to_json(&value))
 }
 
-fn policy_hash(policy: &Value) -> Result<String, String> {
-    let policy = normalize_for_struct(policy.clone())?;
-    let encoded = serde_json::to_vec(&policy)
-        .map_err(|err| format!("failed to encode policy JSON: {err}"))?;
-    let digest: [u8; 32] = Sha256::digest(encoded).into();
-    Ok(format!("sha256-{}", URL_SAFE_NO_PAD.encode(digest)))
-}
-
 fn kid_from_public_key_der(public_key_der: &[u8]) -> String {
     let digest = Sha256::digest(public_key_der);
     hex_encode_prefix(&digest, 16)
@@ -797,219 +1007,18 @@ fn now_secs() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-fn sandbox_policy_to_proto_json(policy: &SandboxPolicy) -> Value {
-    let mut out = Map::new();
-    out.insert("version".to_string(), json!(policy.version));
-
-    if let Some(filesystem) = &policy.filesystem {
-        out.insert(
-            "filesystem".to_string(),
-            json!({
-                "includeWorkdir": filesystem.include_workdir,
-                "readOnly": filesystem.read_only,
-                "readWrite": filesystem.read_write,
-            }),
-        );
-    }
-
-    if let Some(landlock) = &policy.landlock {
-        out.insert(
-            "landlock".to_string(),
-            json!({ "compatibility": landlock.compatibility }),
-        );
-    }
-
-    if let Some(process) = &policy.process {
-        out.insert(
-            "process".to_string(),
-            json!({
-                "runAsUser": process.run_as_user,
-                "runAsGroup": process.run_as_group,
-            }),
-        );
-    }
-
-    out.insert(
-        "networkPolicies".to_string(),
-        Value::Object(
-            policy
-                .network_policies
-                .iter()
-                .map(|(key, rule)| (key.clone(), network_rule_to_proto_json(rule)))
-                .collect(),
-        ),
-    );
-
-    Value::Object(out)
+fn sandbox_policy_to_proto_json(policy: &SandboxPolicy) -> Result<Value, String> {
+    ProtoJsonCodec::openshell()
+        .and_then(|codec| codec.decode_message_to_json(SANDBOX_POLICY_TYPE, policy))
+        .map_err(|err| format!("failed to render policy protobuf JSON: {err}"))
 }
 
-fn network_rule_to_proto_json(rule: &NetworkPolicyRule) -> Value {
-    json!({
-        "name": rule.name,
-        "endpoints": rule.endpoints.iter().map(endpoint_to_proto_json).collect::<Vec<_>>(),
-        "binaries": rule.binaries.iter().map(|binary| {
-            json!({ "path": binary.path })
-        }).collect::<Vec<_>>(),
-    })
-}
-
-fn endpoint_to_proto_json(endpoint: &NetworkEndpoint) -> Value {
-    let mut out = Map::new();
-    insert_string(&mut out, "host", &endpoint.host);
-    insert_u32(&mut out, "port", endpoint.port);
-    insert_string(&mut out, "protocol", &endpoint.protocol);
-    insert_string(&mut out, "tls", &endpoint.tls);
-    insert_string(&mut out, "enforcement", &endpoint.enforcement);
-    insert_string(&mut out, "access", &endpoint.access);
-    insert_values(
-        &mut out,
-        "rules",
-        endpoint.rules.iter().map(l7_rule_to_proto_json).collect(),
-    );
-    insert_strings(&mut out, "allowedIps", &endpoint.allowed_ips);
-    insert_values(
-        &mut out,
-        "denyRules",
-        endpoint
-            .deny_rules
-            .iter()
-            .map(l7_deny_rule_to_proto_json)
-            .collect(),
-    );
-    insert_u32s(&mut out, "ports", &endpoint.ports);
-    insert_bool(&mut out, "allowEncodedSlash", endpoint.allow_encoded_slash);
-    insert_string(&mut out, "persistedQueries", &endpoint.persisted_queries);
-    if !endpoint.graphql_persisted_queries.is_empty() {
-        out.insert(
-            "graphqlPersistedQueries".to_string(),
-            Value::Object(
-                endpoint
-                    .graphql_persisted_queries
-                    .iter()
-                    .map(|(key, operation)| {
-                        (key.clone(), graphql_operation_to_proto_json(operation))
-                    })
-                    .collect(),
-            ),
-        );
-    }
-    insert_u32(
-        &mut out,
-        "graphqlMaxBodyBytes",
-        endpoint.graphql_max_body_bytes,
-    );
-    insert_string(&mut out, "path", &endpoint.path);
-    insert_bool(
-        &mut out,
-        "websocketCredentialRewrite",
-        endpoint.websocket_credential_rewrite,
-    );
-    insert_bool(
-        &mut out,
-        "requestBodyCredentialRewrite",
-        endpoint.request_body_credential_rewrite,
-    );
-    insert_bool(&mut out, "advisorProposed", endpoint.advisor_proposed);
-    Value::Object(out)
-}
-
-fn l7_rule_to_proto_json(rule: &L7Rule) -> Value {
-    let mut out = Map::new();
-    if let Some(allow) = &rule.allow {
-        out.insert("allow".to_string(), l7_allow_to_proto_json(allow));
-    }
-    Value::Object(out)
-}
-
-fn l7_allow_to_proto_json(allow: &L7Allow) -> Value {
-    let mut out = Map::new();
-    insert_string(&mut out, "method", &allow.method);
-    insert_string(&mut out, "path", &allow.path);
-    insert_string(&mut out, "command", &allow.command);
-    insert_query(&mut out, &allow.query);
-    insert_string(&mut out, "operationType", &allow.operation_type);
-    insert_string(&mut out, "operationName", &allow.operation_name);
-    insert_strings(&mut out, "fields", &allow.fields);
-    Value::Object(out)
-}
-
-fn l7_deny_rule_to_proto_json(rule: &L7DenyRule) -> Value {
-    let mut out = Map::new();
-    insert_string(&mut out, "method", &rule.method);
-    insert_string(&mut out, "path", &rule.path);
-    insert_string(&mut out, "command", &rule.command);
-    insert_query(&mut out, &rule.query);
-    insert_string(&mut out, "operationType", &rule.operation_type);
-    insert_string(&mut out, "operationName", &rule.operation_name);
-    insert_strings(&mut out, "fields", &rule.fields);
-    Value::Object(out)
-}
-
-fn graphql_operation_to_proto_json(operation: &GraphqlOperation) -> Value {
-    let mut out = Map::new();
-    insert_string(&mut out, "operationType", &operation.operation_type);
-    insert_string(&mut out, "operationName", &operation.operation_name);
-    insert_strings(&mut out, "fields", &operation.fields);
-    Value::Object(out)
-}
-
-fn insert_query(
-    out: &mut Map<String, Value>,
-    query: &HashMap<String, openshell_core::proto::L7QueryMatcher>,
-) {
-    if query.is_empty() {
-        return;
-    }
-    out.insert(
-        "query".to_string(),
-        Value::Object(
-            query
-                .iter()
-                .map(|(key, matcher)| {
-                    let mut value = Map::new();
-                    insert_string(&mut value, "glob", &matcher.glob);
-                    insert_strings(&mut value, "any", &matcher.any);
-                    (key.clone(), Value::Object(value))
-                })
-                .collect(),
-        ),
-    );
-}
-
-fn insert_string(out: &mut Map<String, Value>, key: &str, value: &str) {
-    if !value.is_empty() {
-        out.insert(key.to_string(), Value::String(value.to_string()));
-    }
-}
-
-fn insert_bool(out: &mut Map<String, Value>, key: &str, value: bool) {
-    if value {
-        out.insert(key.to_string(), Value::Bool(value));
-    }
-}
-
-fn insert_u32(out: &mut Map<String, Value>, key: &str, value: u32) {
-    if value != 0 {
-        out.insert(key.to_string(), json!(value));
-    }
-}
-
-fn insert_strings(out: &mut Map<String, Value>, key: &str, values: &[String]) {
-    if !values.is_empty() {
-        out.insert(key.to_string(), json!(values));
-    }
-}
-
-fn insert_u32s(out: &mut Map<String, Value>, key: &str, values: &[u32]) {
-    if !values.is_empty() {
-        out.insert(key.to_string(), json!(values));
-    }
-}
-
-fn insert_values(out: &mut Map<String, Value>, key: &str, values: Vec<Value>) {
-    if !values.is_empty() {
-        out.insert(key.to_string(), Value::Array(values));
-    }
+fn sandbox_policy_from_interceptor_json(policy: &Value) -> Result<SandboxPolicy, String> {
+    let bytes = ProtoJsonCodec::openshell()
+        .and_then(|codec| codec.encode_json_to_message(SANDBOX_POLICY_TYPE, policy))
+        .map_err(|err| format!("sandbox policy cannot be decoded as protobuf JSON: {err}"))?;
+    SandboxPolicy::decode(bytes.as_slice())
+        .map_err(|err| format!("sandbox policy protobuf payload is invalid: {err}"))
 }
 
 fn struct_to_json(value: &Struct) -> Value {
@@ -1076,12 +1085,195 @@ fn proto_value_to_json(value: &ProtoValue) -> Value {
     }
 }
 
+fn spawn_policy_watch_worker(
+    service: GovernanceInterceptorService,
+    policy_path: PathBuf,
+    gateway_endpoint: Option<String>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut last_seen = policy_file_fingerprint(&policy_path).await.ok();
+        loop {
+            tokio::time::sleep(interval).await;
+            let fingerprint = match policy_file_fingerprint(&policy_path).await {
+                Ok(fingerprint) => fingerprint,
+                Err(err) => {
+                    eprintln!("failed to stat governance policy file: {err}");
+                    continue;
+                }
+            };
+            if last_seen.as_ref() == Some(&fingerprint) {
+                continue;
+            }
+            last_seen = Some(fingerprint);
+
+            let policy_yaml = match tokio::fs::read_to_string(&policy_path).await {
+                Ok(policy_yaml) => policy_yaml,
+                Err(err) => {
+                    eprintln!(
+                        "failed to read governance policy file {}: {err}",
+                        policy_path.display()
+                    );
+                    continue;
+                }
+            };
+
+            let policy_state = match service.reload_policy_from_yaml(&policy_yaml) {
+                Ok(Some(policy_state)) => policy_state,
+                Ok(None) => continue,
+                Err(err) => {
+                    eprintln!(
+                        "failed to reload governance policy file {}; keeping previous policy: {err}",
+                        policy_path.display()
+                    );
+                    continue;
+                }
+            };
+
+            println!("reloaded governance policy {}", policy_state.policy_hash);
+            if let Some(endpoint) = gateway_endpoint.as_deref() {
+                if let Err(err) =
+                    propagate_policy_to_running_sandboxes(endpoint, &policy_state).await
+                {
+                    eprintln!("failed to propagate governance policy reload: {err}");
+                }
+            } else {
+                println!(
+                    "gateway endpoint not configured; policy reload applies to future sandbox creation only"
+                );
+            }
+        }
+    });
+}
+
+async fn policy_file_fingerprint(path: &Path) -> Result<(SystemTime, u64), String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
+    Ok((modified, metadata.len()))
+}
+
+async fn propagate_policy_to_running_sandboxes(
+    gateway_endpoint: &str,
+    policy_state: &PolicyState,
+) -> Result<(), String> {
+    let channel = Channel::from_shared(gateway_endpoint.to_string())
+        .map_err(|err| format!("invalid gateway endpoint {gateway_endpoint}: {err}"))?
+        .connect()
+        .await
+        .map_err(|err| format!("connect to gateway {gateway_endpoint} failed: {err}"))?;
+    let mut client = OpenShellClient::new(channel);
+    let mut offset = 0_u32;
+    let limit = 100_u32;
+    let correlation_id = format!("{}:{}", RELOAD_CORRELATION_PREFIX, now_secs());
+    loop {
+        let response = client
+            .list_sandboxes(ListSandboxesRequest {
+                limit,
+                offset,
+                label_selector: String::new(),
+            })
+            .await
+            .map_err(|status| format!("list sandboxes failed: {status}"))?
+            .into_inner();
+        let count = response.sandboxes.len();
+        for sandbox in response.sandboxes {
+            if !sandbox_accepts_policy_reload(&sandbox) {
+                continue;
+            }
+            let Some(name) = sandbox_name(&sandbox).filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            let resource_version = sandbox
+                .metadata
+                .as_ref()
+                .map_or(0, |metadata| metadata.resource_version);
+            let result = client
+                .update_config(UpdateConfigRequest {
+                    name: name.clone(),
+                    policy: Some(policy_state.policy_proto.clone()),
+                    annotations: policy_update_annotations(policy_state, &correlation_id),
+                    expected_resource_version: resource_version,
+                    ..Default::default()
+                })
+                .await;
+            match result {
+                Ok(response) => {
+                    println!(
+                        "propagated governance policy reload to sandbox {} version {}",
+                        name,
+                        response.into_inner().version
+                    );
+                }
+                Err(status) if status.code() == Code::InvalidArgument => {
+                    eprintln!(
+                        "governance policy reload rejected for sandbox {name}: {}",
+                        status.message()
+                    );
+                }
+                Err(status) => {
+                    eprintln!("failed to update sandbox {name}: {status}");
+                }
+            }
+        }
+        if count < usize::try_from(limit).unwrap_or(usize::MAX) {
+            break;
+        }
+        offset = offset.saturating_add(limit);
+    }
+    Ok(())
+}
+
+fn sandbox_accepts_policy_reload(sandbox: &Sandbox) -> bool {
+    let phase = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| SandboxPhase::try_from(status.phase).ok());
+    matches!(
+        phase,
+        Some(SandboxPhase::Ready | SandboxPhase::Provisioning)
+    )
+}
+
+fn sandbox_name(sandbox: &Sandbox) -> Option<String> {
+    sandbox
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.name.clone())
+}
+
+fn policy_update_annotations(
+    policy_state: &PolicyState,
+    correlation_id: &str,
+) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            POLICY_SIGNATURE_ANNOTATION.to_string(),
+            policy_state.policy_signature.clone(),
+        ),
+        (
+            POLICY_HASH_ANNOTATION.to_string(),
+            policy_state.policy_hash.clone(),
+        ),
+        (
+            POLICY_SIGNATURE_KID_ANNOTATION.to_string(),
+            policy_state.policy_signature_kid.clone(),
+        ),
+        (
+            POLICY_RELOAD_CORRELATION_ANNOTATION.to_string(),
+            correlation_id.to_string(),
+        ),
+    ])
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen: SocketAddr = "127.0.0.1:18081".parse()?;
     let mut policy_path: Option<PathBuf> = None;
     let mut profiles_path: Option<PathBuf> = None;
     let mut gateway_endpoint: Option<String> = None;
+    let mut policy_watch_interval = Duration::from_millis(DEFAULT_POLICY_WATCH_INTERVAL_MS);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1101,9 +1293,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let value = args.next().ok_or("--gateway-endpoint requires a URL")?;
                 gateway_endpoint = Some(value);
             }
+            "--policy-watch-interval-ms" => {
+                let value = args
+                    .next()
+                    .ok_or("--policy-watch-interval-ms requires a duration")?;
+                let millis = value.parse::<u64>()?;
+                if millis == 0 {
+                    return Err("--policy-watch-interval-ms must be greater than zero".into());
+                }
+                policy_watch_interval = Duration::from_millis(millis);
+            }
             "-h" | "--help" => {
                 println!(
-                    "usage: governance-interceptor [--listen ADDR] [--policy FILE] [--profiles FILE_OR_DIR] [--gateway-endpoint URL]"
+                    "usage: governance-interceptor [--listen ADDR] [--policy FILE] [--profiles FILE_OR_DIR] [--gateway-endpoint URL] [--policy-watch-interval-ms MS]"
                 );
                 return Ok(());
             }
@@ -1111,22 +1313,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let policy_yaml = if let Some(path) = policy_path {
-        tokio::fs::read_to_string(path).await?
-    } else {
-        include_str!("../policy.yaml").to_string()
-    };
+    let policy_path = policy_path.unwrap_or_else(default_policy_path);
+    let policy_yaml = tokio::fs::read_to_string(&policy_path).await?;
     let profiles_path = profiles_path.unwrap_or_else(default_profiles_path);
     let service =
         GovernanceInterceptorService::from_policy_and_profiles_path(&policy_yaml, profiles_path)?;
 
-    if let Some(endpoint) = gateway_endpoint {
-        println!(
-            "--gateway-endpoint is ignored; provider profiles are vended through the interceptor snapshot API ({endpoint})"
-        );
+    if let Some(endpoint) = &gateway_endpoint {
+        println!("policy reload propagation enabled through gateway endpoint {endpoint}");
+    } else {
+        println!("policy reload propagation disabled; --gateway-endpoint was not provided");
     }
     let profile_state = service.current_profile_state();
     println!("loaded provider profiles: {}", profile_state.ids.join(", "));
+    println!(
+        "loaded governance policy {} from {}",
+        service.current_policy_state().policy_hash,
+        policy_path.display()
+    );
+    spawn_policy_watch_worker(
+        service.clone(),
+        policy_path,
+        gateway_endpoint,
+        policy_watch_interval,
+    );
 
     println!("governance interceptor listening on {listen}");
     Server::builder()
@@ -1140,488 +1350,9 @@ fn default_profiles_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("profiles")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn service() -> GovernanceInterceptorService {
-        let profiles = load_provider_profiles(&default_profiles_path()).unwrap();
-        GovernanceInterceptorService::from_profiles(profiles).unwrap()
-    }
-
-    fn evaluation(
-        method: &str,
-        phase: GatewayInterceptorPhase,
-        operation: Value,
-    ) -> InterceptorEvaluation {
-        InterceptorEvaluation {
-            interceptor_name: "test".to_string(),
-            binding_id: "binding".to_string(),
-            service: SERVICE.to_string(),
-            method: method.to_string(),
-            phase: phase as i32,
-            operation: Some(json_to_struct(&operation).unwrap()),
-            current_state: Some(Struct::default()),
-            principal: HashMap::new(),
-        }
-    }
-
-    fn managed_profile_ids(service: &GovernanceInterceptorService) -> Vec<String> {
-        service.current_profile_state().ids
-    }
-
-    fn governed_create_operation(
-        service: &GovernanceInterceptorService,
-        policy: Value,
-        signature: String,
-    ) -> Value {
-        let mut operation = json!({
-            "spec": {
-                "policy": policy,
-                "providers": managed_profile_ids(service),
-            },
-            "annotations": {},
-        });
-        operation
-            .pointer_mut("/annotations")
-            .and_then(Value::as_object_mut)
-            .unwrap()
-            .insert(
-                POLICY_SIGNATURE_ANNOTATION.to_string(),
-                Value::String(signature),
-            );
-        operation
-    }
-
-    fn valid_create_operation(service: &GovernanceInterceptorService) -> Value {
-        governed_create_operation(
-            service,
-            service.policy.clone(),
-            service.policy_signature.clone(),
-        )
-    }
-
-    fn signature_patch_token(result: &InterceptorResult) -> String {
-        result
-            .patches
-            .iter()
-            .find(|patch| {
-                patch.path == "/annotations/openshell.nvidia.com~1policy-signature"
-                    || patch.path == "/annotations"
-            })
-            .and_then(|patch| patch.value.as_ref())
-            .map(proto_value_to_json)
-            .and_then(|value| {
-                value.as_str().map(ToString::to_string).or_else(|| {
-                    value
-                        .pointer(&format!(
-                            "/{}",
-                            json_pointer_escape(POLICY_SIGNATURE_ANNOTATION)
-                        ))
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                })
-            })
-            .expect("signature patch value")
-    }
-
-    #[test]
-    fn manifest_declares_governance_bindings() {
-        let service = service();
-        let manifest = service.manifest();
-        let ids: Vec<_> = manifest
-            .bindings
-            .iter()
-            .map(|binding| binding.id.as_str())
-            .collect();
-        assert!(ids.contains(&"govern-import-provider-profiles"));
-        assert!(ids.contains(&"govern-update-provider-profiles"));
-        assert!(ids.contains(&"govern-delete-provider-profile"));
-        assert!(ids.contains(&"govern-update-config"));
-        assert!(ids.contains(&"govern-create-sandbox"));
-        assert!(!ids.contains(&"govern-attach-provider"));
-        assert!(!ids.contains(&"govern-detach-provider"));
-        assert!(!ids.contains(&"govern-update-provider"));
-        assert!(!ids.contains(&"govern-delete-provider"));
-        assert_eq!(manifest.failure_policy, "fail_closed");
-        assert!(manifest.provider_profiles);
-    }
-
-    #[tokio::test]
-    async fn snapshot_provider_profiles_returns_current_profiles() {
-        let service = service();
-        let snapshot = service
-            .snapshot_provider_profiles(Request::new(ProviderProfileSnapshotRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(!snapshot.revision.is_empty());
-        let profile_ids = snapshot
-            .profiles
-            .iter()
-            .map(|profile| profile.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(profile_ids, vec!["github", "slack"]);
-    }
-
-    #[test]
-    fn profile_loader_uses_file_name_as_profile_id() {
-        let loaded = load_provider_profile_source(
-            "profiles/example-api.yaml",
-            r#"
-id: ignored
-display_name: Example API
-description: Example profile
-credentials: []
-endpoints: []
-binaries: []
-"#,
-            "example-api",
-        )
-        .unwrap();
-        assert_eq!(loaded.profile.id, "example-api");
-
-        let loaded = load_provider_profile_source(
-            "profiles/no-id.yaml",
-            r#"
-display_name: No ID
-description: Filename supplies the profile id
-credentials: []
-endpoints: []
-binaries: []
-"#,
-            "no-id",
-        )
-        .unwrap();
-        assert_eq!(loaded.profile.id, "no-id");
-    }
-
-    #[test]
-    fn create_sandbox_modify_adds_policy_providers_and_signature() {
-        let service = service();
-        let result = service
-            .evaluate_inner(&evaluation(
-                "CreateSandbox",
-                GatewayInterceptorPhase::ModifyOperation,
-                json!({"name": "demo", "spec": {}, "labels": {"team": "platform"}}),
-            ))
-            .unwrap();
-
-        assert!(result.allowed);
-        let paths: Vec<_> = result
-            .patches
-            .iter()
-            .map(|patch| patch.path.as_str())
-            .collect();
-        assert!(paths.contains(&"/spec/policy"));
-        assert!(paths.contains(&"/spec/providers"));
-        assert!(
-            paths.contains(&"/annotations")
-                || paths.contains(&"/annotations/openshell.nvidia.com~1policy-signature")
-        );
-        let token = signature_patch_token(&result);
-        assert_eq!(token.split('.').count(), 3);
-        assert_eq!(
-            result
-                .log_annotations
-                .get("correlation_id")
-                .map(String::as_str),
-            Some("governance:create-sandbox:demo")
-        );
-        assert!(result.log_annotations.contains_key("policy_hash"));
-        assert!(result.log_annotations.contains_key("policy_signature_kid"));
-        assert!(!result.log_annotations.contains_key("policy_signature"));
-    }
-
-    #[test]
-    fn create_sandbox_validate_accepts_signed_policy() {
-        let service = service();
-        let result = service
-            .evaluate_inner(&evaluation(
-                "CreateSandbox",
-                GatewayInterceptorPhase::Validate,
-                valid_create_operation(&service),
-            ))
-            .unwrap();
-        assert!(result.allowed);
-    }
-
-    #[test]
-    fn create_sandbox_validate_denies_missing_signature() {
-        let service = service();
-        let result = service
-            .evaluate_inner(&evaluation(
-                "CreateSandbox",
-                GatewayInterceptorPhase::Validate,
-                json!({
-                    "spec": {
-                        "policy": service.policy,
-                        "providers": managed_profile_ids(&service),
-                    },
-                }),
-            ))
-            .unwrap();
-        assert!(!result.allowed);
-        assert!(result.reason.contains("missing"));
-    }
-
-    #[test]
-    fn create_sandbox_validate_denies_malformed_signature() {
-        let service = service();
-        let result = service
-            .evaluate_inner(&evaluation(
-                "CreateSandbox",
-                GatewayInterceptorPhase::Validate,
-                governed_create_operation(
-                    &service,
-                    service.policy.clone(),
-                    "not-a-jwt".to_string(),
-                ),
-            ))
-            .unwrap();
-        assert!(!result.allowed);
-        assert!(result.reason.contains("signature"));
-    }
-
-    #[test]
-    fn create_sandbox_validate_denies_signature_from_other_key() {
-        let governance = service();
-        let other = service();
-        let result = governance
-            .evaluate_inner(&evaluation(
-                "CreateSandbox",
-                GatewayInterceptorPhase::Validate,
-                governed_create_operation(
-                    &governance,
-                    governance.policy.clone(),
-                    other.policy_signature,
-                ),
-            ))
-            .unwrap();
-        assert!(!result.allowed);
-        assert!(result.reason.contains("signature"));
-    }
-
-    #[test]
-    fn create_sandbox_validate_denies_signed_policy_mismatch() {
-        let service = service();
-        let mut tampered_policy = service.policy.clone();
-        tampered_policy
-            .as_object_mut()
-            .unwrap()
-            .insert("version".to_string(), json!(999));
-        let result = service
-            .evaluate_inner(&evaluation(
-                "CreateSandbox",
-                GatewayInterceptorPhase::Validate,
-                governed_create_operation(
-                    &service,
-                    tampered_policy,
-                    service.policy_signature.clone(),
-                ),
-            ))
-            .unwrap();
-        assert!(!result.allowed);
-        assert!(result.reason.contains("signature"));
-    }
-
-    #[test]
-    fn policy_patch_uses_protobuf_json_names() {
-        let service = service();
-        assert!(service.policy.get("filesystem").is_some());
-        assert!(service.policy.get("networkPolicies").is_some());
-        assert!(service.policy.get("filesystem_policy").is_none());
-        assert!(service.policy.get("network_policies").is_none());
-    }
-
-    #[test]
-    fn provider_creation_is_limited_to_vended_profiles() {
-        let service = service();
-        let github = service
-            .evaluate_inner(&evaluation(
-                "CreateProvider",
-                GatewayInterceptorPhase::Validate,
-                json!({"provider": {"metadata": {"name": "work-github"}, "type": "github"}}),
-            ))
-            .unwrap();
-        assert!(github.allowed);
-
-        let slack = service
-            .evaluate_inner(&evaluation(
-                "CreateProvider",
-                GatewayInterceptorPhase::Validate,
-                json!({"provider": {"metadata": {"name": "team-chat"}, "type": "slack"}}),
-            ))
-            .unwrap();
-        assert!(slack.allowed);
-
-        let teams = service
-            .evaluate_inner(&evaluation(
-                "CreateProvider",
-                GatewayInterceptorPhase::Validate,
-                json!({"provider": {"metadata": {"name": "teams"}, "type": "teams"}}),
-            ))
-            .unwrap();
-        assert!(!teams.allowed);
-        assert!(
-            teams
-                .reason
-                .contains("providers may only use vended provider profiles")
-        );
-    }
-
-    #[test]
-    fn provider_profile_import_is_limited_to_governed_profiles() {
-        let service = service();
-        let result = service
-            .evaluate_inner(&evaluation(
-                "ImportProviderProfiles",
-                GatewayInterceptorPhase::Validate,
-                json!({
-                    "profiles": [
-                        {"profile": {"id": "github"}},
-                        {"profile": {"id": "slack"}}
-                    ]
-                }),
-            ))
-            .unwrap();
-        assert!(result.allowed);
-
-        let result = service
-            .evaluate_inner(&evaluation(
-                "ImportProviderProfiles",
-                GatewayInterceptorPhase::Validate,
-                json!({"profiles": [{"profile": {"id": "custom-slack"}}]}),
-            ))
-            .unwrap();
-        assert!(!result.allowed);
-    }
-
-    #[test]
-    fn provider_profile_update_is_limited_to_matching_governed_profiles() {
-        let service = service();
-        let result = service
-            .evaluate_inner(&evaluation(
-                "UpdateProviderProfiles",
-                GatewayInterceptorPhase::Validate,
-                json!({
-                    "id": "slack",
-                    "profile": {"profile": {"id": "slack"}}
-                }),
-            ))
-            .unwrap();
-        assert!(result.allowed);
-
-        let result = service
-            .evaluate_inner(&evaluation(
-                "UpdateProviderProfiles",
-                GatewayInterceptorPhase::Validate,
-                json!({
-                    "id": "slack",
-                    "profile": {"profile": {"id": "github"}}
-                }),
-            ))
-            .unwrap();
-        assert!(!result.allowed);
-
-        let result = service
-            .evaluate_inner(&evaluation(
-                "UpdateProviderProfiles",
-                GatewayInterceptorPhase::Validate,
-                json!({
-                    "id": "custom-slack",
-                    "profile": {"profile": {"id": "custom-slack"}}
-                }),
-            ))
-            .unwrap();
-        assert!(!result.allowed);
-    }
-
-    #[test]
-    fn provider_profile_delete_is_denied() {
-        let service = service();
-        let result = service
-            .evaluate_inner(&evaluation(
-                "DeleteProviderProfile",
-                GatewayInterceptorPhase::Validate,
-                json!({"id": "github"}),
-            ))
-            .unwrap();
-        assert!(!result.allowed);
-        assert!(result.reason.contains("deletes are blocked"));
-    }
-
-    #[test]
-    fn provider_update_and_delete_are_not_governed() {
-        let service = service();
-        let update = service
-            .evaluate_inner(&evaluation(
-                "UpdateProvider",
-                GatewayInterceptorPhase::Validate,
-                json!({"provider": {"metadata": {"name": "slack"}}}),
-            ))
-            .unwrap();
-        assert!(update.allowed);
-
-        let delete = service
-            .evaluate_inner(&evaluation(
-                "DeleteProvider",
-                GatewayInterceptorPhase::Validate,
-                json!({"name": "github"}),
-            ))
-            .unwrap();
-        assert!(delete.allowed);
-    }
-
-    #[test]
-    fn policy_update_and_merge_are_denied() {
-        let service = service();
-        for operation in [
-            json!({"name": "demo", "policy": {"version": 1}}),
-            json!({"name": "demo", "mergeOperations": [{"op": "add"}]}),
-            json!({"name": "demo", "merge_operations": [{"op": "add"}]}),
-        ] {
-            let result = service
-                .evaluate_inner(&evaluation(
-                    "UpdateConfig",
-                    GatewayInterceptorPhase::Validate,
-                    operation,
-                ))
-                .unwrap();
-            assert!(!result.allowed);
-        }
-
-        let settings_update = service
-            .evaluate_inner(&evaluation(
-                "UpdateConfig",
-                GatewayInterceptorPhase::Validate,
-                json!({"global": true, "settingKey": "providers_v2_enabled"}),
-            ))
-            .unwrap();
-        assert!(settings_update.allowed);
-
-        let global_policy_update = service
-            .evaluate_inner(&evaluation(
-                "UpdateConfig",
-                GatewayInterceptorPhase::Validate,
-                json!({"global": true, "policy": {"version": 1}}),
-            ))
-            .unwrap();
-        assert!(global_policy_update.allowed);
-
-        let mut sandbox_policy_sync = evaluation(
-            "UpdateConfig",
-            GatewayInterceptorPhase::Validate,
-            json!({"name": "demo", "policy": {"version": 1}}),
-        );
-        sandbox_policy_sync
-            .principal
-            .insert("kind".to_string(), "sandbox".to_string());
-        sandbox_policy_sync
-            .principal
-            .insert("sandbox_id".to_string(), "demo-id".to_string());
-        let sandbox_policy_sync = service.evaluate_inner(&sandbox_policy_sync).unwrap();
-        assert!(sandbox_policy_sync.allowed);
-    }
+fn default_policy_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policy.yaml")
 }
+
+#[cfg(test)]
+mod tests;

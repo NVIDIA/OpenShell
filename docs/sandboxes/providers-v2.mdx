@@ -165,11 +165,14 @@ The `category` field controls how `openshell provider list-profiles` groups prof
 ### Profile Schema
 
 Provider profile YAML and JSON use this shape. Treat this as a field map, not a profile to import verbatim. The endpoint and rule fields mirror the network policy schema used under `network_policies`. Refer to [Policy Schema Reference](/reference/policy-schema) for field semantics.
+Use `annotations` only for non-secret metadata such as source, signature, or governance markers. OpenShell preserves annotations through profile import, export, and interceptor-managed profile snapshots.
 
 ```yaml wordWrap showLineNumbers={false}
 id: custom-api
 # Present on exported custom profiles; preserve it when updating.
 resource_version: 1
+annotations:
+  example.com/source: platform
 display_name: Custom API
 description: Custom API access for sandbox agents
 category: data

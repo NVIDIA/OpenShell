@@ -1098,6 +1098,8 @@ message ProviderProfile {
   // profile files use 0. Gateway responses set this for stored custom profiles.
   // Update calls use this for optimistic concurrency.
   uint64 resource_version = 10;
+  // Optional non-secret annotations attached by profile sources or importers.
+  map<string, string> annotations = 11;
 }
 
 // Stored custom provider profile object.

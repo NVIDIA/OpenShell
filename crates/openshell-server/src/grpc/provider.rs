@@ -2536,6 +2536,7 @@ mod tests {
         let profile = ProviderProfile {
             id: "keycloak-sso".to_string(),
             resource_version: 0,
+            annotations: HashMap::new(),
             display_name: "Keycloak SSO".to_string(),
             description: String::new(),
             category: ProviderProfileCategory::Other as i32,
@@ -3089,6 +3090,7 @@ mod tests {
         ProviderProfile {
             id: id.to_string(),
             resource_version: 0,
+            annotations: HashMap::new(),
             display_name: format!("{id} Profile"),
             description: String::new(),
             category: ProviderProfileCategory::Other as i32,
@@ -3528,6 +3530,7 @@ mod tests {
                     profile: Some(ProviderProfile {
                         id: "advanced-api".to_string(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                         display_name: "Advanced API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Other as i32,
@@ -4661,6 +4664,7 @@ mod tests {
                     profile: Some(ProviderProfile {
                         id: "delegated-refresh-api".to_string(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                         display_name: "Delegated Refresh API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Messaging as i32,
