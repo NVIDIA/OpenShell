@@ -79,6 +79,30 @@ openshell gateway add --local https://127.0.0.1:17670
 openshell status
 ```
 
+### Sandbox callbacks fail with loopback gateway bind
+
+The RPM default binds the primary gateway listener to `127.0.0.1:17670`. When
+Podman uses rootless pasta, sandbox containers call back through
+`host.containers.internal` and may not reach host loopback directly. The Podman
+driver normally adds a protected non-loopback callback listener when TLS/auth
+are enabled.
+
+Check the gateway logs:
+
+```shell
+journalctl --user -u openshell-gateway -b | grep 'callback listener'
+```
+
+A working rootless pasta setup logs that it is adding a callback listener. If
+the logs say TLS/auth are incomplete, restore the generated local TLS/mTLS
+configuration or bind explicitly to a reachable address. If you intentionally
+disabled the listener, re-enable it:
+
+```toml
+[openshell.drivers.podman]
+enable_auto_callback_listener = true
+```
+
 ### Option 2: Externally-managed certificates
 
 Generate certificates that include the server's hostname or IP in the
@@ -272,9 +296,9 @@ Other breaking changes in this release:
   openshell gateway add --local https://127.0.0.1:17670
   ```
 
-- **Default bind address changed from `0.0.0.0` to `127.0.0.1`.** If
-  you relied on network-accessible access without an explicit bind
-  address, add the following to `~/.config/openshell/gateway.toml`:
+- **The default bind address is `127.0.0.1`.** If you rely on
+  network-accessible access without the Podman auto callback listener,
+  add the following to `~/.config/openshell/gateway.toml`:
 
   ```toml
   [openshell.gateway]

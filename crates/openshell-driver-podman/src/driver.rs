@@ -3,7 +3,7 @@
 
 //! Podman compute driver.
 
-use crate::client::{PodmanApiError, PodmanClient, VolumeInspect};
+use crate::client::{PodmanApiError, PodmanClient, SystemInfo, VolumeInspect};
 use crate::config::PodmanComputeConfig;
 use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
 use crate::watcher::{
@@ -19,7 +19,8 @@ use openshell_core::gpu::{
 use openshell_core::proto::compute::v1::{
     DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
 };
-use std::path::{Path, PathBuf};
+use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -42,6 +43,7 @@ pub struct PodmanComputeDriver {
     /// The host's IP on the bridge network. Sandbox containers use this to
     /// reach the gateway server when no explicit gRPC endpoint is configured.
     network_gateway_ip: Option<String>,
+    uses_rootless_pasta: bool,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
 }
@@ -83,62 +85,34 @@ fn podman_volume_is_bind_backed(volume: &VolumeInspect) -> bool {
         })
 }
 
-fn sandbox_token_host_path(sandbox_id: &str) -> Result<PathBuf, ComputeDriverError> {
-    openshell_core::driver_utils::sandbox_token_path("podman-sandbox-tokens", None, sandbox_id)
-        .map_err(|err| ComputeDriverError::Message(format!("resolve state dir failed: {err}")))
-}
-
-async fn write_sandbox_token_file(
+async fn create_sandbox_token_secret(
+    client: &PodmanClient,
     sandbox: &DriverSandbox,
-) -> Result<Option<PathBuf>, ComputeDriverError> {
-    let Some(spec) = sandbox.spec.as_ref() else {
+) -> Result<Option<String>, ComputeDriverError> {
+    let Some(token) = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.sandbox_token.trim())
+        .filter(|token| !token.is_empty())
+    else {
         return Ok(None);
     };
-    if spec.sandbox_token.is_empty() {
-        return Ok(None);
-    }
-    let path = sandbox_token_host_path(&sandbox.id)?;
-    if let Some(parent) = path.parent() {
-        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
-            ComputeDriverError::Message(format!(
-                "create sandbox token directory {} failed: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    tokio::fs::write(&path, format!("{}\n", spec.sandbox_token))
+
+    let secret_name = container::token_secret_name(&sandbox.id);
+    client
+        .create_secret(&secret_name, format!("{token}\n").as_bytes())
         .await
-        .map_err(|err| {
-            ComputeDriverError::Message(format!(
-                "write sandbox token file {} failed: {err}",
-                path.display()
-            ))
-        })?;
-    openshell_core::paths::set_file_owner_only(&path).map_err(|err| {
-        ComputeDriverError::Message(format!(
-            "restrict sandbox token file {} failed: {err}",
-            path.display()
-        ))
-    })?;
-    Ok(Some(path))
+        .map_err(ComputeDriverError::from)?;
+    Ok(Some(secret_name))
 }
 
-fn cleanup_sandbox_token_file(sandbox_id: &str) {
-    let Ok(path) = sandbox_token_host_path(sandbox_id) else {
-        return;
-    };
-    if let Err(err) = std::fs::remove_file(&path)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
+async fn cleanup_sandbox_token_secret(client: &PodmanClient, secret_name: &str) {
+    if let Err(err) = client.remove_secret(secret_name).await {
         warn!(
-            sandbox_id = %sandbox_id,
-            path = %path.display(),
+            secret = %secret_name,
             error = %err,
-            "Failed to remove Podman sandbox token file"
+            "Failed to remove Podman sandbox token secret"
         );
-    }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::remove_dir(dir);
     }
 }
 
@@ -226,6 +200,7 @@ impl PodmanComputeDriver {
                 Ok(()) => break,
                 Err(e) if attempts < MAX_PING_RETRIES => {
                     attempts += 1;
+                    let e = enrich_socket_connection_error(e);
                     warn!(
                         attempt = attempts,
                         max_retries = MAX_PING_RETRIES,
@@ -234,12 +209,12 @@ impl PodmanComputeDriver {
                     );
                     tokio::time::sleep(PING_RETRY_DELAY).await;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(enrich_socket_connection_error(e)),
             }
         }
 
         // Verify cgroups v2, detect rootless mode, and log system info.
-        match client.system_info().await {
+        let uses_rootless_pasta = match client.system_info().await {
             Ok(info) => {
                 if info.host.cgroup_version != "v2" {
                     return Err(PodmanApiError::Connection(format!(
@@ -249,24 +224,30 @@ impl PodmanComputeDriver {
                         info.host.cgroup_version
                     )));
                 }
+                let uses_rootless_pasta = podman_uses_rootless_pasta(&info);
                 info!(
                     cgroup_version = %info.host.cgroup_version,
                     network_backend = %info.host.network_backend,
+                    rootless_network_cmd = %info.host.rootless_network_cmd,
                     rootless = info.host.security.rootless,
                     "Connected to Podman"
                 );
+                uses_rootless_pasta
             }
             Err(e) => {
                 return Err(PodmanApiError::Connection(format!(
                     "failed to query Podman system info: {e}"
                 )));
             }
-        }
+        };
 
         // Rootless pre-flight: warn if subuid/subgid ranges look missing.
         // Not a hard error because some systems configure these via LDAP or
         // other mechanisms that /etc/subuid does not reflect.
-        if !cfg!(target_os = "macos") && rustix::process::getuid().as_raw() != 0 {
+        if !cfg!(target_os = "macos")
+            && rustix::process::getuid().as_raw() != 0
+            && !running_inside_container()
+        {
             check_subuid_range();
         }
 
@@ -318,6 +299,7 @@ impl PodmanComputeDriver {
             client,
             config,
             network_gateway_ip,
+            uses_rootless_pasta,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -333,6 +315,29 @@ impl PodmanComputeDriver {
     #[must_use]
     pub fn network_gateway_ip(&self) -> Option<&str> {
         self.network_gateway_ip.as_deref()
+    }
+
+    /// Extra host-side gateway listener address for direct host deployments.
+    ///
+    /// Direct host gateways that bind only to loopback can also listen on the
+    /// Podman bridge gateway IP so sandbox containers can reach
+    /// `host.containers.internal:<port>`. Rootless pasta uses link-local
+    /// host-gateway forwarding instead, where the gateway should keep its
+    /// loopback listener and must not try to bind the link-local alias.
+    #[must_use]
+    pub fn gateway_bind_address(&self) -> Option<SocketAddr> {
+        gateway_bind_address(
+            self.network_gateway_ip.as_deref(),
+            self.config.gateway_bind_address,
+            self.config.gateway_port,
+            running_inside_container(),
+            self.uses_rootless_pasta,
+            self.config.enable_auto_callback_listener,
+            self.config.gateway_tls_enabled,
+            self.config.gateway_callback_auth_enabled,
+            local_interface_bind_address,
+            socket_address_is_bindable,
+        )
     }
 
     /// Report driver capabilities.
@@ -533,12 +538,12 @@ impl PodmanComputeDriver {
                 .map_err(ComputeDriverError::from)?;
         }
 
-        // 2. Create workspace volume.
+        // 2. Create workspace volume and per-sandbox token secret.
         if let Err(e) = self.client.create_volume(&vol_name).await {
             return Err(ComputeDriverError::from(e));
         }
-        let token_host_path = match write_sandbox_token_file(sandbox).await {
-            Ok(path) => path,
+        let token_secret_name = match create_sandbox_token_secret(&self.client, sandbox).await {
+            Ok(name) => name,
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
                 return Err(e);
@@ -554,20 +559,24 @@ impl PodmanComputeDriver {
             Ok(devices) => devices,
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
-                cleanup_sandbox_token_file(&sandbox.id);
+                if let Some(secret) = token_secret_name.as_deref() {
+                    cleanup_sandbox_token_secret(&self.client, secret).await;
+                }
                 return Err(e);
             }
         };
         let spec = match container::build_container_spec_with_token_and_gpu_devices(
             sandbox,
             &self.config,
-            token_host_path.as_deref(),
+            token_secret_name.as_deref(),
             gpu_devices.as_deref(),
         ) {
             Ok(spec) => spec,
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
-                cleanup_sandbox_token_file(&sandbox.id);
+                if let Some(secret) = token_secret_name.as_deref() {
+                    cleanup_sandbox_token_secret(&self.client, secret).await;
+                }
                 return Err(e);
             }
         };
@@ -579,12 +588,16 @@ impl PodmanComputeDriver {
                 // has the same name but a different ID), so it would be
                 // orphaned otherwise.
                 let _ = self.client.remove_volume(&vol_name).await;
-                cleanup_sandbox_token_file(&sandbox.id);
+                if let Some(secret) = token_secret_name.as_deref() {
+                    cleanup_sandbox_token_secret(&self.client, secret).await;
+                }
                 return Err(ComputeDriverError::AlreadyExists);
             }
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
-                cleanup_sandbox_token_file(&sandbox.id);
+                if let Some(secret) = token_secret_name.as_deref() {
+                    cleanup_sandbox_token_secret(&self.client, secret).await;
+                }
                 return Err(ComputeDriverError::from(e));
             }
         }
@@ -598,7 +611,9 @@ impl PodmanComputeDriver {
             );
             let _ = self.client.remove_container(&name).await;
             let _ = self.client.remove_volume(&vol_name).await;
-            cleanup_sandbox_token_file(&sandbox.id);
+            if let Some(secret) = token_secret_name.as_deref() {
+                cleanup_sandbox_token_secret(&self.client, secret).await;
+            }
             return Err(ComputeDriverError::from(e));
         }
 
@@ -696,7 +711,7 @@ impl PodmanComputeDriver {
                 "Failed to remove workspace volume"
             );
         }
-        cleanup_sandbox_token_file(sandbox_id);
+        cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id)).await;
 
         Ok(container_existed)
     }
@@ -798,6 +813,7 @@ impl PodmanComputeDriver {
             client,
             config,
             network_gateway_ip: None,
+            uses_rootless_pasta: false,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 gpu_inventory,
                 allow_all_default_gpu,
@@ -806,6 +822,178 @@ impl PodmanComputeDriver {
                 (refresh_inventory.clone(), allow_all_default_gpu)
             }),
         }
+    }
+}
+
+/// Return true when the gateway process appears to be running inside a
+/// container. Used only to tune host preflight checks whose local filesystem
+/// or network namespace view is misleading from inside the gateway image.
+fn running_inside_container() -> bool {
+    Path::new("/run/.containerenv").exists() || Path::new("/.dockerenv").exists()
+}
+
+fn podman_uses_rootless_pasta(info: &SystemInfo) -> bool {
+    info.host.security.rootless && info.host.rootless_network_cmd == "pasta"
+}
+
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+fn gateway_bind_address(
+    network_gateway_ip: Option<&str>,
+    gateway_bind_address: Option<SocketAddr>,
+    gateway_port: u16,
+    is_containerized_gateway: bool,
+    uses_rootless_pasta: bool,
+    enable_auto_callback_listener: bool,
+    gateway_tls_enabled: bool,
+    gateway_callback_auth_enabled: bool,
+    callback_listener: impl Fn(u16) -> Option<SocketAddr>,
+    is_bindable: impl Fn(SocketAddr) -> bool,
+) -> Option<SocketAddr> {
+    if is_containerized_gateway {
+        return None;
+    }
+
+    if uses_rootless_pasta {
+        return pasta_gateway_bind_address(
+            gateway_bind_address,
+            gateway_port,
+            enable_auto_callback_listener,
+            gateway_tls_enabled,
+            gateway_callback_auth_enabled,
+            callback_listener,
+            is_bindable,
+        );
+    }
+
+    let addr = bridge_gateway_bind_address_candidate(network_gateway_ip, gateway_port)?;
+    if is_bindable(addr) {
+        Some(addr)
+    } else {
+        warn!(
+            address = %addr,
+            "Podman bridge gateway address is not bindable from the gateway namespace; skipping extra gateway listener"
+        );
+        None
+    }
+}
+
+fn pasta_gateway_bind_address(
+    gateway_bind_address: Option<SocketAddr>,
+    gateway_port: u16,
+    enable_auto_callback_listener: bool,
+    gateway_tls_enabled: bool,
+    gateway_callback_auth_enabled: bool,
+    callback_listener: impl Fn(u16) -> Option<SocketAddr>,
+    is_bindable: impl Fn(SocketAddr) -> bool,
+) -> Option<SocketAddr> {
+    let gateway_bind_address = gateway_bind_address?;
+    if !gateway_bind_address.ip().is_loopback() {
+        return None;
+    }
+    if !enable_auto_callback_listener {
+        info!(
+            bind = %gateway_bind_address,
+            "Rootless Podman pasta detected with loopback gateway bind; automatic callback listener disabled by configuration"
+        );
+        return None;
+    }
+    if !gateway_tls_enabled || !gateway_callback_auth_enabled {
+        warn!(
+            bind = %gateway_bind_address,
+            tls_enabled = gateway_tls_enabled,
+            auth_enabled = gateway_callback_auth_enabled,
+            "Rootless Podman pasta detected with loopback gateway bind but TLS/auth are incomplete; skipping automatic non-loopback callback listener"
+        );
+        return None;
+    }
+
+    let addr = callback_listener(gateway_port)?;
+    if is_bindable(addr) {
+        info!(
+            bind = %gateway_bind_address,
+            callback_listener = %addr,
+            "Rootless Podman pasta detected with loopback gateway bind; adding callback listener for sandbox callbacks"
+        );
+        Some(addr)
+    } else {
+        warn!(
+            bind = %gateway_bind_address,
+            callback_listener = %addr,
+            "Rootless Podman pasta callback listener address is not bindable; sandbox callbacks may fail"
+        );
+        None
+    }
+}
+
+fn bridge_gateway_bind_address_candidate(
+    network_gateway_ip: Option<&str>,
+    gateway_port: u16,
+) -> Option<SocketAddr> {
+    let ip = network_gateway_ip?.parse().ok()?;
+    if openshell_core::net::is_link_local_ip(ip) {
+        return None;
+    }
+    Some(SocketAddr::new(ip, gateway_port))
+}
+
+fn local_interface_bind_address(gateway_port: u16) -> Option<SocketAddr> {
+    local_interface_callback_ips()
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, gateway_port))
+        .find(|addr| socket_address_is_bindable(*addr))
+}
+
+fn local_interface_callback_ips() -> Vec<IpAddr> {
+    let Ok(ifaddrs) = nix::ifaddrs::getifaddrs() else {
+        warn!("Failed to enumerate local interface addresses for Podman callback listener");
+        return Vec::new();
+    };
+
+    let mut ips = Vec::new();
+    for iface in ifaddrs {
+        let Some(address) = iface.address else {
+            continue;
+        };
+        let ip = address
+            .as_sockaddr_in()
+            .map(|addr| IpAddr::V4(addr.ip()))
+            .or_else(|| address.as_sockaddr_in6().map(|addr| IpAddr::V6(addr.ip())));
+        let Some(ip) = ip else {
+            continue;
+        };
+        if callback_listener_ip_is_usable(ip) && !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+
+    ips.sort_by_key(|ip| match ip {
+        IpAddr::V4(_) => 0,
+        IpAddr::V6(_) => 1,
+    });
+    ips
+}
+
+fn callback_listener_ip_is_usable(ip: IpAddr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !openshell_core::net::is_link_local_ip(ip)
+}
+
+fn socket_address_is_bindable(addr: SocketAddr) -> bool {
+    std::net::TcpListener::bind(addr).is_ok()
+}
+
+fn enrich_socket_connection_error(err: PodmanApiError) -> PodmanApiError {
+    match err {
+        PodmanApiError::Connection(message)
+            if running_inside_container() && message.contains("Permission denied") =>
+        {
+            PodmanApiError::Connection(format!(
+                "{message}. Gateway is running inside a container and cannot access the mounted Podman socket; for rootless Podman socket deployments run the gateway container with --userns=keep-id so the container UID matches the host user that owns the socket"
+            ))
+        }
+        other => other,
     }
 }
 
@@ -895,6 +1083,125 @@ mod tests {
         ResourceRequirements {
             gpu: Some(GpuResourceRequirements { count }),
         }
+    }
+
+    #[test]
+    fn gateway_bind_address_uses_non_link_local_bridge_ip() {
+        let addr = gateway_bind_address(
+            Some("10.89.1.1"),
+            Some("127.0.0.1:8080".parse().unwrap()),
+            8080,
+            false,
+            false,
+            true,
+            true,
+            true,
+            |_| Some("192.0.2.10:8080".parse().unwrap()),
+            |_| true,
+        );
+        assert_eq!(addr, Some("10.89.1.1:8080".parse().unwrap()));
+    }
+
+    #[test]
+    fn gateway_bind_address_skips_link_local_bridge_gateway() {
+        let addr = gateway_bind_address(
+            Some("169.254.1.2"),
+            Some("127.0.0.1:8080".parse().unwrap()),
+            8080,
+            false,
+            false,
+            true,
+            true,
+            true,
+            |_| Some("192.0.2.10:8080".parse().unwrap()),
+            |_| true,
+        );
+        assert_eq!(addr, None);
+    }
+
+    #[test]
+    fn gateway_bind_address_skips_containerized_gateway() {
+        let addr = gateway_bind_address(
+            Some("10.89.1.1"),
+            Some("127.0.0.1:8080".parse().unwrap()),
+            8080,
+            true,
+            false,
+            true,
+            true,
+            true,
+            |_| Some("192.0.2.10:8080".parse().unwrap()),
+            |_| true,
+        );
+        assert_eq!(addr, None);
+    }
+
+    #[test]
+    fn gateway_bind_address_uses_local_interface_for_pasta_loopback_tls_auth() {
+        let addr = gateway_bind_address(
+            Some("10.89.1.1"),
+            Some("127.0.0.1:8080".parse().unwrap()),
+            8080,
+            false,
+            true,
+            true,
+            true,
+            true,
+            |_| Some("192.0.2.10:8080".parse().unwrap()),
+            |_| true,
+        );
+        assert_eq!(addr, Some("192.0.2.10:8080".parse().unwrap()));
+    }
+
+    #[test]
+    fn gateway_bind_address_skips_pasta_when_auto_listener_disabled() {
+        let addr = gateway_bind_address(
+            Some("10.89.1.1"),
+            Some("127.0.0.1:8080".parse().unwrap()),
+            8080,
+            false,
+            true,
+            false,
+            true,
+            true,
+            |_| Some("192.0.2.10:8080".parse().unwrap()),
+            |_| true,
+        );
+        assert_eq!(addr, None);
+    }
+
+    #[test]
+    fn gateway_bind_address_skips_pasta_without_tls_auth() {
+        let addr = gateway_bind_address(
+            Some("10.89.1.1"),
+            Some("127.0.0.1:8080".parse().unwrap()),
+            8080,
+            false,
+            true,
+            true,
+            true,
+            false,
+            |_| Some("192.0.2.10:8080".parse().unwrap()),
+            |_| true,
+        );
+        assert_eq!(addr, None);
+    }
+
+    #[test]
+    fn gateway_bind_address_skips_pasta_non_loopback_primary_bind() {
+        let addr = gateway_bind_address(
+            Some("10.89.1.1"),
+            Some("192.0.2.10:8080".parse().unwrap()),
+            8080,
+            false,
+            true,
+            true,
+            true,
+            true,
+            |_| Some("192.0.2.11:8080".parse().unwrap()),
+            |_| true,
+        );
+        assert_eq!(addr, None);
     }
 
     #[test]

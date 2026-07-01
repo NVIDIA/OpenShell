@@ -20,14 +20,16 @@ The defaults are tuned for rootless Podman use:
 version = 1
 
 [openshell.gateway]
-bind_address = "0.0.0.0:17670"
+bind_address = "127.0.0.1:17670"
 compute_drivers = ["podman"]
 ```
 
-`bind_address = "0.0.0.0:17670"` is required because Podman sandbox
-containers reach the gateway over the host network bridge and cannot
-connect to `127.0.0.1` inside the gateway's network namespace. mTLS is
-enabled by default and protects all connections.
+`bind_address = "127.0.0.1:17670"` keeps the user-facing gateway listener on
+loopback by default. For rootless Podman/pasta, the Podman driver adds a
+bindability-checked callback listener on a non-loopback host address when
+mTLS/auth are enabled so sandbox supervisors can reach the gateway. Set
+`enable_auto_callback_listener = false` under `[openshell.drivers.podman]` to
+opt out, or bind explicitly to another address when operating remotely.
 
 `compute_drivers = ["podman"]` pins the compute driver to Podman. Without
 this, the gateway auto-detects in order: Kubernetes, Podman, Docker. Pinning
@@ -64,7 +66,7 @@ systemctl --user edit openshell-gateway
 
 The RPM enables mutual TLS by default. The gateway requires a valid
 client certificate for all API connections and listens on
-`0.0.0.0:17670` by default (see "Default configuration" above).
+`127.0.0.1:17670` by default (see "Default configuration" above).
 
 ### Auto-generated certificates
 
@@ -214,13 +216,14 @@ overrides that persist across package upgrades.
 
 | TOML option | Default | Description |
 |-------------|---------|-------------|
-| `bind_address` | `0.0.0.0:17670` (RPM default) | Address for the gRPC/HTTP API. |
+| `bind_address` | `127.0.0.1:17670` (RPM default) | Address for the gRPC/HTTP API. |
 | `compute_drivers` | `["podman"]` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman. |
 | `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
 | `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
 | `guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Client TLS material bind-mounted into sandbox containers. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |
+| `[openshell.drivers.podman].enable_auto_callback_listener` | `true` | Adds a protected non-loopback callback listener for rootless Podman/pasta loopback-bound gateways. |
 
 The database URL is not accepted in TOML. When `OPENSHELL_DB_URL` is unset,
 the gateway uses `sqlite:$XDG_STATE_HOME/openshell/gateway/openshell.db`.
@@ -235,7 +238,7 @@ settings:
 version = 1
 
 [openshell.gateway]
-bind_address = "0.0.0.0:17670"
+bind_address = "127.0.0.1:17670"
 compute_drivers = ["podman"]
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 
@@ -243,6 +246,8 @@ default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 image_pull_policy = "missing"
 network_name = "openshell"
 stop_timeout_secs = 10
+# Set false to keep the gateway loopback-only even for rootless Podman/pasta.
+enable_auto_callback_listener = true
 ```
 
 ### Image management

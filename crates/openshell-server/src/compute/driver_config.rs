@@ -15,6 +15,7 @@ use openshell_driver_kubernetes::KubernetesComputeConfig;
 use openshell_driver_podman::PodmanComputeConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use super::VmComputeConfig;
@@ -41,7 +42,9 @@ pub struct DriverStartupContext<'a> {
     pub file: Option<&'a config_file::ConfigFile>,
     pub guest_tls: Option<&'a GuestTlsPaths>,
     pub gateway_port: u16,
+    pub gateway_bind_address: SocketAddr,
     pub gateway_tls_enabled: bool,
+    pub gateway_callback_auth_enabled: bool,
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
 }
 
@@ -152,6 +155,9 @@ fn apply_podman_runtime_defaults(
     context: DriverStartupContext<'_>,
 ) {
     podman.gateway_port = context.gateway_port;
+    podman.gateway_bind_address = Some(context.gateway_bind_address);
+    podman.gateway_tls_enabled = context.gateway_tls_enabled;
+    podman.gateway_callback_auth_enabled = context.gateway_callback_auth_enabled;
     apply_podman_env_overrides(podman);
     apply_guest_tls_defaults_to_split_fields(
         &mut podman.guest_tls_ca,
@@ -200,6 +206,27 @@ fn apply_podman_env_overrides(podman: &mut PodmanComputeConfig) {
     if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
         podman.host_gateway_ip = ip;
     }
+    if let Ok(value) = std::env::var("OPENSHELL_PODMAN_ENABLE_AUTO_CALLBACK_LISTENER")
+        && let Some(enabled) =
+            parse_bool_env(&value, "OPENSHELL_PODMAN_ENABLE_AUTO_CALLBACK_LISTENER")
+    {
+        podman.enable_auto_callback_listener = enabled;
+    }
+}
+
+fn parse_bool_env(value: &str, name: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => {
+            tracing::warn!(
+                env = name,
+                value,
+                "Ignoring invalid boolean environment override"
+            );
+            None
+        }
+    }
 }
 
 fn apply_remote_driver_overrides(
@@ -241,7 +268,35 @@ fn apply_guest_tls_defaults_to_split_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
     use std::collections::BTreeMap;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match self.original.as_deref() {
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     fn test_context(file: Option<&config_file::ConfigFile>) -> DriverStartupContext<'_> {
         static EMPTY_ENDPOINT_OVERRIDES: std::sync::LazyLock<BTreeMap<String, PathBuf>> =
@@ -257,7 +312,10 @@ mod tests {
             file,
             guest_tls: None,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            gateway_bind_address: ([127, 0, 0, 1], openshell_core::config::DEFAULT_SERVER_PORT)
+                .into(),
             gateway_tls_enabled: false,
+            gateway_callback_auth_enabled: false,
             endpoint_overrides,
         }
     }
@@ -304,6 +362,49 @@ enable_bind_mounts = true
         let cfg = podman_config_from_context(test_context(Some(&file))).expect("podman config");
 
         assert!(cfg.enable_bind_mounts);
+    }
+
+    #[test]
+    fn podman_auto_callback_listener_env_override_disables_default() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("OPENSHELL_PODMAN_ENABLE_AUTO_CALLBACK_LISTENER", "false");
+
+        let cfg = podman_config_from_context(test_context(None)).expect("podman config");
+
+        assert!(!cfg.enable_auto_callback_listener);
+    }
+
+    #[test]
+    fn podman_auto_callback_listener_invalid_env_preserves_configured_false() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("OPENSHELL_PODMAN_ENABLE_AUTO_CALLBACK_LISTENER", "fales");
+        let file: config_file::ConfigFile = toml::from_str(
+            r"
+[openshell.drivers.podman]
+enable_auto_callback_listener = false
+",
+        )
+        .expect("valid config");
+
+        let cfg = podman_config_from_context(test_context(Some(&file))).expect("podman config");
+
+        assert!(!cfg.enable_auto_callback_listener);
+    }
+
+    #[test]
+    fn podman_auto_callback_listener_invalid_env_preserves_default_true() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("OPENSHELL_PODMAN_ENABLE_AUTO_CALLBACK_LISTENER", "fales");
+
+        let cfg = podman_config_from_context(test_context(None)).expect("podman config");
+
+        assert!(cfg.enable_auto_callback_listener);
     }
 
     #[test]

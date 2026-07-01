@@ -201,6 +201,16 @@ impl ServerState {
     }
 }
 
+fn gateway_callback_auth_enabled(config: &Config) -> bool {
+    config.gateway_jwt.is_some()
+        || config.mtls_auth.enabled
+        || config.oidc.is_some()
+        || config
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.require_client_auth)
+}
+
 /// Run the `OpenShell` server.
 ///
 /// This starts a multiplexed gRPC/HTTP server on the configured bind address.
@@ -250,7 +260,9 @@ pub(crate) async fn run_server(
         file: config_file.as_ref(),
         guest_tls: guest_tls.as_ref(),
         gateway_port: config.bind_address.port(),
+        gateway_bind_address: config.bind_address,
         gateway_tls_enabled: config.tls.is_some(),
+        gateway_callback_auth_enabled: gateway_callback_auth_enabled(&config),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
     let compute = build_compute_runtime(
@@ -926,7 +938,10 @@ mod tests {
             file,
             guest_tls: None,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            gateway_bind_address: ([127, 0, 0, 1], openshell_core::config::DEFAULT_SERVER_PORT)
+                .into(),
             gateway_tls_enabled: false,
+            gateway_callback_auth_enabled: false,
             endpoint_overrides: &config.compute_driver_endpoints,
         }
     }

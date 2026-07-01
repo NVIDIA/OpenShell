@@ -637,9 +637,9 @@ version = 2
             .bind_address
             .expect("bind_address must be explicitly set in the RPM default config");
         assert!(
-            addr.ip().is_unspecified(),
-            "RPM default bind_address must be 0.0.0.0 so Podman sandbox containers \
-             can reach the gateway over the host network bridge, got {addr}"
+            addr.ip().is_loopback(),
+            "RPM default bind_address must be loopback; the Podman driver adds a \
+             protected callback listener for rootless pasta when needed, got {addr}"
         );
         assert_eq!(
             addr.port(),

@@ -400,7 +400,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 
 # Start from the RPM default template so this e2e test exercises the same
 # TOML config path that RPM users get on first start. The template sets
-# bind_address = "0.0.0.0:17670" and compute_drivers = ["podman"]; those
+# bind_address = "127.0.0.1:17670" and compute_drivers = ["podman"]; those
 # values must be correct for Podman e2e to pass, which means a regression
 # to the template (wrong bind address, wrong driver) will surface here.
 #

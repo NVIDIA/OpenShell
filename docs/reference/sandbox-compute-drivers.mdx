@@ -179,9 +179,29 @@ The gateway talks to the Podman API socket. The Podman driver requires Podman 5.
 
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 
-Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
+Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, `enable_auto_callback_listener`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
 On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior.
+
+### Podman callback listener
+
+The RPM gateway binds the primary listener to loopback by default. Rootless
+Podman sandboxes call back through `host.containers.internal`, which may not
+reach host loopback when Podman uses pasta. When TLS and callback
+authentication are enabled, the Podman driver can add a bindability-checked
+listener on a non-loopback local interface for sandbox callbacks. The driver
+selects this address from local interfaces and does not probe external IPs.
+
+Disable this behavior with:
+
+```toml
+[openshell.drivers.podman]
+enable_auto_callback_listener = false
+```
+
+Containerized gateways do not use this automatic listener because their network
+namespace is not the host namespace. Publish the gateway container port on an
+address sandbox containers can reach.
 
 ### Podman Driver Config Mounts
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use openshell_core::config::{DEFAULT_STOP_TIMEOUT_SECS, DEFAULT_SUPERVISOR_IMAGE};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -68,6 +68,7 @@ impl FromStr for ImagePullPolicy {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct PodmanComputeConfig {
     /// Path to the Podman API Unix socket.
     /// Default: `$XDG_RUNTIME_DIR/podman/podman.sock` (Linux),
@@ -89,6 +90,15 @@ pub struct PodmanComputeConfig {
     /// so the correct port is used even when `--port` differs from the
     /// default.  Defaults to [`openshell_core::config::DEFAULT_SERVER_PORT`].
     pub gateway_port: u16,
+    /// Full gateway bind address supplied by the gateway process at runtime.
+    #[serde(skip)]
+    pub gateway_bind_address: Option<SocketAddr>,
+    /// Whether the gateway has TLS enabled. Supplied by the gateway process.
+    #[serde(skip)]
+    pub gateway_tls_enabled: bool,
+    /// Whether gateway callbacks are protected by an auth mechanism.
+    #[serde(skip)]
+    pub gateway_callback_auth_enabled: bool,
     /// Unix socket path the in-container supervisor bridges relay traffic to.
     pub sandbox_ssh_socket_path: String,
     /// Name of the Podman bridge network.
@@ -134,9 +144,17 @@ pub struct PodmanComputeConfig {
     /// Set to `0` to disable health checks entirely.
     /// Defaults to [`DEFAULT_HEALTH_CHECK_INTERVAL_SECS`] (10 seconds).
     pub health_check_interval_secs: u64,
+    /// Automatically add a non-loopback callback listener for rootless Podman
+    /// pasta when the primary gateway bind is loopback-only and TLS/auth are active.
+    #[serde(default = "default_true")]
+    pub enable_auto_callback_listener: bool,
 }
 
 pub const DEFAULT_HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
+
+fn default_true() -> bool {
+    true
+}
 
 impl PodmanComputeConfig {
     /// Returns `true` when all three TLS paths are configured.
@@ -251,6 +269,9 @@ impl Default for PodmanComputeConfig {
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            gateway_bind_address: None,
+            gateway_tls_enabled: false,
+            gateway_callback_auth_enabled: false,
             sandbox_ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
             host_gateway_ip: Self::default_host_gateway_ip(),
@@ -262,6 +283,7 @@ impl Default for PodmanComputeConfig {
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
             enable_bind_mounts: false,
             health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
+            enable_auto_callback_listener: true,
         }
     }
 }
@@ -274,6 +296,12 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("image_pull_policy", &self.image_pull_policy.as_str())
             .field("grpc_endpoint", &self.grpc_endpoint)
             .field("gateway_port", &self.gateway_port)
+            .field("gateway_bind_address", &self.gateway_bind_address)
+            .field("gateway_tls_enabled", &self.gateway_tls_enabled)
+            .field(
+                "gateway_callback_auth_enabled",
+                &self.gateway_callback_auth_enabled,
+            )
             .field("sandbox_ssh_socket_path", &self.sandbox_ssh_socket_path)
             .field("network_name", &self.network_name)
             .field("host_gateway_ip", &self.host_gateway_ip)
@@ -287,6 +315,10 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field(
                 "health_check_interval_secs",
                 &self.health_check_interval_secs,
+            )
+            .field(
+                "enable_auto_callback_listener",
+                &self.enable_auto_callback_listener,
             )
             .finish()
     }

@@ -262,6 +262,9 @@ network_name            = "openshell"
 # Omit for the platform default: empty on Linux, 192.168.127.254 on macOS Podman machine.
 # Set "" to force Podman's host-gateway resolver.
 # host_gateway_ip       = "192.168.127.254"
+# Disable to prevent the gateway from adding a non-loopback callback listener
+# for rootless Podman pasta when the primary bind address is loopback-only.
+enable_auto_callback_listener = true
 sandbox_ssh_socket_path = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 10
 supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
@@ -279,6 +282,12 @@ sandbox_pids_limit      = 2048
 # Set to 0 to disable health checks entirely. Default: 10.
 health_check_interval_secs = 10
 ```
+
+`enable_auto_callback_listener` defaults to `true`. When rootless Podman uses
+pasta and the gateway bind address is loopback-only, the driver may add a
+bindability-checked non-loopback callback listener if TLS/auth are enabled. Set
+it to `false`, or set `OPENSHELL_PODMAN_ENABLE_AUTO_CALLBACK_LISTENER=false`,
+to opt out.
 
 ### MicroVM
 

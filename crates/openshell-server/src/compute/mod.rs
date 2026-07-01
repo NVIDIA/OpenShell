@@ -434,6 +434,7 @@ impl ComputeRuntime {
         let driver = PodmanComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
+        let gateway_bind_addresses = driver.gateway_bind_address().into_iter().collect();
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
             ComputeDriverKind::Podman.as_str().to_string(),
@@ -446,7 +447,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            Vec::new(),
+            gateway_bind_addresses,
         )
         .await
     }

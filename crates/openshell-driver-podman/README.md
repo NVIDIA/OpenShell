@@ -68,8 +68,8 @@ mount types:
   pulls the image during provisioning using the sandbox image pull policy.
 
 Host bind mounts are disabled by default because they expose gateway host paths
-to sandbox requests. The driver still uses internal bind mounts for
-OpenShell-owned token and TLS material.
+to sandbox requests. The driver still uses internal bind mounts for configured
+TLS material; per-sandbox gateway JWTs are delivered through Podman secrets.
 
 Podman `bind` mounts accept `source`, `target`, and optional `read_only`.
 User-supplied bind and volume mounts are read-only by default; set
@@ -214,6 +214,10 @@ Key points:
   host. Linux defaults to Podman's `host-gateway` resolver. macOS Podman
   machine defaults to gvproxy's host-loopback IP, `192.168.127.254`, because
   stale Podman machines may fail to resolve `host-gateway`.
+- Callback listener: direct host gateways that bind to loopback can add a
+  protected non-loopback listener for rootless pasta callbacks when TLS/auth are
+  enabled. Disable this with `enable_auto_callback_listener = false`. Gateway
+  containers skip host listener discovery and require explicit port publishing.
 - nsenter: the supervisor uses `nsenter --net=` instead of `ip netns exec` for
   namespace operations, avoiding the sysfs remount path that fails in rootless
   containers.
@@ -336,6 +340,7 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_GATEWAY_PORT` | `--gateway-port` | `17670` | Gateway port used for endpoint auto-detection by the standalone binary. |
 | `OPENSHELL_NETWORK_NAME` | `--network-name` | `openshell` | Podman bridge network name. |
 | `OPENSHELL_PODMAN_HOST_GATEWAY_IP` | `--host-gateway-ip` | empty on Linux, `192.168.127.254` on macOS | Host gateway IP used for sandbox host aliases. Empty uses Podman's `host-gateway` resolver. |
+| `OPENSHELL_PODMAN_ENABLE_AUTO_CALLBACK_LISTENER` | none | `true` | Enable the protected non-loopback callback listener for rootless pasta when the gateway is loopback-bound and TLS/auth are enabled. |
 | `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Supervisor Unix socket path in `PodmanComputeConfig`. |
 | `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `10` | Container stop timeout in seconds. |
 | `OPENSHELL_SANDBOX_PIDS_LIMIT` | `--sandbox-pids-limit` | `2048` | Podman cgroup PID limit for sandbox containers. Set `0` to inherit Podman's runtime/default PID limit. |
