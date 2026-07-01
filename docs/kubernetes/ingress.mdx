@@ -57,9 +57,9 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set grpcRoute.enabled=true \
-  --set grpcRoute.gateway.create=true \
-  --set grpcRoute.gateway.className=eg
+  --set gatewayApi.routes.grpc.enabled=true \
+  --set gatewayApi.gateway.create=true \
+  --set gatewayApi.gateway.className=eg
 ```
 
 ## Get the external address
@@ -77,63 +77,7 @@ openshell gateway add http://<external-ip> --name production
 openshell status
 ```
 
-This setup is plaintext end-to-end and is intended for development. For external access, terminate TLS at the gateway as shown below.
-
-## HTTPS (TLS termination)
-
-Envoy Gateway can terminate TLS at the listener and forward plaintext to the OpenShell gateway pod:
-
-```text
-client → HTTPS → Envoy Gateway (terminate TLS) → plaintext → openshell gateway pod
-```
-
-Envoy Gateway only terminates TLS here — it does not perform OIDC. Do not enable an Envoy Gateway OIDC `SecurityPolicy` in front of the gateway: that flow relies on browser redirects and cookies and cannot work with the OpenShell CLI or headless agents. Instead, the OpenShell gateway validates an OIDC bearer token that the client sends in the gRPC `authorization` metadata, which Envoy forwards untouched.
-
-Because Envoy terminates TLS, the OpenShell gateway never sees a client certificate, so client mTLS cannot provide identity on this path. Use OIDC bearer tokens for client identity instead.
-
-For headless agents and CI, the CLI obtains the token via the OAuth2 client-credentials grant (no browser): set `OPENSHELL_OIDC_CLIENT_SECRET` to the OAuth client secret before running `openshell gateway add`. The client id comes from `--oidc-client-id` (default `openshell-cli`); pass it explicitly if your IdP client uses a different id. Interactive human users get the browser-based Authorization Code + PKCE flow by default.
-
-### Provide a TLS certificate
-
-Create a `kubernetes.io/tls` Secret in the `openshell` namespace with the certificate for your external hostname:
-
-```shell
-kubectl -n openshell create secret tls openshell-ingress-tls \
-  --cert=tls.crt --key=tls.key
-```
-
-The Secret may also be issued by cert-manager, or you can reference the chart's existing `openshell-server-tls` Secret if its SANs include the external hostname.
-
-### Install with HTTPS termination
-
-Enable an HTTPS listener, point it at the Secret, disable gateway-pod TLS so Envoy forwards plaintext, and configure an OIDC issuer for client identity:
-
-```shell
-helm upgrade --install openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version <version> \
-  --namespace openshell \
-  --set grpcRoute.enabled=true \
-  --set grpcRoute.gateway.create=true \
-  --set grpcRoute.gateway.className=eg \
-  --set grpcRoute.gateway.listener.protocol=HTTPS \
-  --set grpcRoute.gateway.listener.port=443 \
-  --set 'grpcRoute.gateway.listener.tls.certificateRefs[0].name=openshell-ingress-tls' \
-  --set server.disableTls=true \
-  --set server.oidc.issuer=https://<issuer> \
-  --set 'grpcRoute.hostnames[0]=<external-hostname>'
-```
-
-Keep the certificate Secret in the release namespace. Referencing a Secret in another namespace requires a `ReferenceGrant`.
-
-### Register over HTTPS
-
-```shell
-openshell gateway add https://<external-hostname> --name production --oidc-issuer https://<issuer>
-openshell status
-```
-
-See [Authentication](/kubernetes/setup) for OIDC issuer, audience, and roles configuration.
+This setup is plaintext end-to-end and is intended for development.
 
 ## SSH Relay
 
