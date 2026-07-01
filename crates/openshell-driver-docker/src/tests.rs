@@ -756,6 +756,39 @@ fn driver_config_allows_explicit_writable_volume_mounts() {
 }
 
 #[test]
+fn driver_config_rejects_duplicate_mount_targets() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [
+            {
+                "type": "volume",
+                "source": "work-nfs",
+                "target": "/sandbox/work"
+            },
+            {
+                "type": "tmpfs",
+                "target": "/sandbox/work"
+            }
+        ]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .contains("duplicate docker driver_config mount target")
+    );
+}
+
+#[test]
 fn driver_config_rejects_bind_mounts_unless_enabled() {
     let mut sandbox = test_sandbox();
     sandbox

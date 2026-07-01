@@ -82,6 +82,13 @@ nested schema and currently accepts:
 - `pod.priority_class_name`
 - `containers.agent.resources.requests`
 - `containers.agent.resources.limits`
+- `containers.agent.volume_mounts[].name`
+- `containers.agent.volume_mounts[].mount_path`
+- `containers.agent.volume_mounts[].sub_path`
+- `containers.agent.volume_mounts[].read_only`
+- `volumes[].name`
+- `volumes[].persistent_volume_claim.claim_name`
+- `volumes[].persistent_volume_claim.read_only`
 
 Nested keys inside the `kubernetes` block use snake_case. The top-level
 `driver_config` envelope is keyed by driver names, so `kubernetes` is not part
@@ -104,3 +111,50 @@ driver's configured `default_runtime_class_name`; the typed public
 public `--gpu` flag for the default GPU request, pass a count to `--gpu` for
 counted GPU requests, and use `driver_config` only for additional driver-owned
 resource details.
+
+Use PVC volumes to mount existing Kubernetes PersistentVolumeClaims into the
+agent container. PVC volumes and mounts default to read-only unless
+`read_only: false` is set explicitly. Read-write access requires
+`read_only: false` on both the PVC volume and each writable mount. The driver
+rejects duplicate volume names, invalid DNS-1123 volume labels or PVC claim
+subdomain names, mounts that reference unknown volumes, non-normalized or
+protected mount paths, and absolute or parent-traversing `sub_path` values.
+
+Any explicit driver-config mount under `/sandbox` disables the driver's
+default `/sandbox` workspace PVC injection for that sandbox. Only the explicit
+mount paths persist through the external PVC; other `/sandbox` paths come from
+the current sandbox image.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "user-data",
+        "persistent_volume_claim": {
+          "claim_name": "pvc-user-data-123",
+          "read_only": false
+        }
+      }],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/workspace",
+              "sub_path": "workspace",
+              "read_only": false
+            },
+            {
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/memory",
+              "sub_path": "memory",
+              "read_only": false
+            }
+          ]
+        }
+      }
+    }
+  }' \
+  -- claude
+```

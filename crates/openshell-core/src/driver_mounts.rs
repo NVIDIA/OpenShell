@@ -71,6 +71,19 @@ pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
     if !target.starts_with('/') {
         return Err("mount target must be an absolute container path".to_string());
     }
+    if target != "/" {
+        let segments = target.split('/').skip(1).collect::<Vec<_>>();
+        let has_internal_empty_segment = segments
+            .iter()
+            .take(segments.len().saturating_sub(1))
+            .any(|segment| segment.is_empty());
+        if has_internal_empty_segment || segments.iter().any(|segment| *segment == ".") {
+            return Err(
+                "mount target must be normalized and must not contain empty path segments or '.'"
+                    .to_string(),
+            );
+        }
+    }
     let path = Path::new(target);
     if path == Path::new("/") {
         return Err("mount target must not be the container root".to_string());
@@ -164,5 +177,18 @@ mod tests {
             validate_container_mount_target("/sandbox/work ").unwrap_err(),
             "mount target must not contain surrounding whitespace"
         );
+    }
+
+    #[test]
+    fn mount_target_rejects_internal_empty_or_dot_segments() {
+        assert_eq!(
+            validate_container_mount_target("/sandbox/work//tmp").unwrap_err(),
+            "mount target must be normalized and must not contain empty path segments or '.'"
+        );
+        assert_eq!(
+            validate_container_mount_target("/sandbox/work/./tmp").unwrap_err(),
+            "mount target must be normalized and must not contain empty path segments or '.'"
+        );
+        validate_container_mount_target("/sandbox/work/").unwrap();
     }
 }
