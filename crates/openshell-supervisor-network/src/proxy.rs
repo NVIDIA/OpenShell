@@ -8041,9 +8041,10 @@ network_policies:
         assert!(!v1_hash.is_empty());
 
         // 4. Spawn the temp bash with a /dev/tcp one-liner that opens a real
-        //    connection to the listener and sleeps to keep it open. The
-        //    `read -t` blocks on stdin so the shell stays resident.
-        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; sleep 30 <&3");
+        //    connection to the listener. The `read -t` built-in blocks on
+        //    FD 3 so the shell stays resident without forking an external
+        //    process that would inherit the socket.
+        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; read -r -t 30 _ <&3");
         let mut child = Command::new(&bash_v1)
             .arg("-c")
             .arg(&script)
