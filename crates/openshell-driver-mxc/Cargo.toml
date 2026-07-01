@@ -30,9 +30,9 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 
-# ETW/TDH real-time consumer (Plane A audit). Windows-only so the Linux/WSL
-# build stays an empty stub.
+# ETW/TDH real-time consumer and host CONNECT proxy integration.
 [target.'cfg(target_os = "windows")'.dependencies]
+openshell-supervisor-network = { path = "../openshell-supervisor-network" }
 windows = { workspace = true }
 
 [dev-dependencies]
