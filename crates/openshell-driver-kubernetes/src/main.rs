@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
         image_pull_secrets: args.sandbox_image_pull_secrets,
         supervisor_image: args
             .supervisor_image
-            .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string()),
+            .unwrap_or_else(openshell_core::config::default_supervisor_image),
         supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
         supervisor_sideload_method: args.supervisor_sideload_method,
         supervisor_topology: args.supervisor_topology,

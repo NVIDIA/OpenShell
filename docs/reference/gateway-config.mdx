@@ -88,7 +88,8 @@ disable_tls = false
 # Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
 # when the driver-specific table does not override them.
 default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
-supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name  = "openshell-client-tls"
 service_account_name    = "openshell-sandbox"
 host_gateway_ip         = "10.0.0.1"
@@ -172,7 +173,8 @@ service_account_name           = "openshell-sandbox"
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]
-supervisor_image               = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "IfNotPresent"
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
@@ -222,7 +224,8 @@ grpc_endpoint      = "https://host.openshell.internal:17670"
 # Skip the image-pull-and-extract step by pointing at a locally built binary.
 supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
 # When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
-supervisor_image   = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca       = "/etc/openshell/certs/ca.pem"
 guest_tls_cert     = "/etc/openshell/certs/client.pem"
 guest_tls_key      = "/etc/openshell/certs/client-key.pem"
@@ -264,7 +267,8 @@ network_name            = "openshell"
 # host_gateway_ip       = "192.168.127.254"
 sandbox_ssh_socket_path = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 10
-supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"

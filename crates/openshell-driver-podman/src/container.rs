@@ -1798,7 +1798,7 @@ mod tests {
         let vol = &image_volumes[0];
         assert_eq!(
             vol["source"].as_str(),
-            Some("ghcr.io/nvidia/openshell/supervisor:latest"),
+            Some(openshell_core::config::default_supervisor_image().as_str()),
             "image volume source should be the supervisor image"
         );
         assert_eq!(
@@ -1884,8 +1884,9 @@ mod tests {
         let image_volumes = spec["image_volumes"]
             .as_array()
             .expect("image_volumes should be an array");
+        let expected_supervisor = openshell_core::config::default_supervisor_image();
         assert!(image_volumes.iter().any(|volume| {
-            volume["source"].as_str() == Some("ghcr.io/nvidia/openshell/supervisor:latest")
+            volume["source"].as_str() == Some(expected_supervisor.as_str())
                 && volume["destination"].as_str() == Some("/opt/openshell/bin")
         }));
         assert!(image_volumes.iter().any(|volume| {

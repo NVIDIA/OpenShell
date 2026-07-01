@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_core::config::DEFAULT_SUPERVISOR_IMAGE;
+use openshell_core::config;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 use std::str::FromStr;
@@ -263,7 +263,7 @@ impl Default for KubernetesComputeConfig {
             // is Podman vocabulary and is not a valid Kubernetes value.
             image_pull_policy: String::new(),
             image_pull_secrets: Vec::new(),
-            supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
+            supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             supervisor_topology: SupervisorTopology::default(),
