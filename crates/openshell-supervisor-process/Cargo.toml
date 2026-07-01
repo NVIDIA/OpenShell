@@ -13,6 +13,7 @@ rust-version.workspace = true
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 openshell-ocsf = { path = "../openshell-ocsf" }
+openshell-policy = { path = "../openshell-policy" }
 
 anyhow = { workspace = true }
 base64 = { workspace = true }

@@ -13,10 +13,10 @@ mod mechanistic_mapper;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod metadata_server;
 
-use miette::Result;
+use miette::{IntoDiagnostic, Result};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -64,11 +64,21 @@ use openshell_core::denial::DenialEvent;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_network::opa::OpaEngine;
+use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
+use tokio::io::copy_bidirectional;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
 #[cfg(target_os = "linux")]
 use tokio::time::timeout;
+
+const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
+const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
+const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
+const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
+const SIDECAR_PROCESS_PROXY_ADDR: &str = "127.0.0.1:3128";
+const SIDECAR_READY_TIMEOUT_SECS: u64 = 120;
 
 /// Run a command in the sandbox.
 ///
@@ -123,6 +133,16 @@ pub async fn run_sandbox(
         }) {
             debug!("OCSF context already initialized, keeping existing");
         }
+    }
+
+    let sidecar_network_enforcement = sidecar_network_enforcement_enabled();
+    let process_enforcement_mode = process_enforcement_mode();
+    let sidecar_ready_file = supervisor_ready_file();
+    if process_enabled
+        && !network_enabled
+        && let Some(path) = sidecar_ready_file.as_deref()
+    {
+        wait_for_supervisor_ready(path).await?;
     }
 
     // Load policy and initialize OPA engine
@@ -218,6 +238,12 @@ pub async fn run_sandbox(
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
+    if network_enabled
+        && !process_enabled
+        && let Some(path) = entrypoint_pid_file()
+    {
+        spawn_entrypoint_pid_file_watcher(path, entrypoint_pid.clone());
+    }
 
     // Create the workload's network namespace. It is shared infrastructure:
     // the proxy binds to its host-side veth IP, the bypass monitor reads
@@ -225,7 +251,7 @@ pub async fn run_sandbox(
     // it via setns(). The RAII handle lives in this frame for the duration
     // of the sandbox.
     #[cfg(target_os = "linux")]
-    let netns = if network_enabled {
+    let netns = if network_enabled && !sidecar_network_enforcement {
         openshell_supervisor_process::netns::create_netns_for_proxy(&policy)?
     } else {
         None
@@ -294,6 +320,34 @@ pub async fn run_sandbox(
     } else {
         None
     };
+
+    let _gateway_forward = if network_enabled && sidecar_network_enforcement {
+        let endpoint = openshell_endpoint_for_proxy.as_deref().ok_or_else(|| {
+            miette::miette!("sidecar network enforcement requires an OpenShell gateway endpoint")
+        })?;
+        Some(start_gateway_forward_from_env(endpoint).await?)
+    } else {
+        None
+    };
+
+    #[cfg(target_os = "linux")]
+    if network_enabled && sidecar_network_enforcement {
+        if !matches!(policy.network.mode, NetworkMode::Proxy) {
+            return Err(miette::miette!(
+                "sidecar network enforcement requires proxy network mode"
+            ));
+        }
+        if let Some(path) = sidecar_ready_file.as_deref() {
+            write_supervisor_ready(path)?;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    if network_enabled && sidecar_network_enforcement {
+        return Err(miette::miette!(
+            "sidecar network enforcement is only supported on Linux"
+        ));
+    }
 
     // Spawn the denial-aggregator flush task. The aggregator drains denial
     // events from the proxy + bypass monitor, batches them, and ships
@@ -445,8 +499,17 @@ pub async fn run_sandbox(
         }
     }
 
+    let process_policy = process_policy_for_topology(&policy, sidecar_network_enforcement)?;
+
     let exit_code = if process_enabled {
-        let ca_file_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
+        let ca_file_paths = networking
+            .as_ref()
+            .and_then(|n| n.ca_file_paths.clone())
+            .or_else(|| {
+                sidecar_network_enforcement
+                    .then(sidecar_ca_file_paths)
+                    .flatten()
+            });
 
         openshell_supervisor_process::run::run_process(
             program,
@@ -457,7 +520,8 @@ pub async fn run_sandbox(
             sandbox_id.as_deref(),
             openshell_endpoint.as_deref(),
             ssh_socket_path,
-            &policy,
+            &process_policy,
+            process_enforcement_mode,
             entrypoint_pid,
             provider_credentials,
             provider_env,
@@ -516,6 +580,205 @@ async fn wait_for_shutdown_signal() {
         let _ = tokio::signal::ctrl_c().await;
         info!("Received Ctrl-C, shutting down network-only supervisor");
     }
+}
+
+fn sidecar_network_enforcement_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE)
+        .is_ok_and(|value| value == SIDECAR_NETWORK_ENFORCEMENT_MODE)
+}
+
+fn process_enforcement_mode() -> ProcessEnforcementMode {
+    match std::env::var(openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE)
+        .unwrap_or_else(|_| "full".to_string())
+        .as_str()
+    {
+        "network-only" => ProcessEnforcementMode::NetworkOnly,
+        _ => ProcessEnforcementMode::Full,
+    }
+}
+
+fn supervisor_ready_file() -> Option<String> {
+    std::env::var(openshell_core::sandbox_env::SUPERVISOR_READY_FILE)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn entrypoint_pid_file() -> Option<String> {
+    std::env::var(openshell_core::sandbox_env::ENTRYPOINT_PID_FILE)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn spawn_entrypoint_pid_file_watcher(path: String, entrypoint_pid: Arc<AtomicU32>) {
+    tokio::spawn(async move {
+        let pid_path = std::path::PathBuf::from(&path);
+        loop {
+            match std::fs::read_to_string(&pid_path) {
+                Ok(contents) => match contents.trim().parse::<u32>() {
+                    Ok(pid) if pid > 0 => {
+                        entrypoint_pid.store(pid, Ordering::Release);
+                        info!(path, pid, "Loaded sidecar workload entrypoint PID");
+                        return;
+                    }
+                    Ok(_) | Err(_) => {
+                        debug!(path, contents = %contents.trim(), "Ignoring invalid entrypoint PID file contents");
+                    }
+                },
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    debug!(path, error = %err, "Failed to read entrypoint PID file");
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+}
+
+async fn wait_for_supervisor_ready(path: &str) -> Result<()> {
+    let ready_path = std::path::Path::new(path);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS);
+    loop {
+        if ready_path.exists() {
+            info!(path, "Network supervisor sidecar is ready");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "timed out waiting for network supervisor sidecar readiness file {path}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn write_supervisor_ready(path: &str) -> Result<()> {
+    let ready_path = std::path::Path::new(path);
+    if let Some(parent) = ready_path.parent() {
+        std::fs::create_dir_all(parent).into_diagnostic()?;
+    }
+    std::fs::write(ready_path, b"ready\n").into_diagnostic()?;
+    info!(path, "Network supervisor sidecar readiness file written");
+    Ok(())
+}
+
+fn sidecar_ca_file_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
+        .unwrap_or_else(|_| SIDECAR_TLS_DIR.to_string());
+    let cert = std::path::Path::new(&tls_dir).join(SIDECAR_CA_CERT);
+    let bundle = std::path::Path::new(&tls_dir).join(SIDECAR_CA_BUNDLE);
+    (cert.exists() && bundle.exists()).then_some((cert, bundle))
+}
+
+fn process_policy_for_topology(
+    policy: &SandboxPolicy,
+    sidecar_network_enforcement: bool,
+) -> Result<SandboxPolicy> {
+    let mut process_policy = policy.clone();
+    if sidecar_network_enforcement && matches!(process_policy.network.mode, NetworkMode::Proxy) {
+        let proxy = process_policy
+            .network
+            .proxy
+            .get_or_insert(ProxyPolicy { http_addr: None });
+        if proxy.http_addr.is_none() {
+            proxy.http_addr = Some(SIDECAR_PROCESS_PROXY_ADDR.parse().into_diagnostic()?);
+        }
+    }
+    Ok(process_policy)
+}
+
+struct GatewayForwardHandle {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for GatewayForwardHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn start_gateway_forward_from_env(endpoint: &str) -> Result<GatewayForwardHandle> {
+    let listen_addr =
+        std::env::var(openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR).map_err(|_| {
+            miette::miette!(
+                "{} is required for sidecar gateway forwarding",
+                openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR
+            )
+        })?;
+    start_gateway_forward(&listen_addr, endpoint).await
+}
+
+async fn start_gateway_forward(listen_addr: &str, endpoint: &str) -> Result<GatewayForwardHandle> {
+    let upstream = gateway_tcp_addr(endpoint)?;
+    let listener = TcpListener::bind(listen_addr).await.into_diagnostic()?;
+    info!(
+        listen_addr,
+        upstream, "Gateway loopback TCP forward started for sidecar topology"
+    );
+
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut inbound, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    warn!(error = %e, "Gateway forward accept failed");
+                    continue;
+                }
+            };
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let mut outbound = match TcpStream::connect(&upstream).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        warn!(peer = %peer, upstream, error = %e, "Gateway forward connect failed");
+                        return;
+                    }
+                };
+                if let Err(e) = copy_bidirectional(&mut inbound, &mut outbound).await {
+                    debug!(peer = %peer, error = %e, "Gateway forward connection closed with error");
+                }
+            });
+        }
+    });
+
+    Ok(GatewayForwardHandle { task })
+}
+
+fn gateway_tcp_addr(endpoint: &str) -> Result<String> {
+    let (scheme, rest) = endpoint
+        .split_once("://")
+        .ok_or_else(|| miette::miette!("gateway endpoint must include a URL scheme"))?;
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        other => {
+            return Err(miette::miette!(
+                "unsupported gateway endpoint scheme '{other}' for sidecar forwarding"
+            ));
+        }
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        return Err(miette::miette!("gateway endpoint is missing a host"));
+    }
+    if authority.starts_with('[') {
+        let closing = authority
+            .find(']')
+            .ok_or_else(|| miette::miette!("invalid bracketed IPv6 gateway endpoint"))?;
+        let host = &authority[..=closing];
+        let port = authority[closing + 1..]
+            .strip_prefix(':')
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Ok(format!("{host}:{port}"));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => {
+            (host, port.parse::<u16>().unwrap_or(default_port))
+        }
+        _ => (authority, default_port),
+    };
+    Ok(format!("{host}:{port}"))
 }
 
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
@@ -1927,7 +2190,23 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 )]
 mod tests {
     use super::*;
+    use openshell_core::policy::{
+        FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn proxy_policy(http_addr: Option<std::net::SocketAddr>) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy {
+                mode: NetworkMode::Proxy,
+                proxy: Some(ProxyPolicy { http_addr }),
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        }
+    }
 
     fn effective_bool(value: bool) -> openshell_core::proto::EffectiveSetting {
         openshell_core::proto::EffectiveSetting {
@@ -1938,6 +2217,73 @@ mod tests {
             }),
             scope: openshell_core::proto::SettingScope::Global.into(),
         }
+    }
+
+    #[test]
+    fn sidecar_process_policy_sets_loopback_proxy_addr() {
+        let policy = proxy_policy(None);
+
+        let process_policy = process_policy_for_topology(&policy, true).unwrap();
+
+        let http_addr = process_policy
+            .network
+            .proxy
+            .and_then(|proxy| proxy.http_addr)
+            .expect("sidecar process policy should set proxy address");
+        assert_eq!(http_addr.to_string(), SIDECAR_PROCESS_PROXY_ADDR);
+        assert!(
+            policy
+                .network
+                .proxy
+                .as_ref()
+                .expect("original policy should keep proxy config")
+                .http_addr
+                .is_none(),
+            "process policy normalization must not mutate the network policy"
+        );
+    }
+
+    #[test]
+    fn non_sidecar_process_policy_preserves_proxy_addr() {
+        let policy = proxy_policy(None);
+
+        let process_policy = process_policy_for_topology(&policy, false).unwrap();
+
+        assert!(
+            process_policy
+                .network
+                .proxy
+                .and_then(|proxy| proxy.http_addr)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn gateway_tcp_addr_uses_explicit_port() {
+        assert_eq!(
+            gateway_tcp_addr("https://openshell-gateway.openshell.svc:8080").unwrap(),
+            "openshell-gateway.openshell.svc:8080"
+        );
+    }
+
+    #[test]
+    fn gateway_tcp_addr_uses_scheme_default_port() {
+        assert_eq!(
+            gateway_tcp_addr("https://openshell-gateway.openshell.svc").unwrap(),
+            "openshell-gateway.openshell.svc:443"
+        );
+        assert_eq!(
+            gateway_tcp_addr("http://openshell-gateway.openshell.svc").unwrap(),
+            "openshell-gateway.openshell.svc:80"
+        );
+    }
+
+    #[test]
+    fn gateway_tcp_addr_preserves_ipv6_brackets() {
+        assert_eq!(
+            gateway_tcp_addr("https://[fd00::1]:8443").unwrap(),
+            "[fd00::1]:8443"
+        );
     }
 
     #[test]

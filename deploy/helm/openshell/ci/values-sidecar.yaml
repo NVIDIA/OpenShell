@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI/dev overlay for exercising the Kubernetes supervisor sidecar topology.
+#
+# Merge after values.yaml and ci/values-skaffold.yaml:
+#   helm install ... -f values.yaml -f ci/values-skaffold.yaml -f ci/values-sidecar.yaml
+#
+# Or set:
+#   OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-sidecar.yaml
+# before running `mise run e2e:kubernetes`.
+supervisor:
+  topology: sidecar

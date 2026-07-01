@@ -214,6 +214,8 @@ async fn main() -> Result<()> {
         gpu_enabled: args.gpu,
         gpu_mem_mib: args.gpu_mem_mib,
         gpu_vcpus: args.gpu_vcpus,
+        sandbox_uid: None,
+        sandbox_gid: None,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;

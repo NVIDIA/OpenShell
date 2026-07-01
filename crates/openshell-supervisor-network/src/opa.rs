@@ -18,6 +18,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
+use tracing::info;
 
 /// Baked-in rego rules for OPA policy evaluation.
 /// These rules define the network access decision logic and static config
@@ -53,6 +54,49 @@ pub struct NetworkInput {
     /// process and its ancestors. Captures script paths (e.g. `/usr/local/bin/claude`)
     /// that don't appear in `/proc/<pid>/exe` because the interpreter (node) is the exe.
     pub cmdline_paths: Vec<PathBuf>,
+}
+
+pub(crate) fn network_binary_identity_required() -> bool {
+    std::env::var(openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY).map_or(true, |value| {
+        !matches!(
+            value.as_str(),
+            "relaxed" | "disabled" | "endpoint-only" | "false" | "0"
+        )
+    })
+}
+
+fn inject_runtime_policy_data(data: &mut serde_json::Value, require_binary_identity: bool) {
+    let Some(obj) = data.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "runtime".to_string(),
+        serde_json::json!({
+            "require_binary_identity": require_binary_identity,
+        }),
+    );
+}
+
+fn emit_binary_identity_mode(require_binary_identity: bool, source: &str) {
+    info!(
+        require_binary_identity,
+        source, "Configured OPA runtime binary identity mode"
+    );
+    openshell_ocsf::ocsf_emit!(
+        openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+            .severity(openshell_ocsf::SeverityId::Informational)
+            .status(openshell_ocsf::StatusId::Success)
+            .state(openshell_ocsf::StateId::Enabled, "configured")
+            .unmapped(
+                "require_binary_identity",
+                serde_json::json!(require_binary_identity)
+            )
+            .unmapped("source", serde_json::json!(source))
+            .message(format!(
+                "OPA runtime binary identity mode configured [source:{source} require_binary_identity:{require_binary_identity}]"
+            ))
+            .build()
+    );
 }
 
 /// Sandbox configuration extracted from OPA data at startup.
@@ -146,7 +190,9 @@ impl OpaEngine {
         engine
             .add_policy_from_file(policy_path)
             .map_err(|e| miette::miette!("{e}"))?;
-        let data_json = preprocess_yaml_data(&yaml_str)?;
+        let require_binary_identity = network_binary_identity_required();
+        emit_binary_identity_mode(require_binary_identity, "files");
+        let data_json = preprocess_yaml_data(&yaml_str, require_binary_identity)?;
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
@@ -160,11 +206,24 @@ impl OpaEngine {
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
     pub fn from_strings(policy: &str, data_yaml: &str) -> Result<Self> {
+        Self::from_strings_with_binary_identity_required(
+            policy,
+            data_yaml,
+            network_binary_identity_required(),
+        )
+    }
+
+    pub(crate) fn from_strings_with_binary_identity_required(
+        policy: &str,
+        data_yaml: &str,
+        require_binary_identity: bool,
+    ) -> Result<Self> {
         let mut engine = regorus::Engine::new();
         engine
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|e| miette::miette!("{e}"))?;
-        let data_json = preprocess_yaml_data(data_yaml)?;
+        emit_binary_identity_mode(require_binary_identity, "strings");
+        let data_json = preprocess_yaml_data(data_yaml, require_binary_identity)?;
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
@@ -193,11 +252,25 @@ impl OpaEngine {
     /// gap between user-specified symlink paths (e.g., `/usr/bin/python3`) and
     /// kernel-resolved canonical paths (e.g., `/usr/bin/python3.11`).
     pub fn from_proto_with_pid(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> Result<Self> {
+        Self::from_proto_with_pid_and_binary_identity_required(
+            proto,
+            entrypoint_pid,
+            network_binary_identity_required(),
+        )
+    }
+
+    fn from_proto_with_pid_and_binary_identity_required(
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+        require_binary_identity: bool,
+    ) -> Result<Self> {
+        emit_binary_identity_mode(require_binary_identity, "proto");
         let data_json_str = proto_to_opa_data_json(proto, entrypoint_pid);
 
         // Parse back to Value for preprocessing, then re-serialize
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
             .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
+        inject_runtime_policy_data(&mut data, require_binary_identity);
 
         // Validate BEFORE expanding presets
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
@@ -720,9 +793,10 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
 }
 
 /// Preprocess YAML policy data: parse, normalize, validate, expand access presets, return JSON.
-fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
+fn preprocess_yaml_data(yaml_str: &str, require_binary_identity: bool) -> Result<String> {
     let mut data: serde_json::Value = serde_yml::from_str(yaml_str)
         .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
+    inject_runtime_policy_data(&mut data, require_binary_identity);
 
     // Normalize port → ports for all endpoints so Rego always sees "ports" array.
     normalize_endpoint_ports(&mut data);
@@ -2261,6 +2335,88 @@ process:
     fn l7_get_allowed_by_rules() {
         let engine = l7_engine();
         let input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_get_allowed_by_rules_when_binary_identity_relaxed() {
+        let engine =
+            OpaEngine::from_strings_with_binary_identity_required(TEST_POLICY, L7_TEST_DATA, false)
+                .expect("Failed to load relaxed L7 test data");
+        let mut input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        input["exec"]["path"] = "".into();
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn relaxed_binary_identity_preserves_matched_policy_and_l7_for_proto() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "test_l7".to_string(),
+            NetworkPolicyRule {
+                name: "test_l7".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "host.k3d.internal".to_string(),
+                    port: 56123,
+                    protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "GET".to_string(),
+                            path: "/allowed".to_string(),
+                            command: String::new(),
+                            query: std::collections::HashMap::new(),
+                            operation_type: String::new(),
+                            operation_name: String::new(),
+                            fields: Vec::new(),
+                            params: std::collections::HashMap::new(),
+                        }),
+                    }],
+                    allowed_ips: vec!["192.168.0.0/16".to_string()],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+        let engine = OpaEngine::from_proto_with_pid_and_binary_identity_required(&proto, 0, false)
+            .expect("engine from relaxed proto");
+        let network_input = NetworkInput {
+            host: "host.k3d.internal".into(),
+            port: 56123,
+            binary_path: PathBuf::new(),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let action = engine.evaluate_network_action(&network_input).unwrap();
+        assert_eq!(
+            action,
+            NetworkAction::Allow {
+                matched_policy: Some("test_l7".to_string())
+            }
+        );
+
+        let mut input = l7_input("host.k3d.internal", 56123, "GET", "/allowed");
+        input["exec"]["path"] = "".into();
         assert!(eval_l7(&engine, &input));
     }
 
@@ -4589,6 +4745,46 @@ process:
             NetworkAction::Allow {
                 matched_policy: Some("claude_code".to_string())
             },
+        );
+    }
+
+    #[test]
+    fn relaxed_binary_identity_allows_declared_endpoint_without_binary_match() {
+        let engine = OpaEngine::from_strings_with_binary_identity_required(
+            TEST_POLICY,
+            INFERENCE_TEST_DATA,
+            false,
+        )
+        .expect("Failed to load relaxed binary identity test data");
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/tmp/unlisted-agent"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let action = engine.evaluate_network_action(&input).unwrap();
+        assert_eq!(
+            action,
+            NetworkAction::Allow {
+                matched_policy: Some("claude_code".to_string())
+            },
+        );
+        assert!(
+            engine.query_exact_declared_endpoint_host(&input).unwrap(),
+            "relaxed identity should preserve exact declared endpoint handling"
+        );
+
+        let undeclared = NetworkInput {
+            host: "api.openai.com".into(),
+            ..input
+        };
+        let action = engine.evaluate_network_action(&undeclared).unwrap();
+        assert!(
+            matches!(action, NetworkAction::Deny { .. }),
+            "relaxed identity must not allow undeclared endpoints"
         );
     }
 

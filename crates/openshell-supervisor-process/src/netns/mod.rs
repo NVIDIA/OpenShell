@@ -467,6 +467,123 @@ pub fn create_netns_for_proxy(
     }
 }
 
+/// Install pod-network bypass enforcement for Kubernetes sidecar topology.
+///
+/// This runs in the current network namespace, not in a per-workload netns.
+/// The rules allow loopback and the sidecar proxy UID, then reject direct
+/// TCP/UDP egress from other UIDs so traffic must use the sidecar's local
+/// proxy.
+///
+/// # Errors
+///
+/// Returns an error when `nft` is unavailable or the ruleset cannot be loaded.
+pub fn install_sidecar_bypass_rules(proxy_uid: u32) -> Result<()> {
+    match install_sidecar_nft_bypass_rules(proxy_uid) {
+        Ok(()) => Ok(()),
+        Err(nft_error) => {
+            warn!(
+                error = %nft_error,
+                "Failed to install nftables sidecar rules; trying iptables-legacy fallback"
+            );
+            install_sidecar_iptables_legacy_bypass_rules(proxy_uid).map_err(|iptables_error| {
+                miette::miette!(
+                    "sidecar nft ruleset load failed: {nft_error}; sidecar iptables-legacy fallback failed: {iptables_error}"
+                )
+            })
+        }
+    }
+}
+
+fn install_sidecar_nft_bypass_rules(proxy_uid: u32) -> Result<()> {
+    let nft_cmd = find_nft().ok_or_else(|| {
+        miette::miette!(
+            "trusted nft helper not found; sidecar network enforcement requires nftables"
+        )
+    })?;
+    let log_prefix = Some("openshell:sidecar-bypass:");
+    let ruleset = nft_ruleset::generate_sidecar_bypass_ruleset(proxy_uid, log_prefix);
+    run_nft_current_namespace(&nft_cmd, &ruleset)
+}
+
+const SIDECAR_IPTABLES_CHAIN: &str = "OPENSHELL_SIDECAR_BYPASS";
+
+fn install_sidecar_iptables_legacy_bypass_rules(proxy_uid: u32) -> Result<()> {
+    let iptables_cmd = find_iptables_legacy().ok_or_else(|| {
+        miette::miette!(
+            "trusted iptables-legacy helper not found; sidecar network enforcement fallback unavailable"
+        )
+    })?;
+
+    cleanup_sidecar_iptables_legacy_rules(&iptables_cmd);
+
+    let proxy_uid_arg = proxy_uid.to_string();
+    let commands: Vec<Vec<&str>> = vec![
+        vec!["-N", SIDECAR_IPTABLES_CHAIN],
+        vec!["-A", SIDECAR_IPTABLES_CHAIN, "-o", "lo", "-j", "ACCEPT"],
+        vec![
+            "-A",
+            SIDECAR_IPTABLES_CHAIN,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ],
+        vec![
+            "-A",
+            SIDECAR_IPTABLES_CHAIN,
+            "-m",
+            "owner",
+            "--uid-owner",
+            &proxy_uid_arg,
+            "-j",
+            "ACCEPT",
+        ],
+        vec![
+            "-A",
+            SIDECAR_IPTABLES_CHAIN,
+            "-p",
+            "tcp",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            "tcp-reset",
+        ],
+        vec![
+            "-A",
+            SIDECAR_IPTABLES_CHAIN,
+            "-p",
+            "udp",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            "icmp-port-unreachable",
+        ],
+        vec!["-A", "OUTPUT", "-j", SIDECAR_IPTABLES_CHAIN],
+    ];
+
+    for args in commands {
+        if let Err(e) = run_iptables_legacy_current_namespace(&iptables_cmd, &args) {
+            cleanup_sidecar_iptables_legacy_rules(&iptables_cmd);
+            return Err(e);
+        }
+    }
+
+    Ok(())
+}
+
+fn cleanup_sidecar_iptables_legacy_rules(iptables_cmd: &str) {
+    while run_iptables_legacy_current_namespace(
+        iptables_cmd,
+        &["-D", "OUTPUT", "-j", SIDECAR_IPTABLES_CHAIN],
+    )
+    .is_ok()
+    {}
+    let _ = run_iptables_legacy_current_namespace(iptables_cmd, &["-F", SIDECAR_IPTABLES_CHAIN]);
+    let _ = run_iptables_legacy_current_namespace(iptables_cmd, &["-X", SIDECAR_IPTABLES_CHAIN]);
+}
+
 /// Run an `ip` command on the host.
 fn run_ip(args: &[&str]) -> Result<()> {
     let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
@@ -483,6 +600,62 @@ fn run_ip(args: &[&str]) -> Result<()> {
         return Err(miette::miette!(
             "{ip_path} {} failed: {}",
             args.join(" "),
+            stderr.trim()
+        ));
+    }
+
+    Ok(())
+}
+
+fn run_iptables_legacy_current_namespace(iptables_cmd: &str, args: &[&str]) -> Result<()> {
+    debug!(
+        command = %format!("{iptables_cmd} {}", args.join(" ")),
+        "Running iptables-legacy sidecar command"
+    );
+
+    let output = Command::new(iptables_cmd)
+        .args(args)
+        .output()
+        .into_diagnostic()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette::miette!(
+            "{iptables_cmd} {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ));
+    }
+
+    Ok(())
+}
+
+fn run_nft_current_namespace(nft_cmd: &str, ruleset: &str) -> Result<()> {
+    use std::io::Write;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("openshell-sidecar-nft-")
+        .suffix(".conf")
+        .tempfile()
+        .into_diagnostic()?;
+    tmp.write_all(ruleset.as_bytes()).into_diagnostic()?;
+    let ruleset_path = tmp.path().to_string_lossy().to_string();
+
+    debug!(
+        command = %format!("{nft_cmd} -f {ruleset_path}"),
+        "Loading nftables sidecar ruleset"
+    );
+
+    let output = Command::new(nft_cmd)
+        .args(["-f", &ruleset_path])
+        .output()
+        .into_diagnostic()?;
+
+    drop(tmp);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette::miette!(
+            "sidecar nft ruleset load failed: {}",
             stderr.trim()
         ));
     }
@@ -605,6 +778,11 @@ fn enable_nf_log_all_netns() {
 
 /// Well-known paths where nft may be installed.
 const NFT_SEARCH_PATHS: &[&str] = &["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"];
+const IPTABLES_LEGACY_SEARCH_PATHS: &[&str] = &[
+    "/usr/sbin/iptables-legacy",
+    "/sbin/iptables-legacy",
+    "/usr/bin/iptables-legacy",
+];
 
 fn find_trusted_binary<'a>(name: &str, paths: &'a [&str]) -> Result<&'a str> {
     paths
@@ -625,6 +803,12 @@ fn find_trusted_binary<'a>(name: &str, paths: &'a [&str]) -> Result<&'a str> {
 /// Find the nft binary path, checking well-known locations.
 fn find_nft() -> Option<String> {
     find_trusted_binary("nft", NFT_SEARCH_PATHS)
+        .ok()
+        .map(String::from)
+}
+
+fn find_iptables_legacy() -> Option<String> {
+    find_trusted_binary("iptables-legacy", IPTABLES_LEGACY_SEARCH_PATHS)
         .ok()
         .map(String::from)
 }
@@ -664,6 +848,16 @@ mod tests {
             assert!(
                 path.starts_with('/'),
                 "NFT_SEARCH_PATHS entry must be absolute: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn iptables_legacy_search_paths_are_absolute() {
+        for path in IPTABLES_LEGACY_SEARCH_PATHS {
+            assert!(
+                path.starts_with('/'),
+                "IPTABLES_LEGACY_SEARCH_PATHS entry must be absolute: {path}"
             );
         }
     }

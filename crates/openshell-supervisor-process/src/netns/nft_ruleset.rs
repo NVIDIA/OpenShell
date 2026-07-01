@@ -53,6 +53,46 @@ pub fn generate_bypass_ruleset(host_ip: &str, proxy_port: u16, log_prefix: Optio
     )
 }
 
+/// Generate a pod-network ruleset for Kubernetes sidecar enforcement.
+///
+/// The network sidecar and the process supervisor share a pod network
+/// namespace. The sidecar runs as `proxy_uid` and owns external egress;
+/// sandbox traffic must use loopback services hosted by that sidecar
+/// (gateway forward and HTTP CONNECT proxy).
+pub fn generate_sidecar_bypass_ruleset(proxy_uid: u32, log_prefix: Option<&str>) -> String {
+    let log_tcp = log_prefix
+        .map(|p| {
+            format!(
+                "\n        tcp flags syn limit rate 5/second burst 10 packets log prefix \"{p}\" flags skuid"
+            )
+        })
+        .unwrap_or_default();
+    let log_udp = log_prefix
+        .map(|p| {
+            format!(
+                "\n        meta l4proto udp limit rate 5/second burst 10 packets log prefix \"{p}\" flags skuid"
+            )
+        })
+        .unwrap_or_default();
+
+    format!(
+        r#"table inet openshell_sidecar_bypass {{
+    chain output {{
+        type filter hook output priority 0; policy accept;
+
+        oifname "lo" accept
+        ct state established,related accept
+        meta skuid {proxy_uid} accept{log_tcp}
+        meta nfproto ipv4 meta l4proto tcp reject with icmp type port-unreachable
+        meta nfproto ipv6 meta l4proto tcp reject with icmpv6 type port-unreachable{log_udp}
+        meta nfproto ipv4 meta l4proto udp reject with icmp type port-unreachable
+        meta nfproto ipv6 meta l4proto udp reject with icmpv6 type port-unreachable
+    }}
+}}
+"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +183,29 @@ mod tests {
         assert!(
             udp_log_pos < udp_reject_pos,
             "UDP log rule must come before UDP reject rule"
+        );
+    }
+
+    #[test]
+    fn sidecar_ruleset_allows_supervisor_uid_and_loopback() {
+        let ruleset = generate_sidecar_bypass_ruleset(1337, None);
+        assert!(ruleset.contains("table inet openshell_sidecar_bypass"));
+        assert!(ruleset.contains("oifname \"lo\" accept"));
+        assert!(ruleset.contains("meta skuid 1337 accept"));
+    }
+
+    #[test]
+    fn sidecar_ruleset_rejects_tcp_and_udp_egress() {
+        let ruleset = generate_sidecar_bypass_ruleset(0, Some("openshell:sidecar:test:"));
+        assert!(ruleset.contains("meta nfproto ipv4 meta l4proto tcp reject"));
+        assert!(ruleset.contains("meta nfproto ipv6 meta l4proto tcp reject"));
+        assert!(ruleset.contains("meta nfproto ipv4 meta l4proto udp reject"));
+        assert!(ruleset.contains("meta nfproto ipv6 meta l4proto udp reject"));
+        assert_eq!(
+            ruleset
+                .matches("log prefix \"openshell:sidecar:test:\"")
+                .count(),
+            2
         );
     }
 }

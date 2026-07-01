@@ -167,9 +167,14 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read client key from {key_path}"))?;
 
-        let tls_config = ClientTlsConfig::new()
+        let mut tls_config = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca_pem))
             .identity(Identity::from_pem(cert_pem, key_pem));
+        if let Ok(server_name) = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME)
+            && !server_name.is_empty()
+        {
+            tls_config = tls_config.domain_name(server_name);
+        }
 
         ep = ep
             .tls_config(tls_config)

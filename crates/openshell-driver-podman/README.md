@@ -128,8 +128,8 @@ sequenceDiagram
     C->>C: entrypoint: /opt/openshell/bin/openshell-sandbox
 ```
 
-The supervisor image from `deploy/docker/Dockerfile.supervisor` copies the static
-`openshell-sandbox` binary to `/openshell-sandbox`.
+The supervisor image from `deploy/docker/Dockerfile.supervisor` provides the
+static `openshell-sandbox` binary at `/openshell-sandbox`.
 Mounting that image at `/opt/openshell/bin` makes the binary available as
 `/opt/openshell/bin/openshell-sandbox`.
 
