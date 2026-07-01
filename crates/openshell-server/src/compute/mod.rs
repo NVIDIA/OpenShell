@@ -1666,8 +1666,8 @@ fn extract_typed_resources(
 }
 
 /// Build the opaque `platform_config` Struct from platform-specific public
-/// template fields (`runtime_class_name`, annotations, `volume_claim_templates`)
-/// plus any resource fields beyond CPU/memory.
+/// template fields (`runtime_class_name`, annotations) plus any resource fields
+/// beyond CPU/memory.
 fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Struct> {
     use prost_types::{Struct, Value, value::Kind};
 
@@ -1701,16 +1701,6 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
                 kind: Some(Kind::StructValue(Struct {
                     fields: annotation_fields,
                 })),
-            },
-        );
-    }
-
-    // Pass through the raw volume_claim_templates Struct as a nested value.
-    if let Some(ref vct) = template.volume_claim_templates {
-        fields.insert(
-            "volume_claim_templates".to_string(),
-            Value {
-                kind: Some(Kind::StructValue(vct.clone())),
             },
         );
     }

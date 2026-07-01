@@ -1298,17 +1298,6 @@ fn sandbox_to_k8s_spec(
 ) -> serde_json::Value {
     let mut root = serde_json::Map::new();
 
-    // Determine early whether the user provided custom volumeClaimTemplates.
-    // When they haven't, we inject a default workspace VCT and corresponding
-    // init container + volume mount so sandbox data persists.  We need this
-    // flag before building the podTemplate because the workspace persistence
-    // transforms are applied inside sandbox_template_to_k8s.
-    let user_has_vct = spec
-        .and_then(|s| s.template.as_ref())
-        .and_then(|t| platform_config_struct(t, "volume_claim_templates"))
-        .is_some();
-    let inject_workspace = !user_has_vct;
-
     if let Some(spec) = spec {
         let pod_env = spec_pod_env(Some(spec));
         if let Some(template) = spec.template.as_ref() {
@@ -1318,7 +1307,7 @@ fn sandbox_to_k8s_spec(
                     template,
                     driver_gpu_requirements(spec.resource_requirements.as_ref()),
                     &pod_env,
-                    inject_workspace,
+                    true,
                     params,
                 ),
             );
@@ -1328,22 +1317,13 @@ fn sandbox_to_k8s_spec(
                     serde_json::json!(template.agent_socket_path),
                 );
             }
-            if let Some(volume_templates) =
-                platform_config_struct(template, "volume_claim_templates")
-            {
-                root.insert("volumeClaimTemplates".to_string(), volume_templates);
-            }
         }
     }
 
-    // Inject the default workspace volumeClaimTemplate when the user didn't
-    // provide their own.
-    if inject_workspace {
-        root.insert(
-            "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(params.workspace_default_storage_size),
-        );
-    }
+    root.insert(
+        "volumeClaimTemplates".to_string(),
+        default_workspace_volume_claim_templates(params.workspace_default_storage_size),
+    );
 
     // podTemplate is required by the Kubernetes CRD - ensure it's always present
     if !root.contains_key("podTemplate") {
@@ -1354,7 +1334,7 @@ fn sandbox_to_k8s_spec(
                 &SandboxTemplate::default(),
                 driver_gpu_requirements(spec.and_then(|s| s.resource_requirements.as_ref())),
                 &pod_env,
-                inject_workspace,
+                true,
                 params,
             ),
         );
