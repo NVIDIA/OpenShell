@@ -302,6 +302,10 @@ impl WxcExecInvoker {
         }
     }
 
+    pub(crate) const fn is_mock(&self) -> bool {
+        self.mock
+    }
+
     /// Test-only constructor that forces mock mode without touching the
     /// process-global `OPENSHELL_MXC_MOCK_WXC` env var (avoids races/UB across
     /// parallel tests under edition 2024's `unsafe` `set_var`).

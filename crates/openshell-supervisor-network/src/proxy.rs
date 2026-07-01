@@ -7,6 +7,7 @@ pub(crate) mod destination;
 mod egress;
 mod relay;
 
+#[cfg(target_os = "linux")]
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
@@ -34,7 +35,8 @@ use std::mem::size_of;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU32;
 use tokio::io::{
     AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite, AsyncWriteExt,
 };
@@ -93,10 +95,10 @@ fn emit_credential_endpoint_mismatch(host: &str, port: u16, policy_name: &str) {
     ocsf_emit!(finding);
 }
 
-/// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
+/// Hostnames injected by compute drivers as hosts-file aliases for the host
 /// machine. Traffic to these names is eligible for the trusted-gateway SSRF
 /// exemption when the resolved IP matches the driver-injected value read from
-/// `/etc/hosts` at proxy startup.
+/// the platform hosts file at proxy startup.
 const HOST_GATEWAY_ALIASES: &[&str] = &[
     "host.openshell.internal",
     "host.containers.internal",
@@ -235,6 +237,55 @@ pub struct ProxyHandle {
     exited_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
+#[derive(Clone)]
+pub(crate) enum ProxyIdentityMode {
+    /// Linux supervisor mode: bind a CONNECT request to the process that owns
+    /// the redirected TCP socket via procfs.
+    #[cfg(target_os = "linux")]
+    Procfs {
+        identity_cache: Arc<BinaryIdentityCache>,
+        entrypoint_pid: Arc<AtomicU32>,
+    },
+    /// Host-side mode for platforms where procfs socket ownership is
+    /// unavailable. MXC uses this on Windows: every connection redirected to
+    /// the per-sandbox listener is evaluated as the configured sandbox agent
+    /// identity.
+    Static {
+        binary_path: PathBuf,
+        binary_sha256: String,
+    },
+}
+
+impl ProxyIdentityMode {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn procfs(
+        identity_cache: Arc<BinaryIdentityCache>,
+        entrypoint_pid: Arc<AtomicU32>,
+    ) -> Self {
+        Self::Procfs {
+            identity_cache,
+            entrypoint_pid,
+        }
+    }
+
+    pub(crate) fn static_binary(path: impl Into<PathBuf>) -> Self {
+        Self::Static {
+            binary_path: path.into(),
+            binary_sha256: "openshell-host-proxy-static-identity".to_string(),
+        }
+    }
+
+    fn entrypoint_pid(&self) -> u32 {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Procfs { entrypoint_pid, .. } => {
+                entrypoint_pid.load(std::sync::atomic::Ordering::Acquire)
+            }
+            Self::Static { .. } => 0,
+        }
+    }
+}
+
 impl ProxyHandle {
     /// Start the proxy with OPA engine for policy evaluation.
     ///
@@ -245,8 +296,7 @@ impl ProxyHandle {
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
         opa_engine: Arc<OpaEngine>,
-        identity_cache: Arc<BinaryIdentityCache>,
-        entrypoint_pid: Arc<AtomicU32>,
+        identity_mode: Arc<ProxyIdentityMode>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
         provider_credentials: Option<ProviderCredentialState>,
@@ -283,14 +333,14 @@ impl ProxyHandle {
             ocsf_emit!(event);
         }
 
-        // Detect the trusted host gateway IP from /etc/hosts before user code
-        // runs. This is read once at startup so later /etc/hosts modifications
-        // by sandbox workloads cannot influence the stored value.
+        // Detect the trusted host gateway IP from the platform hosts file
+        // before user code runs. This is read once at startup so later hosts
+        // file modifications by sandbox workloads cannot influence it.
         let trusted_host_gateway: Arc<Option<IpAddr>> = Arc::new(detect_trusted_host_gateway());
         if let Some(ref ip) = *trusted_host_gateway {
             tracing::info!(
                 %ip,
-                "Trusted host gateway detected from /etc/hosts; \
+                "Trusted host gateway detected from platform hosts file; \
                  host-gateway aliases exempt from SSRF always-blocked check"
             );
         }
@@ -377,8 +427,7 @@ impl ProxyHandle {
                         consecutive_unknown_errors = 0;
                         set_tcp_nodelay_best_effort(&stream);
                         let opa = opa_engine.clone();
-                        let cache = identity_cache.clone();
-                        let spid = entrypoint_pid.clone();
+                        let identity = identity_mode.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
                         let policy_local = policy_local_ctx.clone();
@@ -401,8 +450,7 @@ impl ProxyHandle {
                             if let Err(err) = handle_tcp_connection(
                                 stream,
                                 opa,
-                                cache,
-                                spid,
+                                identity,
                                 tls,
                                 inf,
                                 policy_local,
@@ -625,7 +673,7 @@ async fn handle_transparent_tcp_connection(
     let cache = identity_cache.clone();
     let pid = entrypoint_pid.clone();
     let decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &engine, &cache, &pid, intent)
+        authorize_egress_intent_procfs(connection, &engine, &cache, &pid, intent)
     })
     .await
     .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
@@ -1685,8 +1733,7 @@ async fn deny_forward_destination(
 async fn handle_tcp_connection(
     mut client: TcpStream,
     opa_engine: Arc<OpaEngine>,
-    identity_cache: Arc<BinaryIdentityCache>,
-    entrypoint_pid: Arc<AtomicU32>,
+    identity_mode: Arc<ProxyIdentityMode>,
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
@@ -1758,8 +1805,7 @@ async fn handle_tcp_connection(
             used,
             &mut client,
             opa_engine,
-            identity_cache,
-            entrypoint_pid,
+            identity_mode,
             policy_local_ctx,
             agent_proposals,
             trusted_host_gateway,
@@ -1811,11 +1857,10 @@ async fn handle_tcp_connection(
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
     // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
     let opa_clone = opa_engine.clone();
-    let cache_clone = identity_cache.clone();
-    let pid_clone = entrypoint_pid.clone();
+    let identity_clone = identity_mode.clone();
     let intent = EgressIntent::connect(host_lc.clone(), port);
     let mut decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+        authorize_egress_intent(connection, &opa_clone, &identity_clone, intent)
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
@@ -1933,7 +1978,7 @@ async fn handle_tcp_connection(
     let effective_tls_skip = decision.endpoint.tls_mode == crate::l7::TlsMode::Skip;
     let credential_guard = query_endpoint_credential_guard(&opa_engine, &decision, &host_lc, port)?;
 
-    let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+    let sandbox_entrypoint_pid = identity_mode.entrypoint_pid();
 
     match hydrate_destination_plan(&mut decision, *trusted_host_gateway) {
         Ok(()) => {}
@@ -2607,7 +2652,7 @@ fn resolve_process_identity(
 
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
 #[cfg(target_os = "linux")]
-fn authorize_egress_intent(
+fn authorize_egress_intent_procfs(
     connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
@@ -2780,33 +2825,67 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
     }
 }
 
-/// Non-Linux stub: OPA identity binding requires /proc.
-#[cfg(not(target_os = "linux"))]
 fn authorize_egress_intent(
     _connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
-    _identity_cache: &BinaryIdentityCache,
-    _entrypoint_pid: &AtomicU32,
+    identity_mode: &ProxyIdentityMode,
     intent: EgressIntent,
 ) -> EgressDecision {
     if !crate::opa::network_binary_identity_required() {
         return evaluate_endpoint_only_opa(engine, intent);
     }
 
-    EgressDecision {
-        intent,
-        action: NetworkAction::Deny {
-            reason: "identity binding unavailable on this platform".into(),
-        },
-        policy_generation: engine.current_generation(),
-        identity: ProcessIdentityEvidence::Unavailable(
-            IdentityUnavailableReason::UnsupportedPlatform,
+    match identity_mode {
+        #[cfg(target_os = "linux")]
+        ProxyIdentityMode::Procfs {
+            identity_cache,
+            entrypoint_pid,
+        } => authorize_egress_intent_procfs(
+            _connection,
+            engine,
+            identity_cache,
+            entrypoint_pid,
+            intent,
         ),
-        endpoint: EndpointDecision::default(),
-        binary: None,
-        binary_pid: None,
-        ancestors: vec![],
-        cmdline_paths: vec![],
+        ProxyIdentityMode::Static {
+            binary_path,
+            binary_sha256,
+        } => {
+            let input = crate::opa::NetworkInput {
+                host: intent.destination.host.clone(),
+                port: intent.destination.port,
+                binary_path: binary_path.clone(),
+                binary_sha256: binary_sha256.clone(),
+                ancestors: Vec::new(),
+                cmdline_paths: Vec::new(),
+            };
+            match engine.evaluate_network_action_with_generation(&input) {
+                Ok((action, generation)) => EgressDecision {
+                    intent,
+                    action,
+                    policy_generation: generation,
+                    identity: ProcessIdentityEvidence::Available,
+                    endpoint: EndpointDecision::default(),
+                    binary: Some(binary_path.clone()),
+                    binary_pid: None,
+                    ancestors: Vec::new(),
+                    cmdline_paths: Vec::new(),
+                },
+                Err(error) => EgressDecision {
+                    intent,
+                    action: NetworkAction::Deny {
+                        reason: format!("policy evaluation error: {error}"),
+                    },
+                    policy_generation: engine.current_generation(),
+                    identity: ProcessIdentityEvidence::Available,
+                    endpoint: EndpointDecision::default(),
+                    binary: Some(binary_path.clone()),
+                    binary_pid: None,
+                    ancestors: Vec::new(),
+                    cmdline_paths: Vec::new(),
+                },
+            }
+        }
     }
 }
 
@@ -3653,16 +3732,16 @@ fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Read the proxy's own `/etc/hosts` at startup and return the IP mapped to
+/// Read the proxy's own platform hosts file at startup and return the IP mapped to
 /// `host.openshell.internal`, if present and safe.
 ///
 /// This is called once before user code runs, so the returned value is immune
-/// to later `/etc/hosts` tampering by sandbox workloads. Returns `None` if no
+/// to later hosts-file tampering by sandbox workloads. Returns `None` if no
 /// entry exists, the entry cannot be parsed, or the mapped IP is a cloud
 /// metadata address.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
-    let contents = std::fs::read_to_string("/etc/hosts").ok()?;
+    let contents = std::fs::read_to_string(platform_hosts_path()).ok()?;
     let ips = parse_hosts_file_for_host(&contents, "host.openshell.internal");
 
     // Multiple distinct IPs for the alias is unexpected — compute drivers
@@ -3674,7 +3753,7 @@ pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
     if ips.len() > 1 {
         warn!(
             ips = ?ips,
-            "host.openshell.internal has {} distinct IPs in /etc/hosts; \
+            "host.openshell.internal has {} distinct IPs in the platform hosts file; \
              expected exactly one. Using first entry. \
              Connections resolving to any other IP will be rejected.",
             ips.len()
@@ -3708,9 +3787,24 @@ pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
     Some(ip)
 }
 
-#[cfg(not(any(target_os = "linux", test)))]
+#[cfg(not(any(target_os = "linux", target_os = "windows", test)))]
 pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
     None
+}
+
+#[cfg(target_os = "linux")]
+fn platform_hosts_path() -> &'static str {
+    "/etc/hosts"
+}
+
+#[cfg(target_os = "windows")]
+fn platform_hosts_path() -> &'static str {
+    r"C:\Windows\System32\drivers\etc\hosts"
+}
+
+#[cfg(all(test, not(any(target_os = "linux", target_os = "windows"))))]
+fn platform_hosts_path() -> &'static str {
+    "/etc/hosts"
 }
 
 /// Resolve `host:port` and validate that every resolved address matches the
@@ -3779,7 +3873,7 @@ fn resolve_ip_literal(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
         .map(|ip| vec![SocketAddr::new(ip, port)])
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn parse_hosts_file_for_host(contents: &str, host: &str) -> Vec<IpAddr> {
     let lookup_host = normalize_host_lookup_key(host);
     let mut addrs = Vec::new();
@@ -4820,8 +4914,7 @@ async fn handle_forward_proxy(
     used: usize,
     client: &mut TcpStream,
     opa_engine: Arc<OpaEngine>,
-    identity_cache: Arc<BinaryIdentityCache>,
-    entrypoint_pid: Arc<AtomicU32>,
+    identity_mode: Arc<ProxyIdentityMode>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     agent_proposals: openshell_core::proposals::AgentProposals,
     trusted_host_gateway: Arc<Option<IpAddr>>,
@@ -4927,11 +5020,10 @@ async fn handle_forward_proxy(
     let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
 
     let opa_clone = opa_engine.clone();
-    let cache_clone = identity_cache.clone();
-    let pid_clone = entrypoint_pid.clone();
+    let identity_clone = identity_mode.clone();
     let intent = EgressIntent::forward_http(host_lc.clone(), port);
     let mut decision = tokio::task::spawn_blocking(move || {
-        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+        authorize_egress_intent(connection, &opa_clone, &identity_clone, intent)
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
@@ -5022,7 +5114,7 @@ async fn handle_forward_proxy(
         action = ?decision.action,
         "Forward proxy L4 policy decision"
     );
-    let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+    let sandbox_entrypoint_pid = identity_mode.entrypoint_pid();
     let forward_generation_guard = match relay::pin_policy_generation(
         &opa_engine,
         decision.policy_generation,

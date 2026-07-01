@@ -17,6 +17,8 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::struct_to_json_value;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
@@ -65,6 +67,13 @@ pub struct MxcComputeConfig {
     /// MXC `configurationId` for isolation session. Default: `"composable"`.
     /// Never use `"small"` (known OS bug).
     pub default_configuration_id: String,
+    /// Enable Pattern-C governed egress. When true, MXC receives filesystem
+    /// grants plus a `network.proxy` redirect and the host CONNECT proxy
+    /// receives the trimmed network-only policy.
+    pub egress_proxy: bool,
+    /// Loopback `IP:PORT` used for MXC `network.proxy` while governed egress is
+    /// enabled. Per-sandbox allocation is added by the follow-up commit.
+    pub egress_proxy_addr: String,
 
     /// Enable `--debug` flag on `wxc-exec` invocations.
     pub debug: bool,
@@ -82,6 +91,8 @@ impl Default for MxcComputeConfig {
             pc_least_privilege: false,
             pc_capabilities: Vec::new(),
             default_configuration_id: crate::mxc::DEFAULT_CONFIGURATION_ID.into(),
+            egress_proxy: false,
+            egress_proxy_addr: String::new(),
 
             debug: false,
             etw_audit: false,
@@ -118,6 +129,9 @@ struct SandboxEntry {
     lifecycle_gate: Arc<Mutex<()>>,
     monitor_cancel: Option<watch::Sender<bool>>,
     monitor_task: Option<JoinHandle<()>>,
+    trimmed_policy: Option<SandboxPolicy>,
+    proxy_addr: Option<SocketAddr>,
+    host_proxy: Option<openshell_supervisor_network::host::HostProxyHandle>,
 }
 
 impl std::fmt::Debug for SandboxEntry {
@@ -250,6 +264,35 @@ fn sandbox_environment(sandbox: &DriverSandbox) -> Vec<String> {
     environment
 }
 
+fn configured_egress_addr(config: &MxcComputeConfig) -> Result<Option<SocketAddr>, tonic::Status> {
+    if !config.egress_proxy {
+        return Ok(None);
+    }
+    if config.backend == MxcBackend::IsolationSession {
+        return Err(tonic::Status::invalid_argument(
+            "mxc governed egress requires process_container; network.proxy is not supported on isolation_session until MXC M1 lands",
+        ));
+    }
+    let raw = config.egress_proxy_addr.trim();
+    if raw.is_empty() {
+        return Err(tonic::Status::invalid_argument(
+            "mxc egress_proxy_addr is required when egress_proxy is enabled",
+        ));
+    }
+    let addr = raw.parse::<SocketAddr>().map_err(|error| {
+        tonic::Status::invalid_argument(format!(
+            "mxc egress_proxy_addr must be an IP:PORT socket address: {error}"
+        ))
+    })?;
+    if addr.ip() != std::net::IpAddr::from([127, 0, 0, 1]) {
+        return Err(tonic::Status::invalid_argument(format!(
+            "mxc egress_proxy_addr must be 127.0.0.1:PORT because MXC 0.6.0-alpha can encode only a localhost proxy port (got {})",
+            addr.ip()
+        )));
+    }
+    Ok(Some(addr))
+}
+
 fn encode_windows_command_line(args: &[String]) -> String {
     args.iter()
         .map(|arg| quote_windows_argument(arg))
@@ -283,6 +326,14 @@ fn quote_windows_argument(arg: &str) -> String {
     quoted.push('"');
     quoted
 }
+fn host_proxy_binary_path(config: &MxcSandboxConfig) -> PathBuf {
+    config
+        .command
+        .first()
+        .filter(|command| !command.trim().is_empty())
+        .map_or_else(|| PathBuf::from("mxc-agent"), PathBuf::from)
+}
+
 impl MxcComputeBackend {
     pub fn new(config: MxcComputeConfig) -> Self {
         let invoker = WxcExecInvoker::new(&config.wxc_exec_path, config.debug);
@@ -389,6 +440,7 @@ impl MxcComputeBackend {
         let policy = self.pending_policies.lock().await.remove(&sandbox_id);
         self.validate_sandbox_create(sandbox)?;
         let sandbox_config = sandbox_config(sandbox)?;
+        let egress_addr = configured_egress_addr(&self.config)?;
 
         // Policy translation is deterministic and side-effect free. Do it before
         // inserting the registry entry or launching MXC so invalid requests fail
@@ -399,7 +451,7 @@ impl MxcComputeBackend {
                 policy.as_ref(),
                 &MapCtx {
                     sandbox_id: sandbox_id.clone(),
-                    egress: None,
+                    egress: egress_addr,
                 },
             )
             .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
@@ -450,6 +502,9 @@ impl MxcComputeBackend {
                     lifecycle_gate,
                     monitor_cancel: None,
                     monitor_task: None,
+                    trimmed_policy: None,
+                    proxy_addr: None,
+                    host_proxy: None,
                 },
             );
         }
@@ -522,6 +577,7 @@ impl MxcComputeBackend {
         let mut registry = self.registry.lock().await;
         if let Some(entry) = registry.get_mut(&sandbox_id) {
             entry.isolation_stopped = isolation_stopped;
+            entry.host_proxy = None;
             entry.phase_state = PhaseState::Stopped;
             entry.sandbox = make_sandbox_with_condition(
                 &entry.sandbox,
@@ -670,6 +726,60 @@ async fn run_lifecycle(
 ) {
     let sandbox_id = sandbox.id.clone();
     let sandbox_name = sandbox.name.clone();
+    let trimmed_policy = mapped.trimmed_policy.clone();
+    let proxy_addr = mapped.proxy_addr;
+    let host_proxy = if !invoker.is_mock()
+        && let (Some(addr), Some(proxy_policy)) = (proxy_addr, trimmed_policy.clone())
+    {
+        match openshell_supervisor_network::host::start_host_proxy(
+            openshell_supervisor_network::host::HostProxyConfig {
+                bind_addr: addr,
+                policy: proxy_policy,
+                binary_path: host_proxy_binary_path(&sandbox_config),
+                sandbox_id: Some(sandbox_id.clone()),
+                sandbox_name: Some(sandbox_name.clone()),
+                openshell_endpoint: None,
+                inference_routes: None,
+                provider_credentials: None,
+                agent_proposals: openshell_core::proposals::AgentProposals::default(),
+                denial_tx: None,
+                activity_tx: None,
+            },
+        )
+        .await
+        {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                set_failed(
+                    &registry,
+                    &watch_tx,
+                    &sandbox,
+                    &sandbox_id,
+                    &format!("failed to start MXC host egress proxy at {addr}: {error}"),
+                )
+                .await;
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(addr) = proxy_addr {
+        {
+            let mut registry = registry.lock().await;
+            if let Some(entry) = registry.get_mut(&sandbox_id) {
+                entry.trimmed_policy = trimmed_policy;
+                entry.proxy_addr = Some(addr);
+                entry.host_proxy = host_proxy;
+            }
+        }
+        let _ = watch_tx.send(platform_event(
+            sandbox_id.clone(),
+            "EgressRedirect",
+            format!("MXC egress redirected to OpenShell host CONNECT proxy at {addr}"),
+        ));
+    }
+
     let filesystem = MxcFilesystem {
         readwrite_paths: mapped.readwrite_paths,
         readonly_paths: mapped.readonly_paths,
@@ -858,6 +968,7 @@ async fn monitor_exec(
             );
             let mut registry = registry.lock().await;
             if let Some(entry) = registry.get_mut(&sandbox_id) {
+                entry.host_proxy = None;
                 entry.sandbox = done.clone();
                 entry.phase_state = PhaseState::Running;
             }
@@ -885,6 +996,7 @@ async fn monitor_exec(
             );
             let mut registry = registry.lock().await;
             if let Some(entry) = registry.get_mut(&sandbox_id) {
+                entry.host_proxy = None;
                 entry.sandbox = failed.clone();
                 entry.phase_state = PhaseState::Failed(format!("exit code {code}"));
             }
@@ -917,6 +1029,7 @@ async fn set_failed(
     );
     let mut reg = registry.lock().await;
     if let Some(entry) = reg.get_mut(sandbox_id) {
+        entry.host_proxy = None;
         entry.sandbox = failed.clone();
         entry.phase_state = PhaseState::Failed(message.to_string());
     }

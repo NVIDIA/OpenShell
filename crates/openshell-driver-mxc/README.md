@@ -13,13 +13,16 @@ readiness; there is no in-sandbox supervisor or `ConnectSupervisor` relay.
 
 ## Capability Matrix
 
-| Capability | MXC driver |
-|---|---|
-| Filesystem policy | Read-only/read-write grants come only from `SandboxPolicy`. `process_container` enforces default-deny; `isolation_session` is an explicit grant-only compatibility mode. |
-| Network policy | Rejected synchronously during sandbox creation until an enforcing egress path is bound. |
-| Process policy | Unsupported; MXC supplies OS isolation only. |
-| Interactive exec/connect/forward | Unsupported; the configured workload runs in-driver. |
-| Restart durability | Unsupported; the in-memory registry cannot recover live sessions. |
+| Capability | MXC driver | Closing it requires |
+|---|---|---|
+| Filesystem policy (read-write / read-only grants) | ✅ provision-time AppContainer shares | — |
+| Governed egress (CONNECT proxy + OPA + L7) | Available behind `egress_proxy` on `process_container`; the driver starts a per-sandbox host CONNECT proxy from the trimmed network policy | HTTPS MITM trust bootstrap and gateway event-bus wiring follow-on |
+| Network policy | Split into MXC `network.proxy` + trimmed OpenShell policy on `process_container`; `isolation_session` still rejects network config | MXC feedback item M1 for persistent sessions |
+| Process policy (seccomp, uid/gid) | ❌ host-side governance design; OS isolation only | not pursued |
+| Interactive exec/connect/forward | ❌ exec runs in-driver, no client attach | gateway interactive-exec surgery (follow-on) |
+| Bundled agent image | ❌ no OCI image; relies on Windows host install | — |
+| Restart durability | ❌ in-memory registry; restart orphans live sessions | follow-on |
+| Concurrent sandboxes | ⚠️ isolation_session v1 is single-session | MXC backend feature |
 
 The filesystem enforcement proof has two paths:
 
@@ -66,7 +69,14 @@ no isolation session needed), set `OPENSHELL_MXC_MOCK_WXC=1`.
 
 The production driver maps the typed `SandboxPolicy` to MXC configuration before it inserts a registry entry or invokes `wxc-exec`. Mapping failure therefore returns from `CreateSandbox` without leaving a partial sandbox.
 
-`EmbeddedPolicyMapper` calls the embedded [`policy_map`](src/policy_map/) module directly and normalizes filesystem paths to Windows form. It does not add gateway-configured host paths. The policy supplied for the sandbox is the only source of filesystem grants.
+When `egress_proxy` is enabled, `EmbeddedPolicyMapper` uses `split_policy`
+instead: MXC receives filesystem grants plus a loopback `network.proxy`
+redirect, and the driver starts a host CONNECT proxy from the trimmed
+network-only `SandboxPolicy`. The proxy uses the configured agent command as
+the static sandbox process identity because MXC does not expose Linux-style
+procfs socket ownership. The development export surface remains the
+[`policy-to-mxc`](examples/policy-to-mxc.rs) example; there is no production
+`openshell policy export-mxc` subcommand yet.
 
 The mapper retains an internal policy-splitting seam for future development, but the runtime exposes no governed-egress switch. Any network rule fails closed until an enforcing proxy is implemented and bound to the sandbox lifecycle.
 
@@ -112,7 +122,7 @@ velocity keys not enabled, isolation_session absent).
 
 ## Deferred work
 
-- **Interactive exec/connect/forward** → `adapt-openshell-gateway-windows`
-- **Governed egress** remains fail-closed until an enforcing proxy is implemented and bound to sandbox lifecycle.
+- **Interactive exec/connect/forward** — gateway interactive-exec surgery (follow-on)
+- **Governed egress polish** — HTTPS MITM trust bootstrap, gateway denial/activity bus wiring, and per-sandbox port allocation
 - **Restart durability** (deprovision orphaned sessions on startup) → follow-on
 - **GPU passthrough** → not pursued in host-side-governance design
