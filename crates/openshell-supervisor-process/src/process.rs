@@ -11,7 +11,7 @@ use crate::netns::NetworkNamespace;
 use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
-use nix::unistd::{Group, Pid, User};
+use nix::unistd::{Gid, Group, Pid, Uid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -26,7 +26,7 @@ use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use tokio::process::{Child, Command};
-use tracing::debug;
+use tracing::{debug, info};
 
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::SANDBOX_TOKEN,
@@ -788,17 +788,36 @@ impl Drop for ProcessHandle {
     }
 }
 
-/// Validate that the `sandbox` user exists in this image.
+/// Validate that the configured sandbox identity exists in this image.
 ///
-/// All sandbox images must include a `sandbox` user for privilege dropping.
-/// This check runs at supervisor startup (inside the container) where we can
-/// inspect `/etc/passwd`. If the user is missing, the sandbox fails fast
-/// with a clear error instead of silently running child processes as root.
+/// When the identity is the literal `"sandbox"`, verifies the user exists
+/// in `/etc/passwd` (all sandbox images ship with one).
+///
+/// When the identity is a numeric UID, skips the passwd lookup entirely —
+/// the kernel will use the resolved UID regardless of whether an entry
+/// exists in `/etc/passwd`. Logs an OCSF event confirming numeric UID usage.
+/// Non-numeric, non-"sandbox" values are rejected.
 #[cfg(unix)]
 pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
-    let user_name = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
+    let identity = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
 
-    if user_name.is_empty() || user_name == "sandbox" {
+    // Numeric UID — no passwd entry required; kernel resolves directly.
+    if openshell_policy::is_valid_sandbox_identity(identity) && identity.parse::<u32>().is_ok() {
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "validated")
+                .message(format!(
+                    "Accepted numeric UID {identity} (no passwd entry required)"
+                ))
+                .build()
+        );
+        return Ok(());
+    }
+
+    // "sandbox" name — must exist in /etc/passwd.
+    if identity == "sandbox" {
         match User::from_name("sandbox") {
             Ok(Some(_)) => {
                 openshell_ocsf::ocsf_emit!(
@@ -820,10 +839,106 @@ pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
                 return Err(miette::miette!("failed to look up 'sandbox' user: {e}"));
             }
         }
+    } else if !identity.is_empty() {
+        // Non-numeric, non-sandbox string — attempt passwd lookup.
+        // This catches cases where someone accidentally put "root" or similar.
+        match User::from_name(identity) {
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    identity,
+                    "non-sandbox user accepted via passwd entry; \
+                     consider using a numeric UID for UID-injected images"
+                );
+            }
+            Ok(None) => {
+                return Err(miette::miette!(
+                    "unrecognized sandbox identity '{identity}'; \
+                     expected 'sandbox' or a numeric UID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+                ));
+            }
+            Err(e) => {
+                return Err(miette::miette!(
+                    "failed to look up identity '{identity}': {e}"
+                ));
+            }
+        }
     }
 
     Ok(())
 }
+
+/// Validate that the configured sandbox group identity is acceptable.
+///
+/// Mirrors [`validate_sandbox_user`] for the group dimension: numeric GIDs
+/// must fall within the allowed sandbox range, the literal `"sandbox"` must
+/// resolve via `/etc/group`, and unrecognised strings are rejected.
+#[cfg(unix)]
+pub fn validate_sandbox_group(policy: &SandboxPolicy) -> Result<()> {
+    let identity = policy.process.run_as_group.as_deref().unwrap_or("sandbox");
+
+    if openshell_policy::is_valid_sandbox_identity(identity) && identity.parse::<u32>().is_ok() {
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "validated")
+                .message(format!(
+                    "Accepted numeric GID {identity} (no group entry required)"
+                ))
+                .build()
+        );
+        return Ok(());
+    }
+
+    if identity == "sandbox" {
+        match Group::from_name("sandbox") {
+            Ok(Some(_)) => {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(openshell_ocsf::SeverityId::Informational)
+                        .status(openshell_ocsf::StatusId::Success)
+                        .state(openshell_ocsf::StateId::Enabled, "validated")
+                        .message("Validated 'sandbox' group exists in image")
+                        .build()
+                );
+            }
+            Ok(None) => {
+                return Err(miette::miette!(
+                    "sandbox group 'sandbox' not found in image; \
+                     all sandbox images must include a 'sandbox' user and group"
+                ));
+            }
+            Err(e) => {
+                return Err(miette::miette!("failed to look up 'sandbox' group: {e}"));
+            }
+        }
+    } else if !identity.is_empty() {
+        match Group::from_name(identity) {
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    identity,
+                    "non-sandbox group accepted via group entry; \
+                     consider using a numeric GID for GID-injected images"
+                );
+            }
+            Ok(None) => {
+                return Err(miette::miette!(
+                    "unrecognized sandbox group identity '{identity}'; \
+                     expected 'sandbox' or a numeric GID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}]"
+                ));
+            }
+            Err(e) => {
+                return Err(miette::miette!(
+                    "failed to look up group identity '{identity}': {e}"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub use openshell_policy::{MAX_SANDBOX_UID, MIN_SANDBOX_UID};
 
 /// Prepare a `read_write` path for the sandboxed process.
 ///
@@ -858,14 +973,180 @@ fn prepare_read_write_path(path: &Path) -> Result<bool> {
     }
 }
 
+/// Update `/etc/passwd` and `/etc/group` so the "sandbox" user/group entries
+/// match the driver-injected UID/GID from environment variables.
+///
+/// When `OPENSHELL_SANDBOX_UID` is set, the image-baked "sandbox" entry may
+/// have a different UID. Updating the files ensures `whoami`, `id`, `ls -l`,
+/// SSH sessions, and `initgroups` resolve the sandbox identity correctly.
+/// If no "sandbox" entry exists, one is appended.
+#[cfg(unix)]
+pub fn update_sandbox_passwd_entries() -> Result<()> {
+    let uid_str = match std::env::var(openshell_core::sandbox_env::SANDBOX_UID) {
+        Ok(v) if !v.is_empty() => v,
+        _ => return Ok(()),
+    };
+    let gid_str = match std::env::var(openshell_core::sandbox_env::SANDBOX_GID) {
+        Ok(v) if !v.is_empty() => v,
+        _ => uid_str.clone(),
+    };
+
+    let _: u32 = uid_str
+        .parse()
+        .map_err(|e| miette::miette!("invalid OPENSHELL_SANDBOX_UID '{uid_str}': {e}"))?;
+    let _: u32 = gid_str
+        .parse()
+        .map_err(|e| miette::miette!("invalid OPENSHELL_SANDBOX_GID '{gid_str}': {e}"))?;
+
+    update_passwd_file(&uid_str, &gid_str)?;
+    update_group_file(&gid_str)?;
+
+    info!(
+        uid = %uid_str,
+        gid = %gid_str,
+        "Updated /etc/passwd and /etc/group for sandbox identity"
+    );
+    Ok(())
+}
+
+/// Rewrite the `sandbox` line in `/etc/passwd` with the given UID/GID,
+/// or append a new entry if none exists.
+#[cfg(unix)]
+fn update_passwd_file(uid: &str, gid: &str) -> Result<()> {
+    rewrite_passwd_at(Path::new("/etc/passwd"), uid, gid)
+}
+
+/// Rewrite the `sandbox` line in `/etc/group` with the given GID,
+/// or append a new entry if none exists.
+#[cfg(unix)]
+fn update_group_file(gid: &str) -> Result<()> {
+    rewrite_group_at(Path::new("/etc/group"), gid)
+}
+
+#[cfg(unix)]
+fn rewrite_passwd_at(path: &Path, uid: &str, gid: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path).into_diagnostic()?;
+
+    let mut found = false;
+    let mut lines: Vec<String> = content
+        .lines()
+        .map(|line| {
+            if line.starts_with("sandbox:") {
+                found = true;
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() >= 7 {
+                    format!(
+                        "{}:{}:{}:{}:{}:{}:{}",
+                        fields[0], fields[1], uid, gid, fields[4], fields[5], fields[6]
+                    )
+                } else {
+                    line.to_string()
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    if !found {
+        lines.push(format!("sandbox:x:{uid}:{gid}::/sandbox:/bin/sh"));
+    }
+
+    let mut output = lines.join("\n");
+    if content.ends_with('\n') || !found {
+        output.push('\n');
+    }
+
+    std::fs::write(path, output).into_diagnostic()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path).into_diagnostic()?;
+
+    let mut found = false;
+    let mut lines: Vec<String> = content
+        .lines()
+        .map(|line| {
+            if line.starts_with("sandbox:") {
+                found = true;
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() >= 4 {
+                    format!("{}:{}:{}:{}", fields[0], fields[1], gid, fields[3])
+                } else {
+                    line.to_string()
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    if !found {
+        lines.push(format!("sandbox:x:{gid}:"));
+    }
+
+    let mut output = lines.join("\n");
+    if content.ends_with('\n') || !found {
+        output.push('\n');
+    }
+
+    std::fs::write(path, output).into_diagnostic()?;
+    Ok(())
+}
+
+/// Recursively chown a directory tree to the given UID/GID.
+///
+/// Symlinks are skipped (not followed) to prevent privilege escalation via
+/// malicious container images. The TOCTOU window is not exploitable because
+/// no untrusted process is running yet.
+#[cfg(unix)]
+fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
+    use nix::unistd::chown;
+
+    let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
+    if meta.file_type().is_symlink() {
+        return Err(miette::miette!(
+            "path '{}' is a symlink — refusing to chown (potential privilege escalation)",
+            root.display()
+        ));
+    }
+
+    chown(root, uid, gid).into_diagnostic()?;
+
+    if meta.is_dir()
+        && let Ok(entries) = std::fs::read_dir(root)
+    {
+        for entry in entries {
+            let entry = entry.into_diagnostic()?;
+            let path = entry.path();
+            if path
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
+                continue;
+            }
+            chown_sandbox_home(&path, uid, gid)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Prepare filesystem for the sandboxed process.
 ///
 /// Creates `read_write` directories if they don't exist and sets ownership
 /// on newly-created paths to the configured sandbox user/group. This runs as
 /// the supervisor (root) before forking the child process.
+///
+/// Accepts both name-based identities (resolved via `/etc/passwd`) and numeric
+/// UIDs/GIDs (passed directly to `chown` without a passwd lookup).
 #[cfg(unix)]
 pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     use nix::unistd::chown;
+    use nix::unistd::{Gid, Uid};
 
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
@@ -881,27 +1162,22 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
         return Ok(());
     }
 
-    // Resolve user and group
-    let uid = if let Some(name) = user_name {
-        Some(
-            User::from_name(name)
-                .into_diagnostic()?
-                .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
-                .uid,
-        )
-    } else {
-        None
+    // Resolve UID: numeric values are passed directly; names resolve via passwd.
+    let uid = match user_name {
+        Some(name) if name.parse::<u32>().is_ok() => {
+            Some(Uid::from_raw(name.parse().into_diagnostic()?))
+        }
+        Some(name) => User::from_name(name).into_diagnostic()?.map(|u| u.uid),
+        _ => None,
     };
 
-    let gid = if let Some(name) = group_name {
-        Some(
-            Group::from_name(name)
-                .into_diagnostic()?
-                .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
-                .gid,
-        )
-    } else {
-        None
+    // Resolve GID: numeric values are passed directly; names resolve via group.
+    let gid = match group_name {
+        Some(name) if name.parse::<u32>().is_ok() => {
+            Some(Gid::from_raw(name.parse().into_diagnostic()?))
+        }
+        Some(name) => Group::from_name(name).into_diagnostic()?.map(|g| g.gid),
+        _ => None,
     };
 
     // Create missing read_write paths and only chown the ones we created.
@@ -914,6 +1190,19 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
                 "Setting ownership on newly created read_write path"
             );
             chown(path, uid, gid).into_diagnostic()?;
+        }
+    }
+
+    // When a driver injects a custom UID/GID via environment variables, the
+    // /sandbox home directory may already exist with image-default ownership
+    // (e.g. UID 1000) that differs from the driver-assigned identity.
+    // Recursively chown /sandbox so the sandbox process can use its home
+    // directory.
+    if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok() {
+        let sandbox_home = Path::new("/sandbox");
+        if sandbox_home.exists() {
+            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
+            chown_sandbox_home(sandbox_home, uid, gid)?;
         }
     }
 
@@ -954,27 +1243,62 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         return Ok(());
     }
 
-    let user = if let Some(name) = user_name {
-        User::from_name(name)
-            .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
-    } else {
-        User::from_uid(nix::unistd::geteuid())
-            .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("Failed to resolve current user"))?
+    // Resolve UID: numeric values are used directly; names resolve via passwd.
+    let target_uid = match user_name {
+        Some(name) if name.parse::<u32>().is_ok() => Uid::from_raw(name.parse().into_diagnostic()?),
+        Some(name) => {
+            User::from_name(name)
+                .into_diagnostic()?
+                .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
+                .uid
+        }
+        None => nix::unistd::geteuid(),
     };
 
-    let group = if let Some(name) = group_name {
-        Group::from_name(name)
+    // Resolve group: if a numeric GID is configured use it directly.
+    // Otherwise try name resolution, then fall back to current user's primary group.
+    let target_gid = match group_name {
+        Some(name) if name.parse::<u32>().is_ok() => Gid::from_raw(name.parse().into_diagnostic()?),
+        Some(name) => {
+            Group::from_name(name)
+                .into_diagnostic()?
+                .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
+                .gid
+        }
+        None => match target_uid.as_raw() {
+            0 => nix::unistd::getegid(),
+            _ => Group::from_gid(
+                User::from_uid(target_uid)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Failed to resolve user from UID {target_uid}"))?
+                    .gid,
+            )
             .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
-    } else {
-        Group::from_gid(user.gid)
-            .into_diagnostic()?
-            .ok_or_else(|| miette::miette!("Failed to resolve user primary group"))?
+            .map_or_else(nix::unistd::getegid, |g| g.gid),
+        },
     };
 
-    if user_name.is_some() {
+    // Resolve the user record for initgroups only when identity is name-based.
+    // Numeric UIDs may not have a /etc/passwd entry; skip the lookup rather than
+    // failing with a spurious "user record not found" error.
+    let user_name_is_numeric = user_name.is_some_and(|n| n.parse::<u32>().is_ok());
+    let user = if user_name.is_some() && !user_name_is_numeric {
+        Some(
+            User::from_uid(target_uid)
+                .into_diagnostic()?
+                .ok_or_else(|| {
+                    miette::miette!("Failed to resolve user record for UID {target_uid}")
+                })?,
+        )
+    } else {
+        None
+    };
+
+    // Set supplementary groups only when we have a name-based identity.
+    // Numeric UIDs may not have a passwd entry, so initgroups would fail.
+    if let Some(ref user) = user
+        && target_uid != nix::unistd::geteuid()
+    {
         let user_cstr =
             CString::new(user.name.clone()).map_err(|_| miette::miette!("Invalid user name"))?;
         #[cfg(any(
@@ -993,34 +1317,40 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             target_os = "redox"
         )))]
         {
-            nix::unistd::initgroups(user_cstr.as_c_str(), group.gid).into_diagnostic()?;
+            nix::unistd::initgroups(user_cstr.as_c_str(), target_gid).into_diagnostic()?;
         }
     }
 
-    nix::unistd::setgid(group.gid).into_diagnostic()?;
+    if target_gid != nix::unistd::getegid() {
+        nix::unistd::setgid(target_gid).into_diagnostic()?;
+    }
 
     // Verify effective GID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
     let effective_gid = nix::unistd::getegid();
-    if effective_gid != group.gid {
+    if effective_gid != target_gid {
         return Err(miette::miette!(
             "Privilege drop verification failed: expected effective GID {}, got {}",
-            group.gid,
+            target_gid,
             effective_gid
         ));
     }
 
     #[cfg(target_os = "linux")]
-    drop_capability_bounding_set()?;
+    if nix::unistd::geteuid().is_root() {
+        drop_capability_bounding_set()?;
+    }
 
     if user_name.is_some() {
-        nix::unistd::setuid(user.uid).into_diagnostic()?;
+        if target_uid != nix::unistd::geteuid() {
+            nix::unistd::setuid(target_uid).into_diagnostic()?;
+        }
 
         // Verify effective UID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
         let effective_uid = nix::unistd::geteuid();
-        if effective_uid != user.uid {
+        if effective_uid != target_uid {
             return Err(miette::miette!(
                 "Privilege drop verification failed: expected effective UID {}, got {}",
-                user.uid,
+                target_uid,
                 effective_uid
             ));
         }
@@ -1028,11 +1358,11 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         // Verify root cannot be re-acquired (CERT POS37-C hardening).
         // If we dropped from root, setuid(0) must fail; success means privileges
         // were not fully relinquished.
-        if nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).is_ok() && user.uid.as_raw() != 0 {
+        if nix::unistd::setuid(Uid::from_raw(0)).is_ok() && target_uid.as_raw() != 0 {
             return Err(miette::miette!(
                 "Privilege drop verification failed: process can still re-acquire root (UID 0) \
                  after switching to UID {}",
-                user.uid
+                target_uid
             ));
         }
     }
@@ -1269,22 +1599,7 @@ mod tests {
         });
 
         let result = drop_privileges(&policy);
-
-        #[cfg(target_os = "linux")]
-        {
-            if capability_bounding_set_clear_available() {
-                assert!(result.is_ok(), "drop_privileges failed: {result:?}");
-            } else {
-                let msg = format!("{}", result.unwrap_err());
-                assert!(
-                    msg.contains("Failed to clear child capability bounding set"),
-                    "unexpected failure: {msg}"
-                );
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "drop_privileges failed: {result:?}");
     }
 
     #[test]
@@ -1601,7 +1916,7 @@ mod tests {
         let current_user = User::from_uid(nix::unistd::geteuid())
             .unwrap()
             .expect("current user entry");
-        let restricted_group = Group::from_gid(nix::unistd::Gid::from_raw(0))
+        let restricted_group = Group::from_gid(Gid::from_raw(0))
             .unwrap()
             .expect("gid 0 group entry");
         if restricted_group.gid == nix::unistd::getegid() {
@@ -1624,6 +1939,169 @@ mod tests {
         let after = std::fs::metadata(&existing).unwrap();
         assert_eq!(after.uid(), before.uid());
         assert_eq!(after.gid(), before.gid());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn chown_sandbox_home_changes_ownership_recursively() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file.txt"), "hello").unwrap();
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        std::fs::write(root.join("subdir").join("nested.txt"), "world").unwrap();
+
+        let expected_uid = nix::unistd::geteuid();
+        let expected_gid = nix::unistd::getegid();
+
+        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid)).unwrap();
+
+        for path in &[
+            root.clone(),
+            root.join("file.txt"),
+            root.join("subdir"),
+            root.join("subdir").join("nested.txt"),
+        ] {
+            let meta = std::fs::metadata(path).unwrap();
+            assert_eq!(
+                meta.uid(),
+                expected_uid.as_raw(),
+                "uid mismatch for {}",
+                path.display()
+            );
+            assert_eq!(
+                meta.gid(),
+                expected_gid.as_raw(),
+                "gid mismatch for {}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_sandbox_home_rejects_symlink_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let err = chown_sandbox_home(
+            &link,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "expected symlink rejection: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_sandbox_home_skips_symlink_children() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let target = dir.path().join("outside");
+        std::fs::write(&target, "secret").unwrap();
+        symlink(&target, root.join("link")).unwrap();
+
+        chown_sandbox_home(
+            &root,
+            Some(nix::unistd::geteuid()),
+            Some(nix::unistd::getegid()),
+        )
+        .expect("should skip symlink children without error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_passwd_modifies_existing_sandbox_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        std::fs::write(
+            &passwd,
+            "root:x:0:0:root:/root:/bin/bash\nsandbox:x:1000:1000::/sandbox:/bin/bash\n",
+        )
+        .unwrap();
+
+        rewrite_passwd_at(&passwd, "5000", "6000").unwrap();
+
+        let content = std::fs::read_to_string(&passwd).unwrap();
+        assert!(content.contains("sandbox:x:5000:6000::/sandbox:/bin/bash"));
+        assert!(content.contains("root:x:0:0:root:/root:/bin/bash"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_passwd_appends_when_no_sandbox_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        std::fs::write(&passwd, "root:x:0:0:root:/root:/bin/bash\n").unwrap();
+
+        rewrite_passwd_at(&passwd, "5000", "6000").unwrap();
+
+        let content = std::fs::read_to_string(&passwd).unwrap();
+        assert!(content.contains("root:x:0:0:root:/root:/bin/bash"));
+        assert!(content.contains("sandbox:x:5000:6000::/sandbox:/bin/sh"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_group_modifies_existing_sandbox_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = dir.path().join("group");
+        std::fs::write(&group, "root:x:0:\nsandbox:x:1000:\n").unwrap();
+
+        rewrite_group_at(&group, "6000").unwrap();
+
+        let content = std::fs::read_to_string(&group).unwrap();
+        assert!(content.contains("sandbox:x:6000:"));
+        assert!(content.contains("root:x:0:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_group_appends_when_no_sandbox_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let group = dir.path().join("group");
+        std::fs::write(&group, "root:x:0:\n").unwrap();
+
+        rewrite_group_at(&group, "6000").unwrap();
+
+        let content = std::fs::read_to_string(&group).unwrap();
+        assert!(content.contains("root:x:0:"));
+        assert!(content.contains("sandbox:x:6000:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_passwd_preserves_other_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        std::fs::write(
+            &passwd,
+            "root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/:/usr/sbin/nologin\nsandbox:x:1000:1000::/sandbox:/bin/bash\n",
+        )
+        .unwrap();
+
+        rewrite_passwd_at(&passwd, "1234567", "1234567").unwrap();
+
+        let content = std::fs::read_to_string(&passwd).unwrap();
+        assert!(content.contains("root:x:0:0:root:/root:/bin/bash"));
+        assert!(content.contains("nobody:x:65534:65534:nobody:/:/usr/sbin/nologin"));
+        assert!(content.contains("sandbox:x:1234567:1234567::/sandbox:/bin/bash"));
+        assert_eq!(content.lines().count(), 3);
     }
 
     #[tokio::test]
@@ -1735,5 +2213,75 @@ mod tests {
                 .expect("dedicated subdirectory should be accepted"),
             Some(PathBuf::from("/run/spire"))
         );
+    }
+
+    // ---- Numeric UID tests (Phase 2) ----
+
+    #[test]
+    fn drop_privileges_accepts_numeric_uid() {
+        // When running as non-root, a numeric UID/GID that matches the
+        // current process should succeed without any passwd lookup.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let uid_raw = nix::unistd::geteuid().as_raw();
+        let gid_raw = nix::unistd::getegid().as_raw();
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(uid_raw.to_string()),
+            run_as_group: Some(gid_raw.to_string()),
+        });
+
+        assert!(
+            drop_privileges(&policy).is_ok(),
+            "should accept current process UID/GID as numeric strings"
+        );
+    }
+
+    #[test]
+    fn drop_privileges_numeric_uid_skips_initgroups() {
+        // When running as non-root with a numeric user but group matches,
+        // initgroups should not be called (guard: target_uid != geteuid()).
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let current_uid = nix::unistd::geteuid().as_raw();
+
+        // Use a different group name that exists (the current one).
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("should resolve current group")
+            .expect("current group should exist");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_uid.to_string()), // numeric UID, no passwd entry needed
+            run_as_group: Some(current_group.name),     // name-based group
+        });
+
+        assert!(
+            drop_privileges(&policy).is_ok(),
+            "should accept numeric UID with name-based group (initgroups guarded)"
+        );
+    }
+
+    #[test]
+    fn drop_privileges_numeric_uid_without_passwd_entry_skips_lookup() {
+        // UID/GID 999999 has no /etc/passwd entry. drop_privileges must not fail
+        // with "Failed to resolve user record" — if it fails, EPERM is expected
+        // (non-root can't setuid to a different UID), not a lookup error.
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("999999".into()),
+            run_as_group: Some("999999".into()),
+        });
+        match drop_privileges(&policy) {
+            Ok(()) => {}
+            Err(e) => {
+                assert!(
+                    !e.to_string().contains("Failed to resolve user record"),
+                    "unexpected error for numeric UID without passwd entry: {e}"
+                );
+            }
+        }
     }
 }

@@ -24,3 +24,10 @@ rules:
       - get
       - list
       - watch
+  # Read namespace annotations for OpenShift SCC UID/GID range resolution.
+  - apiGroups:
+      - ""
+    resources:
+      - namespaces
+    verbs:
+      - get

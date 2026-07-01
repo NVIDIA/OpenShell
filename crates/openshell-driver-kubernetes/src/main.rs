@@ -102,6 +102,12 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")]
     provider_spiffe_workload_api_socket_path: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_K8S_SANDBOX_UID")]
+    sandbox_uid: Option<u32>,
+
+    #[arg(long, env = "OPENSHELL_K8S_SANDBOX_GID")]
+    sandbox_gid: Option<u32>,
 }
 
 #[tokio::main]
@@ -143,6 +149,8 @@ async fn main() -> Result<()> {
         provider_spiffe_workload_api_socket_path: args
             .provider_spiffe_workload_api_socket_path
             .unwrap_or_default(),
+        sandbox_uid: args.sandbox_uid,
+        sandbox_gid: args.sandbox_gid,
     })
     .await
     .into_diagnostic()?;

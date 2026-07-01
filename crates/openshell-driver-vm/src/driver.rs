@@ -207,7 +207,7 @@ enum GuestImagePayloadSource {
     LocalDocker { rootfs_archive: PathBuf },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VmDriverConfig {
     pub openshell_endpoint: String,
     pub state_dir: PathBuf,
@@ -225,7 +225,18 @@ pub struct VmDriverConfig {
     pub gpu_enabled: bool,
     pub gpu_mem_mib: u32,
     pub gpu_vcpus: u8,
+    /// Resolved sandbox UID for rootfs `/etc/passwd` entry.
+    /// When empty, defaults to 10001 (the legacy hardcoded value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_uid: Option<u32>,
+    /// Resolved sandbox GID for rootfs `/etc/passwd` and `/etc/group` entries.
+    /// When empty, defaults to the resolved UID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_gid: Option<u32>,
 }
+
+/// Default sandbox UID used by the VM driver when no config value is set.
+pub const DEFAULT_SANDBOX_UID: u32 = 10001;
 
 impl Default for VmDriverConfig {
     fn default() -> Self {
@@ -246,11 +257,46 @@ impl Default for VmDriverConfig {
             gpu_enabled: false,
             gpu_mem_mib: 8192,
             gpu_vcpus: 4,
+            sandbox_uid: None,
+            sandbox_gid: None,
         }
     }
 }
 
 impl VmDriverConfig {
+    /// Resolve the sandbox UID, falling back to `DEFAULT_SANDBOX_UID`.
+    pub fn resolve_sandbox_uid(&self) -> u32 {
+        self.sandbox_uid.unwrap_or(DEFAULT_SANDBOX_UID)
+    }
+
+    /// Resolve the sandbox GID, falling back to the resolved UID.
+    pub fn resolve_sandbox_gid(&self, resolved_uid: u32) -> u32 {
+        self.sandbox_gid.unwrap_or(resolved_uid)
+    }
+
+    pub fn validate_sandbox_identity(&self) -> Result<(), String> {
+        let range = openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID;
+        if let Some(uid) = self.sandbox_uid
+            && !range.contains(&uid)
+        {
+            return Err(format!(
+                "sandbox_uid {uid} is outside the allowed range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_UID,
+                openshell_policy::MAX_SANDBOX_UID,
+            ));
+        }
+        if let Some(gid) = self.sandbox_gid
+            && !range.contains(&gid)
+        {
+            return Err(format!(
+                "sandbox_gid {gid} is outside the allowed range [{}, {}]",
+                openshell_policy::MIN_SANDBOX_UID,
+                openshell_policy::MAX_SANDBOX_UID,
+            ));
+        }
+        Ok(())
+    }
+
     fn requires_tls_materials(&self) -> bool {
         self.openshell_endpoint.starts_with("https://")
     }
@@ -369,6 +415,7 @@ impl VmDriver {
         lifecycle_extensions
             .validate()
             .map_err(|err| err.message().to_string())?;
+        config.validate_sandbox_identity()?;
         if config.openshell_endpoint.trim().is_empty() {
             return Err("openshell endpoint is required".to_string());
         }
@@ -2488,6 +2535,7 @@ impl VmDriver {
         );
     }
 
+    #[allow(clippy::similar_names)]
     async fn build_cached_local_image_rootfs_image(
         &self,
         sandbox_id: &str,
@@ -2545,14 +2593,19 @@ impl VmDriver {
         let image_identity_owned = image_identity.to_string();
         let exported_rootfs_for_build = exported_rootfs.clone();
         let prepared_rootfs_for_build = prepared_rootfs.clone();
+        let sandbox_uid = self.config.resolve_sandbox_uid();
+        let sandbox_gid = self.config.resolve_sandbox_gid(sandbox_uid);
         self.publish_vm_progress(
             sandbox_id,
             "PreparingRootfs",
-            format!("Preparing VM rootfs for local image \"{image_ref}\""),
+            format!(
+                "Preparing VM rootfs for local image \"{image_ref}\" (sandbox uid={sandbox_uid})"
+            ),
             HashMap::from([
                 ("image_ref".to_string(), image_ref.to_string()),
                 ("image_source".to_string(), "local_docker".to_string()),
                 ("image_identity".to_string(), image_identity.to_string()),
+                ("sandbox_uid".to_string(), sandbox_uid.to_string()),
             ]),
         );
         let prepare_result = tokio::task::spawn_blocking(move || {
@@ -2560,6 +2613,8 @@ impl VmDriver {
             prepare_sandbox_rootfs_from_image_root(
                 &prepared_rootfs_for_build,
                 &image_identity_owned,
+                sandbox_uid,
+                sandbox_gid,
             )
             .map_err(|err| {
                 format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
@@ -2608,6 +2663,7 @@ impl VmDriver {
         Ok(())
     }
 
+    #[allow(clippy::similar_names)]
     async fn build_cached_registry_image_rootfs_image(
         &self,
         sandbox_id: &str,
@@ -2678,20 +2734,25 @@ impl VmDriver {
         let image_ref_owned = image_ref.to_string();
         let image_identity_owned = image_identity.to_string();
         let prepared_rootfs_for_build = prepared_rootfs.clone();
+        let sandbox_uid = self.config.resolve_sandbox_uid();
+        let sandbox_gid = self.config.resolve_sandbox_gid(sandbox_uid);
         self.publish_vm_progress(
             sandbox_id,
             "PreparingRootfs",
-            format!("Preparing VM rootfs for image \"{image_ref}\""),
+            format!("Preparing VM rootfs for image \"{image_ref}\" (sandbox uid={sandbox_uid})"),
             HashMap::from([
                 ("image_ref".to_string(), image_ref.to_string()),
                 ("image_source".to_string(), "registry".to_string()),
                 ("image_identity".to_string(), image_identity.to_string()),
+                ("sandbox_uid".to_string(), sandbox_uid.to_string()),
             ]),
         );
         let prepare_result = tokio::task::spawn_blocking(move || {
             prepare_sandbox_rootfs_from_image_root(
                 &prepared_rootfs_for_build,
                 &image_identity_owned,
+                sandbox_uid,
+                sandbox_gid,
             )
             .map_err(|err| {
                 format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")

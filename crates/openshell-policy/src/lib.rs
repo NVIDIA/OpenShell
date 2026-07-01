@@ -918,6 +918,41 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox UID/GID constants
+// ---------------------------------------------------------------------------
+
+/// Minimum accepted UID for sandbox process identity.
+/// UIDs below this are reserved for system users and are rejected.
+pub const MIN_SANDBOX_UID: u32 = 1000;
+
+/// Maximum accepted UID for sandbox process identity.
+/// UIDs above this exceed typical OS limits and are rejected.
+pub const MAX_SANDBOX_UID: u32 = 2_000_000_000;
+
+/// The literal string value accepted as a valid sandbox user/group name.
+const SANDBOX_NAME: &str = "sandbox";
+
+/// Validate whether a process identity field value is acceptable.
+///
+/// Accepts either the literal `"sandbox"` or a numeric UID/GID parsed as
+/// `u32` within the range `[MIN_SANDBOX_UID, MAX_SANDBOX_UID]`.
+///
+/// Rejects:
+/// - The empty string (callers should use `ensure_sandbox_process_identity`
+///   to fill defaults before validation)
+/// - UID 0 or values below `MIN_SANDBOX_UID`
+/// - Values above `MAX_SANDBOX_UID`
+/// - Non-numeric strings other than `"sandbox"` (e.g. `"root"`, `"nobody"`)
+pub fn is_valid_sandbox_identity(value: &str) -> bool {
+    if value == SANDBOX_NAME {
+        return true;
+    }
+    value
+        .parse::<u32>()
+        .is_ok_and(|uid| (MIN_SANDBOX_UID..=MAX_SANDBOX_UID).contains(&uid))
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -1090,7 +1125,10 @@ impl fmt::Display for PolicyViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidProcessIdentity { field, value } => {
-                write!(f, "{field} must be 'sandbox', got '{value}'")
+                write!(
+                    f,
+                    "{field} must be 'sandbox' or a numeric UID/GID in range [{MIN_SANDBOX_UID}, {MAX_SANDBOX_UID}], got '{value}'"
+                )
             }
             Self::PathTraversal { path } => {
                 write!(f, "path contains '..' traversal component: {path}")
@@ -1168,17 +1206,18 @@ pub fn validate_sandbox_policy(
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
     let mut violations = Vec::new();
 
-    // Check process identity — must be "sandbox".
+    // Check process identity — must be "sandbox" or a numeric UID/GID
+    // within the acceptable sandbox range.
     // `ensure_sandbox_process_identity` should be called before this to
-    // fill in defaults; anything other than "sandbox" is rejected.
+    // fill in defaults; any invalid value is rejected.
     if let Some(ref process) = policy.process {
-        if process.run_as_user != "sandbox" {
+        if !is_valid_sandbox_identity(&process.run_as_user) {
             violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_user",
                 value: process.run_as_user.clone(),
             });
         }
-        if process.run_as_group != "sandbox" {
+        if !is_valid_sandbox_identity(&process.run_as_group) {
             violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_group",
                 value: process.run_as_group.clone(),
@@ -2029,6 +2068,180 @@ network_policies:
         assert!(s.contains("root"));
         assert!(s.contains("run_as_user"));
         assert!(s.contains("sandbox"));
+    }
+
+    // ---- is_valid_sandbox_identity tests ----
+
+    #[test]
+    fn valid_identity_accepts_sandbox() {
+        assert!(is_valid_sandbox_identity("sandbox"));
+    }
+
+    #[test]
+    fn valid_identity_accepts_numeric_uid_in_range() {
+        assert!(is_valid_sandbox_identity("1000"));
+        assert!(is_valid_sandbox_identity("50000"));
+        assert!(is_valid_sandbox_identity("1000660000"));
+    }
+
+    #[test]
+    fn valid_identity_accepts_boundary_uids() {
+        assert!(is_valid_sandbox_identity(&MIN_SANDBOX_UID.to_string()));
+        assert!(is_valid_sandbox_identity(&MAX_SANDBOX_UID.to_string()));
+    }
+
+    #[test]
+    fn valid_identity_rejects_zero() {
+        assert!(!is_valid_sandbox_identity("0"));
+    }
+
+    #[test]
+    fn valid_identity_rejects_system_uids_below_min() {
+        assert!(!is_valid_sandbox_identity("999"));
+        assert!(!is_valid_sandbox_identity("100"));
+        assert!(!is_valid_sandbox_identity("1"));
+    }
+
+    #[test]
+    fn valid_identity_rejects_uid_above_max() {
+        assert!(!is_valid_sandbox_identity(
+            &MAX_SANDBOX_UID.saturating_add(1).to_string()
+        ));
+    }
+
+    #[test]
+    fn valid_identity_rejects_non_numeric_names() {
+        assert!(!is_valid_sandbox_identity("root"));
+        assert!(!is_valid_sandbox_identity("nobody"));
+        assert!(!is_valid_sandbox_identity("user"));
+    }
+
+    #[test]
+    fn valid_identity_rejects_empty_string() {
+        assert!(!is_valid_sandbox_identity(""));
+    }
+
+    // ---- Policy validation with numeric UIDs ----
+
+    #[test]
+    fn validate_accepts_numeric_uid_in_range() {
+        let policy = SandboxPolicy {
+            version: 1,
+            process: Some(ProcessPolicy {
+                run_as_user: "1000".into(),
+                run_as_group: "5000".into(),
+            }),
+            filesystem: None,
+            landlock: None,
+            network_policies: HashMap::new(),
+        };
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_boundary_uids() {
+        let policy = SandboxPolicy {
+            version: 1,
+            process: Some(ProcessPolicy {
+                run_as_user: MIN_SANDBOX_UID.to_string(),
+                run_as_group: MAX_SANDBOX_UID.to_string(),
+            }),
+            filesystem: None,
+            landlock: None,
+            network_policies: HashMap::new(),
+        };
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_uid_out_of_range_low() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "500".into(),
+            run_as_group: "sandbox".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            PolicyViolation::InvalidProcessIdentity {
+                field: "run_as_user",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_uid_out_of_range_high() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: (MAX_SANDBOX_UID + 1).to_string(),
+            run_as_group: "sandbox".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            PolicyViolation::InvalidProcessIdentity {
+                field: "run_as_user",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_root_string() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "root".into(),
+            run_as_group: "sandbox".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            PolicyViolation::InvalidProcessIdentity {
+                field: "run_as_user",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_nobody_string() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "nobody".into(),
+            run_as_group: "nogroup".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn validate_accepts_mixed_sandbox_name_and_uid() {
+        // run_as_user as "sandbox" name, run_as_group as numeric UID
+        let policy = SandboxPolicy {
+            version: 1,
+            process: Some(ProcessPolicy {
+                run_as_user: "sandbox".into(),
+                run_as_group: "1000".into(),
+            }),
+            filesystem: None,
+            landlock: None,
+            network_policies: HashMap::new(),
+        };
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn policy_violation_display_includes_range() {
+        let v = PolicyViolation::InvalidProcessIdentity {
+            field: "run_as_user",
+            value: "root".into(),
+        };
+        let s = format!("{v}");
+        assert!(s.contains("sandbox"));
+        assert!(s.contains(&MIN_SANDBOX_UID.to_string()));
+        assert!(s.contains(&MAX_SANDBOX_UID.to_string()));
+        assert!(s.contains("root"));
     }
 
     // ---- Multi-port and host wildcard tests ----

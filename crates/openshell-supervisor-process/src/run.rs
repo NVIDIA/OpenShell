@@ -67,11 +67,19 @@ pub async fn run_process(
     >,
     #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
 ) -> Result<i32> {
+    // When a driver injects a custom UID/GID, update /etc/passwd and
+    // /etc/group so the "sandbox" entry matches. Must run before
+    // validate_sandbox_user so passwd lookups see the correct identity.
+    #[cfg(unix)]
+    crate::process::update_sandbox_passwd_entries()?;
+
     // Validate that the sandbox user exists in the image. All sandbox images
     // must include a "sandbox" user for privilege dropping; failing fast here
     // beats silently running children as root.
     #[cfg(unix)]
     crate::process::validate_sandbox_user(policy)?;
+    #[cfg(unix)]
+    crate::process::validate_sandbox_group(policy)?;
 
     // Create read_write directories and chown newly-created ones to the
     // sandbox user/group. Runs as the supervisor (root) before the child
