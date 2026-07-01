@@ -4,12 +4,14 @@
 title: "OpenShift Identity Federation"
 sidebar-title: "Identity Federation"
 slug: "kubernetes/openshift/identity-federation"
-description: "Configure Keycloak to delegate authentication to the OpenShift OAuth server so cluster users can log in with their existing credentials."
+description: "Optionally configure Keycloak to delegate authentication to the OpenShift OAuth server so cluster users can log in with their existing credentials."
 keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, Keycloak, Identity Federation, OAuth, SSO"
 position: 4
 ---
 
-Keycloak can delegate authentication to the OpenShift OAuth server so users log in with their cluster credentials instead of separate Keycloak accounts. Users are auto-imported into the Keycloak realm on first login.
+If your organisation wants OpenShell users to authenticate with their existing OpenShift cluster credentials instead of managing separate Keycloak accounts, you can configure Keycloak to federate to the OpenShift OAuth server. This is optional — the [OIDC with Keycloak](/kubernetes/openshift/oidc-keycloak) setup works standalone with its own user directory.
+
+When federation is configured, users are auto-imported into the Keycloak realm on first login.
 
 ## Prerequisites
 
