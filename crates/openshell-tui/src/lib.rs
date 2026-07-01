@@ -2480,33 +2480,14 @@ fn format_age(epoch_ms: i64) -> String {
     }
 }
 
-/// Format epoch milliseconds as a human-readable UTC timestamp: `YYYY-MM-DD HH:MM`.
+/// Format epoch milliseconds as a human-readable local-time timestamp: `YYYY-MM-DD HH:MM`.
 fn format_timestamp(epoch_ms: i64) -> String {
+    use chrono::{Local, MappedLocalTime, TimeZone};
     if epoch_ms <= 0 {
         return String::from("-");
     }
-    let secs = epoch_ms / 1000;
-    let days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-
-    let (year, month, day) = days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}")
-}
-
-/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
-#[allow(clippy::unreadable_literal)]
-fn days_to_ymd(days: i64) -> (i64, i64, i64) {
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+    match Local.timestamp_millis_opt(epoch_ms) {
+        MappedLocalTime::Single(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        _ => String::from("-"),
+    }
 }
