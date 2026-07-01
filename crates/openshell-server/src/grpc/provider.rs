@@ -489,6 +489,20 @@ pub(super) async fn resolve_provider_environment(
             }
         }
 
+        if openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
+            == Some("google-vertex-ai")
+            && provider
+                .config
+                .get(openshell_core::inference::VERTEX_AI_PROJECT_ID_KEY)
+                .is_some_and(|project_id| !project_id.trim().is_empty())
+        {
+            warn!(
+                provider = %provider.metadata.as_ref().map_or("?", |m| m.name.as_str()),
+                "injecting ANTHROPIC_VERTEX_PROJECT_ID into sandbox; if using inference.local, \
+                 ensure ANTHROPIC_BASE_URL=https://inference.local is set to prevent Anthropic \
+                 SDK from routing directly to Vertex AI"
+            );
+        }
         registry.inject_env(&provider, &mut env);
     }
 
