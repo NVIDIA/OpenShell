@@ -262,7 +262,7 @@ enum DockerDriverMountConfig {
     Bind {
         source: String,
         target: String,
-        #[serde(default = "driver_mounts::default_true")]
+        #[serde(default = "default_true")]
         read_only: bool,
         #[serde(default)]
         selinux_label: Option<SelinuxLabel>,
@@ -270,7 +270,7 @@ enum DockerDriverMountConfig {
     Volume {
         source: String,
         target: String,
-        #[serde(default = "driver_mounts::default_true")]
+        #[serde(default = "default_true")]
         read_only: bool,
         #[serde(default)]
         subpath: Option<String>,
@@ -287,11 +287,15 @@ enum DockerDriverMountConfig {
     Image {
         source: String,
         target: String,
-        #[serde(default = "driver_mounts::default_true")]
+        #[serde(default = "default_true")]
         read_only: bool,
         #[serde(default)]
         subpath: Option<String>,
     },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 type WatchStream =

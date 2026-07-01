@@ -108,7 +108,7 @@ enum PodmanDriverMountConfig {
     Bind {
         source: String,
         target: String,
-        #[serde(default = "driver_mounts::default_true")]
+        #[serde(default = "default_true")]
         read_only: bool,
         #[serde(default)]
         selinux_label: Option<SelinuxLabel>,
@@ -116,7 +116,7 @@ enum PodmanDriverMountConfig {
     Volume {
         source: String,
         target: String,
-        #[serde(default = "driver_mounts::default_true")]
+        #[serde(default = "default_true")]
         read_only: bool,
         #[serde(default)]
         subpath: Option<String>,
@@ -133,11 +133,15 @@ enum PodmanDriverMountConfig {
     Image {
         source: String,
         target: String,
-        #[serde(default = "driver_mounts::default_true")]
+        #[serde(default = "default_true")]
         read_only: bool,
         #[serde(default)]
         subpath: Option<String>,
     },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Build a Podman container name from the sandbox name.
