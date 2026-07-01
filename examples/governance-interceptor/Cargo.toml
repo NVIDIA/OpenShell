@@ -16,6 +16,7 @@ jsonwebtoken = "9"
 openshell-core = { path = "../../crates/openshell-core", default-features = false }
 openshell-policy = { path = "../../crates/openshell-policy" }
 openshell-providers = { path = "../../crates/openshell-providers" }
+prost = "0.14"
 prost-types = "0.14"
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
 serde = { version = "1", features = ["derive"] }

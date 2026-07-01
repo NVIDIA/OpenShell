@@ -8,8 +8,8 @@
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
 };
-use crate::provider_profile_catalog::{
-    ProviderProfileCatalog, profile_response_payload, profile_storage_payload,
+use crate::provider_profile_sources::{
+    ProviderProfileSources, profile_response_payload, profile_storage_payload,
     stored_profile_resource_version, stored_provider_profile,
 };
 use openshell_core::proto::{
@@ -74,7 +74,7 @@ pub(super) async fn create_provider_record(
 ) -> Result<Provider, Status> {
     create_provider_record_with_catalog(
         store,
-        &ProviderProfileCatalog::with_builtin_profiles(),
+        &ProviderProfileSources::with_default_sources(),
         provider,
     )
     .await
@@ -82,7 +82,7 @@ pub(super) async fn create_provider_record(
 
 pub(super) async fn create_provider_record_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     mut provider: Provider,
 ) -> Result<Provider, Status> {
     use crate::persistence::{ObjectName, current_time_ms};
@@ -198,7 +198,7 @@ pub(super) async fn update_provider_record(
 ) -> Result<Provider, Status> {
     update_provider_record_with_catalog(
         store,
-        &ProviderProfileCatalog::with_builtin_profiles(),
+        &ProviderProfileSources::with_default_sources(),
         provider,
     )
     .await
@@ -206,7 +206,7 @@ pub(super) async fn update_provider_record(
 
 pub(super) async fn update_provider_record_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider: Provider,
 ) -> Result<Provider, Status> {
     use crate::persistence::{ObjectId, ObjectName};
@@ -471,7 +471,7 @@ pub(super) async fn resolve_provider_environment(
 ) -> Result<ProviderEnvironment, Status> {
     resolve_provider_environment_with_catalog(
         store,
-        &ProviderProfileCatalog::with_builtin_profiles(),
+        &ProviderProfileSources::with_default_sources(),
         provider_names,
     )
     .await
@@ -479,7 +479,7 @@ pub(super) async fn resolve_provider_environment(
 
 pub(super) async fn resolve_provider_environment_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider_names: &[String],
 ) -> Result<ProviderEnvironment, Status> {
     if provider_names.is_empty() {
@@ -559,7 +559,7 @@ pub(super) async fn resolve_provider_environment_with_catalog(
 /// host, port, endpoint path, and provider credential identity.
 pub(super) async fn resolve_dynamic_credentials_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider_names: &[String],
 ) -> Result<std::collections::HashMap<String, ProviderProfileCredential>, Status> {
     if provider_names.is_empty() {
@@ -876,7 +876,7 @@ pub async fn validate_provider_environment_keys_unique(
 ) -> Result<(), Status> {
     validate_provider_environment_keys_unique_with_catalog(
         store,
-        &ProviderProfileCatalog::with_builtin_profiles(),
+        &ProviderProfileSources::with_default_sources(),
         provider_names,
     )
     .await
@@ -884,7 +884,7 @@ pub async fn validate_provider_environment_keys_unique(
 
 pub async fn validate_provider_environment_keys_unique_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider_names: &[String],
 ) -> Result<(), Status> {
     validate_provider_environment_keys_unique_at(
@@ -899,7 +899,7 @@ pub async fn validate_provider_environment_keys_unique_with_catalog(
 
 pub async fn validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider: &Provider,
     credential_key: &str,
 ) -> Result<(), Status> {
@@ -919,7 +919,7 @@ pub async fn validate_provider_update_against_attached_sandboxes(
 ) -> Result<(), Status> {
     validate_provider_update_against_attached_sandboxes_with_catalog(
         store,
-        &ProviderProfileCatalog::with_builtin_profiles(),
+        &ProviderProfileSources::with_default_sources(),
         provider,
     )
     .await
@@ -927,7 +927,7 @@ pub async fn validate_provider_update_against_attached_sandboxes(
 
 pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider: &Provider,
 ) -> Result<(), Status> {
     let provider_name = provider.object_name().to_string();
@@ -956,7 +956,7 @@ pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
 
 async fn validate_provider_environment_keys_unique_at(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider_names: &[String],
     candidate_provider: Option<&Provider>,
     now_ms: i64,
@@ -1007,7 +1007,7 @@ struct DynamicTokenGrantBinding {
 
 async fn dynamic_token_grant_bindings_for_provider_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider: &Provider,
 ) -> Result<Vec<DynamicTokenGrantBinding>, Status> {
     let provider_name = provider.object_name().to_string();
@@ -1255,7 +1255,7 @@ pub(super) async fn handle_create_provider(
     let provider_type = provider.r#type.clone();
     let result = create_provider_record_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_catalog,
+        &state.provider_profile_sources,
         provider,
     )
     .await;
@@ -1312,7 +1312,7 @@ pub(super) async fn handle_list_provider_profiles(
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
     let offset = request.offset as usize;
     let profiles = state
-        .provider_profile_catalog
+        .provider_profile_sources
         .list_profiles(state.store.as_ref())
         .await?
         .into_iter()
@@ -1330,7 +1330,7 @@ pub(super) async fn handle_get_provider_profile(
     let id = request.into_inner().id;
     let id = normalize_profile_id_request(&id)?;
     let profile = state
-        .provider_profile_catalog
+        .provider_profile_sources
         .get_profile(state.store.as_ref(), &id)
         .await?
         .ok_or_else(|| Status::not_found("provider profile not found"))?;
@@ -1351,7 +1351,7 @@ pub(super) async fn handle_import_provider_profiles(
     diagnostics.extend(
         profile_conflict_diagnostics(
             state.store.as_ref(),
-            &state.provider_profile_catalog,
+            &state.provider_profile_sources,
             &profiles,
         )
         .await?,
@@ -1361,7 +1361,7 @@ pub(super) async fn handle_import_provider_profiles(
         diagnostics.extend(
             profile_attached_sandbox_diagnostics(
                 state.store.as_ref(),
-                &state.provider_profile_catalog,
+                &state.provider_profile_sources,
                 &profiles,
                 "import",
             )
@@ -1421,7 +1421,7 @@ pub(super) async fn handle_update_provider_profiles(
     diagnostics.extend(
         profile_update_target_diagnostics(
             state.store.as_ref(),
-            &state.provider_profile_catalog,
+            &state.provider_profile_sources,
             &profiles,
             &target_id,
         )
@@ -1455,7 +1455,7 @@ pub(super) async fn handle_update_provider_profiles(
         diagnostics.extend(
             profile_attached_sandbox_diagnostics(
                 state.store.as_ref(),
-                &state.provider_profile_catalog,
+                &state.provider_profile_sources,
                 &profiles,
                 "update",
             )
@@ -1536,7 +1536,7 @@ pub(super) async fn handle_lint_provider_profiles(
     diagnostics.extend(
         profile_conflict_diagnostics(
             state.store.as_ref(),
-            &state.provider_profile_catalog,
+            &state.provider_profile_sources,
             &profiles,
         )
         .await?,
@@ -1557,8 +1557,9 @@ pub(super) async fn handle_delete_provider_profile(
     let id = request.into_inner().id;
     let id = normalize_profile_id_request(&id)?;
     if let Some(source_id) = state
-        .provider_profile_catalog
-        .static_source_for_profile(&id)
+        .provider_profile_sources
+        .static_source_for_profile(state.store.as_ref(), &id)
+        .await?
     {
         return Err(Status::failed_precondition(format!(
             "provider profile '{id}' is managed by source '{source_id}' and cannot be deleted"
@@ -1594,7 +1595,7 @@ pub(super) async fn handle_delete_provider_profile(
 
 pub(super) async fn get_provider_type_profile_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     id: &str,
 ) -> Result<Option<ProviderTypeProfile>, Status> {
     let Some(id) = normalize_profile_id(id) else {
@@ -1605,7 +1606,7 @@ pub(super) async fn get_provider_type_profile_with_catalog(
 
 async fn provider_refresh_defaults(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider: &Provider,
     credential_key: &str,
 ) -> Result<Option<CredentialRefreshProfile>, Status> {
@@ -1654,7 +1655,7 @@ fn validate_refresh_material(
 
 async fn provider_type_allows_empty_credentials(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider_type: &str,
 ) -> Result<bool, Status> {
     let Some(profile) =
@@ -1716,7 +1717,7 @@ fn add_empty_profile_set_diagnostic(
 
 async fn profile_conflict_diagnostics(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     profiles: &[(String, ProviderTypeProfile)],
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
     let mut diagnostics = Vec::new();
@@ -1724,7 +1725,7 @@ async fn profile_conflict_diagnostics(
         let Some(id) = normalize_profile_id(&profile.id) else {
             continue;
         };
-        if let Some(source_id) = catalog.static_source_for_profile(&id) {
+        if let Some(source_id) = catalog.static_source_for_profile(store, &id).await? {
             diagnostics.push(ProfileValidationDiagnostic {
                 source: source.clone(),
                 profile_id: id.clone(),
@@ -1756,7 +1757,7 @@ async fn profile_conflict_diagnostics(
 
 async fn profile_update_target_diagnostics(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     profiles: &[(String, ProviderTypeProfile)],
     target_id: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
@@ -1777,7 +1778,7 @@ async fn profile_update_target_diagnostics(
             });
         }
     }
-    if let Some(source_id) = catalog.static_source_for_profile(target_id) {
+    if let Some(source_id) = catalog.static_source_for_profile(store, target_id).await? {
         diagnostics.push(ProfileValidationDiagnostic {
             source: target_id.to_string(),
             profile_id: target_id.to_string(),
@@ -1807,7 +1808,7 @@ async fn profile_update_target_diagnostics(
         let Some(id) = normalize_profile_id(&profile.id) else {
             continue;
         };
-        if let Some(source_id) = catalog.static_source_for_profile(&id) {
+        if let Some(source_id) = catalog.static_source_for_profile(store, &id).await? {
             diagnostics.push(ProfileValidationDiagnostic {
                 source: source.clone(),
                 profile_id: id.clone(),
@@ -1824,7 +1825,7 @@ async fn profile_update_target_diagnostics(
 
 async fn profile_attached_sandbox_diagnostics(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     profiles: &[(String, ProviderTypeProfile)],
     operation: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
@@ -1975,7 +1976,7 @@ pub(super) async fn handle_update_provider(
         .extend(req.credential_expires_at_ms);
     let result = update_provider_record_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_catalog,
+        &state.provider_profile_sources,
         provider,
     )
     .await;
@@ -2134,14 +2135,14 @@ pub(super) async fn handle_configure_provider_refresh(
         .ok_or_else(|| Status::not_found("provider not found"))?;
     validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_catalog,
+        &state.provider_profile_sources,
         &provider,
         credential_key,
     )
     .await?;
     let refresh_defaults = provider_refresh_defaults(
         state.store.as_ref(),
-        &state.provider_profile_catalog,
+        &state.provider_profile_sources,
         &provider,
         credential_key,
     )

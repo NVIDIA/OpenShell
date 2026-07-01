@@ -24,9 +24,10 @@ use openshell_core::config::{
     GatewayInterceptorBindingOverride, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
     GatewayInterceptorPhaseConfig,
 };
+use openshell_core::proto::ProviderProfile;
 use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
-    InterceptorResult, InterceptorSelector, JsonPatch,
+    InterceptorResult, InterceptorSelector, JsonPatch, ProviderProfileSnapshotRequest,
     gateway_interceptor_client::GatewayInterceptorClient,
 };
 use prost::Message as _;
@@ -36,6 +37,7 @@ use prost_types::{
     field_descriptor_proto::{Label, Type},
 };
 use serde_json::{Map, Number, Value};
+use sha2::Digest as _;
 use tokio::net::UnixStream;
 use tonic::codegen::http::Uri;
 use tonic::transport::{Channel, Endpoint};
@@ -200,7 +202,7 @@ impl std::fmt::Debug for BindingPlan {
 #[derive(Debug, Clone)]
 pub struct GatewayInterceptorRuntime {
     bindings: Arc<BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>>>,
-    profile_catalog_sources: Arc<Vec<ProfileCatalogSource>>,
+    profile_sources: Arc<Vec<ProfileSourcePlan>>,
     routes: Arc<routes::OpenShellRouteIndex>,
     descriptors: Arc<ProtoDescriptors>,
 }
@@ -218,17 +220,29 @@ pub struct InterceptedRequest {
     operation: Value,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProfileCatalogMode {
-    Append,
-    Authoritative,
+#[derive(Debug, Clone)]
+pub struct ProviderProfileSourceSnapshot {
+    pub source_id: String,
+    pub revision: String,
+    pub profiles: Vec<ProviderProfile>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ProfileCatalogSource {
-    pub source_id: String,
-    pub mode: ProfileCatalogMode,
-    pub profiles: Vec<openshell_core::proto::ProviderProfile>,
+#[derive(Clone)]
+struct ProfileSourcePlan {
+    interceptor_name: String,
+    source_id: String,
+    timeout: Duration,
+    client: GatewayInterceptorClient<Channel>,
+}
+
+impl std::fmt::Debug for ProfileSourcePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProfileSourcePlan")
+            .field("interceptor_name", &self.interceptor_name)
+            .field("source_id", &self.source_id)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Return `None` when no interceptors are configured.
@@ -251,8 +265,8 @@ impl GatewayInterceptorRuntime {
         let descriptors =
             ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET)?;
         let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
-        let mut profile_catalog_sources = Vec::new();
-        let mut profile_catalog_source_ids = BTreeSet::new();
+        let mut profile_sources = Vec::new();
+        let mut profile_source_ids = BTreeSet::new();
 
         for config in configs {
             validate_service_config(&config)?;
@@ -335,41 +349,82 @@ impl GatewayInterceptorRuntime {
                 }
             }
 
-            if let Some(source) =
-                normalize_profile_catalog_source(&config.name, manifest.provider_profile_catalog)?
-            {
-                if !profile_catalog_source_ids.insert(source.source_id.clone()) {
+            if manifest.provider_profiles {
+                let source_id = format!("interceptor/{}", config.name);
+                if !profile_source_ids.insert(source_id.clone()) {
                     return Err(InterceptorError::Config(format!(
-                        "duplicate provider profile catalog source id '{}'",
-                        source.source_id
+                        "duplicate provider profile source id '{source_id}'"
                     )));
                 }
-                profile_catalog_sources.push(source);
+                profile_sources.push(ProfileSourcePlan {
+                    interceptor_name: config.name.clone(),
+                    source_id,
+                    timeout,
+                    client: GatewayInterceptorClient::new(channel.clone())
+                        .max_decoding_message_size(max_response_bytes),
+                });
             }
         }
 
         let count: usize = bindings.values().map(Vec::len).sum();
         info!(
             bindings = count,
-            profile_catalog_sources = profile_catalog_sources.len(),
+            profile_sources = profile_sources.len(),
             "gateway interceptors initialized"
         );
         Ok(Self {
             bindings: Arc::new(bindings),
-            profile_catalog_sources: Arc::new(profile_catalog_sources),
+            profile_sources: Arc::new(profile_sources),
             routes: Arc::new(routes),
             descriptors: Arc::new(descriptors),
         })
     }
 
     #[must_use]
-    pub fn profile_catalog_sources(&self) -> &[ProfileCatalogSource] {
-        self.profile_catalog_sources.as_ref()
+    pub fn has_profile_sources(&self) -> bool {
+        !self.profile_sources.is_empty()
+    }
+
+    pub async fn provider_profile_snapshots(&self) -> Result<Vec<ProviderProfileSourceSnapshot>> {
+        let mut snapshots = Vec::with_capacity(self.profile_sources.len());
+        for source in self.profile_sources.iter() {
+            let mut client = source.client.clone();
+            let response = tokio::time::timeout(
+                source.timeout,
+                client.snapshot_provider_profiles(Request::new(ProviderProfileSnapshotRequest {})),
+            )
+            .await
+            .map_err(|_| {
+                InterceptorError::Transport(format!(
+                    "SnapshotProviderProfiles timed out for '{}'",
+                    source.interceptor_name
+                ))
+            })?
+            .map_err(|status| {
+                InterceptorError::Transport(format!(
+                    "SnapshotProviderProfiles failed for '{}': {status}",
+                    source.interceptor_name
+                ))
+            })?
+            .into_inner();
+
+            let revision = if response.revision.trim().is_empty() {
+                provider_profile_snapshot_revision(&response.profiles)
+            } else {
+                response.revision
+            };
+            snapshots.push(ProviderProfileSourceSnapshot {
+                source_id: source.source_id.clone(),
+                revision,
+                profiles: response.profiles,
+            });
+        }
+        Ok(snapshots)
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.bindings.is_empty()
+        self.bindings.is_empty() && self.profile_sources.is_empty()
     }
 
     #[must_use]
@@ -641,57 +696,6 @@ fn normalize_binding(
     }))
 }
 
-fn normalize_profile_catalog_source(
-    interceptor_name: &str,
-    catalog: Option<openshell_core::proto::gateway_interceptor::v1::ProviderProfileCatalog>,
-) -> Result<Option<ProfileCatalogSource>> {
-    let Some(catalog) = catalog else {
-        return Ok(None);
-    };
-
-    let source_id = catalog.source_id.trim();
-    if source_id.is_empty() {
-        return Err(InterceptorError::Config(format!(
-            "interceptor '{interceptor_name}' provider profile catalog source_id must not be empty"
-        )));
-    }
-
-    let mode =
-        openshell_core::proto::gateway_interceptor::v1::ProviderProfileCatalogMode::try_from(
-            catalog.mode,
-        )
-        .map_err(|_| {
-            InterceptorError::Config(format!(
-                "interceptor '{interceptor_name}' provider profile catalog has unknown mode"
-            ))
-        })?;
-    let mode = match mode {
-        openshell_core::proto::gateway_interceptor::v1::ProviderProfileCatalogMode::Append => {
-            ProfileCatalogMode::Append
-        }
-        openshell_core::proto::gateway_interceptor::v1::ProviderProfileCatalogMode::Authoritative => {
-            ProfileCatalogMode::Authoritative
-        }
-        openshell_core::proto::gateway_interceptor::v1::ProviderProfileCatalogMode::Unspecified => {
-            return Err(InterceptorError::Config(format!(
-                "interceptor '{interceptor_name}' provider profile catalog mode must not be unspecified"
-            )));
-        }
-    };
-
-    if mode == ProfileCatalogMode::Authoritative && catalog.profiles.is_empty() {
-        return Err(InterceptorError::Config(format!(
-            "interceptor '{interceptor_name}' authoritative provider profile catalog must not be empty"
-        )));
-    }
-
-    Ok(Some(ProfileCatalogSource {
-        source_id: source_id.to_string(),
-        mode,
-        profiles: catalog.profiles,
-    }))
-}
-
 fn selector_from_proto(selector: Option<&InterceptorSelector>) -> Result<RpcSelector> {
     let selector = selector
         .ok_or_else(|| InterceptorError::Config("binding selector is required".to_string()))?;
@@ -707,6 +711,17 @@ fn selector_from_proto(selector: Option<&InterceptorSelector>) -> Result<RpcSele
         selector.service.trim(),
         selector.method.trim(),
     ))
+}
+
+fn provider_profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
+    let mut profiles = profiles.to_vec();
+    profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"openshell-provider-profile-snapshot-v1");
+    for profile in profiles {
+        hasher.update(profile.encode_to_vec());
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 fn override_selector(

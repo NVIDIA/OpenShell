@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -13,7 +14,7 @@ use jsonwebtoken::{
 use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
     InterceptorManifest, InterceptorResult, InterceptorSelector, JsonPatch,
-    ProviderProfileCatalog, ProviderProfileCatalogMode,
+    ProviderProfileSnapshot, ProviderProfileSnapshotRequest,
     gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
 };
 use openshell_core::proto::{
@@ -22,7 +23,9 @@ use openshell_core::proto::{
 };
 use openshell_policy::parse_sandbox_policy;
 use openshell_providers::{ProviderTypeProfile, normalize_profile_id};
-use prost_types::{ListValue, Struct, Value as ProtoValue, value::Kind};
+use prost::Message as _;
+use prost_types::ListValue;
+use prost_types::{Struct, Value as ProtoValue, value::Kind};
 use rcgen::{KeyPair, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
@@ -36,7 +39,6 @@ const POLICY_JWT_AUDIENCE: &str = "openshell-governance-policy";
 const POLICY_JWT_SUBJECT: &str = "policy.yaml";
 const CREATE_SANDBOX_CORRELATION_PREFIX: &str = "governance:create-sandbox";
 const SERVICE: &str = "openshell.v1.OpenShell";
-const PROFILE_CATALOG_SOURCE_ID: &str = "interceptor/provider-governance";
 
 #[derive(Clone)]
 struct PolicySigner {
@@ -135,8 +137,15 @@ struct GovernanceInterceptorService {
     policy_hash: String,
     policy_signature: String,
     policy_signer: PolicySigner,
-    managed_profile_ids: Vec<String>,
-    managed_profiles: Vec<ProviderProfile>,
+    profiles_path: Option<PathBuf>,
+    profile_state: Arc<RwLock<ProviderProfileState>>,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderProfileState {
+    ids: Vec<String>,
+    profiles: Vec<ProviderProfile>,
+    revision: String,
 }
 
 #[derive(Clone, Debug)]
@@ -145,15 +154,25 @@ struct LoadedProviderProfile {
 }
 
 impl GovernanceInterceptorService {
-    fn from_yaml(policy_yaml: &str, profiles: Vec<LoadedProviderProfile>) -> Result<Self, String> {
+    #[cfg(test)]
+    fn from_profiles(profiles: Vec<LoadedProviderProfile>) -> Result<Self, String> {
+        Self::from_yaml(include_str!("../policy.yaml"), profiles, None)
+    }
+
+    fn from_policy_and_profiles_path(policy_yaml: &str, path: PathBuf) -> Result<Self, String> {
+        let profiles = load_provider_profiles(&path)?;
+        Self::from_yaml(policy_yaml, profiles, Some(path))
+    }
+
+    fn from_yaml(
+        policy_yaml: &str,
+        profiles: Vec<LoadedProviderProfile>,
+        profiles_path: Option<PathBuf>,
+    ) -> Result<Self, String> {
         if profiles.is_empty() {
             return Err("at least one provider profile must be loaded".to_string());
         }
-        let managed_profile_ids = loaded_profile_ids(&profiles);
-        let managed_profiles = profiles
-            .into_iter()
-            .map(|loaded| loaded.profile)
-            .collect::<Vec<_>>();
+        let profile_state = profile_state_from_loaded(profiles);
         let policy = parse_sandbox_policy(policy_yaml)
             .map_err(|err| format!("failed to parse policy YAML: {err}"))?;
         let policy = sandbox_policy_to_proto_json(&policy);
@@ -166,8 +185,8 @@ impl GovernanceInterceptorService {
             policy_hash,
             policy_signature,
             policy_signer,
-            managed_profile_ids,
-            managed_profiles,
+            profiles_path,
+            profile_state: Arc::new(RwLock::new(profile_state)),
         })
     }
 
@@ -175,11 +194,7 @@ impl GovernanceInterceptorService {
         InterceptorManifest {
             name: "provider-governance".to_string(),
             failure_policy: "fail_closed".to_string(),
-            provider_profile_catalog: Some(ProviderProfileCatalog {
-                source_id: PROFILE_CATALOG_SOURCE_ID.to_string(),
-                mode: ProviderProfileCatalogMode::Authoritative as i32,
-                profiles: self.managed_profiles.clone(),
-            }),
+            provider_profiles: true,
             bindings: vec![
                 binding(
                     "govern-create-sandbox",
@@ -190,33 +205,13 @@ impl GovernanceInterceptorService {
                     ],
                 ),
                 binding(
-                    "govern-attach-provider",
-                    "AttachSandboxProvider",
-                    &[GatewayInterceptorPhase::Validate],
-                ),
-                binding(
-                    "govern-detach-provider",
-                    "DetachSandboxProvider",
-                    &[GatewayInterceptorPhase::Validate],
-                ),
-                binding(
-                    "govern-update-config",
-                    "UpdateConfig",
-                    &[GatewayInterceptorPhase::Validate],
-                ),
-                binding(
                     "govern-create-provider",
                     "CreateProvider",
                     &[GatewayInterceptorPhase::Validate],
                 ),
                 binding(
-                    "govern-update-provider",
-                    "UpdateProvider",
-                    &[GatewayInterceptorPhase::Validate],
-                ),
-                binding(
-                    "govern-delete-provider",
-                    "DeleteProvider",
+                    "govern-update-config",
+                    "UpdateConfig",
                     &[GatewayInterceptorPhase::Validate],
                 ),
                 binding(
@@ -242,6 +237,7 @@ impl GovernanceInterceptorService {
         &self,
         evaluation: &InterceptorEvaluation,
     ) -> Result<InterceptorResult, Status> {
+        let profile_state = self.current_profile_state();
         let phase = GatewayInterceptorPhase::try_from(evaluation.phase)
             .map_err(|_| Status::invalid_argument("unknown interceptor phase"))?;
         let operation = evaluation
@@ -252,32 +248,22 @@ impl GovernanceInterceptorService {
 
         match (evaluation.method.as_str(), phase) {
             ("CreateSandbox", GatewayInterceptorPhase::ModifyOperation) => {
-                self.patch_create_sandbox(&operation)
+                self.patch_create_sandbox(&operation, &profile_state.ids)
             }
             ("CreateSandbox", GatewayInterceptorPhase::Validate) => {
-                Ok(self.validate_create_sandbox(&operation))
-            }
-            (
-                "AttachSandboxProvider" | "DetachSandboxProvider",
-                GatewayInterceptorPhase::Validate,
-            ) => Ok(deny("governed providers are fixed at sandbox creation")),
-            ("UpdateConfig", GatewayInterceptorPhase::Validate) => {
-                Ok(validate_update_config(&operation))
+                Ok(self.validate_create_sandbox(&operation, &profile_state.ids))
             }
             ("CreateProvider", GatewayInterceptorPhase::Validate) => {
-                Ok(self.validate_create_provider(&operation))
+                Ok(self.validate_create_provider(&operation, &profile_state.ids))
             }
-            ("UpdateProvider", GatewayInterceptorPhase::Validate) => {
-                Ok(self.validate_update_provider(&operation))
-            }
-            ("DeleteProvider", GatewayInterceptorPhase::Validate) => {
-                Ok(self.validate_delete_provider(&operation))
+            ("UpdateConfig", GatewayInterceptorPhase::Validate) => {
+                Ok(validate_update_config(&operation, &evaluation.principal))
             }
             ("ImportProviderProfiles", GatewayInterceptorPhase::Validate) => {
-                Ok(self.validate_import_provider_profiles(&operation))
+                Ok(self.validate_import_provider_profiles(&operation, &profile_state.ids))
             }
             ("UpdateProviderProfiles", GatewayInterceptorPhase::Validate) => {
-                Ok(self.validate_update_provider_profiles(&operation))
+                Ok(self.validate_update_provider_profiles(&operation, &profile_state.ids))
             }
             ("DeleteProviderProfile", GatewayInterceptorPhase::Validate) => {
                 Ok(validate_delete_provider_profile())
@@ -286,14 +272,18 @@ impl GovernanceInterceptorService {
         }
     }
 
-    fn patch_create_sandbox(&self, operation: &Value) -> Result<InterceptorResult, Status> {
+    fn patch_create_sandbox(
+        &self,
+        operation: &Value,
+        managed_profile_ids: &[String],
+    ) -> Result<InterceptorResult, Status> {
         let mut patches = Vec::new();
         if operation.get("spec").is_some_and(Value::is_object) {
             patches.push(json_patch("add", "/spec/policy", self.policy.clone())?);
             patches.push(json_patch(
                 "add",
                 "/spec/providers",
-                json!(&self.managed_profile_ids),
+                json!(managed_profile_ids),
             )?);
         } else {
             patches.push(json_patch(
@@ -301,7 +291,7 @@ impl GovernanceInterceptorService {
                 "/spec",
                 json!({
                     "policy": self.policy,
-                    "providers": self.managed_profile_ids,
+                    "providers": managed_profile_ids,
                 }),
             )?);
         }
@@ -324,7 +314,11 @@ impl GovernanceInterceptorService {
         Ok(result)
     }
 
-    fn validate_create_sandbox(&self, operation: &Value) -> InterceptorResult {
+    fn validate_create_sandbox(
+        &self,
+        operation: &Value,
+        managed_profile_ids: &[String],
+    ) -> InterceptorResult {
         let Some(policy) = operation.pointer("/spec/policy") else {
             return deny("sandbox policy must match the provider governance baseline");
         };
@@ -350,55 +344,58 @@ impl GovernanceInterceptorService {
         if sandbox_policy_hash != self.policy_hash || policy != &self.policy {
             return deny("sandbox policy must match the provider governance baseline");
         }
-        if !providers_are_managed(
-            operation.pointer("/spec/providers"),
-            &self.managed_profile_ids,
-        ) {
+        if !providers_are_managed(operation.pointer("/spec/providers"), managed_profile_ids) {
             return deny(&format!(
                 "sandbox providers must be exactly {}",
-                format_id_list(&self.managed_profile_ids)
+                format_id_list(managed_profile_ids)
             ));
         }
         allow()
     }
 
-    fn validate_create_provider(&self, operation: &Value) -> InterceptorResult {
-        let name = provider_name(operation);
+    fn current_profile_state(&self) -> ProviderProfileState {
+        if let Some(path) = &self.profiles_path {
+            match load_provider_profiles(path) {
+                Ok(profiles) => {
+                    let state = profile_state_from_loaded(profiles);
+                    if let Ok(mut guard) = self.profile_state.write() {
+                        *guard = state.clone();
+                    }
+                    return state;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "failed to reload provider profiles; keeping last valid snapshot: {err}"
+                    );
+                }
+            }
+        }
+        self.profile_state
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    fn validate_create_provider(
+        &self,
+        operation: &Value,
+        managed_profile_ids: &[String],
+    ) -> InterceptorResult {
         let provider_type = provider_type(operation);
-        if !self.is_managed_profile_id(name) {
+        if !is_managed_profile_id(managed_profile_ids, provider_type) {
             return deny(&format!(
-                "only managed provider records may be created: {}",
-                format_id_list(&self.managed_profile_ids)
+                "providers may only use vended provider profiles: {}",
+                format_id_list(managed_profile_ids)
             ));
-        }
-        if provider_type != name {
-            return deny(&format!("provider '{name}' must use profile '{name}'"));
         }
         allow()
     }
 
-    fn validate_update_provider(&self, operation: &Value) -> InterceptorResult {
-        let name = provider_name(operation);
-        if self.is_managed_profile_id(name) {
-            deny("governed provider records cannot be updated")
-        } else {
-            allow()
-        }
-    }
-
-    fn validate_delete_provider(&self, operation: &Value) -> InterceptorResult {
-        let name = operation
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if self.is_managed_profile_id(name) {
-            deny("governed provider records cannot be deleted")
-        } else {
-            allow()
-        }
-    }
-
-    fn validate_import_provider_profiles(&self, operation: &Value) -> InterceptorResult {
+    fn validate_import_provider_profiles(
+        &self,
+        operation: &Value,
+        managed_profile_ids: &[String],
+    ) -> InterceptorResult {
         let Some(profiles) = operation.get("profiles").and_then(Value::as_array) else {
             return deny("provider profile imports must include governed profile payloads");
         };
@@ -407,25 +404,29 @@ impl GovernanceInterceptorService {
         }
         for item in profiles {
             let id = profile_id_from_import_item(item);
-            if !self.is_managed_profile_id(id) {
+            if !is_managed_profile_id(managed_profile_ids, id) {
                 return deny(&format!(
                     "only managed provider profiles may be imported: {}",
-                    format_id_list(&self.managed_profile_ids)
+                    format_id_list(managed_profile_ids)
                 ));
             }
         }
         allow()
     }
 
-    fn validate_update_provider_profiles(&self, operation: &Value) -> InterceptorResult {
+    fn validate_update_provider_profiles(
+        &self,
+        operation: &Value,
+        managed_profile_ids: &[String],
+    ) -> InterceptorResult {
         let target_id = operation
             .get("id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if !self.is_managed_profile_id(target_id) {
+        if !is_managed_profile_id(managed_profile_ids, target_id) {
             return deny(&format!(
                 "only managed provider profiles may be updated: {}",
-                format_id_list(&self.managed_profile_ids)
+                format_id_list(managed_profile_ids)
             ));
         }
         let payload_id = operation
@@ -438,10 +439,6 @@ impl GovernanceInterceptorService {
             );
         }
         allow()
-    }
-
-    fn is_managed_profile_id(&self, id: &str) -> bool {
-        self.managed_profile_ids.iter().any(|managed| managed == id)
     }
 }
 
@@ -459,6 +456,17 @@ impl GatewayInterceptor for GovernanceInterceptorService {
         request: Request<InterceptorEvaluation>,
     ) -> Result<Response<InterceptorResult>, Status> {
         self.evaluate_inner(request.get_ref()).map(Response::new)
+    }
+
+    async fn snapshot_provider_profiles(
+        &self,
+        _request: Request<ProviderProfileSnapshotRequest>,
+    ) -> Result<Response<ProviderProfileSnapshot>, Status> {
+        let state = self.current_profile_state();
+        Ok(Response::new(ProviderProfileSnapshot {
+            revision: state.revision,
+            profiles: state.profiles,
+        }))
     }
 }
 
@@ -505,7 +513,17 @@ fn deny(reason: &str) -> InterceptorResult {
     }
 }
 
-fn validate_update_config(operation: &Value) -> InterceptorResult {
+fn validate_update_config(
+    operation: &Value,
+    principal: &HashMap<String, String>,
+) -> InterceptorResult {
+    if principal.get("kind").is_some_and(|kind| kind == "sandbox") {
+        return allow();
+    }
+    let is_global = operation
+        .get("global")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let has_policy = operation
         .get("policy")
         .is_some_and(|value| !value.is_null());
@@ -514,8 +532,8 @@ fn validate_update_config(operation: &Value) -> InterceptorResult {
         .or_else(|| operation.get("merge_operations"))
         .and_then(Value::as_array)
         .is_some_and(|operations| !operations.is_empty());
-    if has_policy || has_merge_operations {
-        deny("sandbox policy updates are blocked by the governance baseline")
+    if !is_global && (has_policy || has_merge_operations) {
+        deny("sandbox policy updates are blocked by provider profile governance")
     } else {
         allow()
     }
@@ -523,13 +541,6 @@ fn validate_update_config(operation: &Value) -> InterceptorResult {
 
 fn validate_delete_provider_profile() -> InterceptorResult {
     deny("provider profile deletes are blocked by provider governance")
-}
-
-fn provider_name(operation: &Value) -> &str {
-    operation
-        .pointer("/provider/metadata/name")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
 }
 
 fn provider_type(operation: &Value) -> &str {
@@ -659,6 +670,34 @@ fn loaded_profile_ids(profiles: &[LoadedProviderProfile]) -> Vec<String> {
         .iter()
         .map(|profile| profile.profile.id.clone())
         .collect()
+}
+
+fn profile_state_from_loaded(profiles: Vec<LoadedProviderProfile>) -> ProviderProfileState {
+    let ids = loaded_profile_ids(&profiles);
+    let profiles = profiles
+        .into_iter()
+        .map(|loaded| loaded.profile)
+        .collect::<Vec<_>>();
+    ProviderProfileState {
+        revision: provider_profile_revision(&profiles),
+        ids,
+        profiles,
+    }
+}
+
+fn provider_profile_revision(profiles: &[ProviderProfile]) -> String {
+    let mut profiles = profiles.to_vec();
+    profiles.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut hasher = Sha256::new();
+    hasher.update(b"openshell-governance-provider-profiles-v1");
+    for profile in profiles {
+        hasher.update(profile.encode_to_vec());
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn is_managed_profile_id(managed_profile_ids: &[String], id: &str) -> bool {
+    managed_profile_ids.iter().any(|managed| managed == id)
 }
 
 fn format_id_list(ids: &[String]) -> String {
@@ -1078,18 +1117,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         include_str!("../policy.yaml").to_string()
     };
     let profiles_path = profiles_path.unwrap_or_else(default_profiles_path);
-    let profiles = load_provider_profiles(&profiles_path)?;
-    let service = GovernanceInterceptorService::from_yaml(&policy_yaml, profiles)?;
+    let service =
+        GovernanceInterceptorService::from_policy_and_profiles_path(&policy_yaml, profiles_path)?;
 
     if let Some(endpoint) = gateway_endpoint {
         println!(
-            "--gateway-endpoint is ignored; provider profiles are vended through the interceptor manifest ({endpoint})"
+            "--gateway-endpoint is ignored; provider profiles are vended through the interceptor snapshot API ({endpoint})"
         );
     }
-    println!(
-        "loaded provider profiles: {}",
-        service.managed_profile_ids.join(", ")
-    );
+    let profile_state = service.current_profile_state();
+    println!("loaded provider profiles: {}", profile_state.ids.join(", "));
 
     println!("governance interceptor listening on {listen}");
     Server::builder()
@@ -1106,10 +1143,11 @@ fn default_profiles_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn service() -> GovernanceInterceptorService {
         let profiles = load_provider_profiles(&default_profiles_path()).unwrap();
-        GovernanceInterceptorService::from_yaml(include_str!("../policy.yaml"), profiles).unwrap()
+        GovernanceInterceptorService::from_profiles(profiles).unwrap()
     }
 
     fn evaluation(
@@ -1129,6 +1167,10 @@ mod tests {
         }
     }
 
+    fn managed_profile_ids(service: &GovernanceInterceptorService) -> Vec<String> {
+        service.current_profile_state().ids
+    }
+
     fn governed_create_operation(
         service: &GovernanceInterceptorService,
         policy: Value,
@@ -1137,7 +1179,7 @@ mod tests {
         let mut operation = json!({
             "spec": {
                 "policy": policy,
-                "providers": &service.managed_profile_ids,
+                "providers": managed_profile_ids(service),
             },
             "annotations": {},
         });
@@ -1193,19 +1235,29 @@ mod tests {
             .iter()
             .map(|binding| binding.id.as_str())
             .collect();
-        assert!(ids.contains(&"govern-create-sandbox"));
-        assert!(ids.contains(&"govern-attach-provider"));
-        assert!(ids.contains(&"govern-update-config"));
         assert!(ids.contains(&"govern-import-provider-profiles"));
         assert!(ids.contains(&"govern-update-provider-profiles"));
         assert!(ids.contains(&"govern-delete-provider-profile"));
+        assert!(ids.contains(&"govern-update-config"));
+        assert!(ids.contains(&"govern-create-sandbox"));
+        assert!(!ids.contains(&"govern-attach-provider"));
+        assert!(!ids.contains(&"govern-detach-provider"));
+        assert!(!ids.contains(&"govern-update-provider"));
+        assert!(!ids.contains(&"govern-delete-provider"));
         assert_eq!(manifest.failure_policy, "fail_closed");
-        let catalog = manifest
-            .provider_profile_catalog
-            .expect("manifest includes provider catalog");
-        assert_eq!(catalog.source_id, PROFILE_CATALOG_SOURCE_ID);
-        assert_eq!(catalog.mode, ProviderProfileCatalogMode::Authoritative as i32);
-        let profile_ids = catalog
+        assert!(manifest.provider_profiles);
+    }
+
+    #[tokio::test]
+    async fn snapshot_provider_profiles_returns_current_profiles() {
+        let service = service();
+        let snapshot = service
+            .snapshot_provider_profiles(Request::new(ProviderProfileSnapshotRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!snapshot.revision.is_empty());
+        let profile_ids = snapshot
             .profiles
             .iter()
             .map(|profile| profile.id.as_str())
@@ -1255,6 +1307,7 @@ binaries: []
                 json!({"name": "demo", "spec": {}, "labels": {"team": "platform"}}),
             ))
             .unwrap();
+
         assert!(result.allowed);
         let paths: Vec<_> = result
             .patches
@@ -1304,7 +1357,7 @@ binaries: []
                 json!({
                     "spec": {
                         "policy": service.policy,
-                        "providers": service.managed_profile_ids,
+                        "providers": managed_profile_ids(&service),
                     },
                 }),
             ))
@@ -1383,13 +1436,13 @@ binaries: []
     }
 
     #[test]
-    fn provider_creation_is_limited_to_governed_names() {
+    fn provider_creation_is_limited_to_vended_profiles() {
         let service = service();
         let github = service
             .evaluate_inner(&evaluation(
                 "CreateProvider",
                 GatewayInterceptorPhase::Validate,
-                json!({"provider": {"metadata": {"name": "github"}, "type": "github"}}),
+                json!({"provider": {"metadata": {"name": "work-github"}, "type": "github"}}),
             ))
             .unwrap();
         assert!(github.allowed);
@@ -1398,20 +1451,10 @@ binaries: []
             .evaluate_inner(&evaluation(
                 "CreateProvider",
                 GatewayInterceptorPhase::Validate,
-                json!({"provider": {"metadata": {"name": "slack"}, "type": "slack"}}),
+                json!({"provider": {"metadata": {"name": "team-chat"}, "type": "slack"}}),
             ))
             .unwrap();
         assert!(slack.allowed);
-
-        let wrong_profile = service
-            .evaluate_inner(&evaluation(
-                "CreateProvider",
-                GatewayInterceptorPhase::Validate,
-                json!({"provider": {"metadata": {"name": "slack"}, "type": "github"}}),
-            ))
-            .unwrap();
-        assert!(!wrong_profile.allowed);
-        assert!(wrong_profile.reason.contains("slack"));
 
         let teams = service
             .evaluate_inner(&evaluation(
@@ -1421,6 +1464,11 @@ binaries: []
             ))
             .unwrap();
         assert!(!teams.allowed);
+        assert!(
+            teams
+                .reason
+                .contains("providers may only use vended provider profiles")
+        );
     }
 
     #[test]
@@ -1505,18 +1553,25 @@ binaries: []
     }
 
     #[test]
-    fn provider_attach_and_detach_are_denied() {
+    fn provider_update_and_delete_are_not_governed() {
         let service = service();
-        for method in ["AttachSandboxProvider", "DetachSandboxProvider"] {
-            let result = service
-                .evaluate_inner(&evaluation(
-                    method,
-                    GatewayInterceptorPhase::Validate,
-                    json!({"sandboxName": "demo", "providerName": "github"}),
-                ))
-                .unwrap();
-            assert!(!result.allowed);
-        }
+        let update = service
+            .evaluate_inner(&evaluation(
+                "UpdateProvider",
+                GatewayInterceptorPhase::Validate,
+                json!({"provider": {"metadata": {"name": "slack"}}}),
+            ))
+            .unwrap();
+        assert!(update.allowed);
+
+        let delete = service
+            .evaluate_inner(&evaluation(
+                "DeleteProvider",
+                GatewayInterceptorPhase::Validate,
+                json!({"name": "github"}),
+            ))
+            .unwrap();
+        assert!(delete.allowed);
     }
 
     #[test]
@@ -1525,6 +1580,7 @@ binaries: []
         for operation in [
             json!({"name": "demo", "policy": {"version": 1}}),
             json!({"name": "demo", "mergeOperations": [{"op": "add"}]}),
+            json!({"name": "demo", "merge_operations": [{"op": "add"}]}),
         ] {
             let result = service
                 .evaluate_inner(&evaluation(
@@ -1535,27 +1591,37 @@ binaries: []
                 .unwrap();
             assert!(!result.allowed);
         }
-    }
 
-    #[test]
-    fn governed_provider_update_and_delete_are_denied() {
-        let service = service();
-        let update = service
+        let settings_update = service
             .evaluate_inner(&evaluation(
-                "UpdateProvider",
+                "UpdateConfig",
                 GatewayInterceptorPhase::Validate,
-                json!({"provider": {"metadata": {"name": "slack"}}}),
+                json!({"global": true, "settingKey": "providers_v2_enabled"}),
             ))
             .unwrap();
-        assert!(!update.allowed);
+        assert!(settings_update.allowed);
 
-        let delete = service
+        let global_policy_update = service
             .evaluate_inner(&evaluation(
-                "DeleteProvider",
+                "UpdateConfig",
                 GatewayInterceptorPhase::Validate,
-                json!({"name": "github"}),
+                json!({"global": true, "policy": {"version": 1}}),
             ))
             .unwrap();
-        assert!(!delete.allowed);
+        assert!(global_policy_update.allowed);
+
+        let mut sandbox_policy_sync = evaluation(
+            "UpdateConfig",
+            GatewayInterceptorPhase::Validate,
+            json!({"name": "demo", "policy": {"version": 1}}),
+        );
+        sandbox_policy_sync
+            .principal
+            .insert("kind".to_string(), "sandbox".to_string());
+        sandbox_policy_sync
+            .principal
+            .insert("sandbox_id".to_string(), "demo-id".to_string());
+        let sandbox_policy_sync = service.evaluate_inner(&sandbox_policy_sync).unwrap();
+        assert!(sandbox_policy_sync.allowed);
     }
 }

@@ -14,7 +14,7 @@ use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
-use crate::provider_profile_catalog::ProviderProfileCatalog;
+use crate::provider_profile_sources::ProviderProfileSources;
 use openshell_core::net::is_internal_ip;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
@@ -520,7 +520,7 @@ fn run_prover_findings(
 /// with the merged policy the prover validates against.
 async fn build_credential_set_for_sandbox_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider_names: &[String],
 ) -> Result<CredentialSet, Status> {
     let mut credentials = Vec::new();
@@ -988,7 +988,7 @@ async fn current_effective_policy_for_sandbox(
             .unwrap_or_default();
         let provider_layers = profile_provider_policy_layers_with_catalog(
             state.store.as_ref(),
-            &state.provider_profile_catalog,
+            &state.provider_profile_sources,
             &provider_names,
         )
         .await?;
@@ -1261,7 +1261,7 @@ pub(super) async fn handle_get_sandbox_config(
     {
         let provider_layers = profile_provider_policy_layers_with_catalog(
             state.store.as_ref(),
-            &state.provider_profile_catalog,
+            &state.provider_profile_sources,
             &sandbox_provider_names,
         )
         .await?;
@@ -1276,7 +1276,7 @@ pub(super) async fn handle_get_sandbox_config(
     let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
     let provider_env_revision = compute_provider_env_revision_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_catalog,
+        &state.provider_profile_sources,
         &sandbox_provider_names,
     )
     .await?;
@@ -1300,7 +1300,7 @@ async fn compute_provider_env_revision(
 ) -> Result<u64, Status> {
     compute_provider_env_revision_with_catalog(
         store,
-        &ProviderProfileCatalog::with_builtin_profiles(),
+        &ProviderProfileSources::with_default_sources(),
         provider_names,
     )
     .await
@@ -1308,7 +1308,7 @@ async fn compute_provider_env_revision(
 
 pub(super) async fn compute_provider_env_revision_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider_names: &[String],
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
@@ -1359,7 +1359,7 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
 
 async fn hash_provider_profile_revision(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider_type: &str,
     hasher: &mut Sha256,
 ) -> Result<(), Status> {
@@ -1376,7 +1376,7 @@ async fn profile_provider_policy_layers(
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
     profile_provider_policy_layers_with_catalog(
         store,
-        &ProviderProfileCatalog::with_builtin_profiles(),
+        &ProviderProfileSources::with_default_sources(),
         provider_names,
     )
     .await
@@ -1384,7 +1384,7 @@ async fn profile_provider_policy_layers(
 
 async fn profile_provider_policy_layers_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileCatalog,
+    catalog: &ProviderProfileSources,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
     let mut layers = Vec::new();
@@ -1464,13 +1464,13 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     let provider_names = spec.providers;
     let provider_env_revision = compute_provider_env_revision_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_catalog,
+        &state.provider_profile_sources,
         &provider_names,
     )
     .await?;
     let provider_environment = super::provider::resolve_provider_environment_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_catalog,
+        &state.provider_profile_sources,
         &provider_names,
     )
     .await?;
@@ -2382,7 +2382,7 @@ pub(super) async fn handle_submit_policy_analysis(
         .unwrap_or_default();
     let credential_set = build_credential_set_for_sandbox_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_catalog,
+        &state.provider_profile_sources,
         &provider_names_for_creds,
     )
     .await?;

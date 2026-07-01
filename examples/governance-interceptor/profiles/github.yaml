@@ -14,7 +14,7 @@ credentials:
 discovery:
   credentials: [api_token]
 endpoints:
-  - host: api.github.com
+  - host: api-1.github.com
     port: 443
     protocol: rest
     access: read-only
