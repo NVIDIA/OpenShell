@@ -16,10 +16,14 @@ Each sandbox workload has two trust levels:
 The supervisor keeps enough privilege to manage the sandbox, but the agent child
 loses that privilege before user code runs. On Linux, child setup clears the
 capability bounding set during privilege drop so later execs cannot regain
-container-granted capabilities. This is fail-closed: the supervisor retains
-`CAP_SETPCAP` solely to perform the clear, and spawning the workload or SSH shell
-aborts unless the bounding set ends up empty. A `setpcap` `EPERM` is tolerated
-only when the set is already empty; any other outcome fails the spawn.
+container-granted capabilities. When `CAP_SETPCAP` is available, this is
+fail-closed: the supervisor clears the bounding set and aborts if capabilities
+remain. When `CAP_SETPCAP` is unavailable (rootless Podman with AppArmor
+user-namespace restrictions, or similar environments), the supervisor logs a
+warning, emits an OCSF `DetectionFinding` alert, and continues with the
+bounding set intact. In this degraded mode the child process relies on seccomp
+to block dangerous syscalls; Landlock filesystem restrictions are applied
+independently and may also be active.
 
 ## Startup Flow
 

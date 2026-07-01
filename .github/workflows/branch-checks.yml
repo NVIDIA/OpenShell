@@ -172,6 +172,36 @@ jobs:
       - name: Test
         run: mise run test:python
 
+  rootless-caps:
+    name: Rootless capability tests
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions-rust-lang/setup-rust-toolchain@150fca883cd4034361b621bd4e6a9d34e5143606 # v1.15.4
+        with:
+          toolchain: "1.95.0"
+          cache: false
+
+      - name: Run supervisor capability tests without CAP_SETPCAP
+        run: |
+          sudo useradd -m testuser
+          sudo chmod a+rx /home/runner /home/runner/work /home/runner/work/OpenShell
+          sudo chmod -R a+rX "$GITHUB_WORKSPACE"
+          sudo cp -r /home/runner/.rustup /home/testuser/.rustup
+          sudo chown -R testuser: /home/testuser/.rustup
+          sudo mkdir -p /home/testuser/.cargo
+          sudo cp /home/runner/.cargo/config.toml /home/testuser/.cargo/ 2>/dev/null || true
+          sudo chown -R testuser: /home/testuser/.cargo
+          sudo -u testuser env \
+            PATH="/home/testuser/.cargo/bin:/home/testuser/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin:$PATH" \
+            CARGO_HOME="/home/testuser/.cargo" \
+            RUSTUP_HOME="/home/testuser/.rustup" \
+            CARGO_TARGET_DIR="/home/testuser/target" \
+            bash -c "cd $GITHUB_WORKSPACE && cargo test -p openshell-supervisor-process --lib -- capability_bounding drop_privileges"
+
   markdown:
     name: Markdown
     needs: pr_metadata
