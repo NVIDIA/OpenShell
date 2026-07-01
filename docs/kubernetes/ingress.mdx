@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Ingress"
 sidebar-title: "Ingress"
-description: "Expose the OpenShell gateway externally using the Kubernetes Gateway API and a GRPCRoute."
-keywords: "Generative AI, Cybersecurity, Kubernetes, Gateway API, Envoy Gateway, GRPCRoute, Ingress, External Access"
+description: "Expose the OpenShell gateway externally using Kubernetes Gateway API routes."
+keywords: "Generative AI, Cybersecurity, Kubernetes, Gateway API, Envoy Gateway, GRPCRoute, TLSRoute, TLS Passthrough, Ingress, External Access"
 position: 3
 ---
 
 By default, the OpenShell gateway is only reachable inside the cluster. To let CLI clients connect without a `kubectl port-forward`, expose the gateway through an ingress.
 
-OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart creates a `GRPCRoute` that routes inbound gRPC traffic to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill the `GRPCRoute`. This page uses [Envoy Gateway](https://gateway.envoyproxy.io), which the chart is tested with.
+OpenShell uses the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io) for ingress. The chart can create a `GRPCRoute` for plaintext traffic or a `TLSRoute` for TLS passthrough to the gateway pod. You need a Gateway API implementation installed on your cluster to fulfill these routes. This page uses [Envoy Gateway](https://gateway.envoyproxy.io), which the chart is tested with.
 
 ## Install Envoy Gateway
 
@@ -78,6 +78,38 @@ openshell status
 ```
 
 This setup is plaintext end-to-end and is intended for development.
+
+## Enable TLS passthrough
+
+TLS passthrough keeps the connection encrypted from the client to the OpenShell gateway server. Envoy Gateway reads the TLS Server Name Indication (SNI) to select the route but does not terminate TLS:
+
+```text
+client → TLS → Envoy Gateway (SNI routing) → TLS → OpenShell gateway
+```
+
+Enable TLSRoute and let the chart add a port 443 TLS listener to its Gateway:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set gatewayApi.gateway.create=true \
+  --set gatewayApi.gateway.className=eg \
+  --set gatewayApi.routes.tls.enabled=true \
+  --set 'gatewayApi.routes.tls.hostnames[0]=openshell.example.com' \
+  --set 'pkiInitJob.serverDnsNames[0]=openshell.example.com'
+```
+
+The generated Gateway listener uses protocol `TLS` and mode `Passthrough`. It does not reference a certificate Secret because the OpenShell gateway server completes the TLS handshake.
+
+Configure `pkiInitJob.serverDnsNames` before the built-in certificate generator creates the server Secret. The generator leaves an existing Secret unchanged during upgrades. For an existing installation, ensure `server.tls.certSecretName` contains a certificate whose SAN covers the external hostname. When cert-manager owns the certificate, add the hostname to `certManager.serverDnsNames` instead.
+
+TLS passthrough preserves the gateway's existing authentication mode, including mTLS. Clients must have the corresponding client certificate when `server.tls.clientCaSecretName` is configured. To use OIDC without client certificates, set `server.tls.clientCaSecretName` to an empty string and configure the server OIDC settings.
+
+To create only TLSRoute for a pre-existing Gateway, leave `gatewayApi.gateway.create=false` and set `gatewayApi.gateway.name` and `gatewayApi.gateway.namespace`. The existing Gateway must provide a compatible TLS passthrough listener and allow routes from the OpenShell release namespace.
+
+After the route is accepted and the external DNS record resolves to the Envoy Gateway address, register the HTTPS endpoint using the authentication mode configured for the server.
 
 ## SSH Relay
 

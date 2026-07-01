@@ -201,6 +201,9 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if hasKey .Values "grpcRoute" -}}
 {{- fail "grpcRoute values were replaced by gatewayApi; configure Gateway creation under gatewayApi.gateway and GRPCRoute creation under gatewayApi.routes.grpc." -}}
 {{- end -}}
+{{- if and .Values.gatewayApi.routes.tls.enabled .Values.server.disableTls -}}
+{{- fail "gatewayApi.routes.tls.enabled requires server.disableTls=false because TLS passthrough forwards the encrypted connection to the gateway server." -}}
+{{- end -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}
 {{- $replicaCount := int (default 1 .Values.replicaCount) -}}

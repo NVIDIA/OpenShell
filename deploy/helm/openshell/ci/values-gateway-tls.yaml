@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Gateway API overlay with TLS passthrough to the OpenShell gateway server.
+# Envoy routes by SNI without terminating TLS, preserving server TLS and mTLS.
+
+gatewayApi:
+  gateway:
+    create: true
+    className: "eg"
+  routes:
+    tls:
+      enabled: true
+      hostnames:
+        - openshell.example.com
+
+# Include the external hostname in certificates generated for fresh installs.
+pkiInitJob:
+  serverDnsNames:
+    - openshell.example.com

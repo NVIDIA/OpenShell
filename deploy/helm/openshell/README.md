@@ -54,6 +54,7 @@ The `dev` tags are intended for testing changes ahead of a release. Production d
 See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - Gateway API configuration
+- [`ci/values-gateway-tls.yaml`](ci/values-gateway-tls.yaml) - Gateway API TLS passthrough configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
@@ -153,6 +154,8 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | gatewayApi.gateway.namespace | string | `""` | Namespace of a pre-existing Gateway referenced by routes. Defaults to the release namespace. Chart-created Gateways always use the release namespace. |
 | gatewayApi.routes.grpc.enabled | bool | `false` | Create a Gateway API GRPCRoute for the gateway service. |
 | gatewayApi.routes.grpc.hostnames | list | `[]` | Hostnames the GRPCRoute matches on. Leave empty to match all hosts. |
+| gatewayApi.routes.tls.enabled | bool | `false` | Create a Gateway API TLSRoute that passes encrypted traffic through to the gateway service. When gatewayApi.gateway.create is true, the generated Gateway also gets a TLS listener on port 443 in Passthrough mode. |
+| gatewayApi.routes.tls.hostnames | list | `[]` | SNI hostnames the TLSRoute matches on. Leave empty to match all hosts. |
 | image.pullPolicy | string | `"IfNotPresent"` | Gateway image pull policy. |
 | image.repository | string | `"ghcr.io/nvidia/openshell/gateway"` | Gateway image repository. |
 | image.tag | string | `""` | Gateway image tag. Defaults to the chart appVersion when empty. |

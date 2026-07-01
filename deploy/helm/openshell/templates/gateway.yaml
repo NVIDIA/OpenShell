@@ -15,4 +15,11 @@ spec:
     - name: http
       port: 80
       protocol: HTTP
+    {{- if .Values.gatewayApi.routes.tls.enabled }}
+    - name: tls
+      port: 443
+      protocol: TLS
+      tls:
+        mode: Passthrough
+    {{- end }}
 {{- end }}

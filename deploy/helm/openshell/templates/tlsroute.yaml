@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.gatewayApi.routes.tls.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: TLSRoute
+metadata:
+  name: {{ include "openshell.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ include "openshell.gatewayApiGatewayName" . }}
+      namespace: {{ include "openshell.gatewayApiGatewayNamespace" . }}
+  {{- if .Values.gatewayApi.routes.tls.hostnames }}
+  hostnames:
+    {{- toYaml .Values.gatewayApi.routes.tls.hostnames | nindent 4 }}
+  {{- end }}
+  rules:
+    - backendRefs:
+        - name: {{ include "openshell.fullname" . }}
+          port: {{ .Values.service.port }}
+{{- end }}

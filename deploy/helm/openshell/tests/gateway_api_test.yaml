@@ -7,6 +7,7 @@ templates:
   - templates/gateway.yaml
   - templates/grpcroute.yaml
   - templates/statefulset.yaml
+  - templates/tlsroute.yaml
 release:
   name: openshell
   namespace: my-namespace
@@ -20,6 +21,12 @@ tests:
 
   - it: does not render a GRPCRoute by default
     template: templates/grpcroute.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not render a TLSRoute by default
+    template: templates/tlsroute.yaml
     asserts:
       - hasDocuments:
           count: 0
@@ -54,6 +61,42 @@ tests:
       - notExists:
           path: spec.listeners[0].tls
 
+  - it: does not render a Gateway when only TLSRoute is enabled
+    template: templates/gateway.yaml
+    set:
+      gatewayApi.routes.tls.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: adds a fixed TLS passthrough listener to a chart-created Gateway
+    template: templates/gateway.yaml
+    set:
+      gatewayApi.gateway.create: true
+      gatewayApi.routes.tls.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: spec.listeners[0].name
+          value: http
+      - equal:
+          path: spec.listeners[1].name
+          value: tls
+      - equal:
+          path: spec.listeners[1].port
+          value: 443
+      - equal:
+          path: spec.listeners[1].protocol
+          value: TLS
+      - equal:
+          path: spec.listeners[1].tls.mode
+          value: Passthrough
+      - notExists:
+          path: spec.listeners[1].hostname
+      - notExists:
+          path: spec.listeners[1].tls.certificateRefs
+
   - it: renders a GRPCRoute independently for a pre-existing Gateway
     template: templates/grpcroute.yaml
     set:
@@ -65,6 +108,39 @@ tests:
     asserts:
       - hasDocuments:
           count: 1
+      - equal:
+          path: spec.parentRefs[0].name
+          value: external-gateway
+      - equal:
+          path: spec.parentRefs[0].namespace
+          value: ingress-system
+      - equal:
+          path: spec.hostnames[0]
+          value: openshell.example.com
+      - equal:
+          path: spec.rules[0].backendRefs[0].name
+          value: openshell
+      - equal:
+          path: spec.rules[0].backendRefs[0].port
+          value: 8080
+
+  - it: renders a TLSRoute independently for a pre-existing Gateway
+    template: templates/tlsroute.yaml
+    set:
+      gatewayApi.routes.tls.enabled: true
+      gatewayApi.gateway.name: external-gateway
+      gatewayApi.gateway.namespace: ingress-system
+      gatewayApi.routes.tls.hostnames:
+        - openshell.example.com
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: apiVersion
+          value: gateway.networking.k8s.io/v1
+      - equal:
+          path: kind
+          value: TLSRoute
       - equal:
           path: spec.parentRefs[0].name
           value: external-gateway
@@ -116,3 +192,12 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "grpcRoute values were replaced by gatewayApi"
+
+  - it: rejects TLS passthrough when gateway server TLS is disabled
+    template: templates/statefulset.yaml
+    set:
+      gatewayApi.routes.tls.enabled: true
+      server.disableTls: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "gatewayApi.routes.tls.enabled requires server.disableTls=false"

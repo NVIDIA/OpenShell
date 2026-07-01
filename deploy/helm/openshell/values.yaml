@@ -356,7 +356,7 @@ certManager:
 # Requires a Gateway API controller in the cluster. Install Envoy Gateway via
 # the skaffold.yaml releases or independently:
 #   helm install eg oci://docker.io/envoyproxy/gateway-helm \
-#     --version v1.4.1 -n envoy-gateway-system --create-namespace
+#     --version v1.8.1 -n envoy-gateway-system --create-namespace
 gatewayApi:
   gateway:
     # -- When true, a Gateway resource is created.
@@ -374,4 +374,11 @@ gatewayApi:
       # -- Create a Gateway API GRPCRoute for the gateway service.
       enabled: false
       # -- Hostnames the GRPCRoute matches on. Leave empty to match all hosts.
+      hostnames: []
+    tls:
+      # -- Create a Gateway API TLSRoute that passes encrypted traffic through
+      # to the gateway service. When gatewayApi.gateway.create is true, the
+      # generated Gateway also gets a TLS listener on port 443 in Passthrough mode.
+      enabled: false
+      # -- SNI hostnames the TLSRoute matches on. Leave empty to match all hosts.
       hostnames: []

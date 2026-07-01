@@ -297,6 +297,8 @@ openshell logs <sandbox-name>
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and a `gatewayApi` resource is enabled |
+| TLSRoute remains unaccepted or port 443 is not exposed | The referenced Gateway has no compatible TLS passthrough listener, or the Gateway API controller does not support TLSRoute | Check `kubectl describe tlsroute -n <namespace>` and `kubectl describe gateway -n <namespace>`; with a chart-created Gateway, verify both `gatewayApi.gateway.create=true` and `gatewayApi.routes.tls.enabled=true` |
+| TLS passthrough connection fails during the handshake | The gateway server is running plaintext or its certificate does not cover the external SNI hostname | Keep `server.disableTls=false`, verify the server certificate SAN, and configure `pkiInitJob.serverDnsNames` or `certManager.serverDnsNames` before issuing the certificate |
 
 When handing results back to the user, include:
 
