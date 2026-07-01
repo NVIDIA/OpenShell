@@ -24,6 +24,7 @@ jobs:
       run_core_e2e: ${{ steps.labels.outputs.run_core_e2e }}
       run_gpu_e2e: ${{ steps.labels.outputs.run_gpu_e2e }}
       run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
+      run_rhel_e2e: ${{ steps.labels.outputs.run_rhel_e2e }}
       run_any_e2e: ${{ steps.labels.outputs.run_any_e2e }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -41,12 +42,14 @@ jobs:
             run_core_e2e=true
             run_gpu_e2e=true
             run_kubernetes_ha_e2e=true
+            run_rhel_e2e=true
           else
             run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
             run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
             run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+            run_rhel_e2e="$(jq -r 'index("test:e2e-rhel") != null' <<< "$LABELS_JSON")"
           fi
-          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ]; then
+          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_rhel_e2e" = "true" ]; then
             run_any_e2e=true
           else
             run_any_e2e=false
@@ -55,6 +58,7 @@ jobs:
             echo "run_core_e2e=$run_core_e2e"
             echo "run_gpu_e2e=$run_gpu_e2e"
             echo "run_kubernetes_ha_e2e=$run_kubernetes_ha_e2e"
+            echo "run_rhel_e2e=$run_rhel_e2e"
             echo "run_any_e2e=$run_any_e2e"
           } >> "$GITHUB_OUTPUT"
 
@@ -144,6 +148,19 @@ jobs:
       job-name: Kubernetes HA E2E (Rust smoke)
       extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
       external-postgres-secret: openshell-ha-pg
+
+  rhel-selinux-e2e:
+    needs: [pr_metadata, build-supervisor]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_rhel_e2e == 'true'
+    # Optional proof-of-life suite on a new runner class (requires an
+    # org-provisioned RHEL 10 larger runner). Not part of the required E2E
+    # gate; see kubernetes-ha-e2e above for the same pattern.
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-rhel-selinux.yml
+    with:
+      image-tag: ${{ github.sha }}
 
   core-e2e-result:
     name: Core E2E result
