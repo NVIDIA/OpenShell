@@ -46,7 +46,7 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
                 "command argument {i} exceeds {MAX_EXEC_ARG_LEN} byte limit"
             )));
         }
-        reject_control_chars(arg, &format!("command argument {i}"))?;
+        reject_null_char(arg, &format!("command argument {i}"))?;
     }
     for (key, value) in &req.environment {
         if value.len() > MAX_EXEC_ARG_LEN {
@@ -70,11 +70,23 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
 
 /// Reject null bytes and newlines in a user-supplied value.
 pub(super) fn reject_control_chars(value: &str, field_name: &str) -> Result<(), Status> {
+    reject_null_char(value, field_name)?;
+    reject_newline_chars(value, field_name)?;
+    Ok(())
+}
+
+/// Reject null bytes in a user-supplied value.
+pub(super) fn reject_null_char(value: &str, field_name: &str) -> Result<(), Status> {
     if value.bytes().any(|b| b == 0) {
         return Err(Status::invalid_argument(format!(
             "{field_name} contains null bytes"
         )));
     }
+    Ok(())
+}
+
+/// Reject newline and carriage return characters in a user-supplied value.
+pub(super) fn reject_newline_chars(value: &str, field_name: &str) -> Result<(), Status> {
     if value.bytes().any(|b| b == b'\n' || b == b'\r') {
         return Err(Status::invalid_argument(format!(
             "{field_name} contains newline or carriage return characters"
@@ -1799,5 +1811,55 @@ mod tests {
     fn reject_control_chars_rejects_newlines() {
         assert!(reject_control_chars("line1\nline2", "test").is_err());
         assert!(reject_control_chars("line1\rline2", "test").is_err());
+    }
+
+    #[test]
+    fn validate_exec_allows_newlines_in_command_args() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "def f():\n    return 1\nprint(f())".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(validate_exec_request_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_exec_still_rejects_null_bytes_in_command_args() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["echo".to_string(), "hello\x00world".to_string()],
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(err.message().contains("null"));
+    }
+
+    #[test]
+    fn validate_exec_still_rejects_newlines_in_workdir() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["ls".to_string()],
+            workdir: "/tmp\nmalicious".to_string(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(err.message().contains("newline"));
+    }
+
+    #[test]
+    fn validate_exec_still_rejects_newlines_in_env_values() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["ls".to_string()],
+            environment: std::iter::once(("VAR".to_string(), "val\nmalicious".to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(err.message().contains("newline"));
     }
 }

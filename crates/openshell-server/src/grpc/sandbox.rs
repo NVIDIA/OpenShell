@@ -1466,9 +1466,6 @@ fn shell_escape(value: &str) -> Result<String, String> {
     if value.bytes().any(|b| b == 0) {
         return Err("value contains null bytes".to_string());
     }
-    if value.bytes().any(|b| b == b'\n' || b == b'\r') {
-        return Err("value contains newline or carriage return".to_string());
-    }
     if value.is_empty() {
         return Ok("''".to_string());
     }
@@ -2061,10 +2058,20 @@ mod tests {
     }
 
     #[test]
-    fn shell_escape_rejects_newlines() {
-        assert!(shell_escape("line1\nline2").is_err());
-        assert!(shell_escape("line1\rline2").is_err());
-        assert!(shell_escape("line1\r\nline2").is_err());
+    fn shell_escape_allows_newlines() {
+        assert!(shell_escape("line1\nline2").is_ok());
+        assert!(shell_escape("line1\rline2").is_ok());
+        assert!(shell_escape("line1\r\nline2").is_ok());
+    }
+
+    #[test]
+    fn shell_escape_preserves_newlines_in_single_quotes() {
+        assert_eq!(shell_escape("line1\nline2").unwrap(), "'line1\nline2'");
+        assert_eq!(
+            shell_escape("def f():\n    return 1").unwrap(),
+            "'def f():\n    return 1'"
+        );
+        assert_eq!(shell_escape("line1\r\nline2").unwrap(), "'line1\r\nline2'");
     }
 
     // ---- build_remote_exec_command ----
@@ -2120,7 +2127,25 @@ mod tests {
             workdir: "/tmp\nmalicious".to_string(),
             ..Default::default()
         };
-        assert!(build_remote_exec_command(&req).is_err());
+        // Validation layer rejects newlines in workdir
+        assert!(validate_exec_request_fields(&req).is_err());
+    }
+
+    #[test]
+    fn build_remote_exec_command_accepts_multiline_script() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "def f():\n    return 1\nprint(f())".to_string(),
+            ],
+            ..Default::default()
+        };
+        let cmd = build_remote_exec_command(&req).unwrap();
+        assert!(cmd.starts_with("python3 -c "));
+        assert!(cmd.contains("'def f():\n    return 1\nprint(f())'"));
     }
 
     #[test]
