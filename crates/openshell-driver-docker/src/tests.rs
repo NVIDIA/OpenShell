@@ -801,17 +801,25 @@ fn build_container_create_body_includes_bind_mounts_when_enabled() {
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
-    let mounts = body
+    let binds = body
         .host_config
+        .as_ref()
         .unwrap()
-        .mounts
-        .expect("driver config mounts should be set");
+        .binds
+        .as_ref()
+        .expect("binds should be set");
 
-    assert_eq!(mounts.len(), 1);
-    assert_eq!(mounts[0].typ, Some(MountTypeEnum::BIND));
-    assert_eq!(mounts[0].source.as_deref(), Some("/host/path"));
-    assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/host"));
-    assert_eq!(mounts[0].read_only, Some(true));
+    // User bind mount appears after the system binds.
+    assert!(
+        binds.iter().any(|b| b == "/host/path:/sandbox/host:ro"),
+        "expected bind entry '/host/path:/sandbox/host:ro', got {binds:?}"
+    );
+    // Bind mounts must not appear in the structured mounts vec.
+    let mounts = body.host_config.unwrap().mounts.unwrap_or_default();
+    assert!(
+        mounts.iter().all(|m| m.typ != Some(MountTypeEnum::BIND)),
+        "bind mounts should not appear in structured mounts"
+    );
 }
 
 #[test]
@@ -835,13 +843,122 @@ fn driver_config_defaults_enabled_bind_mounts_to_read_only() {
     config.enable_bind_mounts = true;
 
     let body = build_container_create_body(&sandbox, &config).unwrap();
-    let mounts = body
+    let binds = body
         .host_config
         .unwrap()
-        .mounts
-        .expect("driver config mounts should be set");
+        .binds
+        .expect("binds should be set");
 
-    assert_eq!(mounts[0].read_only, Some(true));
+    assert!(
+        binds
+            .iter()
+            .any(|b| b.contains("/host/path:/sandbox/host:ro")),
+        "default bind mount should be read-only, got {binds:?}"
+    );
+}
+
+#[test]
+fn bind_mount_selinux_shared_label() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/data/shared",
+            "target": "/sandbox/data",
+            "read_only": true,
+            "selinux_label": "shared"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let binds = body
+        .host_config
+        .unwrap()
+        .binds
+        .expect("binds should be set");
+
+    assert!(
+        binds.iter().any(|b| b == "/data/shared:/sandbox/data:ro,z"),
+        "expected ':ro,z' label, got {binds:?}"
+    );
+}
+
+#[test]
+fn bind_mount_selinux_private_label() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/data/exclusive",
+            "target": "/sandbox/data",
+            "read_only": false,
+            "selinux_label": "private"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let binds = body
+        .host_config
+        .unwrap()
+        .binds
+        .expect("binds should be set");
+
+    assert!(
+        binds.iter().any(|b| b == "/data/exclusive:/sandbox/data:Z"),
+        "expected ':Z' label, got {binds:?}"
+    );
+}
+
+#[test]
+fn bind_mount_without_selinux_label() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/host/path",
+            "target": "/sandbox/host",
+            "read_only": false
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let binds = body
+        .host_config
+        .unwrap()
+        .binds
+        .expect("binds should be set");
+
+    assert!(
+        binds.iter().any(|b| b == "/host/path:/sandbox/host"),
+        "expected no options suffix, got {binds:?}"
+    );
 }
 
 #[test]

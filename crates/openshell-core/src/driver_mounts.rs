@@ -5,6 +5,26 @@
 
 use std::path::Path;
 
+/// `SELinux` relabelling mode for bind mounts.
+///
+/// On hosts with `SELinux` enabled (e.g. Fedora, RHEL) a bind-mounted path
+/// must be relabelled so the container process can access it.
+///
+/// * `shared` (`:z`) — the label is shared across all containers that mount
+///   the same path.  Safe when multiple sandboxes read the same data set.
+/// * `private` (`:Z`) — the label is private to *this* container.  The host
+///   directory becomes inaccessible to other containers (and potentially to
+///   the host) until the container is removed.  Use only when exclusive
+///   ownership is acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelinuxLabel {
+    /// Shared `SELinux` label (`:z`).
+    Shared,
+    /// Private `SELinux` label (`:Z`).
+    Private,
+}
+
 const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/opt/openshell",
     "/etc/openshell",
