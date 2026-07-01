@@ -246,6 +246,9 @@ jobs:
           fi
           mkdir -p "$stage"
           install -m 0755 "$found" "$stage/$binary"
+          if [[ "${{ inputs.component }}" == "supervisor" ]]; then
+            PREBUILT_ARCH="${{ matrix.arch }}" tasks/scripts/stage-prebuilt-binaries.sh cni
+          fi
           ls -lh "$stage/"
 
       - name: Build ${{ inputs.component }} image

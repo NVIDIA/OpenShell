@@ -44,7 +44,7 @@ required_prebuilt_binaries() {
 			echo "openshell-gateway"
 			;;
 		supervisor|supervisor-sideload|supervisor-output)
-			echo "openshell-sandbox"
+			echo "openshell-sandbox openshell-cni"
 			;;
 	esac
 }

@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cni daemonset
+templates:
+  - templates/cni-daemonset.yaml
+tests:
+  - it: does not render by default
+    template: templates/cni-daemonset.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders privileged cni installer daemonset when enabled
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+    asserts:
+      - isKind:
+          of: DaemonSet
+      - equal:
+          path: spec.template.spec.hostNetwork
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.privileged
+          value: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-bin
+            mountPath: /host/opt/cni/bin
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-conf
+            mountPath: /host/etc/cni/net.d
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cni-log
+            mountPath: /host/var/log
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '"sandboxNamespaces": \["NAMESPACE"\]'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '"logFile": "\$\{log_file\}"'
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: "firewall backend selected during CNI ADD"
+      - matchRegex:
+          path: spec.template.spec.containers[0].lifecycle.preStop.exec.command[2]
+          pattern: 'select\(\.type != "openshell-cni"\)'
+
+  - it: scopes cni annotation lookup to explicit sandbox namespace
+    template: templates/cni-daemonset.yaml
+    set:
+      cni.enabled: true
+      server.sandboxNamespace: agents
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].command[2]
+          pattern: '"sandboxNamespaces": \["agents"\]'
+
+  - it: fails cni-sidecar topology when cni installer is disabled
+    template: templates/cni-daemonset.yaml
+    set:
+      supervisor.topology: cni-sidecar
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor.topology=cni-sidecar requires cni.enabled=true so the OpenShell chained CNI plugin is installed on every node

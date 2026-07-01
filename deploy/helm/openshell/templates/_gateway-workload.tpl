@@ -17,6 +17,7 @@ metadata:
     {{- end }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
     {{- with .Values.podLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

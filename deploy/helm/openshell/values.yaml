@@ -57,8 +57,35 @@ supervisor:
   processEnforcement: "network-only"
   # -- UID for the long-running network sidecar or proxy supervisor pod. In sidecar
   # topology, the network init container installs nftables rules that exempt
-  # this UID.
+  # this UID. In cni-sidecar topology, the CNI plugin installs equivalent
+  # nftables or iptables rules.
   proxyUid: 1337
+
+cni:
+  # -- Install the OpenShell chained CNI plugin with a privileged node DaemonSet.
+  # Required when supervisor.topology is "cni-sidecar".
+  enabled: false
+  image:
+    # -- CNI installer image repository. Empty uses supervisor.image.repository.
+    repository: ""
+    # -- CNI installer image pull policy. Empty uses supervisor.image.pullPolicy, then image.pullPolicy.
+    pullPolicy: ""
+    # -- CNI installer image tag. Empty uses supervisor.image.tag, then chart appVersion.
+    tag: ""
+  # -- Host CNI binary directory.
+  binDir: /opt/cni/bin
+  # -- Host CNI config directory.
+  confDir: /etc/cni/net.d
+  # -- Log level passed to the OpenShell CNI plugin.
+  logLevel: info
+  # -- Host log file written by the OpenShell CNI plugin and tailed by the installer DaemonSet.
+  logFile: /var/log/openshell-cni.log
+  # -- Host CNI conflist filename patched by the installer. Empty selects the first non-OpenShell .conflist.
+  configFile: ""
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []

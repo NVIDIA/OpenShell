@@ -1212,6 +1212,7 @@ const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy/client";
 /// connects here for gateway gRPC, and the sidecar forwards bytes to the real
 /// gateway endpoint using its own network privileges.
 const SIDECAR_GATEWAY_FORWARD_ADDR: &str = "127.0.0.1:18080";
+const SIDECAR_PROXY_PORT: u16 = 3128;
 
 const LABEL_SANDBOX_ROLE: &str = "openshell.ai/sandbox-role";
 const SANDBOX_ROLE_AGENT: &str = "agent";
@@ -1224,6 +1225,14 @@ const PROXY_POD_CA_SECRET_MOUNT_PATH: &str = "/var/run/openshell-proxy-ca";
 const PROXY_POD_CA_CERT_FILE: &str = "openshell-ca.pem";
 const PROXY_POD_CA_KEY_FILE: &str = "openshell-ca-key.pem";
 const PROXY_POD_SSH_SOCKET_FILE: &str = "/tmp/openshell/ssh.sock";
+
+const OPENSHELL_CNI_ENABLED_ANNOTATION: &str = "openshell.ai/cni";
+const OPENSHELL_CNI_SANDBOX_ID_ANNOTATION: &str = "openshell.ai/sandbox-id";
+const OPENSHELL_CNI_PROXY_UID_ANNOTATION: &str = "openshell.ai/proxy-uid";
+const OPENSHELL_CNI_PROXY_PORT_ANNOTATION: &str = "openshell.ai/proxy-port";
+const OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION: &str =
+    "openshell.ai/network-enforcement-mode";
+const CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "cni-sidecar";
 
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
@@ -1570,6 +1579,7 @@ fn supervisor_sidecar_env(
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
+    topology: SupervisorTopology,
 ) -> Vec<serde_json::Value> {
     let mut env = Vec::new();
     apply_required_env(
@@ -1602,7 +1612,7 @@ fn supervisor_sidecar_env(
     upsert_env(
         &mut env,
         openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
-        "sidecar",
+        &topology.to_string(),
     );
     upsert_env(
         &mut env,
@@ -1641,6 +1651,7 @@ fn supervisor_sidecar_container(
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
+    topology: SupervisorTopology,
 ) -> serde_json::Value {
     let mut container = serde_json::json!({
         "name": SUPERVISOR_NETWORK_SIDECAR_NAME,
@@ -1649,7 +1660,7 @@ fn supervisor_sidecar_container(
             SUPERVISOR_IMAGE_BINARY_PATH,
             "--mode=network",
         ],
-        "env": supervisor_sidecar_env(template_environment, spec_environment, params),
+        "env": supervisor_sidecar_env(template_environment, spec_environment, params, topology),
         "securityContext": {
             "runAsUser": params.proxy_uid,
             "runAsGroup": params.sandbox_gid,
@@ -1741,6 +1752,7 @@ fn apply_supervisor_sidecar_topology(
     template_environment: &std::collections::HashMap<String, String>,
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
+    install_network_init: bool,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -1775,12 +1787,14 @@ fn apply_supervisor_sidecar_topology(
         }));
     }
 
-    let init_containers = spec
-        .entry("initContainers")
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut();
-    if let Some(init_containers) = init_containers {
-        init_containers.push(supervisor_network_init_container(params));
+    if install_network_init {
+        let init_containers = spec
+            .entry("initContainers")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(init_containers) = init_containers {
+            init_containers.push(supervisor_network_init_container(params));
+        }
     }
 
     let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
@@ -1875,7 +1889,7 @@ fn apply_supervisor_sidecar_topology(
             upsert_env(
                 env,
                 openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
-                "sidecar",
+                &params.supervisor_topology.to_string(),
             );
             upsert_env(
                 env,
@@ -1924,6 +1938,7 @@ fn apply_supervisor_sidecar_topology(
         template_environment,
         spec_environment,
         params,
+        params.supervisor_topology,
     ));
 }
 
@@ -2435,7 +2450,7 @@ impl Default for SandboxPodParams<'_> {
 fn validate_proxy_identity(params: &SandboxPodParams<'_>) -> Result<(), KubernetesDriverError> {
     if matches!(
         params.supervisor_topology,
-        SupervisorTopology::Sidecar | SupervisorTopology::ProxyPod
+        SupervisorTopology::Sidecar | SupervisorTopology::CniSidecar | SupervisorTopology::ProxyPod
     ) && params.proxy_uid == params.sandbox_uid
     {
         let topology = params.supervisor_topology.to_string();
@@ -2570,6 +2585,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
         .collect::<serde_json::Map<String, serde_json::Value>>();
     let proxy_pod_topology = params.supervisor_topology == SupervisorTopology::ProxyPod;
+    let cni_sidecar_topology = params.supervisor_topology == SupervisorTopology::CniSidecar;
     if params.provider_spiffe_enabled || proxy_pod_topology {
         pod_labels.insert(
             LABEL_MANAGED_BY.to_string(),
@@ -2607,6 +2623,30 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         pod_annotations.insert(
             "openshell.io/sandbox-id".to_string(),
             serde_json::Value::String(params.sandbox_id.to_string()),
+        );
+    }
+    if cni_sidecar_topology {
+        pod_annotations.insert(
+            OPENSHELL_CNI_ENABLED_ANNOTATION.to_string(),
+            serde_json::Value::String("enabled".to_string()),
+        );
+        if !params.sandbox_id.is_empty() {
+            pod_annotations.insert(
+                OPENSHELL_CNI_SANDBOX_ID_ANNOTATION.to_string(),
+                serde_json::Value::String(params.sandbox_id.to_string()),
+            );
+        }
+        pod_annotations.insert(
+            OPENSHELL_CNI_PROXY_UID_ANNOTATION.to_string(),
+            serde_json::Value::String(params.proxy_uid.to_string()),
+        );
+        pod_annotations.insert(
+            OPENSHELL_CNI_PROXY_PORT_ANNOTATION.to_string(),
+            serde_json::Value::String(SIDECAR_PROXY_PORT.to_string()),
+        );
+        pod_annotations.insert(
+            OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION.to_string(),
+            serde_json::Value::String(CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE.to_string()),
         );
     }
     if !pod_annotations.is_empty() {
@@ -2772,7 +2812,9 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     if !params.client_tls_secret_name.is_empty() {
         let client_tls_default_mode = match params.supervisor_topology {
             SupervisorTopology::Combined => 0o400,
-            SupervisorTopology::Sidecar | SupervisorTopology::ProxyPod => 0o440,
+            SupervisorTopology::Sidecar
+            | SupervisorTopology::CniSidecar
+            | SupervisorTopology::ProxyPod => 0o440,
         };
         volumes.push(serde_json::json!({
             "name": "openshell-client-tls",
@@ -2798,7 +2840,9 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     // supervisor containers run with the sandbox GID and need group-read access.
     let sa_token_default_mode = match params.supervisor_topology {
         SupervisorTopology::Combined => 0o400,
-        SupervisorTopology::Sidecar | SupervisorTopology::ProxyPod => 0o440,
+        SupervisorTopology::Sidecar
+        | SupervisorTopology::CniSidecar
+        | SupervisorTopology::ProxyPod => 0o440,
     };
     volumes.push(serde_json::json!({
         "name": "openshell-sa-token",
@@ -2843,6 +2887,16 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
                 &template.environment,
                 spec_environment,
                 params,
+                true,
+            );
+        }
+        SupervisorTopology::CniSidecar => {
+            apply_supervisor_sidecar_topology(
+                &mut result,
+                &template.environment,
+                spec_environment,
+                params,
+                false,
             );
         }
         SupervisorTopology::ProxyPod => {
@@ -4482,6 +4536,88 @@ mod tests {
             serde_json::json!({
                 "drop": ["ALL"]
             })
+        );
+    }
+
+    #[test]
+    fn cni_sidecar_topology_omits_network_init_and_adds_cni_annotations() {
+        let params = SandboxPodParams {
+            supervisor_topology: SupervisorTopology::CniSidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            sandbox_id: "sb-cni",
+            proxy_uid: 2200,
+            namespace: "default",
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        let annotations = pod_template["metadata"]["annotations"].as_object().unwrap();
+        assert_eq!(
+            annotations[OPENSHELL_CNI_ENABLED_ANNOTATION],
+            serde_json::json!("enabled")
+        );
+        assert_eq!(
+            annotations[OPENSHELL_CNI_SANDBOX_ID_ANNOTATION],
+            serde_json::json!("sb-cni")
+        );
+        assert_eq!(
+            annotations[OPENSHELL_CNI_PROXY_UID_ANNOTATION],
+            serde_json::json!("2200")
+        );
+        assert_eq!(
+            annotations[OPENSHELL_CNI_PROXY_PORT_ANNOTATION],
+            serde_json::json!(SIDECAR_PROXY_PORT.to_string())
+        );
+        assert_eq!(
+            annotations[OPENSHELL_CNI_NETWORK_ENFORCEMENT_MODE_ANNOTATION],
+            serde_json::json!(CNI_SIDECAR_NETWORK_ENFORCEMENT_MODE)
+        );
+
+        let init_containers = pod_template["spec"]
+            .get("initContainers")
+            .and_then(|containers| containers.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !init_containers
+                .iter()
+                .any(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+        );
+
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 2);
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY),
+            Some("cni-sidecar")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE),
+            Some("sidecar-nftables")
+        );
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY),
+            Some("cni-sidecar")
         );
     }
 

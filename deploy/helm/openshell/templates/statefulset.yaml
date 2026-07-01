@@ -14,6 +14,7 @@ spec:
   selector:
     matchLabels:
       {{- include "openshell.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
   template:
     {{- include "openshell.gatewayPodTemplate" . | nindent 4 }}
   volumeClaimTemplates:

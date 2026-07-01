@@ -3625,6 +3625,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-cni"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "libc",
+ "miette",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "tempfile",
+]
+
+[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [

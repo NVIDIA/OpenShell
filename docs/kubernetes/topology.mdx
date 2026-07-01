@@ -3,15 +3,16 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Kubernetes Sandbox Topology"
 sidebar-title: "Topology"
-description: "Choose between combined, sidecar, and proxy-pod topology for Kubernetes sandbox pods."
+description: "Choose between combined, sidecar, cni-sidecar, and proxy-pod topology for Kubernetes sandbox pods."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Sandboxing, Sidecar, Network Policy, RuntimeClass"
 position: 2
 ---
 
 Kubernetes sandbox pods can run the OpenShell supervisor in `combined`,
-`sidecar`, or `proxy-pod` topology. Choose the topology based on which controls
-you need inside the pod, how much privilege your cluster allows on the agent
-container, and whether the cluster enforces Kubernetes NetworkPolicies.
+`sidecar`, `cni-sidecar`, or `proxy-pod` topology. Choose the topology based on
+which controls you need inside the pod, how much privilege your cluster allows
+on the agent container, and whether the cluster can install node-level CNI or
+NetworkPolicy enforcement.
 
 ## Choose a Topology
 
@@ -23,6 +24,7 @@ lower-privilege agent container.
 |---|---|---|
 | `combined` | You need OpenShell network, filesystem, and process controls in the sandbox workload. | The agent container carries the Linux capabilities the supervisor needs. |
 | `sidecar` | You need the agent container to run as non-root without added Linux capabilities, and network policy is the primary control. | Defaults to network-only process supervision unless you opt in to `processEnforcement=full`. |
+| `cni-sidecar` | You need sidecar-mode behavior without a privileged sandbox-pod init container, and a cluster admin can install the OpenShell CNI plugin on every node. | Requires privileged node-level CNI installation; defaults to network-only process supervision unless you opt in to `processEnforcement=full`. |
 | `proxy-pod` | You need network enforcement to run outside the agent pod and your cluster enforces Kubernetes NetworkPolicies. | Requires a NetworkPolicy-enforcing CNI or controller; defaults to network-only process supervision unless you opt in to `processEnforcement=full`. |
 
 ## Privilege Model
@@ -35,6 +37,9 @@ The long-running container permissions differ by topology:
 | `sidecar` | Agent container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
 | `sidecar` | Agent container, process-only supervisor (`full`) | Root supervisor | Not explicitly disabled by the driver | Adds combined-mode capabilities | Agent keeps combined-mode process/filesystem guards. |
 | `sidecar` | Network supervisor sidecar | `proxyUid:sandbox_gid` | `false` | Drops `ALL` | Long-running proxy sidecar is also non-root without added capabilities. |
+| `cni-sidecar` | Agent container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
+| `cni-sidecar` | Agent container, process-only supervisor (`full`) | Root supervisor | Not explicitly disabled by the driver | Adds combined-mode capabilities | Agent keeps combined-mode process/filesystem guards. |
+| `cni-sidecar` | Network supervisor sidecar | `proxyUid:sandbox_gid` | `false` | Drops `ALL` | Long-running proxy sidecar is non-root; node-level CNI installs the pod network rules. |
 | `proxy-pod` | Agent pod container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities in their own pod. |
 | `proxy-pod` | Agent pod container, process-only supervisor (`full`) | Root supervisor | Not explicitly disabled by the driver | Adds combined-mode capabilities | Agent keeps combined-mode process/filesystem guards. |
 | `proxy-pod` | Supervisor pod container, network proxy only | `proxyUid:sandbox_gid` | `false` | Drops `ALL` | Long-running proxy runs outside the agent pod without added capabilities. |
@@ -46,6 +51,7 @@ pod:
 |---|---|---|---|---|---|
 | `combined` | Supervisor install init container | `0` | Not set | Not set | Copies the supervisor binary into the agent container volume. |
 | `sidecar` | Network init container | `0` | `false` | Drops `ALL`; adds `NET_ADMIN`, `NET_RAW`, `CHOWN`, and `FOWNER` | Installs pod-local nftables rules and prepares shared sidecar state. |
+| `cni-sidecar` | None for network rules | N/A | N/A | N/A | The OpenShell CNI DaemonSet installs rules during pod network setup. |
 | `proxy-pod` | Supervisor install init container | `0` | Not set | Not set | Copies the supervisor binary into the agent pod volume. |
 | `proxy-pod` | Proxy CA install init container | `0:sandbox_gid` | `false` | Drops `ALL` | Copies proxy CA material into the agent pod TLS volume. |
 
@@ -151,6 +157,67 @@ dropping, or process/binary identity checks unless you opt in to
 `supervisor.processEnforcement=full`.
 </Warning>
 
+## CNI Sidecar Topology
+
+CNI sidecar topology keeps the sidecar runtime model but moves network rule
+installation out of the sandbox pod. A privileged OpenShell DaemonSet installs a
+chained CNI plugin on each node. During CNI `ADD`, the plugin reads OpenShell
+pod annotations and installs the sidecar bypass-prevention rules in the pod
+network namespace before the workload starts.
+
+```mermaid
+flowchart TB
+  Sandbox["agents.x-k8s.io Sandbox"]
+
+  subgraph Node["Kubernetes node"]
+    DaemonSet["OpenShell CNI DaemonSet"]
+    CNIPlugin["OpenShell chained CNI plugin"]
+    Runtime["container runtime<br/>CNI ADD / CHECK"]
+
+    subgraph Pod["Sandbox pod"]
+      NetNS["pod network namespace"]
+
+      subgraph Agent["agent container"]
+        ProcessSupervisor["process supervisor<br/>network-only by default"]
+        Workload["Agent workload"]
+      end
+
+      NetworkSidecar["network supervisor sidecar<br/>proxyUid"]
+    end
+  end
+
+  Gateway["OpenShell Gateway"]
+  External["External services"]
+
+  Sandbox --> Pod
+  DaemonSet -->|"installs binary + patches conflist"| CNIPlugin
+  Runtime -->|"invokes"| CNIPlugin
+  CNIPlugin -->|"reads pod annotations"| Pod
+  CNIPlugin -->|"installs nftables or iptables rules"| NetNS
+  ProcessSupervisor --> Workload
+  Workload -->|"egress redirected on loopback"| NetworkSidecar
+  NetworkSidecar -->|"gateway forwarding"| Gateway
+  NetworkSidecar -->|"policy-enforced egress"| External
+```
+
+Use this topology when a cluster admin can install node-level CNI components and
+you want sandbox pods to avoid the sidecar topology's privileged network init
+container.
+
+Each node must provide a firewall backend usable from the host-executed plugin.
+The plugin prefers `nft` and falls back to `iptables` when `nft` is unavailable.
+The installer DaemonSet writes plugin failures to `cni.logFile` and tails that
+file, so `kubectl logs daemonset/openshell-cni -c install-cni` includes CNI
+`ADD` and `CHECK` errors that would otherwise only appear in pod events or node
+logs.
+
+<Warning>
+`cni-sidecar` is experimental. It currently targets normal Kubernetes runtimes
+first. Kata Containers and gVisor remain validation targets, because each
+runtime must honor the CNI-installed pod-network rules for this topology to
+provide the expected network enforcement.
+</Warning>
+
 ## Proxy-Pod Topology
 
 Proxy-pod topology moves network enforcement and gateway forwarding into a
@@ -218,10 +285,10 @@ agent-to-supervisor isolation policy is only declarative.
 
 ## Credential Exposure
 
-Sidecar and proxy-pod topologies use pod `fsGroup` and group-readable projected
-credentials so the non-root process supervisor can authenticate to the gateway.
-This includes the projected ServiceAccount token used for sandbox token
-bootstrap and the sandbox client TLS secret.
+Sidecar, cni-sidecar, and proxy-pod topologies use pod `fsGroup` and
+group-readable projected credentials so the non-root process supervisor can
+authenticate to the gateway. This includes the projected ServiceAccount token
+used for sandbox token bootstrap and the sandbox client TLS secret.
 
 Treat the agent container as trusted with respect to those in-pod gateway
 credentials. Use `combined` topology when that credential exposure is not
@@ -236,9 +303,11 @@ depends on the topology and runtime:
   when the cluster enforces NetworkPolicies.
 - `sidecar` is experimental with Kata Containers and is known to fail with
   gVisor because sidecar mode depends on pod-local network rule setup.
+- `cni-sidecar` is intended to test whether CNI-installed pod-network rules can
+  make sidecar-style enforcement work on stricter runtime classes.
 
 Runtime classes do not re-enable OpenShell filesystem and process controls when
-sidecar and proxy-pod modes use the default `network-only` process
+sidecar, cni-sidecar, and proxy-pod modes use the default `network-only` process
 enforcement. Use RuntimeClass isolation as an additional workload boundary, not
 as a replacement for combined topology or `processEnforcement=full`.
 
@@ -254,7 +323,9 @@ openshell sandbox create \
 ## Enable Alternate Topologies
 
 For direct gateway TOML configuration, set the Kubernetes driver fields for
-sidecar mode:
+the topology you want to test.
+
+For sidecar mode:
 
 ```toml
 [openshell.drivers.kubernetes]
@@ -263,7 +334,7 @@ process_enforcement = "network-only"
 proxy_uid = 1337
 ```
 
-Set `supervisor_topology="proxy-pod"` to use proxy-pod mode:
+For proxy-pod mode:
 
 ```toml
 [openshell.drivers.kubernetes]
@@ -272,9 +343,22 @@ process_enforcement = "network-only"
 proxy_uid = 1337
 ```
 
+For CNI-sidecar mode:
+
+```toml
+[openshell.drivers.kubernetes]
+supervisor_topology = "cni-sidecar"
+process_enforcement = "network-only"
+proxy_uid = 1337
+```
+
+Leave `supervisor_topology` unset, or set it to `combined`, to keep the
+original single-container supervisor path.
+
 `proxy_uid` must be a non-root UID and must not match the sandbox UID. In
 sidecar mode, the network init container exempts this UID from proxy
-redirection so the sidecar can reach the gateway. In proxy-pod mode, the same
+redirection so the sidecar can reach the gateway. In CNI-sidecar mode, the
+OpenShell CNI plugin installs equivalent rules. In proxy-pod mode, the same
 value is used as the non-root UID for the proxy supervisor pod created by the
 Deployment.
 
@@ -301,9 +385,23 @@ supervisor:
   proxyUid: 1337
 ```
 
-Leave `supervisor_topology` unset, or set it to `combined`, to keep the
-original single-container supervisor path. For Helm installs, leave
-`supervisor.topology` unset or set it to `combined`.
+Set `supervisor.topology=cni-sidecar` and enable the CNI installer to use CNI
+sidecar mode:
+
+```yaml
+cni:
+  enabled: true
+supervisor:
+  topology: cni-sidecar
+  processEnforcement: network-only
+  proxyUid: 1337
+```
+
+The OpenShell CNI installer requires privileged node access so it can copy the
+plugin into the host CNI binary directory and patch the node CNI conflist.
+
+For Helm installs, leave `supervisor.topology` unset or set it to `combined` to
+keep the original single-container supervisor path.
 
 ## Next Steps
 

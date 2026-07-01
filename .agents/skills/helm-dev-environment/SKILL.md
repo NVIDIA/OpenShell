@@ -65,6 +65,11 @@ mise run helm:skaffold:run
 mise run helm:skaffold:run:sidecar
 ```
 
+**Supervisor CNI-sidecar topology** (build once and leave running):
+```bash
+mise run helm:skaffold:run:cni-sidecar
+```
+
 **Supervisor proxy-pod topology** (build once and leave running):
 ```bash
 mise run helm:skaffold:run:proxy-pod
@@ -73,7 +78,9 @@ mise run helm:skaffold:run:proxy-pod
 All Skaffold commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
 chart. The sidecar profile renders an `openshell-network-init` init container for
 nftables setup and a non-root `openshell-supervisor-network` runtime sidecar for
-proxying. The proxy-pod profile renders network supervision in a separate
+proxying. The cni-sidecar profile enables the privileged OpenShell CNI
+DaemonSet and uses the sidecar runtime model without the pod-local network init
+container. The proxy-pod profile renders network supervision in a separate
 supervisor Deployment with one pod and relies on Kubernetes NetworkPolicy
 enforcement so the agent pod can reach only its paired supervisor plus DNS. The
 default local k3s/k3d cluster keeps k3s's embedded NetworkPolicy controller
@@ -102,6 +109,12 @@ Run the sidecar topology e2e environment:
 
 ```bash
 mise run e2e:kubernetes:sidecar
+```
+
+Run the CNI-sidecar topology e2e environment:
+
+```bash
+mise run e2e:kubernetes:cni-sidecar
 ```
 
 Run the proxy-pod topology e2e environment:
@@ -174,6 +187,12 @@ For a sidecar-profile deployment:
 
 ```bash
 mise run helm:skaffold:delete:sidecar
+```
+
+For a cni-sidecar-profile deployment:
+
+```bash
+mise run helm:skaffold:delete:cni-sidecar
 ```
 
 For a proxy-pod-profile deployment:
@@ -307,6 +326,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-sidecar.yaml` | Supervisor sidecar topology overlay for Kubernetes e2e/dev |
+| `deploy/helm/openshell/ci/values-cni-sidecar.yaml` | Supervisor CNI-sidecar topology overlay for Kubernetes e2e/dev; enables the OpenShell CNI DaemonSet |
 | `deploy/helm/openshell/ci/values-proxy-pod.yaml` | Supervisor proxy-pod topology overlay for Kubernetes e2e/dev; requires NetworkPolicy enforcement |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
