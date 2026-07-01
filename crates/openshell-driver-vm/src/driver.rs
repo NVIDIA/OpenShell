@@ -5,8 +5,8 @@ use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
 use crate::lifecycle::{
-    BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
-    RestoreContext, extension_state_dir,
+    BackendFeature, GuestInitDropin, GuestResource, LaunchAbortReason, LaunchPlan,
+    LifecycleExtensionRegistry, PciPassthroughDevice, RestoreContext, extension_state_dir,
 };
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
@@ -855,6 +855,9 @@ impl VmDriver {
             if let Some(bdf) = plan.gpu_bdf.as_deref() {
                 command.arg("--vm-gpu-bdf").arg(bdf);
             }
+            for device in pci_passthrough_devices(&plan) {
+                command.arg("--vm-pci-passthrough").arg(&device.host_bdf);
+            }
             if let Some(tap) = plan.tap_device.as_deref() {
                 command.arg("--vm-tap-device").arg(tap);
             }
@@ -1395,16 +1398,17 @@ impl VmDriver {
 
     #[allow(clippy::result_large_err)]
     fn validate_launch_plan_backend(is_gpu: bool, plan: &LaunchPlan) -> Result<(), Status> {
-        // NOTE: this guard exists because the non-GPU QEMU launch path
-        // (PCI device transport, VFIO root port wiring) has not landed
-        // yet. Until then, even though the resolver will happily promote
-        // a plan to QEMU when an extension requires `PciPassthrough` or
-        // `ExternalKernelImage`, the launch itself is blocked here so we
-        // don't spawn a QEMU instance with no concrete device backing.
-        // Remove this guard once the non-GPU QEMU launch path supports
-        // emitting `pcie-root-port` + `vfio-pci` for arbitrary device
-        // descriptors.
-        if plan.backend == VmBackend::Qemu && !is_gpu {
+        // A non-GPU sandbox may only run on QEMU when it has a concrete PCI
+        // device to back the launch: the runtime emits `pcie-root-port` +
+        // `vfio-pci` per passthrough device, so an empty plan would spawn a
+        // QEMU instance with nothing attached. A GPU sandbox is always backed
+        // by its GPU device; other sandboxes must carry at least one PCI
+        // passthrough resource (e.g. a BlueField VF NIC).
+        if plan.backend == VmBackend::Qemu
+            && !is_gpu
+            && plan.gpu_bdf.is_none()
+            && pci_passthrough_devices(plan).next().is_none()
+        {
             let offending_feature = plan
                 .required_backend_features
                 .iter()
@@ -1414,7 +1418,7 @@ impl VmDriver {
                 });
             return Err(Status::failed_precondition(format!(
                 "vm lifecycle extension required '{offending_feature}', which resolves to the QEMU backend, \
-                 but non-GPU QEMU launch is not yet supported (pending PCI device transport)"
+                 but no concrete PCI passthrough device was provided to back a non-GPU QEMU launch"
             )));
         }
         if plan.backend != VmBackend::Qemu && is_gpu {
@@ -1505,6 +1509,7 @@ impl VmDriver {
                 gateway_port: None,
                 guest_init_dropins: Vec::new(),
                 env: Vec::new(),
+                resources: Vec::new(),
             });
         }
 
@@ -1546,6 +1551,7 @@ impl VmDriver {
             gateway_port,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
+            resources: Vec::new(),
         })
     }
 
@@ -3988,6 +3994,23 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
 
 fn gateway_port_from_endpoint(endpoint: &str) -> Option<u16> {
     Url::parse(endpoint).ok().and_then(|url| url.port())
+}
+
+/// Host PCI passthrough devices declared on a plan, in declaration order.
+///
+/// PCI-specific knowledge lives in the VM-driver layer (which renders the QEMU
+/// command line) rather than on the generic [`LaunchPlan`]: the plan only
+/// carries an opaque `resources` set. The exhaustive match means a new
+/// [`GuestResource`] variant forces this projection to be revisited.
+fn pci_passthrough_devices(plan: &LaunchPlan) -> impl Iterator<Item = &PciPassthroughDevice> {
+    // `filter_map` is deliberate: it collapses to a `map` only while
+    // `PciPassthrough` is the sole variant. Once other resource kinds exist it
+    // must skip them, and the exhaustive match makes the compiler flag this
+    // site when a variant is added.
+    #[allow(clippy::unnecessary_filter_map)]
+    plan.resources.iter().filter_map(|resource| match resource {
+        GuestResource::PciPassthrough(device) => Some(device),
+    })
 }
 
 fn has_complete_qemu_network(plan: &LaunchPlan) -> bool {
@@ -6734,8 +6757,8 @@ mod tests {
     }
 
     use crate::lifecycle::{
-        BackendFeature, LaunchPlan, LifecycleError, LifecycleExtension, LifecycleExtensionRegistry,
-        LifecycleResult,
+        BackendFeature, GuestResource, LaunchPlan, LifecycleError, LifecycleExtension,
+        LifecycleExtensionRegistry, LifecycleResult, PciPassthroughDevice,
     };
     use crate::runtime::VmBackend;
 
@@ -6866,6 +6889,42 @@ mod tests {
     }
 
     #[test]
+    fn validate_allows_non_gpu_qemu_only_with_concrete_passthrough_device() {
+        let mut plan = LaunchPlan {
+            backend: VmBackend::Qemu,
+            vcpus: 2,
+            mem_mib: 2048,
+            required_backends: Vec::new(),
+            required_backend_features: vec![BackendFeature::PciPassthrough],
+            kernel_profile: None,
+            kernel_image: None,
+            gpu_bdf: None,
+            tap_device: Some("vmtap-x".to_string()),
+            guest_ip: Some("10.0.0.2".to_string()),
+            host_ip: Some("10.0.0.1".to_string()),
+            vsock_cid: Some(7),
+            guest_mac: Some("02:00:00:00:00:01".to_string()),
+            gateway_port: Some(8080),
+            guest_init_dropins: Vec::new(),
+            env: Vec::new(),
+            resources: Vec::new(),
+        };
+
+        // Non-GPU QEMU with no concrete device backing is still rejected.
+        let err = VmDriver::validate_launch_plan_backend(false, &plan)
+            .expect_err("non-GPU QEMU without a device should be rejected");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("no concrete PCI passthrough device"));
+
+        // With a VF passthrough device declared, the launch is permitted.
+        plan.resources = vec![GuestResource::PciPassthrough(PciPassthroughDevice::new(
+            "0000:03:00.2",
+        ))];
+        VmDriver::validate_launch_plan_backend(false, &plan)
+            .expect("non-GPU QEMU with a concrete VF device should be allowed");
+    }
+
+    #[test]
     fn launch_plan_rejects_external_kernel_on_unsupported_backend() {
         let mut plan = LaunchPlan {
             backend: VmBackend::Libkrun,
@@ -6884,6 +6943,7 @@ mod tests {
             gateway_port: None,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
+            resources: Vec::new(),
         };
 
         let err = VmDriver::validate_launch_plan_backend(false, &plan)
@@ -7027,6 +7087,7 @@ mod tests {
             gateway_port: None,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
+            resources: Vec::new(),
         };
         let err = extensions
             .before_launch(&sandbox, Path::new("/tmp/state"), &mut libkrun_plan)
@@ -7051,6 +7112,7 @@ mod tests {
             gateway_port: Some(8080),
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
+            resources: Vec::new(),
         };
         extensions
             .before_launch(&sandbox, Path::new("/tmp/state"), &mut qemu_plan)
@@ -7084,6 +7146,7 @@ mod tests {
             gateway_port: Some(8080),
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
+            resources: Vec::new(),
         };
         let err = extensions
             .before_launch(&sandbox, Path::new("/tmp/state"), &mut plan)

@@ -59,6 +59,8 @@ pub struct VmLaunchConfig {
     pub console_output: PathBuf,
     pub backend: VmBackend,
     pub gpu_bdf: Option<String>,
+    /// Extra host PCI devices (BDFs) to pass through beyond the optional GPU.
+    pub pci_passthrough: Vec<String>,
     pub tap_device: Option<String>,
     pub guest_ip: Option<String>,
     pub host_ip: Option<String>,
@@ -75,10 +77,6 @@ pub fn run_vm(config: &VmLaunchConfig) -> Result<(), String> {
 }
 
 fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
-    let gpu_bdf = config
-        .gpu_bdf
-        .as_deref()
-        .ok_or("gpu_bdf is required for QEMU backend")?;
     let tap_device = config
         .tap_device
         .as_deref()
@@ -175,10 +173,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .arg(format!(
             "vhost-vsock-pci,guest-cid={vsock_cid},bus=vsock_root"
         ))
-        .arg("-device")
-        .arg("pcie-root-port,id=gpu_root,slot=2")
-        .arg("-device")
-        .arg(format!("vfio-pci,host={gpu_bdf},bus=gpu_root"))
+        .args(qemu_pci_passthrough_args(config))
         .arg("-serial")
         .arg(format!("file:{}", config.console_output.display()));
 
@@ -218,6 +213,29 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     } else {
         Err(format!("QEMU exited with status {status}"))
     }
+}
+
+/// Build the `-device` arguments for VFIO passthrough: the optional GPU on its
+/// established root port (slot 2), then any additional devices (e.g. VF NICs).
+/// Slots 1-3 are reserved for vsock/gpu/net, so extra devices start at slot 4,
+/// each on its own `pcie-root-port`.
+fn qemu_pci_passthrough_args(config: &VmLaunchConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(gpu_bdf) = config.gpu_bdf.as_deref() {
+        args.push("-device".to_string());
+        args.push("pcie-root-port,id=gpu_root,slot=2".to_string());
+        args.push("-device".to_string());
+        args.push(format!("vfio-pci,host={gpu_bdf},bus=gpu_root"));
+    }
+    for (index, host_bdf) in config.pci_passthrough.iter().enumerate() {
+        let slot = 4 + index;
+        let root_id = format!("pt{index}_root");
+        args.push("-device".to_string());
+        args.push(format!("pcie-root-port,id={root_id},slot={slot}"));
+        args.push("-device".to_string());
+        args.push(format!("vfio-pci,host={host_bdf},bus={root_id}"));
+    }
+    args
 }
 
 fn qemu_disk_args(config: &VmLaunchConfig) -> Vec<String> {
@@ -1418,6 +1436,7 @@ mod tests {
             console_output: PathBuf::from("/console.log"),
             backend: VmBackend::Qemu,
             gpu_bdf: Some("0000:01:00.0".to_string()),
+            pci_passthrough: Vec::new(),
             tap_device: Some("vmtap-test".to_string()),
             guest_ip: Some("10.0.128.2".to_string()),
             host_ip: Some("10.0.128.1".to_string()),
@@ -1451,6 +1470,34 @@ mod tests {
         assert!(!cmdline.contains("VM_NET_GW="));
         assert!(!cmdline.contains("VM_NET_DNS="));
         assert!(!cmdline.contains("GPU_ENABLED="));
+    }
+
+    #[test]
+    fn qemu_passthrough_args_emit_gpu_and_extra_vfio_devices() {
+        let mut config = qemu_config();
+        config.gpu_bdf = Some("0000:01:00.0".to_string());
+        config.pci_passthrough = vec!["0000:03:00.2".to_string(), "0000:03:00.3".to_string()];
+
+        let args = qemu_pci_passthrough_args(&config);
+
+        assert!(args.contains(&"pcie-root-port,id=gpu_root,slot=2".to_string()));
+        assert!(args.contains(&"vfio-pci,host=0000:01:00.0,bus=gpu_root".to_string()));
+        assert!(args.contains(&"pcie-root-port,id=pt0_root,slot=4".to_string()));
+        assert!(args.contains(&"vfio-pci,host=0000:03:00.2,bus=pt0_root".to_string()));
+        assert!(args.contains(&"pcie-root-port,id=pt1_root,slot=5".to_string()));
+        assert!(args.contains(&"vfio-pci,host=0000:03:00.3,bus=pt1_root".to_string()));
+    }
+
+    #[test]
+    fn qemu_passthrough_args_support_vf_only_without_gpu() {
+        let mut config = qemu_config();
+        config.gpu_bdf = None;
+        config.pci_passthrough = vec!["0000:03:00.2".to_string()];
+
+        let args = qemu_pci_passthrough_args(&config);
+
+        assert!(!args.iter().any(|a| a.contains("gpu_root")));
+        assert!(args.contains(&"vfio-pci,host=0000:03:00.2,bus=pt0_root".to_string()));
     }
 
     #[test]

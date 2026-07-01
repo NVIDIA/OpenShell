@@ -550,6 +550,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "bf-core"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "bf-driver"
+version = "0.0.0"
+dependencies = [
+ "bf-vm",
+ "clap",
+ "futures",
+ "miette",
+ "openshell-core",
+ "openshell-driver-vm",
+ "rustix 1.1.4",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "bf-inventory"
+version = "0.0.0"
+dependencies = [
+ "bf-core",
+ "openshell-vfio",
+]
+
+[[package]]
+name = "bf-vm"
+version = "0.0.0"
+dependencies = [
+ "bf-core",
+ "bf-inventory",
+ "clap",
+ "openshell-core",
+ "openshell-driver-vm",
+ "openshell-vfio",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3647,6 +3703,10 @@ dependencies = [
  "tracing",
  "url",
 ]
+
+[[package]]
+name = "openshell-driver-bluefield"
+version = "0.0.0"
 
 [[package]]
 name = "openshell-driver-docker"
