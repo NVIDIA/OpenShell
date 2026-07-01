@@ -437,6 +437,14 @@ pub fn create_netns_for_proxy(
     if !matches!(policy.network.mode, NetworkMode::Proxy) {
         return Ok(None);
     }
+    if crate::bootstrap_skipped(crate::BootstrapSubsystem::NetworkNamespace) {
+        tracing::warn!(
+            subsystem = "netns",
+            "Skipping network namespace creation (--skip-bootstrap: outer sandbox owns it); \
+             proxy egress is cooperating-client only, not bypass-proof, in this mode"
+        );
+        return Ok(None);
+    }
     match NetworkNamespace::create() {
         Ok(ns) => {
             let proxy_port = policy
