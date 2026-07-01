@@ -102,6 +102,14 @@ impl DescribedChainEntry {
     pub fn on_error(&self) -> OnError {
         self.entry.on_error
     }
+
+    /// True when this entry resolved to a registered binding and will be
+    /// evaluated. When false, the binding is absent from the current registry
+    /// and the entry is handled entirely by its `on_error` policy, so it
+    /// imposes no body-buffering limit on the chain.
+    pub fn is_resolved(&self) -> bool {
+        self.binding.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1164,6 +1172,25 @@ mod tests {
                 binding_ids,
             }]),
         }
+    }
+
+    #[tokio::test]
+    async fn describe_chain_marks_resolved_and_unresolved_entries() {
+        let unresolved = ChainEntry {
+            name: "missing".into(),
+            implementation: "third-party/missing".into(),
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailOpen,
+        };
+        let described = ChainRunner::default()
+            .describe_chain(&[entry("redact", OnError::FailClosed), unresolved])
+            .await
+            .expect("describe chain");
+        // The built-in resolves and reports its real limit; the missing binding
+        // does not resolve and must not contribute a body limit.
+        assert!(described[0].is_resolved());
+        assert_eq!(described[0].max_body_bytes(), 256 * 1024);
+        assert!(!described[1].is_resolved());
     }
 
     #[tokio::test]

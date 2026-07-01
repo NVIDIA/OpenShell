@@ -778,11 +778,18 @@ pub(crate) enum MiddlewareApplyResult {
     Denied(String),
 }
 
+/// Smallest body-buffering limit across the entries that actually resolved to a
+/// registered binding. Unresolved entries (`is_resolved() == false`) report a
+/// zero limit and are excluded here: they are handled by their `on_error` policy
+/// in `evaluate_described` without inspecting the body, so letting a zero drag
+/// the chain limit to zero would spuriously fail the whole chain over capacity.
+/// Returns `None` when no entry resolved, so the caller can skip buffering.
 fn middleware_chain_body_limit(
     chain: &[openshell_supervisor_middleware::DescribedChainEntry],
 ) -> Option<usize> {
     chain
         .iter()
+        .filter(|entry| entry.is_resolved())
         .map(openshell_supervisor_middleware::DescribedChainEntry::max_body_bytes)
         .min()
 }
@@ -812,8 +819,20 @@ pub(crate) async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite 
         return Ok(MiddlewareApplyResult::Allowed(req));
     }
     let chain = runner.describe_chain(&chain).await?;
-    let max_body_bytes =
-        middleware_chain_body_limit(&chain).expect("non-empty middleware chain has a body limit");
+    let Some(max_body_bytes) = middleware_chain_body_limit(&chain) else {
+        // No entry resolved to a registered binding, so nothing inspects the
+        // body. Apply each entry's `on_error` policy without buffering (an
+        // unresolved binding is handled before the body is read) and forward
+        // the original request unchanged if the chain allows.
+        let input = middleware_request_input(scheme, &req, ctx, BTreeMap::new(), String::new(), Vec::new());
+        let outcome = runner.evaluate_described(&chain, input).await?;
+        emit_middleware_events(ctx, &req, &outcome);
+        return Ok(if outcome.allowed {
+            MiddlewareApplyResult::Allowed(req)
+        } else {
+            MiddlewareApplyResult::Denied(outcome.reason)
+        });
+    };
     let buffered = match crate::l7::rest::buffer_request_body_for_middleware(
         &req,
         client,
@@ -961,11 +980,17 @@ fn middleware_network_input(ctx: &L7EvalContext) -> crate::opa::NetworkInput {
     }
 }
 
-fn emit_middleware_events(
+/// Build the OCSF events describing a middleware chain outcome, in emission
+/// order. Separated from `emit_middleware_events` so tests can assert on the
+/// events deterministically without routing through the global tracing pipeline,
+/// whose callsite-interest cache is process-global and races under parallel
+/// tests.
+fn middleware_events(
     ctx: &L7EvalContext,
     req: &crate::l7::provider::L7Request,
     outcome: &openshell_supervisor_middleware::ChainOutcome,
-) {
+) -> Vec<openshell_ocsf::OcsfEvent> {
+    let mut events = Vec::new();
     for invocation in &outcome.applied {
         let allowed = invocation.decision == openshell_core::proto::Decision::Allow;
         let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -1000,7 +1025,7 @@ fn emit_middleware_events(
                 invocation.failed
             ))
             .build();
-        ocsf_emit!(event);
+        events.push(event);
 
         // A middleware that failed but was bypassed under `fail_open` is an
         // enforcement failure operators must be able to alert on, even though the
@@ -1021,7 +1046,7 @@ fn emit_middleware_events(
                     invocation.name
                 ))
                 .build();
-            ocsf_emit!(event);
+            events.push(event);
         }
     }
     if !outcome.allowed && outcome.reason.starts_with("middleware_failed:") {
@@ -1033,7 +1058,7 @@ fn emit_middleware_events(
             ))
             .message("Required supervisor middleware failed closed")
             .build();
-        ocsf_emit!(event);
+        events.push(event);
     }
     for finding in &outcome.findings {
         let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -1055,6 +1080,19 @@ fn emit_middleware_events(
                 finding.finding.r#type, finding.finding.count
             ))
             .build();
+        events.push(event);
+    }
+    events
+}
+
+/// Emit the OCSF events describing a middleware chain outcome through the
+/// tracing pipeline.
+fn emit_middleware_events(
+    ctx: &L7EvalContext,
+    req: &crate::l7::provider::L7Request,
+    outcome: &openshell_supervisor_middleware::ChainOutcome,
+) {
+    for event in middleware_events(ctx, req, outcome) {
         ocsf_emit!(event);
     }
 }
@@ -3051,6 +3089,101 @@ network_policies:
         ));
     }
 
+    #[tokio::test]
+    async fn body_limit_ignores_unresolved_entries() {
+        use openshell_supervisor_middleware::{ChainEntry, ChainRunner, OnError};
+
+        let resolved = ChainEntry {
+            name: "redact".into(),
+            implementation: openshell_supervisor_middleware::BUILTIN_SECRETS.into(),
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+        let unresolved = ChainEntry {
+            name: "missing".into(),
+            implementation: "third-party/missing".into(),
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailOpen,
+        };
+
+        // A single unresolved (0-limit) entry must not drag the chain limit to
+        // zero: the buffer limit reflects only the resolved built-in.
+        let mixed = ChainRunner::default()
+            .describe_chain(&[resolved, unresolved.clone()])
+            .await
+            .expect("describe mixed chain");
+        assert_eq!(middleware_chain_body_limit(&mixed), Some(256 * 1024));
+
+        // When nothing resolves, there is no body limit and the caller skips
+        // buffering entirely.
+        let none = ChainRunner::default()
+            .describe_chain(std::slice::from_ref(&unresolved))
+            .await
+            .expect("describe unresolved chain");
+        assert_eq!(middleware_chain_body_limit(&none), None);
+    }
+
+    #[tokio::test]
+    async fn all_unresolved_fail_open_forwards_body_unbuffered() {
+        // A chain whose only entry is an unregistered binding has no resolvable
+        // body limit. Under fail_open the request must pass through with its
+        // body intact rather than being denied over a phantom zero-byte cap.
+        let (config, tunnel_engine, ctx) =
+            middleware_relay_context("third-party/missing", "fail_open");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"{"api_key":"sk-1234567890abcdef"}"#;
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+
+        let mut upstream_request = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("request should reach upstream")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_request[..n]);
+        // No middleware ran, so the body is forwarded verbatim.
+        assert!(upstream_request.contains(r#""api_key":"sk-1234567890abcdef""#));
+
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("response should reach client")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("204 No Content"));
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn middleware_keeps_the_raw_request_query() {
         let query = raw_query_from_request_headers(
@@ -3095,35 +3228,13 @@ network_policies:
         assert_eq!(input.scheme, "http");
     }
 
-    /// Tracing layer that captures emitted `OcsfEvent`s for assertions.
-    struct OcsfCaptureLayer(Arc<std::sync::Mutex<Vec<openshell_ocsf::OcsfEvent>>>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OcsfCaptureLayer {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().target() == openshell_ocsf::OCSF_TARGET
-                && let Some(ocsf_event) = openshell_ocsf::clone_current_event()
-            {
-                self.0.lock().unwrap().push(ocsf_event);
-            }
-        }
-    }
-
     #[test]
     fn middleware_ocsf_events_are_audit_safe() {
         use openshell_supervisor_middleware::{
             ChainOutcome, MiddlewareInvocation, NamespacedFinding,
         };
-        use tracing_subscriber::layer::SubscriberExt;
 
         const RAW_SECRET: &str = "sk-RAWSECRETVALUE0123456789";
-
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(OcsfCaptureLayer(Arc::clone(&events)));
-        let _guard = tracing::subscriber::set_default(subscriber);
 
         let ctx = L7EvalContext {
             host: "api.example.test".into(),
@@ -3171,23 +3282,26 @@ network_policies:
             }],
         };
 
-        emit_middleware_events(&ctx, &req, &outcome);
+        // Build the events directly rather than routing through the global
+        // tracing pipeline: its callsite-interest cache is process-global, so a
+        // parallel test that emits OCSF with no subscriber installed can cache
+        // the callsite as disabled and make captured-event assertions flaky.
+        let events = middleware_events(&ctx, &req, &outcome);
 
-        let captured = events.lock().unwrap();
         // Per-invocation decisions are HTTP Activity (class 4002).
         assert!(
-            captured.iter().any(|e| e.class_uid() == 4002),
+            events.iter().any(|e| e.class_uid() == 4002),
             "expected an HTTP Activity event for the middleware invocation"
         );
         // Findings are Detection Finding (class 2004) with the finding's severity.
-        let finding_event = captured
+        let finding_event = events
             .iter()
             .find(|e| e.class_uid() == 2004)
             .expect("expected a Detection Finding event");
         assert_eq!(finding_event.base().severity, SeverityId::Medium);
 
         // No raw payload material may appear in any emitted event.
-        let serialized = serde_json::to_string(&*captured).expect("serialize events");
+        let serialized = serde_json::to_string(&events).expect("serialize events");
         assert!(
             !serialized.contains(RAW_SECRET),
             "raw secret leaked into OCSF events: {serialized}"
@@ -3364,12 +3478,19 @@ network_policies:
         .await
         .unwrap();
 
-        let mut response = [0u8; 512];
-        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
-            .await
-            .expect("denial should reach client")
-            .unwrap();
-        let response = String::from_utf8_lossy(&response[..n]);
+        // Accumulate until the reason marker arrives: the deny response can be
+        // delivered in more than one write, so a single read may return only the
+        // status line and flake the body assertion.
+        let mut response = Vec::new();
+        let mut buf = [0u8; 512];
+        while !String::from_utf8_lossy(&response).contains("middleware_failed") {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) => break, // clean EOF, or no more data before the deadline
+                Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
+                Ok(Err(e)) => panic!("read from relay failed: {e}"),
+            }
+        }
+        let response = String::from_utf8_lossy(&response);
         assert!(response.contains("403 Forbidden"));
         assert!(response.contains("middleware_failed"));
 
