@@ -409,7 +409,7 @@ where
                 jsonrpc_info
                     .as_ref()
                     .and_then(|info| info.error.as_deref())
-                    .map(|error| format!("JSON-RPC request rejected: {error}"))
+                    .map(crate::l7::jsonrpc::jsonrpc_parse_rejection_reason)
             });
         let force_deny = parse_error_reason.is_some();
         let (allowed, reason) = if let Some(reason) = parse_error_reason {
@@ -1082,7 +1082,7 @@ where
         let parse_error_reason = jsonrpc_info
             .error
             .as_deref()
-            .map(|e| format!("JSON-RPC request rejected: {e}"));
+            .map(crate::l7::jsonrpc::jsonrpc_parse_rejection_reason);
         let response_frame_reason =
             jsonrpc_response_frame_hard_deny_reason(config.protocol, &jsonrpc_info);
         let force_deny = parse_error_reason.is_some() || response_frame_reason.is_some();
@@ -3307,6 +3307,121 @@ network_policies:
         );
     }
 
+    #[derive(Debug, Clone, Copy)]
+    enum McpBatchEntryPath {
+        Direct,
+        RouteSelected,
+    }
+
+    async fn assert_mcp_batch_denied(
+        body: &[u8],
+        entry_path: McpBatchEntryPath,
+        enforcement: EnforcementMode,
+    ) {
+        let (mut config, tunnel_engine, ctx) = mcp_test_relay_context();
+        config.enforcement = enforcement;
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            match entry_path {
+                McpBatchEntryPath::Direct => {
+                    relay_with_inspection(
+                        &config,
+                        tunnel_engine,
+                        &mut relay_client,
+                        &mut relay_upstream,
+                        &ctx,
+                    )
+                    .await
+                }
+                McpBatchEntryPath::RouteSelected => {
+                    let configs = [config];
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut relay_client,
+                        &mut relay_upstream,
+                        &ctx,
+                    )
+                    .await
+                }
+            }
+        });
+
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.write_all(body).await.unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read_to_end(&mut response),
+        )
+        .await
+        .expect("relay should close after denying an MCP batch")
+        .unwrap();
+        let response = String::from_utf8(response).expect("denial response should be UTF-8");
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "{entry_path:?}/{enforcement:?} returned an unexpected response: {response:?}"
+        );
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("denial response should contain a body");
+        let body: serde_json::Value =
+            serde_json::from_str(body).expect("denial body should be JSON");
+        assert_eq!(
+            body.get("detail").and_then(serde_json::Value::as_str),
+            Some(crate::l7::jsonrpc::UNSUPPORTED_MCP_BATCH_REASON),
+            "{entry_path:?}/{enforcement:?} changed the stable denial detail"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish after denying an MCP batch")
+            .unwrap()
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(1), upstream.read(&mut byte))
+                .await
+                .expect("upstream side should close")
+                .unwrap();
+        assert_eq!(
+            read, 0,
+            "{entry_path:?}/{enforcement:?} forwarded MCP batch bytes upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_rejects_jsonrpc_batches() {
+        let batches: &[&[u8]] = &[
+            br"[]",
+            br#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+            br#"[{"jsonrpc":"2.0","method":"notifications/initialized"}]"#,
+            br#"[{"jsonrpc":"2.0","id":1,"result":{}}]"#,
+            br#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":1,"result":{}}]"#,
+        ];
+
+        for body in batches {
+            assert_mcp_batch_denied(body, McpBatchEntryPath::Direct, EnforcementMode::Enforce)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_batch_entry_path_matrix() {
+        let body = br#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#;
+        for entry_path in [McpBatchEntryPath::Direct, McpBatchEntryPath::RouteSelected] {
+            for enforcement in [EnforcementMode::Audit, EnforcementMode::Enforce] {
+                assert_mcp_batch_denied(body, entry_path, enforcement).await;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn jsonrpc_relay_forwards_allowed_method() {
         let (config, tunnel_engine, ctx) = jsonrpc_test_relay_context();
@@ -3364,6 +3479,64 @@ network_policies:
             .expect("upstream response should reach client")
             .unwrap();
         assert!(String::from_utf8_lossy(&response[..n]).contains("200 OK"));
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should complete")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_relay_forwards_allowed_batch_separately_from_mcp() {
+        let (config, tunnel_engine, ctx) = jsonrpc_test_relay_context();
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"[{"jsonrpc":"2.0","id":1,"method":"initialize"},{"jsonrpc":"2.0","method":"initialize"}]"#;
+        let request = format!(
+            "POST /rpc HTTP/1.1\r\nHost: jsonrpc.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.write_all(body).await.unwrap();
+
+        let mut upstream_bytes = Vec::new();
+        let mut upstream_buf = [0u8; 1024];
+        while !upstream_bytes.ends_with(body) {
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                upstream.read(&mut upstream_buf),
+            )
+            .await
+            .expect("allowed generic JSON-RPC batch should reach upstream")
+            .unwrap();
+            assert_ne!(read, 0, "upstream closed before the full batch arrived");
+            upstream_bytes.extend_from_slice(&upstream_buf[..read]);
+        }
+
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut response = [0u8; 512];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("generic JSON-RPC batch response should reach client")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..read]).contains("204 No Content"));
 
         drop(app);
         tokio::time::timeout(std::time::Duration::from_secs(1), relay)

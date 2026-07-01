@@ -467,12 +467,28 @@ fn forward_l7_hard_deny_reason(
             request_info.jsonrpc.as_ref().and_then(|info| {
                 info.error
                     .as_deref()
-                    .map(|error| format!("JSON-RPC request rejected: {error}"))
+                    .map(crate::l7::jsonrpc::jsonrpc_parse_rejection_reason)
                     .or_else(|| {
                         crate::l7::relay::jsonrpc_response_frame_hard_deny_reason(protocol, info)
                     })
             })
         })
+}
+
+fn forward_l7_denial_detail(
+    force_deny: bool,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    reason: &str,
+) -> String {
+    // Stable classifier reasons are machine-readable API details. Policy and
+    // ordinary parse denials retain request context for human diagnostics.
+    if force_deny && reason == crate::l7::jsonrpc::UNSUPPORTED_MCP_BATCH_REASON {
+        return reason.to_string();
+    }
+    format!("{method} {host}:{port}{path} denied by L7 policy: {reason}")
 }
 
 /// Emit a denial event to the aggregator channel (if configured).
@@ -3791,14 +3807,11 @@ async fn handle_forward_proxy(
                 &reason,
                 "forward-l7-deny",
             );
+            let detail =
+                forward_l7_denial_detail(force_deny, method, &host_lc, port, &path, &reason);
             respond(
                 client,
-                &build_json_error_response(
-                    403,
-                    "Forbidden",
-                    "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} denied by L7 policy: {reason}"),
-                ),
+                &build_json_error_response(403, "Forbidden", "policy_denied", &detail),
             )
             .await?;
             return Ok(());
@@ -4574,6 +4587,40 @@ network_policies:
         assert_eq!(
             reason,
             "JSON-RPC request rejected: missing or non-string 'jsonrpc' field"
+        );
+    }
+
+    #[test]
+    fn forward_mcp_batch_denial_preserves_stable_detail() {
+        let jsonrpc = crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::Mcp,
+        );
+        let request_info = crate::l7::L7RequestInfo {
+            action: "POST".to_string(),
+            target: "/mcp".to_string(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+            jsonrpc: Some(jsonrpc),
+        };
+        let reason = forward_l7_hard_deny_reason(crate::l7::L7Protocol::Mcp, &request_info)
+            .expect("MCP batch should be a forward-proxy hard denial");
+        let detail =
+            forward_l7_denial_detail(true, "POST", "mcp.example.test", 8000, "/mcp", &reason);
+        assert_eq!(detail, crate::l7::jsonrpc::UNSUPPORTED_MCP_BATCH_REASON);
+
+        let response = build_json_error_response(403, "Forbidden", "policy_denied", &detail);
+        let response = String::from_utf8(response).expect("denial response should be UTF-8");
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("denial response should contain a body");
+        let body: serde_json::Value =
+            serde_json::from_str(body).expect("denial body should be JSON");
+        assert_eq!(body["error"], "policy_denied");
+        assert_eq!(
+            body["detail"],
+            crate::l7::jsonrpc::UNSUPPORTED_MCP_BATCH_REASON
         );
     }
 
