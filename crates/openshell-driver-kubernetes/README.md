@@ -82,13 +82,13 @@ nested schema and currently accepts:
 - `pod.priority_class_name`
 - `containers.agent.resources.requests`
 - `containers.agent.resources.limits`
-- `volumes[].name`
-- `volumes[].persistent_volume_claim.claim_name`
-- `volumes[].persistent_volume_claim.read_only`
 - `containers.agent.volume_mounts[].name`
 - `containers.agent.volume_mounts[].mount_path`
 - `containers.agent.volume_mounts[].sub_path`
 - `containers.agent.volume_mounts[].read_only`
+- `volumes[].name`
+- `volumes[].persistent_volume_claim.claim_name`
+- `volumes[].persistent_volume_claim.read_only`
 
 Nested keys inside the `kubernetes` block use snake_case. The top-level
 `driver_config` envelope is keyed by driver names, so `kubernetes` is not part
@@ -116,9 +116,9 @@ Use PVC volumes to mount existing Kubernetes PersistentVolumeClaims into the
 agent container. PVC volumes and mounts default to read-only unless
 `read_only: false` is set explicitly. Read-write access requires
 `read_only: false` on both the PVC volume and each writable mount. The driver
-rejects duplicate volume names, invalid DNS-1123 volume or PVC claim names,
-mounts that reference unknown volumes, non-normalized or protected mount paths,
-and absolute or parent-traversing `sub_path` values.
+rejects duplicate volume names, invalid DNS-1123 volume labels or PVC claim
+subdomain names, mounts that reference unknown volumes, non-normalized or
+protected mount paths, and absolute or parent-traversing `sub_path` values.
 
 Any explicit driver-config mount under `/sandbox` disables the driver's
 default `/sandbox` workspace PVC injection for that sandbox. Only the explicit

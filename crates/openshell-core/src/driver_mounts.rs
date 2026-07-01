@@ -13,11 +13,6 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/run/netns",
 ];
 
-/// Serde default helper for mount options that default to read-only.
-pub fn default_true() -> bool {
-    true
-}
-
 /// Validate a non-empty driver mount source.
 pub fn validate_mount_source(source: &str, field: &str) -> Result<String, String> {
     let source = source.trim();
