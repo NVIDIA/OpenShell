@@ -20,6 +20,12 @@ Create a sandbox with a single command. For example, to create a sandbox with Cl
 openshell sandbox create -- claude
 ```
 
+For automation, use `--output json` or `--output yaml` to get machine-readable sandbox metadata after creation:
+
+```shell
+openshell sandbox create --output json
+```
+
 Every sandbox requires a gateway. Register or select one before running sandbox commands:
 
 ```shell
@@ -292,6 +298,12 @@ Get detailed information about a specific sandbox. The output lists **Policy sou
 
 ```shell
 openshell sandbox get my-sandbox
+```
+
+For automation, use `--output json` or `--output yaml` to get machine-readable sandbox details:
+
+```shell
+openshell sandbox get my-sandbox --output json
 ```
 
 Print only that policy YAML for scripting (same effective policy, no metadata):

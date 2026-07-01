@@ -41,7 +41,7 @@ use openshell_core::proto::{
     DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuResourceRequirements,
     HealthRequest, ImportProviderProfilesRequest, LintProviderProfilesRequest,
     ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
@@ -527,59 +527,141 @@ fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>
 
 /// Show gateway status.
 #[allow(clippy::branches_sharing_code)]
-pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn gateway_status(
+    gateway_name: &str,
+    server: &str,
+    output: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let is_bearer = tls.is_bearer_auth();
+
+    // Build status data before any output.
+    let (status_str, version, error, http_status): (
+        &str,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = match grpc_client(server, tls).await {
+        Ok(mut client) => match client.health(HealthRequest {}).await {
+            Ok(response) => {
+                let health = response.into_inner();
+                ("connected", Some(health.version), None, None)
+            }
+            Err(e) => http_health_check(server, tls).await?.map_or_else(
+                || ("error", None, Some(e.to_string()), None),
+                |http| {
+                    let hs = Some(http.to_string());
+                    if http.is_success() {
+                        ("connected_http", None, Some(e.to_string()), hs)
+                    } else {
+                        ("error", None, Some(e.to_string()), hs)
+                    }
+                },
+            ),
+        },
+        Err(e) => http_health_check(server, tls).await?.map_or_else(
+            || ("disconnected", None, Some(e.to_string()), None),
+            |http| {
+                let hs = Some(http.to_string());
+                if http.is_success() {
+                    ("connected_http", None, Some(e.to_string()), hs)
+                } else {
+                    ("disconnected", None, Some(e.to_string()), hs)
+                }
+            },
+        ),
+    };
+
+    let json_data = status_to_json(
+        gateway_name,
+        server,
+        is_bearer,
+        status_str,
+        &version,
+        &error,
+        &http_status,
+    );
+    if crate::output::print_output_single(output, &json_data, Clone::clone)? {
+        return Ok(());
+    }
+
+    // Human-readable output (existing behavior).
     println!("{}", "Server Status".cyan().bold());
     println!();
     println!("  {} {}", "Gateway:".dimmed(), gateway_name);
     println!("  {} {}", "Server:".dimmed(), server);
-    if tls.is_bearer_auth() {
+    if is_bearer {
         println!("  {} Edge (bearer token)", "Auth:".dimmed());
     }
-
-    // Try to connect and get health
-    match grpc_client(server, tls).await {
-        Ok(mut client) => match client.health(HealthRequest {}).await {
-            Ok(response) => {
-                let health = response.into_inner();
-                println!("  {} {}", "Status:".dimmed(), "Connected".green());
-                println!("  {} {}", "Version:".dimmed(), health.version);
+    match status_str {
+        "connected" => {
+            println!("  {} {}", "Status:".dimmed(), "Connected".green());
+            if let Some(ref v) = version {
+                println!("  {} {}", "Version:".dimmed(), v);
             }
-            Err(e) => {
-                if let Some(status) = http_health_check(server, tls).await? {
-                    if status.is_success() {
-                        println!("  {} {}", "Status:".dimmed(), "Connected (HTTP)".yellow());
-                        println!("  {} {}", "HTTP: ".dimmed(), status);
-                        println!("  {} {}", "gRPC error:".dimmed(), e);
-                    } else {
-                        println!("  {} {}", "Status:".dimmed(), "Error".red());
-                        println!("  {} {}", "HTTP:".dimmed(), status);
-                        println!("  {} {}", "gRPC error:".dimmed(), e);
-                    }
-                } else {
-                    println!("  {} {}", "Status:".dimmed(), "Error".red());
-                    println!("  {} {}", "Error:".dimmed(), e);
-                }
+        }
+        "connected_http" => {
+            println!("  {} {}", "Status:".dimmed(), "Connected (HTTP)".yellow());
+            if let Some(ref hs) = http_status {
+                println!("  {} {}", "HTTP: ".dimmed(), hs);
             }
-        },
-        Err(e) => {
-            if let Some(status) = http_health_check(server, tls).await? {
-                if status.is_success() {
-                    println!("  {} {}", "Status:".dimmed(), "Connected (HTTP)".yellow());
-                    println!("  {} {}", "HTTP:".dimmed(), status);
+            if let Some(ref e) = error {
+                println!("  {} {}", "gRPC error:".dimmed(), e);
+            }
+        }
+        "error" => {
+            println!("  {} {}", "Status:".dimmed(), "Error".red());
+            if let Some(ref hs) = http_status {
+                println!("  {} {}", "HTTP:".dimmed(), hs);
+                if let Some(ref e) = error {
                     println!("  {} {}", "gRPC error:".dimmed(), e);
-                } else {
-                    println!("  {} {}", "Status:".dimmed(), "Disconnected".red());
-                    println!("  {} {}", "HTTP:".dimmed(), status);
-                    println!("  {} {}", "Error:".dimmed(), e);
                 }
-            } else {
-                println!("  {} {}", "Status:".dimmed(), "Disconnected".red());
+            } else if let Some(ref e) = error {
+                println!("  {} {}", "Error:".dimmed(), e);
+            }
+        }
+        _ => {
+            println!("  {} {}", "Status:".dimmed(), "Disconnected".red());
+            if let Some(ref hs) = http_status {
+                println!("  {} {}", "HTTP:".dimmed(), hs);
+            }
+            if let Some(ref e) = error {
                 println!("  {} {}", "Error:".dimmed(), e);
             }
         }
     }
 
     Ok(())
+}
+
+fn status_to_json(
+    gateway_name: &str,
+    server: &str,
+    is_bearer: bool,
+    status: &str,
+    version: &Option<String>,
+    error: &Option<String>,
+    http_status: &Option<String>,
+) -> serde_json::Value {
+    let mut obj = serde_json::json!({
+        "gateway": gateway_name,
+        "server": server,
+        "status": status,
+    });
+    let map = obj.as_object_mut().expect("json! returns object");
+    if is_bearer {
+        map.insert("auth".into(), serde_json::json!("edge_bearer"));
+    }
+    if let Some(v) = version {
+        map.insert("version".into(), serde_json::json!(v));
+    }
+    if let Some(hs) = http_status {
+        map.insert("http_status".into(), serde_json::json!(hs));
+    }
+    if let Some(e) = error {
+        map.insert("error".into(), serde_json::json!(e));
+    }
+    obj
 }
 
 /// Set the active gateway.
@@ -1789,6 +1871,7 @@ pub struct SandboxCreateConfig<'a> {
     pub labels: HashMap<String, String>,
     pub environment: HashMap<String, String>,
     pub approval_mode: &'a str,
+    pub output: &'a str,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -1812,6 +1895,7 @@ impl Default for SandboxCreateConfig<'_> {
             labels: HashMap::new(),
             environment: HashMap::new(),
             approval_mode: "manual",
+            output: "table",
         }
     }
 }
@@ -1842,6 +1926,7 @@ pub async fn sandbox_create(
         labels,
         environment,
         approval_mode,
+        output,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -1991,23 +2076,30 @@ pub async fn sandbox_create(
         }
     }
 
+    let structured_output = output != "table";
+
     // Set up display — interactive terminals get a step-based checklist with
     // spinners; non-interactive (pipes / CI) get timestamped lines.
-    let mut display = if interactive {
+    // Suppress all human chrome when structured output is active.
+    let mut display = if interactive && !structured_output {
         Some(ProvisioningDisplay::new())
     } else {
         None
     };
 
-    // Print header
-    print_sandbox_header(&sandbox, display.as_ref());
-
-    // Set initial active step on the spinner.
-    if let Some(d) = display.as_mut() {
-        d.set_active_step(ProvisioningStep::RequestingSandbox);
+    if structured_output {
+        eprintln!("Provisioning sandbox (structured output on stdout)...");
     } else {
-        let ts = format_timestamp(Duration::ZERO);
-        println!("  {} Requesting compute...", ts.dimmed());
+        // Print header
+        print_sandbox_header(&sandbox, display.as_ref());
+
+        // Set initial active step on the spinner.
+        if let Some(d) = display.as_mut() {
+            d.set_active_step(ProvisioningStep::RequestingSandbox);
+        } else {
+            let ts = format_timestamp(Duration::ZERO);
+            println!("  {} Requesting compute...", ts.dimmed());
+        }
     }
 
     // Non-interactive mode: track start time for timestamps.
@@ -2041,6 +2133,7 @@ pub async fn sandbox_create(
         .into_inner();
 
     let mut last_phase = sandbox.phase();
+    let mut last_sandbox = sandbox.clone();
     let mut last_error_reason = String::new();
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
     // Track whether we have seen a non-Ready phase during the watch.
@@ -2070,7 +2163,9 @@ pub async fn sandbox_create(
             if let Some(d) = display.as_mut() {
                 d.finish_error(&timeout_message);
             }
-            println!();
+            if !structured_output {
+                println!();
+            }
             return Err(miette::miette!(timeout_message));
         }
 
@@ -2089,7 +2184,9 @@ pub async fn sandbox_create(
                 if let Some(d) = display.as_mut() {
                     d.finish_error(&timeout_message);
                 }
-                println!();
+                if !structured_output {
+                    println!();
+                }
                 return Err(miette::miette!(timeout_message));
             }
         };
@@ -2099,6 +2196,7 @@ pub async fn sandbox_create(
             Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) => {
                 let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
                 last_phase = s.phase();
+                last_sandbox = s.clone();
                 if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
                     last_condition_message = Some(message);
                 }
@@ -2279,6 +2377,11 @@ pub async fn sandbox_create(
                     "  Stop with: openshell forward stop {} {sandbox_name}",
                     spec.port,
                 );
+            }
+
+            if structured_output {
+                crate::output::print_output_single(output, &last_sandbox, sandbox_to_json)?;
+                return Ok(());
             }
 
             if let Some(editor) = editor {
@@ -2611,6 +2714,7 @@ pub async fn sandbox_get(
     server: &str,
     name: &str,
     policy_only: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -2647,6 +2751,11 @@ pub async fn sandbox_get(
         let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
             .wrap_err("failed to serialize policy to YAML")?;
         print!("{yaml_str}");
+        return Ok(());
+    }
+
+    let detail_json = sandbox_detail_to_json(&sandbox, &config)?;
+    if crate::output::print_output_single(output, &detail_json, Clone::clone)? {
         return Ok(());
     }
 
@@ -3436,6 +3545,48 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
     })
+}
+
+fn sandbox_detail_to_json(
+    sandbox: &Sandbox,
+    config: &GetSandboxConfigResponse,
+) -> Result<serde_json::Value> {
+    let mut value = sandbox_to_json(sandbox);
+    let obj = value
+        .as_object_mut()
+        .expect("sandbox_to_json returns object");
+
+    let policy_source = if config.policy_source == PolicySource::Global as i32 {
+        "global"
+    } else {
+        "sandbox"
+    };
+    obj.insert("policy_source".into(), serde_json::json!(policy_source));
+
+    let policy_from_global = config.policy_source == PolicySource::Global as i32;
+    let revision = if policy_from_global {
+        if config.global_policy_version > 0 {
+            Some(config.global_policy_version)
+        } else if config.version > 0 {
+            Some(config.version)
+        } else {
+            None
+        }
+    } else if config.version > 0 {
+        Some(config.version)
+    } else {
+        None
+    };
+    obj.insert("revision".into(), serde_json::json!(revision));
+
+    let policy_json = match config.policy.as_ref() {
+        Some(p) => openshell_policy::sandbox_policy_to_json_value(p)
+            .wrap_err("failed to convert policy to JSON")?,
+        None => serde_json::Value::Null,
+    };
+    obj.insert("policy".into(), policy_json);
+
+    Ok(value)
 }
 
 pub async fn sandbox_provider_list(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
@@ -6432,10 +6583,7 @@ pub async fn gateway_settings_get(server: &str, json: bool, tls: &TlsOptions) ->
     Ok(())
 }
 
-fn settings_to_json_sandbox(
-    name: &str,
-    response: &openshell_core::proto::GetSandboxConfigResponse,
-) -> serde_json::Value {
+fn settings_to_json_sandbox(name: &str, response: &GetSandboxConfigResponse) -> serde_json::Value {
     let policy_source = if response.policy_source == PolicySource::Global as i32 {
         "global"
     } else {
@@ -7870,10 +8018,11 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GpuResourceRequirements, Provider, ProviderCredentialRefresh,
-        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, Provider,
+        ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
+        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
+        ProviderProfileCredential, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
+        SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     struct EnvVarGuard {
@@ -9697,5 +9846,116 @@ mod tests {
             json.get("created_at_ms").is_none(),
             "raw milliseconds field should not exist"
         );
+    }
+
+    #[test]
+    fn sandbox_detail_to_json_includes_policy_fields() {
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sb-123".to_string(),
+                name: "test-sb".to_string(),
+                resource_version: 5,
+                created_at_ms: 1_609_459_200_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        sandbox.set_current_policy_version(2);
+
+        let config = GetSandboxConfigResponse {
+            policy_source: PolicySource::Global as i32,
+            global_policy_version: 3,
+            ..Default::default()
+        };
+
+        let json = super::sandbox_detail_to_json(&sandbox, &config).unwrap();
+
+        assert_eq!(json["id"], "sb-123");
+        assert_eq!(json["name"], "test-sb");
+        assert_eq!(json["phase"], "Ready");
+        assert_eq!(json["policy_source"], "global");
+        assert_eq!(json["revision"], 3);
+        assert!(json["policy"].is_null());
+    }
+
+    #[test]
+    fn sandbox_detail_to_json_sandbox_source_without_policy() {
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sb-456".to_string(),
+                name: "no-policy-sb".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let config = GetSandboxConfigResponse {
+            policy_source: PolicySource::Sandbox as i32,
+            version: 0,
+            ..Default::default()
+        };
+
+        let json = super::sandbox_detail_to_json(&sandbox, &config).unwrap();
+
+        assert_eq!(json["policy_source"], "sandbox");
+        assert!(json["revision"].is_null());
+        assert!(json["policy"].is_null());
+    }
+
+    #[test]
+    fn status_to_json_connected() {
+        let json = super::status_to_json(
+            "my-gw",
+            "http://127.0.0.1:8090",
+            false,
+            "connected",
+            &Some("1.2.3".to_string()),
+            &None,
+            &None,
+        );
+
+        assert_eq!(json["gateway"], "my-gw");
+        assert_eq!(json["server"], "http://127.0.0.1:8090");
+        assert_eq!(json["status"], "connected");
+        assert_eq!(json["version"], "1.2.3");
+        assert!(json.get("auth").is_none());
+        assert!(json.get("error").is_none());
+        assert!(json.get("http_status").is_none());
+    }
+
+    #[test]
+    fn status_to_json_disconnected_with_error() {
+        let json = super::status_to_json(
+            "broken-gw",
+            "http://10.0.0.1:8090",
+            false,
+            "disconnected",
+            &None,
+            &Some("connection refused".to_string()),
+            &None,
+        );
+
+        assert_eq!(json["status"], "disconnected");
+        assert_eq!(json["error"], "connection refused");
+        assert!(json.get("version").is_none());
+    }
+
+    #[test]
+    fn status_to_json_connected_http_with_bearer() {
+        let json = super::status_to_json(
+            "edge-gw",
+            "https://edge.example.com",
+            true,
+            "connected_http",
+            &None,
+            &Some("gRPC unavailable".to_string()),
+            &Some("200 OK".to_string()),
+        );
+
+        assert_eq!(json["status"], "connected_http");
+        assert_eq!(json["auth"], "edge_bearer");
+        assert_eq!(json["error"], "gRPC unavailable");
+        assert_eq!(json["http_status"], "200 OK");
+        assert!(json.get("version").is_none());
     }
 }
