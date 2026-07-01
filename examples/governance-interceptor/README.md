@@ -1,24 +1,22 @@
 # Governance Interceptor Example
 
 This standalone example implements the
-`openshell.gateway_interceptor.v1.GatewayInterceptor` service. It demonstrates how to
-extend OpenShell to provide advanced governance over sandbox policies.
+`openshell.gateway_interceptor.v1.GatewayInterceptor` service. It demonstrates
+how an interceptor can vend provider profiles and make them the gateway's
+authoritative profile source.
 
-- every new sandbox receives `policy.yaml` sourced from this examples folder
-- every new sandbox is attached to exactly `github` and `slack`
-- `github` must use the `github` provider profile
-- `slack` must use the custom `slack` provider profile
-- governed provider network policy lives in `profiles/*.yaml`, not in the
-  signed baseline sandbox policy
-- every new sandbox gets an `openshell.nvidia.com/policy-signature` metadata annotation
-  that is used to verify the policy
-- every sandbox creation evaluation adds a `correlation_id` log annotation so the
-  gateway log can be correlated with interceptor-side decisions
-- users cannot attach or detach other providers after sandbox creation
+- provider profile YAML lives in `profiles/*.yaml`
+- `provider list-profiles` shows only the profiles vended by this interceptor
+- providers can only be created with a `type` that matches one of those vended
+  profile IDs
+- every new sandbox receives `policy.yaml` and the vended provider set during
+  `CreateSandbox`
+- every new sandbox gets an `openshell.nvidia.com/policy-signature` metadata
+  annotation that is used to verify the policy
+- sandbox creation evaluations add a `correlation_id` log annotation for gateway
+  audit logs, plus non-secret policy hash/signing key metadata
 - users cannot replace or merge sandbox policy after sandbox creation
-- users cannot create provider records other than `github` and `slack`
-- users cannot update or delete the governed `github` or `slack` provider records
-- users cannot import or update provider profiles outside the governed set
+- users cannot import or update provider profiles outside the vended set
 - provider profile deletion is blocked by the interceptor
 
 Run the interceptor:
@@ -33,9 +31,12 @@ cargo run -- \
 At startup the example parses `policy.yaml`, converts it to the protobuf JSON
 shape used by sandbox creation, computes a canonical SHA-256 digest, and signs
 that digest as an EdDSA JWT. The interceptor adds that JWT to each governed
-sandbox under `metadata.annotations["openshell.nvidia.com/policy-signature"]` and
-verifies the JWT against the sandbox policy during the `CreateSandbox` validate
-phase.
+sandbox under `metadata.annotations["openshell.nvidia.com/policy-signature"]`
+and verifies the JWT against the sandbox policy during the `CreateSandbox`
+validate phase. The signing key is generated in memory on each interceptor
+start. This keeps the example self-contained. Production governance services
+should load managed signing keys, publish verifier keys, and define a rotation
+process.
 
 Provider profile YAML files are loaded by the interceptor from `--profiles`
 (default: this example's `profiles/` directory). The interceptor names each
@@ -43,25 +44,14 @@ profile from its filename without the extension: `profiles/github.yaml` becomes
 profile ID `github`, and `profiles/slack.yaml` becomes profile ID `slack`. The
 YAML files do not need an `id` field; if one is present, the filename still wins.
 
-The interceptor vends the loaded profiles through
-`InterceptorManifest.provider_profile_catalog` with authoritative mode. While
-the interceptor is attached, the gateway treats that catalog as the profile
-source of truth: `provider list-profiles` shows only `github` and `slack`, and
-the built-in/user profile catalog is hidden. The normal import, update, and
-delete profile APIs remain available for gateways without an authoritative
-catalog, but profiles managed by this interceptor cannot be changed through
-those APIs.
-
-The signing key is generated in memory on each interceptor start. This keeps the
-example self-contained. Production governance services should load managed
-signing keys, publish verifier keys, and define a rotation process.
-
-Interceptors can also attach non-secret operational metadata to
-`InterceptorResult.log_annotations`. The gateway logs that map as structured
-interceptor metadata for each successful evaluation. This example adds
-`correlation_id = "governance:create-sandbox:<sandbox-name>"` during
-`CreateSandbox` modification alongside the policy hash and signing key ID. Do
-not put secrets, tokens, or policy signatures in log annotations.
+The interceptor advertises `provider_profiles = true` in its manifest and vends
+the current profile set through `SnapshotProviderProfiles`. While the
+interceptor is attached, the gateway uses that snapshot as the profile source:
+`provider list-profiles` shows only `github` and `slack`, and built-in/user
+sources are omitted. Valid edits to files under `profiles/` change the snapshot
+revision, so running sandboxes that use the edited provider profile reload their
+effective provider-derived policy through the normal gateway config polling
+path. Invalid edits keep the last valid snapshot active.
 
 Gateway TOML snippet:
 

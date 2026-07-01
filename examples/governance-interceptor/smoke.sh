@@ -377,28 +377,21 @@ EOF
   expect_failure "denies provider profile delete" "${CLI[@]}" provider profile delete slack
   expect_failure "denies disallowed provider profile import" "${CLI[@]}" provider profile import -f "$TMPDIR/disallowed-profile.yaml"
 
-  expect_failure "denies slack provider with github profile" "${CLI[@]}" provider create --name slack --type github --credential SLACK_BOT_TOKEN=dummy
   run_step "allows github provider create" "${CLI[@]}" provider create --name github --type github --credential GITHUB_TOKEN=dummy
   run_step "allows slack provider create" "${CLI[@]}" provider create --name slack --type slack --credential SLACK_BOT_TOKEN=dummy
 
-  expect_failure "denies disallowed provider create" "${CLI[@]}" provider create --name bitbucket --type github --credential GITHUB_TOKEN=dummy
+  expect_failure "denies disallowed provider create" "${CLI[@]}" provider create --name bitbucket --type bitbucket --credential BITBUCKET_TOKEN=dummy
 
-  run_step "creates governed sandbox" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --no-auto-providers --keep --no-tty -- /bin/sh -lc true
+  run_step "creates sandbox with explicit providers" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --provider github --provider slack --no-auto-providers --keep --no-tty -- /bin/sh -lc true
   expect_log_contains "gateway logs interceptor log annotations" "log_annotations" "$GATEWAY_LOG"
   expect_log_contains "gateway logs governance correlation id" "governance:create-sandbox:$SANDBOX_NAME" "$GATEWAY_LOG"
   expect_output_contains "sandbox has github provider" "github" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
   expect_output_contains "sandbox has slack provider" "slack" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
   expect_output_contains "effective policy has github provider layer" "_provider_github" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
   expect_output_contains "effective policy has slack provider layer" "_provider_slack" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
-
-  expect_failure "denies provider attach" "${CLI[@]}" sandbox provider attach "$SANDBOX_NAME" github
-  expect_failure "denies provider detach" "${CLI[@]}" sandbox provider detach "$SANDBOX_NAME" github
   expect_failure "denies policy replacement" "${CLI[@]}" policy set "$SANDBOX_NAME" --policy "$EXAMPLE_DIR/policy.yaml"
 
   run_step "deletes governed sandbox" "${CLI[@]}" sandbox delete "$SANDBOX_NAME"
-
-  expect_failure "denies governed provider update" "${CLI[@]}" provider update slack --credential SLACK_BOT_TOKEN=changed
-  expect_failure "denies governed provider delete" "${CLI[@]}" provider delete github
 }
 
 print_ready() {
