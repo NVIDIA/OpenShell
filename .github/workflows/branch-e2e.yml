@@ -1,6 +1,8 @@
 name: Branch E2E Checks
 
 on:
+  merge_group:
+    types: [checks_requested]
   push:
     branches:
       - "pull-request/[0-9]+"
@@ -37,15 +39,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" != "push" ]; then
-            run_core_e2e=true
-            run_gpu_e2e=true
-            run_kubernetes_ha_e2e=true
-          else
-            run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
-            run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
-            run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
-          fi
+          case "$EVENT_NAME" in
+            push)
+              run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
+              run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
+              run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+              ;;
+            merge_group)
+              run_core_e2e=true
+              run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
+              run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+              ;;
+            *)
+              run_core_e2e=true
+              run_gpu_e2e=true
+              run_kubernetes_ha_e2e=true
+              ;;
+          esac
           if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ]; then
             run_any_e2e=true
           else

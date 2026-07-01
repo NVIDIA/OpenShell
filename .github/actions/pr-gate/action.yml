@@ -3,8 +3,8 @@ description: >
   Resolve PR metadata for a `pull-request/<N>` push from copy-pr-bot and decide
   whether the workflow should run. Sets `should-run=true` only when the pushed
   SHA still matches the PR head SHA. If `required_label` is provided, the PR
-  must also carry that label. For non-`push` events (e.g. `workflow_dispatch`),
-  always sets `should-run=true`.
+  must also carry that label. For non-`push` events (e.g. `workflow_dispatch`
+  and `merge_group`), always sets `should-run=true`.
 
 inputs:
   required_label:
