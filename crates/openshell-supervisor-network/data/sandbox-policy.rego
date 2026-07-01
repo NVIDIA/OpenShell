@@ -842,19 +842,19 @@ _policy_endpoint_configs(policy) := [ep |
 	endpoint_has_extended_config(ep)
 ]
 
-# Collect matching endpoint configs across all policies.  Iterates over
-# _matching_policy_names (a set, safe from regorus variable collisions)
-# then collects per-policy configs via the helper function.
 _matching_endpoint_configs := [cfg |
 	some pname
 	_matching_policy_names[pname]
 	cfgs := _policy_endpoint_configs(data.network_policies[pname])
 	cfg := cfgs[_]
+	endpoint_has_extended_config(cfg)
 ]
 
 matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }
+
+network_middlewares := object.get(data, "network_middlewares", [])
 
 _policy_has_exact_declared_endpoint(policy) if {
 	some ep
@@ -909,13 +909,17 @@ endpoint_path_matches_request(ep, request) if {
 }
 
 # An endpoint has extended config if it specifies L7 protocol, allowed_ips,
-# or an explicit tls mode (e.g. tls: skip).
+# middleware, or an explicit tls mode (e.g. tls: skip).
 endpoint_has_extended_config(ep) if {
 	ep.protocol
 }
 
 endpoint_has_extended_config(ep) if {
 	count(object.get(ep, "allowed_ips", [])) > 0
+}
+
+endpoint_has_extended_config(ep) if {
+	count(object.get(ep, "middleware", [])) > 0
 }
 
 endpoint_has_extended_config(ep) if {

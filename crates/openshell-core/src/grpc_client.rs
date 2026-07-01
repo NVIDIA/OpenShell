@@ -24,11 +24,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
-    NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
-    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UpdateConfigRequest, inference_client::InferenceClient,
-    open_shell_client::OpenShellClient,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
+    IssueSandboxTokenRequest, NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus,
+    RefreshSandboxTokenRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
+    inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use crate::sandbox_env;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -573,19 +573,36 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
     fetch_policy_with_client(&mut client, sandbox_id).await
 }
 
+/// Fetch the complete effective sandbox configuration, including external
+/// middleware registrations required by the policy.
+pub async fn fetch_sandbox_config(
+    endpoint: &str,
+    sandbox_id: &str,
+) -> Result<GetSandboxConfigResponse> {
+    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to OpenShell server");
+    let mut client = connect(endpoint).await?;
+    fetch_sandbox_config_with_client(&mut client, sandbox_id).await
+}
+
+async fn fetch_sandbox_config_with_client(
+    client: &mut OpenShellClient<AuthedChannel>,
+    sandbox_id: &str,
+) -> Result<GetSandboxConfigResponse> {
+    client
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox_id: sandbox_id.to_string(),
+        })
+        .await
+        .map(tonic::Response::into_inner)
+        .into_diagnostic()
+}
+
 /// Fetch sandbox policy using an existing client connection.
 async fn fetch_policy_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_id: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
-    let response = client
-        .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox_id.to_string(),
-        })
-        .await
-        .into_diagnostic()?;
-
-    let inner = response.into_inner();
+    let inner = fetch_sandbox_config_with_client(client, sandbox_id).await?;
 
     // version 0 with no policy means the sandbox was created without one.
     if inner.version == 0 && inner.policy.is_none() {
@@ -711,6 +728,7 @@ pub struct SettingsPollResult {
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
     pub provider_env_revision: u64,
+    pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
 }
 
 pub struct ProviderEnvironmentResult {
@@ -755,6 +773,7 @@ impl CachedOpenShellClient {
             settings: inner.settings,
             global_policy_version: inner.global_policy_version,
             provider_env_revision: inner.provider_env_revision,
+            supervisor_middleware_services: inner.supervisor_middleware_services,
         })
     }
 

@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
+use openshell_core::proto::SupervisorMiddlewareService;
 use openshell_core::{GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig, TlsConfig};
 use serde::{Deserialize, Serialize};
 
@@ -151,6 +152,12 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
 
+    // ── Supervisor middleware ─────────────────────────────────────────────
+    /// Statically registered supervisor middleware services. Registration is
+    /// operator-owned and changes require a gateway restart.
+    #[serde(default)]
+    pub middleware: Vec<MiddlewareServiceFileConfig>,
+
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
     // Captured so we can produce a friendly "set this via env/CLI instead"
@@ -158,6 +165,28 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// One `[[openshell.gateway.middleware]]` supervisor middleware registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiddlewareServiceFileConfig {
+    /// Operator-facing name used for diagnostics.
+    pub name: String,
+    /// Plaintext gRPC endpoint reachable by the gateway and supervisors.
+    pub grpc_endpoint: String,
+    /// Operator-owned body limit for every binding exposed by this service.
+    pub max_body_bytes: u64,
+}
+
+impl From<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
+    fn from(config: &MiddlewareServiceFileConfig) -> Self {
+        Self {
+            name: config.name.clone(),
+            grpc_endpoint: config.grpc_endpoint.clone(),
+            max_body_bytes: config.max_body_bytes,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -399,6 +428,26 @@ allow_unauthenticated_users = true
         let file = load(tmp.path()).expect("valid auth config parses");
         let auth = file.openshell.gateway.auth.expect("auth config");
         assert!(auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn parses_supervisor_middleware_registration() {
+        let toml = r#"
+[[openshell.gateway.middleware]]
+name = "local-guard"
+grpc_endpoint = "http://127.0.0.1:50051"
+max_body_bytes = 262144
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid middleware registration parses");
+        assert_eq!(
+            file.openshell.gateway.middleware,
+            vec![MiddlewareServiceFileConfig {
+                name: "local-guard".into(),
+                grpc_endpoint: "http://127.0.0.1:50051".into(),
+                max_body_bytes: 262_144,
+            }]
+        );
     }
 
     #[test]

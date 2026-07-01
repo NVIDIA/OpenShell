@@ -103,6 +103,13 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 grpc_rate_limit_requests       = 120
 grpc_rate_limit_window_seconds = 60
 
+# Operator-run supervisor middleware. The gRPC endpoint must be reachable from
+# both the gateway and sandbox supervisors.
+[[openshell.gateway.middleware]]
+name = "local-content-guard"
+grpc_endpoint = "http://host.openshell.internal:50051"
+max_body_bytes = 262144
+
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
@@ -139,6 +146,27 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. When omitted, it defaults to `0`: the token `exp` claim and `expires_at_ms` response field become `0`, and the sandbox JWT does not expire. Use that default only for local single-player Docker, Podman, or VM gateways. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway uses `0`.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
+
+## Supervisor Middleware Services
+
+Register operator-run supervisor middleware services with one or more `[[openshell.gateway.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
+
+```toml
+[[openshell.gateway.middleware]]
+name = "local-content-guard"
+grpc_endpoint = "http://host.openshell.internal:50051"
+max_body_bytes = 262144
+```
+
+Each service implements the supervisor middleware gRPC contract and may expose multiple binding IDs through `Describe`. Policies reference those binding IDs, not the registration `name`. The gateway rejects duplicate binding IDs across services and prevents operator-run services from claiming the reserved `openshell/` namespace.
+
+The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
+
+`max_body_bytes` is the operator limit for every binding exposed by the service. It must be greater than zero and no larger than each binding's advertised limit. OpenShell rejects an oversized value instead of silently clamping it.
+
+The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
+
+See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, body-limit, and operational guidance.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
 

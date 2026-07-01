@@ -19,6 +19,7 @@ openshell-core = { path = "../openshell-core", default-features = false }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-supervisor-network = { path = "../openshell-supervisor-network" }
+openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 # Async runtime

@@ -1614,6 +1614,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_policy_safety_rejects_invalid_middleware_before_acceptance() {
+        use openshell_core::proto::{MiddlewareEndpointSelector, NetworkMiddlewareConfig};
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_middlewares.push(NetworkMiddlewareConfig {
+            name: "redactor".into(),
+            middleware: "openshell/secrets".into(),
+            on_error: "maybe".into(),
+            endpoints: Some(MiddlewareEndpointSelector {
+                include: vec!["api[.example.com".into()],
+                exclude: Vec::new(),
+            }),
+            ..Default::default()
+        });
+
+        let err = validate_policy_safety(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("invalid on_error"));
+        assert!(err.message().contains("invalid host pattern"));
+    }
+
+    #[test]
     fn validate_no_reserved_provider_policy_keys_rejects_reserved_key() {
         use openshell_core::proto::NetworkPolicyRule;
 

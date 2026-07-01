@@ -12,15 +12,15 @@
 mod compose;
 mod merge;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
-    LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
-    SandboxPolicy,
+    LandlockPolicy, McpOptions, MiddlewareEndpointSelector, NetworkBinary, NetworkEndpoint,
+    NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,8 @@ struct PolicyFile {
     process: Option<ProcessDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    network_middlewares: Vec<NetworkMiddlewareConfigDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,6 +89,28 @@ struct NetworkPolicyRuleDef {
     endpoints: Vec<NetworkEndpointDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     binaries: Vec<NetworkBinaryDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkMiddlewareConfigDef {
+    name: String,
+    middleware: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    config: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    on_error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoints: Option<MiddlewareEndpointSelectorDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MiddlewareEndpointSelectorDef {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exclude: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -672,6 +696,21 @@ fn yaml_mcp_method(
 }
 
 fn to_proto(raw: PolicyFile) -> SandboxPolicy {
+    let network_middlewares = raw
+        .network_middlewares
+        .into_iter()
+        .map(|mw| NetworkMiddlewareConfig {
+            name: mw.name,
+            middleware: mw.middleware,
+            config: Some(json_map_to_struct(mw.config)),
+            on_error: mw.on_error,
+            endpoints: mw.endpoints.map(|selector| MiddlewareEndpointSelector {
+                include: selector.include,
+                exclude: selector.exclude,
+            }),
+        })
+        .collect();
+
     let network_policies = raw
         .network_policies
         .into_iter()
@@ -776,6 +815,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
             run_as_group: p.run_as_group,
         }),
         network_policies,
+        network_middlewares,
     }
 }
 
@@ -908,12 +948,97 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         })
         .collect();
 
+    let network_middlewares = policy
+        .network_middlewares
+        .iter()
+        .map(|mw| NetworkMiddlewareConfigDef {
+            name: mw.name.clone(),
+            middleware: mw.middleware.clone(),
+            config: mw
+                .config
+                .as_ref()
+                .map(struct_to_json_map)
+                .unwrap_or_default(),
+            on_error: mw.on_error.clone(),
+            endpoints: mw
+                .endpoints
+                .as_ref()
+                .map(|selector| MiddlewareEndpointSelectorDef {
+                    include: selector.include.clone(),
+                    exclude: selector.exclude.clone(),
+                }),
+        })
+        .collect();
+
     PolicyFile {
         version: policy.version,
         filesystem_policy,
         landlock,
         process,
         network_policies,
+        network_middlewares,
+    }
+}
+
+fn json_map_to_struct(map: BTreeMap<String, serde_json::Value>) -> prost_types::Struct {
+    prost_types::Struct {
+        fields: map
+            .into_iter()
+            .map(|(key, value)| (key, json_to_protobuf_value(value)))
+            .collect(),
+    }
+}
+
+fn json_to_protobuf_value(value: serde_json::Value) -> prost_types::Value {
+    use prost_types::{ListValue, Struct, Value, value::Kind};
+    Value {
+        kind: Some(match value {
+            serde_json::Value::Null => Kind::NullValue(0),
+            serde_json::Value::Bool(value) => Kind::BoolValue(value),
+            serde_json::Value::Number(value) => {
+                Kind::NumberValue(value.as_f64().unwrap_or_default())
+            }
+            serde_json::Value::String(value) => Kind::StringValue(value),
+            serde_json::Value::Array(values) => Kind::ListValue(ListValue {
+                values: values.into_iter().map(json_to_protobuf_value).collect(),
+            }),
+            serde_json::Value::Object(values) => Kind::StructValue(Struct {
+                fields: values
+                    .into_iter()
+                    .map(|(key, value)| (key, json_to_protobuf_value(value)))
+                    .collect(),
+            }),
+        }),
+    }
+}
+
+fn struct_to_json_map(config: &prost_types::Struct) -> BTreeMap<String, serde_json::Value> {
+    config
+        .fields
+        .iter()
+        .map(|(key, value)| (key.clone(), protobuf_value_to_json(value)))
+        .collect()
+}
+
+fn protobuf_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::NullValue(_)) | None => serde_json::Value::Null,
+        Some(prost_types::value::Kind::BoolValue(value)) => serde_json::Value::Bool(*value),
+        Some(prost_types::value::Kind::NumberValue(value)) => serde_json::Number::from_f64(*value)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Some(prost_types::value::Kind::StringValue(value)) => {
+            serde_json::Value::String(value.clone())
+        }
+        Some(prost_types::value::Kind::ListValue(value)) => {
+            serde_json::Value::Array(value.values.iter().map(protobuf_value_to_json).collect())
+        }
+        Some(prost_types::value::Kind::StructValue(value)) => serde_json::Value::Object(
+            value
+                .fields
+                .iter()
+                .map(|(key, value)| (key.clone(), protobuf_value_to_json(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -1029,6 +1154,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
             run_as_group: "sandbox".into(),
         }),
         network_policies: HashMap::new(),
+        network_middlewares: vec![],
     }
 }
 
@@ -1084,6 +1210,18 @@ pub enum PolicyViolation {
     },
     /// `credential_signing` and `request_body_credential_rewrite` are both set.
     CredentialSigningWithBodyRewrite { policy_name: String, host: String },
+    /// A built-in middleware configuration is invalid.
+    InvalidBuiltinMiddlewareConfig { name: String, reason: String },
+    /// A middleware configuration is structurally invalid.
+    InvalidMiddlewareConfig { name: String, reason: String },
+    /// Middleware configuration names must be unique.
+    DuplicateMiddlewareConfigName { name: String },
+    /// A middleware selector conflicts with an endpoint that skips TLS inspection.
+    MiddlewareTlsSkipConflict {
+        middleware_name: String,
+        policy_name: String,
+        host: String,
+    },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -1145,8 +1283,65 @@ impl fmt::Display for PolicyViolation {
                      and request_body_credential_rewrite set; these options are mutually exclusive"
                 )
             }
+            Self::InvalidBuiltinMiddlewareConfig { name, reason }
+            | Self::InvalidMiddlewareConfig { name, reason } => {
+                write!(f, "middleware config '{name}' is invalid: {reason}")
+            }
+            Self::DuplicateMiddlewareConfigName { name } => {
+                write!(f, "duplicate middleware config '{name}'")
+            }
+            Self::MiddlewareTlsSkipConflict {
+                middleware_name,
+                policy_name,
+                host,
+            } => {
+                write!(
+                    f,
+                    "middleware config '{middleware_name}' selects network policy \
+                     '{policy_name}' tls: skip endpoint '{host}'"
+                )
+            }
         }
     }
+}
+
+/// Match a middleware host selector pattern using the runtime's glob semantics.
+///
+/// Invalid or empty patterns return an error instead of silently becoming a
+/// non-match.
+pub fn middleware_host_matches(pattern: &str, host: &str) -> std::result::Result<bool, String> {
+    if pattern.is_empty() {
+        return Err("host pattern must not be empty".to_string());
+    }
+    if pattern.chars().any(char::is_whitespace) {
+        return Err("host pattern must not contain whitespace".to_string());
+    }
+
+    let pattern = glob::Pattern::new(&pattern.to_ascii_lowercase())
+        .map_err(|error| format!("invalid host pattern: {error}"))?;
+    Ok(pattern.matches(&host.to_ascii_lowercase()))
+}
+
+fn middleware_selector_matches_host(
+    middleware: &NetworkMiddlewareConfig,
+    host: &str,
+) -> std::result::Result<bool, String> {
+    let Some(selector) = &middleware.endpoints else {
+        return Ok(false);
+    };
+    let matches_include = selector
+        .include
+        .iter()
+        .try_fold(false, |matched, pattern| {
+            middleware_host_matches(pattern, host).map(|matches| matched || matches)
+        })?;
+    let matches_exclude = selector
+        .exclude
+        .iter()
+        .try_fold(false, |matched, pattern| {
+            middleware_host_matches(pattern, host).map(|matches| matched || matches)
+        })?;
+    Ok(matches_include && !matches_exclude)
 }
 
 /// Validate that a sandbox policy does not contain unsafe content.
@@ -1163,6 +1358,9 @@ impl fmt::Display for PolicyViolation {
 /// - Individual path lengths must not exceed [`MAX_PATH_LENGTH`]
 /// - Total path count must not exceed [`MAX_FILESYSTEM_PATHS`]
 /// - Network endpoint hosts must not use TLD wildcards (e.g. `*.com`)
+/// - Middleware names, implementations, failure modes, selectors, and built-in
+///   configurations must be valid
+/// - Middleware selectors must not match endpoints that skip TLS inspection
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
@@ -1272,6 +1470,98 @@ pub fn validate_sandbox_policy(
                     policy_name: name.clone(),
                     host: ep.host.clone(),
                 });
+            }
+        }
+    }
+
+    let mut middleware_names = HashSet::new();
+    for middleware in &policy.network_middlewares {
+        if middleware.name.is_empty() {
+            violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                name: middleware.name.clone(),
+                reason: "name must not be empty".to_string(),
+            });
+        } else if !middleware_names.insert(middleware.name.clone()) {
+            violations.push(PolicyViolation::DuplicateMiddlewareConfigName {
+                name: middleware.name.clone(),
+            });
+        }
+
+        if middleware.middleware.is_empty() {
+            violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                name: middleware.name.clone(),
+                reason: "implementation must not be empty".to_string(),
+            });
+        } else if middleware.middleware.starts_with("openshell/")
+            && middleware.middleware != openshell_supervisor_middleware::BUILTIN_SECRETS
+        {
+            violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                name: middleware.name.clone(),
+                reason: format!("unsupported built-in '{}'", middleware.middleware),
+            });
+        }
+
+        if !matches!(
+            middleware.on_error.as_str(),
+            "" | "fail_closed" | "fail_open"
+        ) {
+            violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                name: middleware.name.clone(),
+                reason: format!("invalid on_error '{}'", middleware.on_error),
+            });
+        }
+
+        let Some(selector) = &middleware.endpoints else {
+            violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                name: middleware.name.clone(),
+                reason: "endpoint selector is required".to_string(),
+            });
+            continue;
+        };
+        if selector.include.is_empty() {
+            violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                name: middleware.name.clone(),
+                reason: "endpoint selector must include at least one host pattern".to_string(),
+            });
+        }
+        for pattern in selector.include.iter().chain(&selector.exclude) {
+            if let Err(reason) = middleware_host_matches(pattern, "validation.invalid") {
+                violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                    name: middleware.name.clone(),
+                    reason: format!("endpoint selector pattern '{pattern}' is invalid: {reason}"),
+                });
+            }
+        }
+
+        if middleware.middleware == openshell_supervisor_middleware::BUILTIN_SECRETS {
+            let config = middleware.config.clone().unwrap_or_default();
+            if let Err(error) = openshell_supervisor_middleware::validate_builtin_config(
+                &middleware.middleware,
+                &config,
+            ) {
+                violations.push(PolicyViolation::InvalidBuiltinMiddlewareConfig {
+                    name: middleware.name.clone(),
+                    reason: error.to_string(),
+                });
+            }
+        }
+
+        for (key, rule) in &policy.network_policies {
+            let policy_name = if rule.name.is_empty() {
+                key
+            } else {
+                &rule.name
+            };
+            for endpoint in &rule.endpoints {
+                if endpoint.tls == "skip"
+                    && middleware_selector_matches_host(middleware, &endpoint.host).unwrap_or(false)
+                {
+                    violations.push(PolicyViolation::MiddlewareTlsSkipConflict {
+                        middleware_name: middleware.name.clone(),
+                        policy_name: policy_name.clone(),
+                        host: endpoint.host.clone(),
+                    });
+                }
             }
         }
     }
@@ -1397,6 +1687,70 @@ network_policies:
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
         let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
         assert_eq!(proto2.network_policies["my_api"].name, "my-custom-api-name");
+    }
+
+    #[test]
+    fn round_trip_preserves_network_middlewares() {
+        let yaml = r#"
+version: 1
+network_middlewares:
+  - name: global-redactor
+    middleware: openshell/secrets
+    on_error: fail_open
+    endpoints:
+      include: ["api.example.com", "*.service.test"]
+      exclude: ["internal.example.com"]
+    config:
+      secrets: ["api_key", "authorization"]
+      service:
+        mode: redact
+        max_matches: 2
+  - name: secondary-redactor
+    middleware: openshell/secrets
+    endpoints:
+      include: ["api.example.com"]
+network_policies:
+  api:
+    name: api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        assert_eq!(proto.network_middlewares.len(), 2);
+        assert_eq!(proto.network_middlewares[0].name, "global-redactor");
+        assert_eq!(proto.network_middlewares[0].middleware, "openshell/secrets");
+        assert_eq!(proto.network_middlewares[0].on_error, "fail_open");
+        assert_eq!(
+            proto.network_middlewares[0]
+                .endpoints
+                .as_ref()
+                .expect("selector")
+                .include,
+            vec!["api.example.com", "*.service.test"]
+        );
+        assert_eq!(
+            proto.network_middlewares[0]
+                .endpoints
+                .as_ref()
+                .expect("selector")
+                .exclude,
+            vec!["internal.example.com"]
+        );
+        assert!(
+            proto.network_middlewares[0]
+                .config
+                .as_ref()
+                .expect("config")
+                .fields
+                .contains_key("service")
+        );
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let reparsed = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(reparsed.network_middlewares, proto.network_middlewares);
     }
 
     #[test]
@@ -1530,6 +1884,31 @@ network_policies:
     }
 
     #[test]
+    fn parse_rejects_middleware_attachments_on_network_policies_and_endpoints() {
+        let policy_attachment = r"
+version: 1
+network_policies:
+  api:
+    middleware: [redact]
+    endpoints:
+      - host: api.example.com
+        port: 443
+";
+        assert!(parse_sandbox_policy(policy_attachment).is_err());
+
+        let endpoint_attachment = r"
+version: 1
+network_policies:
+  api:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        middleware: [redact]
+";
+        assert!(parse_sandbox_policy(endpoint_attachment).is_err());
+    }
+
+    #[test]
     fn l7_config_stanza_runtime_fields_use_canonical_schema() {
         let fields = l7_config_alias_runtime_fields(
             L7ConfigStanza::Mcp,
@@ -1602,6 +1981,19 @@ network_policies:
 
     // ---- Policy validation tests ----
 
+    fn middleware_config(name: &str, implementation: &str) -> NetworkMiddlewareConfig {
+        NetworkMiddlewareConfig {
+            name: name.into(),
+            middleware: implementation.into(),
+            config: None,
+            on_error: String::new(),
+            endpoints: Some(MiddlewareEndpointSelector {
+                include: vec!["api.example.com".into()],
+                exclude: Vec::new(),
+            }),
+        }
+    }
+
     #[test]
     fn validate_rejects_root_run_as_user() {
         let mut policy = restrictive_default_policy();
@@ -1628,6 +2020,157 @@ network_policies:
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_builtin_middleware_config() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("redact-secrets", "openshell/secrets");
+        middleware.config = Some(prost_types::Struct {
+            fields: std::iter::once((
+                "secrets".into(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue("allow".into())),
+                },
+            ))
+            .collect(),
+        });
+        policy.network_middlewares.push(middleware);
+
+        let violations = validate_sandbox_policy(&policy).expect_err("invalid config");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidBuiltinMiddlewareConfig { name, .. }
+                if name == "redact-secrets"
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_invalid_middleware_control_fields() {
+        let cases = [
+            (
+                middleware_config("", "openshell/secrets"),
+                "name must not be empty",
+            ),
+            (
+                middleware_config("redactor", ""),
+                "implementation must not be empty",
+            ),
+            (
+                middleware_config("redactor", "openshell/unknown"),
+                "unsupported built-in",
+            ),
+            (
+                {
+                    let mut middleware = middleware_config("redactor", "openshell/secrets");
+                    middleware.on_error = "maybe".into();
+                    middleware
+                },
+                "invalid on_error",
+            ),
+            (
+                {
+                    let mut middleware = middleware_config("redactor", "openshell/secrets");
+                    middleware.endpoints = None;
+                    middleware
+                },
+                "endpoint selector is required",
+            ),
+            (
+                {
+                    let mut middleware = middleware_config("redactor", "openshell/secrets");
+                    middleware.endpoints.as_mut().unwrap().include.clear();
+                    middleware
+                },
+                "must include at least one host pattern",
+            ),
+        ];
+
+        for (middleware, expected) in cases {
+            let mut policy = restrictive_default_policy();
+            policy.network_middlewares.push(middleware);
+            let errors = validate_sandbox_policy(&policy)
+                .expect_err("invalid middleware must be rejected")
+                .into_iter()
+                .map(|violation| violation.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            assert!(
+                errors.contains(expected),
+                "expected {expected:?} in {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_middleware_config_names() {
+        let mut policy = restrictive_default_policy();
+        policy
+            .network_middlewares
+            .push(middleware_config("redactor", "openshell/secrets"));
+        policy
+            .network_middlewares
+            .push(middleware_config("redactor", "openshell/secrets"));
+
+        let violations = validate_sandbox_policy(&policy).expect_err("duplicate name");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::DuplicateMiddlewareConfigName { name } if name == "redactor"
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_malformed_middleware_selector_patterns() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("redactor", "openshell/secrets");
+        middleware.endpoints.as_mut().unwrap().include = vec!["api[.example.com".into()];
+        policy.network_middlewares.push(middleware);
+
+        let errors = validate_sandbox_policy(&policy)
+            .expect_err("malformed selector")
+            .into_iter()
+            .map(|violation| violation.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(errors.contains("invalid host pattern"), "{errors}");
+    }
+
+    #[test]
+    fn middleware_host_selector_matching_is_case_insensitive() {
+        assert!(middleware_host_matches("*.Example.COM", "API.example.com").unwrap());
+        assert!(!middleware_host_matches("*.example.com", "example.com").unwrap());
+        assert!(middleware_host_matches("*", "deep.api.example.com").unwrap());
+    }
+
+    #[test]
+    fn validate_rejects_middleware_selector_matching_tls_skip_endpoint() {
+        let mut policy = restrictive_default_policy();
+        policy
+            .network_middlewares
+            .push(middleware_config("redactor", "openshell/secrets"));
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    tls: "skip".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("tls skip conflict");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MiddlewareTlsSkipConflict {
+                middleware_name,
+                policy_name,
+                host,
+            } if middleware_name == "redactor" && policy_name == "api" && host == "api.example.com"
+        )));
     }
 
     #[test]
@@ -1714,6 +2257,7 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
+            network_middlewares: Vec::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }

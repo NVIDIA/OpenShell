@@ -74,6 +74,7 @@ serde_yml = "0.0.12"
 toml = "0.8"
 apollo-parser = "0.8.5"
 tower-mcp-types = "0.12.0"
+regex = "1"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }

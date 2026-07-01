@@ -1218,8 +1218,26 @@ pub(super) async fn handle_get_sandbox_config(
         }
     }
 
+    if let Some(policy) = policy.as_ref() {
+        state
+            .middleware_registry
+            .ensure_policy_bindings_registered(policy)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "effective policy middleware registration is invalid: {error}"
+                ))
+            })?;
+    }
+
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
-    let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
+    let supervisor_middleware_services =
+        state.middleware_registry.required_services(policy.as_ref());
+    let config_revision = compute_config_revision(
+        policy.as_ref(),
+        &settings,
+        policy_source,
+        &supervisor_middleware_services,
+    );
     let provider_env_revision =
         compute_provider_env_revision(state.store.as_ref(), &sandbox_provider_names).await?;
 
@@ -1232,6 +1250,7 @@ pub(super) async fn handle_get_sandbox_config(
         policy_source: policy_source.into(),
         global_policy_version,
         provider_env_revision,
+        supervisor_middleware_services,
     }))
 }
 
@@ -1510,6 +1529,8 @@ async fn handle_update_config_inner(
             openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             validate_policy_safety(&new_policy)?;
+            crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
+                .await?;
 
             let payload = new_policy.encode_to_vec();
             let hash = deterministic_policy_hash(&new_policy);
@@ -1827,9 +1848,11 @@ async fn handle_update_config_inner(
         validate_no_reserved_provider_policy_keys(&new_policy)?;
     }
 
+    validate_policy_safety(&new_policy)?;
+    crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
+
     if let Some(baseline_policy) = spec.policy.as_ref() {
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
-        validate_policy_safety(&new_policy)?;
     } else {
         // Backfill spec.policy using CAS (first-time policy discovery)
         let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
@@ -3120,6 +3143,7 @@ fn compute_config_revision(
     policy: Option<&ProtoSandboxPolicy>,
     settings: &HashMap<String, EffectiveSetting>,
     policy_source: PolicySource,
+    supervisor_middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
 ) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update((policy_source as i32).to_le_bytes());
@@ -3151,6 +3175,11 @@ fn compute_config_revision(
                 }
             }
         }
+    }
+    let mut middleware = supervisor_middleware_services.iter().collect::<Vec<_>>();
+    middleware.sort_by(|left, right| left.name.cmp(&right.name));
+    for service in middleware {
+        hasher.update(service.encode_to_vec());
     }
 
     let digest = hasher.finalize();
@@ -8773,7 +8802,7 @@ mod tests {
                 allowed_ips: vec!["127.0.0.1".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8794,7 +8823,7 @@ mod tests {
                 allowed_ips: vec!["169.254.169.254".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8812,7 +8841,7 @@ mod tests {
                 port: 80,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8830,7 +8859,7 @@ mod tests {
                 port: 8080,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8848,7 +8877,7 @@ mod tests {
                 port: 80,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -8896,7 +8925,7 @@ mod tests {
                 allowed_ips: vec!["10.0.5.0/24".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());
@@ -8913,7 +8942,7 @@ mod tests {
                 port: 443,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());
@@ -8989,7 +9018,7 @@ mod tests {
             },
         );
 
-        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox);
+        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
         settings.insert(
             "mode".to_string(),
             EffectiveSetting {
@@ -8999,7 +9028,7 @@ mod tests {
                 scope: SettingScope::Sandbox.into(),
             },
         );
-        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox);
+        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
 
         assert_ne!(rev_a, rev_b);
     }
@@ -9264,8 +9293,8 @@ mod tests {
             },
         );
 
-        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox);
-        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox);
+        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
+        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
         assert_eq!(rev_a, rev_b);
     }
 
@@ -9281,8 +9310,8 @@ mod tests {
         };
         let settings = HashMap::new();
 
-        let rev_a = compute_config_revision(Some(&policy_a), &settings, PolicySource::Sandbox);
-        let rev_b = compute_config_revision(Some(&policy_b), &settings, PolicySource::Sandbox);
+        let rev_a = compute_config_revision(Some(&policy_a), &settings, PolicySource::Sandbox, &[]);
+        let rev_b = compute_config_revision(Some(&policy_b), &settings, PolicySource::Sandbox, &[]);
         assert_ne!(rev_a, rev_b);
     }
 
@@ -9291,9 +9320,25 @@ mod tests {
         let policy = ProtoSandboxPolicy::default();
         let settings = HashMap::new();
 
-        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox);
-        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Global);
+        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
+        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Global, &[]);
         assert_ne!(rev_a, rev_b);
+    }
+
+    #[test]
+    fn config_revision_changes_when_supervisor_middleware_services_change() {
+        let policy = ProtoSandboxPolicy::default();
+        let settings = HashMap::new();
+        let service = openshell_core::proto::SupervisorMiddlewareService {
+            name: "local-guard".into(),
+            grpc_endpoint: "http://127.0.0.1:50051".into(),
+            max_body_bytes: 1024,
+        };
+
+        let without = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
+        let with =
+            compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[service]);
+        assert_ne!(without, with);
     }
 
     #[test]
@@ -9309,7 +9354,7 @@ mod tests {
             },
         );
 
-        let rev_a = compute_config_revision(None, &settings, PolicySource::Sandbox);
+        let rev_a = compute_config_revision(None, &settings, PolicySource::Sandbox, &[]);
 
         settings.insert(
             "log_level".to_string(),
@@ -9321,7 +9366,7 @@ mod tests {
             },
         );
 
-        let rev_b = compute_config_revision(None, &settings, PolicySource::Sandbox);
+        let rev_b = compute_config_revision(None, &settings, PolicySource::Sandbox, &[]);
         assert_ne!(rev_a, rev_b);
     }
 

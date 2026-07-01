@@ -11,7 +11,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+glob = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false }
+openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
+prost-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }

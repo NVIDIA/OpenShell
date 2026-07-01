@@ -3767,8 +3767,11 @@ dependencies = [
 name = "openshell-policy"
 version = "0.0.0"
 dependencies = [
+ "glob",
  "miette",
  "openshell-core",
+ "openshell-supervisor-middleware",
+ "prost-types",
  "serde",
  "serde_json",
  "serde_yml",
@@ -3828,6 +3831,7 @@ dependencies = [
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-supervisor-middleware",
  "openshell-supervisor-network",
  "openshell-supervisor-process",
  "rustls",
@@ -3882,6 +3886,7 @@ dependencies = [
  "openshell-providers",
  "openshell-router",
  "openshell-server-macros",
+ "openshell-supervisor-middleware",
  "petname",
  "pin-project-lite",
  "prost",
@@ -3925,6 +3930,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-supervisor-middleware"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "openshell-core",
+ "prost-types",
+ "regex",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+]
+
+[[package]]
 name = "openshell-supervisor-network"
 version = "0.0.0"
 dependencies = [
@@ -3946,6 +3964,8 @@ dependencies = [
  "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
+ "openshell-supervisor-middleware",
+ "prost-types",
  "rcgen",
  "regorus",
  "reqwest 0.12.28",
@@ -3965,6 +3985,7 @@ dependencies = [
  "tokio-tungstenite 0.26.2",
  "tower-mcp-types",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "webpki-roots 1.0.7",
 ]

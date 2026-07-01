@@ -164,6 +164,7 @@ async fn handle_create_sandbox_inner(
         openshell_policy::ensure_sandbox_process_identity(policy);
         validate_no_reserved_provider_policy_keys(policy)?;
         validate_policy_safety(policy)?;
+        crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
 
     let id = uuid::Uuid::new_v4().to_string();

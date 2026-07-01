@@ -20,6 +20,7 @@ filesystem_policy: { ... }
 landlock: { ... }
 process: { ... }
 network_policies: { ... }
+network_middlewares: [ ... ]
 ```
 
 | Field | Type | Required | Category | Description |
@@ -29,6 +30,7 @@ network_policies: { ... }
 | `landlock` | object | No | Static | Configures Landlock LSM enforcement behavior. |
 | `process` | object | No | Static | Sets the user and group the agent process runs as. |
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
+| `network_middlewares` | list | No | Dynamic | Selects ordered HTTP request middleware by destination host. |
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
@@ -472,7 +474,37 @@ Identifies an executable that is permitted to use the associated endpoints.
 |---|---|---|---|
 | `path` | string | Yes | Filesystem path to the executable. Supports glob patterns with `*` and `**`. For example, `/sandbox/.vscode-server/**` matches any executable under that directory tree. |
 
-### Full Example
+## Network Middleware
+
+**Category:** Dynamic
+
+An ordered list of middleware configs selected after network and L7 policy admit an HTTP request. Middleware selection is independent of the network policy entry that admitted the request. Every matching config runs once in list order before provider credential injection.
+
+```yaml showLineNumbers={false}
+network_middlewares:
+  - name: redact-secrets
+    middleware: openshell/secrets
+    config:
+      secrets: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["*.example.com"]
+      exclude: ["trusted.example.com"]
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Policy-local config name. Names must be unique within the list. |
+| `middleware` | string | Yes | Built-in or operator-registered binding ID. `openshell/` is reserved for built-ins. |
+| `config` | object | No | Implementation-owned configuration validated by the selected middleware. |
+| `on_error` | string | No | `fail_closed` denies the request when the stage fails; `fail_open` skips the failed stage. Defaults to `fail_closed`. |
+| `endpoints` | object | Yes | Host selector with required non-empty `include` and optional `exclude` lists. Exclusions take precedence. |
+
+Host selectors use the same case-insensitive exact and DNS glob semantics as network endpoints. Middleware runs only on HTTP requests the supervisor parses. A selector that can require middleware on a `tls: skip` endpoint is rejected because OpenShell cannot inspect that traffic.
+
+See [Supervisor Middleware](/extensibility/supervisor-middleware) for registration, failure behavior, body limits, and operational guidance.
+
+## Full Example
 
 The following policy grants read-only GitHub API access and npm registry access:
 
