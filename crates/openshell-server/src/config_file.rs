@@ -25,7 +25,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
-use openshell_core::{GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig, TlsConfig};
+use openshell_core::{
+    GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig,
+    TlsConfig,
+};
 use serde::{Deserialize, Serialize};
 
 /// Latest schema version this build understands.
@@ -146,6 +149,8 @@ pub struct GatewayFileSection {
     pub oidc: Option<OidcConfig>,
     #[serde(default)]
     pub auth: Option<GatewayAuthConfig>,
+    #[serde(default)]
+    pub interceptors: Vec<GatewayInterceptorConfig>,
     #[serde(default)]
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]

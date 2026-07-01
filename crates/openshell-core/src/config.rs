@@ -352,6 +352,9 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Disabled-by-default gateway interceptor service configs.
+    pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
+
     /// mTLS user authentication configuration. When enabled, a verified TLS
     /// client certificate can authenticate CLI/SDK callers as a
     /// `Principal::User`. This is for local single-user gateways only;
@@ -515,6 +518,81 @@ pub struct GatewayAuthConfig {
     pub allow_unauthenticated_users: bool,
 }
 
+/// One configured gateway interceptor service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayInterceptorConfig {
+    /// Operator-assigned instance name used in logs and config overrides.
+    pub name: String,
+    /// Interceptor gRPC endpoint. Supports `http://`, `https://`, and
+    /// `unix://` endpoints.
+    pub grpc_endpoint: String,
+    /// Deterministic service ordering. Lower values run first.
+    #[serde(default)]
+    pub order: i32,
+    /// Default failure policy for this configured service.
+    #[serde(default)]
+    pub failure_policy: Option<GatewayInterceptorFailurePolicy>,
+    /// RFC-style timeout string such as `500ms` or `2s`.
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// Maximum accepted encoded `Evaluate` response size.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+    /// Maximum JSON patches accepted from one evaluation result.
+    #[serde(default)]
+    pub max_patches: Option<usize>,
+    /// Optional binding overrides. Overrides may disable bindings or narrow
+    /// phases/selectors declared by the interceptor service.
+    #[serde(default)]
+    pub bindings: Vec<GatewayInterceptorBindingOverride>,
+}
+
+/// Failure behavior when an interceptor evaluation cannot produce a valid
+/// result.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorFailurePolicy {
+    FailClosed,
+    FailOpen,
+}
+
+/// Configured override for a manifest binding.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayInterceptorBindingOverride {
+    /// Binding id from the interceptor manifest.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Full selector form: `openshell.v1.OpenShell/CreateSandbox`.
+    #[serde(default)]
+    pub rpc: Option<String>,
+    /// Structured selector service, e.g. `openshell.v1.OpenShell`.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Structured selector method, e.g. `CreateSandbox`.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Narrowed phase set.
+    #[serde(default)]
+    pub phases: Option<Vec<GatewayInterceptorPhaseConfig>>,
+    /// Disable the selected binding.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Binding-specific failure policy override.
+    #[serde(default)]
+    pub failure_policy: Option<GatewayInterceptorFailurePolicy>,
+}
+
+/// Config file phase names.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorPhaseConfig {
+    ModifyOperation,
+    Validate,
+    PostCommit,
+}
+
 const fn default_jwks_ttl_secs() -> u64 {
     3600
 }
@@ -575,6 +653,7 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            gateway_interceptors: Vec::new(),
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
@@ -662,6 +741,16 @@ impl Config {
     ) -> Self {
         self.grpc_rate_limit_requests = requests;
         self.grpc_rate_limit_window_secs = window_secs;
+        self
+    }
+
+    /// Set configured gateway interceptors.
+    #[must_use]
+    pub fn with_gateway_interceptors<I>(mut self, interceptors: I) -> Self
+    where
+        I: IntoIterator<Item = GatewayInterceptorConfig>,
+    {
+        self.gateway_interceptors = interceptors.into_iter().collect();
         self
     }
 
@@ -789,9 +878,9 @@ mod tests {
     #[cfg(unix)]
     use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket, normalize_compute_driver_name,
-        podman_socket_candidates_from_env, podman_socket_responds,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorFailurePolicy,
+        GatewayJwtConfig, detect_driver, docker_host_unix_socket_path, is_unix_socket,
+        normalize_compute_driver_name, podman_socket_candidates_from_env, podman_socket_responds,
     };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
@@ -867,6 +956,15 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, 0);
+    }
+
+    #[test]
+    fn gateway_interceptor_failure_policy_rejects_ignore() {
+        let err =
+            serde_json::from_value::<GatewayInterceptorFailurePolicy>(serde_json::json!("ignore"))
+                .unwrap_err();
+
+        assert!(err.to_string().contains("unknown variant `ignore`"));
     }
 
     #[test]

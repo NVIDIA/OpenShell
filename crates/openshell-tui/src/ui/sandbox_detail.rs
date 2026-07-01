@@ -84,29 +84,40 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(labels_str, t.text),
     ]);
 
-    // Row 4: Providers
+    // Row 4: Annotations
+    let annotations_str = app
+        .sandbox_annotations
+        .get(idx)
+        .filter(|s| !s.is_empty())
+        .map_or("none", String::as_str);
+    let row4 = Line::from(vec![
+        Span::styled("  Annotations: ", t.muted),
+        Span::styled(annotations_str, t.text),
+    ]);
+
+    // Row 5: Providers
     let providers_str = if app.sandbox_providers_list.is_empty() {
         "none".to_string()
     } else {
         app.sandbox_providers_list.join(", ")
     };
-    let row4 = Line::from(vec![
+    let row5 = Line::from(vec![
         Span::styled("  Providers: ", t.muted),
         Span::styled(providers_str, t.text),
     ]);
 
-    // Row 5: Forwarded Ports
+    // Row 6: Forwarded Ports
     let forwards_str = app
         .sandbox_notes
         .get(idx)
         .filter(|s| !s.is_empty())
         .map_or("none", String::as_str);
-    let row5 = Line::from(vec![
+    let row6 = Line::from(vec![
         Span::styled("  Forwards: ", t.muted),
         Span::styled(forwards_str, t.text),
     ]);
 
-    let mut lines = vec![Line::from(""), row1, row2, row3, row4, row5];
+    let mut lines = vec![row1, row2, row3, row4, row5, row6];
 
     // Show global policy indicator when the sandbox's policy is managed at
     // gateway scope.

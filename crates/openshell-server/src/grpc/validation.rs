@@ -15,10 +15,10 @@ use prost::Message;
 use tonic::Status;
 
 use super::{
-    MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_NAME_LEN,
-    MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES, MAX_PROVIDER_CREDENTIALS_ENTRIES,
-    MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS, MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN,
-    MAX_TEMPLATE_STRUCT_SIZE,
+    MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
+    MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
+    MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
+    MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -253,6 +253,28 @@ pub(super) fn validate_string_map(
                 value.len()
             )));
         }
+    }
+    Ok(())
+}
+
+/// Validate object annotations.
+///
+/// Annotation keys use the same qualified-key shape as labels. Annotation
+/// values are opaque metadata and use the normal string-map size limits rather
+/// than Kubernetes label value limits.
+pub(super) fn validate_annotations(
+    annotations: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    validate_string_map(
+        annotations,
+        MAX_METADATA_ANNOTATIONS_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        field_name,
+    )?;
+    for key in annotations.keys() {
+        validate_label_key(key)?;
     }
     Ok(())
 }
@@ -615,6 +637,11 @@ pub(super) fn validate_object_metadata(
         validate_label_key(key)?;
         validate_label_value(value)?;
     }
+
+    validate_annotations(
+        &metadata.annotations,
+        &format!("{resource_type}.metadata.annotations"),
+    )?;
 
     Ok(())
 }
@@ -1147,6 +1174,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
             credentials,

@@ -133,6 +133,7 @@ async fn handle_create_sandbox_inner(
         crate::grpc::validation::validate_label_key(key)?;
         crate::grpc::validation::validate_label_value(value)?;
     }
+    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
 
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
@@ -182,6 +183,7 @@ async fn handle_create_sandbox_inner(
             created_at_ms: now_ms,
             labels: request.labels.clone(),
             resource_version: 0,
+            annotations: request.annotations.clone(),
         }),
         spec: Some(spec),
         status: None,
@@ -1361,6 +1363,7 @@ pub(super) async fn handle_create_ssh_session(
             created_at_ms: now_ms,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
         }),
         sandbox_id: req.sandbox_id.clone(),
         token: token.clone(),
@@ -2253,6 +2256,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once((credential_key.to_string(), "secret".to_string()))
@@ -2270,6 +2274,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::iter::once(("team".to_string(), "agents".to_string())).collect(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(openshell_core::proto::SandboxSpec {
                 log_level: "debug".to_string(),
@@ -2640,6 +2645,7 @@ mod tests {
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
+                annotations: HashMap::new(),
             }),
         )
         .await
@@ -2672,6 +2678,7 @@ mod tests {
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
+                annotations: HashMap::new(),
             }),
         )
         .await
@@ -2680,6 +2687,73 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("_provider_work_github"));
         assert!(err.message().contains("reserved '_provider_' prefix"));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_persists_long_metadata_annotations() {
+        let state = test_server_state().await;
+        let annotation_key = "openshell.nvidia.com/policy-signature".to_string();
+        let annotation_value = "x".repeat(512);
+
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "annotated".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
+                labels: HashMap::new(),
+                annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
+            }),
+        )
+        .await
+        .expect("long annotations should be accepted")
+        .into_inner();
+
+        let created = response.sandbox.expect("created sandbox");
+        assert_eq!(
+            created
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.annotations.get(&annotation_key)),
+            Some(&annotation_value)
+        );
+
+        let fetched = handle_get_sandbox(
+            &state,
+            Request::new(GetSandboxRequest {
+                name: "annotated".to_string(),
+            }),
+        )
+        .await
+        .expect("created sandbox should be fetchable")
+        .into_inner()
+        .sandbox
+        .expect("fetched sandbox");
+        assert_eq!(
+            fetched
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.annotations.get(&annotation_key)),
+            Some(&annotation_value)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_still_rejects_long_label_values() {
+        let state = test_server_state().await;
+        let err = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "bad-label".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
+                labels: HashMap::from([("team".to_string(), "x".repeat(512))]),
+                annotations: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("label value exceeds"));
     }
 
     #[tokio::test]
@@ -2703,6 +2777,7 @@ mod tests {
                         ..Default::default()
                     }),
                     labels: HashMap::new(),
+                    annotations: HashMap::new(),
                 }),
             )
             .await

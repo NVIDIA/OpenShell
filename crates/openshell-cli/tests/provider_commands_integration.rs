@@ -127,6 +127,7 @@ impl OpenShell for TestOpenShell {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 1,
+                    annotations: HashMap::new(),
                 }),
                 spec: None,
                 status: None,
@@ -341,21 +342,23 @@ impl OpenShell for TestOpenShell {
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
         if provider.credentials.is_empty() {
-            let bootstrap_allowed =
-                if let Some(profile) = openshell_providers::get_default_profile(&provider.r#type) {
-                    profile.allows_empty_provider_credentials()
-                } else {
-                    self.state
-                        .profiles
-                        .lock()
-                        .await
-                        .get(&provider.r#type)
-                        .cloned()
-                        .is_some_and(|profile| {
-                            openshell_providers::ProviderTypeProfile::from_proto(&profile)
-                                .allows_empty_provider_credentials()
-                        })
-                };
+            let bootstrap_allowed = if let Some(profile) = openshell_providers::builtin_profiles()
+                .iter()
+                .find(|profile| profile.id == provider.r#type)
+            {
+                profile.allows_empty_provider_credentials()
+            } else {
+                self.state
+                    .profiles
+                    .lock()
+                    .await
+                    .get(&provider.r#type)
+                    .cloned()
+                    .is_some_and(|profile| {
+                        openshell_providers::ProviderTypeProfile::from_proto(&profile)
+                            .allows_empty_provider_credentials()
+                    })
+            };
             if !bootstrap_allowed {
                 return Err(Status::invalid_argument(
                     "provider.credentials must not be empty",
@@ -412,7 +415,7 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
     ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        let mut profiles = openshell_providers::default_profiles()
+        let mut profiles = openshell_providers::builtin_profiles()
             .iter()
             .map(openshell_providers::ProviderTypeProfile::to_proto)
             .collect::<Vec<_>>();
@@ -427,7 +430,10 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
     ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
         let id = request.into_inner().id;
-        let profile = if let Some(profile) = openshell_providers::get_default_profile(&id) {
+        let profile = if let Some(profile) = openshell_providers::builtin_profiles()
+            .iter()
+            .find(|profile| profile.id == id)
+        {
             profile.to_proto()
         } else {
             self.state
@@ -602,6 +608,7 @@ impl OpenShell for TestOpenShell {
                 created_at_ms: existing_metadata.created_at_ms,
                 labels: existing_metadata.labels,
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),

@@ -3752,6 +3752,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-gateway-interceptors"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "hyper-util",
+ "json-patch",
+ "metrics",
+ "openshell-core",
+ "prost",
+ "prost-types",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
@@ -3876,6 +3897,7 @@ dependencies = [
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
  "openshell-driver-podman",
+ "openshell-gateway-interceptors",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-prover",

@@ -79,6 +79,7 @@ impl OpenShell for TestOpenShell {
                     created_at_ms: 0,
                     labels: std::collections::HashMap::new(),
                     resource_version: 0,
+                    annotations: std::collections::HashMap::new(),
                 }),
                 ..Default::default()
             }),

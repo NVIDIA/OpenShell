@@ -200,6 +200,7 @@ pub fn new_refresh_state(
             created_at_ms: now_ms,
             labels: HashMap::new(),
             resource_version: 0,
+            annotations: HashMap::new(),
         }),
         provider_id,
         provider_name,
@@ -924,6 +925,7 @@ mod tests {
                     created_at_ms: 1,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
@@ -1172,6 +1174,7 @@ mod tests {
                 created_at_ms: 1,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
             credentials: HashMap::new(),

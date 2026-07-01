@@ -211,6 +211,7 @@ async fn upsert_cluster_inference_route(
             created_at_ms: now_ms,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
         });
         (new_id, new_metadata, 1, WriteCondition::MustCreate)
     };
@@ -1030,6 +1031,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             config: Some(ClusterInferenceConfig {
                 provider_name: provider_name.to_string(),
@@ -1048,6 +1050,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once((key_name.to_string(), key_value.to_string())).collect(),
@@ -1145,6 +1148,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: "aws-bedrock".to_string(),
             // Placeholder credential — the router ignores it because
@@ -1221,6 +1225,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: "aws-bedrock".to_string(),
             credentials: std::iter::once((
@@ -1269,6 +1274,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: "aws-bedrock".to_string(),
             credentials: std::collections::HashMap::new(),
@@ -1494,6 +1500,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: "openai".to_string(),
             credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
@@ -1517,6 +1524,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             config: Some(ClusterInferenceConfig {
                 provider_name: "openai-dev".to_string(),
@@ -1628,6 +1636,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: "google-vertex-ai".to_string(),
             credentials: std::iter::once((
@@ -1965,6 +1974,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 1,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: "google-vertex-ai".to_string(),
             credentials: std::iter::once((

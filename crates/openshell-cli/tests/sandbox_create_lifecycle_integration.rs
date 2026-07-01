@@ -87,6 +87,7 @@ impl OpenShell for TestOpenShell {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             ..Sandbox::default()
         };
@@ -108,6 +109,7 @@ impl OpenShell for TestOpenShell {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             ..Sandbox::default()
         };
@@ -368,6 +370,7 @@ impl OpenShell for TestOpenShell {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 ..Sandbox::default()
             };

@@ -1928,6 +1928,7 @@ pub async fn sandbox_create(
         }),
         name: name.unwrap_or_default().to_string(),
         labels,
+        annotations: HashMap::new(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -1970,13 +1971,9 @@ pub async fn sandbox_create(
         match client
             .update_config(UpdateConfigRequest {
                 name: sandbox_name.clone(),
-                policy: None,
                 setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
                 setting_value: Some(setting),
-                delete_setting: false,
-                global: false,
-                merge_operations: vec![],
-                expected_resource_version: 0,
+                ..Default::default()
             })
             .await
         {
@@ -2679,6 +2676,17 @@ pub async fn sandbox_get(
         let mut labels: Vec<_> = metadata.labels.iter().collect();
         labels.sort_by_key(|(k, _)| *k);
         for (key, value) in labels {
+            println!("    {key}: {value}");
+        }
+    }
+
+    if let Some(metadata) = &sandbox.metadata
+        && !metadata.annotations.is_empty()
+    {
+        println!("  {} ", "Annotations:".dimmed());
+        let mut annotations: Vec<_> = metadata.annotations.iter().collect();
+        annotations.sort_by_key(|(k, _)| *k);
+        for (key, value) in annotations {
             println!("    {key}: {value}");
         }
     }
@@ -3427,10 +3435,15 @@ pub async fn sandbox_list(
 fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
     let meta = sandbox.metadata.as_ref();
     let labels = meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.labels));
+    let annotations = meta.map_or_else(
+        || serde_json::json!({}),
+        |m| serde_json::json!(m.annotations),
+    );
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "labels": labels,
+        "annotations": annotations,
         "resource_version": meta.map_or(0, |m| m.resource_version),
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase()),
@@ -3883,6 +3896,7 @@ async fn auto_create_provider(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
@@ -3925,6 +3939,7 @@ async fn auto_create_provider(
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                     }),
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
@@ -4670,13 +4685,14 @@ pub async fn provider_create_with_options(
     };
 
     let adc_credential_key = if from_gcloud_adc {
-        let profile =
-            openshell_providers::get_default_profile(&provider_type).ok_or_else(|| {
+        let profile = fetch_provider_profile(&mut client, &provider_type)
+            .await
+            .map_err(|err| {
                 miette::miette!(
-                    "--from-gcloud-adc requires a built-in provider profile, \
-                 but '{provider_type}' has none"
+                    "--from-gcloud-adc is not supported for '{provider_type}' providers ({err})"
                 )
             })?;
+        let profile = ProviderTypeProfile::from_proto(&profile);
         let adc_cred = profile.adc_credential().ok_or_else(|| {
             miette::miette!(
                 "--from-gcloud-adc is not supported for '{provider_type}' providers \
@@ -4764,6 +4780,7 @@ pub async fn provider_create_with_options(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.clone(),
                 credentials: credential_map,
@@ -5695,6 +5712,7 @@ pub async fn provider_update(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: credential_map,
@@ -6306,12 +6324,8 @@ pub async fn sandbox_policy_set_global(
         .update_config(UpdateConfigRequest {
             name: String::new(),
             policy: Some(policy),
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6504,13 +6518,10 @@ pub async fn gateway_setting_set(
     let response = client
         .update_config(UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
-            delete_setting: false,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6539,13 +6550,9 @@ pub async fn sandbox_setting_set(
     let response = client
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
-            policy: None,
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6574,13 +6581,10 @@ pub async fn gateway_setting_delete(
     let response = client
         .update_config(UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key.to_string(),
-            setting_value: None,
             delete_setting: true,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6609,13 +6613,9 @@ pub async fn sandbox_setting_delete(
     let response = client
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
-            policy: None,
             setting_key: key.to_string(),
-            setting_value: None,
             delete_setting: true,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6669,12 +6669,7 @@ pub async fn sandbox_policy_set(
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
             policy: Some(policy),
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?;
@@ -6843,13 +6838,8 @@ pub async fn sandbox_policy_update(
     let response = client
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
-            policy: None,
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
-            global: false,
             merge_operations: plan.merge_operations,
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -9600,6 +9590,7 @@ mod tests {
             resource_version: 42,
             created_at_ms: 1_234_567_890_000,
             labels,
+            annotations: std::collections::HashMap::new(),
         };
 
         let provider = Provider {

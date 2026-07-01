@@ -41,6 +41,24 @@ Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
 
+Gateway interceptors run in one middleware layer on the `openshell.v1.OpenShell`
+gRPC service after authentication and before tonic dispatches to individual
+handlers. At startup the gateway calls each configured interceptor's `Describe`
+RPC, validates declared bindings against the compiled OpenShell descriptor set,
+and builds an immutable execution plan. Unary OpenShell requests that are not
+streaming, supervisor-facing, read-only, or introspection methods are decoded
+through the descriptor set into protobuf JSON, evaluated through configured
+phases, and re-encoded before the handler sees the request. This keeps
+interception centralized: adding an interceptable unary RPC does not require
+method-specific gateway instrumentation.
+
+Interceptor manifests can also vend provider profile catalogs. The gateway
+always starts with the in-tree built-in catalog source, then merges any
+interceptor-declared sources. An authoritative interceptor catalog becomes the
+visible provider profile source of truth for that gateway and hides built-in
+and user-imported profiles from profile resolution, while append catalogs add
+static profiles alongside the built-in/user catalog.
+
 Supported auth modes:
 
 | Mode | Use |
@@ -220,7 +238,7 @@ modes:
   write. Client-facing operations that carry an `expected_resource_version`
   field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
   `UpdateProvider`, `UpdateProviderProfiles`, and `UpdateConfig` (policy
-  backfill path).
+  backfill and sandbox annotation updates).
 
 **Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
 protobuf payloads from list results and hydrate `resource_version` from the

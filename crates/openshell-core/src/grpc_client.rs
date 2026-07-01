@@ -607,12 +607,7 @@ async fn sync_policy_with_client(
         .update_config(UpdateConfigRequest {
             name: sandbox.to_string(),
             policy: Some(policy.clone()),
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()

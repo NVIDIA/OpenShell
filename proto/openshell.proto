@@ -447,6 +447,8 @@ message CreateSandboxRequest {
   string name = 2;
   // Optional labels for the sandbox (key-value metadata).
   map<string, string> labels = 3;
+  // Optional annotations for the sandbox (non-selector metadata).
+  map<string, string> annotations = 4;
 }
 
 // Get sandbox request.
@@ -1096,6 +1098,8 @@ message ProviderProfile {
   // profile files use 0. Gateway responses set this for stored custom profiles.
   // Update calls use this for optimistic concurrency.
   uint64 resource_version = 10;
+  // Optional non-secret annotations attached by profile sources or importers.
+  map<string, string> annotations = 11;
 }
 
 // Stored custom provider profile object.
@@ -1226,6 +1230,9 @@ message UpdateConfigRequest {
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   // Ignored for global-scoped updates.
   uint64 expected_resource_version = 8;
+  // Optional annotations to merge into sandbox metadata after a successful
+  // sandbox-scoped update. Intended for non-secret provenance metadata.
+  map<string, string> annotations = 9;
 }
 
 message PolicyMergeOperation {
@@ -1281,6 +1288,8 @@ message UpdateConfigResponse {
   uint64 settings_revision = 3;
   // True when a setting delete operation removed an existing key.
   bool deleted = 4;
+  // Sandbox metadata annotations after the update. Empty for global updates.
+  map<string, string> annotations = 5;
 }
 
 // Get sandbox policy status request.

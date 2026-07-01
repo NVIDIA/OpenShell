@@ -87,6 +87,7 @@ pub(super) async fn handle_expose_service(
             created_at_ms,
             labels: HashMap::from([("sandbox".to_string(), req.sandbox.clone())]),
             resource_version: 0,
+            annotations: HashMap::new(),
         }),
         sandbox_id: sandbox.object_id().to_string(),
         sandbox_name: req.sandbox.clone(),
@@ -286,6 +287,7 @@ mod tests {
                 created_at_ms: 1_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(openshell_core::proto::SandboxSpec::default()),
             ..Default::default()
