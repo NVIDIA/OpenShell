@@ -11,6 +11,7 @@ use openshell_core::proto::{
     ProviderCredentialRefreshMaterial, ProviderCredentialRefreshStrategy, ProviderProfile,
     ProviderProfileCategory, ProviderProfileCredential, ProviderProfileDiscovery,
 };
+use openshell_core::secrets::uses_reserved_revision_namespace;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
@@ -1166,6 +1167,15 @@ pub fn validate_profile_set(
                         profile_id,
                         "credentials.env_vars",
                         "credential env var must not be empty",
+                    ));
+                } else if uses_reserved_revision_namespace(env_var.trim()) {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.env_vars",
+                        format!(
+                            "credential env var '{env_var}' uses reserved OpenShell placeholder revision namespace"
+                        ),
                     ));
                 } else if !env_vars.insert(env_var.trim().to_string()) {
                     diagnostics.push(ProfileValidationDiagnostic::error(
@@ -2526,7 +2536,7 @@ credentials:
     env_vars: [BROKEN_TOKEN]
     auth_style: query
   - name: api_key
-    env_vars: [BROKEN_TOKEN, ""]
+    env_vars: [BROKEN_TOKEN, "", v10_GITHUB_TOKEN]
     auth_style: unknown
   - name: path_key
     env_vars: [PATH_TOKEN]
@@ -2554,6 +2564,11 @@ binaries: ["", /usr/bin/broken]
         assert!(messages.contains(&"duplicate credential name: api_key"));
         assert!(messages.contains(&"duplicate credential env var 'BROKEN_TOKEN'"));
         assert!(messages.contains(&"credential env var must not be empty"));
+        assert!(
+            messages.iter().any(
+                |message| message.contains("reserved OpenShell placeholder revision namespace")
+            )
+        );
         assert!(messages.contains(&"query_param is required for query auth"));
         assert!(messages.contains(&"path_template is required for path auth"));
         assert!(messages.iter().any(|message| {

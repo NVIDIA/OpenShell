@@ -206,14 +206,6 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
             )));
         }
     }
-    if let Some(ref s) = tmpl.volume_claim_templates {
-        let size = s.encoded_len();
-        if size > MAX_TEMPLATE_STRUCT_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "template.volume_claim_templates serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
-            )));
-        }
-    }
     if let Some(ref s) = tmpl.driver_config {
         let size = s.encoded_len();
         if size > MAX_TEMPLATE_STRUCT_SIZE {

@@ -52,6 +52,34 @@ impl FromStr for SupervisorSideloadMethod {
     }
 }
 
+/// How the supervisor is arranged inside Kubernetes sandbox pods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupervisorTopology {
+    /// Run networking and process supervision in the agent container.
+    #[default]
+    Combined,
+}
+
+impl std::fmt::Display for SupervisorTopology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Combined => f.write_str("combined"),
+        }
+    }
+}
+
+impl FromStr for SupervisorTopology {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "combined" => Ok(Self::Combined),
+            other => Err(format!("unknown supervisor topology '{other}'")),
+        }
+    }
+}
+
 /// Kubernetes `AppArmor` profile requested for the sandbox agent container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppArmorProfile {
@@ -176,6 +204,8 @@ pub struct KubernetesComputeConfig {
     pub supervisor_image_pull_policy: String,
     /// How the supervisor binary is delivered into sandbox pods.
     pub supervisor_sideload_method: SupervisorSideloadMethod,
+    /// How the supervisor is arranged for Kubernetes sandbox pods.
+    pub supervisor_topology: SupervisorTopology,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -236,6 +266,7 @@ impl Default for KubernetesComputeConfig {
             supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            supervisor_topology: SupervisorTopology::default(),
             grpc_endpoint: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             client_tls_secret_name: String::new(),
@@ -331,6 +362,31 @@ mod tests {
             cfg.service_account_name,
             DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME
         );
+    }
+
+    #[test]
+    fn default_supervisor_topology_is_combined() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.supervisor_topology, SupervisorTopology::Combined);
+        assert_eq!(cfg.supervisor_topology.to_string(), "combined");
+    }
+
+    #[test]
+    fn serde_override_supervisor_topology_combined() {
+        let json = serde_json::json!({
+            "supervisor_topology": "combined"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.supervisor_topology, SupervisorTopology::Combined);
+    }
+
+    #[test]
+    fn serde_rejects_invalid_supervisor_topology() {
+        let json = serde_json::json!({
+            "supervisor_topology": "unsupported"
+        });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
     }
 
     #[test]

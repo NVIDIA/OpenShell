@@ -55,7 +55,12 @@ spec:
   renewBefore: {{ .Values.certManager.certificateRenewBefore | quote }}
   commonName: openshell-server
   dnsNames:
-    {{- toYaml .Values.certManager.serverDnsNames | nindent 4 }}
+    {{- range (include "openshell.defaultServerDnsNames" . | fromYamlArray) }}
+    - {{ . | quote }}
+    {{- end }}
+    {{- range .Values.certManager.serverDnsNames }}
+    - {{ . | quote }}
+    {{- end }}
   {{- if .Values.certManager.serverIpAddresses }}
   ipAddresses:
     {{- toYaml .Values.certManager.serverIpAddresses | nindent 4 }}

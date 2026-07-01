@@ -34,6 +34,7 @@ use openshell_core::proto::compute::v1::{
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -137,7 +138,7 @@ impl KubernetesSandboxDriverConfig {
             .agent
             .volume_mounts
             .iter()
-            .any(|mount| driver_mounts::path_is_or_under(&mount.mount_path, WORKSPACE_MOUNT_PATH))
+            .any(|mount| path_is_or_under(&mount.mount_path, WORKSPACE_MOUNT_PATH))
     }
 }
 
@@ -225,8 +226,7 @@ const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
     WORKSPACE_VOLUME_NAME,
 ];
 
-const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] =
-    &[SERVICE_ACCOUNT_TOKEN_MOUNT_PATH, "/spiffe-workload-api"];
+const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[SERVICE_ACCOUNT_TOKEN_MOUNT_PATH];
 
 fn validate_kubernetes_driver_volumes(
     volumes: &[KubernetesDriverVolumeConfig],
@@ -265,7 +265,7 @@ fn validate_kubernetes_driver_volume_mounts(
         );
     }
 
-    let mut mount_paths = Vec::with_capacity(volume_mounts.len());
+    let mut mount_paths = HashSet::new();
     for mount in volume_mounts {
         validate_kubernetes_dns1123_label(&mount.name, "containers.agent.volume_mounts[].name")?;
         let volume_name = mount.name.as_str();
@@ -280,34 +280,16 @@ fn validate_kubernetes_driver_volume_mounts(
             ));
         }
 
-        validate_kubernetes_mount_path(&mount.mount_path)?;
-        mount_paths.push(mount.mount_path.as_str());
+        driver_mounts::validate_container_mount_target(&mount.mount_path)?;
+        let normalized_mount_path = driver_mounts::normalize_mount_target(&mount.mount_path);
+        if !mount_paths.insert(normalized_mount_path.clone()) {
+            return Err(format!(
+                "duplicate kubernetes driver_config mount target '{normalized_mount_path}'"
+            ));
+        }
 
         if let Some(sub_path) = mount.sub_path.as_ref() {
-            validate_kubernetes_mount_subpath(sub_path)?;
-        }
-    }
-    driver_mounts::validate_unique_mount_targets(mount_paths, "kubernetes")
-}
-
-fn validate_kubernetes_driver_runtime_mounts(
-    config: &KubernetesSandboxDriverConfig,
-    provider_spiffe_workload_api_socket_path: Option<&str>,
-) -> Result<(), String> {
-    let Some(socket_path) = provider_spiffe_workload_api_socket_path else {
-        return Ok(());
-    };
-    // The SPIFFE Workload API mount path is derived from gateway runtime
-    // configuration, not from the sandbox template. Static protected paths are
-    // checked during `from_template`; this dynamic conflict can only be checked
-    // once the driver runtime config is available.
-    let spiffe_mount_path = spiffe_socket_mount_path(socket_path);
-    for mount in &config.containers.agent.volume_mounts {
-        let mount_path = mount.mount_path.as_str();
-        if mount_path_conflicts_with_protected_path(mount_path, &spiffe_mount_path) {
-            return Err(format!(
-                "mount path '{mount_path}' conflicts with reserved OpenShell path '{spiffe_mount_path}'"
-            ));
+            driver_mounts::validate_mount_subpath(sub_path)?;
         }
     }
     Ok(())
@@ -360,50 +342,31 @@ fn validate_kubernetes_dns1123_subdomain(value: &str, field: &str) -> Result<(),
     Ok(())
 }
 
-fn validate_kubernetes_mount_path(mount_path: &str) -> Result<(), String> {
-    if mount_path != mount_path.trim() {
-        return Err("mount_path must not contain leading or trailing whitespace".to_string());
-    }
-    if mount_path != "/"
-        && mount_path
-            .split('/')
-            .skip(1)
-            .any(|segment| segment.is_empty() || segment == ".")
-    {
-        return Err(
-            "mount_path must be normalized and must not contain empty path segments or '.'"
-                .to_string(),
-        );
-    }
+fn mount_path_conflicts_with_protected_path(mount_path: &str, protected_path: &str) -> bool {
+    path_is_or_under(mount_path, protected_path) || path_is_or_under(protected_path, mount_path)
+}
 
-    let validated = driver_mounts::validate_container_mount_target(mount_path)?;
-    if validated != mount_path {
-        return Err("mount_path must be normalized".to_string());
-    }
-    for protected_path in KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS {
-        if mount_path_conflicts_with_protected_path(mount_path, protected_path) {
-            return Err(format!(
-                "mount path '{mount_path}' conflicts with reserved OpenShell path '{protected_path}'"
-            ));
+fn path_is_or_under(path: &str, parent: &str) -> bool {
+    let path = Path::new(path);
+    let parent = Path::new(parent);
+    path == parent || path.starts_with(parent)
+}
+
+fn validate_kubernetes_protected_path_conflicts(
+    volume_mounts: &[KubernetesDriverVolumeMountConfig],
+    protected_paths: &[&str],
+) -> Result<(), String> {
+    for mount in volume_mounts {
+        let mount_path = mount.mount_path.as_str();
+        for protected_path in protected_paths {
+            if mount_path_conflicts_with_protected_path(mount_path, protected_path) {
+                return Err(format!(
+                    "mount path '{mount_path}' conflicts with reserved OpenShell path '{protected_path}'"
+                ));
+            }
         }
     }
     Ok(())
-}
-
-fn validate_kubernetes_mount_subpath(sub_path: &str) -> Result<(), String> {
-    if sub_path != sub_path.trim() {
-        return Err("mount subpath must not contain leading or trailing whitespace".to_string());
-    }
-    let validated = driver_mounts::validate_mount_subpath(sub_path)?;
-    if validated != sub_path {
-        return Err("mount subpath must be normalized".to_string());
-    }
-    Ok(())
-}
-
-fn mount_path_conflicts_with_protected_path(mount_path: &str, protected_path: &str) -> bool {
-    driver_mounts::path_is_or_under(mount_path, protected_path)
-        || driver_mounts::path_is_or_under(protected_path, mount_path)
 }
 
 fn kubernetes_driver_volume_to_k8s(volume: &KubernetesDriverVolumeConfig) -> serde_json::Value {
@@ -1582,7 +1545,16 @@ fn kubernetes_driver_config_for_spec(
         .map(KubernetesSandboxDriverConfig::from_template)
         .transpose()?
         .unwrap_or_default();
-    validate_kubernetes_driver_runtime_mounts(&config, provider_spiffe_workload_api_socket_path)?;
+    let mut protected_paths = KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS.to_vec();
+    let provider_spiffe_mount_path;
+    if let Some(socket_path) = provider_spiffe_workload_api_socket_path {
+        provider_spiffe_mount_path = spiffe_socket_mount_path(socket_path);
+        protected_paths.push(&provider_spiffe_mount_path);
+    }
+    validate_kubernetes_protected_path_conflicts(
+        &config.containers.agent.volume_mounts,
+        &protected_paths,
+    )?;
     Ok(config)
 }
 
@@ -1595,16 +1567,12 @@ fn sandbox_to_k8s_spec(
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
-    // PVC. Custom volumeClaimTemplates or explicit Kubernetes driver-config
-    // mounts under /sandbox/ take ownership of workspace persistence.
+    // PVC. Explicit Kubernetes driver-config mounts under /sandbox/ take
+    // ownership of workspace persistence.
     // We need this flag before building the podTemplate because the workspace
     // persistence transforms are applied inside sandbox_template_to_k8s.
-    let template = spec.and_then(|s| s.template.as_ref());
-    let user_has_vct = template
-        .and_then(|t| platform_config_struct(t, "volume_claim_templates"))
-        .is_some();
     let user_has_explicit_workspace_mount = driver_config.has_explicit_sandbox_data_mount();
-    let inject_workspace = !user_has_vct && !user_has_explicit_workspace_mount;
+    let inject_workspace = !user_has_explicit_workspace_mount;
 
     if let Some(spec) = spec {
         let pod_env = spec_pod_env(Some(spec));
@@ -1626,16 +1594,9 @@ fn sandbox_to_k8s_spec(
                     serde_json::json!(template.agent_socket_path),
                 );
             }
-            if let Some(volume_templates) =
-                platform_config_struct(template, "volume_claim_templates")
-            {
-                root.insert("volumeClaimTemplates".to_string(), volume_templates);
-            }
         }
     }
 
-    // Inject the default workspace volumeClaimTemplate when the user didn't
-    // provide their own.
     if inject_workspace {
         root.insert(
             "volumeClaimTemplates".to_string(),
@@ -1986,7 +1947,7 @@ fn sandbox_template_to_k8s_with_validated_config(
 
     // Inject workspace persistence (init container + PVC volume mount) so
     // that /sandbox data survives pod rescheduling. Skipped when the user
-    // provides custom storage through volumeClaimTemplates or driver_config.
+    // provides custom storage through driver_config.
     if inject_workspace {
         apply_workspace_persistence(&mut result, image, params.image_pull_policy);
     }
@@ -2275,9 +2236,9 @@ fn provider_spiffe_socket_path<'a>(params: &'a SandboxPodParams<'a>) -> Option<&
 }
 
 fn spiffe_socket_mount_path(socket_path: &str) -> String {
-    std::path::Path::new(socket_path)
+    Path::new(socket_path)
         .parent()
-        .and_then(std::path::Path::to_str)
+        .and_then(Path::to_str)
         .filter(|path| !path.is_empty() && *path != "/")
         .expect("provider SPIFFE socket path should be validated before pod rendering")
         .to_string()
@@ -2812,15 +2773,13 @@ mod tests {
     }
 
     #[test]
-    fn driver_config_rejects_protected_kubernetes_mount_targets() {
+    fn driver_config_rejects_shared_reserved_mount_targets() {
         for mount_path in [
             "/",
             "/sandbox",
             "/etc/openshell",
             "/etc/openshell-tls/client",
-            "/var/run/secrets/openshell",
             "/opt/openshell/bin",
-            "/spiffe-workload-api",
         ] {
             let template = SandboxTemplate {
                 driver_config: Some(json_struct(serde_json::json!({
@@ -2846,6 +2805,61 @@ mod tests {
                 "expected protected mount target {mount_path:?} to be rejected, got {err}"
             );
         }
+    }
+
+    #[test]
+    fn driver_config_rejects_kubernetes_static_protected_mount_targets() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                    }],
+                    "containers": {
+                        "agent": {
+                            "volume_mounts": [{
+                                "name": "user-data",
+                                "mount_path": "/var/run/secrets/openshell"
+                            }]
+                        }
+                    }
+                }))),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+
+        let err = kubernetes_driver_config_for_spec(Some(&spec), None).unwrap_err();
+
+        assert!(err.contains("/var/run/secrets/openshell"));
+    }
+
+    #[test]
+    fn driver_config_allows_spiffe_workload_path_without_provider_spiffe() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                    }],
+                    "containers": {
+                        "agent": {
+                            "volume_mounts": [{
+                                "name": "user-data",
+                                "mount_path": "/spiffe-workload-api"
+                            }]
+                        }
+                    }
+                }))),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+
+        kubernetes_driver_config_for_spec(Some(&spec), None)
+            .expect("SPIFFE workload path should only be protected when SPIFFE is enabled");
     }
 
     #[test]
@@ -3012,31 +3026,30 @@ mod tests {
 
     #[test]
     fn driver_config_rejects_runtime_provider_spiffe_mount_path() {
-        let template = SandboxTemplate {
-            driver_config: Some(json_struct(serde_json::json!({
-                "volumes": [{
-                    "name": "user-data",
-                    "persistent_volume_claim": {"claim_name": "pvc-user-data"}
-                }],
-                "containers": {
-                    "agent": {
-                        "volume_mounts": [{
-                            "name": "user-data",
-                            "mount_path": "/custom-spiffe"
-                        }]
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                    }],
+                    "containers": {
+                        "agent": {
+                            "volume_mounts": [{
+                                "name": "user-data",
+                                "mount_path": "/custom-spiffe"
+                            }]
+                        }
                     }
-                }
-            }))),
-            ..SandboxTemplate::default()
+                }))),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
         };
-        let config = KubernetesSandboxDriverConfig::from_template(&template)
-            .expect("static driver_config should be valid");
 
-        let err = validate_kubernetes_driver_runtime_mounts(
-            &config,
-            Some("/custom-spiffe/spire-agent.sock"),
-        )
-        .unwrap_err();
+        let err =
+            kubernetes_driver_config_for_spec(Some(&spec), Some("/custom-spiffe/spire-agent.sock"))
+                .unwrap_err();
 
         assert!(err.contains("/custom-spiffe"));
     }

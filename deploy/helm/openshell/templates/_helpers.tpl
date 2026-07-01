@@ -145,6 +145,24 @@ init-container
 {{- end }}
 
 {{/*
+Default server certificate DNS SANs derived from the release name and namespace.
+Returns a YAML list. Append extra SANs from values with range loops.
+*/}}
+{{- define "openshell.defaultServerDnsNames" -}}
+{{- $name := include "openshell.fullname" . -}}
+{{- $ns := .Release.Namespace -}}
+{{- list $name
+      (printf "%s.%s.svc" $name $ns)
+      (printf "%s.%s.svc.cluster.local" $name $ns)
+      "localhost"
+      (printf "%s.localhost" $name)
+      (printf "*.%s.localhost" $name)
+      "host.docker.internal"
+      "host.containers.internal"
+  | toYaml }}
+{{- end }}
+
+{{/*
 Gateway workload kind. StatefulSet is the default because the default SQLite
 database requires persistent per-pod storage.
 */}}

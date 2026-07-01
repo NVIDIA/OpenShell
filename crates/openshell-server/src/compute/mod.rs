@@ -3,10 +3,13 @@
 
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
+pub mod driver_config;
 pub mod lease;
 pub mod vm;
 
 pub use openshell_driver_docker::DockerComputeConfig;
+pub use openshell_driver_kubernetes::KubernetesComputeConfig;
+pub use openshell_driver_podman::PodmanComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
@@ -33,11 +36,9 @@ use openshell_core::proto::{
 };
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
-    ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
+    ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
-use openshell_driver_podman::{
-    ComputeDriverService as PodmanDriverService, PodmanComputeConfig, PodmanComputeDriver,
-};
+use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::fmt;
 use std::net::SocketAddr;
@@ -292,7 +293,6 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
-        _allows_loopback_endpoints: bool,
         gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
         let capabilities = driver
@@ -365,7 +365,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             gateway_bind_addresses,
         )
         .await
@@ -382,7 +381,7 @@ impl ComputeRuntime {
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
+        let driver: SharedComputeDriver = Arc::new(KubernetesDriverService::new(driver));
         Self::from_driver(
             ComputeDriverKind::Kubernetes.as_str().to_string(),
             driver,
@@ -394,7 +393,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            false,
             Vec::new(),
         )
         .await
@@ -420,7 +418,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             Vec::new(),
         )
         .await
@@ -449,7 +446,6 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            true,
             Vec::new(),
         )
         .await
@@ -1670,8 +1666,8 @@ fn extract_typed_resources(
 }
 
 /// Build the opaque `platform_config` Struct from platform-specific public
-/// template fields (`runtime_class_name`, annotations, `volume_claim_templates`)
-/// plus any resource fields beyond CPU/memory.
+/// template fields (`runtime_class_name`, annotations) plus any resource fields
+/// beyond CPU/memory.
 fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Struct> {
     use prost_types::{Struct, Value, value::Kind};
 
@@ -1705,16 +1701,6 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
                 kind: Some(Kind::StructValue(Struct {
                     fields: annotation_fields,
                 })),
-            },
-        );
-    }
-
-    // Pass through the raw volume_claim_templates Struct as a nested value.
-    if let Some(ref vct) = template.volume_claim_templates {
-        fields.insert(
-            "volume_claim_templates".to_string(),
-            Value {
-                kind: Some(Kind::StructValue(vct.clone())),
             },
         );
     }

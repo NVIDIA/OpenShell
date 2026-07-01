@@ -113,6 +113,7 @@ data:
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}
     supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
+    supervisor_topology          = {{ .Values.supervisor.topology | default "combined" | quote }}
     sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
     provider_spiffe_workload_api_socket_path = {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}

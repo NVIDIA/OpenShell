@@ -590,6 +590,8 @@ MCP policy enforcement is directional. It applies to HTTP request bodies sent by
 
 MCP and JSON-RPC endpoint policies currently require full policy YAML applied with `openshell policy set`; the incremental `openshell policy update --add-endpoint` parser does not accept `mcp` or `json-rpc` as protocols.
 
+An MCP client first sends `initialize`. After the server returns a successful response, the client sends `notifications/initialized`. After initialization completes and the server advertises the `tools` capability, the client can call an advertised tool. The response does not need an allow rule because these rules inspect messages sent from the client to the server. This example adds both client initialization messages to the existing tool rules. It omits `tools/list` because it assumes the client already knows the tool names; add that method when the client performs discovery.
+
 ```yaml showLineNumbers={false}
   mcp_server:
     name: mcp_server
@@ -602,6 +604,10 @@ MCP and JSON-RPC endpoint policies currently require full policy YAML applied wi
         mcp:
           max_body_bytes: 131072
         rules:
+          - allow:
+              method: initialize
+          - allow:
+              method: notifications/initialized
           - allow:
               method: tools/call
               tool: read_status

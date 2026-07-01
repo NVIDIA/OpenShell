@@ -231,7 +231,7 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
 /// the gateway section, which keeps each driver's `deny_unknown_fields`
 /// invariant intact.
 pub fn driver_table(
-    driver: ComputeDriverKind,
+    driver_name: &str,
     gateway: &GatewayFileSection,
     raw: Option<&toml::Value>,
 ) -> toml::Value {
@@ -240,7 +240,7 @@ pub fn driver_table(
         _ => toml::Table::new(),
     };
 
-    for key in inheritable_keys(driver) {
+    for key in inheritable_keys(driver_name) {
         if merged.contains_key(*key) {
             continue;
         }
@@ -255,9 +255,9 @@ pub fn driver_table(
 /// Inheritance allowlist (the Q4 "high-overlap set"). Each driver opts in
 /// to a specific subset so a gateway-wide default does not accidentally land
 /// in a driver table that does not understand the field.
-fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
-    match driver {
-        ComputeDriverKind::Kubernetes => &[
+fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
+    match driver_name.parse::<ComputeDriverKind>().ok() {
+        Some(ComputeDriverKind::Kubernetes) => &[
             "namespace",
             "default_image",
             "supervisor_image",
@@ -267,7 +267,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "enable_user_namespaces",
             "sa_token_ttl_secs",
         ],
-        ComputeDriverKind::Docker => &[
+        Some(ComputeDriverKind::Docker) => &[
             "sandbox_namespace",
             "default_image",
             "supervisor_image",
@@ -276,7 +276,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
-        ComputeDriverKind::Podman => &[
+        Some(ComputeDriverKind::Podman) => &[
             "default_image",
             "supervisor_image",
             "host_gateway_ip",
@@ -284,12 +284,13 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
-        ComputeDriverKind::Vm => &[
+        Some(ComputeDriverKind::Vm) => &[
             "default_image",
             "guest_tls_ca",
             "guest_tls_cert",
             "guest_tls_key",
         ],
+        None => &[],
     }
 }
 
@@ -484,7 +485,7 @@ version = 2
             namespace = "agents"
         };
         let merged = driver_table(
-            ComputeDriverKind::Kubernetes,
+            ComputeDriverKind::Kubernetes.as_str(),
             &gateway,
             Some(&toml::Value::Table(raw)),
         );
@@ -511,7 +512,7 @@ version = 2
             host_gateway_ip: Some("10.0.0.1".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Docker, &gateway, None);
+        let merged = driver_table(ComputeDriverKind::Docker.as_str(), &gateway, None);
         let table = merged.as_table().expect("table");
         assert_eq!(
             table.get("sandbox_namespace").and_then(|v| v.as_str()),
@@ -534,7 +535,7 @@ version = 2
             host_gateway_ip: Some("192.168.127.254".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Podman, &gateway, None);
+        let merged = driver_table(ComputeDriverKind::Podman.as_str(), &gateway, None);
         let table = merged.as_table().expect("table");
         assert_eq!(
             table.get("default_image").and_then(|v| v.as_str()),
@@ -556,7 +557,7 @@ version = 2
             default_image = "driver-specific"
         };
         let merged = driver_table(
-            ComputeDriverKind::Podman,
+            ComputeDriverKind::Podman.as_str(),
             &gateway,
             Some(&toml::Value::Table(raw)),
         );
@@ -578,13 +579,35 @@ version = 2
             client_tls_secret_name: Some("openshell-sandbox-tls".to_string()),
             ..Default::default()
         };
-        let merged = driver_table(ComputeDriverKind::Docker, &gateway, None);
+        let merged = driver_table(ComputeDriverKind::Docker.as_str(), &gateway, None);
         assert!(
             !merged
                 .as_table()
                 .unwrap()
                 .contains_key("client_tls_secret_name")
         );
+    }
+
+    #[test]
+    fn remote_driver_table_does_not_inherit_gateway_defaults() {
+        let gateway = GatewayFileSection {
+            default_image: Some("gateway-default:1.0".to_string()),
+            host_gateway_ip: Some("10.0.0.1".to_string()),
+            ..Default::default()
+        };
+        let raw = toml::toml! {
+            socket_path = "/run/openshell/kyma.sock"
+        };
+
+        let merged = driver_table("kyma", &gateway, Some(&toml::Value::Table(raw)));
+        let table = merged.as_table().expect("table");
+
+        assert_eq!(
+            table.get("socket_path").and_then(|v| v.as_str()),
+            Some("/run/openshell/kyma.sock")
+        );
+        assert!(!table.contains_key("default_image"));
+        assert!(!table.contains_key("host_gateway_ip"));
     }
 
     #[test]

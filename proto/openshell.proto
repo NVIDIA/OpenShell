@@ -362,8 +362,8 @@ message SandboxTemplate {
   map<string, string> environment = 6;
   // Platform-specific compute resource requirements and limits.
   google.protobuf.Struct resources = 7;
-  // Optional platform-specific volume claim templates.
-  google.protobuf.Struct volume_claim_templates = 9;
+  reserved 9;
+  reserved "volume_claim_templates";
   // Enable Kubernetes user namespace isolation (hostUsers: false).
   // When true, container UID 0 maps to a non-root host UID and capabilities
   // become namespaced. Requires Kubernetes 1.33+ with user namespace support

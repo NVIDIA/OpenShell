@@ -68,7 +68,6 @@ version = 1                      # optional; reserved for future schema migratio
 bind_address          = "127.0.0.1:17670"  # default: 127.0.0.1:17670 (loopback)
 health_bind_address   = "0.0.0.0:8081"     # optional; omit to disable
 metrics_bind_address  = "0.0.0.0:9090"     # optional; omit to disable
-extra_bind_addresses  = []                 # additional listeners (driver callbacks, etc.)
 
 # Logging
 log_level             = "info"

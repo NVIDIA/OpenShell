@@ -49,7 +49,7 @@ use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_core::{Config, Error, Result as CoreResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -555,20 +555,18 @@ impl DockerComputeDriver {
     ) -> Result<(), Status> {
         for mount in &driver_config.mounts {
             if let DockerDriverMountConfig::Volume { source, .. } = mount {
-                match self.docker.inspect_volume(source.trim()).await {
+                match self.docker.inspect_volume(source).await {
                     Ok(volume) => {
                         if !self.config.enable_bind_mounts && docker_volume_is_bind_backed(&volume)
                         {
                             return Err(Status::failed_precondition(format!(
-                                "docker volume '{}' is backed by a host bind mount and requires enable_bind_mounts = true in [openshell.drivers.docker]",
-                                source.trim()
+                                "docker volume '{source}' is backed by a host bind mount and requires enable_bind_mounts = true in [openshell.drivers.docker]"
                             )));
                         }
                     }
                     Err(err) if is_not_found_error(&err) => {
                         return Err(Status::failed_precondition(format!(
-                            "docker volume '{}' does not exist",
-                            source.trim()
+                            "docker volume '{source}' does not exist"
                         )));
                     }
                     Err(err) => {
@@ -1775,14 +1773,8 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
             read_only,
         } => Ok(Mount {
             typ: Some(MountTypeEnum::BIND),
-            source: Some(
-                driver_mounts::validate_absolute_mount_source(source, "bind source")
-                    .map_err(Status::failed_precondition)?,
-            ),
-            target: Some(
-                driver_mounts::validate_container_mount_target(target)
-                    .map_err(Status::failed_precondition)?,
-            ),
+            source: Some(source.clone()),
+            target: Some(target.clone()),
             read_only: Some(*read_only),
             ..Default::default()
         }),
@@ -1793,27 +1785,13 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
             subpath,
         } => Ok(Mount {
             typ: Some(MountTypeEnum::VOLUME),
-            source: Some(
-                driver_mounts::validate_mount_source(source, "volume source")
-                    .map_err(Status::failed_precondition)?,
-            ),
-            target: Some(
-                driver_mounts::validate_container_mount_target(target)
-                    .map_err(Status::failed_precondition)?,
-            ),
+            source: Some(source.clone()),
+            target: Some(target.clone()),
             read_only: Some(*read_only),
-            volume_options: subpath
-                .as_ref()
-                .map(|subpath| {
-                    Ok::<MountVolumeOptions, Status>(MountVolumeOptions {
-                        subpath: Some(
-                            driver_mounts::validate_mount_subpath(subpath)
-                                .map_err(Status::failed_precondition)?,
-                        ),
-                        ..Default::default()
-                    })
-                })
-                .transpose()?,
+            volume_options: subpath.as_ref().map(|subpath| MountVolumeOptions {
+                subpath: Some(subpath.clone()),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         DockerDriverMountConfig::Tmpfs {
@@ -1823,10 +1801,7 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
             mode,
         } => Ok(Mount {
             typ: Some(MountTypeEnum::TMPFS),
-            target: Some(
-                driver_mounts::validate_container_mount_target(target)
-                    .map_err(Status::failed_precondition)?,
-            ),
+            target: Some(target.clone()),
             tmpfs_options: Some(MountTmpfsOptions {
                 size_bytes: validate_optional_positive_integral_i64(
                     *size_bytes,
@@ -1854,7 +1829,7 @@ fn validate_docker_driver_mounts(
     mounts: &[DockerDriverMountConfig],
     enable_bind_mounts: bool,
 ) -> Result<(), Status> {
-    let mut targets = Vec::with_capacity(mounts.len());
+    let mut targets = HashSet::new();
     for mount in mounts {
         let target = match mount {
             DockerDriverMountConfig::Bind { source, target, .. } => {
@@ -1906,12 +1881,16 @@ fn validate_docker_driver_mounts(
                 ));
             }
         };
-        let target = driver_mounts::validate_container_mount_target(target)
+        driver_mounts::validate_container_mount_target(target)
             .map_err(Status::failed_precondition)?;
-        targets.push(target);
+        let normalized_target = driver_mounts::normalize_mount_target(target);
+        if !targets.insert(normalized_target.clone()) {
+            return Err(Status::failed_precondition(format!(
+                "duplicate docker driver_config mount target '{normalized_target}'"
+            )));
+        }
     }
-    driver_mounts::validate_unique_mount_targets(targets.iter().map(String::as_str), "docker")
-        .map_err(Status::failed_precondition)
+    Ok(())
 }
 
 fn validate_optional_positive_integral_i64(

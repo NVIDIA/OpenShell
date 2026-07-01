@@ -12,7 +12,7 @@ use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 /// Returns `true` when `SELinux` is enabled (enforcing or permissive).
@@ -493,7 +493,7 @@ pub fn podman_driver_volume_mount_sources(
         .mounts
         .into_iter()
         .filter_map(|mount| match mount {
-            PodmanDriverMountConfig::Volume { source, .. } => Some(source.trim().to_string()),
+            PodmanDriverMountConfig::Volume { source, .. } => Some(source),
             _ => None,
         })
         .collect())
@@ -515,7 +515,7 @@ pub fn podman_driver_image_mount_sources(
         .mounts
         .into_iter()
         .filter_map(|mount| match mount {
-            PodmanDriverMountConfig::Image { source, .. } => Some(source.trim().to_string()),
+            PodmanDriverMountConfig::Image { source, .. } => Some(source),
             _ => None,
         })
         .collect())
@@ -541,10 +541,12 @@ fn podman_user_mounts(
                 target,
                 read_only,
             } => {
+                driver_mounts::validate_absolute_mount_source(&source, "bind source")?;
+                driver_mounts::validate_container_mount_target(&target)?;
                 result.mounts.push(Mount {
                     kind: "bind".into(),
-                    source: driver_mounts::validate_absolute_mount_source(&source, "bind source")?,
-                    destination: driver_mounts::validate_container_mount_target(&target)?,
+                    source,
+                    destination: target,
                     options: vec![
                         if read_only { "ro" } else { "rw" }.to_string(),
                         "rbind".to_string(),
@@ -558,9 +560,11 @@ fn podman_user_mounts(
                 subpath,
             } => {
                 reject_subpath(subpath.as_deref(), "podman volume mounts")?;
+                driver_mounts::validate_mount_source(&source, "volume source")?;
+                driver_mounts::validate_container_mount_target(&target)?;
                 result.volumes.push(NamedVolume {
-                    name: driver_mounts::validate_mount_source(&source, "volume source")?,
-                    dest: driver_mounts::validate_container_mount_target(&target)?,
+                    name: source,
+                    dest: target,
                     options: vec![if read_only { "ro" } else { "rw" }.to_string()],
                 });
             }
@@ -583,10 +587,11 @@ fn podman_user_mounts(
                 {
                     options.push(format!("mode={mode:o}"));
                 }
+                driver_mounts::validate_container_mount_target(&target)?;
                 result.mounts.push(Mount {
                     kind: "tmpfs".into(),
                     source: "tmpfs".into(),
-                    destination: driver_mounts::validate_container_mount_target(&target)?,
+                    destination: target,
                     options,
                 });
             }
@@ -597,9 +602,11 @@ fn podman_user_mounts(
                 subpath,
             } => {
                 reject_subpath(subpath.as_deref(), "podman image mounts")?;
+                driver_mounts::validate_mount_source(&source, "image source")?;
+                driver_mounts::validate_container_mount_target(&target)?;
                 result.image_volumes.push(ImageVolume {
-                    source: driver_mounts::validate_mount_source(&source, "image source")?,
-                    destination: driver_mounts::validate_container_mount_target(&target)?,
+                    source,
+                    destination: target,
                     rw: !read_only,
                 });
             }
@@ -626,7 +633,7 @@ fn validate_podman_driver_mounts(
     mounts: &[PodmanDriverMountConfig],
     enable_bind_mounts: bool,
 ) -> Result<(), String> {
-    let mut targets = Vec::with_capacity(mounts.len());
+    let mut targets = HashSet::new();
     for mount in mounts {
         let target = match mount {
             PodmanDriverMountConfig::Bind { source, target, .. } => {
@@ -671,10 +678,15 @@ fn validate_podman_driver_mounts(
                 target
             }
         };
-        let target = driver_mounts::validate_container_mount_target(target)?;
-        targets.push(target);
+        driver_mounts::validate_container_mount_target(target)?;
+        let normalized_target = driver_mounts::normalize_mount_target(target);
+        if !targets.insert(normalized_target.clone()) {
+            return Err(format!(
+                "duplicate podman driver_config mount target '{normalized_target}'"
+            ));
+        }
     }
-    driver_mounts::validate_unique_mount_targets(targets.iter().map(String::as_str), "podman")
+    Ok(())
 }
 
 fn reject_subpath(subpath: Option<&str>, mount_type: &str) -> Result<(), String> {
