@@ -128,7 +128,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (policy, opa_engine, retained_proto) = load_policy(
+    let (policy, opa_engine, retained_proto, middleware_install_pending) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -390,6 +390,7 @@ pub async fn run_sandbox(
             ocsf_enabled: poll_ocsf_enabled,
             provider_credentials: poll_provider_credentials,
             policy_local_ctx: poll_policy_local,
+            middleware_install_pending,
         };
 
         tokio::spawn(async move {
@@ -1337,6 +1338,11 @@ async fn load_policy(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
     Option<openshell_core::proto::SandboxPolicy>,
+    // True when operator-registered middleware could not be connected at
+    // startup and the engine kept the built-in registry. The policy poll loop
+    // retries the install so a recovered service is picked up without a config
+    // change.
+    bool,
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -1366,7 +1372,8 @@ async fn load_policy(
             process: config.process,
         };
         enrich_sandbox_baseline_paths(&mut policy);
-        return Ok((policy, Some(Arc::new(engine)), None));
+        // File mode has no operator-registered middleware to connect.
+        return Ok((policy, Some(Arc::new(engine)), None, false));
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -1449,16 +1456,45 @@ async fn load_policy(
         // engine is rebuilt with the real PID for symlink resolution.
         info!("Creating OPA engine from proto policy data");
         let engine = OpaEngine::from_proto(&proto_policy)?;
-        let middleware_registry =
+        // Connect operator-registered middleware services. A connect/describe
+        // failure must not abort sandbox startup: unlike the previous hard
+        // failure, we degrade to the built-in registry and let each request's
+        // `on_error` policy govern matched traffic (deny for fail_closed, allow
+        // for fail_open). The policy poll loop retries the install so a
+        // recovered service is picked up without a config change. This mirrors
+        // the resilient live-reload path.
+        let middleware_services = sandbox_config.supervisor_middleware_services.clone();
+        let middleware_install_pending = match grpc_retry("Middleware connect", || {
             openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
-                sandbox_config.supervisor_middleware_services,
+                middleware_services.clone(),
             )
-            .await?;
-        engine.replace_middleware_registry(middleware_registry)?;
+        })
+        .await
+        .and_then(|registry| engine.replace_middleware_registry(registry))
+        {
+            Ok(()) => false,
+            Err(error) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "degraded")
+                        .unmapped(
+                            "supervisor_middleware_service_count",
+                            serde_json::json!(middleware_services.len())
+                        )
+                        .message(format!(
+                            "Supervisor middleware connect failed at startup; continuing with built-in middleware only, per-request on_error governs matched requests [error:{error}]"
+                        ))
+                        .build()
+                );
+                true
+            }
+        };
         let opa_engine = Some(Arc::new(engine));
 
         let policy = SandboxPolicy::try_from(proto_policy.clone())?;
-        return Ok((policy, opa_engine, Some(proto_policy)));
+        return Ok((policy, opa_engine, Some(proto_policy), middleware_install_pending));
     }
 
     // No policy source available
@@ -1594,6 +1630,10 @@ struct PolicyPollLoopContext {
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
+    /// True when `load_policy` degraded to the built-in middleware registry
+    /// because operator services could not be connected at startup. The poll
+    /// loop retries the install until it succeeds.
+    middleware_install_pending: bool,
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
@@ -1606,6 +1646,10 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
     let mut current_policy_hash = String::new();
     let mut current_middleware_services = Vec::new();
+    // Set when a middleware install is outstanding (degraded at startup or a
+    // failed reload). Drives a retry on every poll, independent of the config
+    // revision, so a recovered operator service is picked up promptly.
+    let mut middleware_sync_pending = ctx.middleware_install_pending;
     let mut current_settings: std::collections::HashMap<
         String,
         openshell_core::proto::EffectiveSetting,
@@ -1641,14 +1685,70 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             }
         };
 
+        // Reconcile the supervisor middleware registry before evaluating the
+        // rest of the config. This runs independently of the config revision so
+        // an install that degraded at startup (or failed on an earlier poll) is
+        // retried here, letting a recovered operator service be picked up
+        // without waiting for a policy change. A failure keeps the
+        // last-known-good registry; the request path stays governed by each
+        // middleware's `on_error` policy, and a config change is still applied
+        // below rather than being blocked by the middleware outage.
+        if middleware_sync_pending
+            || result.supervisor_middleware_services != current_middleware_services
+        {
+            match openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+                result.supervisor_middleware_services.clone(),
+            )
+            .await
+            .and_then(|registry| ctx.opa_engine.replace_middleware_registry(registry))
+            {
+                Ok(()) => {
+                    current_middleware_services = result.supervisor_middleware_services.clone();
+                    middleware_sync_pending = false;
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped(
+                                "supervisor_middleware_service_count",
+                                serde_json::json!(current_middleware_services.len())
+                            )
+                            .message(format!(
+                                "Supervisor middleware registry reloaded [service_count:{}]",
+                                current_middleware_services.len()
+                            ))
+                            .build()
+                    );
+                }
+                Err(error) => {
+                    // Emit only on the transition into the failed state to avoid
+                    // repeating the same finding on every poll during a
+                    // sustained outage. The startup degrade path emits its own
+                    // event.
+                    if !middleware_sync_pending {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Medium)
+                                .status(StatusId::Failure)
+                                .state(StateId::Other, "failed")
+                                .message(format!(
+                                    "Supervisor middleware registry reload failed, keeping last-known-good registry [error:{error}]"
+                                ))
+                                .build()
+                        );
+                    }
+                    middleware_sync_pending = true;
+                }
+            }
+        }
+
         let provider_env_changed = result.provider_env_revision != current_provider_env_revision;
         if result.config_revision == current_config_revision && !provider_env_changed {
             continue;
         }
 
         let policy_changed = result.policy_hash != current_policy_hash;
-        let middleware_changed =
-            result.supervisor_middleware_services != current_middleware_services;
 
         // Log which settings changed.
         log_setting_changes(&current_settings, &result.settings);
@@ -1703,47 +1803,6 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                         provider_env_revision = result.provider_env_revision,
                         "Settings poll: failed to refresh provider environment"
                     );
-                }
-            }
-        }
-
-        if middleware_changed {
-            match openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
-                result.supervisor_middleware_services.clone(),
-            )
-            .await
-            .and_then(|registry| ctx.opa_engine.replace_middleware_registry(registry))
-            {
-                Ok(()) => {
-                    current_middleware_services = result.supervisor_middleware_services.clone();
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .unmapped(
-                                "supervisor_middleware_service_count",
-                                serde_json::json!(current_middleware_services.len())
-                            )
-                            .message(format!(
-                                "Supervisor middleware registry reloaded [service_count:{}]",
-                                current_middleware_services.len()
-                            ))
-                            .build()
-                    );
-                }
-                Err(error) => {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .state(StateId::Other, "failed")
-                            .message(format!(
-                                "Supervisor middleware registry reload failed, keeping last-known-good registry [error:{error}]"
-                            ))
-                            .build()
-                    );
-                    continue;
                 }
             }
         }
