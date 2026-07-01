@@ -43,6 +43,8 @@ TMPDIR="$(mktemp -d)"
 LOG_DIR="$TMPDIR/logs"
 JWT_DIR="$TMPDIR/jwt"
 GATEWAY_CONFIG="$TMPDIR/gateway.toml"
+POLICY_FILE="$TMPDIR/policy.yaml"
+PROFILE_DIR="$TMPDIR/profiles"
 SETUP_LOG="$LOG_DIR/setup.log"
 GATEWAY_LOG="$LOG_DIR/gateway.log"
 INTERCEPTOR_LOG="$LOG_DIR/interceptor.log"
@@ -53,7 +55,8 @@ else
 fi
 SANDBOX_NAME="$RUN_ID-sandbox"
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$PROFILE_DIR"
+cp "$EXAMPLE_DIR"/profiles/*.yaml "$PROFILE_DIR"/
 
 cleanup() {
   local status=$?
@@ -245,6 +248,46 @@ expect_log_contains() {
   fi
 }
 
+wait_for_output_contains() {
+  local label="$1"
+  local needle="$2"
+  shift 2
+  local output_file="$LOG_DIR/${label//[^A-Za-z0-9_]/_}.out"
+
+  log_command "$label" "$@"
+  for _ in {1..60}; do
+    if "$@" >"$output_file" 2>>"$SETUP_LOG" && grep -Fq -- "$needle" "$output_file"; then
+      pass "$label"
+      return
+    fi
+    sleep 1
+  done
+
+  cat "$output_file" >>"$SETUP_LOG" 2>/dev/null || true
+  fail "$label"
+}
+
+policy_hash_for_sandbox() {
+  local sandbox_name="$1"
+
+  "${CLI[@]}" policy get "$sandbox_name" --full -o json \
+    | awk -F'"' '/"hash":/ { print $4; exit }'
+}
+
+policy_signature_for_sandbox() {
+  local sandbox_name="$1"
+
+  "${CLI[@]}" sandbox get "$sandbox_name" \
+    | awk -F': ' '/openshell.nvidia.com\/policy-signature:/ { print $2; exit }'
+}
+
+profile_signature_for_profile() {
+  local profile_id="$1"
+
+  "${CLI[@]}" provider profile export "$profile_id" -o json \
+    | awk -F'"' '/"openshell.nvidia.com\/profile-signature":/ { print $4; exit }'
+}
+
 wait_for_profile() {
   local profile_id="$1"
   local label="loading $profile_id provider profile"
@@ -307,8 +350,10 @@ start_interceptor() {
   printf 'INFO starting governance interceptor\n'
   "$EXAMPLE_DIR/target/debug/governance-interceptor" \
     --listen "$INTERCEPTOR_ADDR" \
-    --policy "$EXAMPLE_DIR/policy.yaml" \
-    --profiles "$EXAMPLE_DIR/profiles" >"$INTERCEPTOR_LOG" 2>&1 &
+    --policy "$POLICY_FILE" \
+    --profiles "$PROFILE_DIR" \
+    --gateway-endpoint "$GATEWAY_ENDPOINT" \
+    --policy-watch-interval-ms 250 >"$INTERCEPTOR_LOG" 2>&1 &
   INTERCEPTOR_PID=$!
 }
 
@@ -363,6 +408,8 @@ run_suite() {
   expect_output_contains "lists slack profile" "slack" "${CLI[@]}" provider list-profiles
   expect_output_not_contains "hides codex profile" "codex" "${CLI[@]}" provider list-profiles
   expect_output_not_contains "hides google cloud profile" "google-cloud" "${CLI[@]}" provider list-profiles
+  expect_output_contains "github profile has governance profile signature" "openshell.nvidia.com/profile-signature" "${CLI[@]}" provider profile export github -o json
+  expect_output_contains "github profile has governance profile hash" "openshell.nvidia.com/profile-hash" "${CLI[@]}" provider profile export github -o json
 
   cat >"$TMPDIR/disallowed-profile.yaml" <<'EOF'
 id: custom-slack
@@ -382,13 +429,140 @@ EOF
 
   expect_failure "denies disallowed provider create" "${CLI[@]}" provider create --name bitbucket --type bitbucket --credential BITBUCKET_TOKEN=dummy
 
-  run_step "creates sandbox with explicit providers" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --provider github --provider slack --no-auto-providers --keep --no-tty -- /bin/sh -lc true
+  run_step "creates sandbox with selected github provider" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --provider github --no-auto-providers --keep --no-tty -- /bin/sh -lc true
   expect_log_contains "gateway logs interceptor log annotations" "log_annotations" "$GATEWAY_LOG"
   expect_log_contains "gateway logs governance correlation id" "governance:create-sandbox:$SANDBOX_NAME" "$GATEWAY_LOG"
   expect_output_contains "sandbox has github provider" "github" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
-  expect_output_contains "sandbox has slack provider" "slack" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
+  expect_output_not_contains "sandbox does not auto-add slack provider" "slack" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
   expect_output_contains "effective policy has github provider layer" "_provider_github" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
-  expect_output_contains "effective policy has slack provider layer" "_provider_slack" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
+  expect_output_not_contains "effective policy omits unselected slack layer" "_provider_slack" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
+
+  local initial_policy_signature
+  initial_policy_signature="$(policy_signature_for_sandbox "$SANDBOX_NAME")"
+  if [[ -z "$initial_policy_signature" ]]; then
+    fail "reads initial governance policy signature"
+  fi
+  pass "reads initial governance policy signature"
+
+  local initial_github_profile_signature
+  initial_github_profile_signature="$(profile_signature_for_profile github)"
+  if [[ -z "$initial_github_profile_signature" ]]; then
+    fail "reads initial governance profile signature"
+  fi
+  pass "reads initial governance profile signature"
+
+  cat >"$POLICY_FILE" <<'EOF'
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  example_api:
+    name: example-api
+    endpoints:
+    - host: example.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-only
+EOF
+  wait_for_output_contains "gateway sees policy.yaml reload" "example_api" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
+  local policy_reload_hash
+  policy_reload_hash="$(policy_hash_for_sandbox "$SANDBOX_NAME")"
+  if [[ -z "$policy_reload_hash" ]]; then
+    fail "reads reloaded policy.yaml hash"
+  fi
+  wait_for_output_contains "running sandbox logs policy.yaml reload" "$policy_reload_hash" "${CLI[@]}" logs "$SANDBOX_NAME" --source sandbox --since 90s
+
+  local reloaded_policy_signature=""
+  {
+    printf '\n== policy.yaml reload updates sandbox policy signature ==\n'
+    printf '+ wait for sandbox annotation %q to change\n' "openshell.nvidia.com/policy-signature"
+  } >>"$SETUP_LOG"
+  for _ in {1..60}; do
+    reloaded_policy_signature="$(policy_signature_for_sandbox "$SANDBOX_NAME")"
+    if [[ -n "$reloaded_policy_signature" && "$reloaded_policy_signature" != "$initial_policy_signature" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ -z "$reloaded_policy_signature" || "$reloaded_policy_signature" == "$initial_policy_signature" ]]; then
+    fail "policy.yaml reload updates sandbox policy signature"
+  fi
+  pass "policy.yaml reload updates sandbox policy signature"
+
+  cat >"$PROFILE_DIR/github.yaml" <<'EOF'
+display_name: GitHub
+description: GitHub API and Git operations
+category: source_control
+credentials:
+  - name: api_token
+    description: GitHub token
+    env_vars: [GITHUB_TOKEN, GH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_token]
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+  - host: api.github.com
+    port: 443
+    path: /graphql
+    protocol: graphql
+    access: read-only
+    enforcement: enforce
+  - host: github.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+  - host: profile-reload.example
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]
+EOF
+  wait_for_output_contains "gateway sees github profile reload" "profile-reload.example" "${CLI[@]}" provider profile export github -o yaml
+  wait_for_output_contains "effective policy has reloaded github profile" "profile-reload.example" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
+  local reloaded_github_profile_signature=""
+  {
+    printf '\n== github profile reload updates profile signature ==\n'
+    printf '+ wait for provider profile annotation %q to change\n' "openshell.nvidia.com/profile-signature"
+  } >>"$SETUP_LOG"
+  for _ in {1..60}; do
+    reloaded_github_profile_signature="$(profile_signature_for_profile github)"
+    if [[ -n "$reloaded_github_profile_signature" && "$reloaded_github_profile_signature" != "$initial_github_profile_signature" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ -z "$reloaded_github_profile_signature" || "$reloaded_github_profile_signature" == "$initial_github_profile_signature" ]]; then
+    fail "github profile reload updates profile signature"
+  fi
+  pass "github profile reload updates profile signature"
+  local profile_reload_hash
+  profile_reload_hash="$(policy_hash_for_sandbox "$SANDBOX_NAME")"
+  if [[ -z "$profile_reload_hash" ]]; then
+    fail "reads reloaded profile policy hash"
+  fi
+  wait_for_output_contains "running sandbox logs github profile reload" "$profile_reload_hash" "${CLI[@]}" logs "$SANDBOX_NAME" --source sandbox --since 90s
+
   expect_failure "denies policy replacement" "${CLI[@]}" policy set "$SANDBOX_NAME" --policy "$EXAMPLE_DIR/policy.yaml"
 
   run_step "deletes governed sandbox" "${CLI[@]}" sandbox delete "$SANDBOX_NAME"
@@ -402,6 +576,7 @@ READY governance interceptor gateway
 Gateway endpoint:     $GATEWAY_ENDPOINT
 Gateway health check: http://$HEALTH_ADDR/healthz
 Gateway config:       $GATEWAY_CONFIG
+Profile dir:          $PROFILE_DIR
 Setup log:            $SETUP_LOG
 Gateway log:          $GATEWAY_LOG
 Interceptor log:      $INTERCEPTOR_LOG
@@ -434,6 +609,7 @@ run_setup_step "building governance interceptor" cargo build --quiet --manifest-
 run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
 
 generate_gateway_jwt_bundle
+cp "$EXAMPLE_DIR/policy.yaml" "$POLICY_FILE"
 write_gateway_config
 start_interceptor
 start_gateway

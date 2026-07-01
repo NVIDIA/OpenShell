@@ -4613,6 +4613,7 @@ mod tests {
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "generic".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Generic Override".to_string(),
                     description: String::new(),
                     category: openshell_core::proto::ProviderProfileCategory::Other as i32,
@@ -4659,6 +4660,7 @@ mod tests {
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Custom API".to_string(),
                     description: String::new(),
                     category: openshell_core::proto::ProviderProfileCategory::Other as i32,
@@ -4725,6 +4727,7 @@ mod tests {
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Custom API".to_string(),
                     description: String::new(),
                     category: openshell_core::proto::ProviderProfileCategory::Other as i32,
@@ -4992,6 +4995,7 @@ mod tests {
                 profile: Some(ProviderProfile {
                     id: "custom-policy".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Custom Policy".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other as i32,
@@ -5277,6 +5281,7 @@ mod tests {
                 profile: Some(ProviderProfile {
                     id: "custom-token".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Custom Token".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other as i32,
@@ -5497,6 +5502,7 @@ mod tests {
                     profile: Some(ProviderProfile {
                         id: "custom-api".to_string(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                         display_name: "Custom API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Other as i32,
@@ -7613,6 +7619,7 @@ mod tests {
                 profile: Some(ProviderProfile {
                     id: "custom-api".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Custom API".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other as i32,

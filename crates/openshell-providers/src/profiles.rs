@@ -296,6 +296,8 @@ pub struct ProviderTypeProfile {
     pub id: String,
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub resource_version: u64,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub annotations: HashMap<String, String>,
     pub display_name: String,
     #[serde(default)]
     pub description: String,
@@ -327,6 +329,7 @@ impl ProviderTypeProfile {
         Self {
             id: profile.id.clone(),
             resource_version: profile.resource_version,
+            annotations: profile.annotations.clone(),
             display_name: profile.display_name.clone(),
             description: profile.description.clone(),
             category: ProviderProfileCategory::try_from(profile.category)
@@ -417,6 +420,7 @@ impl ProviderTypeProfile {
         ProviderProfile {
             id: self.id.clone(),
             resource_version: self.resource_version,
+            annotations: self.annotations.clone(),
             display_name: self.display_name.clone(),
             description: self.description.clone(),
             category: self.category as i32,
@@ -1700,6 +1704,8 @@ pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use openshell_core::proto::ProviderProfileCategory;
 
     use super::{
@@ -2433,6 +2439,38 @@ endpoints:
     }
 
     #[test]
+    fn profile_annotations_round_trip_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: signed
+annotations:
+  openshell.nvidia.com/profile-hash: sha256:abc123
+  openshell.nvidia.com/profile-signature: signed-token
+display_name: Signed
+description: Signed provider profile
+credentials: []
+endpoints: []
+binaries: []
+",
+        )
+        .expect("profile should parse");
+
+        let proto = profile.to_proto();
+        assert_eq!(
+            proto
+                .annotations
+                .get("openshell.nvidia.com/profile-signature")
+                .map(String::as_str),
+            Some("signed-token")
+        );
+
+        let exported = profile_to_yaml(&ProviderTypeProfile::from_proto(&proto))
+            .expect("profile should serialize");
+        let reparsed = parse_profile_yaml(&exported).expect("exported profile should parse");
+        assert_eq!(reparsed.annotations, profile.annotations);
+    }
+
+    #[test]
     fn profile_yaml_round_trip_preserves_full_network_policy_fields() {
         let profile = parse_profile_yaml(
             r"
@@ -2578,6 +2616,7 @@ binaries: ["", /usr/bin/broken]
                 ProviderTypeProfile {
                     id: " alex-api ".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Space".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2593,6 +2632,7 @@ binaries: ["", /usr/bin/broken]
                 ProviderTypeProfile {
                     id: "alex_api".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Underscore".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2608,6 +2648,7 @@ binaries: ["", /usr/bin/broken]
                 ProviderTypeProfile {
                     id: "Alex-API".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Case".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,

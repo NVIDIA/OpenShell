@@ -369,9 +369,7 @@ fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
-pub(crate) async fn user_provider_profiles(
-    store: &Store,
-) -> Result<Vec<StoredProviderProfile>, Status> {
+pub async fn user_provider_profiles(store: &Store) -> Result<Vec<StoredProviderProfile>, Status> {
     let profiles: Vec<StoredProviderProfile> = store
         .list_messages(10_000, 0)
         .await
@@ -379,7 +377,7 @@ pub(crate) async fn user_provider_profiles(
     Ok(profiles)
 }
 
-pub(crate) fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
+pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
     use crate::persistence::current_time_ms;
     let now_ms = current_time_ms();
     let profile = profile_storage_payload(profile);
@@ -396,12 +394,12 @@ pub(crate) fn stored_provider_profile(profile: ProviderProfile) -> StoredProvide
     }
 }
 
-pub(crate) fn profile_storage_payload(mut profile: ProviderProfile) -> ProviderProfile {
+pub fn profile_storage_payload(mut profile: ProviderProfile) -> ProviderProfile {
     profile.resource_version = 0;
     profile
 }
 
-pub(crate) fn profile_response_payload(
+pub fn profile_response_payload(
     mut profile: ProviderProfile,
     resource_version: u64,
 ) -> ProviderProfile {
@@ -409,7 +407,7 @@ pub(crate) fn profile_response_payload(
     profile
 }
 
-pub(crate) fn stored_profile_resource_version(stored: &StoredProviderProfile) -> u64 {
+pub fn stored_profile_resource_version(stored: &StoredProviderProfile) -> u64 {
     stored
         .metadata
         .as_ref()

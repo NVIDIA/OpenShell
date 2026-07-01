@@ -15,4 +15,14 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 
-network_policies: {}
+network_policies:
+  my_api:
+    name: my-api
+    endpoints:
+      - host: api-1.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: full
+    binaries:
+      - path: /usr/bin/curl

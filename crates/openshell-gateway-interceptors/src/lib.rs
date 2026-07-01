@@ -30,7 +30,7 @@ use openshell_core::proto::gateway_interceptor::v1::{
     InterceptorResult, InterceptorSelector, JsonPatch, ProviderProfileSnapshotRequest,
     gateway_interceptor_client::GatewayInterceptorClient,
 };
-use prost::Message as _;
+use prost::Message;
 use prost_types::{
     DescriptorProto, EnumDescriptorProto, FieldDescriptorProto, FileDescriptorProto,
     FileDescriptorSet, Struct,
@@ -65,6 +65,35 @@ pub enum InterceptorError {
 }
 
 pub type Result<T> = std::result::Result<T, InterceptorError>;
+
+#[derive(Debug, Clone)]
+pub struct ProtoJsonCodec {
+    descriptors: Arc<ProtoDescriptors>,
+}
+
+impl ProtoJsonCodec {
+    pub fn from_descriptor_set(bytes: &[u8]) -> Result<Self> {
+        Ok(Self {
+            descriptors: Arc::new(ProtoDescriptors::from_descriptor_set(bytes)?),
+        })
+    }
+
+    pub fn openshell() -> Result<Self> {
+        Self::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET)
+    }
+
+    pub fn decode_message_to_json<M>(&self, type_name: &str, message: &M) -> Result<Value>
+    where
+        M: Message,
+    {
+        self.descriptors
+            .decode_message_to_json(type_name, &message.encode_to_vec())
+    }
+
+    pub fn encode_json_to_message(&self, type_name: &str, value: &Value) -> Result<Vec<u8>> {
+        self.descriptors.encode_json_to_message(type_name, value)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Phase {

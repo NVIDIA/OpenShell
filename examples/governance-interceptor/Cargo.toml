@@ -11,9 +11,9 @@ rust-version = "1.88"
 license = "Apache-2.0"
 
 [dependencies]
-base64 = "0.22"
 jsonwebtoken = "9"
 openshell-core = { path = "../../crates/openshell-core", default-features = false }
+openshell-gateway-interceptors = { path = "../../crates/openshell-gateway-interceptors" }
 openshell-policy = { path = "../../crates/openshell-policy" }
 openshell-providers = { path = "../../crates/openshell-providers" }
 prost = "0.14"

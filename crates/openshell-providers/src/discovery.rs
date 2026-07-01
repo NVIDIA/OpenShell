@@ -84,6 +84,7 @@ mod tests {
         ProviderTypeProfile {
             id: "custom".to_string(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
             display_name: "Custom".to_string(),
             description: String::new(),
             category: openshell_core::proto::ProviderProfileCategory::Other,
