@@ -57,6 +57,139 @@ tests:
           path: metadata.namespace
           value: other-ns
 
+  - it: grants only pod get for sandbox token bootstrap
+    template: templates/role.yaml
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - pods
+            verbs:
+              - get
+
+  - it: grants sandbox RBAC for proxy-pod supervisor Deployments
+    template: templates/role.yaml
+    set:
+      supervisor.topology: proxy-pod
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - deployments
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - watch
+
+  - it: grants ReplicaSet get for proxy-pod supervisor token bootstrap
+    template: templates/role.yaml
+    set:
+      supervisor.topology: proxy-pod
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - replicasets
+            verbs:
+              - get
+
+  - it: grants proxy-pod Service Secret and NetworkPolicy RBAC only in proxy-pod mode
+    template: templates/role.yaml
+    set:
+      supervisor.topology: proxy-pod
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - services
+              - secrets
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - watch
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - networking.k8s.io
+            resources:
+              - networkpolicies
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - watch
+
+  - it: omits proxy-pod RBAC in the default combined topology
+    template: templates/role.yaml
+    asserts:
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - deployments
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - watch
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - apps
+            resources:
+              - replicasets
+            verbs:
+              - get
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - services
+              - secrets
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - watch
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - networking.k8s.io
+            resources:
+              - networkpolicies
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - watch
+
   - it: uses explicit sandboxNamespace for sandbox RoleBinding
     template: templates/rolebinding.yaml
     set:

@@ -466,6 +466,8 @@ supervisor_sideload_method     = "image-volume"
 # "combined" runs the existing single supervisor container with full process,
 # filesystem, and network enforcement in the agent container. "sidecar" moves
 # pod-level network enforcement and gateway session handling into a network sidecar.
+# "proxy-pod" moves network enforcement and gateway forwarding into a separate
+# supervisor Deployment and uses NetworkPolicy to force agent egress through it.
 topology                       = "combined"
 # Optional corporate HTTP forward proxy for policy-approved TLS egress. The
 # sandbox workload cannot select or override these settings. Only http:// proxy
@@ -546,6 +548,10 @@ proxy_uid                      = 1337
 # inspection capabilities, and enforce endpoint/L7 policy without matching
 # policy.binaries.
 process_binary_aware_network_policy = true
+
+[openshell.drivers.kubernetes.proxy_pod]
+# UID used by the network supervisor pod. It must not match the sandbox UID.
+proxy_uid = 1337
 ```
 
 In managed workspace mode, the Kubernetes driver copies each explicitly named

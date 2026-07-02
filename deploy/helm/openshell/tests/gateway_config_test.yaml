@@ -190,6 +190,18 @@ tests:
           path: data["gateway.toml"]
           pattern: 'supervisor[_]topology\s*='
 
+  - it: renders proxy-pod supervisor topology under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.topology: proxy-pod
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?topology\s*=\s*"proxy-pod"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor[_]topology\s*='
+
   - it: renders proxy uid under [openshell.drivers.kubernetes.sidecar]
     template: templates/gateway-config.yaml
     set:
@@ -198,6 +210,15 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sidecar\].*?proxy_uid\s*=\s*2200'
+
+  - it: renders proxy uid under [openshell.drivers.kubernetes.proxy_pod]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.proxyPod.proxyUid: 2300
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.proxy_pod\].*?proxy_uid\s*=\s*2300'
 
   - it: renders process binary aware network policy under [openshell.drivers.kubernetes.sidecar]
     template: templates/gateway-config.yaml

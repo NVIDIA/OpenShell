@@ -5,8 +5,9 @@
 //!
 //! Path-scoped to `IssueSandboxToken`. Validates a projected SA token
 //! presented by a sandbox pod, reads the pod's `openshell.io/sandbox-id`
-//! annotation, verifies the pod is controlled by the corresponding Sandbox CR,
-//! and returns a [`Principal::Sandbox`] with
+//! annotation, verifies the pod is controlled by the corresponding Sandbox CR
+//! either directly or through a supervisor Deployment controller chain, and
+//! returns a [`Principal::Sandbox`] with
 //! [`SandboxIdentitySource::K8sServiceAccount`]. The `IssueSandboxToken` handler
 //! then mints a gateway-signed JWT for that sandbox id; subsequent gRPC calls
 //! from the supervisor use the gateway-minted JWT validated by
@@ -19,10 +20,11 @@ use super::authenticator::Authenticator;
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
 use k8s_openapi::api::{
+    apps::v1::{Deployment, ReplicaSet},
     authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo},
     core::v1::Pod,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube::Error as KubeError;
 use kube::api::{Api, ApiResource, PostParams};
 use kube::core::{DynamicObject, gvk::GroupVersionKind};
@@ -46,7 +48,10 @@ const SANDBOX_API_VERSION_V1BETA1: &str = "v1beta1";
 const SANDBOX_API_VERSION_V1ALPHA1: &str = "v1alpha1";
 const SANDBOX_API_VERSION_FULL_V1BETA1: &str = "agents.x-k8s.io/v1beta1";
 const SANDBOX_API_VERSION_FULL_V1ALPHA1: &str = "agents.x-k8s.io/v1alpha1";
+const APPS_API_VERSION_FULL_V1: &str = "apps/v1";
 const SANDBOX_KIND: &str = "Sandbox";
+const REPLICA_SET_KIND: &str = "ReplicaSet";
+const DEPLOYMENT_KIND: &str = "Deployment";
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
 const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
@@ -173,6 +178,14 @@ struct SandboxOwnerReference {
     uid: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControllerOwnerReference {
+    api_version: String,
+    kind: String,
+    name: String,
+    uid: String,
+}
+
 /// Resolver backed by the apiserver's `TokenReview` API and `kube::Client`
 /// for the per-pod annotation lookup.
 pub struct LiveK8sResolver {
@@ -232,6 +245,139 @@ impl LiveK8sResolver {
         }
 
         Ok(None)
+    }
+
+    fn replica_sets_api(&self, namespace: &str) -> Api<ReplicaSet> {
+        Api::namespaced(self.client.clone(), namespace)
+    }
+
+    fn deployments_api(&self, namespace: &str) -> Api<Deployment> {
+        Api::namespaced(self.client.clone(), namespace)
+    }
+
+    async fn sandbox_owner_for_pod(
+        &self,
+        pod: &Pod,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<SandboxOwnerReference, Status> {
+        match direct_sandbox_owner_reference(pod) {
+            Ok(owner) => Ok(owner),
+            Err(err) => {
+                let Some(controller) = controller_owner_reference(
+                    pod.metadata.owner_references.as_deref().unwrap_or_default(),
+                ) else {
+                    return Err(err);
+                };
+                if controller.api_version != APPS_API_VERSION_FULL_V1
+                    || controller.kind != REPLICA_SET_KIND
+                {
+                    return Err(err);
+                }
+                self.sandbox_owner_for_replica_set_controller(&controller, namespace, pod_name)
+                    .await
+            }
+        }
+    }
+
+    async fn sandbox_owner_for_replica_set_controller(
+        &self,
+        replica_set_owner: &ControllerOwnerReference,
+        namespace: &str,
+        pod_name: &str,
+    ) -> Result<SandboxOwnerReference, Status> {
+        let replica_set = self
+            .replica_sets_api(namespace)
+            .get_opt(&replica_set_owner.name)
+            .await
+            .map_err(|e| {
+                warn!(
+                    pod = %pod_name,
+                    replica_set = %replica_set_owner.name,
+                    error = %e,
+                    "failed to fetch ReplicaSet for pod identity validation"
+                );
+                Status::internal(format!("replicaset GET failed: {e}"))
+            })?
+            .ok_or_else(|| {
+                warn!(
+                    pod = %pod_name,
+                    replica_set = %replica_set_owner.name,
+                    "pod controller ReplicaSet was not found"
+                );
+                Status::permission_denied("pod controller ReplicaSet not found")
+            })?;
+        validate_object_uid(
+            replica_set.metadata.uid.as_deref().unwrap_or_default(),
+            &replica_set_owner.uid,
+            "pod controller ReplicaSet UID mismatch",
+        )?;
+
+        let deployment_owner = controller_owner_reference(
+            replica_set
+                .metadata
+                .owner_references
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .ok_or_else(|| {
+            warn!(
+                pod = %pod_name,
+                replica_set = %replica_set_owner.name,
+                "ReplicaSet has no controlling Deployment ownerReference"
+            );
+            Status::permission_denied("ReplicaSet is not controlled by a Deployment")
+        })?;
+        if deployment_owner.api_version != APPS_API_VERSION_FULL_V1
+            || deployment_owner.kind != DEPLOYMENT_KIND
+        {
+            warn!(
+                pod = %pod_name,
+                replica_set = %replica_set_owner.name,
+                owner_api_version = %deployment_owner.api_version,
+                owner_kind = %deployment_owner.kind,
+                "ReplicaSet controller is not an apps/v1 Deployment"
+            );
+            return Err(Status::permission_denied(
+                "ReplicaSet is not controlled by a Deployment",
+            ));
+        }
+
+        let deployment = self
+            .deployments_api(namespace)
+            .get_opt(&deployment_owner.name)
+            .await
+            .map_err(|e| {
+                warn!(
+                    pod = %pod_name,
+                    deployment = %deployment_owner.name,
+                    error = %e,
+                    "failed to fetch Deployment for pod identity validation"
+                );
+                Status::internal(format!("deployment GET failed: {e}"))
+            })?
+            .ok_or_else(|| {
+                warn!(
+                    pod = %pod_name,
+                    deployment = %deployment_owner.name,
+                    "ReplicaSet controller Deployment was not found"
+                );
+                Status::permission_denied("ReplicaSet controller Deployment not found")
+            })?;
+        validate_object_uid(
+            deployment.metadata.uid.as_deref().unwrap_or_default(),
+            &deployment_owner.uid,
+            "ReplicaSet controller Deployment UID mismatch",
+        )?;
+
+        sandbox_owner_reference_from_owner_refs(
+            deployment
+                .metadata
+                .owner_references
+                .as_deref()
+                .unwrap_or_default(),
+            "Deployment",
+        )
     }
 }
 
@@ -308,7 +454,9 @@ impl K8sIdentityResolver for LiveK8sResolver {
 
         let sandbox_id = pod_sandbox_id(&pod)?;
 
-        let owner = sandbox_owner_reference(&pod)?;
+        let owner = self
+            .sandbox_owner_for_pod(&pod, &identity.namespace, &identity.pod_name)
+            .await?;
         let sandbox_cr = self
             .get_sandbox_cr_for_owner(&identity.namespace, &owner)
             .await
@@ -455,8 +603,18 @@ fn pod_sandbox_id(pod: &Pod) -> Result<String, Status> {
 }
 
 #[allow(clippy::result_large_err)]
-fn sandbox_owner_reference(pod: &Pod) -> Result<SandboxOwnerReference, Status> {
-    let owner_refs = pod.metadata.owner_references.as_deref().unwrap_or_default();
+fn direct_sandbox_owner_reference(pod: &Pod) -> Result<SandboxOwnerReference, Status> {
+    sandbox_owner_reference_from_owner_refs(
+        pod.metadata.owner_references.as_deref().unwrap_or_default(),
+        "pod",
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn sandbox_owner_reference_from_owner_refs(
+    owner_refs: &[OwnerReference],
+    object_kind: &str,
+) -> Result<SandboxOwnerReference, Status> {
     let mut sandbox_refs = owner_refs
         .iter()
         .filter(|owner| is_supported_sandbox_owner_reference(owner));
@@ -473,27 +631,28 @@ fn sandbox_owner_reference(pod: &Pod) -> Result<SandboxOwnerReference, Status> {
                     SANDBOX_API_VERSION_FULL_V1BETA1,
                     SANDBOX_API_VERSION_FULL_V1ALPHA1,
                 ],
-                "pod Sandbox ownerReference uses unsupported apiVersion"
+                object_kind = %object_kind,
+                "Sandbox ownerReference uses unsupported apiVersion"
             );
         }
-        return Err(Status::permission_denied(
-            "pod is not controlled by an OpenShell Sandbox",
-        ));
+        return Err(Status::permission_denied(format!(
+            "{object_kind} is not controlled by an OpenShell Sandbox"
+        )));
     };
     if sandbox_refs.next().is_some() {
-        return Err(Status::permission_denied(
-            "pod has multiple OpenShell Sandbox owners",
-        ));
+        return Err(Status::permission_denied(format!(
+            "{object_kind} has multiple OpenShell Sandbox owners"
+        )));
     }
     if owner.controller != Some(true) {
-        return Err(Status::permission_denied(
-            "pod Sandbox ownerReference is not controlling",
-        ));
+        return Err(Status::permission_denied(format!(
+            "{object_kind} Sandbox ownerReference is not controlling"
+        )));
     }
     if owner.name.is_empty() || owner.uid.is_empty() {
-        return Err(Status::permission_denied(
-            "pod Sandbox ownerReference is incomplete",
-        ));
+        return Err(Status::permission_denied(format!(
+            "{object_kind} Sandbox ownerReference is incomplete"
+        )));
     }
     Ok(SandboxOwnerReference {
         api_version: owner.api_version.clone(),
@@ -502,9 +661,32 @@ fn sandbox_owner_reference(pod: &Pod) -> Result<SandboxOwnerReference, Status> {
     })
 }
 
-fn is_supported_sandbox_owner_reference(
-    owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
-) -> bool {
+fn controller_owner_reference(owner_refs: &[OwnerReference]) -> Option<ControllerOwnerReference> {
+    let owner = owner_refs
+        .iter()
+        .find(|owner| owner.controller == Some(true))?;
+    Some(ControllerOwnerReference {
+        api_version: owner.api_version.clone(),
+        kind: owner.kind.clone(),
+        name: owner.name.clone(),
+        uid: owner.uid.clone(),
+    })
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_object_uid(actual_uid: &str, expected_uid: &str, message: &str) -> Result<(), Status> {
+    if actual_uid != expected_uid {
+        warn!(
+            expected_uid = %expected_uid,
+            actual_uid = %actual_uid,
+            %message
+        );
+        return Err(Status::permission_denied(message.to_string()));
+    }
+    Ok(())
+}
+
+fn is_supported_sandbox_owner_reference(owner: &OwnerReference) -> bool {
     owner.kind == SANDBOX_KIND
         && matches!(
             owner.api_version.as_str(),
@@ -673,6 +855,17 @@ mod tests {
             block_owner_deletion: None,
             controller: Some(true),
             kind: SANDBOX_KIND.to_string(),
+            name: name.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+
+    fn app_controller_owner(kind: &str, name: &str, uid: &str) -> OwnerReference {
+        OwnerReference {
+            api_version: APPS_API_VERSION_FULL_V1.to_string(),
+            block_owner_deletion: None,
+            controller: Some(true),
+            kind: kind.to_string(),
             name: name.to_string(),
             uid: uid.to_string(),
         }
@@ -898,7 +1091,7 @@ mod tests {
     fn sandbox_owner_reference_extracts_controlling_sandbox_owner() {
         let pod = pod_with_owner_refs(vec![sandbox_owner("sandbox-a", "cr-uid-a")]);
 
-        let owner = sandbox_owner_reference(&pod).expect("expected Sandbox owner");
+        let owner = direct_sandbox_owner_reference(&pod).expect("expected Sandbox owner");
 
         assert_eq!(
             owner,
@@ -918,7 +1111,7 @@ mod tests {
             "cr-uid-a",
         )]);
 
-        let owner = sandbox_owner_reference(&pod).expect("expected v1alpha1 Sandbox owner");
+        let owner = direct_sandbox_owner_reference(&pod).expect("expected v1alpha1 Sandbox owner");
 
         assert_eq!(
             owner,
@@ -934,7 +1127,7 @@ mod tests {
     fn sandbox_owner_reference_rejects_missing_owner() {
         let pod = pod_with_owner_refs(vec![]);
 
-        let err = sandbox_owner_reference(&pod).expect_err("missing owner must fail");
+        let err = direct_sandbox_owner_reference(&pod).expect_err("missing owner must fail");
 
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
@@ -947,8 +1140,8 @@ mod tests {
             "cr-uid-a",
         )]);
 
-        let err =
-            sandbox_owner_reference(&pod).expect_err("unsupported apiVersion must fail closed");
+        let err = direct_sandbox_owner_reference(&pod)
+            .expect_err("unsupported apiVersion must fail closed");
 
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
@@ -959,7 +1152,7 @@ mod tests {
         owner.controller = Some(false);
         let pod = pod_with_owner_refs(vec![owner]);
 
-        let err = sandbox_owner_reference(&pod).expect_err("non-controller owner must fail");
+        let err = direct_sandbox_owner_reference(&pod).expect_err("non-controller owner must fail");
 
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
@@ -971,9 +1164,48 @@ mod tests {
             sandbox_owner("sandbox-b", "cr-uid-b"),
         ]);
 
-        let err = sandbox_owner_reference(&pod).expect_err("multiple owners must fail");
+        let err = direct_sandbox_owner_reference(&pod).expect_err("multiple owners must fail");
 
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn controller_owner_reference_extracts_controlling_apps_owner() {
+        let pod = pod_with_owner_refs(vec![app_controller_owner(
+            REPLICA_SET_KIND,
+            "supervisor-rs",
+            "rs-uid",
+        )]);
+
+        let owner = controller_owner_reference(pod.metadata.owner_references.as_deref().unwrap())
+            .expect("expected controller owner");
+
+        assert_eq!(
+            owner,
+            ControllerOwnerReference {
+                api_version: APPS_API_VERSION_FULL_V1.to_string(),
+                kind: REPLICA_SET_KIND.to_string(),
+                name: "supervisor-rs".to_string(),
+                uid: "rs-uid".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn sandbox_owner_reference_from_deployment_requires_controlling_sandbox_owner() {
+        let deployment_owner_refs = vec![sandbox_owner("sandbox-a", "cr-uid-a")];
+
+        let owner = sandbox_owner_reference_from_owner_refs(&deployment_owner_refs, "Deployment")
+            .expect("expected Deployment Sandbox owner");
+
+        assert_eq!(
+            owner,
+            SandboxOwnerReference {
+                api_version: SANDBOX_API_VERSION_FULL_V1BETA1.to_string(),
+                name: "sandbox-a".to_string(),
+                uid: "cr-uid-a".to_string(),
+            }
+        );
     }
 
     #[test]

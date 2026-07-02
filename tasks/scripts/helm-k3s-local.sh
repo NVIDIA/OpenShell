@@ -69,6 +69,10 @@ Environment:
 macOS uses k3d from mise (Docker required). Linux can use this flow only when
 k3d is installed explicitly; otherwise use kind or an existing cluster context.
 Pair with: mise run helm:skaffold:dev
+
+The proxy-pod Skaffold profile relies on Kubernetes NetworkPolicy enforcement.
+This helper leaves k3s's embedded network policy controller enabled; if you
+replace the CNI, install a policy-enforcing CNI before using that profile.
 EOF
 }
 

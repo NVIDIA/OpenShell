@@ -177,6 +177,7 @@ The most commonly changed values are:
 | `supervisor.topology` | Sandbox pod topology. Refer to [Topology](/kubernetes/topology). |
 | `supervisor.sidecar.proxyUid` | Non-root UID used when sidecar process/binary-aware network policy is disabled. The default binary-aware sidecar runs as UID 0 instead. The configured UID must not match the sandbox UID. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
+| `supervisor.proxyPod.proxyUid` | Non-root UID used by the proxy-pod network supervisor. The UID must not match the sandbox UID. |
 
 Use a values file for repeatable deployments:
 
@@ -260,6 +261,10 @@ The namespaced Role covers sandbox lifecycle and identity:
 | `agents.x-k8s.io` | `sandboxes`, `sandboxes/status` | create, delete, get, list, patch, update, watch |
 | `""` | `events` | get, list, watch |
 | `""` | `pods` | get |
+| `apps` | `deployments` | create, delete, get, list, watch |
+| `apps` | `replicasets` | get |
+| `""` | `services`, `secrets` | create, delete, get, list, watch |
+| `networking.k8s.io` | `networkpolicies` | create, delete, get, list, watch |
 
 The ClusterRole grants node inspection and token validation:
 
@@ -290,7 +295,7 @@ The gateway exposes `/healthz` for process liveness and `/readyz` for dependency
 
 ## Next Steps
 
-- To choose between combined and sidecar sandbox pods, refer to [Topology](/kubernetes/topology).
+- To choose between combined, sidecar, and proxy-pod sandbox topology, refer to [Topology](/kubernetes/topology).
 - To enable automatic certificate rotation with cert-manager, refer to [Managing Certificates](/kubernetes/managing-certificates).
 - To expose the gateway externally without port-forwarding, refer to [Ingress](/kubernetes/ingress).
 - To configure OIDC or reverse-proxy authentication, refer to [Access Control](/kubernetes/access-control).
