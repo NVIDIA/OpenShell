@@ -1,0 +1,46 @@
+{
+  "name": "@nvidia/openshell-sdk",
+  "version": "0.0.0",
+  "description": "Official TypeScript SDK for the OpenShell gateway.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "homepage": "https://github.com/NVIDIA/OpenShell",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NVIDIA/OpenShell.git",
+    "directory": "sdk/typescript"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "gen": "bash gen.sh",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "demo": "tsx src/demo.ts",
+    "prepublishOnly": "npm run gen && npm run build"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.2.3",
+    "@connectrpc/connect": "^2.0.0",
+    "@connectrpc/connect-node": "^2.0.0"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "^2.2.3",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

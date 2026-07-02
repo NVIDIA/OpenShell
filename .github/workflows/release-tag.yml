@@ -40,6 +40,7 @@ jobs:
     outputs:
       python_version: ${{ steps.v.outputs.python }}
       cargo_version: ${{ steps.v.outputs.cargo }}
+      npm_version: ${{ steps.v.outputs.npm }}
       deb_version: ${{ steps.v.outputs.deb }}
       rpm_version: ${{ steps.v.outputs.rpm_version }}
       rpm_release: ${{ steps.v.outputs.rpm_release }}
@@ -65,6 +66,7 @@ jobs:
           set -euo pipefail
           echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
+          echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)" >> "$GITHUB_OUTPUT"
           echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
           echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)" >> "$GITHUB_OUTPUT"
           echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)" >> "$GITHUB_OUTPUT"
@@ -1066,6 +1068,44 @@ jobs:
           FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
         working-directory: ./fern
         run: fern generate --docs
+
+  publish-sdk-typescript:
+    name: Publish TypeScript SDK
+    needs: [compute-versions, release]
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Configure npm auth for GitHub Packages
+        working-directory: ./sdk/typescript
+        run: |
+          {
+            echo "@nvidia:registry=https://npm.pkg.github.com"
+            echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
+          } > .npmrc
+
+      - name: Publish
+        env:
+          OPENSHELL_NPM_VERSION: ${{ needs.compute-versions.outputs.npm_version }}
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: mise run sdk:ts:publish
 
   release-helm:
     name: Release Helm Chart (OCI)

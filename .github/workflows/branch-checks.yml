@@ -190,3 +190,32 @@ jobs:
 
       - name: Lint
         run: mise run markdown:lint
+
+  sdk-typescript:
+    name: TypeScript SDK
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Check TypeScript SDK
+        run: mise run sdk:ts:ci
+
+      # Exercise the full release publish path (version stamp, dist-tag,
+      # prepublishOnly, tarball) without uploading. Uses the off-tag dev
+      # version, which validates the prerelease dist-tag branch too.
+      - name: Verify publishable artifact (dry-run)
+        env:
+          OPENSHELL_NPM_PUBLISH_ARGS: --dry-run
+        run: |
+          OPENSHELL_NPM_VERSION="$(uv run python tasks/scripts/release.py get-version --npm)" \
+            mise run sdk:ts:publish
