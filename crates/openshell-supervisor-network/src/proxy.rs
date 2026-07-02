@@ -1470,25 +1470,25 @@ fn resolve_owner_identity(
 }
 
 #[cfg(target_os = "linux")]
-fn collect_ancestor_identities(pid: u32, stop_pid: u32) -> Vec<(u32, PathBuf)> {
+fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathBuf)> {
     const MAX_DEPTH: usize = 64;
     let mut ancestors = Vec::new();
-    let mut current = pid;
+    let mut current = start_pid;
 
     for _ in 0..MAX_DEPTH {
-        let ppid = match crate::procfs::read_ppid(current) {
-            Some(p) if p > 0 && p != current => p,
+        let parent_pid = match crate::procfs::read_ppid(current) {
+            Some(parent) if parent > 0 && parent != current => parent,
             _ => break,
         };
 
-        if let Ok(path) = crate::procfs::binary_path(ppid.cast_signed()) {
-            ancestors.push((ppid, path));
+        if let Ok(path) = crate::procfs::binary_path(parent_pid.cast_signed()) {
+            ancestors.push((parent_pid, path));
         }
 
-        if ppid == stop_pid || ppid == 1 {
+        if parent_pid == stop_pid || parent_pid == 1 {
             break;
         }
-        current = ppid;
+        current = parent_pid;
     }
 
     ancestors
