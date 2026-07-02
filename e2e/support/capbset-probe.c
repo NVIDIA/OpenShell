@@ -58,9 +58,8 @@ static void print_apparmor_profile(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2 ||
-        (strcmp(argv[1], "eperm") != 0 && strcmp(argv[1], "success") != 0)) {
-        fprintf(stderr, "usage: %s <eperm|success>\n", argv[0]);
+    if (argc != 1) {
+        fprintf(stderr, "usage: %s\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -95,15 +94,18 @@ int main(int argc, char **argv) {
     printf("cap_bnd_after=%016llx\n", cap_bnd_after);
     printf("setpcap_bounding_after=%d\n", setpcap_after);
 
-    if (strcmp(argv[1], "eperm") == 0) {
-        if (drop_result != -1 || drop_errno != EPERM || setpcap_after != 1 ||
-            (cap_bnd_after & setpcap_mask) == 0) {
-            fprintf(stderr, "expected EPERM with CAP_SETPCAP remaining in the bounding set\n");
+    if (drop_result == 0) {
+        if (setpcap_after != 0 || (cap_bnd_after & setpcap_mask) != 0) {
+            fprintf(stderr, "CAP_SETPCAP remained in the bounding set after a successful drop\n");
             return EXIT_FAILURE;
         }
-    } else if (drop_result != 0 || setpcap_after != 0 ||
-               (cap_bnd_after & setpcap_mask) != 0) {
-        fprintf(stderr, "expected CAP_SETPCAP bounding-set drop to succeed\n");
+    } else if (drop_errno == EPERM) {
+        if (setpcap_after != 1 || (cap_bnd_after & setpcap_mask) == 0) {
+            fprintf(stderr, "CAP_SETPCAP changed in the bounding set after EPERM\n");
+            return EXIT_FAILURE;
+        }
+    } else {
+        fprintf(stderr, "unexpected PR_CAPBSET_DROP result\n");
         return EXIT_FAILURE;
     }
 

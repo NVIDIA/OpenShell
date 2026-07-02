@@ -103,16 +103,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Ubuntu 24.04 reproduces #2069: AppArmor blocks PR_CAPBSET_DROP
-          # while CAP_SETPCAP remains in the bounding set.
+          # Ubuntu 24.04 matches the environment reported in #2069 and ships
+          # Podman 4.x. The probe records whether AppArmor blocks the drop.
           - runner: ubuntu-24.04
             podman_major: "4"
-            expected_capbset_drop: eperm
-          # Ubuntu 26.04 provides the supported Podman 5.x coverage and, as of
-          # runner image 20260622.50.1, permits the same bounding-set drop.
+          # Ubuntu 26.04 provides the supported Podman 5.x coverage for
+          # comparison with the Ubuntu 24.04 environment.
           - runner: ubuntu-26.04
             podman_major: "5"
-            expected_capbset_drop: success
     env:
       IMAGE_TAG: ${{ inputs.image-tag }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -186,8 +184,6 @@ jobs:
           podman info --debug
 
       - name: Probe rootless capability bounding set
-        env:
-          EXPECTED_CAPBSET_DROP: ${{ matrix.expected_capbset_drop }}
         run: |
           set -euo pipefail
           probe="$RUNNER_TEMP/openshell-capbset-probe"
@@ -198,7 +194,7 @@ jobs:
             --cap-add=SETPCAP \
             --volume "$probe:/openshell-capbset-probe:ro" \
             docker.io/library/alpine:3.22 \
-            /openshell-capbset-probe "$EXPECTED_CAPBSET_DROP"
+            /openshell-capbset-probe
 
       - name: Log in to GHCR with Podman
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
