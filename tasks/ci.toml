@@ -37,7 +37,7 @@ run = [
 
 [check]
 description = "Run fast compile and type checks"
-depends = ["rust:check", "python:typecheck"]
+depends = ["rust:check", "python:typecheck", "sdk:ts:typecheck"]
 hide = true
 
 [clean]
