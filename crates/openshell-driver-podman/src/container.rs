@@ -13,7 +13,7 @@ use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 #[cfg(target_os = "linux")]
 use std::path::Path;
 
@@ -664,7 +664,7 @@ fn validate_podman_driver_mounts(
     mounts: &[PodmanDriverMountConfig],
     enable_bind_mounts: bool,
 ) -> Result<(), String> {
-    let mut targets = Vec::with_capacity(mounts.len());
+    let mut targets = HashSet::new();
     for mount in mounts {
         let target = match mount {
             PodmanDriverMountConfig::Bind { source, target, .. } => {
@@ -710,9 +710,14 @@ fn validate_podman_driver_mounts(
             }
         };
         driver_mounts::validate_container_mount_target(target)?;
-        targets.push(driver_mounts::normalize_mount_target(target));
+        let normalized_target = driver_mounts::normalize_mount_target(target);
+        if !targets.insert(normalized_target.clone()) {
+            return Err(format!(
+                "duplicate podman driver_config mount target '{normalized_target}'"
+            ));
+        }
     }
-    driver_mounts::validate_unique_mount_targets(targets.iter().map(String::as_str), "podman")
+    Ok(())
 }
 
 fn reject_subpath(subpath: Option<&str>, mount_type: &str) -> Result<(), String> {

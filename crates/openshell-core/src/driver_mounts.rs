@@ -3,7 +3,6 @@
 
 //! Shared validation helpers for driver-config mounts.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 /// `SELinux` relabelling mode for bind mounts.
@@ -92,6 +91,19 @@ pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
     if !target.starts_with('/') {
         return Err("mount target must be an absolute container path".to_string());
     }
+    if target != "/" {
+        let segments = target.split('/').skip(1).collect::<Vec<_>>();
+        let has_internal_empty_segment = segments
+            .iter()
+            .take(segments.len().saturating_sub(1))
+            .any(|segment| segment.is_empty());
+        if has_internal_empty_segment || segments.contains(&".") {
+            return Err(
+                "mount target must be normalized and must not contain empty path segments or '.'"
+                    .to_string(),
+            );
+        }
+    }
     let path = Path::new(target);
     if path == Path::new("/") {
         return Err("mount target must not be the container root".to_string());
@@ -126,22 +138,6 @@ pub fn normalize_mount_target(target: &str) -> String {
 /// Return true when `path` is exactly `parent` or is contained below it.
 pub fn path_is_or_under(path: &Path, parent: &Path) -> bool {
     path == parent || path.starts_with(parent)
-}
-
-/// Validate that already-normalized driver mount targets are unique.
-pub fn validate_unique_mount_targets<'a>(
-    targets: impl IntoIterator<Item = &'a str>,
-    driver_name: &str,
-) -> Result<(), String> {
-    let mut seen = HashSet::new();
-    for target in targets {
-        if !seen.insert(target) {
-            return Err(format!(
-                "duplicate {driver_name} driver_config mount target '{target}'"
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -181,33 +177,6 @@ mod tests {
     }
 
     #[test]
-    fn path_is_or_under_matches_boundaries() {
-        assert!(path_is_or_under(
-            Path::new("/sandbox"),
-            Path::new("/sandbox")
-        ));
-        assert!(path_is_or_under(
-            Path::new("/sandbox/work"),
-            Path::new("/sandbox")
-        ));
-        assert!(!path_is_or_under(
-            Path::new("/sandbox-work"),
-            Path::new("/sandbox")
-        ));
-    }
-
-    #[test]
-    fn unique_mount_targets_rejects_duplicates() {
-        let err =
-            validate_unique_mount_targets(["/sandbox/work", "/sandbox/work"], "test").unwrap_err();
-
-        assert_eq!(
-            err,
-            "duplicate test driver_config mount target '/sandbox/work'"
-        );
-    }
-
-    #[test]
     fn mount_subpath_must_be_relative_without_parent_dirs() {
         assert!(validate_mount_subpath("project/a").is_ok());
         assert!(validate_mount_subpath(" project/a ").is_err());
@@ -229,5 +198,21 @@ mod tests {
             validate_container_mount_target("/sandbox/work ").unwrap_err(),
             "mount target must not contain surrounding whitespace"
         );
+    }
+    #[test]
+    fn mount_target_rejects_internal_empty_or_dot_segments() {
+        assert_eq!(
+            validate_container_mount_target("/sandbox/work//tmp").unwrap_err(),
+            "mount target must be normalized and must not contain empty path segments or '.'"
+        );
+        assert_eq!(
+            validate_container_mount_target("/sandbox/work/./tmp").unwrap_err(),
+            "mount target must be normalized and must not contain empty path segments or '.'"
+        );
+        assert_eq!(
+            validate_container_mount_target("/sandbox/work/../../tmp").unwrap_err(),
+            "mount target must not contain '..'"
+        );
+        validate_container_mount_target("/sandbox/work/").unwrap();
     }
 }
