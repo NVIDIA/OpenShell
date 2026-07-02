@@ -32,8 +32,10 @@ pub(super) const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
 /// Maximum length of the workdir field (bytes).
 pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
 
-/// Validate fields of an `ExecSandboxRequest` for control characters and size
-/// limits before constructing a shell command string.
+/// Validate exec request size limits and field-specific character constraints.
+///
+/// Command arguments only reject NUL (newlines are valid for inline scripts).
+/// Environment values and workdir reject both NUL and newlines.
 pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
     if req.command.len() > MAX_EXEC_COMMAND_ARGS {
         return Err(Status::invalid_argument(format!(
