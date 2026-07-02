@@ -93,12 +93,26 @@ jobs:
         run: ${{ matrix.cmd }}
 
   e2e-podman-rootless:
-    name: E2E (rust-podman-rootless)
+    name: E2E (rust-podman-rootless, ${{ matrix.runner }})
     # Run directly on the Ubuntu host so the test observes the host's AppArmor
     # and unprivileged-user-namespace policy. A privileged job container masks
     # the restrictions that production rootless Podman installations enforce.
-    runs-on: ubuntu-26.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 24.04 reproduces #2069: AppArmor blocks PR_CAPBSET_DROP
+          # while CAP_SETPCAP remains in the bounding set.
+          - runner: ubuntu-24.04
+            podman_major: "4"
+            expected_capbset_drop: eperm
+          # Ubuntu 26.04 provides the supported Podman 5.x coverage and, as of
+          # runner image 20260622.50.1, permits the same bounding-set drop.
+          - runner: ubuntu-26.04
+            podman_major: "5"
+            expected_capbset_drop: success
     env:
       IMAGE_TAG: ${{ inputs.image-tag }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -157,14 +171,41 @@ jobs:
           set -euo pipefail
           podman_version="$(podman version --format '{{.Client.Version}}')"
           case "$podman_version" in
-            5.*) ;;
-            *) echo "ERROR: expected Podman 5.x, found $podman_version" >&2; exit 1 ;;
+            "${{ matrix.podman_major }}".*) ;;
+            *) echo "ERROR: expected Podman ${{ matrix.podman_major }}.x, found $podman_version" >&2; exit 1 ;;
           esac
           test "$(podman info --format '{{.Host.Security.Rootless}}')" = "true"
           test "$(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
+          echo "=== host ==="
+          uname -a
+          echo "=== AppArmor ==="
+          cat /proc/self/attr/current
+          sudo aa-status || true
+          echo "=== Podman ==="
+          podman version
+          podman info --debug
+
+      - name: Probe rootless capability bounding set
+        env:
+          EXPECTED_CAPBSET_DROP: ${{ matrix.expected_capbset_drop }}
+        run: |
+          set -euo pipefail
+          probe="$RUNNER_TEMP/openshell-capbset-probe"
+          cc -static -O2 -Wall -Wextra -Werror \
+            e2e/support/capbset-probe.c \
+            -o "$probe"
+          podman run --rm \
+            --cap-add=SETPCAP \
+            --volume "$probe:/openshell-capbset-probe:ro" \
+            docker.io/library/alpine:3.22 \
+            /openshell-capbset-probe "$EXPECTED_CAPBSET_DROP"
 
       - name: Log in to GHCR with Podman
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Run rootless Podman E2E
         run: mise run --no-deps --skip-deps e2e:podman:rootless
+
+      - name: Print AppArmor denials
+        if: always()
+        run: sudo dmesg | grep -E 'apparmor=.*DENIED|profile="unprivileged_userns"' | tail -100 || true
