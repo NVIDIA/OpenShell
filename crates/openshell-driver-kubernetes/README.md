@@ -53,9 +53,29 @@ pods do not need direct external ingress for SSH.
 
 ## Container Security Context
 
-The driver grants the sandbox agent container the Linux capabilities the
-supervisor needs for namespace setup and policy enforcement. It can also request
-a Kubernetes AppArmor profile through `app_armor_profile`.
+The default `combined` supervisor topology grants the sandbox agent container
+the Linux capabilities the supervisor needs for namespace setup and process,
+filesystem, and network policy enforcement.
+
+The `sidecar` supervisor topology moves pod-level network setup into a root init
+container and runs the long-lived network sidecar as a non-root UID with no
+added Linux capabilities. The agent container also runs as the resolved sandbox
+UID/GID with `allowPrivilegeEscalation: false` and `capabilities.drop: ["ALL"]`.
+In this mode OpenShell preserves gateway session and SSH behavior, but the
+process supervisor defaults to network-only mode and does not apply Landlock
+filesystem policy, process privilege dropping, or process/binary identity
+checks. Network endpoint and L7 policy remain enforced by the network sidecar.
+Set `process_enforcement = "full"` only when you want combined-mode
+process/filesystem guards and accept the added agent-container permissions.
+
+Sidecar mode uses the pod `fsGroup` to make the projected service-account token
+and sandbox client TLS secret group-readable so the non-root process supervisor
+can authenticate to the gateway. Treat the agent container as trusted with
+respect to those in-pod gateway credentials until a narrower credential handoff
+exists.
+
+The driver can request a Kubernetes AppArmor profile through
+`app_armor_profile`.
 
 Supported values are `Unconfined`, `RuntimeDefault`, and
 `Localhost/<profile-name>`. An empty or unset value omits

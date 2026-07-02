@@ -91,10 +91,11 @@ Runtime layout:
   as a release artifact. Linux GNU VM driver binaries must not reference
   `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
   before publishing artifacts.
-- **Supervisor**: `scratch` base, static musl binary at `/openshell-sandbox`.
-  Static linkage is required because the image is mounted/extracted into
-  sandbox environments (Docker extraction, Podman image volumes, Kubernetes
-  init-container copy-self) and cannot rely on a dynamic loader.
+- **Supervisor**: Alpine base with `nftables`, static musl binary at
+  `/openshell-sandbox`. Static linkage keeps the binary usable when the image
+  is mounted/extracted into sandbox environments (Docker extraction, Podman
+  image volumes, Kubernetes init-container copy-self), while `nftables` supports
+  Kubernetes supervisor sidecar egress enforcement.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.

@@ -5,8 +5,9 @@
 
 use super::AppArmorProfile;
 use crate::config::{
-    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, SupervisorSideloadMethod,
+    DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
+    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, ProcessEnforcementMode,
+    SupervisorSideloadMethod, SupervisorTopology,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Namespace, Node};
@@ -220,6 +221,9 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::Precondition)?;
         config
             .validate_sandbox_identity_config()
+            .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_proxy_uid()
             .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
@@ -549,7 +553,8 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::Message)?;
 
         // Resolve sandbox UID/GID from config or OpenShift SCC namespace annotations.
-        let (resolved_uid, resolved_gid, ns_annotations) = self.resolve_sandbox_identity().await;
+        let (resolved_user_id, resolved_group_id, ns_annotations) =
+            self.resolve_sandbox_identity().await;
 
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
@@ -558,6 +563,9 @@ impl KubernetesComputeDriver {
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
+            supervisor_topology: self.config.supervisor_topology,
+            process_enforcement: self.config.process_enforcement,
+            proxy_uid: self.config.proxy_uid,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
@@ -574,9 +582,10 @@ impl KubernetesComputeDriver {
             provider_spiffe_workload_api_socket_path: &self
                 .config
                 .provider_spiffe_workload_api_socket_path,
-            sandbox_uid: resolved_uid,
-            sandbox_gid: resolved_gid,
+            sandbox_uid: resolved_user_id,
+            sandbox_gid: resolved_group_id,
         };
+        validate_sidecar_proxy_identity(&params)?;
 
         let mut obj = DynamicObject::new(name, &agent_sandbox_api.resource);
         // Copy only the SCC-related annotations onto the Sandbox CR for
@@ -1035,6 +1044,31 @@ const SUPERVISOR_VOLUME_NAME: &str = "openshell-supervisor-bin";
 /// Name of the init container that installs the supervisor binary.
 const SUPERVISOR_INIT_CONTAINER_NAME: &str = "openshell-supervisor-install";
 
+/// Name of the init container that prepares pod-level sidecar networking.
+const SUPERVISOR_NETWORK_INIT_CONTAINER_NAME: &str = "openshell-network-init";
+
+/// Container name for the network-only supervisor sidecar.
+const SUPERVISOR_NETWORK_SIDECAR_NAME: &str = "openshell-supervisor-network";
+
+/// Shared volume used by the network sidecar to signal readiness to the
+/// process-only supervisor in the agent container.
+const SIDECAR_STATE_VOLUME_NAME: &str = "openshell-sidecar-state";
+const SIDECAR_STATE_MOUNT_PATH: &str = "/run/openshell-sidecar";
+const SIDECAR_READY_FILE: &str = "/run/openshell-sidecar/supervisor.ready";
+const SIDECAR_ENTRYPOINT_PID_FILE: &str = "/run/openshell-sidecar/entrypoint.pid";
+const SIDECAR_SSH_SOCKET_FILE: &str = "/run/openshell-sidecar/ssh.sock";
+
+/// Shared TLS work directory. The network sidecar writes the proxy CA bundle
+/// here, while the agent container consumes it after the readiness file exists.
+const SIDECAR_TLS_VOLUME_NAME: &str = "openshell-supervisor-tls";
+const SIDECAR_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy";
+const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy/client";
+
+/// Loopback listener owned by the network sidecar. The process-only supervisor
+/// connects here for gateway gRPC, and the sidecar forwards bytes to the real
+/// gateway endpoint using its own network privileges.
+const SIDECAR_GATEWAY_FORWARD_ADDR: &str = "127.0.0.1:18080";
+
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
 /// The init container writes the binary here; the agent container reads it.
@@ -1109,31 +1143,12 @@ fn supervisor_init_container(
     spec
 }
 
-/// Apply supervisor side-load transforms to an already-built pod template JSON.
-///
-/// Depending on the sideload method:
-/// - **`ImageVolume`**: mounts the supervisor OCI image directly as a read-only
-///   volume (no init container needed, requires K8s >= v1.33).
-/// - **`InitContainer`**: injects an emptyDir volume and an init container that
-///   copies the supervisor binary from the supervisor image into that volume.
-///
-/// In both cases, the agent container gets a command override to run the
-/// side-loaded binary and `runAsUser: 0` so it can create network namespaces,
-/// set up the proxy, and configure Landlock/seccomp.
-#[allow(clippy::similar_names)]
-fn apply_supervisor_sideload(
-    pod_template: &mut serde_json::Value,
+fn apply_supervisor_binary_source(
+    spec: &mut serde_json::Map<String, serde_json::Value>,
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
     method: SupervisorSideloadMethod,
-    sandbox_uid: u32,
-    sandbox_gid: u32,
 ) {
-    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
-        return;
-    };
-
-    // 1. Add the volume (image source or emptyDir depending on method)
     let volumes = spec
         .entry("volumes")
         .or_insert_with(|| serde_json::json!([]))
@@ -1152,7 +1167,6 @@ fn apply_supervisor_sideload(
         }
     }
 
-    // 2. Add the init container only for the init-container method
     if method == SupervisorSideloadMethod::InitContainer {
         let init_containers = spec
             .entry("initContainers")
@@ -1165,8 +1179,35 @@ fn apply_supervisor_sideload(
             ));
         }
     }
+}
 
-    // 3. Find the agent container and add volume mount + command override
+/// Apply supervisor side-load transforms to an already-built pod template JSON.
+///
+/// Depending on the sideload method:
+/// - **`ImageVolume`**: mounts the supervisor OCI image directly as a read-only
+///   volume (no init container needed, requires K8s >= v1.33).
+/// - **`InitContainer`**: injects an emptyDir volume and an init container that
+///   copies the supervisor binary from the supervisor image into that volume.
+///
+/// In both cases, the agent container gets a command override to run the
+/// side-loaded binary as root so it can create network namespaces, set up the
+/// proxy, and configure Landlock/seccomp.
+#[allow(clippy::similar_names)]
+fn apply_supervisor_sideload(
+    pod_template: &mut serde_json::Value,
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
+    method: SupervisorSideloadMethod,
+    sandbox_uid: u32,
+    sandbox_gid: u32,
+) {
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    apply_supervisor_binary_source(spec, supervisor_image, supervisor_image_pull_policy, method);
+
+    // Find the agent container and add volume mount + command override
     let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
         return;
     };
@@ -1227,6 +1268,420 @@ fn apply_supervisor_sideload(
     }
 }
 
+fn sidecar_state_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": SIDECAR_STATE_VOLUME_NAME,
+        "mountPath": SIDECAR_STATE_MOUNT_PATH,
+    })
+}
+
+fn sidecar_tls_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": SIDECAR_TLS_VOLUME_NAME,
+        "mountPath": SIDECAR_TLS_MOUNT_PATH,
+    })
+}
+
+fn sidecar_process_gateway_endpoint(grpc_endpoint: &str) -> String {
+    if grpc_endpoint.is_empty() {
+        String::new()
+    } else if grpc_endpoint.starts_with("https://") {
+        format!("https://{SIDECAR_GATEWAY_FORWARD_ADDR}")
+    } else {
+        format!("http://{SIDECAR_GATEWAY_FORWARD_ADDR}")
+    }
+}
+
+fn gateway_tls_server_name(grpc_endpoint: &str) -> Option<String> {
+    let rest = grpc_endpoint.strip_prefix("https://")?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        return bracketed.split(']').next().map(str::to_string);
+    }
+    authority
+        .split(':')
+        .next()
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+}
+
+fn copy_log_level_env(
+    env: &mut Vec<serde_json::Value>,
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+) {
+    if let Some(value) = spec_environment
+        .get(openshell_core::sandbox_env::LOG_LEVEL)
+        .or_else(|| template_environment.get(openshell_core::sandbox_env::LOG_LEVEL))
+    {
+        upsert_env(env, openshell_core::sandbox_env::LOG_LEVEL, value);
+    }
+}
+
+fn supervisor_sidecar_env(
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    params: &SandboxPodParams<'_>,
+) -> Vec<serde_json::Value> {
+    let mut env = Vec::new();
+    apply_required_env(
+        &mut env,
+        params.sandbox_id,
+        params.sandbox_name,
+        params.grpc_endpoint,
+        "",
+        !params.client_tls_secret_name.is_empty(),
+        provider_spiffe_socket_path(params),
+    );
+    if !params.client_tls_secret_name.is_empty() {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_CA,
+            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/ca.crt"),
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_CERT,
+            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/tls.crt"),
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_KEY,
+            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/tls.key"),
+        );
+    }
+    copy_log_level_env(&mut env, template_environment, spec_environment);
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
+        "sidecar",
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
+        "sidecar-nftables",
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY,
+        "relaxed",
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SUPERVISOR_READY_FILE,
+        SIDECAR_READY_FILE,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::ENTRYPOINT_PID_FILE,
+        SIDECAR_ENTRYPOINT_PID_FILE,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR,
+        SIDECAR_GATEWAY_FORWARD_ADDR,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::PROXY_TLS_DIR,
+        SIDECAR_TLS_MOUNT_PATH,
+    );
+    env
+}
+
+fn supervisor_sidecar_container(
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    params: &SandboxPodParams<'_>,
+) -> serde_json::Value {
+    let mut container = serde_json::json!({
+        "name": SUPERVISOR_NETWORK_SIDECAR_NAME,
+        "image": params.supervisor_image,
+        "command": [
+            SUPERVISOR_IMAGE_BINARY_PATH,
+            "--mode=network",
+        ],
+        "env": supervisor_sidecar_env(template_environment, spec_environment, params),
+        "securityContext": {
+            "runAsUser": params.proxy_uid,
+            "runAsGroup": params.sandbox_gid,
+            "runAsNonRoot": true,
+            "allowPrivilegeEscalation": false,
+            "capabilities": {
+                "drop": ["ALL"]
+            }
+        },
+        "volumeMounts": [
+            sidecar_state_volume_mount(),
+            sidecar_tls_volume_mount(),
+            {
+                "name": "openshell-sa-token",
+                "mountPath": "/var/run/secrets/openshell",
+                "readOnly": true
+            }
+        ]
+    });
+    if !params.supervisor_image_pull_policy.is_empty() {
+        container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
+    }
+    if params.provider_spiffe_enabled {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(serde_json::json!({
+                "name": SPIFFE_WORKLOAD_API_VOLUME_NAME,
+                "mountPath": spiffe_socket_mount_path(params.provider_spiffe_workload_api_socket_path),
+                "readOnly": true,
+            }));
+    }
+    if let Some(profile) = params.app_armor_profile {
+        container["securityContext"]["appArmorProfile"] = app_armor_profile_to_k8s(profile);
+    }
+    container
+}
+
+fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_json::Value {
+    let mut container = serde_json::json!({
+        "name": SUPERVISOR_NETWORK_INIT_CONTAINER_NAME,
+        "image": params.supervisor_image,
+        "command": [
+            SUPERVISOR_IMAGE_BINARY_PATH,
+            "--mode=network-init",
+            "--proxy-uid",
+            params.proxy_uid.to_string(),
+            "--proxy-gid",
+            params.sandbox_gid.to_string(),
+            "--sidecar-state-dir",
+            SIDECAR_STATE_MOUNT_PATH,
+            "--sidecar-tls-dir",
+            SIDECAR_TLS_MOUNT_PATH,
+        ],
+        "securityContext": {
+            "runAsUser": 0,
+            "allowPrivilegeEscalation": false,
+            "capabilities": {
+                "drop": ["ALL"],
+                "add": ["NET_ADMIN", "NET_RAW", "CHOWN", "FOWNER"]
+            }
+        },
+        "volumeMounts": [
+            sidecar_state_volume_mount(),
+            sidecar_tls_volume_mount(),
+        ]
+    });
+    if !params.supervisor_image_pull_policy.is_empty() {
+        container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
+    }
+    if !params.client_tls_secret_name.is_empty() {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(serde_json::json!({
+                "name": "openshell-client-tls",
+                "mountPath": "/etc/openshell-tls/client",
+                "readOnly": true
+            }));
+    }
+    if let Some(profile) = params.app_armor_profile {
+        container["securityContext"]["appArmorProfile"] = app_armor_profile_to_k8s(profile);
+    }
+    container
+}
+
+fn apply_supervisor_sidecar_topology(
+    pod_template: &mut serde_json::Value,
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    params: &SandboxPodParams<'_>,
+) {
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    let pod_security_context = spec
+        .entry("securityContext")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(sc) = pod_security_context.as_object_mut() {
+        sc.insert("fsGroup".to_string(), serde_json::json!(params.sandbox_gid));
+    }
+
+    apply_supervisor_binary_source(
+        spec,
+        params.supervisor_image,
+        params.supervisor_image_pull_policy,
+        params.supervisor_sideload_method,
+    );
+
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        volumes.push(serde_json::json!({
+            "name": SIDECAR_STATE_VOLUME_NAME,
+            "emptyDir": {}
+        }));
+        volumes.push(serde_json::json!({
+            "name": SIDECAR_TLS_VOLUME_NAME,
+            "emptyDir": {}
+        }));
+    }
+
+    let init_containers = spec
+        .entry("initContainers")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(init_containers) = init_containers {
+        init_containers.push(supervisor_network_init_container(params));
+    }
+
+    let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+
+    let target_index = containers
+        .iter()
+        .position(|c| c.get("name").and_then(|v| v.as_str()) == Some("agent"))
+        .unwrap_or(0);
+
+    if let Some(container) = containers
+        .get_mut(target_index)
+        .and_then(|v| v.as_object_mut())
+    {
+        container.insert(
+            "command".to_string(),
+            serde_json::json!([
+                format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
+                "--mode=process"
+            ]),
+        );
+
+        let security_context = container
+            .entry("securityContext")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(sc) = security_context.as_object_mut() {
+            match params.process_enforcement {
+                ProcessEnforcementMode::NetworkOnly => {
+                    sc.insert(
+                        "runAsUser".to_string(),
+                        serde_json::json!(params.sandbox_uid),
+                    );
+                    sc.insert(
+                        "runAsGroup".to_string(),
+                        serde_json::json!(params.sandbox_gid),
+                    );
+                    sc.insert("runAsNonRoot".to_string(), serde_json::json!(true));
+                    sc.insert(
+                        "allowPrivilegeEscalation".to_string(),
+                        serde_json::json!(false),
+                    );
+                    sc.insert(
+                        "capabilities".to_string(),
+                        serde_json::json!({
+                            "drop": ["ALL"]
+                        }),
+                    );
+                }
+                ProcessEnforcementMode::Full => {
+                    sc.insert("runAsUser".to_string(), serde_json::json!(0));
+                    sc.remove("runAsGroup");
+                    sc.remove("runAsNonRoot");
+                    sc.remove("allowPrivilegeEscalation");
+                    sc.entry("capabilities".to_string()).or_insert_with(|| {
+                        serde_json::json!({
+                            "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
+                        })
+                    });
+                }
+            }
+        }
+
+        let volume_mounts = container
+            .entry("volumeMounts")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(volume_mounts) = volume_mounts {
+            volume_mounts.push(supervisor_volume_mount());
+            volume_mounts.push(sidecar_state_volume_mount());
+            volume_mounts.push(sidecar_tls_volume_mount());
+        }
+
+        let env = container
+            .entry("env")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(env) = env {
+            let process_endpoint = sidecar_process_gateway_endpoint(params.grpc_endpoint);
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::ENDPOINT,
+                &process_endpoint,
+            );
+            if let Some(server_name) = gateway_tls_server_name(params.grpc_endpoint) {
+                upsert_env(
+                    env,
+                    openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
+                    &server_name,
+                );
+            }
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
+                "sidecar",
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
+                "sidecar-nftables",
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE,
+                &params.process_enforcement.to_string(),
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SSH_SOCKET_PATH,
+                SIDECAR_SSH_SOCKET_FILE,
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SUPERVISOR_READY_FILE,
+                SIDECAR_READY_FILE,
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::ENTRYPOINT_PID_FILE,
+                SIDECAR_ENTRYPOINT_PID_FILE,
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::PROXY_TLS_DIR,
+                SIDECAR_TLS_MOUNT_PATH,
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SANDBOX_UID,
+                &params.sandbox_uid.to_string(),
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SANDBOX_GID,
+                &params.sandbox_gid.to_string(),
+            );
+        }
+    }
+
+    containers.push(supervisor_sidecar_container(
+        template_environment,
+        spec_environment,
+        params,
+    ));
+}
+
 /// Apply workspace persistence transforms to an already-built pod template.
 ///
 /// This injects:
@@ -1242,6 +1697,7 @@ fn apply_supervisor_sideload(
 /// The init container mounts the PVC at a temporary path so it can still see
 /// the image's `/sandbox` directory.  It checks for a sentinel file and skips
 /// the copy if the PVC was already initialised.
+#[allow(clippy::similar_names)]
 fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
@@ -1301,6 +1757,10 @@ fn apply_workspace_persistence(
         // self-referential symlinks under `/sandbox/.uv`, and GNU cp can
         // fail while seeding the PVC even though preserving the symlink as-is
         // is valid. `tar` copies the tree without dereferencing those links.
+        // Archive only the contents, not the `/sandbox` directory entry
+        // itself, so extraction never tries to chmod the PVC mount root.
+        // Extract without restoring owner, mode, or timestamps so the
+        // non-root init container can seed kubelet-owned PVCs.
         //
         // The inner `[ -d ... ]` guard handles custom images that don't have
         // a /sandbox directory — the copy is skipped but the sentinel is
@@ -1308,7 +1768,12 @@ fn apply_workspace_persistence(
         let copy_cmd = format!(
             "if [ ! -f {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL} ]; then \
                if [ -d {WORKSPACE_MOUNT_PATH} ]; then \
-                 tar -C {WORKSPACE_MOUNT_PATH} -cf - . | tar -C {WORKSPACE_INIT_MOUNT_PATH} -xpf -; \
+                 tmp=$(mktemp) && rm -f \"$tmp\" && \
+                   (cd {WORKSPACE_MOUNT_PATH} && find . -mindepth 1 -maxdepth 1 -exec tar -cf \"$tmp\" {{}} +) && \
+                   if [ -f \"$tmp\" ]; then \
+                     tar -C {WORKSPACE_INIT_MOUNT_PATH} --no-same-owner --no-same-permissions --touch -xf \"$tmp\" && \
+                     rm -f \"$tmp\"; \
+                   fi; \
                fi && \
                touch {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL}; \
              fi"
@@ -1366,6 +1831,9 @@ struct SandboxPodParams<'a> {
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
+    supervisor_topology: SupervisorTopology,
+    process_enforcement: ProcessEnforcementMode,
+    proxy_uid: u32,
     service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
@@ -1397,6 +1865,9 @@ impl Default for SandboxPodParams<'_> {
             supervisor_image: "",
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            supervisor_topology: SupervisorTopology::default(),
+            process_enforcement: ProcessEnforcementMode::default(),
+            proxy_uid: DEFAULT_PROXY_UID,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
@@ -1415,6 +1886,20 @@ impl Default for SandboxPodParams<'_> {
             sandbox_gid: DEFAULT_SANDBOX_UID,
         }
     }
+}
+
+fn validate_sidecar_proxy_identity(
+    params: &SandboxPodParams<'_>,
+) -> Result<(), KubernetesDriverError> {
+    if params.supervisor_topology == SupervisorTopology::Sidecar
+        && params.proxy_uid == params.sandbox_uid
+    {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "proxy_uid ({}) must not match sandbox_uid ({}) in sidecar topology",
+            params.proxy_uid, params.sandbox_uid
+        )));
+    }
+    Ok(())
 }
 
 fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
@@ -1707,13 +2192,22 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
     );
 
-    // Add TLS secret volume.  Mode 0400 (owner-read) prevents the
-    // unprivileged sandbox user from reading the mTLS private key.
+    // Add TLS secret volume. Combined mode uses mode 0400 because the
+    // supervisor starts as root and drops privileges before running workload
+    // children. Sidecar mode keeps the process supervisor non-root, so it uses
+    // pod fsGroup + 0440 to preserve gateway session and SSH control behavior.
     let mut volumes: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
+        let client_tls_default_mode = match params.supervisor_topology {
+            SupervisorTopology::Combined => 0o400,
+            SupervisorTopology::Sidecar => 0o440,
+        };
         volumes.push(serde_json::json!({
             "name": "openshell-client-tls",
-            "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
+            "secret": {
+                "secretName": params.client_tls_secret_name,
+                "defaultMode": client_tls_default_mode
+            }
         }));
     }
     if params.provider_spiffe_enabled {
@@ -1728,7 +2222,12 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     // Projected ServiceAccountToken volume — kubelet writes a short-lived
     // audience-bound JWT into /var/run/secrets/openshell/token and rotates
     // it automatically. The supervisor exchanges this for a gateway-minted
-    // JWT via `IssueSandboxToken` once at startup.
+    // JWT via `IssueSandboxToken` once at startup. In sidecar topology both
+    // supervisor containers run with the sandbox GID and need group-read access.
+    let sa_token_default_mode = match params.supervisor_topology {
+        SupervisorTopology::Combined => 0o400,
+        SupervisorTopology::Sidecar => 0o440,
+    };
     volumes.push(serde_json::json!({
         "name": "openshell-sa-token",
         "projected": {
@@ -1739,7 +2238,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
                     "path": "token"
                 }
             }],
-            "defaultMode": 256
+            "defaultMode": sa_token_default_mode
         }
     }));
     spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
@@ -1763,14 +2262,26 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
 
     let mut result = serde_json::Value::Object(template_value);
 
-    apply_supervisor_sideload(
-        &mut result,
-        params.supervisor_image,
-        params.supervisor_image_pull_policy,
-        params.supervisor_sideload_method,
-        params.sandbox_uid,
-        params.sandbox_gid,
-    );
+    match params.supervisor_topology {
+        SupervisorTopology::Combined => {
+            apply_supervisor_sideload(
+                &mut result,
+                params.supervisor_image,
+                params.supervisor_image_pull_policy,
+                params.supervisor_sideload_method,
+                params.sandbox_uid,
+                params.sandbox_gid,
+            );
+        }
+        SupervisorTopology::Sidecar => {
+            apply_supervisor_sidecar_topology(
+                &mut result,
+                &template.environment,
+                spec_environment,
+                params,
+            );
+        }
+    }
 
     // Inject workspace persistence (init container + PVC volume mount) so
     // that /sandbox data survives pod rescheduling.  Skipped when the user
@@ -2262,6 +2773,15 @@ mod tests {
         assert!(!should_try_next_sandbox_api_version(&err));
     }
 
+    fn rendered_env<'a>(container: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+        container["env"]
+            .as_array()?
+            .iter()
+            .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))?
+            .get("value")?
+            .as_str()
+    }
+
     #[test]
     fn driver_config_rejects_invalid_shape() {
         let template = SandboxTemplate {
@@ -2599,6 +3119,312 @@ mod tests {
             volume["image"].get("pullPolicy").is_none(),
             "pullPolicy should be omitted when empty"
         );
+    }
+
+    #[test]
+    fn sidecar_topology_renders_process_agent_and_network_sidecar() {
+        let params = SandboxPodParams {
+            supervisor_topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            supervisor_image_pull_policy: "IfNotPresent",
+            grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
+            client_tls_secret_name: "openshell-client-tls",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        assert!(
+            pod_template["spec"]["shareProcessNamespace"].is_null(),
+            "sidecar mode no longer needs a shared process namespace when binary identity is relaxed"
+        );
+        assert_eq!(pod_template["spec"]["securityContext"]["fsGroup"], 1500);
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 2);
+
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert_eq!(
+            agent["command"],
+            serde_json::json!([
+                format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
+                "--mode=process"
+            ])
+        );
+        assert_eq!(agent["securityContext"]["runAsUser"], 1500);
+        assert_eq!(agent["securityContext"]["runAsGroup"], 1500);
+        assert_eq!(agent["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            agent["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"]
+            })
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::ENDPOINT),
+            Some("https://127.0.0.1:18080")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME),
+            Some("openshell-gateway.openshell.svc")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE),
+            Some("network-only")
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SSH_SOCKET_PATH),
+            Some(SIDECAR_SSH_SOCKET_FILE)
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SUPERVISOR_READY_FILE),
+            Some(SIDECAR_READY_FILE)
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::ENTRYPOINT_PID_FILE),
+            Some(SIDECAR_ENTRYPOINT_PID_FILE)
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::PROXY_TLS_DIR),
+            Some(SIDECAR_TLS_MOUNT_PATH)
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SANDBOX_UID),
+            Some("1500")
+        );
+
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(sidecar["image"], "supervisor-image:latest");
+        assert_eq!(sidecar["imagePullPolicy"], "IfNotPresent");
+        assert_eq!(
+            sidecar["command"],
+            serde_json::json!([SUPERVISOR_IMAGE_BINARY_PATH, "--mode=network"])
+        );
+        assert_eq!(sidecar["securityContext"]["runAsUser"], 2200);
+        assert_eq!(sidecar["securityContext"]["runAsGroup"], 1500);
+        assert_eq!(sidecar["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            sidecar["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"]
+            })
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::ENDPOINT),
+            Some("https://openshell-gateway.openshell.svc:8080")
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR),
+            Some(SIDECAR_GATEWAY_FORWARD_ADDR)
+        );
+        assert_eq!(
+            rendered_env(
+                sidecar,
+                openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY
+            ),
+            Some("relaxed")
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::ENTRYPOINT_PID_FILE),
+            Some(SIDECAR_ENTRYPOINT_PID_FILE)
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::PROXY_TLS_DIR),
+            Some(SIDECAR_TLS_MOUNT_PATH)
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::TLS_CA),
+            Some("/etc/openshell-tls/proxy/client/ca.crt")
+        );
+        let sidecar_mounts = sidecar["volumeMounts"].as_array().unwrap();
+        assert!(
+            !sidecar_mounts
+                .iter()
+                .any(|mount| mount["name"] == "openshell-client-tls"),
+            "runtime sidecar should use the init-copied TLS files, not the root-owned Secret mount"
+        );
+        let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        let sa_token = volumes
+            .iter()
+            .find(|volume| volume["name"] == "openshell-sa-token")
+            .unwrap();
+        assert_eq!(sa_token["projected"]["defaultMode"], 0o440);
+        let client_tls = volumes
+            .iter()
+            .find(|volume| volume["name"] == "openshell-client-tls")
+            .unwrap();
+        assert_eq!(client_tls["secret"]["defaultMode"], 0o440);
+
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        let network_init = init_containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+            .unwrap();
+        assert_eq!(network_init["image"], "supervisor-image:latest");
+        assert_eq!(network_init["imagePullPolicy"], "IfNotPresent");
+        assert_eq!(
+            network_init["command"],
+            serde_json::json!([
+                SUPERVISOR_IMAGE_BINARY_PATH,
+                "--mode=network-init",
+                "--proxy-uid",
+                "2200",
+                "--proxy-gid",
+                "1500",
+                "--sidecar-state-dir",
+                SIDECAR_STATE_MOUNT_PATH,
+                "--sidecar-tls-dir",
+                SIDECAR_TLS_MOUNT_PATH
+            ])
+        );
+        assert_eq!(
+            network_init["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"],
+                "add": ["NET_ADMIN", "NET_RAW", "CHOWN", "FOWNER"]
+            })
+        );
+        let network_init_mounts = network_init["volumeMounts"].as_array().unwrap();
+        assert!(network_init_mounts.iter().any(|mount| {
+            mount["name"] == "openshell-client-tls"
+                && mount["mountPath"] == "/etc/openshell-tls/client"
+        }));
+    }
+
+    #[test]
+    fn sidecar_topology_adds_shared_state_and_tls_volumes() {
+        let params = SandboxPodParams {
+            supervisor_topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| volume["name"] == SIDECAR_STATE_VOLUME_NAME)
+        );
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| volume["name"] == SIDECAR_TLS_VOLUME_NAME)
+        );
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == SUPERVISOR_VOLUME_NAME && volume["image"].is_object()
+        }));
+
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        for container_name in ["agent", SUPERVISOR_NETWORK_SIDECAR_NAME] {
+            let container = containers
+                .iter()
+                .find(|container| container["name"] == container_name)
+                .unwrap();
+            let mounts = container["volumeMounts"].as_array().unwrap();
+            assert!(mounts.iter().any(|mount| {
+                mount["name"] == SIDECAR_STATE_VOLUME_NAME
+                    && mount["mountPath"] == SIDECAR_STATE_MOUNT_PATH
+            }));
+            assert!(mounts.iter().any(|mount| {
+                mount["name"] == SIDECAR_TLS_VOLUME_NAME
+                    && mount["mountPath"] == SIDECAR_TLS_MOUNT_PATH
+            }));
+        }
+    }
+
+    #[test]
+    fn sidecar_topology_full_process_enforcement_keeps_combined_agent_permissions() {
+        let params = SandboxPodParams {
+            supervisor_topology: SupervisorTopology::Sidecar,
+            process_enforcement: ProcessEnforcementMode::Full,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            proxy_uid: 2200,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        let sc = &agent["securityContext"];
+        assert_eq!(sc["runAsUser"], 0);
+        assert!(sc.get("runAsGroup").is_none());
+        assert!(sc.get("runAsNonRoot").is_none());
+        assert!(sc.get("allowPrivilegeEscalation").is_none());
+        assert_eq!(
+            sc["capabilities"],
+            serde_json::json!({
+                "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
+            })
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE),
+            Some("full")
+        );
+
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(sidecar["securityContext"]["runAsUser"], 2200);
+        assert_eq!(
+            sidecar["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"]
+            })
+        );
+    }
+
+    #[test]
+    fn sidecar_topology_rejects_proxy_uid_matching_sandbox_uid() {
+        let params = SandboxPodParams {
+            supervisor_topology: SupervisorTopology::Sidecar,
+            proxy_uid: 1500,
+            sandbox_uid: 1500,
+            ..SandboxPodParams::default()
+        };
+
+        let err = validate_sidecar_proxy_identity(&params).unwrap_err();
+        assert!(matches!(err, KubernetesDriverError::Precondition(_)));
+        assert!(err.to_string().contains("proxy_uid"));
     }
 
     /// Regression test: TLS mount path must match env var paths.
@@ -3178,6 +4004,16 @@ mod tests {
         assert!(
             script.contains("tar -C"),
             "init script must seed image contents with a tar stream"
+        );
+        assert!(
+            script.contains("find . -mindepth 1 -maxdepth 1"),
+            "init script must archive sandbox contents without the mount root entry"
+        );
+        assert!(
+            script.contains("--no-same-owner")
+                && script.contains("--no-same-permissions")
+                && script.contains("--touch"),
+            "init script must avoid restoring metadata onto the PVC root"
         );
     }
 

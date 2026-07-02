@@ -33,6 +33,9 @@ clap = { workspace = true }
 # Error handling
 miette = { workspace = true }
 
+# Unix ownership for Kubernetes sidecar init setup
+nix = { workspace = true }
+
 # TLS crypto provider install (main.rs)
 rustls = { workspace = true }
 

@@ -60,9 +60,17 @@ mise run helm:skaffold:dev
 mise run helm:skaffold:run
 ```
 
+**Supervisor sidecar topology** (build once and leave running):
+```bash
+mise run helm:skaffold:run:sidecar
+```
+
 Both commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
-chart. The `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
-generates mTLS secrets on first install. Envoy Gateway opt-in; see the Optional Add-ons section below.
+chart. The sidecar profile renders an `openshell-network-init` init container for
+nftables setup and a non-root `openshell-supervisor-network` runtime sidecar for
+proxying. The `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway
+generate-certs`) generates mTLS secrets on first install. Envoy Gateway opt-in;
+see the Optional Add-ons section below.
 
 The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
 
@@ -124,6 +132,12 @@ openshell sandbox list --gateway-endpoint https://localhost:8090
 
 ```bash
 mise run helm:skaffold:delete
+```
+
+For a sidecar-profile deployment:
+
+```bash
+mise run helm:skaffold:delete:sidecar
 ```
 
 ### Delete the cluster entirely
@@ -250,6 +264,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
+| `deploy/helm/openshell/ci/values-sidecar.yaml` | Supervisor sidecar topology overlay for Kubernetes e2e/dev |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |

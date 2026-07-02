@@ -19,6 +19,10 @@ allow_network if {
 	network_policy_for_request
 }
 
+binary_identity_required if {
+	object.get(object.get(data, "runtime", {}), "require_binary_identity", true)
+}
+
 # --- Deny reasons (specific diagnostics for debugging policy denials) ---
 
 deny_reason := "missing input.network" if {
@@ -131,6 +135,12 @@ endpoint_allowed(policy, network) if {
 	endpoint.ports[_] == network.port
 }
 
+# Binary matching can be relaxed by trusted runtime configuration. In that
+# mode, network policies are endpoint/L7 scoped and ignore policy.binaries.
+binary_allowed(_, _) if {
+	not binary_identity_required
+}
+
 # Binary matching: exact path.
 # SHA256 integrity is enforced in Rust via trust-on-first-use (TOFU) cache,
 # not in Rego. The proxy computes and caches binary hashes at runtime.
@@ -159,6 +169,10 @@ binary_allowed(policy, exec) if {
 	all_paths := array.concat([exec.path], exec.ancestors)
 	some p in all_paths
 	glob.match(b.path, ["/"], p)
+}
+
+user_declared_binary_allowed(_, _) if {
+	not binary_identity_required
 }
 
 user_declared_binary_allowed(policy, exec) if {

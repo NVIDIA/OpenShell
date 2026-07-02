@@ -42,6 +42,8 @@ const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from
 const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const INFERENCE_LOCAL_PORT: u16 = 443;
+#[cfg(target_os = "linux")]
+const SIDECAR_SUPERVISOR_TOPOLOGY: &str = "sidecar";
 
 /// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
 /// machine. Traffic to these names is eligible for the trusted-gateway SSRF
@@ -1426,7 +1428,7 @@ fn resolve_owner_identity(
         })?;
 
     let bin_hash = identity_cache
-        .verify_or_cache(&bin_path)
+        .verify_or_cache_process_exe(&bin_path, owner_pid)
         .map_err(|e| IdentityError {
             reason: format!("binary integrity check failed: {e}"),
             binary: Some(bin_path.clone()),
@@ -1434,11 +1436,15 @@ fn resolve_owner_identity(
             ancestors: vec![],
         })?;
 
-    let ancestors = crate::procfs::collect_ancestor_binaries(owner_pid, entrypoint_pid);
+    let ancestor_identities = collect_ancestor_identities(owner_pid, entrypoint_pid);
+    let ancestors: Vec<PathBuf> = ancestor_identities
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect();
 
-    for ancestor in &ancestors {
+    for (ancestor_pid, ancestor) in &ancestor_identities {
         identity_cache
-            .verify_or_cache(ancestor)
+            .verify_or_cache_process_exe(ancestor, *ancestor_pid)
             .map_err(|e| IdentityError {
                 reason: format!(
                     "ancestor integrity check failed for {}: {e}",
@@ -1461,6 +1467,31 @@ fn resolve_owner_identity(
         cmdline_paths,
         bin_hash,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn collect_ancestor_identities(pid: u32, stop_pid: u32) -> Vec<(u32, PathBuf)> {
+    const MAX_DEPTH: usize = 64;
+    let mut ancestors = Vec::new();
+    let mut current = pid;
+
+    for _ in 0..MAX_DEPTH {
+        let ppid = match crate::procfs::read_ppid(current) {
+            Some(p) if p > 0 && p != current => p,
+            _ => break,
+        };
+
+        if let Ok(path) = crate::procfs::binary_path(ppid.cast_signed()) {
+            ancestors.push((ppid, path));
+        }
+
+        if ppid == stop_pid || ppid == 1 {
+            break;
+        }
+        current = ppid;
+    }
+
+    ancestors
 }
 
 /// Resolve the identity of the process owning a TCP peer connection.
@@ -1573,8 +1604,17 @@ fn evaluate_opa_tcp(
         }
     };
 
-    let pid = entrypoint_pid.load(Ordering::Acquire);
-    if pid == 0 {
+    if !crate::opa::network_binary_identity_required() {
+        let result = evaluate_endpoint_only_opa(engine, host, port);
+        debug!(
+            "evaluate_opa_tcp endpoint-only: host={host} port={port} action={:?}",
+            result.action
+        );
+        return result;
+    }
+
+    let entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+    let Some(proc_net_anchor_pid) = proc_net_anchor_pid(entrypoint_pid) else {
         return deny(
             "entrypoint process not yet spawned".into(),
             None,
@@ -1582,12 +1622,12 @@ fn evaluate_opa_tcp(
             vec![],
             vec![],
         );
-    }
+    };
 
     let total_start = std::time::Instant::now();
     let peer_port = peer_addr.port();
 
-    let identity = match resolve_process_identity(pid, peer_port, identity_cache) {
+    let identity = match resolve_process_identity(proc_net_anchor_pid, peer_port, identity_cache) {
         Ok(id) => id,
         Err(err) => {
             return deny(
@@ -1641,6 +1681,52 @@ fn evaluate_opa_tcp(
     result
 }
 
+#[cfg(target_os = "linux")]
+fn proc_net_anchor_pid(entrypoint_pid: u32) -> Option<u32> {
+    if entrypoint_pid != 0 {
+        return Some(entrypoint_pid);
+    }
+    sidecar_topology_enabled().then(std::process::id)
+}
+
+#[cfg(target_os = "linux")]
+fn sidecar_topology_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
+        .is_ok_and(|value| value == SIDECAR_SUPERVISOR_TOPOLOGY)
+}
+
+fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> ConnectDecision {
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: PathBuf::new(),
+        binary_sha256: String::new(),
+        ancestors: vec![],
+        cmdline_paths: vec![],
+    };
+
+    match engine.evaluate_network_action_with_generation(&input) {
+        Ok((action, generation)) => ConnectDecision {
+            action,
+            generation,
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        },
+        Err(e) => ConnectDecision {
+            action: NetworkAction::Deny {
+                reason: format!("policy evaluation error: {e}"),
+            },
+            generation: engine.current_generation(),
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        },
+    }
+}
+
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
 fn evaluate_opa_tcp(
@@ -1648,9 +1734,13 @@ fn evaluate_opa_tcp(
     engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
-    _host: &str,
-    _port: u16,
+    host: &str,
+    port: u16,
 ) -> ConnectDecision {
+    if !crate::opa::network_binary_identity_required() {
+        return evaluate_endpoint_only_opa(engine, host, port);
+    }
+
     ConnectDecision {
         action: NetworkAction::Deny {
             reason: "identity binding unavailable on this platform".into(),
@@ -2152,14 +2242,24 @@ fn query_l7_route_snapshot(
     };
 
     match engine.query_endpoint_configs_with_generation(&input) {
-        Ok((vals, generation)) => Some(L7RouteSnapshot {
-            configs: vals
+        Ok((vals, generation)) => {
+            let configs: Vec<_> = vals
                 .into_iter()
                 .filter_map(|val| crate::l7::parse_l7_config(&val))
                 .map(|config| L7ConfigSnapshot { config })
-                .collect(),
-            generation,
-        }),
+                .collect();
+            debug!(
+                host,
+                port,
+                generation,
+                config_count = configs.len(),
+                "Forward proxy L7 route lookup complete"
+            );
+            Some(L7RouteSnapshot {
+                configs,
+                generation,
+            })
+        }
         Err(e) => {
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Fail)
@@ -3337,10 +3437,29 @@ async fn handle_forward_proxy(
         }
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
+    debug!(
+        host = %host_lc,
+        port,
+        binary = %binary_str,
+        binary_pid = %pid_str,
+        matched_policy = %policy_str,
+        decision_generation = decision.generation,
+        current_generation = opa_engine.current_generation(),
+        action = ?decision.action,
+        "Forward proxy L4 policy decision"
+    );
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
     let forward_generation_guard = match opa_engine.generation_guard(decision.generation) {
         Ok(guard) => guard,
         Err(e) => {
+            warn!(
+                host = %host_lc,
+                port,
+                decision_generation = decision.generation,
+                current_generation = opa_engine.current_generation(),
+                error = %e,
+                "Forward proxy rejected request because policy generation changed after L4 decision"
+            );
             emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
             emit_activity_simple(activity_tx, true, "policy_stale");
             respond(
@@ -3401,6 +3520,15 @@ async fn handle_forward_proxy(
         && !route.configs.is_empty()
     {
         if route.generation != forward_generation_guard.captured_generation() {
+            warn!(
+                host = %host_lc,
+                port,
+                decision_generation = decision.generation,
+                guard_generation = forward_generation_guard.captured_generation(),
+                route_generation = route.generation,
+                current_generation = opa_engine.current_generation(),
+                "Forward proxy rejected request because L7 route lookup used a different policy generation"
+            );
             emit_l7_tunnel_close_after_policy_change(
                 &host_lc,
                 port,
@@ -3426,6 +3554,14 @@ async fn handle_forward_proxy(
         let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
             Ok(engine) => engine,
             Err(e) => {
+                warn!(
+                    host = %host_lc,
+                    port,
+                    route_generation = route.generation,
+                    current_generation = opa_engine.current_generation(),
+                    error = %e,
+                    "Forward proxy rejected request because L7 tunnel engine could not be cloned"
+                );
                 emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
                 emit_activity_simple(activity_tx, true, "policy_stale");
                 respond(
@@ -4105,6 +4241,14 @@ async fn handle_forward_proxy(
     };
 
     if let Err(e) = forward_generation_guard.ensure_current() {
+        warn!(
+            host = %host_lc,
+            port,
+            captured_generation = forward_generation_guard.captured_generation(),
+            current_generation = forward_generation_guard.current_generation(),
+            error = %e,
+            "Forward proxy rejected request because policy changed before upstream connect"
+        );
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         emit_activity_simple(activity_tx, true, "policy_stale");
         respond(
@@ -4243,6 +4387,14 @@ async fn handle_forward_proxy(
     };
 
     if let Err(e) = forward_generation_guard.ensure_current() {
+        warn!(
+            host = %host_lc,
+            port,
+            captured_generation = forward_generation_guard.captured_generation(),
+            current_generation = forward_generation_guard.current_generation(),
+            error = %e,
+            "Forward proxy rejected request because policy changed before relay"
+        );
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         respond(
             client,
@@ -4378,6 +4530,46 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn endpoint_only_opa_allows_declared_endpoint_without_process_identity() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let data = r#"
+version: 1
+network_policies:
+  test_l7:
+    name: test_l7
+    endpoints:
+      - host: host.k3d.internal
+        port: 56123
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: /allowed
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let engine = OpaEngine::from_strings_with_binary_identity_required(policy, data, false)
+            .expect("relaxed engine");
+
+        let decision = evaluate_endpoint_only_opa(&engine, "host.k3d.internal", 56123);
+        assert_eq!(
+            decision.action,
+            NetworkAction::Allow {
+                matched_policy: Some("test_l7".to_string()),
+            }
+        );
+        assert!(decision.binary.is_none());
+        assert!(decision.ancestors.is_empty());
+
+        let denied = evaluate_endpoint_only_opa(&engine, "api.example.com", 443);
+        assert!(
+            matches!(denied.action, NetworkAction::Deny { .. }),
+            "endpoint-only mode must still deny undeclared endpoints"
+        );
+    }
 
     fn websocket_l7_config(
         protocol: crate::l7::L7Protocol,

@@ -55,15 +55,30 @@ description = "Run skaffold dev for deploy/helm/openshell (iterative deploy)"
 dir = "deploy/helm/openshell"
 run = "skaffold dev"
 
+["helm:skaffold:dev:sidecar"]
+description = "Run skaffold dev with the Kubernetes supervisor sidecar topology"
+dir = "deploy/helm/openshell"
+run = "skaffold dev -p sidecar"
+
 ["helm:skaffold:run"]
 description = "Run skaffold run for deploy/helm/openshell (one-shot deploy)"
 dir = "deploy/helm/openshell"
 run = "skaffold run"
 
+["helm:skaffold:run:sidecar"]
+description = "Run skaffold run with the Kubernetes supervisor sidecar topology"
+dir = "deploy/helm/openshell"
+run = "skaffold run -p sidecar"
+
 ["helm:skaffold:delete"]
 description = "Run skaffold delete for deploy/helm/openshell"
 dir = "deploy/helm/openshell"
 run = "skaffold delete"
+
+["helm:skaffold:delete:sidecar"]
+description = "Run skaffold delete for the Kubernetes supervisor sidecar topology"
+dir = "deploy/helm/openshell"
+run = "skaffold delete -p sidecar"
 
 ["helm:skaffold:diagnose"]
 description = "Run skaffold diagnose for deploy/helm/openshell"

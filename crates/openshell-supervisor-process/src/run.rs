@@ -33,7 +33,7 @@ use openshell_core::denial::DenialEvent;
 
 #[cfg(target_os = "linux")]
 use crate::managed_children;
-use crate::process::ProcessHandle;
+use crate::process::{ProcessEnforcementMode, ProcessHandle};
 
 fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
@@ -57,6 +57,7 @@ pub async fn run_process(
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<String>,
     policy: &SandboxPolicy,
+    enforcement_mode: ProcessEnforcementMode,
     entrypoint_pid: Arc<AtomicU32>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
@@ -71,21 +72,26 @@ pub async fn run_process(
     // /etc/group so the "sandbox" entry matches. Must run before
     // validate_sandbox_user so passwd lookups see the correct identity.
     #[cfg(unix)]
-    crate::process::update_sandbox_passwd_entries()?;
+    if enforcement_mode.enforces_process_controls() {
+        crate::process::update_sandbox_passwd_entries()?;
+    }
 
     // Validate that the sandbox user exists in the image. All sandbox images
     // must include a "sandbox" user for privilege dropping; failing fast here
     // beats silently running children as root.
     #[cfg(unix)]
-    crate::process::validate_sandbox_user(policy)?;
-    #[cfg(unix)]
-    crate::process::validate_sandbox_group(policy)?;
+    if enforcement_mode.enforces_process_controls() {
+        crate::process::validate_sandbox_user(policy)?;
+        crate::process::validate_sandbox_group(policy)?;
+    }
 
     // Create read_write directories and chown newly-created ones to the
     // sandbox user/group. Runs as the supervisor (root) before the child
     // is forked so the workload sees writable paths it owns.
     #[cfg(unix)]
-    crate::process::prepare_filesystem(policy)?;
+    if enforcement_mode.enforces_process_controls() {
+        crate::process::prepare_filesystem(policy)?;
+    }
 
     // Eagerly fetch initial settings and install the agent skill if the
     // proposals flag is on at startup, rather than waiting for the policy
@@ -206,31 +212,10 @@ pub async fn run_process(
     // their env so cooperative tools (curl, npm, Node) route through the
     // CONNECT proxy. Linux uses the netns host_ip; on other targets fall back
     // to the policy-declared http_addr directly.
-    let ssh_proxy_url = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        #[cfg(target_os = "linux")]
-        {
-            netns.map(|ns| {
-                let port = policy
-                    .network
-                    .proxy
-                    .as_ref()
-                    .and_then(|p| p.http_addr)
-                    .map_or(3128, |addr| addr.port());
-                format!("http://{}:{port}", ns.host_ip())
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            policy
-                .network
-                .proxy
-                .as_ref()
-                .and_then(|p| p.http_addr)
-                .map(|addr| format!("http://{addr}"))
-        }
-    } else {
-        None
-    };
+    #[cfg(target_os = "linux")]
+    let ssh_proxy_url = ssh_proxy_url_for_policy(policy, netns.map(NetworkNamespace::host_ip));
+    #[cfg(not(target_os = "linux"))]
+    let ssh_proxy_url = ssh_proxy_url_for_policy(policy, None);
 
     let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
     if let Some(listen_path) = ssh_socket_path.clone() {
@@ -259,6 +244,7 @@ pub async fn run_process(
                 ca_paths,
                 provider_credentials_clone,
                 user_env_clone,
+                enforcement_mode,
             )
             .await
             {
@@ -325,6 +311,7 @@ pub async fn run_process(
         workdir,
         interactive,
         policy,
+        enforcement_mode,
         netns,
         ca_file_paths.as_ref(),
         &provider_env,
@@ -337,12 +324,16 @@ pub async fn run_process(
         workdir,
         interactive,
         policy,
+        enforcement_mode,
         ca_file_paths.as_ref(),
         &provider_env,
     )?;
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
+    if let Some(path) = entrypoint_pid_file() {
+        write_entrypoint_pid_file(&path, handle.pid())?;
+    }
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
             .activity(ActivityId::Open)
@@ -393,6 +384,42 @@ pub async fn run_process(
     );
 
     Ok(status.code())
+}
+
+fn entrypoint_pid_file() -> Option<String> {
+    std::env::var(openshell_core::sandbox_env::ENTRYPOINT_PID_FILE)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn write_entrypoint_pid_file(path: &str, pid: u32) -> Result<()> {
+    let pid_path = std::path::Path::new(path);
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent).into_diagnostic()?;
+    }
+    std::fs::write(pid_path, format!("{pid}\n")).into_diagnostic()?;
+    info!(
+        path,
+        pid, "Published workload entrypoint PID for network sidecar"
+    );
+    Ok(())
+}
+
+fn ssh_proxy_url_for_policy(
+    policy: &SandboxPolicy,
+    netns_proxy_host: Option<std::net::IpAddr>,
+) -> Option<String> {
+    if !matches!(policy.network.mode, NetworkMode::Proxy) {
+        return None;
+    }
+
+    let proxy = policy.network.proxy.as_ref()?;
+    if let Some(host) = netns_proxy_host {
+        let port = proxy.http_addr.map_or(3128, |addr| addr.port());
+        return Some(format!("http://{host}:{port}"));
+    }
+
+    proxy.http_addr.map(|addr| format!("http://{addr}"))
 }
 
 /// Eagerly fetch initial settings and install the agent-driven policy
@@ -449,5 +476,55 @@ async fn install_initial_agent_skill(sandbox_id: Option<&str>, openshell_endpoin
         tracing::debug!(
             "agent_policy_proposals_enabled is false at startup; skipping skill install"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_core::policy::{
+        FilesystemPolicy, LandlockPolicy, NetworkMode, NetworkPolicy, ProcessPolicy, ProxyPolicy,
+    };
+
+    fn policy(mode: NetworkMode, http_addr: Option<std::net::SocketAddr>) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy {
+                mode,
+                proxy: http_addr.map(|http_addr| ProxyPolicy {
+                    http_addr: Some(http_addr),
+                }),
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn ssh_proxy_url_uses_policy_addr_without_netns() {
+        let policy = policy(NetworkMode::Proxy, Some(([127, 0, 0, 1], 3128).into()));
+
+        assert_eq!(
+            ssh_proxy_url_for_policy(&policy, None).as_deref(),
+            Some("http://127.0.0.1:3128")
+        );
+    }
+
+    #[test]
+    fn ssh_proxy_url_prefers_netns_host_with_policy_port() {
+        let policy = policy(NetworkMode::Proxy, Some(([127, 0, 0, 1], 8080).into()));
+
+        assert_eq!(
+            ssh_proxy_url_for_policy(&policy, Some([10, 200, 0, 1].into())).as_deref(),
+            Some("http://10.200.0.1:8080")
+        );
+    }
+
+    #[test]
+    fn ssh_proxy_url_skips_non_proxy_mode() {
+        let policy = policy(NetworkMode::Allow, Some(([127, 0, 0, 1], 3128).into()));
+
+        assert_eq!(ssh_proxy_url_for_policy(&policy, None), None);
     }
 }

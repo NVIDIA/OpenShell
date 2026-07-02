@@ -6,7 +6,7 @@
 use crate::child_env;
 #[cfg(target_os = "linux")]
 use crate::managed_children;
-use crate::process::{drop_privileges, is_supervisor_only_env_var};
+use crate::process::{ProcessEnforcementMode, drop_privileges, is_supervisor_only_env_var};
 use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
@@ -42,6 +42,7 @@ type SshServerInit = (
 fn ssh_server_init(
     listen_path: &Path,
     ca_file_paths: &Option<(PathBuf, PathBuf)>,
+    enforcement_mode: ProcessEnforcementMode,
 ) -> Result<SshServerInit> {
     let mut rng = OsRng;
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
@@ -55,13 +56,16 @@ fn ssh_server_init(
     let config = Arc::new(config);
     let ca_paths = ca_file_paths.as_ref().map(|p| Arc::new(p.clone()));
 
-    // Ensure the parent directory exists and is root-owned with 0700
-    // permissions. The sandbox entrypoint runs as an unprivileged user; it
-    // must not be able to enter this directory and connect to the socket.
+    // In full enforcement mode the supervisor starts as root and can isolate
+    // the SSH socket in a root-only directory before spawning unprivileged
+    // children. In network-only sidecar mode the process supervisor itself
+    // runs as the sandbox UID, so the driver points the socket at a writable
+    // sidecar state volume and accepts that Unix permissions no longer isolate
+    // same-UID child processes from the socket.
     if let Some(parent) = listen_path.parent() {
         std::fs::create_dir_all(parent).into_diagnostic()?;
         #[cfg(unix)]
-        {
+        if enforcement_mode.enforces_process_controls() {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o700);
             std::fs::set_permissions(parent, perms).into_diagnostic()?;
@@ -108,21 +112,23 @@ pub async fn run_ssh_server(
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
+    enforcement_mode: ProcessEnforcementMode,
 ) -> Result<()> {
-    let (listener, config, ca_paths) = match ssh_server_init(&listen_path, &ca_file_paths) {
-        Ok(v) => {
-            // Signal that the SSH server has bound the socket and is ready to
-            // accept connections. The parent task awaits this before spawning
-            // the entrypoint process, ensuring exec requests won't race
-            // against server startup.
-            let _ = ready_tx.send(Ok(()));
-            v
-        }
-        Err(err) => {
-            let _ = ready_tx.send(Err(err));
-            return Ok(());
-        }
-    };
+    let (listener, config, ca_paths) =
+        match ssh_server_init(&listen_path, &ca_file_paths, enforcement_mode) {
+            Ok(v) => {
+                // Signal that the SSH server has bound the socket and is ready to
+                // accept connections. The parent task awaits this before spawning
+                // the entrypoint process, ensuring exec requests won't race
+                // against server startup.
+                let _ = ready_tx.send(Ok(()));
+                v
+            }
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+                return Ok(());
+            }
+        };
 
     loop {
         let (stream, _peer) = listener.accept().await.into_diagnostic()?;
@@ -145,6 +151,7 @@ pub async fn run_ssh_server(
                 ca_paths,
                 provider_credentials,
                 user_environment,
+                enforcement_mode,
             )
             .await
             {
@@ -172,6 +179,7 @@ async fn handle_connection(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
+    enforcement_mode: ProcessEnforcementMode,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -195,6 +203,7 @@ async fn handle_connection(
         ca_file_paths,
         provider_credentials,
         user_environment,
+        enforcement_mode,
     );
     russh::server::run_stream(config, stream, handler)
         .await
@@ -223,6 +232,7 @@ struct SshHandler {
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
+    enforcement_mode: ProcessEnforcementMode,
     channels: HashMap<ChannelId, ChannelState>,
 }
 
@@ -236,6 +246,7 @@ impl SshHandler {
         ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
         provider_credentials: ProviderCredentialState,
         user_environment: HashMap<String, String>,
+        enforcement_mode: ProcessEnforcementMode,
     ) -> Self {
         Self {
             policy,
@@ -245,6 +256,7 @@ impl SshHandler {
             ca_file_paths,
             provider_credentials,
             user_environment,
+            enforcement_mode,
             channels: HashMap::new(),
         }
     }
@@ -468,6 +480,7 @@ impl russh::server::Handler for SshHandler {
                 self.ca_file_paths.clone(),
                 &self.provider_credentials.child_env_with_gcp_resolved(),
                 &self.user_environment,
+                self.enforcement_mode,
             )?;
             let state = self.channels.get_mut(&channel).ok_or_else(|| {
                 anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
@@ -564,6 +577,7 @@ impl SshHandler {
                 self.ca_file_paths.clone(),
                 &provider_env,
                 &self.user_environment,
+                self.enforcement_mode,
             )?;
             state.pty_master = Some(pty_master);
             state.input_sender = Some(input_sender);
@@ -582,6 +596,7 @@ impl SshHandler {
                 self.ca_file_paths.clone(),
                 &provider_env,
                 &self.user_environment,
+                self.enforcement_mode,
             )?;
             state.input_sender = Some(input_sender);
         }
@@ -748,6 +763,7 @@ fn spawn_pty_shell(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
     user_environment: &HashMap<String, String>,
+    enforcement_mode: ProcessEnforcementMode,
 ) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
     let winsize = Winsize {
         ws_row: to_u16(pty.row_height.max(1)),
@@ -806,12 +822,20 @@ fn spawn_pty_shell(
 
     // Probe Landlock availability from the parent process where tracing works.
     #[cfg(target_os = "linux")]
-    sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+    if enforcement_mode.enforces_process_controls() {
+        sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+    }
 
     // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
     #[cfg(target_os = "linux")]
-    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
-        .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    let prepared_sandbox = if enforcement_mode.enforces_process_controls() {
+        Some(
+            sandbox::linux::prepare(policy, workdir.as_deref())
+                .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?,
+        )
+    } else {
+        None
+    };
 
     #[cfg(unix)]
     {
@@ -821,6 +845,7 @@ fn spawn_pty_shell(
             workdir.clone(),
             slave_fd,
             netns_fd,
+            enforcement_mode,
             #[cfg(target_os = "linux")]
             prepared_sandbox,
         )?;
@@ -913,6 +938,7 @@ fn spawn_pipe_exec(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
     user_environment: &HashMap<String, String>,
+    enforcement_mode: ProcessEnforcementMode,
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
     let mut cmd = command.map_or_else(
         || {
@@ -955,12 +981,20 @@ fn spawn_pipe_exec(
 
     // Probe Landlock availability from the parent process where tracing works.
     #[cfg(target_os = "linux")]
-    sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+    if enforcement_mode.enforces_process_controls() {
+        sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+    }
 
     // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
     #[cfg(target_os = "linux")]
-    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
-        .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    let prepared_sandbox = if enforcement_mode.enforces_process_controls() {
+        Some(
+            sandbox::linux::prepare(policy, workdir.as_deref())
+                .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?,
+        )
+    } else {
+        None
+    };
 
     #[cfg(unix)]
     {
@@ -969,6 +1003,7 @@ fn spawn_pipe_exec(
             policy.clone(),
             workdir.clone(),
             netns_fd,
+            enforcement_mode,
             #[cfg(target_os = "linux")]
             prepared_sandbox,
         )?;
@@ -1068,7 +1103,9 @@ fn spawn_pipe_exec(
 mod unsafe_pty {
     #[cfg(not(target_os = "linux"))]
     use super::sandbox;
-    use super::{Command, RawFd, SandboxPolicy, Winsize, drop_privileges, setsid};
+    use super::{
+        Command, ProcessEnforcementMode, RawFd, SandboxPolicy, Winsize, drop_privileges, setsid,
+    };
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
 
@@ -1107,17 +1144,21 @@ mod unsafe_pty {
         _workdir: Option<String>,
         slave_fd: RawFd,
         netns_fd: Option<RawFd>,
-        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
+        enforcement_mode: ProcessEnforcementMode,
+        #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> anyhow::Result<()> {
         // Wrap in Option so we can .take() it out of the FnMut closure.
         // pre_exec is only called once (after fork, before exec).
         #[cfg(target_os = "linux")]
-        let mut prepared = Some(prepared);
+        let mut prepared = prepared;
         #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = crate::process::supervisor_identity_mount_from_env()
-            .map_err(|err| {
+        let supervisor_identity_mount = if enforcement_mode.enforces_process_controls() {
+            crate::process::supervisor_identity_mount_from_env().map_err(|err| {
                 anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
-            })?;
+            })?
+        } else {
+            None
+        };
         unsafe {
             cmd.pre_exec(move || {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -1126,6 +1167,7 @@ mod unsafe_pty {
                 enter_netns_and_sandbox(
                     netns_fd,
                     &policy,
+                    enforcement_mode,
                     #[cfg(target_os = "linux")]
                     supervisor_identity_mount,
                     #[cfg(target_os = "linux")]
@@ -1152,20 +1194,25 @@ mod unsafe_pty {
         policy: SandboxPolicy,
         _workdir: Option<String>,
         netns_fd: Option<RawFd>,
-        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
+        enforcement_mode: ProcessEnforcementMode,
+        #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
-        let mut prepared = Some(prepared);
+        let mut prepared = prepared;
         #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = crate::process::supervisor_identity_mount_from_env()
-            .map_err(|err| {
+        let supervisor_identity_mount = if enforcement_mode.enforces_process_controls() {
+            crate::process::supervisor_identity_mount_from_env().map_err(|err| {
                 anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
-            })?;
+            })?
+        } else {
+            None
+        };
         unsafe {
             cmd.pre_exec(move || {
                 enter_netns_and_sandbox(
                     netns_fd,
                     &policy,
+                    enforcement_mode,
                     #[cfg(target_os = "linux")]
                     supervisor_identity_mount,
                     #[cfg(target_os = "linux")]
@@ -1179,6 +1226,7 @@ mod unsafe_pty {
     fn enter_netns_and_sandbox(
         netns_fd: Option<RawFd>,
         policy: &SandboxPolicy,
+        enforcement_mode: ProcessEnforcementMode,
         #[cfg(target_os = "linux")] supervisor_identity_mount: Option<
             &crate::process::SupervisorIdentityMountNamespace,
         >,
@@ -1207,7 +1255,9 @@ mod unsafe_pty {
 
         // Drop privileges. initgroups/setgid/setuid need /etc/group and
         // /etc/passwd which would be blocked if Landlock were already enforced.
-        drop_privileges(policy).map_err(|err| std::io::Error::other(err.to_string()))?;
+        if enforcement_mode.enforces_process_controls() {
+            drop_privileges(policy).map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
         crate::process::harden_child_process()
             .map_err(|err| std::io::Error::other(err.to_string()))?;
 
@@ -1220,7 +1270,9 @@ mod unsafe_pty {
         }
 
         #[cfg(not(target_os = "linux"))]
-        sandbox::apply(policy, None).map_err(|err| std::io::Error::other(err.to_string()))?;
+        if enforcement_mode.enforces_process_controls() {
+            sandbox::apply(policy, None).map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
 
         Ok(())
     }
@@ -1681,21 +1733,24 @@ mod tests {
             policy,
             None,
             None, // no netns fd
+            ProcessEnforcementMode::Full,
             #[cfg(target_os = "linux")]
-            sandbox::linux::prepare(
-                &SandboxPolicy {
-                    version: 0,
-                    filesystem: FilesystemPolicy::default(),
-                    network: NetworkPolicy::default(),
-                    landlock: LandlockPolicy::default(),
-                    process: ProcessPolicy {
-                        run_as_user: None,
-                        run_as_group: None,
+            Some(
+                sandbox::linux::prepare(
+                    &SandboxPolicy {
+                        version: 0,
+                        filesystem: FilesystemPolicy::default(),
+                        network: NetworkPolicy::default(),
+                        landlock: LandlockPolicy::default(),
+                        process: ProcessPolicy {
+                            run_as_user: None,
+                            run_as_group: None,
+                        },
                     },
-                },
-                None,
-            )
-            .expect("prepare should succeed in test environment"),
+                    None,
+                )
+                .expect("prepare should succeed in test environment"),
+            ),
         )
         .expect("install pre_exec should succeed");
 
