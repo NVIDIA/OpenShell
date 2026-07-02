@@ -37,13 +37,6 @@ jobs:
           - suite: rust-docker
             cmd: "mise run --no-deps --skip-deps e2e:rust"
             apt_packages: "openssh-client"
-          - suite: rust-podman
-            cmd: "mise run --no-deps --skip-deps e2e:podman"
-            apt_packages: "openssh-client podman"
-          - suite: rust-podman-rootless
-            cmd: "mise run --no-deps --skip-deps e2e:podman:rootless"
-            apt_packages: "openssh-client podman uidmap"
-            rootless: true
           - suite: mcp
             cmd: "mise run --no-deps --skip-deps e2e:mcp"
             apt_packages: ""
@@ -89,28 +82,6 @@ jobs:
       - name: Log in to GHCR with Docker
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Log in to GHCR with Podman
-        if: startsWith(matrix.suite, 'rust-podman')
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Set up rootless Podman user
-        if: matrix.rootless
-        run: |
-          useradd -m openshell-test
-          echo "openshell-test:100000:65536" >> /etc/subuid
-          echo "openshell-test:100000:65536" >> /etc/subgid
-          mkdir -p "/run/user/$(id -u openshell-test)"
-          chown openshell-test: "/run/user/$(id -u openshell-test)"
-          chmod 700 "/run/user/$(id -u openshell-test)"
-          chown -R openshell-test: .
-          mkdir -p /home/openshell-test/.cache/mise /home/openshell-test/.cargo /home/openshell-test/.local/state/mise
-          chown -R openshell-test: /home/openshell-test/.cache /home/openshell-test/.cargo /home/openshell-test/.local
-          install -m 0755 "$(command -v mise)" /usr/local/bin/mise
-          chmod a+x /root /root/.local /root/.local/bin
-          for dir in /root/.cargo /root/.rustup /root/.local/share/mise /opt/mise; do
-            [ -d "$dir" ] && chmod -R a+rX "$dir"
-          done
-
       - name: Install Python dependencies and generate protobuf stubs
         if: matrix.suite == 'python'
         run: uv sync --frozen && mise run --no-deps python:proto
@@ -119,27 +90,81 @@ jobs:
         env:
           OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
           OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE: ${{ format('openshell-mcp-conformance-client:{0}', inputs.image-tag) }}
-          E2E_CMD: ${{ matrix.cmd }}
+        run: ${{ matrix.cmd }}
+
+  e2e-podman-rootless:
+    name: E2E (rust-podman-rootless)
+    # Run directly on the Ubuntu host so the test observes the host's AppArmor
+    # and unprivileged-user-namespace policy. A privileged job container masks
+    # the restrictions that production rootless Podman installations enforce.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    env:
+      IMAGE_TAG: ${{ inputs.image-tag }}
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+      OPENSHELL_REGISTRY_HOST: ghcr.io
+      OPENSHELL_REGISTRY_NAMESPACE: nvidia/openshell
+      OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
+      OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+          persist-credentials: false
+
+      - name: Install mise
         run: |
-          if [ "${{ matrix.rootless }}" = "true" ]; then
-            TESTUID="$(id -u openshell-test)"
-            runuser -u openshell-test -- env \
-              XDG_RUNTIME_DIR="/run/user/${TESTUID}" \
-              HOME="/home/openshell-test" \
-              PATH="/usr/local/bin:/root/.cargo/bin:/opt/mise/shims:/root/.local/bin:${PATH}" \
-              CARGO_HOME="/home/openshell-test/.cargo" \
-              RUSTUP_HOME="/root/.rustup" \
-              MISE_DATA_DIR="/opt/mise" \
-              MISE_CACHE_DIR="/home/openshell-test/.cache/mise" \
-              MISE_STATE_DIR="/home/openshell-test/.local/state/mise" \
-              OPENSHELL_SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE}" \
-              OPENSHELL_REGISTRY="${OPENSHELL_REGISTRY}" \
-              OPENSHELL_REGISTRY_HOST="${OPENSHELL_REGISTRY_HOST}" \
-              OPENSHELL_REGISTRY_USERNAME="${OPENSHELL_REGISTRY_USERNAME}" \
-              OPENSHELL_REGISTRY_PASSWORD="${OPENSHELL_REGISTRY_PASSWORD}" \
-              IMAGE_TAG="${IMAGE_TAG}" \
-              MISE_GITHUB_TOKEN="${MISE_GITHUB_TOKEN}" \
-              bash -c "${E2E_CMD}"
-          else
-            ${E2E_CMD}
+          curl https://mise.run | MISE_VERSION=v2026.4.25 sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Install Podman and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            fuse-overlayfs \
+            libssl-dev \
+            libz3-dev \
+            openssh-client \
+            passt \
+            pkg-config \
+            podman \
+            slirp4netns \
+            uidmap
+
+      - name: Configure rootless Podman
+        run: |
+          set -euo pipefail
+          if ! grep -q "^${USER}:" /etc/subuid; then
+            sudo usermod --add-subuids 100000-165535 "$USER"
           fi
+          if ! grep -q "^${USER}:" /etc/subgid; then
+            sudo usermod --add-subgids 100000-165535 "$USER"
+          fi
+          runtime_dir="/run/user/$(id -u)"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
+          echo "XDG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
+
+      - name: Verify rootless Podman environment
+        run: |
+          set -euo pipefail
+          podman_version="$(podman version --format '{{.Client.Version}}')"
+          case "$podman_version" in
+            5.*) ;;
+            *) echo "ERROR: expected Podman 5.x, found $podman_version" >&2; exit 1 ;;
+          esac
+          test "$(podman info --format '{{.Host.Security.Rootless}}')" = "true"
+          test "$(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
+
+      - name: Log in to GHCR with Podman
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Run rootless Podman E2E
+        run: mise run --no-deps --skip-deps e2e:podman:rootless
