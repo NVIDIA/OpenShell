@@ -308,7 +308,28 @@ The shared state directory should preserve `sandbox_gid` inheritance
 `@openshell-sidecar-ssh`; the network sidecar verifies its peer PID before
 bridging gateway relay requests. No `ssh.sock` file should appear in the shared
 state directory.
-Inspect all three when sandbox registration or egress enforcement fails:
+
+If `topology = "proxy-pod"` is rendered, each sandbox should have a
+separate supervisor Deployment with one supervisor pod, a headless supervisor
+Service, a proxy CA Secret, and two per-sandbox NetworkPolicies. The agent pod
+should have `openshell.ai/sandbox-role=agent`; the supervisor pod should have
+`openshell.ai/sandbox-role=supervisor`; both should share the same
+`openshell.ai/sandbox-id`. The supervisor Deployment must have a controlling
+`Sandbox` ownerReference. The Deployment pod template must carry the
+`openshell.io/sandbox-id` annotation so the TokenReview bootstrap path can mint
+a sandbox JWT. For supervisor pods, the gateway validates the
+`Pod -> ReplicaSet -> Deployment -> Sandbox` owner chain, so missing
+`apps/replicasets get` RBAC can also break bootstrap. Helm renders the
+Deployment, ReplicaSet, Service, Secret, and NetworkPolicy RBAC only when
+`supervisor.topology=proxy-pod`; if those resources fail with forbidden errors,
+confirm both the rendered `gateway.toml` and Helm values use proxy-pod topology.
+If the agent cannot reach the gateway, check DNS to the headless Service, the
+agent egress NetworkPolicy DNS exception for kube-dns/CoreDNS, and the
+supervisor ingress NetworkPolicy allowing only that agent pod on ports `3128`
+and `18080`.
+
+Inspect the relevant containers when sandbox registration or egress enforcement
+fails:
 
 ```bash
 kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E '^\[openshell\.drivers\.kubernetes\]|^topology\s*='

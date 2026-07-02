@@ -65,6 +65,11 @@ description = "Run skaffold dev with the Kubernetes supervisor sidecar topology 
 dir = "deploy/helm/openshell"
 run = "skaffold dev -p sidecar-mtls"
 
+["helm:skaffold:dev:proxy-pod"]
+description = "Run skaffold dev with proxy-pod topology; requires NetworkPolicy enforcement in the target cluster"
+dir = "deploy/helm/openshell"
+run = "skaffold dev -p proxy-pod"
+
 ["helm:skaffold:run"]
 description = "Run skaffold run for deploy/helm/openshell (one-shot deploy)"
 dir = "deploy/helm/openshell"
@@ -80,6 +85,11 @@ description = "Run skaffold run with the Kubernetes supervisor sidecar topology 
 dir = "deploy/helm/openshell"
 run = "skaffold run -p sidecar-mtls"
 
+["helm:skaffold:run:proxy-pod"]
+description = "Run skaffold run with proxy-pod topology; requires NetworkPolicy enforcement in the target cluster"
+dir = "deploy/helm/openshell"
+run = "skaffold run -p proxy-pod"
+
 ["helm:skaffold:delete"]
 description = "Run skaffold delete for deploy/helm/openshell"
 dir = "deploy/helm/openshell"
@@ -94,6 +104,11 @@ run = "skaffold delete -p sidecar"
 description = "Run skaffold delete for the Kubernetes supervisor sidecar topology with TLS/mTLS enabled"
 dir = "deploy/helm/openshell"
 run = "skaffold delete -p sidecar-mtls"
+
+["helm:skaffold:delete:proxy-pod"]
+description = "Run skaffold delete for the Kubernetes proxy-pod topology"
+dir = "deploy/helm/openshell"
+run = "skaffold delete -p proxy-pod"
 
 ["helm:skaffold:diagnose"]
 description = "Run skaffold diagnose for deploy/helm/openshell"

@@ -64,9 +64,11 @@ Podman, and VM drivers deliver the initial token through supervisor-only
 runtime material; Kubernetes supervisors exchange a projected ServiceAccount
 token through `IssueSandboxToken`. The gateway validates that projected token
 with Kubernetes `TokenReview`, requires the configured sandbox service account,
-checks the returned pod binding against the live pod UID, and verifies the pod's
-controlling `Sandbox` ownerReference against the live Sandbox CR UID and
-sandbox-id label before minting the gateway JWT. The bootstrap path accepts
+checks the returned pod binding against the live pod UID, and verifies the
+pod's ownership against the live Sandbox CR UID and sandbox-id label before
+minting the gateway JWT. Agent pods must be directly controlled by the
+`Sandbox` CR. Proxy-pod supervisor pods may be controlled through the Kubernetes
+`Pod -> ReplicaSet -> Deployment -> Sandbox` chain. The bootstrap path accepts
 both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
 controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
 deployments. Supervisors renew gateway JWTs in memory before expiry only while

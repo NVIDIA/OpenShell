@@ -121,6 +121,11 @@ deploy:
           #- ci/values-spire.yaml
           # To exercise the Kubernetes supervisor sidecar topology:
           #- ci/values-sidecar.yaml
+          # To exercise proxy-pod topology, use the proxy-pod Skaffold profile
+          # against a cluster with NetworkPolicy enforcement enabled. Stock k3s
+          # includes its embedded network policy controller; if you replace the
+          # CNI, install a policy-enforcing CNI before deploying this profile.
+          #- ci/values-proxy-pod.yaml
           # To test multi-replica external PostgreSQL behavior:
           #- ci/values-high-availability.yaml
         setValueTemplates:
@@ -143,3 +148,8 @@ profiles:
         path: /deploy/helm/releases/0/setValues
         value:
           server.disableTls: "false"
+  - name: proxy-pod
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-proxy-pod.yaml

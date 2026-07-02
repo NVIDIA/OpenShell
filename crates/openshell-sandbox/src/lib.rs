@@ -68,11 +68,14 @@ use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
+use tokio::io::copy_bidirectional;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
 #[cfg(any(test, target_os = "linux"))]
 use tokio::time::timeout;
 
 const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
+const PROXY_POD_NETWORK_ENFORCEMENT_MODE: &str = "proxy-pod";
 const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
 const SIDECAR_CA_CERT: &str = "openshell-ca.pem";
 const SIDECAR_CA_BUNDLE: &str = "ca-bundle.pem";
@@ -134,7 +137,9 @@ pub async fn run_sandbox(
         }
     }
 
+    let external_network_enforcement = external_network_enforcement_enabled();
     let sidecar_network_enforcement = sidecar_network_enforcement_enabled();
+    let proxy_pod_network_enforcement = proxy_pod_network_enforcement_enabled();
     let process_enforcement_mode = process_enforcement_mode();
     let process_uses_sidecar_control =
         process_enabled && !network_enabled && sidecar_network_enforcement;
@@ -156,6 +161,14 @@ pub async fn run_sandbox(
     } else {
         None
     };
+    let supervisor_ready_addr = supervisor_ready_addr();
+    if process_enabled
+        && !network_enabled
+        && proxy_pod_network_enforcement
+        && let Some(addr) = supervisor_ready_addr.as_deref()
+    {
+        wait_for_supervisor_ready_addr(addr).await?;
+    }
 
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
@@ -313,7 +326,7 @@ pub async fn run_sandbox(
     // it via setns(). The RAII handle lives in this frame for the duration
     // of the sandbox.
     #[cfg(target_os = "linux")]
-    let netns = if network_enabled && !sidecar_network_enforcement {
+    let netns = if network_enabled && !external_network_enforcement {
         openshell_supervisor_process::netns::create_netns_for_proxy(&policy)?
     } else {
         None
@@ -383,11 +396,25 @@ pub async fn run_sandbox(
         None
     };
 
+    let _gateway_forward = if network_enabled && proxy_pod_network_enforcement {
+        if !matches!(policy.network.mode, NetworkMode::Proxy) {
+            return Err(miette::miette!(
+                "external network enforcement requires proxy network mode"
+            ));
+        }
+        let endpoint = openshell_endpoint_for_proxy.as_deref().ok_or_else(|| {
+            miette::miette!("proxy-pod network enforcement requires an OpenShell gateway endpoint")
+        })?;
+        Some(start_gateway_forward_from_env(endpoint).await?)
+    } else {
+        None
+    };
+
     #[cfg(target_os = "linux")]
     let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
         if !matches!(policy.network.mode, NetworkMode::Proxy) {
             return Err(miette::miette!(
-                "sidecar network enforcement requires proxy network mode"
+                "external network enforcement requires proxy network mode"
             ));
         }
         let socket = sidecar_control_socket().ok_or_else(|| {
@@ -451,9 +478,9 @@ pub async fn run_sandbox(
     }
 
     #[cfg(not(target_os = "linux"))]
-    if network_enabled && sidecar_network_enforcement {
+    if network_enabled && external_network_enforcement {
         return Err(miette::miette!(
-            "sidecar network enforcement is only supported on Linux"
+            "external network enforcement is only supported on Linux"
         ));
     }
 
@@ -628,6 +655,8 @@ pub async fn run_sandbox(
                     sidecar_bootstrap_ca_file_paths
                         .clone()
                         .or_else(sidecar_ca_file_paths)
+                } else if proxy_pod_network_enforcement {
+                    sidecar_ca_file_paths()
                 } else {
                     None
                 }
@@ -773,12 +802,26 @@ fn sidecar_network_enforcement_enabled() -> bool {
         .is_ok_and(|value| value == SIDECAR_NETWORK_ENFORCEMENT_MODE)
 }
 
+fn proxy_pod_network_enforcement_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE)
+        .is_ok_and(|value| value == PROXY_POD_NETWORK_ENFORCEMENT_MODE)
+}
+
+fn external_network_enforcement_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE).is_ok_and(|value| {
+        matches!(
+            value.as_str(),
+            SIDECAR_NETWORK_ENFORCEMENT_MODE | PROXY_POD_NETWORK_ENFORCEMENT_MODE
+        )
+    })
+}
+
 fn process_enforcement_mode() -> ProcessEnforcementMode {
     match std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
         .ok()
         .as_deref()
     {
-        Some("sidecar") => ProcessEnforcementMode::NetworkOnly,
+        Some("sidecar" | "proxy-pod") => ProcessEnforcementMode::NetworkOnly,
         _ => ProcessEnforcementMode::Full,
     }
 }
@@ -788,6 +831,30 @@ fn sidecar_control_socket() -> Option<std::path::PathBuf> {
         .ok()
         .filter(|path| !path.is_empty())
         .map(std::path::PathBuf::from)
+}
+
+fn supervisor_ready_addr() -> Option<String> {
+    std::env::var(openshell_core::sandbox_env::SUPERVISOR_READY_ADDR)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+async fn wait_for_supervisor_ready_addr(addr: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS);
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(_) => {
+                info!(addr, "Network supervisor TCP endpoint is ready");
+                return Ok(());
+            }
+            Err(err) if tokio::time::Instant::now() >= deadline => {
+                return Err(miette::miette!(
+                    "timed out waiting for network supervisor TCP endpoint {addr}: {err}"
+                ));
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -966,6 +1033,100 @@ fn process_policy_for_topology(
         }
     }
     Ok(process_policy)
+}
+
+struct GatewayForwardHandle {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for GatewayForwardHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn start_gateway_forward_from_env(endpoint: &str) -> Result<GatewayForwardHandle> {
+    let listen_addr =
+        std::env::var(openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR).map_err(|_| {
+            miette::miette!(
+                "{} is required for proxy-pod gateway forwarding",
+                openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR
+            )
+        })?;
+    start_gateway_forward(&listen_addr, endpoint).await
+}
+
+async fn start_gateway_forward(listen_addr: &str, endpoint: &str) -> Result<GatewayForwardHandle> {
+    let upstream = gateway_tcp_addr(endpoint)?;
+    let listener = TcpListener::bind(listen_addr).await.into_diagnostic()?;
+    info!(
+        listen_addr,
+        upstream, "Gateway TCP forward started for proxy-pod topology"
+    );
+
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut inbound, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    warn!(error = %e, "Gateway forward accept failed");
+                    continue;
+                }
+            };
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let mut outbound = match TcpStream::connect(&upstream).await {
+                    Ok(stream) => stream,
+                    Err(e) => {
+                        warn!(peer = %peer, upstream, error = %e, "Gateway forward connect failed");
+                        return;
+                    }
+                };
+                if let Err(e) = copy_bidirectional(&mut inbound, &mut outbound).await {
+                    debug!(peer = %peer, error = %e, "Gateway forward connection closed with error");
+                }
+            });
+        }
+    });
+
+    Ok(GatewayForwardHandle { task })
+}
+
+fn gateway_tcp_addr(endpoint: &str) -> Result<String> {
+    let (scheme, rest) = endpoint
+        .split_once("://")
+        .ok_or_else(|| miette::miette!("gateway endpoint must include a URL scheme"))?;
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        other => {
+            return Err(miette::miette!(
+                "unsupported gateway endpoint scheme '{other}' for proxy-pod forwarding"
+            ));
+        }
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        return Err(miette::miette!("gateway endpoint is missing a host"));
+    }
+    if authority.starts_with('[') {
+        let closing = authority
+            .find(']')
+            .ok_or_else(|| miette::miette!("invalid bracketed IPv6 gateway endpoint"))?;
+        let host = &authority[..=closing];
+        let port = authority[closing + 1..]
+            .strip_prefix(':')
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Ok(format!("{host}:{port}"));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => {
+            (host, port.parse::<u16>().unwrap_or(default_port))
+        }
+        _ => (authority, default_port),
+    };
+    Ok(format!("{host}:{port}"))
 }
 
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
