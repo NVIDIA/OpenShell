@@ -540,6 +540,18 @@ mod tests {
             }
         }
 
+        if std::fs::read_link(format!("/proc/{child_pid}/exe")).is_err()
+            || std::fs::read_dir(format!("/proc/{child_pid}/fd")).is_err()
+        {
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+                libc::waitpid(child_pid, std::ptr::null_mut(), 0);
+            }
+            eprintln!("skipping: cannot read /proc/{child_pid} (restricted /proc)");
+            return;
+        }
+
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             if let Ok(link) = std::fs::read_link(format!("/proc/{child_pid}/exe"))

@@ -1599,6 +1599,17 @@ mod tests {
         });
 
         let result = drop_privileges(&policy);
+        #[cfg(target_os = "linux")]
+        {
+            if nix::unistd::geteuid().is_root() && !capability_bounding_set_clear_available() {
+                let msg = format!("{}", result.unwrap_err());
+                assert!(
+                    msg.contains("Failed to clear child capability bounding set"),
+                    "unexpected failure: {msg}"
+                );
+                return;
+            }
+        }
         assert!(result.is_ok(), "drop_privileges failed: {result:?}");
     }
 
@@ -1913,9 +1924,10 @@ mod tests {
             return;
         }
 
-        let current_user = User::from_uid(nix::unistd::geteuid())
-            .unwrap()
-            .expect("current user entry");
+        let Ok(Some(current_user)) = User::from_uid(nix::unistd::geteuid()) else {
+            eprintln!("skipping: current UID has no /etc/passwd entry");
+            return;
+        };
         let restricted_group = Group::from_gid(Gid::from_raw(0))
             .unwrap()
             .expect("gid 0 group entry");
@@ -2266,10 +2278,10 @@ mod tests {
     }
 
     #[test]
-    fn drop_privileges_numeric_uid_without_passwd_entry_skips_lookup() {
-        // UID/GID 999999 has no /etc/passwd entry. drop_privileges must not fail
-        // with "Failed to resolve user record" — if it fails, EPERM is expected
-        // (non-root can't setuid to a different UID), not a lookup error.
+    fn numeric_uid_privilege_drop_child() {
+        if std::env::var_os("OPENSHELL_TEST_NUMERIC_UID_CHILD").is_none() {
+            return;
+        }
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("999999".into()),
             run_as_group: Some("999999".into()),
@@ -2283,5 +2295,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn drop_privileges_numeric_uid_without_passwd_entry_skips_lookup() {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
+        cmd.arg("numeric_uid_privilege_drop_child")
+            .arg("--nocapture")
+            .env("OPENSHELL_TEST_NUMERIC_UID_CHILD", "1")
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped());
+        let output = cmd.output().expect("spawn child");
+        assert!(
+            output.status.success(),
+            "numeric UID privilege drop child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
