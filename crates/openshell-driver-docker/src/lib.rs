@@ -1799,6 +1799,15 @@ fn docker_bind_string(
 ) -> Result<String, Status> {
     driver_mounts::validate_absolute_mount_source(source, "bind source")
         .map_err(Status::failed_precondition)?;
+    // Legacy `-v` binds silently create missing source directories as empty,
+    // root-owned paths.  The structured `--mount` API that was used before this
+    // change rejected missing sources at container-create time.  Preserve that
+    // fail-fast behaviour with an explicit existence check.
+    if !Path::new(source).exists() {
+        return Err(Status::failed_precondition(format!(
+            "bind source path does not exist: {source}"
+        )));
+    }
     driver_mounts::validate_container_mount_target(target).map_err(Status::failed_precondition)?;
     let normalized_target = driver_mounts::normalize_mount_target(target);
 
@@ -1824,23 +1833,22 @@ fn docker_driver_mounts(config: &DockerSandboxDriverConfig) -> Result<Vec<Mount>
     config
         .mounts
         .iter()
-        .filter(|m| !matches!(m, DockerDriverMountConfig::Bind { .. }))
-        .map(docker_mount_from_config)
+        .filter_map(|m| docker_mount_from_config(m).transpose())
         .collect()
 }
 
-fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, Status> {
+fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Option<Mount>, Status> {
     match config {
         DockerDriverMountConfig::Bind { .. } => {
             // Bind mounts are handled via docker_driver_bind_strings.
-            unreachable!("bind mounts are filtered out before reaching docker_mount_from_config")
+            Ok(None)
         }
         DockerDriverMountConfig::Volume {
             source,
             target,
             read_only,
             subpath,
-        } => Ok(Mount {
+        } => Ok(Some(Mount {
             typ: Some(MountTypeEnum::VOLUME),
             source: Some(source.clone()),
             target: Some(target.clone()),
@@ -1850,13 +1858,13 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
                 ..Default::default()
             }),
             ..Default::default()
-        }),
+        })),
         DockerDriverMountConfig::Tmpfs {
             target,
             options,
             size_bytes,
             mode,
-        } => Ok(Mount {
+        } => Ok(Some(Mount {
             typ: Some(MountTypeEnum::TMPFS),
             target: Some(target.clone()),
             tmpfs_options: Some(MountTmpfsOptions {
@@ -1875,7 +1883,7 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
                     .transpose()?,
             }),
             ..Default::default()
-        }),
+        })),
         DockerDriverMountConfig::Image { .. } => Err(Status::failed_precondition(
             "invalid docker driver_config: docker image mounts are not supported",
         )),

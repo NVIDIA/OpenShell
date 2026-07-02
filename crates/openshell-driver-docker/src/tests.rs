@@ -781,6 +781,8 @@ fn driver_config_rejects_bind_mounts_unless_enabled() {
 
 #[test]
 fn build_container_create_body_includes_bind_mounts_when_enabled() {
+    let bind_src = TempDir::new().unwrap();
+    let src_path = bind_src.path().to_str().unwrap();
     let mut sandbox = test_sandbox();
     sandbox
         .spec
@@ -792,7 +794,7 @@ fn build_container_create_body_includes_bind_mounts_when_enabled() {
         .driver_config = Some(json_struct(serde_json::json!({
         "mounts": [{
             "type": "bind",
-            "source": "/host/path",
+            "source": src_path,
             "target": "/sandbox/host",
             "read_only": true
         }]
@@ -810,9 +812,10 @@ fn build_container_create_body_includes_bind_mounts_when_enabled() {
         .expect("binds should be set");
 
     // User bind mount appears after the system binds.
+    let expected = format!("{src_path}:/sandbox/host:ro");
     assert!(
-        binds.iter().any(|b| b == "/host/path:/sandbox/host:ro"),
-        "expected bind entry '/host/path:/sandbox/host:ro', got {binds:?}"
+        binds.iter().any(|b| b == &expected),
+        "expected bind entry '{expected}', got {binds:?}"
     );
     // Bind mounts must not appear in the structured mounts vec.
     let mounts = body.host_config.unwrap().mounts.unwrap_or_default();
@@ -824,6 +827,8 @@ fn build_container_create_body_includes_bind_mounts_when_enabled() {
 
 #[test]
 fn driver_config_defaults_enabled_bind_mounts_to_read_only() {
+    let bind_src = TempDir::new().unwrap();
+    let src_path = bind_src.path().to_str().unwrap();
     let mut sandbox = test_sandbox();
     sandbox
         .spec
@@ -835,7 +840,7 @@ fn driver_config_defaults_enabled_bind_mounts_to_read_only() {
         .driver_config = Some(json_struct(serde_json::json!({
         "mounts": [{
             "type": "bind",
-            "source": "/host/path",
+            "source": src_path,
             "target": "/sandbox/host"
         }]
     })));
@@ -849,16 +854,17 @@ fn driver_config_defaults_enabled_bind_mounts_to_read_only() {
         .binds
         .expect("binds should be set");
 
+    let expected = format!("{src_path}:/sandbox/host:ro");
     assert!(
-        binds
-            .iter()
-            .any(|b| b.contains("/host/path:/sandbox/host:ro")),
+        binds.iter().any(|b| b == &expected),
         "default bind mount should be read-only, got {binds:?}"
     );
 }
 
 #[test]
 fn bind_mount_selinux_shared_label() {
+    let bind_src = TempDir::new().unwrap();
+    let src_path = bind_src.path().to_str().unwrap();
     let mut sandbox = test_sandbox();
     sandbox
         .spec
@@ -870,7 +876,7 @@ fn bind_mount_selinux_shared_label() {
         .driver_config = Some(json_struct(serde_json::json!({
         "mounts": [{
             "type": "bind",
-            "source": "/data/shared",
+            "source": src_path,
             "target": "/sandbox/data",
             "read_only": true,
             "selinux_label": "shared"
@@ -886,14 +892,17 @@ fn bind_mount_selinux_shared_label() {
         .binds
         .expect("binds should be set");
 
+    let expected = format!("{src_path}:/sandbox/data:ro,z");
     assert!(
-        binds.iter().any(|b| b == "/data/shared:/sandbox/data:ro,z"),
+        binds.iter().any(|b| b == &expected),
         "expected ':ro,z' label, got {binds:?}"
     );
 }
 
 #[test]
 fn bind_mount_selinux_private_label() {
+    let bind_src = TempDir::new().unwrap();
+    let src_path = bind_src.path().to_str().unwrap();
     let mut sandbox = test_sandbox();
     sandbox
         .spec
@@ -905,7 +914,7 @@ fn bind_mount_selinux_private_label() {
         .driver_config = Some(json_struct(serde_json::json!({
         "mounts": [{
             "type": "bind",
-            "source": "/data/exclusive",
+            "source": src_path,
             "target": "/sandbox/data",
             "read_only": false,
             "selinux_label": "private"
@@ -921,14 +930,17 @@ fn bind_mount_selinux_private_label() {
         .binds
         .expect("binds should be set");
 
+    let expected = format!("{src_path}:/sandbox/data:Z");
     assert!(
-        binds.iter().any(|b| b == "/data/exclusive:/sandbox/data:Z"),
+        binds.iter().any(|b| b == &expected),
         "expected ':Z' label, got {binds:?}"
     );
 }
 
 #[test]
 fn bind_mount_without_selinux_label() {
+    let bind_src = TempDir::new().unwrap();
+    let src_path = bind_src.path().to_str().unwrap();
     let mut sandbox = test_sandbox();
     sandbox
         .spec
@@ -940,7 +952,7 @@ fn bind_mount_without_selinux_label() {
         .driver_config = Some(json_struct(serde_json::json!({
         "mounts": [{
             "type": "bind",
-            "source": "/host/path",
+            "source": src_path,
             "target": "/sandbox/host",
             "read_only": false
         }]
@@ -955,9 +967,40 @@ fn bind_mount_without_selinux_label() {
         .binds
         .expect("binds should be set");
 
+    let expected = format!("{src_path}:/sandbox/host");
     assert!(
-        binds.iter().any(|b| b == "/host/path:/sandbox/host"),
+        binds.iter().any(|b| b == &expected),
         "expected no options suffix, got {binds:?}"
+    );
+}
+
+#[test]
+fn driver_config_rejects_missing_bind_source() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/no/such/path",
+            "target": "/sandbox/data"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let err = build_container_create_body(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("bind source path does not exist"),
+        "expected missing-source error, got: {}",
+        err.message()
     );
 }
 
