@@ -78,24 +78,6 @@ const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
 
-/// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
-/// used when no supervisor binary override is provided.
-pub fn default_docker_supervisor_image() -> String {
-    format!(
-        "{}:{}",
-        openshell_core::config::DEFAULT_SUPERVISOR_IMAGE_REPO,
-        default_docker_supervisor_image_tag()
-    )
-}
-
-fn default_docker_supervisor_image_tag() -> String {
-    openshell_core::config::resolve_supervisor_image_tag(
-        option_env!("OPENSHELL_IMAGE_TAG"),
-        option_env!("IMAGE_TAG"),
-        env!("CARGO_PKG_VERSION"),
-    )
-}
-
 /// Queried by the Docker driver to decide when a sandbox's supervisor
 /// relay is live. Implementations return `true` once a sandbox has an
 /// active `ConnectSupervisor` session registered.
@@ -3048,7 +3030,9 @@ fn resolve_supervisor_bin_source(
 
     // Tier 5: pull the release-matched default supervisor image and extract
     // the binary to a host-side cache keyed by image content digest.
-    Ok(SupervisorBinSource::Image(default_docker_supervisor_image()))
+    Ok(SupervisorBinSource::Image(
+        openshell_core::config::default_supervisor_image(),
+    ))
 }
 
 pub(crate) async fn resolve_supervisor_bin(

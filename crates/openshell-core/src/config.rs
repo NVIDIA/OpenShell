@@ -50,36 +50,26 @@ pub fn default_supervisor_image() -> String {
 }
 
 fn default_supervisor_image_tag() -> String {
-    resolve_supervisor_image_tag(
-        option_env!("OPENSHELL_IMAGE_TAG"),
-        option_env!("IMAGE_TAG"),
+    resolve_supervisor_image_tag(&[
+        option_env!("OPENSHELL_IMAGE_TAG").unwrap_or(""),
+        option_env!("IMAGE_TAG").unwrap_or(""),
         env!("CARGO_PKG_VERSION"),
-    )
+    ])
 }
 
-/// Resolve the supervisor image tag from build-time inputs.
+/// Resolve the supervisor image tag from an ordered list of candidates.
 ///
-/// Priority: `OPENSHELL_IMAGE_TAG` > `IMAGE_TAG` > `CARGO_PKG_VERSION`.
-/// Falls back to `"dev"` when the Cargo version is empty or `"0.0.0"`.
-/// Replaces `+` with `-` for OCI tag compatibility.
+/// Returns the first non-empty, non-`"0.0.0"` candidate, falling back to
+/// `"dev"` when none qualifies. Replaces `+` with `-` for OCI tag
+/// compatibility.
 #[must_use]
-pub fn resolve_supervisor_image_tag(
-    openshell_image_tag: Option<&str>,
-    image_tag: Option<&str>,
-    cargo_pkg_version: &str,
-) -> String {
-    let tag = openshell_image_tag
-        .filter(|tag| !tag.is_empty())
-        .or_else(|| image_tag.filter(|tag| !tag.is_empty()))
-        .unwrap_or_else(|| {
-            if cargo_pkg_version.is_empty() || cargo_pkg_version == "0.0.0" {
-                "dev"
-            } else {
-                cargo_pkg_version
-            }
-        });
-
-    tag.replace('+', "-")
+pub fn resolve_supervisor_image_tag(candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .copied()
+        .find(|t| !t.is_empty() && *t != "0.0.0")
+        .unwrap_or("dev")
+        .replace('+', "-")
 }
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
@@ -1111,21 +1101,15 @@ mod tests {
     fn supervisor_image_tag_prefers_explicit_build_tags() {
         use super::resolve_supervisor_image_tag;
         assert_eq!(
-            resolve_supervisor_image_tag(Some("1.2.3"), Some("sha"), "0.0.0"),
-            "1.2.3",
+            resolve_supervisor_image_tag(&["1.2.3", "sha", "0.0.0"]),
+            "1.2.3"
         );
+        assert_eq!(resolve_supervisor_image_tag(&["", "sha", "0.0.0"]), "sha");
+        assert_eq!(resolve_supervisor_image_tag(&["", "", "1.2.3"]), "1.2.3");
+        assert_eq!(resolve_supervisor_image_tag(&["", "", "0.0.0"]), "dev");
         assert_eq!(
-            resolve_supervisor_image_tag(None, Some("sha"), "0.0.0"),
-            "sha",
-        );
-        assert_eq!(resolve_supervisor_image_tag(None, None, "1.2.3"), "1.2.3",);
-        assert_eq!(
-            resolve_supervisor_image_tag(Some(""), Some(""), "0.0.0"),
-            "dev",
-        );
-        assert_eq!(
-            resolve_supervisor_image_tag(Some("latest"), None, "1.2.3"),
-            "latest",
+            resolve_supervisor_image_tag(&["latest", "", "1.2.3"]),
+            "latest"
         );
     }
 
@@ -1133,11 +1117,11 @@ mod tests {
     fn supervisor_image_tag_sanitizes_build_metadata_for_oci() {
         use super::resolve_supervisor_image_tag;
         assert_eq!(
-            resolve_supervisor_image_tag(None, None, "0.0.37-dev.156+g1d3b741ee"),
+            resolve_supervisor_image_tag(&["", "", "0.0.37-dev.156+g1d3b741ee"]),
             "0.0.37-dev.156-g1d3b741ee",
         );
         assert_eq!(
-            resolve_supervisor_image_tag(Some("0.0.37-dev.156+g1d3b741ee"), None, "0.0.0"),
+            resolve_supervisor_image_tag(&["0.0.37-dev.156+g1d3b741ee", "", "0.0.0"]),
             "0.0.37-dev.156-g1d3b741ee",
         );
     }
