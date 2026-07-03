@@ -74,7 +74,6 @@ openshell --gateway-endpoint "$GATEWAY" provider create \
 openshell --gateway-endpoint "$GATEWAY" sandbox create \
   --name spiffe-token-demo \
   --provider spiffe-token-demo \
-  --keep \
   --no-tty \
   -- echo "sandbox ready"
 

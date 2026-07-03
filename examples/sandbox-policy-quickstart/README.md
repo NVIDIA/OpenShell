@@ -22,11 +22,10 @@ while writes are blocked — all without restarting anything.
 ### 1. Create a sandbox
 
 ```bash
-openshell sandbox create --name demo --keep --no-auto-providers
+openshell sandbox create --name demo --no-auto-providers
 ```
 
-`--keep` keeps the sandbox running after you exit so you can reconnect
-later. `--no-auto-providers` skips the provider setup prompt since this
+`--no-auto-providers` skips the provider setup prompt since this
 demo doesn't use an AI agent.
 
 You'll land in an interactive shell inside the sandbox:
@@ -50,7 +49,7 @@ The sandbox proxy intercepted the HTTPS CONNECT request to
 curl: (56) Received HTTP code 403 from proxy after CONNECT
 ```
 
-Exit the sandbox (the sandbox stays alive thanks to `--keep`):
+Exit the sandbox (sandboxes are kept running by default; pass `--no-keep` at creation time to delete on exit):
 
 ```bash
 exit

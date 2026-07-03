@@ -38,10 +38,10 @@ bash examples/sandbox-policy-quickstart/demo.sh
 Start by creating a sandbox with no network policies. This gives you a clean environment to observe default-deny behavior.
 
 ```shell
-openshell sandbox create --name demo --keep --no-auto-providers
+openshell sandbox create --name demo --no-auto-providers
 ```
 
-`--keep` keeps the sandbox running after you exit so you can reconnect later. `--no-auto-providers` skips the provider setup prompt since this tutorial uses `curl` instead of an AI agent.
+`--no-auto-providers` skips the provider setup prompt since this tutorial uses `curl` instead of an AI agent.
 
 You land in an interactive shell inside the sandbox:
 
@@ -65,7 +65,7 @@ The request fails. By default, all outbound network traffic is denied. The sandb
 curl: (56) Received HTTP code 403 from proxy after CONNECT
 ```
 
-Exit the sandbox. The `--keep` flag keeps it running:
+Exit the sandbox. Sandboxes are kept running by default, so you can reconnect later. Use `--no-keep` at creation time if you want the sandbox deleted after exit:
 
 ```shell
 exit

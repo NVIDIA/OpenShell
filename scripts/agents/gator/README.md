@@ -42,8 +42,6 @@ The launcher:
 - For `--harness codex`, optionally bakes a host Codex executable as `/etc/openshell/agent-payload/runtime/harnesses/codex/codex`.
 - Starts the selected harness without a TTY.
 - Runs gator in `watch` mode by default. The sandbox stays alive while the supervisor sleeps between bounded Codex cycles, so Codex is not connected during passive PR waits. The supervisor prints periodic heartbeat lines during active cycles and passive sleeps.
-- Deletes the sandbox automatically after the supervisor exits. Pass `--keep` to preserve it for debugging.
-
 The GitHub provider profile allows read-only GraphQL queries on `api.github.com/graphql` so `gh` read paths can use GraphQL when needed. Write operations remain REST-only and scoped to the two allowed repositories.
 
 Set `GATOR_CODEX_ACCESS_CREDENTIAL_KEY` or pass `--codex-access-key` if the gator Codex profile uses a credential key other than `CODEX_AUTH_ACCESS_TOKEN` for the short-lived access token.

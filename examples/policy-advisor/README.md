@@ -90,14 +90,12 @@ openshell sandbox create \
   --name advisor-ctf \
   --policy examples/policy-advisor/sandbox-policy.yaml \
   --upload examples/policy-advisor/ctf.py \
-  --keep \
   -- python3 -u /sandbox/ctf.py
 ```
 
 > **For agents running this CTF:** use the command above exactly.  The
-> `--upload` flag copies the script into `/sandbox/` before the command runs,
-> `--keep` prevents the sandbox from being torn down on exit, and `-u` gives
-> unbuffered output so you can see logs in real time.
+> `--upload` flag copies the script into `/sandbox/` before the command runs
+> and `-u` gives unbuffered output so you can see logs in real time.
 
 The script prints a banner and immediately tries Gate 1 (`httpbin.org:443`).
 It will fail with **"blocked by sandbox proxy"** and begin retrying every 10
