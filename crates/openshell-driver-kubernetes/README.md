@@ -70,10 +70,11 @@ for `nvidia.com/gpu` and requests the configured GPU count in the workload spec.
 When no count is set, the driver requests one GPU resource. The sandbox image
 must provide the user-space libraries needed by the agent workload.
 
-## Driver Config POC
+## Driver Config
 
-The RFC 0005 POC accepts the selected `SandboxTemplate.driver_config.kubernetes`
-block as `DriverSandboxTemplate.driver_config`. The Kubernetes driver owns the
+Following RFC 0006, this driver accepts the selected
+`SandboxTemplate.driver_config.kubernetes` block as
+`DriverSandboxTemplate.driver_config`. The Kubernetes driver owns the
 nested schema and currently accepts:
 
 - `pod.node_selector`
@@ -97,7 +98,7 @@ openshell sandbox create \
 ```
 
 Resource keys use native Kubernetes resource names and quantity strings. The
-POC parser renders the keys listed above and rejects unknown fields.
+parser renders the keys listed above and rejects unknown fields.
 `pod.runtime_class_name` maps to PodSpec `runtimeClassName` and overrides the
 driver's configured `default_runtime_class_name`; the typed public
 `SandboxTemplate.runtime_class_name` still takes precedence when set. Use the
