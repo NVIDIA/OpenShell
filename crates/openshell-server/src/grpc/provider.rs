@@ -115,6 +115,17 @@ pub(super) async fn create_provider_record(
         metadata.id.clone_from(&provider_id);
     }
 
+    // Serialize ObjectMeta labels to the DB labels column so that
+    // label-selector queries (including ownership-filtered list) work.
+    let labels_json = provider
+        .metadata
+        .as_ref()
+        .map(|metadata| &metadata.labels)
+        .filter(|labels| !labels.is_empty())
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| Status::internal(format!("failed to serialize provider labels: {e}")))?;
+
     // Create with MustCreate condition to prevent duplicate creation race
     let result = store
         .put_if(
@@ -122,7 +133,7 @@ pub(super) async fn create_provider_record(
             &provider_id,
             provider.object_name(),
             &provider.encode_to_vec(),
-            None,
+            labels_json.as_deref(),
             WriteCondition::MustCreate,
         )
         .await
@@ -166,6 +177,24 @@ pub(super) async fn list_provider_records(
         .list_messages(limit, offset)
         .await
         .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
+
+    Ok(providers
+        .into_iter()
+        .map(redact_provider_credentials)
+        .collect())
+}
+
+/// List provider records filtered by a label selector.
+async fn list_provider_records_with_selector(
+    store: &Store,
+    selector: &str,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Provider>, Status> {
+    let providers: Vec<Provider> = store
+        .list_messages_with_selector(selector, limit, offset)
+        .await
+        .map_err(|e| Status::internal(format!("list providers with selector failed: {e}")))?;
 
     Ok(providers
         .into_iter()
@@ -1127,6 +1156,8 @@ impl ObjectType for Provider {
 // ---------------------------------------------------------------------------
 
 use crate::ServerState;
+use crate::auth::ownership::{check_ownership, owner_label_selector, stamp_owner_labels};
+use crate::auth::principal::Principal;
 use openshell_core::proto::{
     ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse, CreateProviderRequest,
     DeleteProviderProfileRequest, DeleteProviderProfileResponse, DeleteProviderRefreshRequest,
@@ -1151,8 +1182,14 @@ pub(super) async fn handle_create_provider(
     state: &Arc<ServerState>,
     request: Request<CreateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Anonymous);
+    let ownership_config = state.ownership_config();
     let req = request.into_inner();
-    let Some(provider) = req.provider else {
+    let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
             LifecycleOperation::Create,
@@ -1161,6 +1198,11 @@ pub(super) async fn handle_create_provider(
         return Err(Status::invalid_argument("provider is required"));
     };
     let provider_type = provider.r#type.clone();
+
+    // Ensure metadata exists before stamping ownership labels.
+    let metadata = provider.metadata.get_or_insert_with(Default::default);
+    stamp_owner_labels(&principal, &ownership_config, &mut metadata.labels);
+
     let result = create_provider_record(state.store.as_ref(), provider).await;
     match result {
         Ok(provider) => {
@@ -1188,8 +1230,23 @@ pub(super) async fn handle_get_provider(
     state: &Arc<ServerState>,
     request: Request<GetProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Anonymous);
+    let ownership_config = state.ownership_config();
     let name = request.into_inner().name;
     let provider = get_provider_record(state.store.as_ref(), &name).await?;
+
+    // Ownership check: only the resource owner (or an admin) can access.
+    let empty = std::collections::HashMap::new();
+    let labels = provider
+        .metadata
+        .as_ref()
+        .map(|m| &m.labels)
+        .unwrap_or(&empty);
+    check_ownership(&principal, &ownership_config, labels)?;
 
     Ok(Response::new(ProviderResponse {
         provider: Some(provider),
@@ -1200,9 +1257,22 @@ pub(super) async fn handle_list_providers(
     state: &Arc<ServerState>,
     request: Request<ListProvidersRequest>,
 ) -> Result<Response<ListProvidersResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Anonymous);
+    let ownership_config = state.ownership_config();
     let request = request.into_inner();
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
-    let providers = list_provider_records(state.store.as_ref(), limit, request.offset).await?;
+
+    let owner_selector = owner_label_selector(&principal, &ownership_config);
+    let providers = if let Some(selector) = owner_selector {
+        list_provider_records_with_selector(state.store.as_ref(), &selector, limit, request.offset)
+            .await?
+    } else {
+        list_provider_records(state.store.as_ref(), limit, request.offset).await?
+    };
 
     Ok(Response::new(ListProvidersResponse { providers }))
 }
@@ -1891,6 +1961,12 @@ pub(super) async fn handle_update_provider(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Anonymous);
+    let ownership_config = state.ownership_config();
     let req = request.into_inner();
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
@@ -1901,6 +1977,26 @@ pub(super) async fn handle_update_provider(
         return Err(Status::invalid_argument("provider is required"));
     };
     let provider_type = provider.r#type.clone();
+
+    // Security fix from V1 review: validate name is non-empty before ownership check.
+    let provider_name = provider
+        .metadata
+        .as_ref()
+        .map_or("", |m| m.name.as_str());
+    if provider_name.is_empty() {
+        return Err(Status::invalid_argument("provider name is required"));
+    }
+
+    // Ownership check: fetch the existing provider and verify ownership.
+    let existing = get_provider_record(state.store.as_ref(), provider_name).await?;
+    let empty = std::collections::HashMap::new();
+    let labels = existing
+        .metadata
+        .as_ref()
+        .map(|m| &m.labels)
+        .unwrap_or(&empty);
+    check_ownership(&principal, &ownership_config, labels)?;
+
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
@@ -2262,7 +2358,32 @@ pub(super) async fn handle_delete_provider(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRequest>,
 ) -> Result<Response<DeleteProviderResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Anonymous);
+    let ownership_config = state.ownership_config();
     let name = request.into_inner().name;
+
+    // Ownership check: fetch the existing provider and verify ownership.
+    // Propagate store errors instead of swallowing them — silently skipping
+    // the ownership check on database failures is a security issue.
+    if let Some(existing) = state
+        .store
+        .get_message_by_name::<Provider>(&name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+    {
+        let empty = std::collections::HashMap::new();
+        let labels = existing
+            .metadata
+            .as_ref()
+            .map(|m| &m.labels)
+            .unwrap_or(&empty);
+        check_ownership(&principal, &ownership_config, labels)?;
+    }
+
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &name).await;
     let result = delete_provider_record(state.store.as_ref(), &name).await;
     match result {

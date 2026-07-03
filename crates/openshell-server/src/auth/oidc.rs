@@ -102,6 +102,9 @@ pub struct OidcClaims {
     /// Roles extracted from the configurable claim path.
     #[serde(skip)]
     pub roles: Vec<String>,
+    /// Groups extracted from the configurable claim path.
+    #[serde(skip)]
+    pub groups: Vec<String>,
     /// Raw claims for flexible role extraction.
     #[serde(flatten)]
     extra: serde_json::Value,
@@ -161,6 +164,30 @@ impl OidcClaims {
         raw.into_iter()
             .filter(|s| !STANDARD_OIDC_SCOPES.contains(&s.as_str()))
             .collect()
+    }
+
+    /// Extract groups from the JWT claims using a dot-separated path.
+    ///
+    /// Follows the same pattern as [`extract_roles`] — traverses a
+    /// dot-delimited claim path and collects the resulting JSON array
+    /// into `self.groups`.
+    fn extract_groups(&mut self, groups_claim: &str) {
+        if groups_claim.is_empty() {
+            return;
+        }
+        let mut value = &self.extra;
+        for segment in groups_claim.split('.') {
+            match value.get(segment) {
+                Some(v) => value = v,
+                None => return,
+            }
+        }
+        if let Some(arr) = value.as_array() {
+            self.groups = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
     }
 }
 
@@ -332,6 +359,7 @@ impl JwksCache {
 
         let mut claims = token_data.claims;
         claims.extract_roles(&self.config.roles_claim);
+        claims.extract_groups(&self.config.groups_claim);
 
         let scopes = if self.config.scopes_claim.is_empty() {
             vec![]
@@ -344,6 +372,7 @@ impl JwksCache {
             display_name: claims.preferred_username,
             roles: claims.roles,
             scopes,
+            groups: claims.groups,
             provider: IdentityProvider::Oidc,
         })
     }

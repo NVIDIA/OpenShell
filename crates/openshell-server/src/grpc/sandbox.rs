@@ -29,6 +29,7 @@ use openshell_core::telemetry::{
 };
 use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -50,6 +51,8 @@ use super::validation::{
     validate_no_reserved_provider_policy_keys, validate_policy_safety, validate_sandbox_spec,
 };
 use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, clamp_limit};
+use crate::auth::ownership::{check_ownership, owner_label_selector, stamp_owner_labels};
+use crate::auth::principal::Principal;
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
@@ -120,6 +123,13 @@ async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    // Extract principal BEFORE consuming the request with into_inner().
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Anonymous);
+    let ownership_config = state.ownership_config();
     let request = request.into_inner();
     let spec = request
         .spec
@@ -175,12 +185,21 @@ async fn handle_create_sandbox_inner(
 
     let now_ms = current_time_ms();
 
+    // Stamp ownership labels on the request labels (for ObjectMeta persistence).
+    let mut request_labels = request.labels.clone();
+    stamp_owner_labels(&principal, &ownership_config, &mut request_labels);
+
+    // Stamp ownership labels on the template labels (for compute drivers).
+    if let Some(ref mut tmpl) = spec.template {
+        stamp_owner_labels(&principal, &ownership_config, &mut tmpl.labels);
+    }
+
     let mut sandbox = Sandbox {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: id.clone(),
             name: name.clone(),
             created_at_ms: now_ms,
-            labels: request.labels.clone(),
+            labels: request_labels,
             resource_version: 0,
         }),
         spec: Some(spec),
@@ -236,6 +255,12 @@ pub(super) async fn handle_get_sandbox(
     state: &Arc<ServerState>,
     request: Request<GetSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Anonymous);
+    let ownership_config = state.ownership_config();
     let name = request.into_inner().name;
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -248,6 +273,16 @@ pub(super) async fn handle_get_sandbox(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
     let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+    // Ownership check: only the resource owner (or an admin) can access.
+    let empty = HashMap::new();
+    let labels = sandbox
+        .metadata
+        .as_ref()
+        .map(|m| &m.labels)
+        .unwrap_or(&empty);
+    check_ownership(&principal, &ownership_config, labels)?;
+
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
@@ -257,20 +292,37 @@ pub(super) async fn handle_list_sandboxes(
     state: &Arc<ServerState>,
     request: Request<ListSandboxesRequest>,
 ) -> Result<Response<ListSandboxesResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Anonymous);
+    let ownership_config = state.ownership_config();
     let request = request.into_inner();
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
 
-    let sandboxes: Vec<Sandbox> = if request.label_selector.is_empty() {
+    // Combine the user-supplied label selector with the ownership selector.
+    let owner_selector = owner_label_selector(&principal, &ownership_config);
+    let combined_selector = match (&request.label_selector, &owner_selector) {
+        (user, None) if user.is_empty() => String::new(),
+        (user, None) => user.clone(),
+        (user, Some(owner)) if user.is_empty() => owner.clone(),
+        (user, Some(owner)) => format!("{user},{owner}"),
+    };
+
+    let sandboxes: Vec<Sandbox> = if combined_selector.is_empty() {
         state
             .store
             .list_messages(limit, request.offset)
             .await
             .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
     } else {
-        crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+        if !request.label_selector.is_empty() {
+            crate::grpc::validation::validate_label_selector(&request.label_selector)?;
+        }
         state
             .store
-            .list_messages_with_selector(&request.label_selector, limit, request.offset)
+            .list_messages_with_selector(&combined_selector, limit, request.offset)
             .await
             .map_err(|e| Status::internal(format!("list sandboxes with selector failed: {e}")))?
     };
@@ -497,18 +549,39 @@ async fn handle_delete_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxRequest>,
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<Principal>()
+        .cloned()
+        .unwrap_or(Principal::Anonymous);
+    let ownership_config = state.ownership_config();
     let name = request.into_inner().name;
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
 
-    let sandbox_id = state
+    // Fetch the sandbox to perform ownership check. Propagate store errors
+    // instead of swallowing them — .ok().flatten() would skip the ownership
+    // check on database failures (security fix from V1 review).
+    let sandbox = state
         .store
         .get_message_by_name::<Sandbox>(&name)
         .await
-        .ok()
-        .flatten()
-        .map(|sandbox| sandbox.object_id().to_string());
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+
+    let sandbox_id = if let Some(ref sandbox) = sandbox {
+        let empty = HashMap::new();
+        let labels = sandbox
+            .metadata
+            .as_ref()
+            .map(|m| &m.labels)
+            .unwrap_or(&empty);
+        check_ownership(&principal, &ownership_config, labels)?;
+        Some(sandbox.object_id().to_string())
+    } else {
+        None
+    };
+
     let deleted = state.compute.delete_sandbox(&name).await?;
     if deleted && let Some(sandbox_id) = sandbox_id {
         state.telemetry.end_sandbox_session(&sandbox_id);
@@ -1049,8 +1122,8 @@ async fn validate_ssh_forward_token(
 }
 
 fn acquire_ssh_connection_slots(
-    token_counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
-    sandbox_counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    token_counts: &std::sync::Mutex<HashMap<String, u32>>,
+    sandbox_counts: &std::sync::Mutex<HashMap<String, u32>>,
     token: &str,
     sandbox_id: &str,
 ) -> Result<(), Status> {
@@ -1084,7 +1157,7 @@ fn acquire_ssh_connection_slots(
 }
 
 fn decrement_ssh_connection_count(
-    counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    counts: &std::sync::Mutex<HashMap<String, u32>>,
     key: &str,
 ) {
     let mut counts = counts.lock().unwrap();
@@ -1359,7 +1432,7 @@ pub(super) async fn handle_create_ssh_session(
             id: token.clone(),
             name: generate_name(),
             created_at_ms: now_ms,
-            labels: std::collections::HashMap::new(),
+            labels: HashMap::new(),
             resource_version: 0,
         }),
         sandbox_id: req.sandbox_id.clone(),

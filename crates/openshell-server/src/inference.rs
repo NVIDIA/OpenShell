@@ -1007,6 +1007,7 @@ mod tests {
                 display_name: None,
                 roles: vec!["openshell-user".to_string()],
                 scopes: vec![],
+                groups: vec![],
                 provider: IdentityProvider::Oidc,
             },
         })

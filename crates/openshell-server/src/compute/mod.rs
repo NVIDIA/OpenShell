@@ -489,6 +489,20 @@ impl ComputeRuntime {
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
         let mut sandbox = sandbox;
+
+        // Serialize ObjectMeta labels to the DB labels column so that
+        // label-selector queries (including ownership-filtered list) work.
+        let labels_json = sandbox
+            .metadata
+            .as_ref()
+            .map(|metadata| &metadata.labels)
+            .filter(|labels| !labels.is_empty())
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| {
+                Status::internal(format!("failed to serialize sandbox labels: {e}"))
+            })?;
+
         let result = self
             .store
             .put_if(
@@ -496,7 +510,7 @@ impl ComputeRuntime {
                 &sandbox_id,
                 sandbox.object_name(),
                 &sandbox.encode_to_vec(),
-                None,
+                labels_json.as_deref(),
                 WriteCondition::MustCreate,
             )
             .await

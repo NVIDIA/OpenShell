@@ -352,6 +352,9 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Multi-tenant resource ownership enforcement.
+    pub ownership: OwnershipConfigCore,
+
     /// mTLS user authentication configuration. When enabled, a verified TLS
     /// client certificate can authenticate CLI/SDK callers as a
     /// `Principal::User`. This is for local single-user gateways only;
@@ -490,6 +493,13 @@ pub struct OidcConfig {
     /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
     #[serde(default)]
     pub scopes_claim: String,
+
+    /// Dot-separated path to the groups array in the JWT claims.
+    /// Used for multi-tenant deployments where group membership maps to
+    /// organizational tenants.
+    /// Defaults to `groups`.
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
 }
 
 /// mTLS user authentication for local, single-user gateways.
@@ -513,6 +523,25 @@ pub struct GatewayAuthConfig {
     /// gateway-minted sandbox JWTs.
     #[serde(default)]
     pub allow_unauthenticated_users: bool,
+}
+
+/// Multi-tenant resource ownership configuration.
+///
+/// When enabled, the gateway stamps every created sandbox and provider with
+/// the caller's identity subject (`openshell.ai/owner`) and an optional tenant
+/// identifier (`openshell.ai/tenant`). Subsequent get/list/delete operations
+/// enforce that only the resource owner (or an admin) can access the resource.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipConfigCore {
+    /// Enable per-resource ownership enforcement.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Optional tenant identifier for gateway-per-tenant deployments.
+    /// When set, every created resource is labeled with this value.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
 }
 
 const fn default_jwks_ttl_secs() -> u64 {
@@ -564,6 +593,10 @@ fn default_user_role() -> String {
     "openshell-user".to_string()
 }
 
+fn default_groups_claim() -> String {
+    "groups".to_string()
+}
+
 impl Config {
     /// Create a new config with optional TLS.
     pub fn new(tls: Option<TlsConfig>) -> Self {
@@ -575,6 +608,7 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            ownership: OwnershipConfigCore::default(),
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),

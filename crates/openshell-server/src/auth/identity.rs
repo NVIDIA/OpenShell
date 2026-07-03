@@ -26,6 +26,11 @@ pub struct Identity {
     /// `OAuth2` scopes granted to this identity. Empty when scope enforcement is disabled.
     pub scopes: Vec<String>,
 
+    /// Group memberships extracted from the JWT claims.
+    /// Used for multi-tenant deployments where group membership maps to
+    /// organizational tenants.
+    pub groups: Vec<String>,
+
     /// Which authentication provider produced this identity.
     pub provider: IdentityProvider,
 }

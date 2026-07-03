@@ -99,6 +99,14 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub grpc_rate_limit_window_seconds: Option<u64>,
 
+    // ── Ownership ───────────────────────────────────────────────────────
+    /// Enable multi-tenant resource ownership enforcement.
+    #[serde(default)]
+    pub ownership_enabled: Option<bool>,
+    /// Tenant identifier for gateway-per-tenant deployments.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.

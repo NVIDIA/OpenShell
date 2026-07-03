@@ -16,6 +16,7 @@ pub mod identity;
 pub mod k8s_sa;
 pub mod method_authz;
 pub mod oidc;
+pub mod ownership;
 pub mod principal;
 pub mod sandbox_jwt;
 pub mod sandbox_methods;

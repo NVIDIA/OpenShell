@@ -27,6 +27,14 @@ pub const LABEL_SANDBOX_NAME: &str = "openshell.ai/sandbox-name";
 /// Container/pod label carrying the sandbox namespace.
 pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
 
+/// Container/pod label carrying the identity subject of the user who created
+/// the sandbox. Used for multi-tenant ownership enforcement.
+pub const LABEL_OWNER: &str = "openshell.ai/owner";
+
+/// Container/pod label carrying the organizational tenant identifier.
+/// Set from the gateway's configured `tenant_id` in multi-tenant deployments.
+pub const LABEL_TENANT: &str = "openshell.ai/tenant";
+
 // ---------------------------------------------------------------------------
 
 /// Path to the sandbox supervisor binary inside the container image.

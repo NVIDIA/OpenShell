@@ -154,6 +154,7 @@ mod tests {
             display_name: None,
             roles: roles.iter().map(|r| (*r).to_string()).collect(),
             scopes: vec![],
+            groups: vec![],
             provider: IdentityProvider::Oidc,
         }
     }
@@ -164,6 +165,7 @@ mod tests {
             display_name: None,
             roles: roles.iter().map(|r| (*r).to_string()).collect(),
             scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            groups: vec![],
             provider: IdentityProvider::Oidc,
         }
     }

@@ -210,6 +210,22 @@ struct RunArgs {
         action = ArgAction::Set
     )]
     enable_loopback_service_http: bool,
+
+    /// Enable multi-tenant resource ownership enforcement.
+    /// When enabled, sandboxes and providers are labeled with the caller's
+    /// identity subject, and access is restricted to the resource owner.
+    #[arg(
+        long = "ownership-enabled",
+        env = "OPENSHELL_OWNERSHIP_ENABLED",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    ownership_enabled: bool,
+
+    /// Tenant identifier for gateway-per-tenant deployments.
+    /// When set, every created resource is labeled with this value.
+    #[arg(long = "tenant-id", env = "OPENSHELL_TENANT_ID")]
+    tenant_id: Option<String>,
 }
 
 pub fn command() -> Command {
@@ -393,6 +409,24 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
         config = config.with_ssh_session_ttl_secs(ttl);
     }
 
+    // Ownership configuration: CLI > file > default.
+    config.ownership.enabled = args.ownership_enabled;
+    if let Some(ref tid) = args.tenant_id {
+        config.ownership.tenant_id = Some(tid.clone());
+    }
+    if let Some(file) = file.as_ref() {
+        if !arg_defaulted(matches, "ownership_enabled") {
+            // CLI/env already set — keep it.
+        } else if let Some(enabled) = file.openshell.gateway.ownership_enabled {
+            config.ownership.enabled = enabled;
+        }
+        if args.tenant_id.is_none() {
+            if let Some(ref tid) = file.openshell.gateway.tenant_id {
+                config.ownership.tenant_id = Some(tid.clone());
+            }
+        }
+    }
+
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
@@ -402,6 +436,7 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
             admin_role: args.oidc_admin_role.clone(),
             user_role: args.oidc_user_role.clone(),
             scopes_claim: args.oidc_scopes_claim.clone(),
+            groups_claim: String::from("groups"),
         });
     }
 

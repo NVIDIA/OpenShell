@@ -149,6 +149,24 @@ pub struct ServerState {
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
 }
 
+impl ServerState {
+    /// Build the server-side ownership configuration from the gateway config.
+    ///
+    /// Combines the core `OwnershipConfigCore` with the OIDC admin role name
+    /// so the ownership layer can bypass checks for admin principals.
+    pub(crate) fn ownership_config(&self) -> auth::ownership::OwnershipConfig {
+        auth::ownership::OwnershipConfig {
+            enabled: self.config.ownership.enabled,
+            admin_role: self
+                .config
+                .oidc
+                .as_ref()
+                .map_or_else(|| "openshell-admin".to_string(), |o| o.admin_role.clone()),
+            tenant_id: self.config.ownership.tenant_id.clone(),
+        }
+    }
+}
+
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),

@@ -106,6 +106,7 @@ mod tests {
                 display_name: None,
                 roles: vec![],
                 scopes: vec![],
+                groups: vec![],
                 provider: IdentityProvider::Oidc,
             },
         })
