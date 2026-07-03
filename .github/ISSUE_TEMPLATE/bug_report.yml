@@ -59,7 +59,9 @@ body:
     id: logs
     attributes:
       label: Logs
-      description: Relevant log output, error messages, or stack traces.
+      description: |
+        Relevant log output, error messages, or stack traces.
+        Redact credentials, API keys, and tokens before pasting — verbose error output from some frameworks includes the full request config.
       render: shell
     validations:
       required: false
