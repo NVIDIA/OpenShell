@@ -131,14 +131,14 @@ write_policy() {
     echo "$file"
 }
 
-# Create a sandbox with --keep and a sleep, wait for Ready.
+# Create a sandbox with a sleep, wait for Ready (sandboxes are kept by default).
 create_sandbox() {
     local name="$1"
     shift
     local provider_flag=("$@")
 
     echo "  Creating sandbox: $name"
-    openshell sandbox create --name "$name" --keep "${provider_flag[@]}" \
+    openshell sandbox create --name "$name" "${provider_flag[@]}" \
         -- sh -c "echo Ready && sleep 3600" >/dev/null 2>&1 &
     local pid=$!
 
@@ -147,7 +147,7 @@ create_sandbox() {
         if openshell sandbox list 2>/dev/null | grep -q "$name.*Ready"; then
             echo "  Sandbox $name is Ready"
             SANDBOXES+=("$name")
-            # Kill the blocking create process (sandbox stays alive with --keep)
+            # Kill the blocking create process (sandbox stays alive by default)
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
             # Brief settle time — SSH server inside the sandbox may still be

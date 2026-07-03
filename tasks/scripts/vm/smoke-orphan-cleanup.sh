@@ -93,7 +93,7 @@ EOF
 }
 
 create_sandbox() {
-    echo "==> Creating sandbox (--keep, long-running)"
+    echo "==> Creating sandbox (long-running)"
     mkdir -p "$XDG"
     XDG_CONFIG_HOME="$XDG" "$ROOT/scripts/bin/openshell" gateway add \
         --name vm-orphan http://127.0.0.1:"$PORT" >/dev/null
@@ -101,7 +101,7 @@ create_sandbox() {
 
     # Run the CLI in the background; it blocks waiting for sleep to finish.
     XDG_CONFIG_HOME="$XDG" "$ROOT/scripts/bin/openshell" sandbox create \
-        --name "orphan-$$" --keep -- sleep 99999 \
+        --name "orphan-$$" -- sleep 99999 \
         > "$LOG.create" 2>&1 &
     CLI_PID=$!
 

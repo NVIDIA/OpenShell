@@ -128,7 +128,6 @@ create_sandbox() {
         --name "$SANDBOX" \
         --upload "${RUNNER_SOURCE}:/sandbox/runner.sh" \
         --no-git-ignore \
-        --keep \
         --no-auto-providers \
         --no-tty \
         -- bash -lc "chmod +x /sandbox/runner.sh && echo sandbox ready" \

@@ -230,7 +230,6 @@ create_sandbox() {
         --policy "$POLICY_FILE" \
         --upload "${RUNNER_SOURCE}:/sandbox/policy-validation-runner.sh" \
         --no-git-ignore \
-        --keep \
         --no-auto-providers \
         --no-tty \
         -- bash -lc "chmod +x /sandbox/policy-validation-runner.sh && echo sandbox ready"
