@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Standalone test fixture. Keeping it out of the root workspace prevents the
+# fixture binary from becoming part of production workspace builds or images.
+[workspace]
+
+[package]
+name = "openshell-e2e-middleware-fixture"
+description = "Scripted supervisor middleware used only by OpenShell E2E tests"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+openshell-core = { path = "../../crates/openshell-core", default-features = false }
+serde_json = "1"
+tokio = { version = "1.43", features = ["full"] }
+tonic = "0.14"
+
+[lints.rust]
+unsafe_code = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"

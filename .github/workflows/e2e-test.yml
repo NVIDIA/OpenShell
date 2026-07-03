@@ -59,6 +59,9 @@ jobs:
           - suite: rust-docker
             cmd: "mise run --no-deps --skip-deps e2e:rust"
             apt_packages: "openssh-client"
+          - suite: supervisor-middleware
+            cmd: "mise run --no-deps --skip-deps e2e:supervisor-middleware"
+            apt_packages: "openssh-client"
           - suite: mcp
             cmd: "mise run --no-deps --skip-deps e2e:mcp"
             apt_packages: ""

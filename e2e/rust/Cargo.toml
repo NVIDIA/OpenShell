@@ -135,6 +135,11 @@ path = "tests/proxy_egress_pipeline.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
+name = "supervisor_middleware"
+path = "tests/supervisor_middleware.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "gpu"
 path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]

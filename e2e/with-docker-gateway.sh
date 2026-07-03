@@ -113,6 +113,9 @@ E2E_NAMESPACE=""
 DOCKER_NETWORK_NAME=""
 DOCKER_NETWORK_CONNECTED_CONTAINER=""
 DOCKER_NETWORK_MANAGED=0
+MIDDLEWARE_FIXTURE_PID=""
+MIDDLEWARE_FIXTURE_LOG="${WORKDIR}/middleware-fixture.log"
+MIDDLEWARE_FIXTURE_ENDPOINT=""
 GPU_MODE="${OPENSHELL_E2E_DOCKER_GPU:-0}"
 OIDC_MODE="${OPENSHELL_E2E_OIDC_GATEWAY:-0}"
 OIDC_ISSUER="${OPENSHELL_E2E_OIDC_ISSUER:-}"
@@ -134,6 +137,18 @@ cleanup() {
   local exit_code=$?
 
   e2e_stop_gateway "${GATEWAY_PID}" "${GATEWAY_PID_FILE}"
+
+  if [ -n "${MIDDLEWARE_FIXTURE_PID}" ] \
+     && kill -0 "${MIDDLEWARE_FIXTURE_PID}" 2>/dev/null; then
+    kill "${MIDDLEWARE_FIXTURE_PID}" 2>/dev/null || true
+    wait "${MIDDLEWARE_FIXTURE_PID}" 2>/dev/null || true
+  fi
+
+  if [ "${exit_code}" -ne 0 ] && [ -s "${MIDDLEWARE_FIXTURE_LOG}" ]; then
+    echo "=== supervisor middleware fixture log ==="
+    cat "${MIDDLEWARE_FIXTURE_LOG}"
+    echo "=== end supervisor middleware fixture log ==="
+  fi
 
   if [ "${exit_code}" -ne 0 ] \
      && [ -n "${E2E_NAMESPACE}" ] \
@@ -249,6 +264,60 @@ connect_current_container_to_docker_network() {
   fi
 
   GATEWAY_HOST_ALIAS_IP="${container_ip}"
+}
+
+start_middleware_fixture() {
+  local manifest="${ROOT}/e2e/supervisor-middleware-fixture/Cargo.toml"
+  local binary="${TARGET_DIR}/debug/openshell-e2e-middleware-fixture"
+  local fixture_host
+  local fixture_port
+
+  echo "Building supervisor middleware E2E fixture..."
+  CARGO_TARGET_DIR="${TARGET_DIR}" cargo build --locked --manifest-path "${manifest}"
+
+  if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
+    # In GitHub Actions, the fixture and gateway run in the job container.
+    # The wrapper has already attached that container to the sandbox network.
+    fixture_host="${GATEWAY_HOST_ALIAS_IP}"
+  elif [ "$(uname -s)" = "Linux" ]; then
+    # In a native Linux run, the fixture and gateway run on the host. The
+    # bridge gateway address is reachable from both the host and containers.
+    fixture_host="$(docker network inspect \
+      --format '{{(index .IPAM.Config 0).Gateway}}' \
+      "${DOCKER_NETWORK_NAME}")"
+  else
+    echo "ERROR: supervisor middleware E2E currently supports GitHub Actions and native Linux Docker." >&2
+    return 2
+  fi
+
+  if [ -z "${fixture_host}" ]; then
+    echo "ERROR: failed to determine a supervisor middleware fixture address." >&2
+    return 2
+  fi
+
+  fixture_port="$(e2e_pick_port)"
+  echo "Starting supervisor middleware E2E fixture on ${fixture_host}:${fixture_port}..."
+  OPENSHELL_E2E_MIDDLEWARE_LISTEN="0.0.0.0:${fixture_port}" \
+    "${binary}" >"${MIDDLEWARE_FIXTURE_LOG}" 2>&1 &
+  MIDDLEWARE_FIXTURE_PID=$!
+
+  local attempt
+  for attempt in $(seq 1 100); do
+    if ! kill -0 "${MIDDLEWARE_FIXTURE_PID}" 2>/dev/null; then
+      echo "ERROR: supervisor middleware E2E fixture exited before becoming ready." >&2
+      cat "${MIDDLEWARE_FIXTURE_LOG}" >&2 || true
+      return 1
+    fi
+    if python3 -c "import socket; s=socket.create_connection(('127.0.0.1', ${fixture_port}), 0.2); s.close()" 2>/dev/null; then
+      MIDDLEWARE_FIXTURE_ENDPOINT="http://${fixture_host}:${fixture_port}"
+      echo "Supervisor middleware E2E fixture ready at ${MIDDLEWARE_FIXTURE_ENDPOINT}."
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "ERROR: supervisor middleware E2E fixture did not become ready within 20s." >&2
+  return 1
 }
 
 if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
@@ -466,6 +535,10 @@ else
   GATEWAY_HOST_ALIAS_IP=""
 fi
 
+if [ "${OPENSHELL_E2E_MIDDLEWARE_FIXTURE:-0}" = "1" ]; then
+  start_middleware_fixture
+fi
+
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
 e2e_generate_gateway_jwt "${JWT_DIR}"
@@ -493,6 +566,13 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
       e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
     fi
+  fi
+  if [ -n "${MIDDLEWARE_FIXTURE_ENDPOINT}" ]; then
+    printf '[[openshell.supervisor.middleware]]\n'
+    printf 'name = "e2e-scripted"\n'
+    printf 'grpc_endpoint = %s\n' "$(toml_string "${MIDDLEWARE_FIXTURE_ENDPOINT}")"
+    printf 'max_body_bytes = 4096\n'
+    printf 'timeout = "500ms"\n\n'
   fi
   printf '[openshell.drivers.docker]\n'
   printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
