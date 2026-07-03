@@ -313,18 +313,18 @@ fn copy_sidecar_client_tls_if_present(
 
 #[cfg(target_os = "linux")]
 fn run_network_init(
-    network_proxy_uid: u32,
-    network_proxy_gid: u32,
+    proxy_user_id: u32,
+    proxy_primary_group_id: u32,
     sidecar_state_dir: &str,
     sidecar_tls_dir: &str,
 ) -> Result<()> {
-    if network_proxy_uid < openshell_policy::MIN_SANDBOX_UID {
+    if proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
         return Err(miette::miette!(
             "--proxy-uid must be at least {}",
             openshell_policy::MIN_SANDBOX_UID
         ));
     }
-    if network_proxy_gid < openshell_policy::MIN_SANDBOX_UID {
+    if proxy_primary_group_id < openshell_policy::MIN_SANDBOX_UID {
         return Err(miette::miette!(
             "--proxy-gid must be at least {}",
             openshell_policy::MIN_SANDBOX_UID
@@ -335,18 +335,23 @@ fn run_network_init(
     let sidecar_tls_dir = Path::new(sidecar_tls_dir);
     prepare_sidecar_directory(
         sidecar_state_dir,
-        network_proxy_uid,
-        network_proxy_gid,
+        proxy_user_id,
+        proxy_primary_group_id,
         0o775,
     )?;
-    prepare_sidecar_directory(sidecar_tls_dir, network_proxy_uid, network_proxy_gid, 0o755)?;
+    prepare_sidecar_directory(
+        sidecar_tls_dir,
+        proxy_user_id,
+        proxy_primary_group_id,
+        0o755,
+    )?;
     copy_sidecar_client_tls_if_present(
         Path::new(CLIENT_TLS_DIR),
         sidecar_tls_dir,
-        network_proxy_uid,
-        network_proxy_gid,
+        proxy_user_id,
+        proxy_primary_group_id,
     )?;
-    openshell_supervisor_process::netns::install_sidecar_bypass_rules(network_proxy_uid)
+    openshell_supervisor_process::netns::install_sidecar_bypass_rules(proxy_user_id)
 }
 
 #[cfg(not(target_os = "linux"))]
