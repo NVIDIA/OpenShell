@@ -166,10 +166,11 @@ Docker mount schema:
 | `volume` | `source`, `target`, optional `read_only` (`true` by default), optional `subpath`. The named volume must already exist. Docker local-driver bind-backed volumes require `enable_bind_mounts = true`. |
 | `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
 
-OpenShell rejects mount targets that replace the workspace root, container root,
-supervisor files, `/etc/openshell`, `/etc/openshell-tls`, authentication
-material, or network namespace paths. These checks do not make host bind mounts
-safe.
+OpenShell rejects mount `source`, `target`, and Docker volume `subpath` values
+with surrounding whitespace. OpenShell also rejects mount targets that replace
+the workspace root, container root, supervisor files, `/etc/openshell`,
+`/etc/openshell-tls`, authentication material, or network namespace paths. These
+checks do not make host bind mounts safe.
 
 ## Podman Driver
 
@@ -233,10 +234,11 @@ Podman mount schema:
 | `image` | `source`, `target`, optional `read_only` (`true` by default). |
 
 Podman `volume` and `image` mounts do not support `subpath` in OpenShell driver
-config. OpenShell rejects mount targets that replace the workspace root,
-container root, supervisor files, `/etc/openshell`, `/etc/openshell-tls`,
-authentication material, or network namespace paths. These checks do not make
-host bind mounts safe.
+config, and OpenShell rejects `subpath` for those mount types. OpenShell rejects
+mount `source` and `target` values with surrounding whitespace. OpenShell also
+rejects mount targets that replace the workspace root, container root, supervisor
+files, `/etc/openshell`, `/etc/openshell-tls`, authentication material, or
+network namespace paths. These checks do not make host bind mounts safe.
 
 ## MicroVM Driver
 

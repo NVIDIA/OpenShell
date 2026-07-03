@@ -71,13 +71,15 @@ Host bind mounts are disabled by default because they expose gateway host paths
 to sandbox requests. The driver still uses internal bind mounts for
 OpenShell-owned token and TLS material.
 
-Podman `bind` mounts accept `source`, `target`, and optional `read_only`.
-User-supplied bind and volume mounts are read-only by default; set
-`read_only: false` to make them writable. Podman image and volume mounts do not
-support `subpath` in OpenShell driver config. Mount targets must be absolute
-container paths and must not replace the workspace root (`/sandbox`) or overlap
-OpenShell supervisor files, `/etc/openshell`, `/etc/openshell-tls`, or
-`/run/netns`.
+Podman `bind` mounts accept `source`, `target`, optional `read_only`, and an
+optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
+`:Z`) for SELinux-enforcing hosts. User-supplied bind and volume mounts are
+read-only by default; set `read_only: false` to make them writable. Podman
+image and volume mounts do not support `subpath` in OpenShell driver config.
+Mount `source` and `target` values must not contain surrounding whitespace.
+Mount targets must be absolute container paths and must not replace
+the workspace root (`/sandbox`) or overlap OpenShell supervisor files,
+`/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
 
 Example named-volume usage:
 
