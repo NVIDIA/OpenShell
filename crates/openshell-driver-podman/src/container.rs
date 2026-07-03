@@ -71,6 +71,12 @@ pub struct PodmanSandboxDriverConfig {
         deserialize_with = "deserialize_optional_non_empty_string_list"
     )]
     pub cdi_devices: Option<Vec<String>>,
+    /// Optional per-sandbox user namespace mode.
+    ///
+    /// Accepts the same values as `podman run --userns`, e.g. `"keep-id"`,
+    /// `"keep-id:uid=200,gid=210"`, `"auto"`, `"nomap"`, or `"host"`.
+    #[serde(default)]
+    pub userns_mode: String,
     mounts: Vec<PodmanDriverMountConfig>,
 }
 
@@ -196,6 +202,12 @@ struct ContainerSpec {
     /// the gateway server running on the host in rootless mode.
     hostadd: Vec<String>,
     netns: NetNS,
+    /// User namespace mode. Defaults to Podman's own behavior when
+    /// `driver_config.userns_mode` is unset. When set to e.g.
+    /// `"keep-id:uid=200,gid=210"`, the sandbox container runs inside
+    /// a user namespace where container UID 0 maps to the host UID 200.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    userns: Option<UserNS>,
     // Matches libpod's network spec format, which is `{name: {opts}}` where
     // empty opts is a unit struct rather than `()`. Keep as a map so JSON
     // serialization matches the API exactly.
@@ -296,6 +308,20 @@ struct MemoryLimits {
 #[derive(Serialize)]
 struct NetNS {
     nsmode: String,
+}
+
+/// User namespace specification for the libpod container create API.
+///
+/// Mirrors Podman's `specgen.Namespace` struct, which has two fields:
+/// `nsmode` (e.g. `"keep-id"`, `"host"`, `"auto"`) and an optional `value`
+/// string holding the mode-specific options (e.g. `"uid=200,gid=210"` for
+/// `keep-id`). The CLI `--userns keep-id:uid=200,gid=210` is split on the
+/// first colon: `nsmode = "keep-id"`, `value = "uid=200,gid=210"`.
+#[derive(Serialize)]
+struct UserNS {
+    nsmode: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    value: String,
 }
 
 #[derive(Serialize)]
@@ -813,10 +839,12 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
     let vol = volume_name(&sandbox.id);
+    let sandbox_driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
 
     let env = build_env(sandbox, config, image);
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
+
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
     let devices = gpu_device_ids.map(|device_ids| {
@@ -971,6 +999,7 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
+        userns: build_userns(&sandbox_driver_config.userns_mode),
         networks,
         devices,
         // Mount a tmpfs at /run/netns so the sandbox supervisor can create
@@ -1048,6 +1077,32 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     };
 
     Ok(serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail"))
+}
+
+/// Parse a `--userns` style string (e.g. `"keep-id:uid=200,gid=210"`)
+/// into a libpod `Namespace` object.
+///
+/// Splits on the first colon: the left side becomes `nsmode`, the right
+/// side becomes `value`. If there is no colon, the entire string is the
+/// `nsmode` and `value` is empty.
+///
+/// Returns `None` when the input is empty, so the `userns` field is
+/// omitted from the JSON and Podman uses its default (host namespace).
+fn build_userns(userns_mode: &str) -> Option<UserNS> {
+    let userns_mode = userns_mode.trim();
+    if userns_mode.is_empty() {
+        return None;
+    }
+    match userns_mode.split_once(':') {
+        Some((nsmode, value)) => Some(UserNS {
+            nsmode: nsmode.to_string(),
+            value: value.to_string(),
+        }),
+        None => Some(UserNS {
+            nsmode: userns_mode.to_string(),
+            value: String::new(),
+        }),
+    }
 }
 
 fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
@@ -2360,5 +2415,178 @@ mod tests {
             .filter(|m| m["type"].as_str() == Some("bind"))
             .count();
         assert_eq!(bind_count, 0, "no bind mounts without TLS config");
+    }
+
+    // ── userns tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn container_spec_omits_userns_when_unset() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert!(
+            spec.get("userns").is_none(),
+            "userns should be omitted when userns_mode is empty"
+        );
+    }
+
+    #[test]
+    fn container_spec_omits_userns_when_whitespace_only() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut sandbox = sandbox;
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "userns_mode": "   "
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert!(
+            spec.get("userns").is_none(),
+            "userns should be omitted when userns_mode is whitespace only"
+        );
+    }
+
+    #[test]
+    fn container_spec_userns_keep_id_without_options_from_driver_config() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "userns_mode": "keep-id"
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let userns = spec.get("userns").expect("userns should be present");
+        assert_eq!(userns["nsmode"].as_str(), Some("keep-id"));
+        assert!(
+            userns.get("value").is_none() || userns["value"].as_str() == Some(""),
+            "value should be omitted or empty for keep-id without options"
+        );
+    }
+
+    #[test]
+    fn container_spec_userns_keep_id_with_uid_and_gid_from_driver_config() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "userns_mode": "keep-id:uid=200,gid=210"
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let userns = spec.get("userns").expect("userns should be present");
+        assert_eq!(userns["nsmode"].as_str(), Some("keep-id"));
+        assert_eq!(userns["value"].as_str(), Some("uid=200,gid=210"));
+    }
+
+    #[test]
+    fn container_spec_userns_auto_from_driver_config() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "userns_mode": "auto"
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let userns = spec.get("userns").expect("userns should be present");
+        assert_eq!(userns["nsmode"].as_str(), Some("auto"));
+    }
+
+    #[test]
+    fn container_spec_userns_trims_whitespace_from_driver_config() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "userns_mode": "  keep-id:uid=200,gid=210  "
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let userns = spec.get("userns").expect("userns should be present");
+        assert_eq!(userns["nsmode"].as_str(), Some("keep-id"));
+        assert_eq!(userns["value"].as_str(), Some("uid=200,gid=210"));
+    }
+
+    #[test]
+    fn driver_config_accepts_userns_mode_alongside_mounts() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "userns_mode": "nomap",
+                    "mounts": [{
+                        "type": "tmpfs",
+                        "target": "/sandbox/tmp"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(spec["userns"]["nsmode"].as_str(), Some("nomap"));
+    }
+
+    #[test]
+    fn build_userns_splits_on_first_colon() {
+        // Single colon: left = nsmode, right = value
+        let result = build_userns("keep-id:uid=200,gid=210").unwrap();
+        assert_eq!(result.nsmode, "keep-id");
+        assert_eq!(result.value, "uid=200,gid=210");
+    }
+
+    #[test]
+    fn build_userns_no_colon_returns_nsmode_only() {
+        let result = build_userns("auto").unwrap();
+        assert_eq!(result.nsmode, "auto");
+        assert!(result.value.is_empty());
+    }
+
+    #[test]
+    fn build_userns_empty_returns_none() {
+        assert!(build_userns("").is_none());
+        assert!(build_userns("   ").is_none());
     }
 }

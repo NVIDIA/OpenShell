@@ -50,11 +50,17 @@ The container spec in `container.rs` sets these security-critical fields:
 
 The restricted agent child does not retain these supervisor privileges.
 
-## Driver Config Mounts
+## Per-Sandbox Driver Config
 
 The gateway forwards the `podman` block from `--driver-config-json` to this
-driver. The driver accepts user-supplied `mounts` entries with these Podman
-mount types:
+driver.
+
+`userns_mode`: optional per-sandbox user namespace mode. Accepts the same
+values as `podman run --userns`, such as `keep-id`,
+`keep-id:uid=998,gid=998`, `auto`, `nomap`, or `host`.
+
+The driver also accepts user-supplied `mounts` entries with these Podman mount
+types:
 
 - `bind`: mounts an absolute host path when `[openshell.drivers.podman]`
   has `enable_bind_mounts = true`.
@@ -86,6 +92,14 @@ podman volume create openshell-work
 
 openshell sandbox create \
   --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work"}]}}' \
+  -- claude
+```
+
+Example per-sandbox user namespace selection:
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"podman":{"userns_mode":"keep-id:uid=998,gid=998"}}' \
   -- claude
 ```
 
