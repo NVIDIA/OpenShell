@@ -79,8 +79,22 @@ pub mod inference {
     }
 }
 
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    unused_qualifications,
+    rust_2018_idioms
+)]
+pub mod runtime {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/openshell.runtime.v1.rs"));
+    }
+}
+
 pub use datamodel::v1::*;
 pub use inference::v1::*;
 pub use openshell::*;
+pub use runtime::v1::*;
 pub use sandbox::v1::*;
 pub use test::ObjectForTest;

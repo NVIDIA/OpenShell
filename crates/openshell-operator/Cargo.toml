@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-operator"
+description = "Kubernetes operator for SandboxRuntime CRD lifecycle management"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-operator"
+path = "src/main.rs"
+
+[[bin]]
+name = "openshell-crd-gen"
+path = "src/bin/crd_gen.rs"
+
+[lib]
+name = "openshell_operator"
+path = "src/lib.rs"
+
+[dependencies]
+# Kubernetes (inherits workspace features: runtime, derive)
+# Additional "admission" feature for webhook support
+kube = { workspace = true, features = ["admission"] }
+k8s-openapi = { workspace = true }
+
+# CRD schema generation
+schemars = { workspace = true }
+
+# Webhook JSON patches
+json-patch = { workspace = true }
+
+# gRPC / Protobuf (for bridge service types)
+tonic = { workspace = true }
+prost = { workspace = true }
+
+# HTTP server (webhook endpoints)
+axum = { workspace = true }
+tower = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+
+# TLS (webhook HTTPS)
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# CLI (operator binary args)
+clap = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

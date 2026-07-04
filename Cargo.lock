@@ -3766,6 +3766,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-operator"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "json-patch",
+ "k8s-openapi",
+ "kube",
+ "prost",
+ "rustls",
+ "rustls-pemfile",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-policy"
 version = "0.0.0"
 dependencies = [
@@ -3879,6 +3909,7 @@ dependencies = [
  "openshell-driver-kubernetes",
  "openshell-driver-podman",
  "openshell-ocsf",
+ "openshell-operator",
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
@@ -3895,6 +3926,7 @@ dependencies = [
  "rustix 1.1.4",
  "rustls",
  "rustls-pemfile",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",

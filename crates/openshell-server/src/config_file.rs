@@ -151,6 +151,11 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
 
+    // ── Operator bridge ─────────────────────────────────────────────────
+    /// Enable the SandboxRuntime operator bridge.
+    #[serde(default)]
+    pub operator_enabled: Option<bool>,
+
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
     // Captured so we can produce a friendly "set this via env/CLI instead"

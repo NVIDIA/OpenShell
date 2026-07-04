@@ -26,10 +26,12 @@ openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
 openshell-server-macros = { path = "../openshell-server-macros" }
+openshell-operator = { path = "../openshell-operator" }
 
 # Kubernetes client (used by the `generate-certs` subcommand)
 kube = { workspace = true }
 k8s-openapi = { workspace = true }
+schemars = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

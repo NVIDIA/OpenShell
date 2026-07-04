@@ -147,6 +147,10 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+
+    /// Optional SandboxRuntime bridge for operator CRD management.
+    /// `None` when operator integration is disabled.
+    pub sandbox_runtime_bridge: Option<grpc::sandbox_runtime::SandboxRuntimeManagerService>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -197,6 +201,7 @@ impl ServerState {
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
             grpc_rate_limiter,
+            sandbox_runtime_bridge: None,
         }
     }
 }
@@ -358,6 +363,25 @@ pub(crate) async fn run_server(
                 "in-cluster K8s client construction failed; \
                  K8s ServiceAccount bootstrap is disabled"
             ),
+        }
+    }
+
+    // SandboxRuntime operator bridge. When operator_enabled is set, the
+    // gateway creates a kube::Client and exposes the SandboxRuntimeManager
+    // gRPC service so CLI/API callers can manage CRDs declaratively.
+    if config.operator_enabled {
+        match kube::Client::try_default().await {
+            Ok(client) => {
+                state.sandbox_runtime_bridge =
+                    Some(grpc::sandbox_runtime::SandboxRuntimeManagerService::new(client));
+                info!("SandboxRuntime operator bridge enabled");
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "K8s client unavailable; SandboxRuntime operator bridge disabled"
+                );
+            }
         }
     }
 

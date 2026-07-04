@@ -400,6 +400,9 @@ pub struct Config {
 
     /// Browser-facing sandbox service routing configuration.
     pub service_routing: ServiceRoutingConfig,
+
+    /// Whether the SandboxRuntime operator bridge is enabled.
+    pub operator_enabled: bool,
 }
 
 /// Browser-facing sandbox service routing configuration.
@@ -584,6 +587,7 @@ impl Config {
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
+            operator_enabled: false,
         }
     }
 
@@ -703,6 +707,13 @@ impl Config {
     #[must_use]
     pub const fn with_loopback_service_http(mut self, enabled: bool) -> Self {
         self.service_routing.enable_loopback_service_http = enabled;
+        self
+    }
+
+    /// Enable or disable the SandboxRuntime operator bridge.
+    #[must_use]
+    pub const fn with_operator_enabled(mut self, enabled: bool) -> Self {
+        self.operator_enabled = enabled;
         self
     }
 }

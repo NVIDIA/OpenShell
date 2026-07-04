@@ -393,6 +393,13 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
         config = config.with_ssh_session_ttl_secs(ttl);
     }
 
+    if let Some(enabled) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.operator_enabled)
+    {
+        config = config.with_operator_enabled(enabled);
+    }
+
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,

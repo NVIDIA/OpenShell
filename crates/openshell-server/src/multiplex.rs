@@ -162,8 +162,20 @@ impl MultiplexService {
             scopes_enabled: !oidc.scopes_claim.is_empty(),
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
+        use openshell_core::proto::runtime::v1::sandbox_runtime_manager_server::SandboxRuntimeManagerServer;
+        use crate::grpc::sandbox_runtime::SandboxRuntimeManagerService;
+
+        type RuntimeSvc = SandboxRuntimeManagerServer<SandboxRuntimeManagerService>;
+        let runtime_manager: MaybeService<RuntimeSvc> =
+            match self.state.sandbox_runtime_bridge.as_ref() {
+                Some(bridge) => MaybeService::Enabled(
+                    SandboxRuntimeManagerServer::new(bridge.clone())
+                        .max_decoding_message_size(MAX_GRPC_DECODE_SIZE),
+                ),
+                None => MaybeService::Disabled,
+            };
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, inference),
+            GrpcRouter::new(openshell, inference, runtime_manager),
             authenticator_chain,
             authz_policy,
             self.state
@@ -370,26 +382,39 @@ where
     }
 }
 
-/// Combined gRPC service that routes between `OpenShell` and Inference services
-/// based on the request path prefix.
+/// Wrapper for an optional gRPC service that may be disabled.
+///
+/// When `Disabled`, requests for this service are routed to the primary
+/// OpenShell service, which returns UNIMPLEMENTED for the unknown method.
 #[derive(Clone)]
-pub struct GrpcRouter<N, I> {
-    openshell: N,
-    inference: I,
+pub enum MaybeService<S> {
+    Enabled(S),
+    Disabled,
 }
 
-impl<N, I> GrpcRouter<N, I> {
-    fn new(openshell: N, inference: I) -> Self {
+/// Combined gRPC service that routes between `OpenShell`, Inference, and
+/// optionally the SandboxRuntimeManager services based on request path prefix.
+#[derive(Clone)]
+pub struct GrpcRouter<N, I, R> {
+    openshell: N,
+    inference: I,
+    runtime_manager: MaybeService<R>,
+}
+
+impl<N, I, R> GrpcRouter<N, I, R> {
+    fn new(openshell: N, inference: I, runtime_manager: MaybeService<R>) -> Self {
         Self {
             openshell,
             inference,
+            runtime_manager,
         }
     }
 }
 
 const INFERENCE_PATH_PREFIX: &str = "/openshell.inference.v1.Inference/";
+const RUNTIME_MANAGER_PATH_PREFIX: &str = "/openshell.runtime.v1.SandboxRuntimeManager/";
 
-impl<N, I, B> tower::Service<Request<B>> for GrpcRouter<N, I>
+impl<N, I, R, B> tower::Service<Request<B>> for GrpcRouter<N, I, R>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
@@ -400,6 +425,11 @@ where
         + Send
         + 'static,
     I::Future: Send,
+    R: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    R::Future: Send,
     B: Send + 'static,
 {
     type Response = N::Response;
@@ -411,11 +441,23 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let is_inference = req.uri().path().starts_with(INFERENCE_PATH_PREFIX);
+        let path = req.uri().path();
 
-        if is_inference {
+        if path.starts_with(INFERENCE_PATH_PREFIX) {
             let mut svc = self.inference.clone();
             Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if path.starts_with(RUNTIME_MANAGER_PATH_PREFIX) {
+            match &mut self.runtime_manager {
+                MaybeService::Enabled(svc) => {
+                    let mut svc = svc.clone();
+                    Box::pin(async move { svc.ready().await?.call(req).await })
+                }
+                MaybeService::Disabled => {
+                    // Route to openshell, which returns UNIMPLEMENTED.
+                    let mut svc = self.openshell.clone();
+                    Box::pin(async move { svc.ready().await?.call(req).await })
+                }
+            }
         } else {
             let mut svc = self.openshell.clone();
             Box::pin(async move { svc.ready().await?.call(req).await })

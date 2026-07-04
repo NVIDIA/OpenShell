@@ -9,6 +9,7 @@ pub mod provider;
 mod sandbox;
 mod service;
 mod validation;
+pub mod sandbox_runtime;
 
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,

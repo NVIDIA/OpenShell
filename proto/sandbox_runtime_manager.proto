@@ -1,0 +1,62 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.runtime.v1;
+
+/// Service for managing SandboxRuntime custom resources from the gateway.
+service SandboxRuntimeManager {
+  rpc CreateSandboxRuntime(CreateSandboxRuntimeRequest) returns (SandboxRuntimeResponse);
+  rpc GetSandboxRuntime(GetSandboxRuntimeRequest) returns (SandboxRuntimeResponse);
+  rpc ListSandboxRuntimes(ListSandboxRuntimesRequest) returns (ListSandboxRuntimesResponse);
+  rpc DeleteSandboxRuntime(DeleteSandboxRuntimeRequest) returns (DeleteSandboxRuntimeResponse);
+}
+
+message SandboxRuntimeMessage {
+  string name = 1;
+  string namespace = 2;
+  string runtime_type = 3;
+  string image = 4;
+  int32 replicas = 5;
+  string target_kind = 6;
+  string phase = 7;
+  string message = 8;
+  string description = 9;
+}
+
+message CreateSandboxRuntimeRequest {
+  string name = 1;
+  string namespace = 2;
+  string runtime_type = 3;
+  string image = 4;
+  int32 replicas = 5;
+  string target_kind = 6;
+  string description = 7;
+}
+
+message GetSandboxRuntimeRequest {
+  string name = 1;
+  string namespace = 2;
+}
+
+message ListSandboxRuntimesRequest {
+  string namespace = 1;
+}
+
+message DeleteSandboxRuntimeRequest {
+  string name = 1;
+  string namespace = 2;
+}
+
+message SandboxRuntimeResponse {
+  SandboxRuntimeMessage runtime = 1;
+}
+
+message ListSandboxRuntimesResponse {
+  repeated SandboxRuntimeMessage runtimes = 1;
+}
+
+message DeleteSandboxRuntimeResponse {
+  bool deleted = 1;
+}
