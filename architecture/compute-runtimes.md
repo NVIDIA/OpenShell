@@ -16,11 +16,59 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
+Drivers report **backend state only**. A driver snapshot with `Ready=True` means
+the underlying compute resource (container, pod, VM) is healthy and running —
+nothing more. Drivers must not gate on supervisor session state or hold
+references to gateway-internal types. The gateway owns the public
+`SandboxPhase::Ready` decision. This applies equally to extension drivers
+implementing `ComputeDriver` out of tree.
+
 Drivers own runtime-specific platform event interpretation. When an event should
 drive client provisioning UI, the driver attaches the shared
 `openshell.progress.*` metadata defined in `openshell-core` instead of requiring
 clients to parse Kubernetes reasons, VM cache states, or other driver-local
 reason strings.
+
+## Sandbox Readiness Composition
+
+The gateway composes driver backend state with supervisor session presence to
+produce the public `SandboxPhase`. This composition is gateway-owned and applied
+uniformly across all drivers:
+
+```
+backend_phase = derive_phase(driver_status)
+
+public_phase =
+  if backend_phase in {Error, Deleting}:                     → pass through (terminal precedence)
+  if backend_phase == Ready && session connected:             → Ready
+  if backend_phase == Ready && no session:                    → Provisioning
+  if backend_phase in {Provisioning, Unknown} && session:    → Ready
+  if backend_phase in {Provisioning, Unknown} && no session: → Provisioning
+```
+
+When `public_phase == Ready` the sandbox is usable through the gateway — both the
+backend resource is healthy and a supervisor session is registered. A sandbox whose
+backend reports ready but has no supervisor session yet holds `Provisioning`; the
+driver's `BackendReady=True` condition is visible in the sandbox status for operators
+who need to distinguish that state from a sandbox still provisioning its compute resource.
+
+**Session precedence over lagging driver snapshots:** A supervisor session can only be
+established by a running workload. When `set_supervisor_session_state` promotes the
+store record to `Ready` on session connect, a driver watch event may still arrive
+shortly after carrying a stale `Provisioning` or `Unknown` backend phase. The
+composition rule treats a connected session as the stronger signal and keeps `Ready`
+in that case, preventing a lagging snapshot from undoing the session-driven promotion.
+
+**HA deployments:** Supervisor sessions are process-local. A gateway replica that
+does not own the active supervisor session holds the public phase at `Provisioning`.
+The owning replica's `supervisor_session_connected` write propagates through the
+shared store and reconcile loop. This is correct behavior — a replica should not
+claim `Ready` for a session it does not hold.
+
+**Extension point:** The readiness decision is a safety invariant, not an
+operator-configurable hook. The driver contract is the correct extension point for
+custom backend readiness semantics. RFC-0010 lifecycle hooks may observe readiness
+transitions via `post_commit`; they do not override the composition rule.
 
 The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated

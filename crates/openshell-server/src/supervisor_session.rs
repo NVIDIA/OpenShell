@@ -63,12 +63,6 @@ struct LiveSession {
 /// target-open failure reported by the supervisor.
 type RelayStreamSender = oneshot::Sender<Result<tokio::io::DuplexStream, Status>>;
 
-impl openshell_driver_docker::SupervisorReadiness for SupervisorSessionRegistry {
-    fn is_supervisor_connected(&self, sandbox_id: &str) -> bool {
-        Self::is_connected(self, sandbox_id)
-    }
-}
-
 /// Registry of active supervisor sessions and pending relay channels.
 #[derive(Default)]
 pub struct SupervisorSessionRegistry {
