@@ -1503,10 +1503,10 @@ fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathB
 ///
 /// This is the identity-resolution block of [`evaluate_opa_tcp`] extracted
 /// into a standalone helper so it can be exercised by Linux-only regression
-/// tests without a full OPA engine. The key invariant under test is that on
-/// a hot-swap of the peer binary, the failure mode is
-/// `"Binary integrity violation"` (from the identity cache) rather than
-/// `"Failed to stat ... (deleted)"` (from the kernel-tainted path).
+/// tests without a full OPA engine. The key hot-swap invariant under test is
+/// that display paths are stripped for policy/logging, while integrity hashing
+/// reads the live executable via `/proc/<pid>/exe` instead of the replacement
+/// file that now exists at the display path.
 #[cfg(target_os = "linux")]
 fn resolve_process_identity(
     entrypoint_pid: u32,
@@ -8184,27 +8184,23 @@ network_policies:
         assert_eq!(resp_str[body_start..].len(), cl);
     }
 
-    /// End-to-end regression for the `docker cp` hot-swap hazard that
-    /// motivated `binary_path()` stripping the kernel's `" (deleted)"`
-    /// suffix (PR #844).
+    /// End-to-end regression for the `docker cp` hot-swap hazard around
+    /// unlinked process executables.
     ///
-    /// Before the strip, the identity-resolution chain inside
-    /// `evaluate_opa_tcp` failed with `"Failed to stat
-    /// /opt/openshell/bin/openshell-sandbox (deleted)"` because
-    /// `BinaryIdentityCache::verify_or_cache()` tried to `metadata()` the
-    /// tainted path. That masked the real security signal: a live process
-    /// was now bound to a *different* binary on disk than the one that was
-    /// TOFU-cached. After the strip, `binary_path()` returns a path that
-    /// stats fine, the cache rehashes the new bytes, and the hash mismatch
-    /// surfaces as a `Binary integrity violation` error — the contract this
-    /// PR is trying to establish.
+    /// `binary_path()` strips the kernel's `" (deleted)"` suffix so policy
+    /// identity and logs use a clean display path. Integrity verification must
+    /// not hash that display path after a hot-swap, because it may now point to
+    /// unrelated replacement bytes. It hashes `/proc/<pid>/exe` instead, which
+    /// resolves to the live executable inode even after the original path was
+    /// unlinked.
     ///
     /// Test shape (from the review comment on the initial PR):
     /// 1. Start a `TcpListener` in the test process.
     /// 2. Copy `/bin/bash` to a temp path we control.
     /// 3. Prime `BinaryIdentityCache` with that temp binary's hash.
     /// 4. Spawn the temp bash as a child with a `/dev/tcp` one-liner that
-    ///    opens a real TCP connection to the listener and holds it open.
+    ///    opens a real TCP connection to the listener and holds it open
+    ///    inside the bash process.
     /// 5. Accept the connection on the listener side and capture the peer's
     ///    ephemeral port — that's what `resolve_process_identity` uses to
     ///    walk `/proc/net/tcp` back to the child PID.
@@ -8214,13 +8210,12 @@ network_policies:
     ///    now readlink to `" (deleted)"` OR the overwritten file, depending
     ///    on whether the filesystem reused the inode.
     /// 7. Call `resolve_process_identity` and assert:
-    ///    - the error reason contains `"Binary integrity violation"` (the
-    ///      cache detected the tampered on-disk bytes), and
-    ///    - the error reason does NOT contain `"Failed to stat"` or
-    ///      `"(deleted)"` (the old pre-strip failure mode).
+    ///    - identity resolution succeeds using the live executable hash, and
+    ///    - the returned display path does not contain the kernel-added
+    ///      `"(deleted)"` suffix.
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_process_identity_surfaces_binary_integrity_violation_on_hot_swap() {
+    fn resolve_process_identity_hashes_live_exe_after_hot_swap() {
         use crate::identity::BinaryIdentityCache;
         use std::io::Read;
         use std::net::TcpListener;
@@ -8252,9 +8247,12 @@ network_policies:
         assert!(!v1_hash.is_empty());
 
         // 4. Spawn the temp bash with a /dev/tcp one-liner that opens a real
-        //    connection to the listener and sleeps to keep it open. The
-        //    `read -t` blocks on stdin so the shell stays resident.
-        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; sleep 30 <&3");
+        //    connection to the listener and blocks in bash's `read` builtin
+        //    to keep it open. Do not use an external command like `sleep`:
+        //    it inherits the socket fd and intentionally trips the shared
+        //    socket ambiguity guard instead of exercising the hot-swap path.
+        let script =
+            format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; read -r -t 30 _ <&3 || true");
         let mut child = Command::new(&bash_v1)
             .arg("-c")
             .arg(&script)
@@ -8298,10 +8296,11 @@ network_policies:
         std::fs::write(&bash_v1, tampered_bytes).expect("write replacement bytes");
 
         // 7. Resolve identity through the real helper and assert the
-        //    contract: we want "Binary integrity violation", not
-        //    "Failed to stat ... (deleted)".
+        //    contract: hash the live executable via /proc/<pid>/exe while
+        //    returning a clean display path for policy/logging.
         let test_pid = std::process::id();
         let result = resolve_process_identity(test_pid, peer_port, &cache);
+        let child_pid = child.id();
 
         // Always clean up the child before asserting so a failure doesn't
         // leak a sleeping process across test runs.
@@ -8309,40 +8308,29 @@ network_policies:
         let _ = child.wait();
 
         match result {
-            Ok(_) => panic!(
-                "resolve_process_identity unexpectedly succeeded after hot-swap; \
-                 the cache should have detected the tampered on-disk bytes"
-            ),
-            Err(err) => {
-                assert!(
-                    err.reason.contains("Binary integrity violation"),
-                    "expected 'Binary integrity violation' error, got: {}",
-                    err.reason
+            Ok(identity) => {
+                assert_eq!(
+                    identity.binary_pid, child_pid,
+                    "expected the hot-swapped bash child to own the socket"
+                );
+                assert_eq!(
+                    identity.bin_path, bash_v1,
+                    "expected stripped display path to remain the original binary path"
                 );
                 assert!(
-                    !err.reason.contains("Failed to stat"),
-                    "pre-PR-#844 failure mode leaked: {}",
-                    err.reason
+                    !identity.bin_path.to_string_lossy().contains("(deleted)"),
+                    "resolved binary path still tainted: {}",
+                    identity.bin_path.display()
                 );
-                assert!(
-                    !err.reason.contains("(deleted)"),
-                    "resolved path still contains '(deleted)' suffix: {}",
-                    err.reason
+                assert_eq!(
+                    identity.bin_hash, v1_hash,
+                    "expected integrity hash from the live executable, not replacement bytes"
                 );
-                // The binary field should be populated — we did resolve a
-                // path before failing.
-                assert!(
-                    err.binary.is_some(),
-                    "expected resolved binary path on integrity failure"
-                );
-                if let Some(path) = &err.binary {
-                    assert!(
-                        !path.to_string_lossy().contains("(deleted)"),
-                        "resolved binary path still tainted: {}",
-                        path.display()
-                    );
-                }
             }
+            Err(err) => panic!(
+                "resolve_process_identity failed after hot-swap; expected live-exe identity: {}",
+                err.reason
+            ),
         }
     }
 
