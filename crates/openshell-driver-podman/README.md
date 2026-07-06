@@ -68,8 +68,8 @@ mount types:
   pulls the image during provisioning using the sandbox image pull policy.
 
 Host bind mounts are disabled by default because they expose gateway host paths
-to sandbox requests. The driver still uses internal bind mounts for
-OpenShell-owned token and TLS material.
+to sandbox requests. The driver still uses internal bind mounts for configured
+TLS material; per-sandbox gateway JWTs are delivered through Podman secrets.
 
 Podman `bind` mounts accept `source`, `target`, and optional `read_only`.
 User-supplied bind and volume mounts are read-only by default; set

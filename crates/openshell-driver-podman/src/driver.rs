@@ -19,7 +19,7 @@ use openshell_core::gpu::{
 use openshell_core::proto::compute::v1::{
     DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -83,62 +83,34 @@ fn podman_volume_is_bind_backed(volume: &VolumeInspect) -> bool {
         })
 }
 
-fn sandbox_token_host_path(sandbox_id: &str) -> Result<PathBuf, ComputeDriverError> {
-    openshell_core::driver_utils::sandbox_token_path("podman-sandbox-tokens", None, sandbox_id)
-        .map_err(|err| ComputeDriverError::Message(format!("resolve state dir failed: {err}")))
-}
-
-async fn write_sandbox_token_file(
+async fn create_sandbox_token_secret(
+    client: &PodmanClient,
     sandbox: &DriverSandbox,
-) -> Result<Option<PathBuf>, ComputeDriverError> {
-    let Some(spec) = sandbox.spec.as_ref() else {
+) -> Result<Option<String>, ComputeDriverError> {
+    let Some(token) = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.sandbox_token.trim())
+        .filter(|token| !token.is_empty())
+    else {
         return Ok(None);
     };
-    if spec.sandbox_token.is_empty() {
-        return Ok(None);
-    }
-    let path = sandbox_token_host_path(&sandbox.id)?;
-    if let Some(parent) = path.parent() {
-        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
-            ComputeDriverError::Message(format!(
-                "create sandbox token directory {} failed: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    tokio::fs::write(&path, format!("{}\n", spec.sandbox_token))
+
+    let secret_name = container::token_secret_name(&sandbox.id);
+    client
+        .create_secret(&secret_name, format!("{token}\n").as_bytes())
         .await
-        .map_err(|err| {
-            ComputeDriverError::Message(format!(
-                "write sandbox token file {} failed: {err}",
-                path.display()
-            ))
-        })?;
-    openshell_core::paths::set_file_owner_only(&path).map_err(|err| {
-        ComputeDriverError::Message(format!(
-            "restrict sandbox token file {} failed: {err}",
-            path.display()
-        ))
-    })?;
-    Ok(Some(path))
+        .map_err(ComputeDriverError::from)?;
+    Ok(Some(secret_name))
 }
 
-fn cleanup_sandbox_token_file(sandbox_id: &str) {
-    let Ok(path) = sandbox_token_host_path(sandbox_id) else {
-        return;
-    };
-    if let Err(err) = std::fs::remove_file(&path)
-        && err.kind() != std::io::ErrorKind::NotFound
-    {
+async fn cleanup_sandbox_token_secret(client: &PodmanClient, secret_name: &str) {
+    if let Err(err) = client.remove_secret(secret_name).await {
         warn!(
-            sandbox_id = %sandbox_id,
-            path = %path.display(),
+            secret = %secret_name,
             error = %err,
-            "Failed to remove Podman sandbox token file"
+            "Failed to remove Podman sandbox token secret"
         );
-    }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::remove_dir(dir);
     }
 }
 
@@ -533,12 +505,12 @@ impl PodmanComputeDriver {
                 .map_err(ComputeDriverError::from)?;
         }
 
-        // 2. Create workspace volume.
+        // 2. Create workspace volume and per-sandbox token secret.
         if let Err(e) = self.client.create_volume(&vol_name).await {
             return Err(ComputeDriverError::from(e));
         }
-        let token_host_path = match write_sandbox_token_file(sandbox).await {
-            Ok(path) => path,
+        let token_secret_name = match create_sandbox_token_secret(&self.client, sandbox).await {
+            Ok(name) => name,
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
                 return Err(e);
@@ -554,20 +526,24 @@ impl PodmanComputeDriver {
             Ok(devices) => devices,
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
-                cleanup_sandbox_token_file(&sandbox.id);
+                if let Some(secret) = token_secret_name.as_deref() {
+                    cleanup_sandbox_token_secret(&self.client, secret).await;
+                }
                 return Err(e);
             }
         };
         let spec = match container::build_container_spec_with_token_and_gpu_devices(
             sandbox,
             &self.config,
-            token_host_path.as_deref(),
+            token_secret_name.as_deref(),
             gpu_devices.as_deref(),
         ) {
             Ok(spec) => spec,
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
-                cleanup_sandbox_token_file(&sandbox.id);
+                if let Some(secret) = token_secret_name.as_deref() {
+                    cleanup_sandbox_token_secret(&self.client, secret).await;
+                }
                 return Err(e);
             }
         };
@@ -579,12 +555,16 @@ impl PodmanComputeDriver {
                 // has the same name but a different ID), so it would be
                 // orphaned otherwise.
                 let _ = self.client.remove_volume(&vol_name).await;
-                cleanup_sandbox_token_file(&sandbox.id);
+                if let Some(secret) = token_secret_name.as_deref() {
+                    cleanup_sandbox_token_secret(&self.client, secret).await;
+                }
                 return Err(ComputeDriverError::AlreadyExists);
             }
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
-                cleanup_sandbox_token_file(&sandbox.id);
+                if let Some(secret) = token_secret_name.as_deref() {
+                    cleanup_sandbox_token_secret(&self.client, secret).await;
+                }
                 return Err(ComputeDriverError::from(e));
             }
         }
@@ -598,7 +578,9 @@ impl PodmanComputeDriver {
             );
             let _ = self.client.remove_container(&name).await;
             let _ = self.client.remove_volume(&vol_name).await;
-            cleanup_sandbox_token_file(&sandbox.id);
+            if let Some(secret) = token_secret_name.as_deref() {
+                cleanup_sandbox_token_secret(&self.client, secret).await;
+            }
             return Err(ComputeDriverError::from(e));
         }
 
@@ -696,7 +678,7 @@ impl PodmanComputeDriver {
                 "Failed to remove workspace volume"
             );
         }
-        cleanup_sandbox_token_file(sandbox_id);
+        cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id)).await;
 
         Ok(container_existed)
     }

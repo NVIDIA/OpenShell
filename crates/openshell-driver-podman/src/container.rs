@@ -51,6 +51,9 @@ const CONTAINER_PREFIX: &str = "openshell-sandbox-";
 /// Volume name prefix.
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
 
+/// Secret name prefix for per-sandbox gateway JWTs.
+const TOKEN_SECRET_PREFIX: &str = "openshell-token-";
+
 /// Container-side mount paths for client TLS materials and the sandbox token.
 const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
 const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
@@ -149,6 +152,12 @@ pub fn volume_name(sandbox_id: &str) -> String {
     format!("{VOLUME_PREFIX}{sandbox_id}-workspace")
 }
 
+/// Build the per-sandbox Podman secret name for the gateway JWT.
+#[must_use]
+pub fn token_secret_name(sandbox_id: &str) -> String {
+    format!("{TOKEN_SECRET_PREFIX}{sandbox_id}")
+}
+
 /// Truncate a container ID to 12 characters (standard short form).
 #[must_use]
 pub fn short_id(id: &str) -> String {
@@ -187,6 +196,8 @@ struct ContainerSpec {
     /// environment-variable injection, distinct from `secrets` which only
     /// handles file-mounted secrets under `/run/secrets/`.
     secret_env: BTreeMap<String, String>,
+    /// File-mounted Podman secrets.
+    secrets: Vec<SecretMount>,
     stop_timeout: u32,
     /// Extra /etc/hosts entries. Used to inject `host.containers.internal`
     /// via Podman's `host-gateway` magic so sandbox containers can reach
@@ -269,6 +280,15 @@ struct HealthConfig {
     retries: u32,
     #[serde(rename = "StartPeriod")]
     start_period: u64,
+}
+
+#[derive(Serialize)]
+struct SecretMount {
+    source: String,
+    target: String,
+    uid: u32,
+    gid: u32,
+    mode: u32,
 }
 
 #[derive(Serialize)]
@@ -763,9 +783,9 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
 pub fn build_container_spec_with_token(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
-    token_host_path: Option<&Path>,
+    token_secret_name: Option<&str>,
 ) -> Value {
-    try_build_container_spec_with_token(sandbox, config, token_host_path)
+    try_build_container_spec_with_token(sandbox, config, token_secret_name)
         .expect("container spec should be valid")
 }
 
@@ -773,7 +793,7 @@ pub fn build_container_spec_with_token(
 pub fn try_build_container_spec_with_token(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
-    token_host_path: Option<&Path>,
+    token_secret_name: Option<&str>,
 ) -> Result<Value, ComputeDriverError> {
     let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
     let gpu_requirements = sandbox
@@ -791,13 +811,13 @@ pub fn try_build_container_spec_with_token(
     } else {
         None
     };
-    build_container_spec_with_token_and_gpu_devices(sandbox, config, token_host_path, cdi_devices)
+    build_container_spec_with_token_and_gpu_devices(sandbox, config, token_secret_name, cdi_devices)
 }
 
 pub fn build_container_spec_with_token_and_gpu_devices(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
-    token_host_path: Option<&Path>,
+    token_secret_name: Option<&str>,
     gpu_device_ids: Option<&[String]>,
 ) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
@@ -809,6 +829,16 @@ pub fn build_container_spec_with_token_and_gpu_devices(
     let resource_limits = build_resource_limits(sandbox, config);
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
+    if sandbox
+        .spec
+        .as_ref()
+        .is_some_and(|spec| !spec.sandbox_token.is_empty())
+        && token_secret_name.is_none()
+    {
+        return Err(ComputeDriverError::Precondition(
+            "podman sandbox token secret is required when sandbox token is set".to_string(),
+        ));
+    }
     let devices = gpu_device_ids.map(|device_ids| {
         device_ids
             .iter()
@@ -953,6 +983,15 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         },
         resource_limits,
         secret_env: BTreeMap::new(),
+        secrets: token_secret_name.map_or_else(Vec::new, |source| {
+            vec![SecretMount {
+                source: source.to_string(),
+                target: SANDBOX_TOKEN_MOUNT_PATH.into(),
+                uid: 0,
+                gid: 0,
+                mode: 0o400,
+            }]
+        }),
         stop_timeout: config.stop_timeout_secs,
         // Inject stable host aliases into /etc/hosts so sandbox containers can
         // reach services on the host. `host.openshell.internal` is the driver-
@@ -1009,18 +1048,6 @@ pub fn build_container_spec_with_token_and_gpu_devices(
                     kind: "bind".into(),
                     source: key.display().to_string(),
                     destination: TLS_KEY_MOUNT_PATH.into(),
-                    options: ro,
-                });
-            }
-            if let Some(path) = token_host_path {
-                let mut ro = vec!["ro".into(), "rbind".into()];
-                if is_selinux_enabled() {
-                    ro.push("z".into());
-                }
-                m.push(Mount {
-                    kind: "bind".into(),
-                    source: path.display().to_string(),
-                    destination: SANDBOX_TOKEN_MOUNT_PATH.into(),
                     options: ro,
                 });
             }
@@ -2215,7 +2242,7 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_uses_token_file_mount_without_raw_token_env() {
+    fn container_spec_uses_token_secret_mount_without_raw_token_env() {
         use openshell_core::proto::compute::v1::DriverSandboxSpec;
 
         let mut sandbox = test_sandbox("token-id", "token-name");
@@ -2224,9 +2251,9 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let token_path = Path::new("/host/token.jwt");
+        let secret_name = token_secret_name(&sandbox.id);
 
-        let spec = build_container_spec_with_token(&sandbox, &config, Some(token_path));
+        let spec = build_container_spec_with_token(&sandbox, &config, Some(&secret_name));
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
@@ -2241,14 +2268,22 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("/etc/openshell/auth/sandbox.jwt")
         );
+        let secrets = spec["secrets"]
+            .as_array()
+            .expect("secrets should be an array");
+        assert!(secrets.iter().any(|secret| {
+            secret["source"].as_str() == Some(secret_name.as_str())
+                && secret["target"].as_str() == Some("/etc/openshell/auth/sandbox.jwt")
+                && secret["mode"].as_u64() == Some(0o400)
+        }));
         let mounts = spec["mounts"]
             .as_array()
             .expect("mounts should be an array");
-        assert!(mounts.iter().any(|m| {
-            m["type"].as_str() == Some("bind")
-                && m["source"].as_str() == Some("/host/token.jwt")
-                && m["destination"].as_str() == Some("/etc/openshell/auth/sandbox.jwt")
-        }));
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| { m["destination"].as_str() == Some("/etc/openshell/auth/sandbox.jwt") })
+        );
     }
 
     #[test]

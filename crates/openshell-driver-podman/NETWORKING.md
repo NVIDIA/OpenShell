@@ -406,7 +406,7 @@ start and bind-mounted into sandbox containers by the Podman driver.
 | DNS | Kubernetes CoreDNS | Podman bridge DNS through aardvark-dns when DNS is enabled. |
 | Network policy | Kubernetes network policy for pod ingress plus supervisor policy | nftables inside inner sandbox netns plus supervisor policy. |
 | Supervisor delivery | Kubernetes driver managed pod image or template | OCI image volume mount. |
-| Secrets | Kubernetes Secret volume and env vars | Mounted TLS client materials from a Podman secret. |
+| Secrets | Kubernetes Secret volume and env vars | Per-sandbox JWT via Podman secret; TLS client materials from configured host files. |
 
 Both drivers use the same reverse gRPC relay for SSH transport. The most
 important Podman-specific difference is network reachability: in rootless
