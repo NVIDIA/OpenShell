@@ -58,7 +58,9 @@ pub fn generate_bypass_ruleset(host_ip: &str, proxy_port: u16, log_prefix: Optio
 /// The network sidecar and the process supervisor share a pod network
 /// namespace. The sidecar runs as `proxy_uid` and owns external egress;
 /// sandbox traffic must use loopback services hosted by that sidecar
-/// (gateway forward and HTTP CONNECT proxy).
+/// (gateway forward and HTTP CONNECT proxy). The generated fence rejects
+/// TCP/UDP bypass attempts from non-proxy UIDs; other L4 protocols are outside
+/// the sidecar policy fence.
 pub fn generate_sidecar_bypass_ruleset(proxy_uid: u32, log_prefix: Option<&str>) -> String {
     let log_tcp = log_prefix
         .map(|p| {

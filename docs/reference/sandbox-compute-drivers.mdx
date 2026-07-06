@@ -324,6 +324,8 @@ mode keeps gateway session and SSH behavior, but the process supervisor runs in
 and process/binary identity checks are not applied by the process container.
 Set `process_enforcement = "full"` only when you want those combined-mode
 process/filesystem guards and accept the added agent-container permissions.
+Network policy still runs in the sidecar and remains endpoint/L7 scoped in
+sidecar topology; `full` does not restore binary-scoped network identity.
 
 Sidecar mode uses pod `fsGroup` so the non-root process supervisor can read the
 projected ServiceAccount token and sandbox client TLS secret required for

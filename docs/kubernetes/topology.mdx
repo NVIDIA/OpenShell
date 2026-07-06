@@ -141,7 +141,9 @@ Sidecar mode defaults the process supervisor to `network-only`. OpenShell still
 enforces network endpoint and L7 policy through the sidecar, but the process
 supervisor does not apply Landlock filesystem policy, process privilege
 dropping, or process/binary identity checks unless you opt in to
-`supervisor.processEnforcement=full`.
+`supervisor.processEnforcement=full`. Network policy still runs in the sidecar
+and remains endpoint/L7 scoped; `full` does not restore binary-scoped network
+identity in sidecar topology.
 </Warning>
 
 ## Credential Exposure

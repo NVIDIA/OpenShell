@@ -275,11 +275,12 @@ If `supervisor_topology = "sidecar"` is rendered, sandbox pods should have an
 container owns nftables setup and should be the only sidecar topology container
 with `NET_ADMIN`. It also needs `CHOWN`/`FOWNER` to hand shared emptyDir state
 to `sidecar_proxy_uid`. The long-running network sidecar runs as
-`sidecar_proxy_uid` with primary GID `0` so it can read the root-owned,
-group-readable projected service-account token. In sidecar topology the
-`openshell-sa-token` projected volume should render `defaultMode: 288` (`0440`);
-if the proxy logs `failed to read K8s SA token`, verify this token mode and the
-network sidecar security context. The process container should also publish the
+`sidecar_proxy_uid` with primary GID `sandbox_gid`; the pod `fsGroup` is also
+set to `sandbox_gid` so the projected service-account token is group-readable.
+In sidecar topology the `openshell-sa-token` projected volume should render
+`defaultMode: 288` (`0440`); if the proxy logs `failed to read K8s SA token`,
+verify this token mode plus the pod `fsGroup` and network sidecar
+`runAsGroup`. The process container should also publish the
 workload entrypoint PID to `OPENSHELL_ENTRYPOINT_PID_FILE`
 (`/run/openshell-sidecar/entrypoint.pid` by default), and the network sidecar
 should read it for binary-scoped policy decisions; if allowed network rules are
