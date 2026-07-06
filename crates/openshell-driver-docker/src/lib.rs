@@ -5,6 +5,15 @@
 
 #![allow(clippy::result_large_err)]
 
+/// Compile-out guard: greppable proof this crate is linked into a binary.
+///
+/// `tasks/scripts/verify-drivers-compiled-out.sh` asserts this string is
+/// present when `--features driver-docker` is on and absent when it is
+/// off. `#[used]` prevents dead-code elimination; the linker cannot drop it.
+/// Do not remove without updating the verify script.
+#[used]
+static COMPILE_MARKER: &str = "OPENSHELL_DRIVER_MARKER:docker";
+
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{

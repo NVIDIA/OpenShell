@@ -33,9 +33,41 @@ run = [
   # markers, so the absent checks below can never become silently vacuous.
   "cargo build -p openshell-server --bin openshell-gateway",
   "tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway",
-  # Guard: telemetry-free builds must contain no telemetry markers.
-  "cargo build -p openshell-server --bin openshell-gateway --no-default-features",
+  # Guard: telemetry-free builds must contain no telemetry markers. The
+  # gateway needs at least one compute driver to link, so build with a
+  # single-driver feature set that excludes telemetry.
+  "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-kubernetes,driver-docker,driver-podman,driver-vm",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway",
   "cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features",
   "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox",
+]
+
+["rust:verify:drivers-off"]
+description = "Verify each compute driver can be compiled out via per-driver cargo features"
+run = [
+  # Positive control: the default build carries every driver's markers.
+  "cargo build -p openshell-server --bin openshell-gateway",
+  "tasks/scripts/verify-drivers-compiled-out.sh present all target/debug/openshell-gateway",
+
+  # Each single-driver build carries only that driver's markers.
+  "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-kubernetes",
+  "tasks/scripts/verify-drivers-compiled-out.sh only kubernetes target/debug/openshell-gateway",
+  "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-docker",
+  "tasks/scripts/verify-drivers-compiled-out.sh only docker target/debug/openshell-gateway",
+  "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-podman",
+  "tasks/scripts/verify-drivers-compiled-out.sh only podman target/debug/openshell-gateway",
+  "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-vm",
+  "tasks/scripts/verify-drivers-compiled-out.sh only vm target/debug/openshell-gateway",
+
+  # Mixed feature set: verifies driver features compose additively.
+  "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-docker,driver-podman",
+  "tasks/scripts/verify-drivers-compiled-out.sh only docker,podman target/debug/openshell-gateway",
+
+  # Zero-driver build is a valid extension-only gateway shape. Assert both
+  # that the binary links and that none of the built-in driver markers survived.
+  "cargo build -p openshell-server --bin openshell-gateway --no-default-features",
+  "tasks/scripts/verify-drivers-compiled-out.sh absent all target/debug/openshell-gateway",
+  # The zero-driver profile also gates the extension-only unit test paths. Run the library test
+  # suite under --no-default-features so those assertions actually execute.
+  "cargo test -p openshell-server --lib --no-default-features",
 ]
