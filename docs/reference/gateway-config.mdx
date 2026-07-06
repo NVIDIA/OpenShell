@@ -447,3 +447,47 @@ compute_drivers = ["kyma"]
 [openshell.drivers.kyma]
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
+
+## Choosing Which Drivers Are Compiled In
+
+Each built-in compute driver is gated by a Cargo feature on
+`openshell-server`, all enabled by default. Operators who only need one
+driver can produce a smaller gateway with a reduced supply-chain surface
+by building `--no-default-features` and selecting a subset:
+
+| Feature | Compiles in |
+|---|---|
+| `driver-kubernetes` | Kubernetes driver, K8s ServiceAccount authenticator, `kube-rs` and K8s client dependencies. |
+| `driver-docker` | Docker driver, `bollard` and Docker-specific supervisor readiness plumbing. |
+| `driver-podman` | Podman driver and libpod REST client. |
+| `driver-vm` | In-server plumbing for spawning `openshell-driver-vm` and speaking to it over UDS. The driver binary itself is packaged separately. |
+| `telemetry` | Anonymous telemetry emission. |
+
+Kubernetes-only gateway:
+
+```shell
+cargo build --release -p openshell-server --bin openshell-gateway \
+  --no-default-features --features driver-kubernetes,telemetry
+```
+
+Docker + Podman gateway (drops K8s and VM code and their transitive
+dependencies):
+
+```shell
+cargo build --release -p openshell-server --bin openshell-gateway \
+  --no-default-features --features driver-docker,driver-podman,telemetry
+```
+
+Extension-only gateway (no in-tree drivers; talks only to an out-of-tree
+driver over a Unix socket) with disabled telemetry:
+
+```shell
+cargo build --release -p openshell-server --bin openshell-gateway --no-default-features
+```
+
+This build carries no built-in driver code. `compute_drivers` must name an
+extension driver with a matching `[openshell.drivers.<name>].socket_path`.
+Configuring a driver in `gateway.toml` that this gateway was not built with fails at startup with a
+message naming both the driver and the Cargo flag that re-enables it.
+Extension drivers reached via `--compute-driver-socket` do not depend on any
+driver feature and work regardless.

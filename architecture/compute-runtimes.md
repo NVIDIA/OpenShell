@@ -191,3 +191,27 @@ them without changing the sandbox architecture.
 
 When runtime infrastructure changes, validate the relevant sandbox e2e path and
 update the matching driver README if a maintainer-facing constraint changes.
+
+## Compile-Time Driver Selection
+
+Each built-in runtime is gated by a Cargo feature on `openshell-server`:
+`driver-kubernetes`, `driver-docker`, `driver-podman`, `driver-vm`. All
+four are on by default, so the default gateway is byte-equivalent to
+before the feature split. Building `--no-default-features` and selecting a
+subset produces a gateway that carries only the requested drivers, along
+with their transitive dependencies and driver-specific plumbing (Docker's
+supervisor readiness impl, the K8s ServiceAccount authenticator, the VM
+subprocess launcher, and so on).
+
+A zero-driver build is a supported extension-only gateway shape. It
+carries no in-tree driver code and speaks `compute_driver.proto` only to
+out-of-tree drivers named in `compute_drivers` with a matching
+`[openshell.drivers.<name>].socket_path`. A driver named in
+`gateway.toml` that this binary was not built with fails at startup with
+a message naming both the driver and the Cargo flag that re-enables it;
+auto-detection skips drivers that were compiled out and falls through to
+a "no suitable driver" error rather than silently picking a
+different backend. Extension drivers reached via
+`--compute-driver-socket` are always available regardless of driver
+features — they run out-of-process and the gateway only needs to speak
+`compute_driver.proto`.

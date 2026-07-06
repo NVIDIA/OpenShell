@@ -252,13 +252,24 @@ OpenShell collects anonymous telemetry to help improve the project for developer
 
 Disable telemetry at runtime by setting `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. OpenShell propagates this deployment setting into sandbox supervisor environments so sandbox-side telemetry collection is disabled as well.
 
-You can also compile telemetry out entirely. Telemetry support is a default-on `telemetry` Cargo feature; building with `--no-default-features` produces binaries that contain no telemetry endpoint, no telemetry HTTP client, and no emission code. Build telemetry-free artifacts with, for example, `cargo build --release -p openshell-server --no-default-features` (gateway) and the equivalent for `openshell-sandbox` and `openshell-driver-vm`. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches.
+You can also compile telemetry out entirely. Telemetry support is a default-on `telemetry` Cargo feature; building `openshell-server` with `--no-default-features` and selecting only the driver features you need produces a gateway that contains no telemetry endpoint, no telemetry HTTP client, and no emission code. The gateway requires at least one compute driver to link; for example, `cargo build --release -p openshell-server --bin openshell-gateway --no-default-features --features driver-kubernetes,driver-docker,driver-podman,driver-vm` builds a telemetry-free gateway with every driver. Build telemetry-free `openshell-sandbox` and `openshell-driver-vm` binaries with a plain `--no-default-features`. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches.
 
 Telemetry events are limited to anonymous operational categories and counts, such as sandbox lifecycle outcomes, provider profile buckets, policy decision counts, and aggregate network activity denial categories. OpenShell telemetry does not collect sandbox names or IDs, hostnames, file paths, binary paths, prompts, credentials, provider names, model names, or user content.
 
 Opting out applies only to telemetry emitted by OpenShell. Third-party services, model providers, inference endpoints, agents, or tools that you configure and use with OpenShell may have their own terms and privacy practices.
 
 We publish aggregate usage trends from this telemetry every two weeks. See the [community telemetry reports](telemetry/README.md) for the latest summary.
+
+## Choosing Which Compute Drivers Are Compiled In
+
+Each built-in compute driver — Kubernetes, Docker, Podman, VM — is gated by a Cargo feature on `openshell-server` (`driver-kubernetes`, `driver-docker`, `driver-podman`, `driver-vm`), all enabled by default. Operators who only need one driver can produce a slimmer gateway with a reduced supply-chain surface by building with `--no-default-features` and enabling the drivers they want:
+
+```shell
+cargo build --release -p openshell-server --bin openshell-gateway \
+  --no-default-features --features driver-kubernetes,telemetry
+```
+
+Any non-empty driver subset is a valid build, including zero built-in drivers (an extension-only gateway that reaches an out-of-tree driver over `[openshell.drivers.<name>].socket_path`). What the gateway needs at *runtime* is a `compute_drivers` entry it can serve: either a built-in this binary was built with, or an extension driver name with a matching socket_path entry. Naming a built-in that this gateway was not built with fails at startup with a message naming both the driver and the Cargo flag that re-enables it. Extension drivers reached via `--compute-driver-socket` work regardless of the feature set. See the [gateway configuration reference](docs/reference/gateway-config.mdx) for details.
 
 ## Notice and Disclaimer
 
