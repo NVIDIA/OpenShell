@@ -13,6 +13,7 @@ pub mod authz;
 pub mod guard;
 mod http;
 pub mod identity;
+#[cfg(feature = "driver-kubernetes")]
 pub mod k8s_sa;
 pub mod method_authz;
 pub mod oidc;

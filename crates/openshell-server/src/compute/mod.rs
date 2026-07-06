@@ -5,11 +5,16 @@
 
 pub mod driver_config;
 pub mod lease;
+#[cfg(feature = "driver-vm")]
 pub mod vm;
 
+#[cfg(feature = "driver-docker")]
 pub use openshell_driver_docker::DockerComputeConfig;
+#[cfg(feature = "driver-kubernetes")]
 pub use openshell_driver_kubernetes::KubernetesComputeConfig;
+#[cfg(feature = "driver-podman")]
 pub use openshell_driver_podman::PodmanComputeConfig;
+#[cfg(feature = "driver-vm")]
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
@@ -38,10 +43,13 @@ use openshell_core::proto::{
     SandboxTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_core::{ObjectLabels, ObjectWorkspace};
+#[cfg(feature = "driver-docker")]
 use openshell_driver_docker::DockerComputeDriver;
+#[cfg(feature = "driver-kubernetes")]
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
+#[cfg(feature = "driver-podman")]
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::collections::HashMap;
@@ -165,6 +173,7 @@ trait ShutdownCleanup: Send + Sync {
 }
 
 #[tonic::async_trait]
+#[cfg(feature = "driver-docker")]
 impl ShutdownCleanup for DockerComputeDriver {
     async fn cleanup_on_shutdown(&self) -> Result<(), String> {
         let stopped = self
@@ -190,6 +199,7 @@ trait StartupResume: Send + Sync {
 }
 
 #[tonic::async_trait]
+#[cfg(feature = "driver-docker")]
 impl StartupResume for DockerComputeDriver {
     async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
         Self::resume_sandbox(self, sandbox_id, sandbox_name)
@@ -214,6 +224,7 @@ pub struct ManagedDriverProcess {
 }
 
 impl ManagedDriverProcess {
+    #[cfg(feature = "driver-vm")]
     pub(crate) fn new(child: tokio::process::Child, socket_path: PathBuf) -> Self {
         Self {
             child: std::sync::Mutex::new(Some(child)),
@@ -239,6 +250,7 @@ pub struct AcquiredRemoteDriverEndpoint {
 }
 
 impl AcquiredRemoteDriverEndpoint {
+    #[cfg(feature = "driver-vm")]
     pub(crate) fn managed_builtin(
         driver_kind: ComputeDriverKind,
         channel: Channel,
@@ -457,6 +469,7 @@ impl ComputeRuntime {
         self.delete_gates.entry_count()
     }
 
+    #[cfg(feature = "driver-docker")]
     pub async fn new_docker(
         config: openshell_core::Config,
         docker_config: DockerComputeConfig,
@@ -491,6 +504,7 @@ impl ComputeRuntime {
         .await
     }
 
+    #[cfg(feature = "driver-kubernetes")]
     pub async fn new_kubernetes(
         config: KubernetesComputeConfig,
         store: Arc<Store>,
@@ -544,6 +558,7 @@ impl ComputeRuntime {
         .await
     }
 
+    #[cfg(feature = "driver-podman")]
     pub async fn new_podman(
         config: PodmanComputeConfig,
         store: Arc<Store>,

@@ -1775,6 +1775,7 @@ mem_mib = "not-a-number"
     }
 
     #[test]
+    #[cfg(feature = "driver-kubernetes")]
     fn driver_inherits_shared_image_from_gateway_section() {
         // [openshell.gateway].default_image inherits into the K8s driver
         // table when the driver-specific table does not set it.
@@ -1800,6 +1801,7 @@ namespace = "agents"
     }
 
     #[test]
+    #[cfg(feature = "driver-kubernetes")]
     fn driver_specific_value_overrides_gateway_inheritance() {
         let file = config_file_from_toml(
             r#"
