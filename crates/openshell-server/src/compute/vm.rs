@@ -56,6 +56,17 @@ use tonic::transport::Endpoint;
 #[cfg(unix)]
 use tower::service_fn;
 
+/// Compile-out guard: greppable proof `driver-vm` is compiled in.
+///
+/// `tasks/scripts/verify-drivers-compiled-out.sh` asserts this string is
+/// present when `--features driver-vm` is on and absent when it is off.
+/// The VM driver runs out-of-process and has no in-server crate dependency,
+/// so this marker lives with the launcher plumbing gated by the feature.
+/// `#[used]` prevents dead-code elimination. Do not remove without
+/// updating the verify script.
+#[used]
+static COMPILE_MARKER: &str = "OPENSHELL_DRIVER_MARKER:vm";
+
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
 const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
