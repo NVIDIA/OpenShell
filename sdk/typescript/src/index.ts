@@ -8,7 +8,7 @@
 // added alongside a conformance suite that pins it byte-identical across the
 // TypeScript, Python, and Go SDKs.
 
-export { OpenShellClient, errorCode } from './client.js'
+export { OpenShellClient, SandboxClient, errorCode } from './client.js'
 export type {
   ConnectOptions,
   ExecOptions,
