@@ -861,21 +861,6 @@ async fn build_compute_runtime(
             )
             .await
         }
-        // Configured driver was compiled out. Fail startup with a message
-        // naming the driver and the Cargo flag that re-enables it.
-        #[cfg(not(all(
-            feature = "driver-kubernetes",
-            feature = "driver-docker",
-            feature = "driver-podman",
-            feature = "driver-vm",
-        )))]
-        ConfiguredComputeDriver::Builtin(kind) => {
-            return Err(Error::config(format!(
-                "compute driver '{name}' is not compiled into this gateway; \
-                 rebuild openshell-server with --features driver-{name} to enable it",
-                name = kind.as_str(),
-            )));
-        }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
                 compute::driver_config::remote_driver_config_from_context(driver_startup, &name)?;
@@ -896,6 +881,21 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
+        }
+        // Unreachable at runtime. This fallback is required for match exhaustiveness
+        // in non-default builds (including the extension-only build with zero driver features),
+        // where some or all of the arms above are cfg'd out.
+        #[cfg(not(all(
+            feature = "driver-kubernetes",
+            feature = "driver-docker",
+            feature = "driver-podman",
+            feature = "driver-vm",
+        )))]
+        ConfiguredComputeDriver::Builtin(kind) => {
+            unreachable!(
+                "compute driver '{}' passed startup validation but is not compiled into this gateway",
+                kind.as_str()
+            );
         }
     };
 
@@ -922,15 +922,12 @@ fn configured_compute_driver(
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
     match config.compute_drivers.as_slice() {
-        [] => match openshell_core::config::detect_driver() {
+        [] => match filtered_detect_driver() {
             Some(ComputeDriverKind::Vm) => Err(Error::config(
                 "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
             )),
             Some(driver) => Ok(ConfiguredComputeDriver::Builtin(driver)),
-            None => Err(Error::config(
-                "no compute driver configured and auto-detection found no suitable driver; \
-                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
-            )),
+            None => Err(Error::config(no_driver_configured_message())),
         },
         [driver] => resolve_configured_compute_driver(driver, driver_startup),
         drivers => Err(Error::config(format!(
@@ -938,6 +935,49 @@ fn configured_compute_driver(
             drivers.join(",")
         ))),
     }
+}
+
+/// Error message when no compute driver is configured and auto-detection
+/// finds nothing usable.
+fn no_driver_configured_message() -> String {
+    let builtins = compiled_in_builtin_names();
+    if builtins.is_empty() {
+        // No built-ins were compiled in, so auto-detection had nothing to try.
+        // Point operators at the only path that can succeed in this binary.
+        "no compute driver configured and auto-detection found no suitable driver; \
+         this gateway was built without any in-tree drivers, so `compute_drivers` \
+         must name an extension driver with a matching \
+         [openshell.drivers.<name>].socket_path"
+            .to_string()
+    } else {
+        format!(
+            "no compute driver configured and auto-detection found no suitable driver; \
+             set --drivers or OPENSHELL_DRIVERS to one of: {} \
+             (or to an extension driver name with a matching \
+             [openshell.drivers.<name>].socket_path)",
+            builtins.join(", "),
+        )
+    }
+}
+
+/// Names of the built-in compute drivers linked into this binary, in the
+/// stable order expected by user-facing messages. Empty when the gateway was
+/// built as extension-only (no `driver-*` features).
+fn compiled_in_builtin_names() -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if cfg!(feature = "driver-kubernetes") {
+        names.push("kubernetes");
+    }
+    if cfg!(feature = "driver-podman") {
+        names.push("podman");
+    }
+    if cfg!(feature = "driver-docker") {
+        names.push("docker");
+    }
+    if cfg!(feature = "driver-vm") {
+        names.push("vm");
+    }
+    names
 }
 
 fn resolve_configured_compute_driver(
@@ -954,10 +994,40 @@ fn resolve_configured_compute_driver(
     }
 
     if let Some(kind) = driver_kind {
+        if !driver_compiled_in(kind) {
+            return Err(Error::config(format!(
+                "compute driver '{name}' is not compiled into this gateway; \
+                 rebuild openshell-server with --features driver-{name} to enable it"
+            )));
+        }
         return Ok(ConfiguredComputeDriver::Builtin(kind));
     }
 
     Ok(ConfiguredComputeDriver::Remote { name })
+}
+
+/// Whether the built-in driver `kind` was compiled into this gateway.
+///
+/// Third-party drivers reached via `--compute-driver-socket` are handled
+/// through the remote path and are always available regardless of features.
+const fn driver_compiled_in(kind: ComputeDriverKind) -> bool {
+    match kind {
+        ComputeDriverKind::Kubernetes => cfg!(feature = "driver-kubernetes"),
+        ComputeDriverKind::Docker => cfg!(feature = "driver-docker"),
+        ComputeDriverKind::Podman => cfg!(feature = "driver-podman"),
+        ComputeDriverKind::Vm => cfg!(feature = "driver-vm"),
+    }
+}
+
+/// Auto-detect a driver, ignoring any that were compiled out.
+///
+/// Wraps [`openshell_core::config::detect_driver`]; if the environment's
+/// preferred driver is not compiled in, the caller falls back to the
+/// standard "no driver configured" error rather than silently starting a
+/// different backend.
+fn filtered_detect_driver() -> Option<ComputeDriverKind> {
+    let kind = openshell_core::config::detect_driver()?;
+    driver_compiled_in(kind).then_some(kind)
 }
 
 fn builtin_compute_driver(name: &str) -> Option<ComputeDriverKind> {
@@ -1400,6 +1470,28 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(any(
+        feature = "driver-kubernetes",
+        feature = "driver-docker",
+        feature = "driver-podman",
+        feature = "driver-vm",
+    )))]
+    fn configured_compute_driver_empty_points_at_extensions_when_no_builtins() {
+        let config = Config::new(None).with_compute_drivers(std::iter::empty::<String>());
+        let err =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("without any in-tree drivers"),
+            "expected extension-only guidance, got: {msg}"
+        );
+        assert!(
+            msg.contains("socket_path"),
+            "expected extension socket_path guidance, got: {msg}"
+        );
+    }
+
+    #[test]
     fn configured_compute_driver_rejects_multiple_entries() {
         let config = Config::new(None)
             .with_compute_drivers([ComputeDriverKind::Kubernetes, ComputeDriverKind::Podman]);
@@ -1413,6 +1505,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "driver-podman")]
     fn configured_compute_driver_accepts_podman() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
         let driver =
@@ -1424,6 +1517,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "driver-vm")]
     fn configured_compute_driver_accepts_vm() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
         let driver =
@@ -1435,6 +1529,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "driver-docker")]
     fn configured_compute_driver_accepts_docker() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
         let driver =
@@ -1538,5 +1633,40 @@ mod tests {
             gateway_listener_addresses(primary, &[docker, docker]),
             vec![primary, docker]
         );
+    }
+
+    /// When a built-in driver was compiled out, resolving it must fail with a
+    /// message that names both the driver and the Cargo flag that re-enables
+    /// it. Iterates over every compiled-out kind so a single test run under
+    /// e.g. `--no-default-features` exercises all four rejection messages;
+    /// the default build has every driver and the loop body is skipped.
+    #[test]
+    fn configured_compute_driver_rejects_compiled_out_builtin() {
+        let missing = [
+            (
+                cfg!(feature = "driver-kubernetes"),
+                ComputeDriverKind::Kubernetes,
+            ),
+            (cfg!(feature = "driver-docker"), ComputeDriverKind::Docker),
+            (cfg!(feature = "driver-podman"), ComputeDriverKind::Podman),
+            (cfg!(feature = "driver-vm"), ComputeDriverKind::Vm),
+        ]
+        .into_iter()
+        .filter_map(|(present, kind)| (!present).then_some(kind));
+
+        for kind in missing {
+            let config = Config::new(None).with_compute_drivers([kind]);
+            let err =
+                configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("not compiled into this gateway"),
+                "driver {kind:?}: unexpected error: {msg}"
+            );
+            assert!(
+                msg.contains(&format!("--features driver-{}", kind.as_str())),
+                "driver {kind:?}: error must name the Cargo flag that re-enables the driver: {msg}"
+            );
+        }
     }
 }
