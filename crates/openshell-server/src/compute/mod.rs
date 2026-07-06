@@ -1686,13 +1686,23 @@ impl ComputeRuntime {
             return Ok(());
         }
 
-        // Single-attempt CAS: on conflict, the next watch event will naturally retry
+        self.update_sandbox_record(incoming, existing_record.resource_version)
+            .await
+    }
+
+    // Subsequent driver snapshot for an existing sandbox: apply a single-attempt CAS update.
+    // On conflict the next watch event will naturally retry.
+    async fn update_sandbox_record(
+        &self,
+        incoming: DriverSandbox,
+        expected_resource_version: u64,
+    ) -> Result<(), String> {
         let session_connected = self.supervisor_sessions.has_session(&incoming.id);
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(
                 &incoming.id,
-                existing_record.resource_version,
+                expected_resource_version,
                 |sandbox| apply_driver_snapshot(sandbox, &incoming, session_connected),
             )
             .await
