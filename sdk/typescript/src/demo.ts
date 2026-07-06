@@ -33,21 +33,21 @@ async function main() {
     image: env.OPENSHELL_DEFAULT_IMAGE,
     labels: { 'openshell.dev/demo': 'sdk-ts' },
   }
-  const ref = await client.createSandbox(spec)
+  const ref = await client.sandbox.create(spec)
   console.log(`created: ${ref.name} [${ref.phase}]`)
 
-  await client.waitReady(ref.name, 120)
+  await client.sandbox.waitReady(ref.name, 120)
   console.log(`ready: ${ref.name}`)
 
-  const result: ExecResult = await client.exec(ref.name, ['/bin/sh', '-c', 'echo hello from $(hostname)'], {
+  const result: ExecResult = await client.sandbox.exec(ref.name, ['/bin/sh', '-c', 'echo hello from $(hostname)'], {
     timeoutSecs: 30,
   })
   console.log(`exec exit=${result.exitCode} stdout=${result.stdout.toString().trim()}`)
 
-  const all = await client.listSandboxes({ labelSelector: 'openshell.dev/demo=sdk-ts' })
+  const all = await client.sandbox.list({ labelSelector: 'openshell.dev/demo=sdk-ts' })
   console.log(`listed ${all.length} demo sandbox(es)`)
 
-  console.log(`deleted: ${await client.deleteSandbox(ref.name)}`)
+  console.log(`deleted: ${await client.sandbox.delete(ref.name)}`)
 }
 
 main().catch((e) => {

@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // The OpenShell gateway client: a thin, idiomatic ergonomics layer over the
-// protobuf-generated gRPC stubs (src/gen/). It owns proto request assembly,
-// curated public types, the ExecSandbox server-stream drain, and the
-// waitReady/waitDeleted poll loops. Transport and auth live in transport.ts;
-// the error taxonomy in errors.ts.
+// protobuf-generated gRPC stubs (src/gen/). Resource operations live on scoped
+// clients (`SandboxClient`, mirroring the Python SDK) that OpenShellClient
+// composes as `client.sandbox.*`, mirroring the CLI's noun-verb model; each
+// scoped client is also usable standalone via its own `connect()`. Gateway-
+// scoped calls (`health`) stay top-level. A scoped client owns proto request
+// assembly, the curated public types, the ExecSandbox server-stream drain, and
+// the waitReady/waitDeleted poll loops. Transport and auth live in
+// transport.ts; the error taxonomy in errors.ts.
 
-import { createClient, type Client } from '@connectrpc/connect'
+import { createClient, type Client, type Transport } from '@connectrpc/connect'
 import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js'
 import type { Sandbox } from './gen/openshell_pb.js'
 import { buildTransport, type ConnectOptions } from './transport.js'
@@ -83,25 +87,26 @@ function sandboxRef(sandbox: Sandbox | undefined): SandboxRef {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-// ---- The client ------------------------------------------------------------
+// ---- sandbox client --------------------------------------------------------
 
-export class OpenShellClient {
-  private constructor(private readonly grpc: Client<typeof OpenShell>) {}
+// Sandbox lifecycle + exec. Usable standalone via `SandboxClient.connect()`,
+// or reached as `client.sandbox` on an OpenShellClient, which shares one
+// transport (one connection) across all of its scoped clients.
+export class SandboxClient {
+  private readonly grpc: Client<typeof OpenShell>
 
-  static async connect(options: ConnectOptions): Promise<OpenShellClient> {
-    return new OpenShellClient(createClient(OpenShell, buildTransport(options)))
+  // Takes a transport rather than options so OpenShellClient can compose
+  // several scoped clients over a single connection. For standalone use,
+  // prefer the SandboxClient.connect() factory below.
+  constructor(transport: Transport) {
+    this.grpc = createClient(OpenShell, transport)
   }
 
-  async health(): Promise<Health> {
-    try {
-      const resp = await this.grpc.health({})
-      return { status: statusName(resp.status), version: resp.version }
-    } catch (e) {
-      throw fromConnect(e)
-    }
+  static async connect(options: ConnectOptions): Promise<SandboxClient> {
+    return new SandboxClient(buildTransport(options))
   }
 
-  async createSandbox(spec: SandboxSpec): Promise<SandboxRef> {
+  async create(spec: SandboxSpec): Promise<SandboxRef> {
     try {
       const resp = await this.grpc.createSandbox({
         name: spec.name ?? '',
@@ -119,7 +124,7 @@ export class OpenShellClient {
     }
   }
 
-  async getSandbox(name: string): Promise<SandboxRef> {
+  async get(name: string): Promise<SandboxRef> {
     try {
       const resp = await this.grpc.getSandbox({ name })
       return sandboxRef(resp.sandbox)
@@ -128,7 +133,7 @@ export class OpenShellClient {
     }
   }
 
-  async listSandboxes(options?: ListOptions | null): Promise<SandboxRef[]> {
+  async list(options?: ListOptions | null): Promise<SandboxRef[]> {
     try {
       const resp = await this.grpc.listSandboxes({
         limit: options?.limit ?? 0,
@@ -141,7 +146,7 @@ export class OpenShellClient {
     }
   }
 
-  async deleteSandbox(name: string): Promise<boolean> {
+  async delete(name: string): Promise<boolean> {
     try {
       const resp = await this.grpc.deleteSandbox({ name })
       return resp.deleted
@@ -154,7 +159,7 @@ export class OpenShellClient {
     const deadline = Date.now() + timeoutSecs * 1000
     let delay = 250
     for (;;) {
-      const ref = await this.getSandbox(name)
+      const ref = await this.get(name)
       if (ref.phase === 'ready') return ref
       if (ref.phase === 'error') throw new SdkError('connect', `sandbox '${name}' entered error phase`)
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}'`)
@@ -168,7 +173,7 @@ export class OpenShellClient {
     let delay = 250
     for (;;) {
       try {
-        await this.getSandbox(name)
+        await this.get(name)
       } catch (e) {
         if (e instanceof SdkError && e.code === 'not_found') return
         throw e
@@ -182,7 +187,7 @@ export class OpenShellClient {
   async exec(name: string, command: string[], options?: ExecOptions | null): Promise<ExecResult> {
     try {
       // Resolve the sandbox id first, exactly like the gateway client.
-      const sandbox = await this.getSandbox(name)
+      const sandbox = await this.get(name)
       const stream = this.grpc.execSandbox({
         sandboxId: sandbox.id,
         command,
@@ -212,6 +217,35 @@ export class OpenShellClient {
       return { exitCode, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) }
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e)
+    }
+  }
+}
+
+// ---- The client ------------------------------------------------------------
+
+export class OpenShellClient {
+  /** Sandbox lifecycle + exec: create/get/list/delete, waitReady/waitDeleted, exec. */
+  readonly sandbox: SandboxClient
+
+  private readonly grpc: Client<typeof OpenShell>
+
+  private constructor(transport: Transport) {
+    // One transport (one connection) shared across every scoped client.
+    this.grpc = createClient(OpenShell, transport)
+    this.sandbox = new SandboxClient(transport)
+  }
+
+  static async connect(options: ConnectOptions): Promise<OpenShellClient> {
+    return new OpenShellClient(buildTransport(options))
+  }
+
+  // Gateway-scoped, so it stays top-level rather than under a namespace.
+  async health(): Promise<Health> {
+    try {
+      const resp = await this.grpc.health({})
+      return { status: statusName(resp.status), version: resp.version }
+    } catch (e) {
+      throw fromConnect(e)
     }
   }
 }

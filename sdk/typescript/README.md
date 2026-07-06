@@ -28,15 +28,27 @@ const client = await OpenShellClient.connect({
   oidcToken: process.env.OPENSHELL_TOKEN,
 })
 
-const sandbox = await client.createSandbox({
+const sandbox = await client.sandbox.create({
   image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
 })
-await client.waitReady(sandbox.name, 120)
+await client.sandbox.waitReady(sandbox.name, 120)
 
-const result = await client.exec(sandbox.name, ['/bin/sh', '-c', 'echo hello'])
+const result = await client.sandbox.exec(sandbox.name, ['/bin/sh', '-c', 'echo hello'])
 console.log(result.stdout.toString())
 
-await client.deleteSandbox(sandbox.name)
+await client.sandbox.delete(sandbox.name)
+```
+
+### Scoped clients
+
+`client.sandbox` is a `SandboxClient`. If you only need sandboxes, connect one
+directly — same API, one less hop:
+
+```ts
+import { SandboxClient } from '@nvidia/openshell-sdk'
+
+const sandbox = await SandboxClient.connect({ gateway, oidcToken })
+await sandbox.create({ image })
 ```
 
 ## Development
