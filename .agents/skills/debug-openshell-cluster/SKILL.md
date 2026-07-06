@@ -285,7 +285,11 @@ sandbox token file, or those credential mounts. Instead, the network sidecar
 writes `/run/openshell-sidecar/policy.pb` and
 `/run/openshell-sidecar/provider-env.json`, then writes the readiness file. If
 the process supervisor fails before launching the workload, inspect those
-snapshot files and the network sidecar logs.
+snapshot files and the network sidecar logs. If new SSH/exec sessions do not
+pick up refreshed provider environment, inspect the provider-env snapshot
+revision and network sidecar settings-poll logs; the process container should
+consume newer provider-env snapshot revisions without receiving gateway
+credentials.
 
 The process container should also publish the workload entrypoint PID to
 `OPENSHELL_ENTRYPOINT_PID_FILE`

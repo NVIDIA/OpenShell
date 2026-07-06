@@ -321,7 +321,10 @@ Linux capabilities. A root init container performs the nftables setup, and the
 long-running sidecar runs non-root with no added Linux capabilities. The
 network sidecar owns gateway authentication and writes local policy/provider
 snapshots for the process supervisor, so the agent container does not mount the
-sandbox bootstrap token or client TLS secret in the default sidecar path.
+sandbox bootstrap token or client TLS secret in the default sidecar path. The
+provider environment snapshot is refreshed by the network sidecar after
+settings polls so future child processes can see updated provider env without
+gateway access in the agent container.
 Sidecar mode keeps gateway session and SSH behavior, but the process supervisor
 runs in `network-only` mode by default: filesystem policy, process privilege
 dropping, and process/binary identity checks are not applied by the process

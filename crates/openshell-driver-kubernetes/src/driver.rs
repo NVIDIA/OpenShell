@@ -3169,6 +3169,7 @@ mod tests {
         assert_eq!(agent["securityContext"]["runAsUser"], 1500);
         assert_eq!(agent["securityContext"]["runAsGroup"], 1500);
         assert_eq!(agent["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(agent["securityContext"]["allowPrivilegeEscalation"], false);
         assert_eq!(
             agent["securityContext"]["capabilities"],
             serde_json::json!({

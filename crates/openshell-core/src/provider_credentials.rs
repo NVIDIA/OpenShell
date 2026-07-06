@@ -89,6 +89,37 @@ impl ProviderCredentialState {
         }
     }
 
+    /// Install an already-prepared child environment snapshot.
+    ///
+    /// This is intentionally narrower than [`Self::install_environment`]: it
+    /// updates only the workload-facing env map and clears resolver state so a
+    /// process that does not own gateway/provider resolver material can still
+    /// pick up refreshed provider env for future child processes.
+    pub fn install_child_env_snapshot(
+        &self,
+        revision: u64,
+        mut child_env: HashMap<String, String>,
+    ) -> usize {
+        let mut inner = self
+            .inner
+            .write()
+            .expect("provider credential state poisoned");
+
+        for key in &inner.suppressed_keys {
+            child_env.remove(key);
+        }
+
+        inner.current = Arc::new(ProviderCredentialSnapshot {
+            revision,
+            child_env,
+            dynamic_credentials: HashMap::new(),
+        });
+        inner.generations.clear();
+        inner.current_resolver = None;
+        inner.combined_resolver = None;
+        inner.current.child_env.len()
+    }
+
     pub fn snapshot(&self) -> Arc<ProviderCredentialSnapshot> {
         self.inner
             .read()
@@ -617,6 +648,39 @@ mod tests {
         assert!(
             !state.snapshot().child_env.contains_key("GCE_METADATA_HOST"),
             "suppressed key must not reappear after install_environment"
+        );
+    }
+
+    #[test]
+    fn child_env_snapshot_install_updates_env_without_resolver_material() {
+        let state = ProviderCredentialState::from_child_env_snapshot(
+            1,
+            HashMap::from([
+                ("GITHUB_TOKEN".to_string(), "old".to_string()),
+                ("GCE_METADATA_HOST".to_string(), "marker".to_string()),
+            ]),
+        );
+        state.remove_env_key("GCE_METADATA_HOST");
+
+        let env_count = state.install_child_env_snapshot(
+            2,
+            HashMap::from([
+                ("GITHUB_TOKEN".to_string(), "new".to_string()),
+                ("GCE_METADATA_HOST".to_string(), "marker".to_string()),
+            ]),
+        );
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(env_count, 1);
+        assert_eq!(
+            snapshot.child_env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("new")
+        );
+        assert!(!snapshot.child_env.contains_key("GCE_METADATA_HOST"));
+        assert!(
+            state.resolver().is_none(),
+            "child-env snapshots must not install provider resolver material"
         );
     }
 

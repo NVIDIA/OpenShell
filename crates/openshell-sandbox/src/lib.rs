@@ -207,6 +207,7 @@ pub async fn run_sandbox(
         policy.process.run_as_group = Some(gid);
     }
 
+    let mut process_sidecar_provider_snapshot_path = None;
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let (provider_credentials, mut provider_env) = if process_uses_sidecar_snapshots {
         let snapshot_path = sidecar_provider_env_snapshot_file().ok_or_else(|| {
@@ -215,6 +216,7 @@ pub async fn run_sandbox(
                 openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE
             )
         })?;
+        process_sidecar_provider_snapshot_path = Some(snapshot_path.clone());
         read_sidecar_provider_env_snapshot(&snapshot_path)?
     } else {
         // Fetch provider environment variables from the server.
@@ -283,6 +285,9 @@ pub async fn run_sandbox(
         let provider_env = provider_credentials.child_env_with_gcp_resolved();
         (provider_credentials, provider_env)
     };
+    if let Some(snapshot_path) = process_sidecar_provider_snapshot_path {
+        spawn_sidecar_provider_env_snapshot_watcher(snapshot_path, provider_credentials.clone());
+    }
 
     // Initialize the agent-proposals feature flag. Default false until the
     // initial settings fetch (or the poll loop) tells us otherwise. The flag
@@ -529,6 +534,10 @@ pub async fn run_sandbox(
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
+        let poll_sidecar_provider_env_snapshot_path = (network_enabled
+            && sidecar_network_enforcement)
+            .then(sidecar_provider_env_snapshot_file)
+            .flatten();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -543,6 +552,7 @@ pub async fn run_sandbox(
             ocsf_enabled: poll_ocsf_enabled,
             provider_credentials: poll_provider_credentials,
             policy_local_ctx: poll_policy_local,
+            sidecar_provider_env_snapshot_path: poll_sidecar_provider_env_snapshot_path,
         };
 
         tokio::spawn(async move {
@@ -839,12 +849,31 @@ fn write_sidecar_policy_snapshot(
     Ok(())
 }
 
+struct SidecarProviderEnvSnapshot {
+    revision: u64,
+    child_env: std::collections::HashMap<String, String>,
+}
+
 fn read_sidecar_provider_env_snapshot(
     path: &str,
 ) -> Result<(
     ProviderCredentialState,
     std::collections::HashMap<String, String>,
 )> {
+    let snapshot = read_sidecar_provider_env_snapshot_data(path)?;
+    let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
+        snapshot.revision,
+        snapshot.child_env.clone(),
+    );
+    info!(
+        path,
+        env_count = snapshot.child_env.len(),
+        "Loaded sidecar provider env snapshot"
+    );
+    Ok((provider_credentials, snapshot.child_env))
+}
+
+fn read_sidecar_provider_env_snapshot_data(path: &str) -> Result<SidecarProviderEnvSnapshot> {
     let bytes = std::fs::read(path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read sidecar provider env snapshot from {path}"))?;
@@ -861,14 +890,10 @@ fn read_sidecar_provider_env_snapshot(
             .wrap_err_with(|| {
                 format!("failed to decode child_env from sidecar provider env snapshot {path}")
             })?;
-    let provider_credentials =
-        ProviderCredentialState::from_child_env_snapshot(revision, child_env.clone());
-    info!(
-        path,
-        env_count = child_env.len(),
-        "Loaded sidecar provider env snapshot"
-    );
-    Ok((provider_credentials, child_env))
+    Ok(SidecarProviderEnvSnapshot {
+        revision,
+        child_env,
+    })
 }
 
 fn write_sidecar_provider_env_snapshot(
@@ -885,8 +910,7 @@ fn write_sidecar_provider_env_snapshot(
         "child_env": child_env,
     });
     let bytes = serde_json::to_vec(&value).into_diagnostic()?;
-    std::fs::write(snapshot_path, bytes)
-        .into_diagnostic()
+    write_atomic(snapshot_path, &bytes)
         .wrap_err_with(|| format!("failed to write sidecar provider env snapshot to {path}"))?;
     info!(
         path,
@@ -894,6 +918,70 @@ fn write_sidecar_provider_env_snapshot(
         "Wrote sidecar provider env snapshot"
     );
     Ok(())
+}
+
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).into_diagnostic()?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("snapshot");
+    let tmp_path = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp_path, bytes).into_diagnostic()?;
+    std::fs::rename(&tmp_path, path).into_diagnostic()?;
+    Ok(())
+}
+
+fn refresh_sidecar_provider_env_snapshot(
+    path: &str,
+    provider_credentials: &ProviderCredentialState,
+) -> Result<Option<(u64, usize)>> {
+    let snapshot = read_sidecar_provider_env_snapshot_data(path)?;
+    let current_revision = provider_credentials.snapshot().revision;
+    if snapshot.revision <= current_revision {
+        return Ok(None);
+    }
+    let env_count =
+        provider_credentials.install_child_env_snapshot(snapshot.revision, snapshot.child_env);
+    Ok(Some((snapshot.revision, env_count)))
+}
+
+fn spawn_sidecar_provider_env_snapshot_watcher(
+    path: String,
+    provider_credentials: ProviderCredentialState,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match refresh_sidecar_provider_env_snapshot(&path, &provider_credentials) {
+                Ok(Some((revision, env_count))) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped("provider_env_revision", serde_json::json!(revision))
+                            .message(format!(
+                                "Sidecar provider environment snapshot refreshed [revision:{revision} env_count:{env_count}]"
+                            ))
+                            .build()
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path,
+                        "Failed to refresh sidecar provider environment snapshot"
+                    );
+                }
+            }
+        }
+    })
 }
 
 fn sidecar_ca_file_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
@@ -2316,6 +2404,7 @@ struct PolicyPollLoopContext {
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
+    sidecar_provider_env_snapshot_path: Option<String>,
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
@@ -2427,13 +2516,38 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             .await
             {
                 Ok(env_result) => {
-                    let env_count = ctx.provider_credentials.install_environment(
+                    ctx.provider_credentials.install_environment(
                         env_result.provider_env_revision,
                         env_result.environment,
                         env_result.credential_expires_at_ms,
                         env_result.dynamic_credentials,
                     );
-                    current_provider_env_revision = env_result.provider_env_revision;
+                    let child_env = ctx.provider_credentials.child_env_with_gcp_resolved();
+                    let env_count = child_env.len();
+                    let snapshot_write_ok = match ctx.sidecar_provider_env_snapshot_path.as_deref()
+                    {
+                        Some(snapshot_path) => {
+                            match write_sidecar_provider_env_snapshot(
+                                snapshot_path,
+                                env_result.provider_env_revision,
+                                &child_env,
+                            ) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        path = snapshot_path,
+                                        "Settings poll: failed to write sidecar provider environment snapshot"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        None => true,
+                    };
+                    if snapshot_write_ok {
+                        current_provider_env_revision = env_result.provider_env_revision;
+                    }
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
@@ -2441,10 +2555,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                             .state(StateId::Enabled, "loaded")
                             .unmapped(
                                 "provider_env_revision",
-                                serde_json::json!(current_provider_env_revision)
+                                serde_json::json!(env_result.provider_env_revision)
                             )
                             .message(format!(
-                                "Provider environment refreshed [revision:{current_provider_env_revision} env_count:{env_count}]"
+                                "Provider environment refreshed [revision:{} env_count:{env_count}]",
+                                env_result.provider_env_revision
                             ))
                             .build()
                     );
@@ -2751,6 +2866,54 @@ mod tests {
                 .proxy
                 .and_then(|proxy| proxy.http_addr)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn sidecar_provider_env_snapshot_refresh_installs_newer_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("provider-env.json");
+        let snapshot_path = snapshot_path.to_str().unwrap();
+        let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
+            1,
+            std::collections::HashMap::from([("TOKEN".to_string(), "old".to_string())]),
+        );
+
+        write_sidecar_provider_env_snapshot(
+            snapshot_path,
+            2,
+            &std::collections::HashMap::from([("TOKEN".to_string(), "new".to_string())]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            refresh_sidecar_provider_env_snapshot(snapshot_path, &provider_credentials).unwrap(),
+            Some((2, 1))
+        );
+        let snapshot = provider_credentials.snapshot();
+        assert_eq!(snapshot.revision, 2);
+        assert_eq!(
+            snapshot.child_env.get("TOKEN").map(String::as_str),
+            Some("new")
+        );
+
+        write_sidecar_provider_env_snapshot(
+            snapshot_path,
+            1,
+            &std::collections::HashMap::from([("TOKEN".to_string(), "stale".to_string())]),
+        )
+        .unwrap();
+        assert_eq!(
+            refresh_sidecar_provider_env_snapshot(snapshot_path, &provider_credentials).unwrap(),
+            None
+        );
+        assert_eq!(
+            provider_credentials
+                .snapshot()
+                .child_env
+                .get("TOKEN")
+                .map(String::as_str),
+            Some("new")
         );
     }
 

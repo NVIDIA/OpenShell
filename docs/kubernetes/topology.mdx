@@ -155,18 +155,20 @@ container does not mount the projected ServiceAccount token used for sandbox
 token bootstrap, does not mount the sandbox client TLS secret, and does not get
 gateway callback environment variables.
 
-The network sidecar writes local snapshots that the process supervisor needs at
-startup:
+The network sidecar writes local snapshots that the process supervisor needs:
 
 - A protobuf policy snapshot.
 - A workload-facing provider environment snapshot.
 
 The provider snapshot contains the environment variables OpenShell intentionally
-injects into the workload. It does not give the agent container gateway
-authentication material. Use `combined` topology when you need full
-process/filesystem enforcement in the same supervisor path; use additional
-runtime isolation when you need a stronger container boundary around
-network-only sidecar workloads.
+injects into the workload. The process supervisor loads it at startup and
+watches for newer revisions that the network sidecar writes after settings
+polls, so future child processes can see refreshed provider env without giving
+the agent container gateway authentication material. This does not mutate the
+environment of the already-running workload entrypoint. Use `combined` topology
+when you need full process/filesystem enforcement in the same supervisor path;
+use additional runtime isolation when you need a stronger container boundary
+around network-only sidecar workloads.
 
 ## RuntimeClass Isolation
 
