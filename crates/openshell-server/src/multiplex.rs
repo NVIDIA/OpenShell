@@ -447,6 +447,7 @@ where
 /// to pass-through unless mTLS or local unauthenticated users are enabled.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
+    #[cfg(feature = "driver-kubernetes")]
     if let Some(k8s) = state.k8s_sa_authenticator.clone() {
         authenticators.push(k8s);
     }

@@ -143,6 +143,7 @@ pub struct ServerState {
     /// Optional K8s `ServiceAccount` authenticator that backs the
     /// `IssueSandboxToken` bootstrap path. Only present when the gateway
     /// runs in-cluster.
+    #[cfg(feature = "driver-kubernetes")]
     pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
@@ -195,6 +196,7 @@ impl ServerState {
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
+            #[cfg(feature = "driver-kubernetes")]
             k8s_sa_authenticator: None,
             grpc_rate_limiter,
         }
@@ -330,6 +332,7 @@ pub(crate) async fn run_server(
     // env var) and has a sandbox JWT issuer to mint replacements against;
     // outside the cluster we can't call the apiserver's TokenReview API,
     // and without the issuer there's nothing to exchange the SA token for.
+    #[cfg(feature = "driver-kubernetes")]
     if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
         // Pod lookups and TokenReview identity checks must match the sandbox
         // namespace and service account used by the Kubernetes driver.
@@ -740,6 +743,7 @@ async fn build_compute_runtime(
     info!(driver = %driver.name(), "Using compute driver");
 
     let runtime = match driver {
+        #[cfg(feature = "driver-kubernetes")]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes) => {
             warn_if_kubernetes_sandbox_jwt_expiry_disabled(config);
             let k8s_config =
@@ -754,6 +758,7 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(feature = "driver-docker")]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => {
             let docker_config = compute::driver_config::docker_config_from_context(driver_startup)?;
             ComputeRuntime::new_docker(
@@ -767,6 +772,7 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(feature = "driver-podman")]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
             let podman_config = compute::driver_config::podman_config_from_context(driver_startup)?;
             ComputeRuntime::new_podman(
@@ -779,6 +785,7 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(feature = "driver-vm")]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm) => {
             let vm_config = compute::driver_config::vm_config_from_context(driver_startup)?;
             let endpoint = compute::vm::spawn(config, &vm_config).await?;
@@ -791,6 +798,21 @@ async fn build_compute_runtime(
                 supervisor_sessions,
             )
             .await
+        }
+        // Configured driver was compiled out. Fail startup with a message
+        // naming the driver and the Cargo flag that re-enables it.
+        #[cfg(not(all(
+            feature = "driver-kubernetes",
+            feature = "driver-docker",
+            feature = "driver-podman",
+            feature = "driver-vm",
+        )))]
+        ConfiguredComputeDriver::Builtin(kind) => {
+            return Err(Error::config(format!(
+                "compute driver '{name}' is not compiled into this gateway; \
+                 rebuild openshell-server with --features driver-{name} to enable it",
+                name = kind.as_str(),
+            )));
         }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
@@ -880,6 +902,7 @@ fn builtin_compute_driver(name: &str) -> Option<ComputeDriverKind> {
     name.parse().ok()
 }
 
+#[cfg(feature = "driver-kubernetes")]
 fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
     config
         .gateway_jwt
@@ -887,6 +910,7 @@ fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
         .is_some_and(|jwt| jwt.ttl_secs == 0)
 }
 
+#[cfg(feature = "driver-kubernetes")]
 fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
     if kubernetes_sandbox_jwt_expiry_disabled(config) {
         warn!(
@@ -897,11 +921,12 @@ fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "driver-kubernetes")]
+    use super::kubernetes_sandbox_jwt_expiry_disabled;
     use super::{
         ConfiguredComputeDriver, ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_addresses, is_benign_tls_handshake_failure,
-        kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
+        gateway_listener_addresses, is_benign_tls_handshake_failure, serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1349,6 +1374,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "driver-kubernetes")]
     fn kubernetes_sandbox_jwt_expiry_disabled_warns_for_zero_ttl() {
         fn config_with_jwt_ttl(ttl_secs: u64) -> Config {
             let mut config = Config::new(None);
