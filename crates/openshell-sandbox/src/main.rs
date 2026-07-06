@@ -337,7 +337,7 @@ fn run_network_init(
         sidecar_state_dir,
         proxy_user_id,
         proxy_primary_group_id,
-        0o775,
+        0o2775,
     )?;
     prepare_sidecar_directory(
         sidecar_tls_dir,

@@ -3833,6 +3833,7 @@ dependencies = [
  "openshell-policy",
  "openshell-supervisor-network",
  "openshell-supervisor-process",
+ "prost",
  "rustls",
  "serde_json",
  "temp-env",

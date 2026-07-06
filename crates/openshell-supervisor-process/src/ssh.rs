@@ -43,6 +43,7 @@ fn ssh_server_init(
     listen_path: &Path,
     ca_file_paths: &Option<(PathBuf, PathBuf)>,
     enforcement_mode: ProcessEnforcementMode,
+    shared_socket: bool,
 ) -> Result<SshServerInit> {
     let mut rng = OsRng;
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
@@ -56,16 +57,15 @@ fn ssh_server_init(
     let config = Arc::new(config);
     let ca_paths = ca_file_paths.as_ref().map(|p| Arc::new(p.clone()));
 
-    // In full enforcement mode the supervisor starts as root and can isolate
-    // the SSH socket in a root-only directory before spawning unprivileged
-    // children. In network-only sidecar mode the process supervisor itself
-    // runs as the sandbox UID, so the driver points the socket at a writable
-    // sidecar state volume and accepts that Unix permissions no longer isolate
-    // same-UID child processes from the socket.
+    // In full enforcement mode the supervisor normally starts as root and can
+    // isolate the SSH socket in a root-only directory before spawning
+    // unprivileged children. Sidecar topology is different: the gateway relay
+    // runs in the network sidecar as a different UID, so the shared sidecar
+    // state directory must stay group-accessible.
     if let Some(parent) = listen_path.parent() {
         std::fs::create_dir_all(parent).into_diagnostic()?;
         #[cfg(unix)]
-        if enforcement_mode.enforces_process_controls() {
+        if enforcement_mode.enforces_process_controls() && !shared_socket {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o700);
             std::fs::set_permissions(parent, perms).into_diagnostic()?;
@@ -78,14 +78,14 @@ fn ssh_server_init(
     }
     let listener = UnixListener::bind(listen_path).into_diagnostic()?;
 
-    // Tighten permissions so only the supervisor (root) can connect. The
-    // sandbox entrypoint runs as an unprivileged user and must not be able to
-    // dial the SSH daemon directly — all access goes through the relay from
-    // the gateway.
+    // Tighten permissions so only the supervisor owner can connect in combined
+    // mode. In sidecar mode, allow the shared sandbox GID so the network
+    // sidecar's relay can connect to the process supervisor's SSH socket.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
+        let mode = if shared_socket { 0o660 } else { 0o600 };
+        let perms = std::fs::Permissions::from_mode(mode);
         std::fs::set_permissions(listen_path, perms).into_diagnostic()?;
     }
 
@@ -113,22 +113,27 @@ pub async fn run_ssh_server(
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
     enforcement_mode: ProcessEnforcementMode,
+    shared_socket: bool,
 ) -> Result<()> {
-    let (listener, config, ca_paths) =
-        match ssh_server_init(&listen_path, &ca_file_paths, enforcement_mode) {
-            Ok(v) => {
-                // Signal that the SSH server has bound the socket and is ready to
-                // accept connections. The parent task awaits this before spawning
-                // the entrypoint process, ensuring exec requests won't race
-                // against server startup.
-                let _ = ready_tx.send(Ok(()));
-                v
-            }
-            Err(err) => {
-                let _ = ready_tx.send(Err(err));
-                return Ok(());
-            }
-        };
+    let (listener, config, ca_paths) = match ssh_server_init(
+        &listen_path,
+        &ca_file_paths,
+        enforcement_mode,
+        shared_socket,
+    ) {
+        Ok(v) => {
+            // Signal that the SSH server has bound the socket and is ready to
+            // accept connections. The parent task awaits this before spawning
+            // the entrypoint process, ensuring exec requests won't race
+            // against server startup.
+            let _ = ready_tx.send(Ok(()));
+            v
+        }
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return Ok(());
+        }
+    };
 
     loop {
         let (stream, _peer) = listener.accept().await.into_diagnostic()?;
@@ -1326,6 +1331,52 @@ fn is_loopback_host(host: &str) -> bool {
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    #[cfg(unix)]
+    fn file_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn set_file_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_server_init_full_enforcement_keeps_private_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("ssh");
+        std::fs::create_dir_all(&parent).unwrap();
+        set_file_mode(&parent, 0o775);
+        let socket = parent.join("ssh.sock");
+
+        let (listener, _, _) =
+            ssh_server_init(&socket, &None, ProcessEnforcementMode::Full, false).unwrap();
+        drop(listener);
+
+        assert_eq!(file_mode(&parent), 0o700);
+        assert_eq!(file_mode(&socket), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ssh_server_init_shared_socket_keeps_group_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("ssh");
+        std::fs::create_dir_all(&parent).unwrap();
+        set_file_mode(&parent, 0o775);
+        let socket = parent.join("ssh.sock");
+
+        let (listener, _, _) =
+            ssh_server_init(&socket, &None, ProcessEnforcementMode::Full, true).unwrap();
+        drop(listener);
+
+        assert_eq!(file_mode(&parent), 0o775);
+        assert_eq!(file_mode(&socket), 0o660);
+    }
 
     /// Verify that dropping the input sender (the operation `channel_eof`
     /// performs) causes the stdin writer loop to exit and close the child's

@@ -56,6 +56,7 @@ pub async fn run_process(
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<String>,
+    shared_ssh_socket: bool,
     policy: &SandboxPolicy,
     enforcement_mode: ProcessEnforcementMode,
     entrypoint_pid: Arc<AtomicU32>,
@@ -245,6 +246,7 @@ pub async fn run_process(
                 provider_credentials_clone,
                 user_env_clone,
                 enforcement_mode,
+                shared_ssh_socket,
             )
             .await
             {

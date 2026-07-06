@@ -1057,17 +1057,14 @@ const SIDECAR_STATE_MOUNT_PATH: &str = "/run/openshell-sidecar";
 const SIDECAR_READY_FILE: &str = "/run/openshell-sidecar/supervisor.ready";
 const SIDECAR_ENTRYPOINT_PID_FILE: &str = "/run/openshell-sidecar/entrypoint.pid";
 const SIDECAR_SSH_SOCKET_FILE: &str = "/run/openshell-sidecar/ssh.sock";
+const SIDECAR_POLICY_SNAPSHOT_FILE: &str = "/run/openshell-sidecar/policy.pb";
+const SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE: &str = "/run/openshell-sidecar/provider-env.json";
 
 /// Shared TLS work directory. The network sidecar writes the proxy CA bundle
 /// here, while the agent container consumes it after the readiness file exists.
 const SIDECAR_TLS_VOLUME_NAME: &str = "openshell-supervisor-tls";
 const SIDECAR_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy";
 const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy/client";
-
-/// Loopback listener owned by the network sidecar. The process-only supervisor
-/// connects here for gateway gRPC, and the sidecar forwards bytes to the real
-/// gateway endpoint using its own network privileges.
-const SIDECAR_GATEWAY_FORWARD_ADDR: &str = "127.0.0.1:18080";
 
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
@@ -1282,32 +1279,6 @@ fn sidecar_tls_volume_mount() -> serde_json::Value {
     })
 }
 
-fn sidecar_process_gateway_endpoint(grpc_endpoint: &str) -> String {
-    if grpc_endpoint.is_empty() {
-        String::new()
-    } else if grpc_endpoint.starts_with("https://") {
-        format!("https://{SIDECAR_GATEWAY_FORWARD_ADDR}")
-    } else {
-        format!("http://{SIDECAR_GATEWAY_FORWARD_ADDR}")
-    }
-}
-
-fn gateway_tls_server_name(grpc_endpoint: &str) -> Option<String> {
-    let rest = grpc_endpoint.strip_prefix("https://")?;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.is_empty() {
-        return None;
-    }
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        return bracketed.split(']').next().map(str::to_string);
-    }
-    authority
-        .split(':')
-        .next()
-        .filter(|host| !host.is_empty())
-        .map(str::to_string)
-}
-
 fn copy_log_level_env(
     env: &mut Vec<serde_json::Value>,
     template_environment: &std::collections::HashMap<String, String>,
@@ -1381,8 +1352,18 @@ fn supervisor_sidecar_env(
     );
     upsert_env(
         &mut env,
-        openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR,
-        SIDECAR_GATEWAY_FORWARD_ADDR,
+        openshell_core::sandbox_env::SSH_SOCKET_PATH,
+        SIDECAR_SSH_SOCKET_FILE,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE,
+        SIDECAR_POLICY_SNAPSHOT_FILE,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE,
+        SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE,
     );
     upsert_env(
         &mut env,
@@ -1604,6 +1585,9 @@ fn apply_supervisor_sidecar_topology(
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(volume_mounts) = volume_mounts {
+            remove_volume_mount(volume_mounts, "openshell-sa-token");
+            remove_volume_mount(volume_mounts, "openshell-client-tls");
+            remove_volume_mount(volume_mounts, SPIFFE_WORKLOAD_API_VOLUME_NAME);
             volume_mounts.push(supervisor_volume_mount());
             volume_mounts.push(sidecar_state_volume_mount());
             volume_mounts.push(sidecar_tls_volume_mount());
@@ -1614,19 +1598,18 @@ fn apply_supervisor_sidecar_topology(
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(env) = env {
-            let process_endpoint = sidecar_process_gateway_endpoint(params.grpc_endpoint);
-            upsert_env(
+            remove_env(env, openshell_core::sandbox_env::ENDPOINT);
+            remove_env(env, openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
+            remove_env(env, openshell_core::sandbox_env::TLS_CA);
+            remove_env(env, openshell_core::sandbox_env::TLS_CERT);
+            remove_env(env, openshell_core::sandbox_env::TLS_KEY);
+            remove_env(env, openshell_core::sandbox_env::SANDBOX_TOKEN);
+            remove_env(env, openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+            remove_env(env, openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
+            remove_env(
                 env,
-                openshell_core::sandbox_env::ENDPOINT,
-                &process_endpoint,
+                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
             );
-            if let Some(server_name) = gateway_tls_server_name(params.grpc_endpoint) {
-                upsert_env(
-                    env,
-                    openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
-                    &server_name,
-                );
-            }
             upsert_env(
                 env,
                 openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
@@ -1656,6 +1639,16 @@ fn apply_supervisor_sidecar_topology(
                 env,
                 openshell_core::sandbox_env::ENTRYPOINT_PID_FILE,
                 SIDECAR_ENTRYPOINT_PID_FILE,
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE,
+                SIDECAR_POLICY_SNAPSHOT_FILE,
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE,
+                SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE,
             );
             upsert_env(
                 env,
@@ -2599,6 +2592,14 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     env.push(serde_json::json!({"name": name, "value": value}));
 }
 
+fn remove_env(env: &mut Vec<serde_json::Value>, name: &str) {
+    env.retain(|item| item.get("name").and_then(|value| value.as_str()) != Some(name));
+}
+
+fn remove_volume_mount(volume_mounts: &mut Vec<serde_json::Value>, name: &str) {
+    volume_mounts.retain(|mount| mount.get("name").and_then(|value| value.as_str()) != Some(name));
+}
+
 /// Extract a string value from the template's `platform_config` Struct.
 fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<String> {
     let config = template.platform_config.as_ref()?;
@@ -3176,11 +3177,19 @@ mod tests {
         );
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::ENDPOINT),
-            Some("https://127.0.0.1:18080")
+            None
         );
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME),
-            Some("openshell-gateway.openshell.svc")
+            None
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::TLS_CA),
+            None
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::K8S_SA_TOKEN_FILE),
+            None
         );
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE),
@@ -3197,6 +3206,20 @@ mod tests {
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::ENTRYPOINT_PID_FILE),
             Some(SIDECAR_ENTRYPOINT_PID_FILE)
+        );
+        assert_eq!(
+            rendered_env(
+                agent,
+                openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE
+            ),
+            Some(SIDECAR_POLICY_SNAPSHOT_FILE)
+        );
+        assert_eq!(
+            rendered_env(
+                agent,
+                openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE
+            ),
+            Some(SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE)
         );
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::PROXY_TLS_DIR),
@@ -3231,8 +3254,22 @@ mod tests {
             Some("https://openshell-gateway.openshell.svc:8080")
         );
         assert_eq!(
-            rendered_env(sidecar, openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR),
-            Some(SIDECAR_GATEWAY_FORWARD_ADDR)
+            rendered_env(sidecar, openshell_core::sandbox_env::SSH_SOCKET_PATH),
+            Some(SIDECAR_SSH_SOCKET_FILE)
+        );
+        assert_eq!(
+            rendered_env(
+                sidecar,
+                openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE
+            ),
+            Some(SIDECAR_POLICY_SNAPSHOT_FILE)
+        );
+        assert_eq!(
+            rendered_env(
+                sidecar,
+                openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE
+            ),
+            Some(SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE)
         );
         assert_eq!(
             rendered_env(
@@ -3259,6 +3296,19 @@ mod tests {
                 .iter()
                 .any(|mount| mount["name"] == "openshell-client-tls"),
             "runtime sidecar should use the init-copied TLS files, not the root-owned Secret mount"
+        );
+        let agent_mounts = agent["volumeMounts"].as_array().unwrap();
+        assert!(
+            !agent_mounts
+                .iter()
+                .any(|mount| mount["name"] == "openshell-sa-token"),
+            "agent container must not mount gateway bootstrap token in sidecar topology"
+        );
+        assert!(
+            !agent_mounts
+                .iter()
+                .any(|mount| mount["name"] == "openshell-client-tls"),
+            "agent container must not mount gateway client TLS secret in sidecar topology"
         );
         let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
         let sa_token = volumes

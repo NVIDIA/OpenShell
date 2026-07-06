@@ -110,9 +110,10 @@ flowchart TB
   Init -->|"installs nftables rules"| NetNS
   ProcessSupervisor --> Workload
   Workload -->|"egress redirected on loopback"| NetworkSidecar
-  NetworkSidecar -->|"gateway forwarding"| Gateway
+  NetworkSidecar -->|"gateway session + relays"| Gateway
   NetworkSidecar -->|"policy-enforced egress"| External
-  ProcessSupervisor --- State
+  NetworkSidecar -->|"policy/provider snapshots"| State
+  ProcessSupervisor -->|"reads snapshots"| State
   NetworkSidecar --- State
 ```
 
@@ -121,7 +122,7 @@ The pod contains these OpenShell-managed pieces:
 | Component | Runs as | Purpose |
 |---|---|---|
 | Network init container | Root with setup capabilities | Installs pod-level nftables rules and prepares shared sidecar state. |
-| Network sidecar | `supervisor.proxyUid` | Runs the proxy, enforces network policy, writes proxy TLS material, and forwards gateway traffic on loopback. |
+| Network sidecar | `supervisor.proxyUid` | Runs the proxy, enforces network policy, owns gateway authentication and the gateway session, and writes proxy TLS plus local policy/provider snapshots. |
 | Agent container | Resolved sandbox UID/GID | Runs the process supervisor and launches the user workload. |
 
 In this topology, the agent container defaults to `runAsNonRoot: true`,
@@ -132,9 +133,10 @@ long-running network sidecar always drops all Linux capabilities. The root init
 container keeps the setup capabilities needed to configure pod networking.
 
 Sidecar mode preserves gateway session behavior, including SSH connectivity,
-because the process supervisor still owns the session relay. The network sidecar
-handles outbound enforcement and forwards the process supervisor's gateway
-traffic to the real gateway endpoint.
+because the network sidecar owns the gateway session and bridges relay requests
+to the process supervisor's local SSH socket. The agent container does not get a
+gateway endpoint, gateway TLS material, or the sandbox bootstrap token in the
+default sidecar path.
 
 <Warning>
 Sidecar mode defaults the process supervisor to `network-only`. OpenShell still
@@ -148,14 +150,23 @@ identity in sidecar topology.
 
 ## Credential Exposure
 
-Sidecar topology uses pod `fsGroup` and group-readable projected credentials so
-the non-root process supervisor can authenticate to the gateway. This includes
-the projected ServiceAccount token used for sandbox token bootstrap and the
-sandbox client TLS secret.
+Sidecar topology keeps gateway credentials in the network sidecar. The agent
+container does not mount the projected ServiceAccount token used for sandbox
+token bootstrap, does not mount the sandbox client TLS secret, and does not get
+gateway callback environment variables.
 
-Treat the agent container as trusted with respect to those in-pod gateway
-credentials. Use `combined` topology when that credential exposure is not
-acceptable for your deployment.
+The network sidecar writes local snapshots that the process supervisor needs at
+startup:
+
+- A protobuf policy snapshot.
+- A workload-facing provider environment snapshot.
+
+The provider snapshot contains the environment variables OpenShell intentionally
+injects into the workload. It does not give the agent container gateway
+authentication material. Use `combined` topology when you need full
+process/filesystem enforcement in the same supervisor path; use additional
+runtime isolation when you need a stronger container boundary around
+network-only sidecar workloads.
 
 ## RuntimeClass Isolation
 

@@ -92,16 +92,18 @@ paths, and command metadata.
 Kubernetes can run the supervisor in the default combined topology or in a
 sidecar topology. Combined mode keeps network and process supervision in the
 agent container. Sidecar mode runs network enforcement, the proxy, and gateway
-loopback forwarding in a dedicated sidecar, while the agent container runs only
-the process-supervision leaf and launches the user workload after the sidecar
-signals readiness. In sidecar mode, an init container performs the privileged
+session in a dedicated sidecar, while the agent container runs only the
+process-supervision leaf and launches the user workload after the sidecar
+signals readiness. The sidecar writes local policy and provider-environment
+snapshots into shared state so the process leaf can start without gateway
+credentials. In sidecar mode, an init container performs the privileged
 pod-network nftables setup with `NET_ADMIN` and hands shared state ownership to
 the configured proxy UID; the long-running network sidecar runs as that UID and
 does not keep `NET_ADMIN`. The agent container runs as the resolved sandbox
 UID/GID with no added Linux capabilities. Sidecar mode preserves gateway session
-and SSH behavior, but treats the process leaf as network-only: Landlock
-filesystem policy, process privilege dropping, and process/binary identity
-checks are not applied there.
+and SSH behavior, but treats the process leaf as network-only by default:
+Landlock filesystem policy, process privilege dropping, and process/binary
+identity checks are not applied there.
 
 ## Images
 

@@ -63,6 +63,32 @@ impl ProviderCredentialState {
         }
     }
 
+    /// Build a static provider state from an already-prepared child
+    /// environment snapshot.
+    ///
+    /// Kubernetes sidecar topology uses this in the process-only supervisor:
+    /// the network sidecar owns provider credential resolvers and writes the
+    /// workload-facing env map into a shared local snapshot. The process leaf
+    /// must inject that map into child processes without re-placeholderizing it
+    /// or holding the gateway-side resolver material.
+    pub fn from_child_env_snapshot(revision: u64, child_env: HashMap<String, String>) -> Self {
+        let snapshot = Arc::new(ProviderCredentialSnapshot {
+            revision,
+            child_env,
+            dynamic_credentials: HashMap::new(),
+        });
+
+        Self {
+            inner: Arc::new(RwLock::new(ProviderCredentialStateInner {
+                current: snapshot,
+                generations: VecDeque::new(),
+                current_resolver: None,
+                combined_resolver: None,
+                suppressed_keys: HashSet::new(),
+            })),
+        }
+    }
+
     pub fn snapshot(&self) -> Arc<ProviderCredentialSnapshot> {
         self.inner
             .read()

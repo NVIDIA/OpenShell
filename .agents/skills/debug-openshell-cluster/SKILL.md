@@ -276,15 +276,25 @@ container owns nftables setup and should be the only sidecar topology container
 with `NET_ADMIN`. It also needs `CHOWN`/`FOWNER` to hand shared emptyDir state
 to `sidecar_proxy_uid`. The long-running network sidecar runs as
 `sidecar_proxy_uid` with primary GID `sandbox_gid`; the pod `fsGroup` is also
-set to `sandbox_gid` so the projected service-account token is group-readable.
-In sidecar topology the `openshell-sa-token` projected volume should render
-`defaultMode: 288` (`0440`); if the proxy logs `failed to read K8s SA token`,
-verify this token mode plus the pod `fsGroup` and network sidecar
-`runAsGroup`. The process container should also publish the
-workload entrypoint PID to `OPENSHELL_ENTRYPOINT_PID_FILE`
+set to `sandbox_gid`.
+
+In sidecar topology only the network sidecar should mount the gateway bootstrap
+credentials (`openshell-sa-token` and `openshell-client-tls`). The process
+container should not receive `OPENSHELL_ENDPOINT`, gateway TLS env vars, the
+sandbox token file, or those credential mounts. Instead, the network sidecar
+writes `/run/openshell-sidecar/policy.pb` and
+`/run/openshell-sidecar/provider-env.json`, then writes the readiness file. If
+the process supervisor fails before launching the workload, inspect those
+snapshot files and the network sidecar logs.
+
+The process container should also publish the workload entrypoint PID to
+`OPENSHELL_ENTRYPOINT_PID_FILE`
 (`/run/openshell-sidecar/entrypoint.pid` by default), and the network sidecar
 should read it for binary-scoped policy decisions; if allowed network rules are
 all denied, inspect that file and the network sidecar logs.
+The shared state directory should preserve `sandbox_gid` inheritance
+(`02775`), and the SSH socket should be group-connectable (`0660`) so the
+network sidecar can bridge gateway relay requests to the process supervisor.
 Inspect all three when sandbox registration or egress enforcement fails:
 
 ```bash

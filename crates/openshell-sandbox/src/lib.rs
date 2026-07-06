@@ -13,7 +13,8 @@ mod mechanistic_mapper;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod metadata_server;
 
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr};
+use prost::Message;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -67,8 +68,6 @@ use openshell_supervisor_network::opa::OpaEngine;
 use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
-use tokio::io::copy_bidirectional;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::UnboundedSender;
 #[cfg(target_os = "linux")]
 use tokio::time::timeout;
@@ -148,14 +147,32 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (mut policy, opa_engine, retained_proto, loaded_policy_origin) = load_policy(
-        sandbox_id.clone(),
-        sandbox,
-        openshell_endpoint.clone(),
-        policy_rules,
-        policy_data,
-    )
-    .await?;
+    let process_uses_sidecar_snapshots =
+        process_enabled && !network_enabled && sidecar_network_enforcement;
+    let (mut policy, opa_engine, retained_proto, loaded_policy_origin) = if process_uses_sidecar_snapshots {
+        let snapshot_path = sidecar_policy_snapshot_file().ok_or_else(|| {
+            miette::miette!(
+                "{} is required for process-only sidecar topology",
+                openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE
+            )
+        })?;
+        let (policy, engine, proto) = load_policy_from_sidecar_snapshot(&snapshot_path)?;
+        (
+            policy,
+            engine,
+            proto,
+            LoadedPolicyOrigin::Gateway { revision: None },
+        )
+    } else {
+        load_policy(
+            sandbox_id.clone(),
+            sandbox,
+            openshell_endpoint.clone(),
+            policy_rules,
+            policy_data,
+        )
+        .await?
+    };
 
     // Override the policy's process identity with the driver-resolved UID/GID
     // from the pod environment. The policy defaults to the name "sandbox" which
@@ -190,71 +207,82 @@ pub async fn run_sandbox(
         policy.process.run_as_group = Some(gid);
     }
 
-    // Fetch provider environment variables from the server.
-    // This is done after loading the policy so the sandbox can still start
-    // even if provider env fetch fails (graceful degradation).
-    let (
-        provider_env_revision,
-        provider_env,
-        provider_credential_expires_at_ms,
-        dynamic_credentials,
-    ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-        match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
-            Ok(result) => {
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Informational)
-                        .status(StatusId::Success)
-                        .state(StateId::Enabled, "loaded")
-                        .message(format!(
-                            "Fetched provider environment [env_count:{}]",
-                            result.environment.len()
-                        ))
-                        .build()
-                );
-                (
-                    result.provider_env_revision,
-                    result.environment,
-                    result.credential_expires_at_ms,
-                    result.dynamic_credentials,
-                )
-            }
-            Err(e) => {
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .state(StateId::Other, "degraded")
-                        .message(format!(
-                            "Failed to fetch provider environment, continuing without: {e}"
-                        ))
-                        .build()
-                );
-                (
-                    0,
-                    std::collections::HashMap::new(),
-                    std::collections::HashMap::new(),
-                    std::collections::HashMap::new(),
-                )
-            }
-        }
-    } else {
-        (
-            0,
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        )
-    };
-
-    let provider_credentials = ProviderCredentialState::from_environment(
-        provider_env_revision,
-        provider_env,
-        provider_credential_expires_at_ms,
-        dynamic_credentials,
-    );
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut provider_env = provider_credentials.child_env_with_gcp_resolved();
+    let (provider_credentials, mut provider_env) = if process_uses_sidecar_snapshots {
+        let snapshot_path = sidecar_provider_env_snapshot_file().ok_or_else(|| {
+            miette::miette!(
+                "{} is required for process-only sidecar topology",
+                openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE
+            )
+        })?;
+        read_sidecar_provider_env_snapshot(&snapshot_path)?
+    } else {
+        // Fetch provider environment variables from the server.
+        // This is done after loading the policy so the sandbox can still start
+        // even if provider env fetch fails (graceful degradation).
+        let (
+            provider_env_revision,
+            provider_env,
+            provider_credential_expires_at_ms,
+            dynamic_credentials,
+        ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
+                Ok(result) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .message(format!(
+                                "Fetched provider environment [env_count:{}]",
+                                result.environment.len()
+                            ))
+                            .build()
+                    );
+                    (
+                        result.provider_env_revision,
+                        result.environment,
+                        result.credential_expires_at_ms,
+                        result.dynamic_credentials,
+                    )
+                }
+                Err(e) => {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .state(StateId::Other, "degraded")
+                            .message(format!(
+                                "Failed to fetch provider environment, continuing without: {e}"
+                            ))
+                            .build()
+                    );
+                    (
+                        0,
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                    )
+                }
+            }
+        } else {
+            (
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
+        };
+
+        let provider_credentials = ProviderCredentialState::from_environment(
+            provider_env_revision,
+            provider_env,
+            provider_credential_expires_at_ms,
+            dynamic_credentials,
+        );
+        let provider_env = provider_credentials.child_env_with_gcp_resolved();
+        (provider_credentials, provider_env)
+    };
 
     // Initialize the agent-proposals feature flag. Default false until the
     // initial settings fetch (or the poll loop) tells us otherwise. The flag
@@ -354,14 +382,31 @@ pub async fn run_sandbox(
         None
     };
 
-    let _gateway_forward = if network_enabled && sidecar_network_enforcement {
-        let endpoint = openshell_endpoint_for_proxy.as_deref().ok_or_else(|| {
-            miette::miette!("sidecar network enforcement requires an OpenShell gateway endpoint")
+    if network_enabled && sidecar_network_enforcement {
+        let policy_snapshot_path = sidecar_policy_snapshot_file().ok_or_else(|| {
+            miette::miette!(
+                "{} is required for sidecar process snapshots",
+                openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE
+            )
         })?;
-        Some(start_gateway_forward_from_env(endpoint).await?)
-    } else {
-        None
-    };
+        let provider_snapshot_path = sidecar_provider_env_snapshot_file().ok_or_else(|| {
+            miette::miette!(
+                "{} is required for sidecar provider snapshots",
+                openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE
+            )
+        })?;
+        let proto = retained_proto.as_ref().ok_or_else(|| {
+            miette::miette!(
+                "sidecar topology requires a gateway policy snapshot for the process supervisor"
+            )
+        })?;
+        write_sidecar_policy_snapshot(&policy_snapshot_path, proto)?;
+        write_sidecar_provider_env_snapshot(
+            &provider_snapshot_path,
+            provider_credentials.snapshot().revision,
+            &provider_env,
+        )?;
+    }
 
     #[cfg(target_os = "linux")]
     if network_enabled && sidecar_network_enforcement {
@@ -373,6 +418,24 @@ pub async fn run_sandbox(
         if let Some(path) = sidecar_ready_file.as_deref() {
             write_supervisor_ready(path)?;
         }
+    }
+
+    if network_enabled
+        && sidecar_network_enforcement
+        && let (Some(endpoint), Some(id), Some(socket)) = (
+            openshell_endpoint.as_deref(),
+            sandbox_id.as_deref(),
+            ssh_socket_path.as_ref(),
+        )
+    {
+        wait_for_sidecar_ssh_socket(socket).await?;
+        openshell_supervisor_process::supervisor_session::spawn(
+            endpoint.to_string(),
+            id.to_string(),
+            std::path::PathBuf::from(socket),
+            None,
+        );
+        info!("sidecar supervisor session task spawned");
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -452,11 +515,13 @@ pub async fn run_sandbox(
     }
 
     // Spawn background policy poll task (gRPC mode only).
-    if let (Some(id), Some(endpoint), Some(engine)) = (
-        sandbox_id.as_deref(),
-        openshell_endpoint.as_deref(),
-        opa_engine.as_ref(),
-    ) {
+    if !process_uses_sidecar_snapshots
+        && let (Some(id), Some(endpoint), Some(engine)) = (
+            sandbox_id.as_deref(),
+            openshell_endpoint.as_deref(),
+            opa_engine.as_ref(),
+        )
+    {
         let poll_id = id.to_string();
         let poll_endpoint = endpoint.to_string();
         let poll_engine = engine.clone();
@@ -554,6 +619,7 @@ pub async fn run_sandbox(
             sandbox_id.as_deref(),
             openshell_endpoint.as_deref(),
             ssh_socket_path,
+            sidecar_network_enforcement,
             &process_policy,
             process_enforcement_mode,
             entrypoint_pid,
@@ -696,6 +762,140 @@ fn write_supervisor_ready(path: &str) -> Result<()> {
     Ok(())
 }
 
+async fn wait_for_sidecar_ssh_socket(path: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if sidecar_ssh_socket_ready(path) {
+            info!(path, "Sidecar SSH socket is ready for gateway relay");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(miette::miette!(
+                "timed out waiting for process supervisor SSH socket {path}"
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(unix)]
+fn sidecar_ssh_socket_ready(path: &str) -> bool {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.file_type().is_socket() && metadata.permissions().mode() & 0o060 == 0o060
+}
+
+#[cfg(not(unix))]
+fn sidecar_ssh_socket_ready(path: &str) -> bool {
+    std::path::Path::new(path).exists()
+}
+
+fn sidecar_policy_snapshot_file() -> Option<String> {
+    std::env::var(openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE)
+        .ok()
+        .filter(|path| !path.is_empty())
+}
+
+fn sidecar_provider_env_snapshot_file() -> Option<String> {
+    std::env::var(openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE)
+        .ok()
+        .filter(|path| !path.is_empty())
+}
+
+fn load_policy_from_sidecar_snapshot(
+    path: &str,
+) -> Result<(
+    SandboxPolicy,
+    Option<Arc<OpaEngine>>,
+    Option<openshell_core::proto::SandboxPolicy>,
+)> {
+    let bytes = std::fs::read(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read sidecar policy snapshot from {path}"))?;
+    let proto = openshell_core::proto::SandboxPolicy::decode(bytes.as_slice())
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to decode sidecar policy snapshot from {path}"))?;
+    let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto)?));
+    let policy = SandboxPolicy::try_from(proto.clone())?;
+    info!(path, "Loaded sidecar policy snapshot");
+    Ok((policy, opa_engine, Some(proto)))
+}
+
+fn write_sidecar_policy_snapshot(
+    path: &str,
+    proto: &openshell_core::proto::SandboxPolicy,
+) -> Result<()> {
+    let snapshot_path = std::path::Path::new(path);
+    if let Some(parent) = snapshot_path.parent() {
+        std::fs::create_dir_all(parent).into_diagnostic()?;
+    }
+    std::fs::write(snapshot_path, proto.encode_to_vec())
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write sidecar policy snapshot to {path}"))?;
+    info!(path, "Wrote sidecar policy snapshot");
+    Ok(())
+}
+
+fn read_sidecar_provider_env_snapshot(
+    path: &str,
+) -> Result<(
+    ProviderCredentialState,
+    std::collections::HashMap<String, String>,
+)> {
+    let bytes = std::fs::read(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read sidecar provider env snapshot from {path}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to parse sidecar provider env snapshot from {path}"))?;
+    let revision = value
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let child_env: std::collections::HashMap<String, String> =
+        serde_json::from_value(value.get("child_env").cloned().unwrap_or_default())
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("failed to decode child_env from sidecar provider env snapshot {path}")
+            })?;
+    let provider_credentials =
+        ProviderCredentialState::from_child_env_snapshot(revision, child_env.clone());
+    info!(
+        path,
+        env_count = child_env.len(),
+        "Loaded sidecar provider env snapshot"
+    );
+    Ok((provider_credentials, child_env))
+}
+
+fn write_sidecar_provider_env_snapshot(
+    path: &str,
+    revision: u64,
+    child_env: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let snapshot_path = std::path::Path::new(path);
+    if let Some(parent) = snapshot_path.parent() {
+        std::fs::create_dir_all(parent).into_diagnostic()?;
+    }
+    let value = serde_json::json!({
+        "revision": revision,
+        "child_env": child_env,
+    });
+    let bytes = serde_json::to_vec(&value).into_diagnostic()?;
+    std::fs::write(snapshot_path, bytes)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write sidecar provider env snapshot to {path}"))?;
+    info!(
+        path,
+        env_count = child_env.len(),
+        "Wrote sidecar provider env snapshot"
+    );
+    Ok(())
+}
+
 fn sidecar_ca_file_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let tls_dir = std::env::var(openshell_core::sandbox_env::PROXY_TLS_DIR)
         .unwrap_or_else(|_| SIDECAR_TLS_DIR.to_string());
@@ -719,100 +919,6 @@ fn process_policy_for_topology(
         }
     }
     Ok(process_policy)
-}
-
-struct GatewayForwardHandle {
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for GatewayForwardHandle {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn start_gateway_forward_from_env(endpoint: &str) -> Result<GatewayForwardHandle> {
-    let listen_addr =
-        std::env::var(openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR).map_err(|_| {
-            miette::miette!(
-                "{} is required for sidecar gateway forwarding",
-                openshell_core::sandbox_env::GATEWAY_FORWARD_ADDR
-            )
-        })?;
-    start_gateway_forward(&listen_addr, endpoint).await
-}
-
-async fn start_gateway_forward(listen_addr: &str, endpoint: &str) -> Result<GatewayForwardHandle> {
-    let upstream = gateway_tcp_addr(endpoint)?;
-    let listener = TcpListener::bind(listen_addr).await.into_diagnostic()?;
-    info!(
-        listen_addr,
-        upstream, "Gateway loopback TCP forward started for sidecar topology"
-    );
-
-    let task = tokio::spawn(async move {
-        loop {
-            let (mut inbound, peer) = match listener.accept().await {
-                Ok(accepted) => accepted,
-                Err(e) => {
-                    warn!(error = %e, "Gateway forward accept failed");
-                    continue;
-                }
-            };
-            let upstream = upstream.clone();
-            tokio::spawn(async move {
-                let mut outbound = match TcpStream::connect(&upstream).await {
-                    Ok(stream) => stream,
-                    Err(e) => {
-                        warn!(peer = %peer, upstream, error = %e, "Gateway forward connect failed");
-                        return;
-                    }
-                };
-                if let Err(e) = copy_bidirectional(&mut inbound, &mut outbound).await {
-                    debug!(peer = %peer, error = %e, "Gateway forward connection closed with error");
-                }
-            });
-        }
-    });
-
-    Ok(GatewayForwardHandle { task })
-}
-
-fn gateway_tcp_addr(endpoint: &str) -> Result<String> {
-    let (scheme, rest) = endpoint
-        .split_once("://")
-        .ok_or_else(|| miette::miette!("gateway endpoint must include a URL scheme"))?;
-    let default_port = match scheme {
-        "http" => 80,
-        "https" => 443,
-        other => {
-            return Err(miette::miette!(
-                "unsupported gateway endpoint scheme '{other}' for sidecar forwarding"
-            ));
-        }
-    };
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.is_empty() {
-        return Err(miette::miette!("gateway endpoint is missing a host"));
-    }
-    if authority.starts_with('[') {
-        let closing = authority
-            .find(']')
-            .ok_or_else(|| miette::miette!("invalid bracketed IPv6 gateway endpoint"))?;
-        let host = &authority[..=closing];
-        let port = authority[closing + 1..]
-            .strip_prefix(':')
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(default_port);
-        return Ok(format!("{host}:{port}"));
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() => {
-            (host, port.parse::<u16>().unwrap_or(default_port))
-        }
-        _ => (authority, default_port),
-    };
-    Ok(format!("{host}:{port}"))
 }
 
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
@@ -2645,34 +2751,6 @@ mod tests {
                 .proxy
                 .and_then(|proxy| proxy.http_addr)
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn gateway_tcp_addr_uses_explicit_port() {
-        assert_eq!(
-            gateway_tcp_addr("https://openshell-gateway.openshell.svc:8080").unwrap(),
-            "openshell-gateway.openshell.svc:8080"
-        );
-    }
-
-    #[test]
-    fn gateway_tcp_addr_uses_scheme_default_port() {
-        assert_eq!(
-            gateway_tcp_addr("https://openshell-gateway.openshell.svc").unwrap(),
-            "openshell-gateway.openshell.svc:443"
-        );
-        assert_eq!(
-            gateway_tcp_addr("http://openshell-gateway.openshell.svc").unwrap(),
-            "openshell-gateway.openshell.svc:80"
-        );
-    }
-
-    #[test]
-    fn gateway_tcp_addr_preserves_ipv6_brackets() {
-        assert_eq!(
-            gateway_tcp_addr("https://[fd00::1]:8443").unwrap(),
-            "[fd00::1]:8443"
         );
     }
 

@@ -181,7 +181,7 @@ supervisor_image_pull_policy   = "IfNotPresent"
 supervisor_sideload_method     = "image-volume"
 # "combined" runs the existing single supervisor container with full process,
 # filesystem, and network enforcement in the agent container. "sidecar" moves
-# pod-level network enforcement and gateway forwarding into a network sidecar.
+# pod-level network enforcement and gateway session handling into a network sidecar.
 supervisor_topology            = "combined"
 # Process/filesystem controls for non-combined topologies. "network-only"
 # keeps the low-permission agent shape; "full" grants combined-mode

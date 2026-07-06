@@ -59,11 +59,15 @@ pub const SUPERVISOR_READY_FILE: &str = "OPENSHELL_SUPERVISOR_READY_FILE";
 /// read by the network sidecar for process/binary-bound network policy checks.
 pub const ENTRYPOINT_PID_FILE: &str = "OPENSHELL_ENTRYPOINT_PID_FILE";
 
-/// Loopback address where the network sidecar forwards gateway gRPC traffic.
-pub const GATEWAY_FORWARD_ADDR: &str = "OPENSHELL_GATEWAY_FORWARD_ADDR";
+/// Local protobuf policy snapshot written by the network sidecar and read by
+/// the process-only supervisor in Kubernetes sidecar topology.
+pub const SIDECAR_POLICY_SNAPSHOT_FILE: &str = "OPENSHELL_SIDECAR_POLICY_SNAPSHOT_FILE";
 
-/// Optional TLS server name used when the process supervisor reaches the
-/// gateway through a loopback TCP forward.
+/// Local provider environment snapshot written by the network sidecar and read
+/// by the process-only supervisor in Kubernetes sidecar topology.
+pub const SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE: &str = "OPENSHELL_SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE";
+
+/// Optional TLS server name override used when connecting to the gateway.
 pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
 
 /// Directory where the network supervisor writes the proxy CA files consumed
