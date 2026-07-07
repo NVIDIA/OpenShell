@@ -17,6 +17,15 @@ depends = ["sdk:ts:install"]
 dir = "sdk/typescript"
 run = "npm run gen"
 
+# Lints the repo-level proto module (buf.yaml at the root) against STANDARD.
+# buf ships only in the SDK's devDependencies today, so this depends on the
+# SDK install and runs buf from there; the target is all of proto/, not just
+# the SDK's client-surface subset.
+["proto:lint"]
+description = "Lint proto/ with buf (repo-level buf.yaml)"
+depends = ["sdk:ts:install"]
+run = "./sdk/typescript/node_modules/.bin/buf lint"
+
 ["sdk:ts:typecheck"]
 description = "Type-check the TypeScript SDK"
 depends = ["sdk:ts:proto"]
@@ -30,8 +39,8 @@ dir = "sdk/typescript"
 run = "npm run build"
 
 ["sdk:ts:ci"]
-description = "TypeScript SDK checks (codegen, typecheck, build)"
-depends = ["sdk:ts:typecheck", "sdk:ts:build"]
+description = "TypeScript SDK checks (proto lint, codegen, typecheck, build)"
+depends = ["proto:lint", "sdk:ts:typecheck", "sdk:ts:build"]
 hide = true
 
 # Publish to the registry in package.json publishConfig. Set OPENSHELL_NPM_VERSION

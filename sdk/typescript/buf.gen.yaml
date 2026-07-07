@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Code generation for the TypeScript SDK. buf compiles proto/ with its own
-# compiler (no protoc) and drives the connect-es plugin from this package's
-# devDependencies. Limited to the client-surface closure so we don't emit the
-# unused inference/compute/test protos; well-known types resolve through
-# @bufbuild/protobuf/wkt and are not generated.
+# Code generation for the TypeScript SDK. The proto module boundary and
+# validation policy live in the repo-level buf.yaml; this template only drives
+# generation. buf compiles the module with its own compiler (no protoc) and
+# runs the connect-es plugin from this package's devDependencies. Limited to
+# the client-surface closure so we don't emit the unused inference/compute/test
+# protos; well-known types resolve through @bufbuild/protobuf/wkt and are not
+# generated.
 version: v2
 clean: true
 inputs:
