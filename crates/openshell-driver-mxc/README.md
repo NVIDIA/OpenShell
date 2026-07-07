@@ -44,9 +44,17 @@ backend = "process_container"
 default_configuration_id = "composable"
 pc_least_privilege = false
 pc_capabilities = []
+# Pattern-C governed egress. The address is a loopback seed; each sandbox
+# receives a unique ephemeral proxy port.
+egress_proxy = false
+egress_proxy_addr = ""
 debug = false
 etw_audit = false
 ```
+
+When `egress_proxy` is enabled, `egress_proxy_addr` must be a loopback
+`IP:PORT` seed. The driver preserves the configured IP and allocates a unique
+ephemeral port for each sandbox's `network.proxy` redirect.
 
 Supply workload settings for each sandbox. The public config is keyed by driver name; the gateway forwards only the inner `mxc` object to the driver:
 
@@ -58,9 +66,9 @@ openshell sandbox create --name mxc-demo --policy demo.yaml `
 
 The `command` array is required and preserves Windows argument boundaries. `cwd` is optional. Environment variables come from the standard sandbox and template environment maps; the driver never copies values from the gateway host environment.
 
-Network policy support depends on the selected containment path. Policy
-replacement and merge updates use the gateway's standard sandbox configuration
-revision contract.
+The host CONNECT proxy enforces network policy when governed egress is enabled.
+Live policy replacement or merge updates remain unsupported; delete and recreate
+the sandbox to apply a different policy.
 
 When `etw_audit` is enabled, each gateway process owns a distinct real-time ETW
 session named from the stable `OpenShell-MXC-ETW` prefix, its process ID, and a
@@ -115,7 +123,7 @@ procfs socket ownership. The development export surface remains the
 [`policy-to-mxc`](examples/policy-to-mxc.rs) example; there is no production
 `openshell policy export-mxc` subcommand yet.
 
-The mapper retains an internal policy-splitting seam for future development, but the runtime exposes no governed-egress switch. Any network rule fails closed until an enforcing proxy is implemented and bound to the sandbox lifecycle.
+If governed egress is disabled, any network rule fails closed rather than launching without an enforcement path.
 
 Parity and matrix tests under [`tests/`](tests/) cover the mapper on the Windows MSVC lane. The driver performs this mapping automatically; there is no separate policy-export command or example.
 
