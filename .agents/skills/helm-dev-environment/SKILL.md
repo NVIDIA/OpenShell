@@ -73,9 +73,10 @@ mise run helm:skaffold:run:sidecar-mtls
 Both commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
 chart. The sidecar profile renders an `openshell-network-init` init container for
 nftables setup and a non-root `openshell-supervisor-network` runtime sidecar for
-proxying. The `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway
-generate-certs`) generates mTLS secrets on first install. Envoy Gateway opt-in;
-see the Optional Add-ons section below.
+proxying. The sidecar-mTLS profile reuses `ci/values-sidecar.yaml` and restores
+`server.disableTls=false` inline for Skaffold. The `pkiInitJob` hook (a pre-install
+Job that runs `openshell-gateway generate-certs`) generates mTLS secrets on first
+install. Envoy Gateway opt-in; see the Optional Add-ons section below.
 
 The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
 
@@ -87,7 +88,8 @@ create the Secret named `openshell-ha-pg` with a `uri` key, then run
 ### TLS behaviour
 
 `ci/values-skaffold.yaml` sets `server.disableTls: true`, so Skaffold-based deploys run
-plaintext by default. To test with TLS enabled, comment out that line and redeploy.
+plaintext by default. To test sidecar topology with TLS enabled, use
+`mise run helm:skaffold:run:sidecar-mtls`.
 
 | Mode | `server.disableTls` | Gateway scheme |
 |------|---------------------|----------------|
@@ -270,7 +272,6 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-sidecar.yaml` | Supervisor sidecar topology overlay for Kubernetes e2e/dev |
-| `deploy/helm/openshell/ci/values-sidecar-mtls.yaml` | Supervisor sidecar topology overlay with built-in TLS/mTLS re-enabled after Skaffold dev values |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |

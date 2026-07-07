@@ -138,4 +138,8 @@ profiles:
     patches:
       - op: add
         path: /deploy/helm/releases/0/valuesFiles/-
-        value: ci/values-sidecar-mtls.yaml
+        value: ci/values-sidecar.yaml
+      - op: add
+        path: /deploy/helm/releases/0/setValues
+        value:
+          server.disableTls: "false"
