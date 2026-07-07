@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Repo-level buf module. Declares proto/ as the single module so buf generate,
+# buf lint, buf breaking, and the editor LSP all resolve imports the same way.
+# Code generation lives with each consumer (see sdk/typescript/buf.gen.yaml);
+# this file owns the module boundary and proto validation policy.
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  except:
+    # Flat proto/ layout: all files live in one directory with nested
+    # packages (openshell.v1, openshell.sandbox.v1, ...). Adopting these
+    # would require restructuring the tree into openshell/<svc>/v1/ and
+    # updating every Rust/Python/TS codegen path and import.
+    - DIRECTORY_SAME_PACKAGE
+    - PACKAGE_DIRECTORY_MATCH
+    # Established API shape: services are unsuffixed (OpenShell, not
+    # OpenShellService) and RPCs reuse shared request/response messages with
+    # short names. Renaming these is a breaking change across the codebase.
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - SERVICE_SUFFIX
+breaking:
+  use:
+    - FILE

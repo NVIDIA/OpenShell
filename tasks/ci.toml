@@ -51,7 +51,7 @@ hide = true
 
 [lint]
 description = "Run repository lint checks"
-depends = ["license:check", "rust:format:check", "rust:lint", "python:format:check", "python:lint", "helm:lint", "helm:docs:check", "markdown:lint"]
+depends = ["license:check", "rust:format:check", "rust:lint", "python:format:check", "python:lint", "helm:lint", "helm:docs:check", "markdown:lint", "proto:lint"]
 hide = true
 
 [ci]
