@@ -221,6 +221,21 @@ openshell sandbox list --selector env=dev
 openshell sandbox list --selector env=dev,team=platform
 ```
 
+The Python SDK accepts the same gateway labels and selectors. Labels passed to
+`create` are stored on the gateway sandbox object and are returned on
+`SandboxRef.labels`, so selector-based listing finds Python-created sandboxes:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    sandbox = client.create(name="deep-research-1", labels={"env": "dev", "team": "platform"})
+    assert sandbox.labels["team"] == "platform"
+
+    matches = client.list(label_selector="env=dev,team=platform")
+    assert sandbox.id in {s.id for s in matches}
+```
+
 ## Expose Long Running Services
 
 Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
