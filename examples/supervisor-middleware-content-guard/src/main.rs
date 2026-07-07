@@ -10,7 +10,8 @@ use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
 };
 use openshell_core::proto::{
     Decision, Finding, HttpRequestEvaluation, HttpRequestResult, MiddlewareBinding,
-    MiddlewareManifest, ValidateConfigRequest, ValidateConfigResponse,
+    MiddlewareManifest, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+    ValidateConfigRequest, ValidateConfigResponse,
 };
 use prost_types::Struct;
 use prost_types::value::Kind;
@@ -19,8 +20,8 @@ use tonic::{Request, Response, Status};
 
 const API_VERSION: &str = "openshell.middleware.v1";
 const BINDING_ID: &str = "example/content-guard";
-const OPERATION: &str = "HttpRequest";
-const PHASE: &str = "pre_credentials";
+const OPERATION: SupervisorMiddlewareOperation = SupervisorMiddlewareOperation::HttpRequest;
+const PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
 const MAX_BODY_BYTES: u64 = 256 * 1024;
 const DEFAULT_REPLACEMENT: &str = "[REDACTED]";
 
@@ -124,8 +125,8 @@ impl SupervisorMiddleware for ContentGuard {
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![MiddlewareBinding {
                 id: BINDING_ID.into(),
-                operation: OPERATION.into(),
-                phase: PHASE.into(),
+                operation: OPERATION as i32,
+                phase: PHASE as i32,
                 max_body_bytes: MAX_BODY_BYTES,
             }],
         }))
@@ -172,7 +173,7 @@ impl SupervisorMiddleware for ContentGuard {
 fn validate_envelope(
     api_version: &str,
     binding_id: &str,
-    phase: Option<&str>,
+    phase: Option<&i32>,
 ) -> Result<(), String> {
     if api_version != API_VERSION {
         return Err(format!("unsupported api_version '{api_version}'"));
@@ -181,7 +182,7 @@ fn validate_envelope(
         return Err(format!("unsupported binding_id '{binding_id}'"));
     }
     if let Some(phase) = phase
-        && phase != PHASE
+        && *phase != PHASE as i32
     {
         return Err(format!("unsupported phase '{phase}'"));
     }
