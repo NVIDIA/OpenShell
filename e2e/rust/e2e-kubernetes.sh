@@ -12,14 +12,14 @@
 # the sandbox-side `host.openshell.internal` alias compile and run. The
 # wrapper detects the cluster's host-routable IP and wires it into the chart
 # via `server.hostGatewayIP`. Targeting a cluster where the test host is
-# unreachable from pods? Set OPENSHELL_E2E_KUBERNETES_FEATURES=e2e to drop the
+# unreachable from pods? Set OPENSHELL_E2E_KUBE_FEATURES=e2e to drop the
 # alias-dependent tests entirely.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES:-e2e,e2e-host-gateway,e2e-kubernetes}"
+E2E_FEATURES="${OPENSHELL_E2E_KUBE_FEATURES:-e2e,e2e-host-gateway,e2e-kubernetes}"
 
 cargo build -p openshell-cli
 

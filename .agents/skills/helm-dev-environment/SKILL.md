@@ -189,7 +189,9 @@ manual edits in the worktree.
 
 ### Envoy Gateway (Gateway API / GRPCRoute)
 
-Use the `high-availability` Skaffold profile for HA reverse-proxy testing:
+Use the `high-availability` Skaffold profile for HA reverse-proxy testing. The
+profile intentionally includes Envoy Gateway so multi-replica behavior is
+exercised through the same Gateway API path used by reverse-proxy deployments:
 
 ```bash
 cd deploy/helm/openshell
@@ -199,9 +201,10 @@ KUBECONFIG=kubeconfig mise run helm:gateway:apply
 ```
 
 `values-gateway.yaml` creates a `Gateway` (listener on port 80, class `eg`) and
-`GRPCRoute` in the `openshell` namespace. The `high-availability` profile installs the
-Envoy Gateway Helm chart and layers both `values-high-availability.yaml` and
-`values-gateway.yaml` onto the OpenShell release.
+`GRPCRoute` in the `openshell` namespace. The `high-availability` profile
+installs the Envoy Gateway Helm chart and layers both
+`values-high-availability.yaml` and `values-gateway.yaml` onto the OpenShell
+release.
 
 `deploy/kube/manifests/envoy-gateway-openshell.yaml` creates:
 
@@ -241,18 +244,24 @@ task creates an external PostgreSQL fixture, installs Envoy Gateway, applies
 `GRPCRoute`, and runs the full Kubernetes e2e suite, including
 `kubernetes_ha_rebalancing`. That coverage validates sandbox create/watch and
 exec through the Envoy proxy while gateway replicas scale up, scale down, and
-rotate.
+rotate. It also keeps a long-running sandbox alive and runs upload/download
+operations while gateway pods roll, so file sync exercises the same relay retry
+path as interactive sessions.
 
 If you reuse an existing Skaffold cluster for the full kube suite, make sure the
-cluster has the Docker Desktop host-gateway alias configured for host-gateway
-tests. The e2e wrapper sets this on chart installs; manual reuse may require:
+chart has `server.hostGatewayIP` set so sandbox pods can resolve
+`host.openshell.internal` back to the test host. The e2e wrapper detects this on
+chart installs; manual reuse may require:
 
 ```bash
+HOST_GATEWAY_IP="${OPENSHELL_E2E_HOST_GATEWAY_IP:?set host gateway IP}"
 KUBECONFIG=kubeconfig helm upgrade openshell deploy/helm/openshell \
   --namespace openshell --reuse-values \
-  --set server.hostGatewayIP=192.168.65.254 \
+  --set "server.hostGatewayIP=${HOST_GATEWAY_IP}" \
   --wait --timeout 5m
 ```
+
+Use the IP that pods in that cluster use to reach listeners on the test host.
 
 ### Keycloak OIDC
 

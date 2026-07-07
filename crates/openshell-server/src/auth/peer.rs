@@ -30,6 +30,7 @@ pub const DEFAULT_PEER_TOKEN_AUDIENCE: &str = "openshell-gateway-peer";
 /// Environment variable overriding the expected peer token audience.
 pub const PEER_TOKEN_AUDIENCE_ENV: &str = "OPENSHELL_PEER_TOKEN_AUDIENCE";
 /// Environment variable carrying the projected peer `ServiceAccount` token path.
+/// Uses the `*_TOKEN_FILE` convention from sandbox token env vars.
 pub const PEER_SA_TOKEN_FILE_ENV: &str = "OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE";
 /// Default mount path for the projected peer `ServiceAccount` token.
 pub const DEFAULT_PEER_SA_TOKEN_FILE: &str = "/var/run/secrets/openshell-peer/token";

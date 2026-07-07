@@ -100,9 +100,12 @@ In multi-replica Kubernetes deployments, every gateway pod can accept client
 RPCs, but a sandbox supervisor maintains one active stream to one gateway
 replica at a time. The connected replica publishes a short-lived supervisor
 owner record in the shared Postgres object store with its replica id, peer DNS
-endpoint, supervisor instance id, and connection epoch. Heartbeats renew the
-record, and reconnects from the same supervisor instance with a newer epoch can
-supersede the previous owner before the TTL expires.
+endpoint, supervisor instance id, and connection epoch. Ownership does not move
+because another gateway receives a client request. It changes only when the
+supervisor opens a new control stream, usually after the previous owner pod is
+terminated or the stream breaks. A reconnect from the same supervisor instance
+with a newer epoch can supersede the previous owner before the TTL expires, and
+heartbeats from the active connection renew that current owner record.
 
 Session-bound operations such as exec, TCP forwarding, file sync, and sandbox
 service routing first check the local session registry. If the supervisor is
@@ -111,7 +114,9 @@ owned by another gateway replica, the serving gateway opens an internal
 keeps client traffic working when a Kubernetes Service routes the client to a
 non-owner gateway pod. If a peer owner is stale or unreachable during a rollout,
 the serving gateway retries ownership lookup until the normal relay wait
-deadline.
+deadline. Each retry re-reads the owner record, so a supervisor reconnect or
+heartbeat can surface a new owner; if no fresh reachable owner appears before
+the deadline, the client operation fails rather than electing an owner itself.
 
 File upload and download use tar-over-SSH through the same relay path. A gateway
 pod termination drops the active SSH proxy byte stream, so the CLI retries the

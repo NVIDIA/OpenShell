@@ -143,6 +143,8 @@ profiles:
         path: /deploy/helm/releases/0/setValues
         value:
           server.disableTls: "false"
+  # Full HA test path: installs Envoy Gateway and layers both HA replicas and
+  # Gateway API routing values onto the OpenShell release.
   - name: high-availability
     patches:
       - op: add

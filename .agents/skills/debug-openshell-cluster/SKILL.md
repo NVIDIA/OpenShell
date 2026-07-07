@@ -132,13 +132,13 @@ Common findings:
 helm -n openshell status openshell
 helm -n openshell get values openshell
 kubectl -n openshell get deployment,statefulset,pod,svc,pvc
-WORKLOAD="$(kubectl -n openshell get deployment openshell >/dev/null 2>&1 && echo deployment/openshell || echo statefulset/openshell)"
-kubectl -n openshell logs "${WORKLOAD}" -c openshell-gateway --tail=200
-kubectl -n openshell rollout status "${WORKLOAD}"
+GATEWAY_DEPLOYMENT="$(kubectl -n openshell get deployment openshell >/dev/null 2>&1 && echo deployment/openshell || echo statefulset/openshell)"
+kubectl -n openshell logs "${GATEWAY_DEPLOYMENT}" -c openshell-gateway --tail=200
+kubectl -n openshell rollout status "${GATEWAY_DEPLOYMENT}"
 ```
 
-Use the log and rollout commands for the workload kind that exists in the
-release. Look for failed installs, unexpected values, missing namespace, wrong
+Use the log and rollout commands for the gateway resource kind that exists in
+the release. Look for failed installs, unexpected values, missing namespace, wrong
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
@@ -166,7 +166,7 @@ kubectl auth can-i create tokenreviews.authentication.k8s.io \
   --as=system:serviceaccount:openshell:openshell
 kubectl auth can-i get pods -n openshell \
   --as=system:serviceaccount:openshell:openshell
-kubectl -n openshell logs "${WORKLOAD}" --tail=200 | grep -E 'gateway peer|PeerRelay|supervisor owner|owner relay'
+kubectl -n openshell logs "${GATEWAY_DEPLOYMENT}" --tail=200 | grep -E 'gateway peer|PeerRelay|supervisor owner|owner relay'
 ```
 
 Expected gateway startup logs include
@@ -176,7 +176,10 @@ volume has audience `openshell-gateway-peer` and that the receiving gateway can
 create TokenReviews. If they fail with `PermissionDenied`, verify the gateway
 ServiceAccount name, release namespace, pod UID, and Helm selector labels match
 the live gateway pods. Deployment-backed gateway pods should also publish
-`OPENSHELL_PEER_ENDPOINT` from their pod IP.
+`OPENSHELL_PEER_ENDPOINT` from their pod IP. The
+`OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE` name follows the existing
+token-file convention used by `OPENSHELL_SANDBOX_TOKEN_FILE` and
+`OPENSHELL_K8S_SA_TOKEN_FILE`.
 
 Check required Helm deployment secrets:
 
@@ -224,8 +227,8 @@ label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
 Check the image references currently used by the gateway deployment:
 
 ```bash
-WORKLOAD="$(kubectl -n openshell get deployment openshell >/dev/null 2>&1 && echo deployment/openshell || echo statefulset/openshell)"
-kubectl -n openshell get "${WORKLOAD}" -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
+GATEWAY_DEPLOYMENT="$(kubectl -n openshell get deployment openshell >/dev/null 2>&1 && echo deployment/openshell || echo statefulset/openshell)"
+kubectl -n openshell get "${GATEWAY_DEPLOYMENT}" -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
 helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
@@ -269,8 +272,8 @@ If the gateway is healthy but sandbox creation fails:
 ```bash
 kubectl -n openshell get pods
 kubectl -n openshell get events --sort-by=.lastTimestamp | tail -n 50
-WORKLOAD="$(kubectl -n openshell get deployment openshell >/dev/null 2>&1 && echo deployment/openshell || echo statefulset/openshell)"
-kubectl -n openshell logs "${WORKLOAD}" -c openshell-gateway --tail=200
+GATEWAY_DEPLOYMENT="$(kubectl -n openshell get deployment openshell >/dev/null 2>&1 && echo deployment/openshell || echo statefulset/openshell)"
+kubectl -n openshell logs "${GATEWAY_DEPLOYMENT}" -c openshell-gateway --tail=200
 ```
 
 Check the configured sandbox namespace:
