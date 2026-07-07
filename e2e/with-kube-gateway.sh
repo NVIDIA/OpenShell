@@ -394,7 +394,7 @@ require_cmd() {
 }
 
 configure_fixture_container_engine() {
-  [ -n "${CONTAINER_ENGINE:-}" ] || return
+  [ -n "${CONTAINER_ENGINE:-}" ] || return 0
   local selected_engine
   selected_engine="$(printf '%s' "${CONTAINER_ENGINE}" | tr '[:upper:]' '[:lower:]')"
   case "${selected_engine}" in
@@ -518,7 +518,7 @@ if [ -z "${HOST_GATEWAY_IP}" ] \
     # is unreachable for the typical test-host listener (0.0.0.0 bind).
     detected="$(docker network inspect "${net}" \
       -f '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' 2>/dev/null \
-      | awk '/^[0-9.]+$/ { print; exit }')"
+      | awk '/^[0-9.]+$/ { print; exit }' || true)"
     if [ -n "${detected}" ]; then
       HOST_GATEWAY_IP="${detected}"
       echo "Detected host gateway IP ${HOST_GATEWAY_IP} from docker network '${net}'."
