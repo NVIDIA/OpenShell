@@ -65,6 +65,11 @@ mise run helm:skaffold:run
 mise run helm:skaffold:run:sidecar
 ```
 
+**Supervisor sidecar topology with TLS/mTLS enabled** (build once and leave running):
+```bash
+mise run helm:skaffold:run:sidecar-mtls
+```
+
 Both commands build the `gateway` and `supervisor` images and deploy the OpenShell Helm
 chart. The sidecar profile renders an `openshell-network-init` init container for
 nftables setup and a non-root `openshell-supervisor-network` runtime sidecar for
@@ -265,6 +270,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-sidecar.yaml` | Supervisor sidecar topology overlay for Kubernetes e2e/dev |
+| `deploy/helm/openshell/ci/values-sidecar-mtls.yaml` | Supervisor sidecar topology overlay with built-in TLS/mTLS re-enabled after Skaffold dev values |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |

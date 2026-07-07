@@ -134,3 +134,8 @@ profiles:
       - op: add
         path: /deploy/helm/releases/0/valuesFiles/-
         value: ci/values-sidecar.yaml
+  - name: sidecar-mtls
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-sidecar-mtls.yaml

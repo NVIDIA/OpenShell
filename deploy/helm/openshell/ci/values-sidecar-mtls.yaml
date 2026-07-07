@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI/dev overlay for exercising the Kubernetes supervisor sidecar topology with
+# the built-in PKI init job and gateway TLS/mTLS enabled.
+#
+# Merge after ci/values-skaffold.yaml so local image pull policy and developer
+# auth settings remain active while this file restores TLS:
+#   helm install ... -f values.yaml -f ci/values-skaffold.yaml -f ci/values-sidecar-mtls.yaml
+#
+# Or use the Skaffold profile:
+#   mise run helm:skaffold:run:sidecar-mtls
+server:
+  disableTls: false
+
+supervisor:
+  topology: sidecar

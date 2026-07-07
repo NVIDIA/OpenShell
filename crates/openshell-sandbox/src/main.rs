@@ -43,6 +43,16 @@ const CLIENT_TLS_DIR: &str = "/etc/openshell-tls/client";
 const SIDECAR_CLIENT_TLS_SUBDIR: &str = "client";
 #[cfg(target_os = "linux")]
 const CLIENT_TLS_FILES: [&str; 3] = ["ca.crt", "tls.crt", "tls.key"];
+#[cfg(target_os = "linux")]
+const SIDECAR_STATE_DIR_MODE: u32 = 0o2775;
+#[cfg(target_os = "linux")]
+const SIDECAR_TLS_DIR_MODE: u32 = 0o755;
+#[cfg(target_os = "linux")]
+const SIDECAR_TLS_STAGING_DIR_MODE: u32 = 0o700;
+#[cfg(target_os = "linux")]
+const SIDECAR_CLIENT_TLS_DIR_MODE: u32 = 0o750;
+#[cfg(target_os = "linux")]
+const SIDECAR_CLIENT_TLS_FILE_MODE: u32 = 0o400;
 
 /// Which supervisor leaves are enabled in this process.
 ///
@@ -257,6 +267,35 @@ fn prepare_sidecar_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Resu
 }
 
 #[cfg(target_os = "linux")]
+fn prepare_sidecar_directory_for_current_user(path: &Path, mode: u32) -> Result<()> {
+    use miette::Context as _;
+    use nix::unistd::{Gid, Uid, chown};
+    use std::os::unix::fs::PermissionsExt;
+
+    let uid = Uid::current();
+    let gid = Gid::current();
+    std::fs::create_dir_all(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create sidecar directory {}", path.display()))?;
+    chown(path, Some(uid), Some(gid))
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to chown sidecar directory {} to {}:{}",
+                path.display(),
+                uid.as_raw(),
+                gid.as_raw()
+            )
+        })?;
+    let mut perms = std::fs::metadata(path).into_diagnostic()?.permissions();
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to chmod sidecar directory {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn copy_sidecar_client_tls_if_present(
     source_dir: &Path,
     sidecar_tls_dir: &Path,
@@ -272,7 +311,7 @@ fn copy_sidecar_client_tls_if_present(
     }
 
     let dest_dir = sidecar_tls_dir.join(SIDECAR_CLIENT_TLS_SUBDIR);
-    prepare_sidecar_directory(&dest_dir, uid, gid, 0o750)?;
+    prepare_sidecar_directory_for_current_user(&dest_dir, SIDECAR_TLS_STAGING_DIR_MODE)?;
     for file_name in CLIENT_TLS_FILES {
         let source = source_dir.join(file_name);
         if !source.exists() {
@@ -282,6 +321,13 @@ fn copy_sidecar_client_tls_if_present(
             ));
         }
         let dest = dest_dir.join(file_name);
+        if dest.exists() {
+            std::fs::remove_file(&dest)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to remove stale client TLS file {}", dest.display())
+                })?;
+        }
         std::fs::copy(&source, &dest)
             .into_diagnostic()
             .wrap_err_with(|| {
@@ -292,7 +338,7 @@ fn copy_sidecar_client_tls_if_present(
                 )
             })?;
         let mut perms = std::fs::metadata(&dest).into_diagnostic()?.permissions();
-        perms.set_mode(0o400);
+        perms.set_mode(SIDECAR_CLIENT_TLS_FILE_MODE);
         std::fs::set_permissions(&dest, perms)
             .into_diagnostic()
             .wrap_err_with(|| {
@@ -307,6 +353,8 @@ fn copy_sidecar_client_tls_if_present(
                 )
             })?;
     }
+
+    prepare_sidecar_directory(&dest_dir, uid, gid, SIDECAR_CLIENT_TLS_DIR_MODE)?;
 
     Ok(())
 }
@@ -337,19 +385,23 @@ fn run_network_init(
         sidecar_state_dir,
         proxy_user_id,
         proxy_primary_group_id,
-        0o2775,
+        SIDECAR_STATE_DIR_MODE,
     )?;
-    prepare_sidecar_directory(
-        sidecar_tls_dir,
-        proxy_user_id,
-        proxy_primary_group_id,
-        0o755,
-    )?;
+    // The init container runs as uid 0 with CAP_DAC_OVERRIDE dropped. Keep the
+    // TLS work directory owned by the init user until the client cert copy is
+    // complete, then hand it to the long-running proxy UID.
+    prepare_sidecar_directory_for_current_user(sidecar_tls_dir, SIDECAR_TLS_DIR_MODE)?;
     copy_sidecar_client_tls_if_present(
         Path::new(CLIENT_TLS_DIR),
         sidecar_tls_dir,
         proxy_user_id,
         proxy_primary_group_id,
+    )?;
+    prepare_sidecar_directory(
+        sidecar_tls_dir,
+        proxy_user_id,
+        proxy_primary_group_id,
+        SIDECAR_TLS_DIR_MODE,
     )?;
     openshell_supervisor_process::netns::install_sidecar_bypass_rules(proxy_user_id)
 }
@@ -622,5 +674,14 @@ mod tests {
     fn mode_rejects_empty_value() {
         let err = "".parse::<Mode>().unwrap_err();
         assert!(err.contains("at least one"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sidecar_tls_modes_preserve_proxy_owned_parent_and_private_client_dir() {
+        assert_eq!(SIDECAR_TLS_DIR_MODE, 0o755);
+        assert_eq!(SIDECAR_TLS_STAGING_DIR_MODE, 0o700);
+        assert_eq!(SIDECAR_CLIENT_TLS_DIR_MODE, 0o750);
+        assert_eq!(SIDECAR_CLIENT_TLS_FILE_MODE, 0o400);
     }
 }
