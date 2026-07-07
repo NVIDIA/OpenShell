@@ -183,10 +183,6 @@ supervisor_sideload_method     = "image-volume"
 # filesystem, and network enforcement in the agent container. "sidecar" moves
 # pod-level network enforcement and gateway session handling into a network sidecar.
 supervisor_topology            = "combined"
-# Process/filesystem controls for non-combined topologies. "network-only"
-# keeps the low-permission agent shape; "full" grants combined-mode
-# process/filesystem controls to the agent process supervisor.
-process_enforcement            = "network-only"
 # UID used by the long-running network sidecar. In sidecar topology the
 # network init container installs nftables rules that exempt this UID.
 proxy_uid                      = 1337

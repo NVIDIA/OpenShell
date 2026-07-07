@@ -88,43 +88,6 @@ impl FromStr for SupervisorTopology {
     }
 }
 
-/// Process/filesystem controls applied by the process supervisor in split
-/// Kubernetes topologies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProcessEnforcementMode {
-    /// Preserve process launch and session relay behavior, but leave
-    /// filesystem/process guards to the network supervisor topology.
-    #[default]
-    NetworkOnly,
-    /// Run the process supervisor with the same process/filesystem controls as
-    /// combined topology.
-    Full,
-}
-
-impl std::fmt::Display for ProcessEnforcementMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NetworkOnly => f.write_str("network-only"),
-            Self::Full => f.write_str("full"),
-        }
-    }
-}
-
-impl FromStr for ProcessEnforcementMode {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "network-only" => Ok(Self::NetworkOnly),
-            "full" => Ok(Self::Full),
-            other => Err(format!(
-                "unknown process enforcement mode '{other}'; expected 'network-only' or 'full'"
-            )),
-        }
-    }
-}
-
 /// Kubernetes `AppArmor` profile requested for the sandbox agent container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppArmorProfile {
@@ -251,10 +214,6 @@ pub struct KubernetesComputeConfig {
     pub supervisor_sideload_method: SupervisorSideloadMethod,
     /// How the supervisor is arranged for Kubernetes sandbox pods.
     pub supervisor_topology: SupervisorTopology,
-    /// Process/filesystem enforcement mode used by the agent container in
-    /// non-combined topologies. `network-only` keeps the low-permission agent
-    /// shape; `full` grants the agent supervisor combined-mode controls.
-    pub process_enforcement: ProcessEnforcementMode,
     /// UID used by the long-running network sidecar in `sidecar` topology.
     /// The network init container installs nftables rules that exempt this
     /// UID, so it must not match the sandbox workload UID.
@@ -345,7 +304,6 @@ impl Default for KubernetesComputeConfig {
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             supervisor_topology: SupervisorTopology::default(),
-            process_enforcement: ProcessEnforcementMode::default(),
             proxy_uid: DEFAULT_PROXY_UID,
             grpc_endpoint: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
@@ -541,13 +499,6 @@ mod tests {
     }
 
     #[test]
-    fn default_process_enforcement_is_network_only() {
-        let cfg = KubernetesComputeConfig::default();
-        assert_eq!(cfg.process_enforcement, ProcessEnforcementMode::NetworkOnly);
-        assert_eq!(cfg.process_enforcement.to_string(), "network-only");
-    }
-
-    #[test]
     fn serde_override_supervisor_topology_sidecar() {
         let json = serde_json::json!({
             "supervisor_topology": "sidecar"
@@ -563,15 +514,6 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.supervisor_topology, SupervisorTopology::Combined);
-    }
-
-    #[test]
-    fn serde_override_process_enforcement_full() {
-        let json = serde_json::json!({
-            "process_enforcement": "full"
-        });
-        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.process_enforcement, ProcessEnforcementMode::Full);
     }
 
     #[test]
@@ -604,12 +546,12 @@ mod tests {
     }
 
     #[test]
-    fn serde_rejects_invalid_process_enforcement() {
+    fn serde_rejects_removed_process_enforcement_field() {
         let json = serde_json::json!({
-            "process_enforcement": "privileged"
+            "process_enforcement": "network-only"
         });
         let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
-        assert!(err.to_string().contains("unknown variant"));
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

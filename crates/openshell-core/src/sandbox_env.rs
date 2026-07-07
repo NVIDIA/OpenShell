@@ -36,15 +36,6 @@ pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
 /// Network enforcement backend selected by the compute driver.
 pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
 
-/// Process enforcement mode selected by the compute driver.
-///
-/// The default when unset is `"full"`, where the process supervisor enforces
-/// filesystem/process policy before spawning workloads. Kubernetes sidecar
-/// topology sets this to `"network-only"` so the process wrapper can run as
-/// the sandbox UID without Linux capabilities while preserving SSH/session
-/// behavior.
-pub const PROCESS_ENFORCEMENT_MODE: &str = "OPENSHELL_PROCESS_ENFORCEMENT_MODE";
-
 /// Whether network policy evaluation must bind requests to the peer binary.
 ///
 /// The default when unset is `"required"`. Kubernetes sidecar experiments may

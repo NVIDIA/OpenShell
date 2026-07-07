@@ -49,10 +49,6 @@ supervisor:
   # "sidecar" runs network enforcement in a dedicated sidecar and the process
   # supervisor as a low-capability wrapper in the agent container.
   topology: "combined"
-  # -- Process/filesystem controls applied by the agent process supervisor in
-  # non-combined topologies. "network-only" keeps the low-permission agent
-  # shape; "full" grants combined-mode process/filesystem controls.
-  processEnforcement: "network-only"
   # -- UID for the long-running network sidecar in sidecar topology. The
   # network init container installs nftables rules that exempt this UID.
   proxyUid: 1337

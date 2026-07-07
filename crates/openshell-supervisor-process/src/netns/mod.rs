@@ -513,9 +513,43 @@ fn install_sidecar_iptables_legacy_bypass_rules(proxy_uid: u32) -> Result<()> {
             "trusted iptables-legacy helper not found; sidecar network enforcement fallback unavailable"
         )
     })?;
+    let ip6tables_cmd = find_ip6tables_legacy().ok_or_else(|| {
+        miette::miette!(
+            "trusted ip6tables-legacy helper not found; sidecar network enforcement fallback cannot fence IPv6"
+        )
+    })?;
 
     cleanup_sidecar_iptables_legacy_rules(&iptables_cmd);
+    cleanup_sidecar_iptables_legacy_rules(&ip6tables_cmd);
 
+    if let Err(e) = install_sidecar_iptables_legacy_family_rules(
+        &iptables_cmd,
+        proxy_uid,
+        "icmp-port-unreachable",
+    ) {
+        cleanup_sidecar_iptables_legacy_rules(&iptables_cmd);
+        cleanup_sidecar_iptables_legacy_rules(&ip6tables_cmd);
+        return Err(e);
+    }
+
+    if let Err(e) = install_sidecar_iptables_legacy_family_rules(
+        &ip6tables_cmd,
+        proxy_uid,
+        "icmp6-port-unreachable",
+    ) {
+        cleanup_sidecar_iptables_legacy_rules(&iptables_cmd);
+        cleanup_sidecar_iptables_legacy_rules(&ip6tables_cmd);
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+fn install_sidecar_iptables_legacy_family_rules(
+    cmd: &str,
+    proxy_uid: u32,
+    udp_reject_with: &str,
+) -> Result<()> {
     let proxy_uid_arg = proxy_uid.to_string();
     let commands: Vec<Vec<&str>> = vec![
         vec!["-N", SIDECAR_IPTABLES_CHAIN],
@@ -558,14 +592,14 @@ fn install_sidecar_iptables_legacy_bypass_rules(proxy_uid: u32) -> Result<()> {
             "-j",
             "REJECT",
             "--reject-with",
-            "icmp-port-unreachable",
+            udp_reject_with,
         ],
         vec!["-A", "OUTPUT", "-j", SIDECAR_IPTABLES_CHAIN],
     ];
 
     for args in commands {
-        if let Err(e) = run_iptables_legacy_current_namespace(&iptables_cmd, &args) {
-            cleanup_sidecar_iptables_legacy_rules(&iptables_cmd);
+        if let Err(e) = run_iptables_legacy_current_namespace(cmd, &args) {
+            cleanup_sidecar_iptables_legacy_rules(cmd);
             return Err(e);
         }
     }
@@ -783,6 +817,11 @@ const IPTABLES_LEGACY_SEARCH_PATHS: &[&str] = &[
     "/sbin/iptables-legacy",
     "/usr/bin/iptables-legacy",
 ];
+const IP6TABLES_LEGACY_SEARCH_PATHS: &[&str] = &[
+    "/usr/sbin/ip6tables-legacy",
+    "/sbin/ip6tables-legacy",
+    "/usr/bin/ip6tables-legacy",
+];
 
 fn find_trusted_binary<'a>(name: &str, paths: &'a [&str]) -> Result<&'a str> {
     paths
@@ -809,6 +848,12 @@ fn find_nft() -> Option<String> {
 
 fn find_iptables_legacy() -> Option<String> {
     find_trusted_binary("iptables-legacy", IPTABLES_LEGACY_SEARCH_PATHS)
+        .ok()
+        .map(String::from)
+}
+
+fn find_ip6tables_legacy() -> Option<String> {
+    find_trusted_binary("ip6tables-legacy", IP6TABLES_LEGACY_SEARCH_PATHS)
         .ok()
         .map(String::from)
 }
@@ -858,6 +903,16 @@ mod tests {
             assert!(
                 path.starts_with('/'),
                 "IPTABLES_LEGACY_SEARCH_PATHS entry must be absolute: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ip6tables_legacy_search_paths_are_absolute() {
+        for path in IP6TABLES_LEGACY_SEARCH_PATHS {
+            assert!(
+                path.starts_with('/'),
+                "IP6TABLES_LEGACY_SEARCH_PATHS entry must be absolute: {path}"
             );
         }
     }

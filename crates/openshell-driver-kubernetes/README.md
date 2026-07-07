@@ -62,11 +62,9 @@ container and runs the long-lived network sidecar as a non-root UID with no
 added Linux capabilities. The agent container also runs as the resolved sandbox
 UID/GID with `allowPrivilegeEscalation: false` and `capabilities.drop: ["ALL"]`.
 In this mode OpenShell preserves gateway session and SSH behavior, but the
-process supervisor defaults to network-only mode and does not apply Landlock
+process supervisor runs in network-only mode and does not apply Landlock
 filesystem policy, process privilege dropping, or process/binary identity
 checks. Network endpoint and L7 policy remain enforced by the network sidecar.
-Set `process_enforcement = "full"` only when you want combined-mode
-process/filesystem guards and accept the added agent-container permissions.
 
 Sidecar mode uses the pod `fsGroup` to make the projected service-account token
 and sandbox client TLS secret group-readable so the non-root process supervisor

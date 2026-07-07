@@ -21,7 +21,7 @@ lower-privilege agent container.
 | Topology | Use when | Main tradeoff |
 |---|---|---|
 | `combined` | You need OpenShell network, filesystem, and process controls in the sandbox workload. | The agent container carries the Linux capabilities the supervisor needs. |
-| `sidecar` | You need the agent container to run as non-root without added Linux capabilities, and network policy is the primary control. | Defaults to network-only process supervision unless you opt in to `processEnforcement=full`. |
+| `sidecar` | You need the agent container to run as non-root without added Linux capabilities, and network policy is the primary control. | The process supervisor is network-only, so filesystem/process controls do not run in the agent container. |
 
 ## Privilege Model
 
@@ -31,7 +31,6 @@ The long-running container permissions differ by topology:
 |---|---|---|---|---|---|
 | `combined` | Agent container, which also runs the supervisor | Not forced by topology | Not explicitly disabled by the driver | Adds `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG`; adds `SETUID`, `SETGID`, and `DAC_READ_SEARCH` when user namespaces are enabled | Full supervisor controls run in the agent container. |
 | `sidecar` | Agent container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
-| `sidecar` | Agent container, process-only supervisor (`full`) | Root supervisor | Not explicitly disabled by the driver | Adds combined-mode capabilities | Agent keeps combined-mode process/filesystem guards. |
 | `sidecar` | Network supervisor sidecar | `proxyUid:sandbox_gid` | `false` | Drops `ALL` | Long-running proxy sidecar is also non-root without added capabilities. |
 
 Short-lived setup containers still have the permissions needed to prepare the
@@ -96,7 +95,7 @@ flowchart TB
     NetNS["pod network namespace"]
 
     subgraph Agent["agent container"]
-      ProcessSupervisor["process supervisor<br/>network-only by default"]
+      ProcessSupervisor["process supervisor<br/>network-only"]
       Workload["Agent workload"]
     end
 
@@ -126,9 +125,7 @@ The pod contains these OpenShell-managed pieces:
 | Agent container | Resolved sandbox UID/GID | Runs the process supervisor and launches the user workload. |
 
 In this topology, the agent container defaults to `runAsNonRoot: true`,
-`allowPrivilegeEscalation: false`, and `capabilities.drop: ["ALL"]`. Set
-`supervisor.processEnforcement=full` only when you want combined-mode
-process/filesystem guards and accept the added agent-container permissions. The
+`allowPrivilegeEscalation: false`, and `capabilities.drop: ["ALL"]`. The
 long-running network sidecar always drops all Linux capabilities. The root init
 container keeps the setup capabilities needed to configure pod networking.
 
@@ -139,13 +136,11 @@ gateway endpoint, gateway TLS material, or the sandbox bootstrap token in the
 default sidecar path.
 
 <Warning>
-Sidecar mode defaults the process supervisor to `network-only`. OpenShell still
+Sidecar mode runs the process supervisor in `network-only` mode. OpenShell still
 enforces network endpoint and L7 policy through the sidecar, but the process
 supervisor does not apply Landlock filesystem policy, process privilege
-dropping, or process/binary identity checks unless you opt in to
-`supervisor.processEnforcement=full`. Network policy still runs in the sidecar
-and remains endpoint/L7 scoped; `full` does not restore binary-scoped network
-identity in sidecar topology.
+dropping, or process/binary identity checks. Use `combined` topology when you
+need those controls in the same supervisor path.
 </Warning>
 
 ## Credential Exposure
@@ -197,23 +192,18 @@ For direct gateway TOML configuration, set the Kubernetes driver fields:
 ```toml
 [openshell.drivers.kubernetes]
 supervisor_topology = "sidecar"
-process_enforcement = "network-only"
 proxy_uid = 1337
 ```
 
 `proxy_uid` must be a non-root UID and must not match the sandbox UID.
 The network init container exempts this UID from proxy redirection so the
 sidecar can reach the gateway.
-Set `process_enforcement="full"` only when you want the agent process supervisor
-to keep combined-mode process/filesystem guards and accept the added
-agent-container permissions.
 
 When the Helm chart renders `gateway.toml`, set the equivalent chart values:
 
 ```yaml
 supervisor:
   topology: sidecar
-  processEnforcement: network-only
   proxyUid: 1337
 ```
 

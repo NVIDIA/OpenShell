@@ -307,7 +307,6 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
 | `supervisor_topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, or `sidecar` to move pod-level network enforcement and the gateway session into a dedicated sidecar. |
-| `process_enforcement` | `supervisor.processEnforcement` | Process/filesystem controls for non-combined topologies. `network-only` keeps the low-permission agent shape. `full` grants combined-mode process/filesystem controls to the agent process supervisor. |
 | `proxy_uid` | `supervisor.proxyUid` | UID used by the long-running network sidecar in `sidecar` topology. The network init container exempts this UID from proxy redirection. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
@@ -326,13 +325,9 @@ provider environment snapshot is refreshed by the network sidecar after
 settings polls so future child processes can see updated provider env without
 gateway access in the agent container.
 Sidecar mode keeps gateway session and SSH behavior, but the process supervisor
-runs in `network-only` mode by default: filesystem policy, process privilege
-dropping, and process/binary identity checks are not applied by the process
-container.
-Set `process_enforcement = "full"` only when you want those combined-mode
-process/filesystem guards and accept the added agent-container permissions.
-Network policy still runs in the sidecar and remains endpoint/L7 scoped in
-sidecar topology; `full` does not restore binary-scoped network identity.
+runs in `network-only` mode: filesystem policy, process privilege dropping, and
+process/binary identity checks are not applied by the process container. Network
+policy still runs in the sidecar and remains endpoint/L7 scoped.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 

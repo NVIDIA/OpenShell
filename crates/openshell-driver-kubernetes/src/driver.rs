@@ -6,8 +6,8 @@
 use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
-    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, ProcessEnforcementMode,
-    SupervisorSideloadMethod, SupervisorTopology,
+    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, SupervisorSideloadMethod,
+    SupervisorTopology,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Namespace, Node};
@@ -564,7 +564,6 @@ impl KubernetesComputeDriver {
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
             supervisor_topology: self.config.supervisor_topology,
-            process_enforcement: self.config.process_enforcement,
             proxy_uid: self.config.proxy_uid,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
@@ -1544,40 +1543,25 @@ fn apply_supervisor_sidecar_topology(
             .entry("securityContext")
             .or_insert_with(|| serde_json::json!({}));
         if let Some(sc) = security_context.as_object_mut() {
-            match params.process_enforcement {
-                ProcessEnforcementMode::NetworkOnly => {
-                    sc.insert(
-                        "runAsUser".to_string(),
-                        serde_json::json!(params.sandbox_uid),
-                    );
-                    sc.insert(
-                        "runAsGroup".to_string(),
-                        serde_json::json!(params.sandbox_gid),
-                    );
-                    sc.insert("runAsNonRoot".to_string(), serde_json::json!(true));
-                    sc.insert(
-                        "allowPrivilegeEscalation".to_string(),
-                        serde_json::json!(false),
-                    );
-                    sc.insert(
-                        "capabilities".to_string(),
-                        serde_json::json!({
-                            "drop": ["ALL"]
-                        }),
-                    );
-                }
-                ProcessEnforcementMode::Full => {
-                    sc.insert("runAsUser".to_string(), serde_json::json!(0));
-                    sc.remove("runAsGroup");
-                    sc.remove("runAsNonRoot");
-                    sc.remove("allowPrivilegeEscalation");
-                    sc.entry("capabilities".to_string()).or_insert_with(|| {
-                        serde_json::json!({
-                            "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
-                        })
-                    });
-                }
-            }
+            sc.insert(
+                "runAsUser".to_string(),
+                serde_json::json!(params.sandbox_uid),
+            );
+            sc.insert(
+                "runAsGroup".to_string(),
+                serde_json::json!(params.sandbox_gid),
+            );
+            sc.insert("runAsNonRoot".to_string(), serde_json::json!(true));
+            sc.insert(
+                "allowPrivilegeEscalation".to_string(),
+                serde_json::json!(false),
+            );
+            sc.insert(
+                "capabilities".to_string(),
+                serde_json::json!({
+                    "drop": ["ALL"]
+                }),
+            );
         }
 
         let volume_mounts = container
@@ -1619,11 +1603,6 @@ fn apply_supervisor_sidecar_topology(
                 env,
                 openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
                 "sidecar-nftables",
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE,
-                &params.process_enforcement.to_string(),
             );
             upsert_env(
                 env,
@@ -1825,7 +1804,6 @@ struct SandboxPodParams<'a> {
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
     supervisor_topology: SupervisorTopology,
-    process_enforcement: ProcessEnforcementMode,
     proxy_uid: u32,
     service_account_name: &'a str,
     sandbox_id: &'a str,
@@ -1859,7 +1837,6 @@ impl Default for SandboxPodParams<'_> {
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             supervisor_topology: SupervisorTopology::default(),
-            process_enforcement: ProcessEnforcementMode::default(),
             proxy_uid: DEFAULT_PROXY_UID,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
@@ -3193,10 +3170,6 @@ mod tests {
             None
         );
         assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE),
-            Some("network-only")
-        );
-        assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::SSH_SOCKET_PATH),
             Some(SIDECAR_SSH_SOCKET_FILE)
         );
@@ -3407,61 +3380,6 @@ mod tests {
                     && mount["mountPath"] == SIDECAR_TLS_MOUNT_PATH
             }));
         }
-    }
-
-    #[test]
-    fn sidecar_topology_full_process_enforcement_keeps_combined_agent_permissions() {
-        let params = SandboxPodParams {
-            supervisor_topology: SupervisorTopology::Sidecar,
-            process_enforcement: ProcessEnforcementMode::Full,
-            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
-            supervisor_image: "supervisor-image:latest",
-            grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
-            sandbox_uid: 1500,
-            sandbox_gid: 1500,
-            proxy_uid: 2200,
-            ..SandboxPodParams::default()
-        };
-        let pod_template = sandbox_template_to_k8s(
-            &SandboxTemplate::default(),
-            false,
-            &std::collections::HashMap::new(),
-            false,
-            &params,
-        );
-
-        let containers = pod_template["spec"]["containers"].as_array().unwrap();
-        let agent = containers
-            .iter()
-            .find(|container| container["name"] == "agent")
-            .unwrap();
-        let sc = &agent["securityContext"];
-        assert_eq!(sc["runAsUser"], 0);
-        assert!(sc.get("runAsGroup").is_none());
-        assert!(sc.get("runAsNonRoot").is_none());
-        assert!(sc.get("allowPrivilegeEscalation").is_none());
-        assert_eq!(
-            sc["capabilities"],
-            serde_json::json!({
-                "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
-            })
-        );
-        assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE),
-            Some("full")
-        );
-
-        let sidecar = containers
-            .iter()
-            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
-            .unwrap();
-        assert_eq!(sidecar["securityContext"]["runAsUser"], 2200);
-        assert_eq!(
-            sidecar["securityContext"]["capabilities"],
-            serde_json::json!({
-                "drop": ["ALL"]
-            })
-        );
     }
 
     #[test]

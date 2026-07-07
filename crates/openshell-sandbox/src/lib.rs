@@ -698,11 +698,11 @@ fn sidecar_network_enforcement_enabled() -> bool {
 }
 
 fn process_enforcement_mode() -> ProcessEnforcementMode {
-    match std::env::var(openshell_core::sandbox_env::PROCESS_ENFORCEMENT_MODE)
-        .unwrap_or_else(|_| "full".to_string())
-        .as_str()
+    match std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
+        .ok()
+        .as_deref()
     {
-        "network-only" => ProcessEnforcementMode::NetworkOnly,
+        Some("sidecar") => ProcessEnforcementMode::NetworkOnly,
         _ => ProcessEnforcementMode::Full,
     }
 }
