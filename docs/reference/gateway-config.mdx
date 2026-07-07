@@ -759,6 +759,38 @@ health_check_interval_secs = 10
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
 ```
 
+### MXC
+
+The MXC driver is Windows-only and opt-in. It links into the gateway, invokes Microsoft MXC through `wxc-exec.exe`, and runs each sandbox's configured command in-driver instead of using the Linux sandbox supervisor.
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address    = "127.0.0.1:17670"
+log_level       = "info"
+compute_drivers = ["mxc"]
+
+[openshell.drivers.mxc]
+wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
+# process_container (default) or isolation_session.
+backend = "process_container"
+default_configuration_id = "composable"
+pc_least_privilege = false
+pc_capabilities    = []
+# Pattern-C governed egress. The address is a loopback seed; the driver
+# allocates a unique ephemeral port for each sandbox.
+egress_proxy      = false
+egress_proxy_addr = ""
+debug = false
+etw_audit = false
+```
+
+Set `egress_proxy = true` with a loopback seed such as `egress_proxy_addr = "127.0.0.1:18080"` to enable the Windows Pattern-C split. MXC redirects sandbox traffic to a sandbox-unique port on the configured loopback IP, where the host CONNECT proxy enforces the trimmed network policy. Governed egress requires `process_container` until MXC supports `network.proxy` for isolation sessions.
+
+Supply the workload command and optional working directory through the sandbox's `mxc` driver configuration, for example `{"mxc":{"command":["cmd","/c","echo hello"],"cwd":"C:\\work"}}`.
+
 ### MicroVM
 
 Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
