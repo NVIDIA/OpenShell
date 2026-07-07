@@ -136,7 +136,11 @@ class SandboxRef:
     id: str
     name: str
     status: SandboxStatusRef
-    labels: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    # Excluded from equality/hash so SandboxRef stays hashable (MappingProxyType
+    # is unhashable) and keeps its original (id, name, status) identity.
+    labels: Mapping[str, str] = field(
+        default_factory=lambda: MappingProxyType({}), compare=False
+    )
 
     @property
     def phase(self) -> int:
@@ -699,7 +703,8 @@ class Sandbox:
         self._delete_on_exit = delete_on_exit
         self._spec = spec
         self._name = name
-        self._labels = labels
+        # Copy so later caller mutation cannot change what gets sent on enter.
+        self._labels = dict(labels) if labels is not None else None
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
         self._auto_refresh = auto_refresh

@@ -1601,6 +1601,17 @@ def test_direct_sandbox_ref_construction_defaults_labels() -> None:
     assert dict(ref.labels) == {}
 
 
+def test_sandbox_ref_stays_hashable_with_labels_excluded_from_identity() -> None:
+    ref_a = _sandbox_ref(_make_sandbox_proto("sandbox-1", "job-1", {"aiq": "a"}))
+    ref_b = _sandbox_ref(_make_sandbox_proto("sandbox-1", "job-1", {"aiq": "b"}))
+
+    # Frozen dataclass must remain hashable despite the immutable labels field.
+    assert hash(ref_a) == hash(ref_b)
+    # Labels are excluded from identity: same (id, name, status) compares equal.
+    assert ref_a == ref_b
+    assert {ref_a, ref_b} == {ref_a}
+
+
 def test_high_level_creation_forwards_name_and_labels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
