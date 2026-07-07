@@ -171,6 +171,27 @@ the structured 403 and authors the narrowest rule. Mechanistically mapping L7
 would either over-broaden rules or require path-templating logic that rots
 quickly.
 
+## Policy Revision Acknowledgement
+
+When the supervisor loads a sandbox-scoped policy from the gateway, it
+acknowledges the exact revision it constructed. After the OPA engine is built
+successfully, the supervisor reports that revision as `LOADED`, which advances
+`SandboxStatus.current_policy_version` and moves the revision out of `Pending`.
+If policy construction fails, it reports the same revision as `FAILED` with the
+original construction error.
+
+This holds even when the initial policy is enriched with baseline paths during
+startup: the enriched revision the supervisor synced back to the gateway is the
+revision it acknowledges, so a successfully constructed initial policy never
+remains `Pending`. The acknowledgement is delivered with bounded retries and is
+non-fatal: a transient delivery failure does not fail an otherwise healthy
+sandbox, and the pending acknowledgement is retried before any newer revision is
+processed so policy history is never reordered.
+
+Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
+zero) are acknowledged. Global policies and local-file development policies do
+not use the sandbox revision API and produce no acknowledgement.
+
 ## Failure Behavior
 
 - If gateway config polling fails, the sandbox keeps its last-known-good policy.
