@@ -207,8 +207,10 @@ fn draw_enter_key(
         warning_rows + 12
     } else {
         let num_creds = form.credentials.len().clamp(1, 8) as u16;
+        let config_rows = (form.config.len() as u16).min(6) + 3; // existing entries + label(1) + key input(1) + value input(1) 
         // type(1) + name(2) + spacer(1) + creds + spacer(1) + submit(1) + status(1) + hint(1)
-        warning_rows + 1 + 2 + 1 + num_creds + 1 + 1 + 1 + 1
+
+        warning_rows + 1 + 2 + 1 + num_creds + 1 + config_rows + 1 + 1 + 1 + 1
     };
     let modal_height = (content_height + 4).min(area.height.saturating_sub(2));
     let popup_area = centered_rect(modal_width, modal_height, area);
@@ -241,6 +243,17 @@ fn draw_enter_key(
         let num_creds = form.credentials.len().clamp(1, 8) as u16;
         constraints.push(Constraint::Length(num_creds)); // credential rows
     }
+
+    constraints.push(Constraint::Length(1)); // spacer before config
+    constraints.push(Constraint::Length(1)); // config keys label
+    #[allow(clippy::cast_possible_truncation)]
+    let num_config = form.config.len().min(6) as u16;
+    if num_config > 0 {
+        constraints.push(Constraint::Length(num_config)); // existing config entries
+    }
+    constraints.push(Constraint::Length(1)); // config key input
+    constraints.push(Constraint::Length(1)); // config value input
+
     constraints.push(Constraint::Length(1)); // spacer
     constraints.push(Constraint::Length(1)); // submit
     constraints.push(Constraint::Length(1)); // status
@@ -361,7 +374,78 @@ fn draw_enter_key(
     }
     idx += 1;
 
-    // Spacer.
+    // Spacer before config.
+    idx += 1;
+
+    // Config Keys label.
+    let config_focused = matches!(
+        form.key_field,
+        ProviderKeyField::ConfigKeyName | ProviderKeyField::ConfigKeyValue
+    );
+    let header_style = if config_focused { t.accent_bold } else { t.muted };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled("Config Keys:", header_style))),
+        chunks[idx],
+    );
+    idx += 1;
+
+    // Existing config entries.
+    if !form.config.is_empty() {
+        let config_lines: Vec<Line<'_>> = form
+            .config
+            .iter()
+            .enumerate()
+            .take(6)
+            .map(|(i, (key, value))| {
+                let is_selected = config_focused && i == form.config_cursor;
+                let style = if is_selected { t.accent_bold } else { t.text };
+                Line::from(vec![
+                    Span::styled(format!("  {key}="), style),
+                    Span::styled(value.as_str(), if is_selected { t.accent } else { t.muted }),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(config_lines), chunks[idx]);
+        idx += 1;
+    }
+
+    // Config key input.
+    let editing_key = form.key_field == ProviderKeyField::ConfigKeyName;
+    let key_display = if form.config_key_input.is_empty() {
+        if editing_key { "_".to_string() } else { "key".to_string() }
+    } else {
+        let mut s = form.config_key_input.clone();
+        if editing_key { s.push('_'); }
+        s
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Key: ", t.muted),
+            Span::styled(key_display, if editing_key { t.accent } else { t.muted }),
+        ])),
+        chunks[idx],
+    );
+    idx += 1;
+
+    // Config value input.
+    let editing_val = form.key_field == ProviderKeyField::ConfigKeyValue;
+    let val_display = if form.config_value_input.is_empty() {
+        if editing_val { "_".to_string() } else { "value".to_string() }
+    } else {
+        let mut s = form.config_value_input.clone();
+        if editing_val { s.push('_'); }
+        s
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Val: ", t.muted),
+            Span::styled(val_display, if editing_val { t.accent } else { t.muted }),
+        ])),
+        chunks[idx],
+    );
+    idx += 1;
+
+    // Spacer before submit.
     idx += 1;
 
     // Submit button.

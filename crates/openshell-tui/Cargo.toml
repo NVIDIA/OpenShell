@@ -27,6 +27,7 @@ owo-colors = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+indexmap = { workspace = true }
 
 [lints]
 workspace = true

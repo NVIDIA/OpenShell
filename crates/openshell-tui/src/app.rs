@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use indexmap::IndexMap;
 use openshell_bootstrap::GatewayMetadataSource;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
@@ -347,6 +348,10 @@ pub enum ProviderKeyField {
     EnvVarName,
     /// Custom env var value (generic / no-known-env-vars types only).
     GenericValue,
+    /// Config key name input.
+    ConfigKeyName,
+    /// Config key value input.
+    ConfigKeyValue,
     Submit,
 }
 
@@ -363,6 +368,12 @@ pub struct CreateProviderForm {
     pub credentials: Vec<(String, String)>,
     /// Which credential row is focused.
     pub cred_cursor: usize,
+    /// TODO: inline doc for config, possibilities of using IndexMap
+    pub config: IndexMap<String, String>,
+    /// Which config row is focused.
+    pub config_cursor: usize,
+    pub config_key_input: String,
+    pub config_value_input: String,
     /// For generic / types with no known env vars: custom env var name.
     pub generic_env_name: String,
     /// For generic / types with no known env vars: custom value.
@@ -2111,6 +2122,10 @@ impl App {
             name: String::new(),
             credentials: Vec::new(),
             cred_cursor: 0,
+            config: IndexMap::new(),
+            config_cursor: 0,
+            config_key_input: String::new(),
+            config_value_input: String::new(),
             generic_env_name: String::new(),
             generic_value: String::new(),
             key_field: ProviderKeyField::Name,
@@ -2219,6 +2234,10 @@ impl App {
                     form.name.clear();
                     form.credentials.clear();
                     form.cred_cursor = 0;
+                    form.config.clear();
+                    form.config_cursor = 0;
+                    form.config_key_input.clear();
+                    form.config_value_input.clear();
                     form.generic_env_name.clear();
                     form.generic_value.clear();
                 }
@@ -2232,11 +2251,11 @@ impl App {
                             _ => ProviderKeyField::Name,
                         };
                     } else {
-                        // Name → Credential[0..N-1] → Submit → Name
+                        // Name → Credential[0..N-1] → ConfigKeyName → ConfigKeyValue → Submit → Name
                         match form.key_field {
                             ProviderKeyField::Name => {
                                 if form.credentials.is_empty() {
-                                    form.key_field = ProviderKeyField::Submit;
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
                                 } else {
                                     form.key_field = ProviderKeyField::Credential;
                                     form.cred_cursor = 0;
@@ -2246,7 +2265,27 @@ impl App {
                                 if form.cred_cursor < form.credentials.len().saturating_sub(1) {
                                     form.cred_cursor += 1;
                                 } else {
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
+                                }
+                            }
+                            ProviderKeyField::ConfigKeyName => {
+                                form.key_field = ProviderKeyField::ConfigKeyValue;
+                            }
+                            ProviderKeyField::ConfigKeyValue => {
+                                if !form.config_key_input.is_empty()
+                                    && !form.config_value_input.is_empty()
+                                {
+                                    form.config.insert(
+                                        std::mem::take(&mut form.config_key_input),
+                                        std::mem::take(&mut form.config_value_input),
+                                    );
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
+                                } else if form.config_key_input.is_empty()
+                                    && form.config_value_input.is_empty()
+                                {
                                     form.key_field = ProviderKeyField::Submit;
+                                } else {
+                                    form.key_field = ProviderKeyField::ConfigKeyName;
                                 }
                             }
                             _ => {
@@ -2272,13 +2311,19 @@ impl App {
                                     form.key_field = ProviderKeyField::Name;
                                 }
                             }
-                            ProviderKeyField::Submit => {
+                            ProviderKeyField::ConfigKeyValue => {
+                                form.key_field = ProviderKeyField::ConfigKeyName;
+                            }
+                            ProviderKeyField::ConfigKeyName => {
                                 if form.credentials.is_empty() {
                                     form.key_field = ProviderKeyField::Name;
                                 } else {
                                     form.key_field = ProviderKeyField::Credential;
                                     form.cred_cursor = form.credentials.len().saturating_sub(1);
                                 }
+                            }
+                            ProviderKeyField::Submit => {
+                                form.key_field = ProviderKeyField::ConfigKeyValue;
                             }
                             _ => {
                                 form.key_field = ProviderKeyField::Submit;
@@ -2293,6 +2338,50 @@ impl App {
                             Self::handle_text_input(value, key);
                         }
                     }
+                    ProviderKeyField::ConfigKeyName => match key.code {
+                        KeyCode::Enter => {
+                            if !form.config_key_input.is_empty()
+                                && !form.config_value_input.is_empty()
+                            {
+                                form.config.insert(
+                                    std::mem::take(&mut form.config_key_input),
+                                    std::mem::take(&mut form.config_value_input),
+                                );
+                            }
+                        }
+                        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if !form.config.is_empty() {
+                                let key_to_remove = form
+                                    .config
+                                    .keys()
+                                    .nth(form.config_cursor)
+                                    .cloned()
+                                    .unwrap_or_default();
+                                form.config.shift_remove(&key_to_remove);
+                                form.config_cursor = form
+                                    .config_cursor
+                                    .min(form.config.len().saturating_sub(1));
+                            }
+                        }
+                        _ => {
+                            Self::handle_text_input(&mut form.config_key_input, key);
+                        }
+                    },
+                    ProviderKeyField::ConfigKeyValue => match key.code {
+                        KeyCode::Enter => {
+                            if !form.config_key_input.is_empty()
+                                && !form.config_value_input.is_empty()
+                            {
+                                form.config.insert(
+                                    std::mem::take(&mut form.config_key_input),
+                                    std::mem::take(&mut form.config_value_input),
+                                );
+                            }
+                        }
+                        _ => {
+                            Self::handle_text_input(&mut form.config_value_input, key);
+                        }
+                    },
                     ProviderKeyField::EnvVarName => {
                         Self::handle_text_input(&mut form.generic_env_name, key);
                     }
