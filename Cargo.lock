@@ -4018,7 +4018,6 @@ dependencies = [
  "terminal-colorsaurus",
  "tokio",
  "tonic",
- "tracing",
  "url",
 ]
 
