@@ -508,37 +508,37 @@ fn install_sidecar_nft_bypass_rules(proxy_uid: u32) -> Result<()> {
 const SIDECAR_IPTABLES_CHAIN: &str = "OPENSHELL_SIDECAR_BYPASS";
 
 fn install_sidecar_iptables_legacy_bypass_rules(proxy_uid: u32) -> Result<()> {
-    let iptables_cmd = find_iptables_legacy().ok_or_else(|| {
+    let ipv4_filter_tool = find_iptables_legacy().ok_or_else(|| {
         miette::miette!(
             "trusted iptables-legacy helper not found; sidecar network enforcement fallback unavailable"
         )
     })?;
-    let ip6tables_cmd = find_ip6tables_legacy().ok_or_else(|| {
+    let ipv6_fence_tool = find_ip6tables_legacy().ok_or_else(|| {
         miette::miette!(
             "trusted ip6tables-legacy helper not found; sidecar network enforcement fallback cannot fence IPv6"
         )
     })?;
 
-    cleanup_sidecar_iptables_legacy_rules(&iptables_cmd);
-    cleanup_sidecar_iptables_legacy_rules(&ip6tables_cmd);
+    cleanup_sidecar_iptables_legacy_rules(&ipv4_filter_tool);
+    cleanup_sidecar_iptables_legacy_rules(&ipv6_fence_tool);
 
     if let Err(e) = install_sidecar_iptables_legacy_family_rules(
-        &iptables_cmd,
+        &ipv4_filter_tool,
         proxy_uid,
         "icmp-port-unreachable",
     ) {
-        cleanup_sidecar_iptables_legacy_rules(&iptables_cmd);
-        cleanup_sidecar_iptables_legacy_rules(&ip6tables_cmd);
+        cleanup_sidecar_iptables_legacy_rules(&ipv4_filter_tool);
+        cleanup_sidecar_iptables_legacy_rules(&ipv6_fence_tool);
         return Err(e);
     }
 
     if let Err(e) = install_sidecar_iptables_legacy_family_rules(
-        &ip6tables_cmd,
+        &ipv6_fence_tool,
         proxy_uid,
         "icmp6-port-unreachable",
     ) {
-        cleanup_sidecar_iptables_legacy_rules(&iptables_cmd);
-        cleanup_sidecar_iptables_legacy_rules(&ip6tables_cmd);
+        cleanup_sidecar_iptables_legacy_rules(&ipv4_filter_tool);
+        cleanup_sidecar_iptables_legacy_rules(&ipv6_fence_tool);
         return Err(e);
     }
 
