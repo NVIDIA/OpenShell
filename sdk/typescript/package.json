@@ -21,12 +21,15 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "gen": "bash gen.sh",
+    "gen": "buf generate",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "demo": "tsx src/demo.ts",
@@ -38,6 +41,7 @@
     "@connectrpc/connect-node": "^2.0.0"
   },
   "devDependencies": {
+    "@bufbuild/buf": "^1.71.0",
     "@bufbuild/protoc-gen-es": "^2.2.3",
     "@types/node": "^24",
     "tsx": "^4.19.2",

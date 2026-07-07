@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# TypeScript SDK tasks (sdk/typescript). Codegen uses the pinned protoc (mise)
-# + the connect-es plugin from the package's own devDependencies.
+# TypeScript SDK tasks (sdk/typescript). Codegen runs `buf generate` (buf and
+# the connect-es plugin come from the package's own devDependencies); buf
+# self-compiles proto/, so no protoc is required.
 
 ["sdk:ts:install"]
 description = "Install TypeScript SDK dependencies"
