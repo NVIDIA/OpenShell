@@ -173,12 +173,14 @@ quickly.
 
 ## Policy Revision Acknowledgement
 
-When the supervisor loads a sandbox-scoped policy from the gateway, it
-acknowledges the exact revision it constructed. After the OPA engine is built
-successfully, the supervisor reports that revision as `LOADED`, which advances
+When the supervisor loads a sandbox-scoped policy from the gateway, it retains
+the version, hash, source, and configuration revision returned with that exact
+policy snapshot. After the OPA engine is built successfully, the supervisor
+reports that revision as `LOADED`, which advances
 `SandboxStatus.current_policy_version` and moves the revision out of `Pending`.
-If policy construction fails, it reports the same revision as `FAILED` with the
-original construction error.
+If policy construction fails, it reports the captured revision as `FAILED` with
+the original construction error. It never infers revision identity by comparing
+policy structure.
 
 This holds even when the initial policy is enriched with baseline paths during
 startup: the enriched revision the supervisor synced back to the gateway is the
@@ -187,10 +189,12 @@ remains `Pending`. If the first poll returns a different revision, the superviso
 processes it through the normal reload path instead of treating it as already
 loaded.
 
-Policy status delivery uses a FIFO background worker with bounded retries. This
-preserves report order without blocking policy polling, enforcement, settings,
-or provider refreshes when the status endpoint is unavailable. Delivery failure
-is non-fatal and logged after the retry bound is exhausted.
+Policy status delivery uses a FIFO background worker. Retryable delivery
+failures retain the ordered update and retry with capped exponential backoff;
+terminal errors are logged and discarded. The outbox is nonblocking and does
+not discard updates because of a fixed queue capacity, so status endpoint
+outages cannot block policy polling, enforcement, settings, or provider
+refreshes and cannot permanently lose the initial acknowledgement.
 
 Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
 zero) are acknowledged. Global policies and local-file development policies do
