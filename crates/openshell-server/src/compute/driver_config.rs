@@ -8,6 +8,11 @@
 //! It does not acquire, connect to, or start compute drivers.
 
 use crate::config_file;
+#[cfg(any(
+    feature = "driver-docker",
+    feature = "driver-podman",
+    feature = "driver-vm"
+))]
 use crate::defaults::LocalTlsPaths;
 #[cfg(any(
     feature = "driver-kubernetes",
@@ -30,6 +35,11 @@ use std::path::PathBuf;
 #[cfg(feature = "driver-vm")]
 use super::VmComputeConfig;
 
+#[cfg(any(
+    feature = "driver-docker",
+    feature = "driver-podman",
+    feature = "driver-vm"
+))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestTlsPaths {
     ca: PathBuf,
@@ -37,6 +47,11 @@ pub struct GuestTlsPaths {
     key: PathBuf,
 }
 
+#[cfg(any(
+    feature = "driver-docker",
+    feature = "driver-podman",
+    feature = "driver-vm"
+))]
 impl From<&LocalTlsPaths> for GuestTlsPaths {
     fn from(paths: &LocalTlsPaths) -> Self {
         Self {
@@ -51,21 +66,15 @@ impl From<&LocalTlsPaths> for GuestTlsPaths {
 pub struct DriverStartupContext<'a> {
     pub file: Option<&'a config_file::ConfigFile>,
     // Consumed only by the docker/podman/vm runtime-defaults helpers below.
-    #[cfg_attr(
-        not(any(
-            feature = "driver-docker",
-            feature = "driver-podman",
-            feature = "driver-vm"
-        )),
-        allow(dead_code)
-    )]
+    #[cfg(any(
+        feature = "driver-docker",
+        feature = "driver-podman",
+        feature = "driver-vm"
+    ))]
     pub guest_tls: Option<&'a GuestTlsPaths>,
-    #[cfg_attr(
-        not(any(feature = "driver-podman", feature = "driver-vm")),
-        allow(dead_code)
-    )]
+    #[cfg(any(feature = "driver-podman", feature = "driver-vm"))]
     pub gateway_port: u16,
-    #[cfg_attr(not(feature = "driver-vm"), allow(dead_code))]
+    #[cfg(feature = "driver-vm")]
     pub gateway_tls_enabled: bool,
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
 }
@@ -295,8 +304,15 @@ mod tests {
     ) -> DriverStartupContext<'a> {
         DriverStartupContext {
             file,
+            #[cfg(any(
+                feature = "driver-docker",
+                feature = "driver-podman",
+                feature = "driver-vm"
+            ))]
             guest_tls: None,
+            #[cfg(any(feature = "driver-podman", feature = "driver-vm"))]
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            #[cfg(feature = "driver-vm")]
             gateway_tls_enabled: false,
             endpoint_overrides,
         }
