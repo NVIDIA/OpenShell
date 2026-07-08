@@ -49,9 +49,10 @@ supervisor:
   # "sidecar" runs network enforcement in a dedicated sidecar and the process
   # supervisor as a low-capability wrapper in the agent container.
   topology: "combined"
-  # -- UID for the long-running network sidecar in sidecar topology. The
-  # network init container installs nftables rules that exempt this UID.
-  proxyUid: 1337
+  sidecar:
+    # -- UID for the long-running network sidecar in sidecar topology. The
+    # network init container installs nftables rules that exempt this UID.
+    proxyUid: 1337
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []

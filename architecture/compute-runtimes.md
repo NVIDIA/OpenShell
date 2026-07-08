@@ -107,8 +107,12 @@ log expressions can fail without rolling back the required table, chain, and
 reject rules.
 The agent container runs as the resolved sandbox UID/GID with no added Linux
 capabilities. Sidecar mode preserves gateway session and SSH behavior, but
-treats the process leaf as network-only: Landlock filesystem policy, process
-privilege dropping, and process/binary identity checks are not applied there.
+treats the process leaf as network-only: Landlock filesystem policy and child
+seccomp still apply where supported, while process privilege dropping and
+supervisor identity mount isolation do not run because the agent container is
+already unprivileged. Sidecar pods use a shared process namespace so the
+network sidecar can resolve workload process and binary identity through
+`/proc/<entrypoint-pid>`.
 
 ## Images
 

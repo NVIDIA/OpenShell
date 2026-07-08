@@ -65,7 +65,7 @@ fn ssh_server_init(
     if let Some(parent) = listen_path.parent() {
         std::fs::create_dir_all(parent).into_diagnostic()?;
         #[cfg(unix)]
-        if enforcement_mode.enforces_process_controls() && !shared_socket {
+        if enforcement_mode.uses_privileged_process_setup() && !shared_socket {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o700);
             std::fs::set_permissions(parent, perms).into_diagnostic()?;
@@ -827,20 +827,15 @@ fn spawn_pty_shell(
 
     // Probe Landlock availability from the parent process where tracing works.
     #[cfg(target_os = "linux")]
-    if enforcement_mode.enforces_process_controls() {
+    if enforcement_mode.enforces_child_sandbox() {
         sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
     }
 
-    // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
+    // Phase 1: Prepare Landlock ruleset before the child applies it.
     #[cfg(target_os = "linux")]
-    let prepared_sandbox = if enforcement_mode.enforces_process_controls() {
-        Some(
-            sandbox::linux::prepare(policy, workdir.as_deref())
-                .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?,
-        )
-    } else {
-        None
-    };
+    let prepared_sandbox =
+        crate::process::prepare_child_sandbox(policy, workdir.as_deref(), enforcement_mode)
+            .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
 
     #[cfg(unix)]
     {
@@ -986,20 +981,15 @@ fn spawn_pipe_exec(
 
     // Probe Landlock availability from the parent process where tracing works.
     #[cfg(target_os = "linux")]
-    if enforcement_mode.enforces_process_controls() {
+    if enforcement_mode.enforces_child_sandbox() {
         sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
     }
 
-    // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
+    // Phase 1: Prepare Landlock ruleset before the child applies it.
     #[cfg(target_os = "linux")]
-    let prepared_sandbox = if enforcement_mode.enforces_process_controls() {
-        Some(
-            sandbox::linux::prepare(policy, workdir.as_deref())
-                .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?,
-        )
-    } else {
-        None
-    };
+    let prepared_sandbox =
+        crate::process::prepare_child_sandbox(policy, workdir.as_deref(), enforcement_mode)
+            .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
 
     #[cfg(unix)]
     {
@@ -1157,7 +1147,7 @@ mod unsafe_pty {
         #[cfg(target_os = "linux")]
         let mut prepared = prepared;
         #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = if enforcement_mode.enforces_process_controls() {
+        let supervisor_identity_mount = if enforcement_mode.uses_privileged_process_setup() {
             crate::process::supervisor_identity_mount_from_env().map_err(|err| {
                 anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
             })?
@@ -1205,7 +1195,7 @@ mod unsafe_pty {
         #[cfg(target_os = "linux")]
         let mut prepared = prepared;
         #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = if enforcement_mode.enforces_process_controls() {
+        let supervisor_identity_mount = if enforcement_mode.uses_privileged_process_setup() {
             crate::process::supervisor_identity_mount_from_env().map_err(|err| {
                 anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
             })?
@@ -1260,7 +1250,7 @@ mod unsafe_pty {
 
         // Drop privileges. initgroups/setgid/setuid need /etc/group and
         // /etc/passwd which would be blocked if Landlock were already enforced.
-        if enforcement_mode.enforces_process_controls() {
+        if enforcement_mode.uses_privileged_process_setup() {
             drop_privileges(policy).map_err(|err| std::io::Error::other(err.to_string()))?;
         }
         crate::process::harden_child_process()
@@ -1275,7 +1265,7 @@ mod unsafe_pty {
         }
 
         #[cfg(not(target_os = "linux"))]
-        if enforcement_mode.enforces_process_controls() {
+        if enforcement_mode.enforces_child_sandbox() {
             sandbox::apply(policy, None).map_err(|err| std::io::Error::other(err.to_string()))?;
         }
 

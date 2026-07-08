@@ -182,10 +182,7 @@ supervisor_sideload_method     = "image-volume"
 # "combined" runs the existing single supervisor container with full process,
 # filesystem, and network enforcement in the agent container. "sidecar" moves
 # pod-level network enforcement and gateway session handling into a network sidecar.
-supervisor_topology            = "combined"
-# UID used by the long-running network sidecar. In sidecar topology the
-# network init container installs nftables rules that exempt this UID.
-proxy_uid                      = 1337
+topology                       = "combined"
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
@@ -209,6 +206,11 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # back to 1000 on non-OpenShift clusters.
 # sandbox_uid = 1500
 # sandbox_gid = 1500
+
+[openshell.drivers.kubernetes.sidecar]
+# UID used by the long-running network sidecar. In sidecar topology the
+# network init container installs nftables rules that exempt this UID.
+proxy_uid                      = 1337
 ```
 
 ### Docker

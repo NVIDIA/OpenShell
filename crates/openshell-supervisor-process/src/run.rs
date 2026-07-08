@@ -73,7 +73,7 @@ pub async fn run_process(
     // /etc/group so the "sandbox" entry matches. Must run before
     // validate_sandbox_user so passwd lookups see the correct identity.
     #[cfg(unix)]
-    if enforcement_mode.enforces_process_controls() {
+    if enforcement_mode.uses_privileged_process_setup() {
         crate::process::update_sandbox_passwd_entries()?;
     }
 
@@ -81,7 +81,7 @@ pub async fn run_process(
     // must include a "sandbox" user for privilege dropping; failing fast here
     // beats silently running children as root.
     #[cfg(unix)]
-    if enforcement_mode.enforces_process_controls() {
+    if enforcement_mode.uses_privileged_process_setup() {
         crate::process::validate_sandbox_user(policy)?;
         crate::process::validate_sandbox_group(policy)?;
     }
@@ -90,7 +90,7 @@ pub async fn run_process(
     // sandbox user/group. Runs as the supervisor (root) before the child
     // is forked so the workload sees writable paths it owns.
     #[cfg(unix)]
-    if enforcement_mode.enforces_process_controls() {
+    if enforcement_mode.uses_privileged_process_setup() {
         crate::process::prepare_filesystem(policy)?;
     }
 

@@ -21,7 +21,7 @@ lower-privilege agent container.
 | Topology | Use when | Main tradeoff |
 |---|---|---|
 | `combined` | You need OpenShell network, filesystem, and process controls in the sandbox workload. | The agent container carries the Linux capabilities the supervisor needs. |
-| `sidecar` | You need the agent container to run as non-root without added Linux capabilities, and network policy is the primary control. | The process supervisor is network-only, so filesystem/process controls do not run in the agent container. |
+| `sidecar` | You need the agent container to run as non-root without added Linux capabilities, and network policy is the primary control. | Privilege-dropping and supervisor mount isolation do not run in the agent container. |
 
 ## Privilege Model
 
@@ -121,7 +121,7 @@ The pod contains these OpenShell-managed pieces:
 | Component | Runs as | Purpose |
 |---|---|---|
 | Network init container | Root with setup capabilities | Installs pod-level nftables rules and prepares shared sidecar state. |
-| Network sidecar | `supervisor.proxyUid` | Runs the proxy, enforces network policy, owns gateway authentication and the gateway session, and writes proxy TLS plus local policy/provider snapshots. |
+| Network sidecar | `supervisor.sidecar.proxyUid` | Runs the proxy, enforces network policy, owns gateway authentication and the gateway session, and writes proxy TLS plus local policy/provider snapshots. |
 | Agent container | Resolved sandbox UID/GID | Runs the process supervisor and launches the user workload. |
 
 In this topology, the agent container defaults to `runAsNonRoot: true`,
@@ -137,10 +137,14 @@ default sidecar path.
 
 <Warning>
 Sidecar mode runs the process supervisor in `network-only` mode. OpenShell still
-enforces network endpoint and L7 policy through the sidecar, but the process
-supervisor does not apply Landlock filesystem policy, process privilege
-dropping, or process/binary identity checks. Use `combined` topology when you
-need those controls in the same supervisor path.
+enforces network endpoint and L7 policy through the sidecar, and the process
+supervisor applies Landlock filesystem policy and child seccomp filters where
+the kernel/runtime supports them. The process supervisor does not perform
+root-to-sandbox privilege dropping because Kubernetes starts the container as
+the sandbox UID/GID, and it does not perform supervisor identity mount
+isolation because gateway credentials are not mounted into the agent container.
+Sidecar pods use `shareProcessNamespace: true` so the network sidecar can
+resolve workload process and binary identity through `/proc/<entrypoint-pid>`.
 </Warning>
 
 ## Credential Exposure
@@ -161,9 +165,9 @@ watches for newer revisions that the network sidecar writes after settings
 polls, so future child processes can see refreshed provider env without giving
 the agent container gateway authentication material. This does not mutate the
 environment of the already-running workload entrypoint. Use `combined` topology
-when you need full process/filesystem enforcement in the same supervisor path;
-use additional runtime isolation when you need a stronger container boundary
-around network-only sidecar workloads.
+when you need the full single-supervisor enforcement path; use additional
+runtime isolation when you need a stronger container boundary around sidecar
+workloads.
 
 ## RuntimeClass Isolation
 
@@ -172,9 +176,10 @@ Containers when the cluster supports them. A sandboxed runtime strengthens the
 container boundary while OpenShell focuses on network policy enforcement from
 the sidecar.
 
-Runtime classes do not re-enable the OpenShell filesystem and process controls
-that sidecar mode relaxes. Use them as an additional workload boundary, not as a
-replacement for the combined topology's full supervisor controls.
+Runtime classes do not re-enable the OpenShell privilege-drop or supervisor
+mount-isolation controls that sidecar mode relaxes. Use them as an additional
+workload boundary, not as a replacement for the combined topology's full
+supervisor controls.
 
 You can set a default runtime class in the Kubernetes driver configuration or
 override it per sandbox with driver config:
@@ -191,7 +196,9 @@ For direct gateway TOML configuration, set the Kubernetes driver fields:
 
 ```toml
 [openshell.drivers.kubernetes]
-supervisor_topology = "sidecar"
+topology = "sidecar"
+
+[openshell.drivers.kubernetes.sidecar]
 proxy_uid = 1337
 ```
 
@@ -204,11 +211,12 @@ When the Helm chart renders `gateway.toml`, set the equivalent chart values:
 ```yaml
 supervisor:
   topology: sidecar
-  proxyUid: 1337
+  sidecar:
+    proxyUid: 1337
 ```
 
-Leave `supervisor_topology` unset, or set it to `combined`, to keep the
-original single-container supervisor path. For Helm installs, leave
+Leave `topology` unset, or set it to `combined`, to keep the original
+single-container supervisor path. For Helm installs, leave
 `supervisor.topology` unset or set it to `combined`.
 
 ## Next Steps

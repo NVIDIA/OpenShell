@@ -563,8 +563,8 @@ impl KubernetesComputeDriver {
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
-            supervisor_topology: self.config.supervisor_topology,
-            proxy_uid: self.config.proxy_uid,
+            supervisor_topology: self.config.topology,
+            proxy_uid: self.config.sidecar.proxy_uid,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
@@ -1336,11 +1336,6 @@ fn supervisor_sidecar_env(
     );
     upsert_env(
         &mut env,
-        openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY,
-        "relaxed",
-    );
-    upsert_env(
-        &mut env,
         openshell_core::sandbox_env::SUPERVISOR_READY_FILE,
         SIDECAR_READY_FILE,
     );
@@ -1487,6 +1482,8 @@ fn apply_supervisor_sidecar_topology(
     if let Some(sc) = pod_security_context.as_object_mut() {
         sc.insert("fsGroup".to_string(), serde_json::json!(params.sandbox_gid));
     }
+
+    spec.insert("shareProcessNamespace".to_string(), serde_json::json!(true));
 
     apply_supervisor_binary_source(
         spec,
@@ -3124,10 +3121,7 @@ mod tests {
             &params,
         );
 
-        assert!(
-            pod_template["spec"]["shareProcessNamespace"].is_null(),
-            "sidecar mode no longer needs a shared process namespace when binary identity is relaxed"
-        );
+        assert_eq!(pod_template["spec"]["shareProcessNamespace"], true);
         assert_eq!(pod_template["spec"]["securityContext"]["fsGroup"], 1500);
         let containers = pod_template["spec"]["containers"].as_array().unwrap();
         assert_eq!(containers.len(), 2);
@@ -3250,7 +3244,7 @@ mod tests {
                 sidecar,
                 openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY
             ),
-            Some("relaxed")
+            None
         );
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::ENTRYPOINT_PID_FILE),

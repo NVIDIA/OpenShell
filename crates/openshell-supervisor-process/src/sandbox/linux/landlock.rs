@@ -5,7 +5,7 @@
 
 use landlock::{
     ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError, Ruleset,
-    RulesetAttr, RulesetCreatedAttr,
+    RulesetAttr,
 };
 use miette::{IntoDiagnostic, Result};
 use openshell_core::policy::{LandlockCompatibility, SandboxPolicy};
@@ -95,6 +95,12 @@ pub struct PreparedRuleset {
     compatibility: LandlockCompatibility,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathOpenMode {
+    Privileged,
+    CurrentUser,
+}
+
 /// Phase 1: Open `PathFds` and build the Landlock ruleset **as root**.
 ///
 /// This must run before `drop_privileges()` so that `PathFd::new()` can open
@@ -103,6 +109,27 @@ pub struct PreparedRuleset {
 /// Returns `None` if there are no filesystem paths to restrict (no-op).
 /// Returns `Some(PreparedRuleset)` on success, or an error.
 pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<PreparedRuleset>> {
+    prepare_with_path_open_mode(policy, workdir, PathOpenMode::Privileged)
+}
+
+/// Phase 1 for already-unprivileged workloads.
+///
+/// Kubernetes sidecar mode starts the process supervisor as the sandbox UID, so
+/// Landlock path FDs are opened as the same UID that will run the workload.
+/// Paths this UID cannot open are already unavailable to the workload; omit
+/// them from the allowlist and let the resulting ruleset deny everything else.
+pub fn prepare_current_user(
+    policy: &SandboxPolicy,
+    workdir: Option<&str>,
+) -> Result<Option<PreparedRuleset>> {
+    prepare_with_path_open_mode(policy, workdir, PathOpenMode::CurrentUser)
+}
+
+fn prepare_with_path_open_mode(
+    policy: &SandboxPolicy,
+    workdir: Option<&str>,
+    path_open_mode: PathOpenMode,
+) -> Result<Option<PreparedRuleset>> {
     let read_only = policy.filesystem.read_only.clone();
     let mut read_write = policy.filesystem.read_write.clone();
 
@@ -188,7 +215,7 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
         let mut rules_applied: usize = 0;
 
         for path in &read_only {
-            if let Some(path_fd) = try_open_path(path, compatibility)? {
+            if let Some(path_fd) = try_open_path(path, compatibility, path_open_mode)? {
                 debug!(path = %path.display(), "Landlock allow read-only");
                 ruleset = ruleset
                     .add_rule(PathBeneath::new(path_fd, access_read))
@@ -198,7 +225,7 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
         }
 
         for path in &read_write {
-            if let Some(path_fd) = try_open_path(path, compatibility)? {
+            if let Some(path_fd) = try_open_path(path, compatibility, path_open_mode)? {
                 debug!(path = %path.display(), "Landlock allow read-write");
                 ruleset = ruleset
                     .add_rule(PathBeneath::new(path_fd, access_all))
@@ -325,7 +352,11 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
 ///
 /// In `HardRequirement` mode, any failure is fatal — the caller propagates the
 /// error, which ultimately aborts sandbox startup.
-fn try_open_path(path: &Path, compatibility: &LandlockCompatibility) -> Result<Option<PathFd>> {
+fn try_open_path(
+    path: &Path,
+    compatibility: &LandlockCompatibility,
+    path_open_mode: PathOpenMode,
+) -> Result<Option<PathFd>> {
     match PathFd::new(path) {
         Ok(fd) => Ok(Some(fd)),
         Err(err) => {
@@ -335,6 +366,28 @@ fn try_open_path(path: &Path, compatibility: &LandlockCompatibility) -> Result<O
                 PathFdError::OpenCall { source, .. }
                     if source.kind() == std::io::ErrorKind::NotFound
             );
+            if matches!(path_open_mode, PathOpenMode::CurrentUser) {
+                if is_not_found {
+                    debug!(
+                        path = %path.display(),
+                        reason,
+                        "Skipping non-existent Landlock path for current user"
+                    );
+                } else {
+                    openshell_ocsf::ocsf_emit!(
+                        openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                            .severity(openshell_ocsf::SeverityId::Informational)
+                            .status(openshell_ocsf::StatusId::Success)
+                            .state(openshell_ocsf::StateId::Other, "already-denied")
+                            .message(format!(
+                                "Skipping inaccessible Landlock path for current user [path:{} error:{err}]",
+                                path.display()
+                            ))
+                            .build()
+                    );
+                }
+                return Ok(None);
+            }
             match compatibility {
                 LandlockCompatibility::BestEffort => {
                     // NotFound is expected for stale baseline paths (e.g.
@@ -421,6 +474,7 @@ mod tests {
         let result = try_open_path(
             &PathBuf::from("/nonexistent/openshell/test/path"),
             &LandlockCompatibility::BestEffort,
+            PathOpenMode::Privileged,
         );
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
@@ -431,6 +485,7 @@ mod tests {
         let result = try_open_path(
             &PathBuf::from("/nonexistent/openshell/test/path"),
             &LandlockCompatibility::HardRequirement,
+            PathOpenMode::Privileged,
         );
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -447,9 +502,24 @@ mod tests {
     #[test]
     fn try_open_path_succeeds_for_existing_path() {
         let dir = tempfile::tempdir().unwrap();
-        let result = try_open_path(dir.path(), &LandlockCompatibility::BestEffort);
+        let result = try_open_path(
+            dir.path(),
+            &LandlockCompatibility::BestEffort,
+            PathOpenMode::Privileged,
+        );
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn try_open_path_current_user_skips_missing_path_in_hard_requirement() {
+        let result = try_open_path(
+            &PathBuf::from("/nonexistent/openshell/test/path"),
+            &LandlockCompatibility::HardRequirement,
+            PathOpenMode::CurrentUser,
+        );
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 
     #[test]

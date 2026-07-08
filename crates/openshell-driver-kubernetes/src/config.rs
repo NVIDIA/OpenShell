@@ -88,6 +88,35 @@ impl FromStr for SupervisorTopology {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesSidecarConfig {
+    /// UID used by the long-running network sidecar in `sidecar` topology.
+    /// The network init container installs nftables rules that exempt this
+    /// UID, so it must not match the sandbox workload UID.
+    pub proxy_uid: u32,
+}
+
+impl Default for KubernetesSidecarConfig {
+    fn default() -> Self {
+        Self {
+            proxy_uid: DEFAULT_PROXY_UID,
+        }
+    }
+}
+
+impl KubernetesSidecarConfig {
+    pub fn validate_proxy_uid(&self) -> Result<(), String> {
+        if self.proxy_uid < openshell_policy::MIN_SANDBOX_UID {
+            return Err(format!(
+                "sidecar.proxy_uid must be at least {}",
+                openshell_policy::MIN_SANDBOX_UID
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Kubernetes `AppArmor` profile requested for the sandbox agent container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppArmorProfile {
@@ -213,11 +242,9 @@ pub struct KubernetesComputeConfig {
     /// How the supervisor binary is delivered into sandbox pods.
     pub supervisor_sideload_method: SupervisorSideloadMethod,
     /// How the supervisor is arranged for Kubernetes sandbox pods.
-    pub supervisor_topology: SupervisorTopology,
-    /// UID used by the long-running network sidecar in `sidecar` topology.
-    /// The network init container installs nftables rules that exempt this
-    /// UID, so it must not match the sandbox workload UID.
-    pub proxy_uid: u32,
+    pub topology: SupervisorTopology,
+    /// Sidecar-only settings used when `topology = "sidecar"`.
+    pub sidecar: KubernetesSidecarConfig,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -303,8 +330,8 @@ impl Default for KubernetesComputeConfig {
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
-            supervisor_topology: SupervisorTopology::default(),
-            proxy_uid: DEFAULT_PROXY_UID,
+            topology: SupervisorTopology::default(),
+            sidecar: KubernetesSidecarConfig::default(),
             grpc_endpoint: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             client_tls_secret_name: String::new(),
@@ -350,13 +377,7 @@ impl KubernetesComputeConfig {
     }
 
     pub fn validate_proxy_uid(&self) -> Result<(), String> {
-        if self.proxy_uid < openshell_policy::MIN_SANDBOX_UID {
-            return Err(format!(
-                "proxy_uid must be at least {}",
-                openshell_policy::MIN_SANDBOX_UID
-            ));
-        }
-        Ok(())
+        self.sidecar.validate_proxy_uid()
     }
 
     /// Resolve the sandbox UID/GID pair.
@@ -486,50 +507,63 @@ mod tests {
     }
 
     #[test]
-    fn default_supervisor_topology_is_combined() {
+    fn default_topology_is_combined() {
         let cfg = KubernetesComputeConfig::default();
-        assert_eq!(cfg.supervisor_topology, SupervisorTopology::Combined);
-        assert_eq!(cfg.supervisor_topology.to_string(), "combined");
+        assert_eq!(cfg.topology, SupervisorTopology::Combined);
+        assert_eq!(cfg.topology.to_string(), "combined");
     }
 
     #[test]
     fn default_proxy_uid_is_dedicated_non_root_uid() {
         let cfg = KubernetesComputeConfig::default();
-        assert_eq!(cfg.proxy_uid, DEFAULT_PROXY_UID);
+        assert_eq!(cfg.sidecar.proxy_uid, DEFAULT_PROXY_UID);
     }
 
     #[test]
-    fn serde_override_supervisor_topology_sidecar() {
+    fn serde_override_topology_sidecar() {
         let json = serde_json::json!({
-            "supervisor_topology": "sidecar"
+            "topology": "sidecar"
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.supervisor_topology, SupervisorTopology::Sidecar);
+        assert_eq!(cfg.topology, SupervisorTopology::Sidecar);
     }
 
     #[test]
-    fn serde_override_supervisor_topology_combined() {
+    fn serde_override_topology_combined() {
         let json = serde_json::json!({
-            "supervisor_topology": "combined"
+            "topology": "combined"
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.supervisor_topology, SupervisorTopology::Combined);
+        assert_eq!(cfg.topology, SupervisorTopology::Combined);
     }
 
     #[test]
-    fn serde_override_proxy_uid() {
+    fn serde_rejects_sidecar_binary_identity_field() {
         let json = serde_json::json!({
-            "proxy_uid": 2000
+            "sidecar": {
+                "binary_identity": "shared-pid"
+            }
+        });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn serde_override_sidecar_proxy_uid_nested() {
+        let json = serde_json::json!({
+            "sidecar": {
+                "proxy_uid": 2000
+            }
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(cfg.proxy_uid, 2000);
+        assert_eq!(cfg.sidecar.proxy_uid, 2000);
         cfg.validate_proxy_uid().unwrap();
     }
 
     #[test]
     fn validate_proxy_uid_rejects_privileged_uid() {
         let cfg = KubernetesComputeConfig {
-            proxy_uid: 999,
+            sidecar: KubernetesSidecarConfig { proxy_uid: 999 },
             ..KubernetesComputeConfig::default()
         };
         let err = cfg.validate_proxy_uid().unwrap_err();
@@ -537,12 +571,32 @@ mod tests {
     }
 
     #[test]
-    fn serde_rejects_invalid_supervisor_topology() {
+    fn serde_rejects_invalid_topology() {
         let json = serde_json::json!({
-            "supervisor_topology": "unsupported"
+            "topology": "unsupported"
         });
         let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
         assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn serde_rejects_removed_supervisor_topology_field() {
+        let json = serde_json::json!({
+            "supervisor_topology": "sidecar"
+        });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn serde_rejects_removed_flat_sidecar_fields() {
+        for json in [
+            serde_json::json!({ "sidecar_binary_identity": "shared-pid" }),
+            serde_json::json!({ "proxy_uid": 2000 }),
+        ] {
+            let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+            assert!(err.to_string().contains("unknown field"));
+        }
     }
 
     #[test]
