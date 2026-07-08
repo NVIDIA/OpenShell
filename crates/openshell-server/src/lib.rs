@@ -939,7 +939,12 @@ fn configured_compute_driver(
                 "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
             )),
             Some(driver) => Ok(ConfiguredComputeDriver::Builtin(driver)),
-            None => Err(Error::config(no_driver_configured_message())),
+            None => Err(Error::config(
+                "no compute driver configured and auto-detection found no suitable driver; \
+                 set --drivers or OPENSHELL_DRIVERS to a supported driver, \
+                 or to an extension driver name with a matching \
+                 [openshell.drivers.<name>].socket_path",
+            )),
         },
         [driver] => resolve_configured_compute_driver(driver, driver_startup),
         drivers => Err(Error::config(format!(
@@ -947,49 +952,6 @@ fn configured_compute_driver(
             drivers.join(",")
         ))),
     }
-}
-
-/// Error message when no compute driver is configured and auto-detection
-/// finds nothing usable.
-fn no_driver_configured_message() -> String {
-    let builtins = compiled_in_builtin_names();
-    if builtins.is_empty() {
-        // No built-ins were compiled in, so auto-detection had nothing to try.
-        // Point operators at the only path that can succeed in this binary.
-        "no compute driver configured and auto-detection found no suitable driver; \
-         this gateway was built without any in-tree drivers, so `compute_drivers` \
-         must name an extension driver with a matching \
-         [openshell.drivers.<name>].socket_path"
-            .to_string()
-    } else {
-        format!(
-            "no compute driver configured and auto-detection found no suitable driver; \
-             set --drivers or OPENSHELL_DRIVERS to one of: {} \
-             (or to an extension driver name with a matching \
-             [openshell.drivers.<name>].socket_path)",
-            builtins.join(", "),
-        )
-    }
-}
-
-/// Names of the built-in compute drivers linked into this binary, in the
-/// stable order expected by user-facing messages. Empty when the gateway was
-/// built as extension-only (no `driver-*` features).
-fn compiled_in_builtin_names() -> Vec<&'static str> {
-    let mut names = Vec::new();
-    if cfg!(feature = "driver-kubernetes") {
-        names.push("kubernetes");
-    }
-    if cfg!(feature = "driver-podman") {
-        names.push("podman");
-    }
-    if cfg!(feature = "driver-docker") {
-        names.push("docker");
-    }
-    if cfg!(feature = "driver-vm") {
-        names.push("vm");
-    }
-    names
 }
 
 fn resolve_configured_compute_driver(
@@ -1499,10 +1461,6 @@ mod tests {
         let err =
             configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
         let msg = err.to_string();
-        assert!(
-            msg.contains("without any in-tree drivers"),
-            "expected extension-only guidance, got: {msg}"
-        );
         assert!(
             msg.contains("socket_path"),
             "expected extension socket_path guidance, got: {msg}"
