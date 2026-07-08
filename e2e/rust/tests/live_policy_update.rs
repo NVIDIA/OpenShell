@@ -421,3 +421,75 @@ async fn live_policy_update_from_empty_network_policies() {
 
     guard.cleanup().await;
 }
+
+/// Regression for #2159: a sparse initial policy that the supervisor enriches
+/// with baseline filesystem paths during startup must have its resulting
+/// revision acknowledged as loaded, not left `Pending`.
+///
+/// Reproduction (matches the maintainer's triage): create a sandbox with the
+/// network-only `examples/policy-advisor/sandbox-policy.yaml`. The supervisor
+/// adds baseline filesystem paths, syncs the enriched policy back to the
+/// gateway (creating revision 2, superseding revision 1), builds the OPA engine
+/// and then acknowledges revision 2 as loaded. Before the fix, revision 2
+/// stayed `Pending` even though the sandbox was `Ready` and the policy was
+/// effective.
+///
+/// NOTE: This exercises the Docker-backed supervisor built from this branch.
+/// The exact `policy list` status wording ("Loaded"/"Superseded") may differ by
+/// CLI version; the assertions below key on the effective version reaching 2 and
+/// no revision remaining `Pending` once the acknowledgement lands.
+#[tokio::test]
+async fn initial_sparse_policy_is_acknowledged_as_loaded() {
+    // Repo-relative path to the sparse network-only policy fixture.
+    let sparse_policy = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/policy-advisor/sandbox-policy.yaml"
+    );
+
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--name", "e2e-2159-sparse-enrich", "--policy", sparse_policy, "--no-tty"],
+        &["sh", "-c", "echo Ready && sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create keep sandbox with sparse policy");
+
+    // The enriched revision (2) is synced during startup; the acknowledgement
+    // (LOADED) is delivered by the supervisor's poll loop shortly after Ready.
+    // Poll until the effective policy is version 2 and no revision is Pending.
+    let mut acknowledged = false;
+    let mut last_list = String::new();
+    for _ in 0..30 {
+        let get = run_cli(&["policy", "get", &guard.name]).await;
+        let version = get.success.then(|| extract_version(&get.output)).flatten();
+
+        let list = run_cli(&["policy", "list", &guard.name]).await;
+        last_list = list.output.clone();
+        let pending = list.output.to_lowercase().contains("pending");
+
+        if version == Some(2) && list.success && !pending {
+            acknowledged = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    assert!(
+        acknowledged,
+        "enriched initial policy should reach revision 2 with no Pending revision.\n\
+         last `policy list` output:\n{last_list}"
+    );
+
+    // Both the superseded original (1) and the loaded enriched revision (2)
+    // must appear in the revision history.
+    assert!(
+        list_output_contains_version(&last_list, 2),
+        "policy list should contain revision 2:\n{last_list}"
+    );
+    assert!(
+        list_output_contains_version(&last_list, 1),
+        "policy list should contain revision 1:\n{last_list}"
+    );
+
+    guard.cleanup().await;
+}
