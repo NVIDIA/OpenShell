@@ -285,43 +285,22 @@ impl NetworkNamespace {
         // monitor can see log entries from the sandbox namespace.
         enable_nf_log_all_netns();
 
-        // Try combined ruleset with log rules first. Log rules must appear
-        // before reject rules in the chain so packets are logged before being
-        // rejected. If the kernel lacks nft_log support, fall back to the
-        // reject-only ruleset.
-        let ruleset_with_log =
-            nft_ruleset::generate_bypass_ruleset(&host_ip_str, proxy_port, Some(&log_prefix));
+        let commands =
+            nft_ruleset::generate_bypass_commands(&host_ip_str, proxy_port, Some(&log_prefix));
 
-        if let Err(e) = run_nft_netns(&self.name, &nft_path, &ruleset_with_log) {
+        if let Err(e) = run_nft_commands_netns(&self.name, &nft_path, &commands) {
             openshell_ocsf::ocsf_emit!(
                 openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                    .severity(openshell_ocsf::SeverityId::Low)
+                    .severity(openshell_ocsf::SeverityId::Medium)
                     .status(openshell_ocsf::StatusId::Failure)
-                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .state(openshell_ocsf::StateId::Disabled, "failed")
                     .message(format!(
-                        "Failed to install bypass log rules (non-fatal), falling back to reject-only [ns:{}]: {e}",
+                        "Failed to install bypass detection rules [ns:{}]: {e}",
                         self.name
                     ))
                     .build()
             );
-
-            let ruleset_no_log =
-                nft_ruleset::generate_bypass_ruleset(&host_ip_str, proxy_port, None);
-
-            if let Err(e) = run_nft_netns(&self.name, &nft_path, &ruleset_no_log) {
-                openshell_ocsf::ocsf_emit!(
-                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                        .severity(openshell_ocsf::SeverityId::Medium)
-                        .status(openshell_ocsf::StatusId::Failure)
-                        .state(openshell_ocsf::StateId::Disabled, "failed")
-                        .message(format!(
-                            "Failed to install bypass detection rules [ns:{}]: {e}",
-                            self.name
-                        ))
-                        .build()
-                );
-                return Err(e);
-            }
+            return Err(e);
         }
 
         openshell_ocsf::ocsf_emit!(
@@ -501,8 +480,8 @@ fn install_sidecar_nft_bypass_rules(proxy_uid: u32) -> Result<()> {
         )
     })?;
     let log_prefix = Some("openshell:sidecar-bypass:");
-    let ruleset = nft_ruleset::generate_sidecar_bypass_ruleset(proxy_uid, log_prefix);
-    run_nft_current_namespace(&nft_cmd, &ruleset)
+    let commands = nft_ruleset::generate_sidecar_bypass_commands(proxy_uid, log_prefix);
+    run_nft_commands_current_namespace(&nft_cmd, &commands)
 }
 
 const SIDECAR_IPTABLES_CHAIN: &str = "OPENSHELL_SIDECAR_BYPASS";
@@ -664,36 +643,42 @@ fn run_iptables_legacy_current_namespace(iptables_cmd: &str, args: &[&str]) -> R
     Ok(())
 }
 
-fn run_nft_current_namespace(nft_cmd: &str, ruleset: &str) -> Result<()> {
-    use std::io::Write;
-    let mut tmp = tempfile::Builder::new()
-        .prefix("openshell-sidecar-nft-")
-        .suffix(".conf")
-        .tempfile()
-        .into_diagnostic()?;
-    tmp.write_all(ruleset.as_bytes()).into_diagnostic()?;
-    let ruleset_path = tmp.path().to_string_lossy().to_string();
+/// Run a sequence of nft commands in the current network namespace.
+///
+/// Each command is executed as a separate `nft` invocation to avoid atomic
+/// batch rollback (where one unsupported expression like `ct state` or `log`
+/// causes the entire transaction, including table creation, to fail).
+///
+/// Commands marked as non-required are allowed to fail with a warning.
+/// Required commands that fail abort the sequence immediately.
+fn run_nft_commands_current_namespace(
+    nft_cmd: &str,
+    commands: &[nft_ruleset::NftCommand],
+) -> Result<()> {
+    for cmd in commands {
+        let args_str = cmd.args.join(" ");
+        debug!(command = %format!("{nft_cmd} {args_str}"), "Running nft command");
 
-    debug!(
-        command = %format!("{nft_cmd} -f {ruleset_path}"),
-        "Loading nftables sidecar ruleset"
-    );
+        let output = Command::new(nft_cmd)
+            .args(&cmd.args)
+            .output()
+            .into_diagnostic()?;
 
-    let output = Command::new(nft_cmd)
-        .args(["-f", &ruleset_path])
-        .output()
-        .into_diagnostic()?;
-
-    drop(tmp);
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette::miette!(
-            "sidecar nft ruleset load failed: {}",
-            stderr.trim()
-        ));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if cmd.required {
+                return Err(miette::miette!(
+                    "{nft_cmd} {args_str} failed: {}",
+                    stderr.trim()
+                ));
+            }
+            warn!(
+                command = %args_str,
+                error = %stderr.trim(),
+                "non-required nft command failed (continuing)"
+            );
+        }
     }
-
     Ok(())
 }
 
@@ -739,47 +724,51 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Load an nftables ruleset inside a network namespace via `nsenter --net=`.
+/// Run a sequence of nft commands inside a network namespace via `nsenter --net=`.
 ///
-/// Writes the ruleset to a temp file and loads it with `nft -f <path>`.
-/// A temp file is used instead of piping to stdin (`nft -f -`) because
-/// `nft` resolves `-` to `/dev/stdin`, which may not exist in minimal
-/// VM guest environments (e.g. virtiofs rootfs without /proc mounted
-/// at nft invocation time).
-fn run_nft_netns(netns: &str, nft_cmd: &str, ruleset: &str) -> Result<()> {
-    use std::io::Write;
-    let mut tmp = tempfile::Builder::new()
-        .prefix("openshell-nft-")
-        .suffix(".conf")
-        .tempfile()
-        .into_diagnostic()?;
-    tmp.write_all(ruleset.as_bytes()).into_diagnostic()?;
-    let ruleset_path = tmp.path().to_string_lossy().to_string();
-
+/// Each command is executed as a separate invocation to avoid atomic batch
+/// rollback. See [`run_nft_commands_current_namespace`] for rationale.
+fn run_nft_commands_netns(
+    netns: &str,
+    nft_cmd: &str,
+    commands: &[nft_ruleset::NftCommand],
+) -> Result<()> {
     let nsenter_path = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
     let ns_path = format!("/var/run/netns/{netns}");
     let net_flag = format!("--net={ns_path}");
 
-    debug!(
-        command = %format!("{nsenter_path} {net_flag} -- {nft_cmd} -f {ruleset_path}"),
-        "Loading nftables ruleset in namespace"
-    );
+    for cmd in commands {
+        let args_str = cmd.args.join(" ");
+        debug!(
+            command = %format!("{nsenter_path} {net_flag} -- {nft_cmd} {args_str}"),
+            "Running nft command in namespace"
+        );
 
-    let output = Command::new(nsenter_path)
-        .args([net_flag.as_str(), "--", nft_cmd, "-f", &ruleset_path])
-        .output()
-        .into_diagnostic()?;
+        let mut full_args = vec![net_flag.as_str(), "--", nft_cmd];
+        let arg_refs: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
+        full_args.extend(&arg_refs);
 
-    drop(tmp);
+        let output = Command::new(nsenter_path)
+            .args(&full_args)
+            .output()
+            .into_diagnostic()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette::miette!(
-            "nft ruleset load failed in netns {netns}: {}",
-            stderr.trim()
-        ));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if cmd.required {
+                return Err(miette::miette!(
+                    "nft {args_str} failed in netns {netns}: {}",
+                    stderr.trim()
+                ));
+            }
+            warn!(
+                command = %args_str,
+                error = %stderr.trim(),
+                netns = %netns,
+                "non-required nft command failed in namespace (continuing)"
+            );
+        }
     }
-
     Ok(())
 }
 

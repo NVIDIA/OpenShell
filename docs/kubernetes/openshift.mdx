@@ -14,6 +14,11 @@ The OpenShift install path is experimental. It currently requires running sandbo
 
 OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, granting the `privileged` SCC to the sandbox service account, and overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself.
 
+OpenShell installs sandbox nftables rules as individual commands. On OpenShift
+nodes where optional conntrack or packet log expressions are unavailable, those
+optional rules can fail without rolling back the required proxy bypass reject
+rules.
+
 ## Prerequisites
 
 - OpenShift 4.x cluster with `oc` configured

@@ -102,6 +102,9 @@ updated provider env without giving the process leaf gateway access. In sidecar
 mode, an init container performs the privileged pod-network nftables setup with
 `NET_ADMIN` and hands shared state ownership to the configured proxy UID; the
 long-running network sidecar runs as that UID and does not keep `NET_ADMIN`.
+The init path applies nftables as individual commands so optional conntrack and
+log expressions can fail without rolling back the required table, chain, and
+reject rules.
 The agent container runs as the resolved sandbox UID/GID with no added Linux
 capabilities. Sidecar mode preserves gateway session and SSH behavior, but
 treats the process leaf as network-only: Landlock filesystem policy, process
