@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![warn(missing_debug_implementations)]
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -368,11 +370,13 @@ pub struct CreateProviderForm {
     pub credentials: Vec<(String, String)>,
     /// Which credential row is focused.
     pub cred_cursor: usize,
-    /// TODO: inline doc for config, possibilities of using IndexMap
+    /// Provider config key-value pairs (e.g. `ANTHROPIC_BASE_URL`).
     pub config: IndexMap<String, String>,
-    /// Which config row is focused.
+    /// Which existing config entry is selected (for deletion).
     pub config_cursor: usize,
+    /// Config key being entered.
     pub config_key_input: String,
+    /// Config value being entered.
     pub config_value_input: String,
     /// For generic / types with no known env vars: custom env var name.
     pub generic_env_name: String,
@@ -508,7 +512,20 @@ pub struct UpdateProviderForm {
     pub provider_type: String,
     pub credential_key: String,
     pub new_value: String,
+    pub config: IndexMap<String, String>,
+    pub config_key_input: String,
+    pub config_value_input: String,
+    pub config_cursor: usize,
+    pub focus: UpdateProviderField,
     pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateProviderField {
+    CredentialValue,
+    ConfigKey,
+    ConfigValue,
+    Submit,
 }
 
 // ---------------------------------------------------------------------------
@@ -2358,9 +2375,8 @@ impl App {
                                     .cloned()
                                     .unwrap_or_default();
                                 form.config.shift_remove(&key_to_remove);
-                                form.config_cursor = form
-                                    .config_cursor
-                                    .min(form.config.len().saturating_sub(1));
+                                form.config_cursor =
+                                    form.config_cursor.min(form.config.len().saturating_sub(1));
                             }
                         }
                         _ => {
@@ -2503,6 +2519,17 @@ impl App {
             .get(self.provider_selected)
             .cloned()
             .unwrap_or_default();
+        let existing_config = self
+            .provider_entries
+            .get(self.provider_selected)
+            .map(|e| {
+                e.provider
+                    .config
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<IndexMap<_, _>>()
+            })
+            .unwrap_or_default();
 
         // If we don't know the credential key, derive from registry.
         let key = if cred_key.is_empty() {
@@ -2520,6 +2547,11 @@ impl App {
             provider_type: ptype,
             credential_key: key,
             new_value: String::new(),
+            config: existing_config,
+            config_key_input: String::new(),
+            config_value_input: String::new(),
+            config_cursor: 0,
+            focus: UpdateProviderField::CredentialValue,
             status: None,
         });
     }
@@ -2533,18 +2565,100 @@ impl App {
             KeyCode::Esc => {
                 self.update_provider_form = None;
             }
-            KeyCode::Enter => {
-                if form.new_value.is_empty() {
-                    form.status = Some("Value is required.".to_string());
-                    return;
+            KeyCode::Tab => match form.focus {
+                UpdateProviderField::CredentialValue => {
+                    form.focus = UpdateProviderField::ConfigKey;
                 }
-                self.pending_provider_update = true;
-            }
-            KeyCode::Char(c) => form.new_value.push(c),
-            KeyCode::Backspace => {
-                form.new_value.pop();
-            }
-            _ => {}
+                UpdateProviderField::ConfigKey => {
+                    form.focus = UpdateProviderField::ConfigValue;
+                }
+                UpdateProviderField::ConfigValue => {
+                    if !form.config_key_input.is_empty() && !form.config_value_input.is_empty() {
+                        form.config.insert(
+                            std::mem::take(&mut form.config_key_input),
+                            std::mem::take(&mut form.config_value_input),
+                        );
+                        form.focus = UpdateProviderField::ConfigKey;
+                    } else if form.config_key_input.is_empty() && form.config_value_input.is_empty()
+                    {
+                        form.focus = UpdateProviderField::Submit;
+                    } else {
+                        form.focus = UpdateProviderField::ConfigKey;
+                    }
+                }
+                UpdateProviderField::Submit => {
+                    form.focus = UpdateProviderField::CredentialValue;
+                }
+            },
+            KeyCode::BackTab => match form.focus {
+                UpdateProviderField::CredentialValue => {
+                    form.focus = UpdateProviderField::Submit;
+                }
+                UpdateProviderField::ConfigKey => {
+                    form.focus = UpdateProviderField::CredentialValue;
+                }
+                UpdateProviderField::ConfigValue => {
+                    form.focus = UpdateProviderField::ConfigKey;
+                }
+                UpdateProviderField::Submit => {
+                    form.focus = UpdateProviderField::ConfigValue;
+                }
+            },
+            _ => match form.focus {
+                UpdateProviderField::CredentialValue => {
+                    Self::handle_text_input(&mut form.new_value, key);
+                }
+                UpdateProviderField::ConfigKey => match key.code {
+                    KeyCode::Enter => {
+                        if !form.config_key_input.is_empty() && !form.config_value_input.is_empty()
+                        {
+                            form.config.insert(
+                                std::mem::take(&mut form.config_key_input),
+                                std::mem::take(&mut form.config_value_input),
+                            );
+                        }
+                    }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if !form.config.is_empty() {
+                            let key_to_remove = form
+                                .config
+                                .keys()
+                                .nth(form.config_cursor)
+                                .cloned()
+                                .unwrap_or_default();
+                            form.config.shift_remove(&key_to_remove);
+                            form.config_cursor =
+                                form.config_cursor.min(form.config.len().saturating_sub(1));
+                        }
+                    }
+                    _ => {
+                        Self::handle_text_input(&mut form.config_key_input, key);
+                    }
+                },
+                UpdateProviderField::ConfigValue => match key.code {
+                    KeyCode::Enter => {
+                        if !form.config_key_input.is_empty() && !form.config_value_input.is_empty()
+                        {
+                            form.config.insert(
+                                std::mem::take(&mut form.config_key_input),
+                                std::mem::take(&mut form.config_value_input),
+                            );
+                        }
+                    }
+                    _ => {
+                        Self::handle_text_input(&mut form.config_value_input, key);
+                    }
+                },
+                UpdateProviderField::Submit => {
+                    if key.code == KeyCode::Enter {
+                        if form.new_value.is_empty() {
+                            form.status = Some("Value is required.".to_string());
+                            return;
+                        }
+                        self.pending_provider_update = true;
+                    }
+                }
+            },
         }
     }
 

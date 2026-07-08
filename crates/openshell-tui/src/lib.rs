@@ -1699,6 +1699,11 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let ptype = form.provider_type.clone();
     let cred_key = form.credential_key.clone();
     let new_value = form.new_value.clone();
+    let config: HashMap<String, String> = form
+        .config
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     tokio::spawn(async move {
         let mut credentials = HashMap::new();
@@ -1715,7 +1720,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 }),
                 r#type: ptype,
                 credentials,
-                config: HashMap::default(),
+                config,
                 credential_expires_at_ms: HashMap::default(),
             }),
             credential_expires_at_ms: HashMap::default(),
