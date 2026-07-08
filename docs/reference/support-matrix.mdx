@@ -2,97 +2,108 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 title: "Support Matrix"
-description: ""
+description: "Review OpenShell compatibility across host platforms, compute drivers, GPU environments, Kubernetes, and SDKs."
 position: 5
 ---
+OpenShell can run sandboxes on a local macOS, Linux, or Windows machine or as
+a distributed deployment on Kubernetes. The OpenShell CLI, TUI, and SDKs can
+manage a local gateway or connect to a remote gateway. This matrix lists the
+supported platforms, runtimes, GPU environments, and client toolchains.
 
-This page lists the host platform, compute driver, software, runtime, and kernel requirements for running OpenShell.
+## Platforms
 
-## Supported Platforms
+OpenShell can be installed and run on macOS, Linux, or Windows using standard
+package installers. The [Installation guide](/about/installation) provides
+setup instructions.
 
-OpenShell publishes multi-architecture gateway images for `linux/amd64` and `linux/arm64`. The CLI, package-managed gateway, and standalone gateway binary are supported on the following host platforms:
-
-| Platform                         | Architecture          | Status    |
-| -------------------------------- | --------------------- | --------- |
-| Linux (Debian/Ubuntu)            | x86_64 (amd64)        | Supported |
-| Linux (Debian/Ubuntu)            | aarch64 (arm64)       | Supported |
-| macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
-| Windows (WSL 2 + Docker Desktop) | x86_64                | Experimental  |
-
-On Linux, the `openshell` CLI is a static musl binary and does not require glibc at runtime.
-
-## Standalone Gateway Binary
-
-OpenShell publishes standalone `openshell-gateway` release assets for manual download on these platforms:
-
-| Platform              | Artifact pattern                               |
-| --------------------- | ---------------------------------------------- |
-| Linux x86_64 (amd64)  | `openshell-gateway-x86_64-unknown-linux-gnu`   |
-| Linux aarch64 (arm64) | `openshell-gateway-aarch64-unknown-linux-gnu`  |
-| macOS Apple Silicon   | `openshell-gateway-aarch64-apple-darwin`       |
-
-These artifacts are attached to GitHub releases. Kubernetes deployments should use the Helm chart and the published gateway image.
-
-On Linux, `openshell-gateway` requires glibc 2.28 or newer. Compatible systems include, for example, Ubuntu 20.04+, RHEL 8+, Rocky Linux 8+, Amazon Linux 2023+, and Fedora 32+.
+| Platform                | Installation methods | Requirements                                 |
+| ----------------------- | -------------------- | -------------------------------------------- |
+| macOS (Apple Silicon)   | Homebrew             | macOS 13.3 or later                          |
+| Linux (x86_64, arm64)   | APT/DEB, RPM, Snap   | glibc 2.28 or later                          |
+| Windows (x86_64, arm64) | MSI, WinGet          | Windows minimum version: TBD; MSVC toolchain |
 
 ## Compute Drivers
 
-The gateway can manage sandboxes through several compute drivers.
+| Driver     | Supported hosts       | Minimum version                            | Requirements                                                                          |
+| ---------- | --------------------- | ------------------------------------------ | ------------------------------------------------------------------------------------- |
+| Docker     | macOS, Linux, Windows | 28.0.4 or later                            | Docker Engine or Docker Desktop.                                                      |
+| Podman     | macOS, Linux, Windows | 5.x                                        | Podman socket, rootless networking, and cgroups v2.                                   |
+| MicroVM    | macOS, Linux          | macOS 13.3 or later; KVM support on Linux  | Host virtualization enabled; `Hypervisor.framework` on macOS; KVM on Linux.           |
+| Kubernetes | Kubernetes clusters   | 1.29 or later                              | See [Kubernetes](#kubernetes) for Helm, Agent Sandbox, and distribution requirements. |
 
-| Compute Driver | Status | Notes |
-|---|---|---|
-| Docker | Supported for local development and single-machine gateways. | Requires Docker Desktop or Docker Engine on the gateway host. |
-| Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
-| Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
-| MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
+## GPU Support
 
-## Software Prerequisites
+OpenShell supports NVIDIA GPU-backed sandboxes across compute drivers when the
+host or cluster exposes compatible devices. Any LTS CUDA release is supported,
+with release validation focused on Tesla Recommended Driver (TRD) branches.
+GPU-capable sandbox images provide the CUDA user-space libraries required by
+the workload.
 
-Install the software for the compute driver you use:
+| Compute driver | Supported environment       | Device interface          | Requirements and limits                                                                                                              |
+| -------------- | --------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Docker         | Linux; Windows through WSL2 | NVIDIA CDI                | Docker CDI is enabled and NVIDIA devices are visible. Default and counted GPU requests are supported. WSL2 may expose all GPUs as one selectable device. |
+| Podman         | Linux; Windows through WSL2 | NVIDIA CDI                | NVIDIA CDI devices are visible to Podman. Default and counted GPU requests are supported. WSL2 may expose all GPUs as one selectable device.             |
+| MicroVM        | Linux                       | QEMU/VFIO PCI passthrough | The host provides IOMMU and VFIO support, root privileges, and a compatible sandbox image. Each sandbox supports one GPU.                           |
+| Kubernetes     | Linux GPU nodes             | `nvidia.com/gpu`          | The NVIDIA device plugin or GPU Operator exposes allocatable GPU capacity, and the sandbox image includes the required user-space libraries.          |
 
-| Component | Minimum Version | Notes |
-|---|---|---|
-| Docker Desktop or Docker Engine | 28.04 | Required for Docker-backed gateways, local image builds, and Docker development workflows. |
-| Podman | 5.x | Required for Podman-backed gateways. |
-| Kubernetes | 1.29 | Required for Helm deployments and Kubernetes sandbox scheduling. |
-| Helm | 3.x | Required to install `deploy/helm/openshell`. |
-| kubectl | Compatible with your cluster | Required for Kubernetes operational inspection and secret creation. |
-| Host virtualization | Host dependent | Required for MicroVM-backed gateways. MicroVM uses Hypervisor.framework on macOS and KVM on Linux. |
+GPU requests use `--gpu`. [GPU resource management](/sandboxes/manage-sandboxes#gpu-resources)
+describes default, counted, and exact-device requests.
 
-## Sandbox Runtime Versions
+## Supervisor Kernel Requirements
 
-Sandbox container images are maintained in the [openshell-community](https://github.com/nvidia/openshell-community) repository. Refer to that repository for the current list of installed components and their versions.
+These requirements apply to the Linux environment running the supervisor. On
+macOS and Windows, they apply to the container or virtual machine kernel, not
+the host kernel.
 
-## Container Images
+| Kernel capability                 | Requirement | Minimum | Behavior when unavailable                                                      |
+| --------------------------------- | ----------- | ------- | ------------------------------------------------------------------------------ |
+| seccomp BPF                       | Required    | 3.17    | Supervisor security initialization fails.                                      |
+| Network namespaces and veth       | Required    | 3.13    | Supervisor initialization fails, and the sandbox does not become ready.        |
+| nftables bypass-detection rules   | Recommended | 3.13    | The sandbox starts with bypass detection degraded and emits an OCSF configuration event. |
+| Landlock LSM                      | Recommended | 5.13    | `best_effort` runs degraded with a security finding; `hard_requirement` fails. |
 
-OpenShell publishes the gateway image for `linux/amd64` and `linux/arm64`.
+## Kubernetes
 
-| Image | Reference | Pulled When |
-|---|---|---|
-| Gateway | `ghcr.io/nvidia/openshell/gateway:latest` | Helm chart install or upgrade, or standalone container deployment |
+OpenShell runs on Kubernetes as a distributed, multi-tenant application.
 
-The Helm chart in `deploy/helm/openshell` deploys the gateway workload, service account, service, optional persistent storage, and network policy for Kubernetes. It defaults to a StatefulSet for SQLite-backed installs and can render a Deployment for external database-backed installs.
+| Component                         | Supported version               | Notes                                                 |
+| --------------------------------- | ------------------------------- | ----------------------------------------------------- |
+| Kubernetes                        | 1.29 or later                   | Required for Helm deployments and sandbox scheduling. |
+| Helm                              | 3.x                             | Required to install and upgrade the OpenShell chart.  |
+| Agent Sandbox controller and CRDs | Compatible release; version TBD | Required before installing the OpenShell chart.       |
+| User namespaces                   | 1.33 or later                   | Optional. Policy enforcement remains available without support, but Kubernetes cannot set `hostUsers: false` for UID remapping. See [User Namespace Isolation guidance](/security/best-practices#user-namespace-isolation). |
 
-Sandbox images are maintained separately in the [openshell-community](https://github.com/nvidia/openshell-community) repository.
+Kubernetes deployments require the Agent Sandbox controller and its `Sandbox`
+CRDs before the OpenShell Helm chart is installed. The
+[Kubernetes setup guide](/kubernetes/setup) provides installation instructions.
 
-To override the default image references, use Helm values:
+### Distributions
 
-| Helm value | Purpose |
-|---|---|
-| `image.repository` / `image.tag` | Override the gateway image reference. |
-| `server.sandboxImage` | Override the default sandbox image. |
+- GKE Standard and Autopilot clusters are supported.
+- OpenShift 4.x is supported with the OpenShift-specific SCC binding and chart
+configuration. Refer to [OpenShift installation](/kubernetes/openshift) for
+the required overrides.
 
-## Kernel Requirements
+## CLI and TUI Clients
 
-OpenShell enforces sandbox isolation through two Linux kernel security modules:
+Package installers install the OpenShell CLI, TUI, and gateway and start a local
+gateway service. Standalone CLI and TUI binaries are also available from
+[GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) and can connect
+to a remote gateway without running a local gateway.
 
-| Module                                                         | Requirement | Details                                                                                                                                                                                                                                          |
-| -------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [Landlock LSM](https://docs.kernel.org/security/landlock.html) | Recommended | Enforces filesystem access restrictions at the kernel level. The `best_effort` compatibility mode uses the highest Landlock ABI the host kernel supports. The `hard_requirement` mode fails sandbox creation if the required ABI is unavailable. |
-| seccomp                                                        | Required    | Filters dangerous system calls. Available on all modern Linux kernels (3.17+).                                                                                                                                                                   |
+## SDKs
 
-On macOS, these kernel modules run inside the Docker Desktop Linux VM, not on the host kernel.
+The supported SDKs connect to local or remote OpenShell deployments.
 
-## Agent Compatibility
+| SDK        | Minimum version |
+| ---------- | --------------- |
+| Python     | 3.12            |
+| TypeScript | 5.7             |
+| Rust       | 1.90            |
+| Go         | 1.24            |
 
-For the full list of supported agents and their default policy coverage, refer to the [Supported Agents](/about/supported-agents) page.
+## API Compatibility
+
+OpenShell maintains compatibility across its gRPC APIs, clients, SDKs, and
+compute drivers. Refer to [API Compatibility](/reference/api-compatibility) for
+the versioning, deprecation, and client/server compatibility policy.

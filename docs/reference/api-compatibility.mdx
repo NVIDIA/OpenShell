@@ -1,0 +1,56 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "API Compatibility"
+description: "Review OpenShell API versioning, deprecation, schema evolution, and client/server compatibility guarantees."
+position: 6
+---
+The compatibility policy covers published gRPC services, Protobuf messages,
+generated SDK interfaces, documented error behavior, and public Driver,
+Interceptor, and Middleware APIs.
+
+## Compatibility Promise
+
+| Release phase | Compatibility policy                                                                                                                                                                                                                                                                          |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Beta          | Patch releases are backward compatible. A minor release may contain a breaking API change only after the affected API is deprecated in the preceding minor release. The release includes migration guidance and coordinated SDK updates.                                                      |
+| Stable        | Minor and patch releases are backward compatible within an API major version. Breaking changes use a new versioned Protobuf package and API major version. The previous stable API remains supported for at least 12 months or two minor releases after its replacement, whichever is longer. |
+
+## Change Policy
+
+| Change      | Policy                                                                                                                                                                                                                                              |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Additive    | New optional fields, messages, methods, and enum values may be added when existing requests and responses retain their meaning and defaults.                                                                                                        |
+| Deprecating | The existing element remains functional while the schema and documentation identify it as deprecated, name its replacement, and state its planned removal release.                                                                                  |
+| Breaking    | Removing or renaming an API element, reusing or renumbering a field, changing a field type or cardinality, making an existing input required, or changing documented semantics follows the beta process or ships in a new stable API major version. |
+
+## Client and Server Compatibility
+
+OpenShell evaluates compatibility in both client/server directions. Clients
+include the CLI, TUI, and supported SDKs.
+
+| Combination                    | Expected behavior                                                                                                                                     |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Older client with newer server | Operations available to the client retain their request, response, error, and behavioral semantics throughout the support window.                     |
+| Newer client with older server | Features shared by both releases continue to work. Features unavailable from the server are hidden or return an actionable unsupported-version error. |
+| Different patch versions       | Existing features remain compatible in both directions.                                                                                               |
+| Different API major versions   | Compatibility depends on the server continuing to expose the older API version during its deprecation window.                                         |
+
+Clients use the capabilities advertised by the server to select supported
+behavior instead of inferring feature availability from the server version
+alone.
+
+Release validation exercises the oldest supported release of the CLI, TUI, and
+each SDK against the candidate server. Current clients run the shared-feature
+suite against each server release in the support window. Capability-specific
+tests verify the behavior of features that are newer than the server.
+
+## Schema Compatibility
+
+Removed Protobuf field and enum numbers and names remain reserved and are never
+reused. CI compares API changes with the default branch for source, wire, and
+JSON compatibility. Client/server validation covers request semantics, response
+semantics, documented errors, and feature negotiation.
+
+For supported platforms, clients, compute drivers, Kubernetes distributions,
+and SDK versions, refer to the [Support Matrix](/reference/support-matrix).
