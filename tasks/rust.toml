@@ -50,30 +50,78 @@ run = [
 
 ["rust:verify:drivers-off"]
 description = "Verify each compute driver can be compiled out via per-driver cargo features"
-run = [
+depends = [
   # Positive control: the default build carries every driver's markers.
+  "rust:verify:drivers-off:default-all",
+  # Each single-driver build carries only that driver's markers.
+  "rust:verify:drivers-off:kubernetes",
+  "rust:verify:drivers-off:docker",
+  "rust:verify:drivers-off:podman",
+  "rust:verify:drivers-off:vm",
+  # Mixed feature set: verifies driver features compose additively.
+  "rust:verify:drivers-off:docker+podman",
+  # Zero-driver build is a valid extension-only gateway shape. Asserts the
+  # binary links, no built-in driver markers survived, and the extension-only
+  # unit-test paths behind #[cfg(not(any(feature = "driver-*")))] execute.
+  "rust:verify:drivers-off:none",
+]
+
+["rust:verify:drivers-off:default-all"]
+description = "Verify the default gateway build carries every driver's markers"
+hide = true
+run = [
   "cargo build -p openshell-server --bin openshell-gateway",
   "tasks/scripts/verify-drivers-compiled-out.sh present all target/debug/openshell-gateway",
+]
 
-  # Each single-driver build carries only that driver's markers.
+["rust:verify:drivers-off:kubernetes"]
+description = "Verify a --features driver-kubernetes gateway carries only the kubernetes marker"
+hide = true
+run = [
   "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-kubernetes",
   "tasks/scripts/verify-drivers-compiled-out.sh only kubernetes target/debug/openshell-gateway",
+]
+
+["rust:verify:drivers-off:docker"]
+description = "Verify a --features driver-docker gateway carries only the docker marker"
+hide = true
+run = [
   "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-docker",
   "tasks/scripts/verify-drivers-compiled-out.sh only docker target/debug/openshell-gateway",
+]
+
+["rust:verify:drivers-off:podman"]
+description = "Verify a --features driver-podman gateway carries only the podman marker"
+hide = true
+run = [
   "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-podman",
   "tasks/scripts/verify-drivers-compiled-out.sh only podman target/debug/openshell-gateway",
+]
+
+["rust:verify:drivers-off:vm"]
+description = "Verify a --features driver-vm gateway carries only the vm marker"
+hide = true
+run = [
   "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-vm",
   "tasks/scripts/verify-drivers-compiled-out.sh only vm target/debug/openshell-gateway",
+]
 
-  # Mixed feature set: verifies driver features compose additively.
+["rust:verify:drivers-off:docker+podman"]
+description = "Verify a --features driver-docker,driver-podman gateway carries only those two markers"
+hide = true
+run = [
   "cargo build -p openshell-server --bin openshell-gateway --no-default-features --features driver-docker,driver-podman",
   "tasks/scripts/verify-drivers-compiled-out.sh only docker,podman target/debug/openshell-gateway",
+]
 
-  # Zero-driver build is a valid extension-only gateway shape. Assert both
-  # that the binary links and that none of the built-in driver markers survived.
+["rust:verify:drivers-off:none"]
+description = "Verify a --no-default-features gateway links, carries no driver markers, and runs the extension-only unit tests"
+hide = true
+run = [
   "cargo build -p openshell-server --bin openshell-gateway --no-default-features",
   "tasks/scripts/verify-drivers-compiled-out.sh absent all target/debug/openshell-gateway",
-  # The zero-driver profile also gates the extension-only unit test paths. Run the library test
-  # suite under --no-default-features so those assertions actually execute.
+  # The zero-driver profile gates the extension-only unit test paths; run
+  # the library test suite under --no-default-features so those assertions
+  # actually execute.
   "cargo test -p openshell-server --lib --no-default-features",
 ]
