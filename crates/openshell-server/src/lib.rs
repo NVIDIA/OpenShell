@@ -80,6 +80,11 @@ use tracing_bus::TracingLogBus;
 pub(crate) struct ServerStartupConfig {
     pub config: Config,
     pub config_file: Option<config_file::ConfigFile>,
+    #[cfg(any(
+        feature = "driver-docker",
+        feature = "driver-podman",
+        feature = "driver-vm"
+    ))]
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
 }
 
@@ -217,6 +222,11 @@ pub(crate) async fn run_server(
     let ServerStartupConfig {
         config,
         config_file,
+        #[cfg(any(
+            feature = "driver-docker",
+            feature = "driver-podman",
+            feature = "driver-vm"
+        ))]
         guest_tls,
     } = startup;
 
@@ -250,8 +260,15 @@ pub(crate) async fn run_server(
     let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
     let driver_startup = compute::driver_config::DriverStartupContext {
         file: config_file.as_ref(),
+        #[cfg(any(
+            feature = "driver-docker",
+            feature = "driver-podman",
+            feature = "driver-vm"
+        ))]
         guest_tls: guest_tls.as_ref(),
+        #[cfg(any(feature = "driver-podman", feature = "driver-vm"))]
         gateway_port: config.bind_address.port(),
+        #[cfg(feature = "driver-vm")]
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
@@ -1014,8 +1031,15 @@ mod tests {
     ) -> crate::compute::driver_config::DriverStartupContext<'a> {
         crate::compute::driver_config::DriverStartupContext {
             file,
+            #[cfg(any(
+                feature = "driver-docker",
+                feature = "driver-podman",
+                feature = "driver-vm"
+            ))]
             guest_tls: None,
+            #[cfg(any(feature = "driver-podman", feature = "driver-vm"))]
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            #[cfg(feature = "driver-vm")]
             gateway_tls_enabled: false,
             endpoint_overrides: &config.compute_driver_endpoints,
         }
