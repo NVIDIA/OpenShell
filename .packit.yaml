@@ -66,7 +66,7 @@ jobs:
     trigger: commit
     branch: main
     owner: "maxamillion"
-    project: "openshell"
+    project: "nvidia-openshell"
     identifier: main-commit
     targets:
       - fedora-all
@@ -79,7 +79,7 @@ jobs:
   - job: copr_build
     trigger: release
     owner: "maxamillion"
-    project: "openshell"
+    project: "nvidia-openshell"
     targets:
       - fedora-all
       - epel-10
