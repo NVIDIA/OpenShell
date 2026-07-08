@@ -820,21 +820,16 @@ async fn build_compute_runtime(
             )
             .await
         }
-        // Unreachable at runtime. This fallback is required for match exhaustiveness
-        // in non-default builds (including the extension-only build with zero driver features),
-        // where some or all of the arms above are cfg'd out.
-        #[cfg(not(all(
-            feature = "driver-kubernetes",
-            feature = "driver-docker",
-            feature = "driver-podman",
-            feature = "driver-vm",
-        )))]
-        ConfiguredComputeDriver::Builtin(kind) => {
-            unreachable!(
-                "compute driver '{}' passed startup validation but is not compiled into this gateway",
-                kind.as_str()
-            );
-        }
+        // Unreachable at runtime: config validation in `configured_compute_driver`
+        // rejects builtins whose feature was compiled out, so a `Builtin` variant
+        // reaching here means validation and dispatch got out of sync.
+        // `#[allow(unreachable_patterns)]` silences the lint in the default
+        // build where every concrete arm above is compiled in and this
+        // catch-all is unreachable at compile time.
+        #[allow(unreachable_patterns)]
+        _ => unreachable!(
+            "configured compute driver passed startup validation but is not compiled into this gateway"
+        ),
     };
 
     runtime.map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
