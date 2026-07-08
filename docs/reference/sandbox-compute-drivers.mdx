@@ -308,6 +308,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
 | `topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, or `sidecar` to move pod-level network enforcement and the gateway session into a dedicated sidecar. |
 | `sidecar.proxy_uid` | `supervisor.sidecar.proxyUid` | UID used by the long-running network sidecar in `sidecar` topology. The network init container exempts this UID from proxy redirection. |
+| `sidecar.process_binary_aware_network_policy` | `supervisor.sidecar.processBinaryAwareNetworkPolicy` | Keep process/binary-aware network policy enabled in `sidecar` topology. Set false to drop the sidecar's `SYS_PTRACE` capability used for cross-UID `/proc` inspection and enforce endpoint/L7 policy without matching `policy.binaries`. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
@@ -317,7 +318,10 @@ needed by the supervisor for network namespace setup, Landlock filesystem
 policy, process privilege changes, and network policy enforcement. In `sidecar`
 topology, the agent container runs as the resolved sandbox UID/GID with no added
 Linux capabilities. A root init container performs the nftables setup, and the
-long-running sidecar runs non-root with no added Linux capabilities. The
+long-running sidecar runs non-root, drops default capabilities, and adds only
+`SYS_PTRACE` for workload process identity resolution through shared `/proc`. The
+`sidecar.process_binary_aware_network_policy = false` setting removes that
+sidecar capability and relaxes network policy to endpoint/L7 matching only. The
 network sidecar owns gateway authentication and writes local policy/provider
 state to the process supervisor over a local control socket, so the agent
 container does not mount the sandbox bootstrap token or client TLS secret in

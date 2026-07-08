@@ -58,9 +58,13 @@ the Linux capabilities the supervisor needs for namespace setup and process,
 filesystem, and network policy enforcement.
 
 The `sidecar` supervisor topology moves pod-level network setup into a root init
-container and runs the long-lived network sidecar as a non-root UID with no
-added Linux capabilities. The agent container also runs as the resolved sandbox
-UID/GID with `allowPrivilegeEscalation: false` and `capabilities.drop: ["ALL"]`.
+container and runs the long-lived network sidecar as a non-root UID that drops
+default Linux capabilities and adds only `SYS_PTRACE` for workload `/proc`
+inspection. The agent container also runs as the resolved sandbox UID/GID with
+`allowPrivilegeEscalation: false` and `capabilities.drop: ["ALL"]`.
+Set `sidecar.process_binary_aware_network_policy = false` to omit `SYS_PTRACE`
+from the sidecar and enforce endpoint/L7 network policy without matching
+`policy.binaries`.
 In this mode OpenShell preserves gateway session and SSH behavior, but the
 process supervisor does not perform root-to-sandbox privilege dropping or
 supervisor identity mount isolation. It still applies Landlock filesystem policy

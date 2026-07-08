@@ -147,6 +147,15 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sidecar\].*?proxy_uid\s*=\s*2200'
 
+  - it: renders process binary aware network policy under [openshell.drivers.kubernetes.sidecar]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.sidecar.processBinaryAwareNetworkPolicy: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sidecar\].*?process_binary_aware_network_policy\s*=\s*false'
+
   - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:

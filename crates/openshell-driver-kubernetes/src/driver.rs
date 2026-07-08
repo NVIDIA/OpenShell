@@ -565,6 +565,10 @@ impl KubernetesComputeDriver {
             supervisor_sideload_method: self.config.supervisor_sideload_method,
             supervisor_topology: self.config.topology,
             proxy_uid: self.config.sidecar.proxy_uid,
+            process_binary_aware_network_policy: self
+                .config
+                .sidecar
+                .process_binary_aware_network_policy,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
@@ -1346,6 +1350,13 @@ fn supervisor_sidecar_env(
         openshell_core::sandbox_env::PROXY_TLS_DIR,
         SIDECAR_TLS_MOUNT_PATH,
     );
+    if !params.process_binary_aware_network_policy {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY,
+            "relaxed",
+        );
+    }
     env
 }
 
@@ -1354,6 +1365,16 @@ fn supervisor_sidecar_container(
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
+    let capabilities = if params.process_binary_aware_network_policy {
+        serde_json::json!({
+            "drop": ["ALL"],
+            "add": ["SYS_PTRACE"]
+        })
+    } else {
+        serde_json::json!({
+            "drop": ["ALL"]
+        })
+    };
     let mut container = serde_json::json!({
         "name": SUPERVISOR_NETWORK_SIDECAR_NAME,
         "image": params.supervisor_image,
@@ -1367,9 +1388,7 @@ fn supervisor_sidecar_container(
             "runAsGroup": params.sandbox_gid,
             "runAsNonRoot": true,
             "allowPrivilegeEscalation": false,
-            "capabilities": {
-                "drop": ["ALL"]
-            }
+            "capabilities": capabilities
         },
         "volumeMounts": [
             sidecar_state_volume_mount(),
@@ -1769,6 +1788,7 @@ struct SandboxPodParams<'a> {
     supervisor_sideload_method: SupervisorSideloadMethod,
     supervisor_topology: SupervisorTopology,
     proxy_uid: u32,
+    process_binary_aware_network_policy: bool,
     service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
@@ -1802,6 +1822,7 @@ impl Default for SandboxPodParams<'_> {
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             supervisor_topology: SupervisorTopology::default(),
             proxy_uid: DEFAULT_PROXY_UID,
+            process_binary_aware_network_policy: true,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
@@ -3173,7 +3194,8 @@ mod tests {
         assert_eq!(
             sidecar["securityContext"]["capabilities"],
             serde_json::json!({
-                "drop": ["ALL"]
+                "drop": ["ALL"],
+                "add": ["SYS_PTRACE"]
             })
         );
         assert_eq!(
@@ -3278,6 +3300,49 @@ mod tests {
             mount["name"] == "openshell-client-tls"
                 && mount["mountPath"] == "/etc/openshell-tls/client"
         }));
+    }
+
+    #[test]
+    fn sidecar_topology_can_relax_process_binary_aware_network_policy() {
+        let params = SandboxPodParams {
+            supervisor_topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            process_binary_aware_network_policy: false,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(
+            sidecar["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"]
+            })
+        );
+        assert_eq!(
+            rendered_env(
+                sidecar,
+                openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY
+            ),
+            Some("relaxed")
+        );
     }
 
     #[test]

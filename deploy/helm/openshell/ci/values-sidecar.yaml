@@ -11,3 +11,8 @@
 # before running `mise run e2e:kubernetes`.
 supervisor:
   topology: sidecar
+  sidecar:
+    # The strict sidecar default requires cross-container /proc identity access.
+    # CI/dev e2e uses the explicit downgraded mode so endpoint and L7 policy
+    # coverage remains runnable on local k3d while that path is hardened.
+    processBinaryAwareNetworkPolicy: false

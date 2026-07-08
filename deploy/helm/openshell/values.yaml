@@ -53,6 +53,11 @@ supervisor:
     # -- UID for the long-running network sidecar in sidecar topology. The
     # network init container installs nftables rules that exempt this UID.
     proxyUid: 1337
+    # -- Keep process/binary-aware network policy enabled in sidecar topology.
+    # When false, the network sidecar drops the SYS_PTRACE capability used for
+    # cross-UID /proc inspection and enforces endpoint/L7 policy without
+    # matching policy.binaries.
+    processBinaryAwareNetworkPolicy: true
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []

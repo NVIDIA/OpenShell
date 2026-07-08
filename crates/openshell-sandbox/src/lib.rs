@@ -819,39 +819,50 @@ fn spawn_sidecar_entrypoint_handler(
     sandbox_id: Option<String>,
 ) {
     tokio::spawn(async move {
-        let Some(started) = entrypoint_rx.recv().await else {
-            return;
-        };
-
-        entrypoint_pid.store(started.pid, std::sync::atomic::Ordering::Release);
-        info!(
-            pid = started.pid,
-            ssh_socket = %started.ssh_socket_path.display(),
-            "Sidecar process supervisor reported entrypoint start"
-        );
-
-        if let (Some(engine), Some(proto)) = (opa_engine.as_ref(), retained_proto.as_ref()) {
-            match engine.reload_from_proto_with_pid(proto, started.pid) {
-                Ok(()) => info!(
+        let mut session_started = false;
+        while let Some(started) = entrypoint_rx.recv().await {
+            entrypoint_pid.store(started.pid, std::sync::atomic::Ordering::Release);
+            if started.start_session {
+                info!(
                     pid = started.pid,
-                    "Policy binary symlink resolution complete for sidecar entrypoint"
-                ),
-                Err(err) => warn!(
-                    error = %err,
+                    ssh_socket = %started.ssh_socket_path.display(),
+                    "Sidecar process supervisor reported entrypoint start"
+                );
+            } else {
+                info!(
                     pid = started.pid,
-                    "Failed to rebuild OPA engine with sidecar entrypoint PID"
-                ),
+                    "Sidecar process supervisor reported initial process anchor"
+                );
             }
-        }
 
-        if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
-            openshell_supervisor_process::supervisor_session::spawn(
-                endpoint,
-                id,
-                started.ssh_socket_path,
-                None,
-            );
-            info!("sidecar supervisor session task spawned");
+            if let (Some(engine), Some(proto)) = (opa_engine.as_ref(), retained_proto.as_ref()) {
+                match engine.reload_from_proto_with_pid(proto, started.pid) {
+                    Ok(()) => info!(
+                        pid = started.pid,
+                        "Policy binary symlink resolution complete for sidecar process anchor"
+                    ),
+                    Err(err) => warn!(
+                        error = %err,
+                        pid = started.pid,
+                        "Failed to rebuild OPA engine with sidecar process anchor PID"
+                    ),
+                }
+            }
+
+            if started.start_session
+                && !session_started
+                && let (Some(endpoint), Some(id)) =
+                    (openshell_endpoint.as_ref(), sandbox_id.as_ref())
+            {
+                openshell_supervisor_process::supervisor_session::spawn(
+                    endpoint.clone(),
+                    id.clone(),
+                    started.ssh_socket_path,
+                    None,
+                );
+                session_started = true;
+                info!("sidecar supervisor session task spawned");
+            }
         }
     });
 }

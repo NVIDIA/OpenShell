@@ -34,6 +34,7 @@ pub struct BootstrapData {
 pub struct EntrypointStarted {
     pub pid: u32,
     pub ssh_socket_path: PathBuf,
+    pub start_session: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -116,7 +117,7 @@ pub struct ProcessConnection {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireClientMessage {
-    BootstrapRequest,
+    BootstrapRequest { supervisor_pid: Option<u32> },
     EntrypointStarted { pid: u32, ssh_socket_path: String },
 }
 
@@ -326,7 +327,15 @@ async fn handle_connection(
             miette::miette!("sidecar control client disconnected before bootstrap")
         })?;
     match decode_client_message(&first_line)? {
-        WireClientMessage::BootstrapRequest => {}
+        WireClientMessage::BootstrapRequest { supervisor_pid } => {
+            if let Some(pid) = supervisor_pid.filter(|pid| *pid != 0) {
+                let _ = entrypoint_tx.send(EntrypointStarted {
+                    pid,
+                    ssh_socket_path: PathBuf::new(),
+                    start_session: false,
+                });
+            }
+        }
         WireClientMessage::EntrypointStarted { .. } => {
             return Err(miette::miette!(
                 "sidecar control client sent entrypoint event before bootstrap"
@@ -348,7 +357,7 @@ async fn handle_connection(
                     return Ok(());
                 };
                 match decode_client_message(&line)? {
-                    WireClientMessage::BootstrapRequest => {
+                    WireClientMessage::BootstrapRequest { .. } => {
                         debug!("Ignoring duplicate sidecar bootstrap request");
                     }
                     WireClientMessage::EntrypointStarted { pid, ssh_socket_path } => {
@@ -359,6 +368,7 @@ async fn handle_connection(
                         let _ = entrypoint_tx.send(EntrypointStarted {
                             pid,
                             ssh_socket_path: PathBuf::from(ssh_socket_path),
+                            start_session: true,
                         });
                     }
                 }
@@ -382,7 +392,13 @@ pub async fn connect_process_client(
 ) -> Result<(BootstrapData, ProcessConnection)> {
     let stream = connect_with_retry(path, timeout).await?;
     let (reader, mut writer) = stream.into_split();
-    write_json_line(&mut writer, &WireClientMessage::BootstrapRequest).await?;
+    write_json_line(
+        &mut writer,
+        &WireClientMessage::BootstrapRequest {
+            supervisor_pid: Some(std::process::id()),
+        },
+    )
+    .await?;
 
     let mut lines = BufReader::new(reader).lines();
     let first_line = lines
@@ -540,6 +556,13 @@ mod tests {
             .await
             .unwrap();
 
+        let anchor = tokio::time::timeout(Duration::from_secs(1), entrypoint_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(anchor.pid, std::process::id());
+        assert!(!anchor.start_session);
+
         send_entrypoint_started(
             &connection.writer,
             4242,
@@ -557,6 +580,7 @@ mod tests {
             started.ssh_socket_path,
             PathBuf::from("/run/openshell-sidecar/ssh.sock")
         );
+        assert!(started.start_session);
     }
 
     #[test]

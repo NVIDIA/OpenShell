@@ -101,7 +101,11 @@ environment updates after settings polls so future process sessions see
 updated provider env without giving the process leaf gateway access. In sidecar
 mode, an init container performs the privileged pod-network nftables setup with
 `NET_ADMIN` and hands shared state ownership to the configured proxy UID; the
-long-running network sidecar runs as that UID and does not keep `NET_ADMIN`.
+long-running network sidecar runs as that UID, does not keep `NET_ADMIN`, and
+adds only `SYS_PTRACE` so it can resolve workload process/binary identity
+through shared `/proc`. Operators can set the sidecar
+`process_binary_aware_network_policy` flag false to omit `SYS_PTRACE`; that
+downgrades network policy to endpoint/L7 matching without `policy.binaries`.
 The init path applies nftables as individual commands so optional conntrack and
 log expressions can fail without rolling back the required table, chain, and
 reject rules.

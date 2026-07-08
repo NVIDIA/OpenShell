@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use miette::{IntoDiagnostic, Result};
 use std::net::SocketAddr;
 use tracing::info;
@@ -97,6 +97,14 @@ struct Args {
     )]
     sidecar_proxy_uid: u32,
 
+    #[arg(
+        long = "sidecar-process-binary-aware-network-policy",
+        env = "OPENSHELL_K8S_SIDECAR_PROCESS_BINARY_AWARE_NETWORK_POLICY",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    sidecar_process_binary_aware_network_policy: bool,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -143,6 +151,7 @@ async fn main() -> Result<()> {
         topology: args.topology,
         sidecar: KubernetesSidecarConfig {
             proxy_uid: args.sidecar_proxy_uid,
+            process_binary_aware_network_policy: args.sidecar_process_binary_aware_network_policy,
         },
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,

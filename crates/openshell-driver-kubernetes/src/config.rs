@@ -95,12 +95,18 @@ pub struct KubernetesSidecarConfig {
     /// The network init container installs nftables rules that exempt this
     /// UID, so it must not match the sandbox workload UID.
     pub proxy_uid: u32,
+    /// Require process/binary-aware network policy enforcement in sidecar
+    /// topology. When disabled, the network sidecar drops the extra `/proc`
+    /// inspection permission and evaluates endpoint/L7 policy without
+    /// matching `policy.binaries`.
+    pub process_binary_aware_network_policy: bool,
 }
 
 impl Default for KubernetesSidecarConfig {
     fn default() -> Self {
         Self {
             proxy_uid: DEFAULT_PROXY_UID,
+            process_binary_aware_network_policy: true,
         }
     }
 }
@@ -520,6 +526,12 @@ mod tests {
     }
 
     #[test]
+    fn default_sidecar_requires_process_binary_aware_network_policy() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.sidecar.process_binary_aware_network_policy);
+    }
+
+    #[test]
     fn serde_override_topology_sidecar() {
         let json = serde_json::json!({
             "topology": "sidecar"
@@ -549,6 +561,17 @@ mod tests {
     }
 
     #[test]
+    fn serde_override_sidecar_process_binary_aware_network_policy_nested() {
+        let json = serde_json::json!({
+            "sidecar": {
+                "process_binary_aware_network_policy": false
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.sidecar.process_binary_aware_network_policy);
+    }
+
+    #[test]
     fn serde_override_sidecar_proxy_uid_nested() {
         let json = serde_json::json!({
             "sidecar": {
@@ -563,7 +586,10 @@ mod tests {
     #[test]
     fn validate_proxy_uid_rejects_privileged_uid() {
         let cfg = KubernetesComputeConfig {
-            sidecar: KubernetesSidecarConfig { proxy_uid: 999 },
+            sidecar: KubernetesSidecarConfig {
+                proxy_uid: 999,
+                ..KubernetesSidecarConfig::default()
+            },
             ..KubernetesComputeConfig::default()
         };
         let err = cfg.validate_proxy_uid().unwrap_err();

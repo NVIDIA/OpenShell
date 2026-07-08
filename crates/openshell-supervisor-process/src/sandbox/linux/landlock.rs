@@ -5,7 +5,7 @@
 
 use landlock::{
     ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, PathFdError, Ruleset,
-    RulesetAttr,
+    RulesetAttr, RulesetCreatedAttr,
 };
 use miette::{IntoDiagnostic, Result};
 use openshell_core::policy::{LandlockCompatibility, SandboxPolicy};

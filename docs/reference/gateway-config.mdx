@@ -211,6 +211,10 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # UID used by the long-running network sidecar. In sidecar topology the
 # network init container installs nftables rules that exempt this UID.
 proxy_uid                      = 1337
+# Keep process/binary-aware network policy enabled in sidecar topology. Set
+# false to drop the sidecar's SYS_PTRACE capability used for cross-UID /proc
+# inspection and enforce endpoint/L7 policy without matching policy.binaries.
+process_binary_aware_network_policy = true
 ```
 
 ### Docker

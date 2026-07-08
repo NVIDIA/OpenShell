@@ -31,7 +31,7 @@ The long-running container permissions differ by topology:
 |---|---|---|---|---|---|
 | `combined` | Agent container, which also runs the supervisor | Not forced by topology | Not explicitly disabled by the driver | Adds `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG`; adds `SETUID`, `SETGID`, and `DAC_READ_SEARCH` when user namespaces are enabled | Full supervisor controls run in the agent container. |
 | `sidecar` | Agent container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
-| `sidecar` | Network supervisor sidecar | `proxyUid:sandbox_gid` | `false` | Drops `ALL` | Long-running proxy sidecar is also non-root without added capabilities. |
+| `sidecar` | Network supervisor sidecar | `proxyUid:sandbox_gid` | `false` | Drops `ALL`; adds `SYS_PTRACE` by default | Long-running proxy sidecar is non-root and can inspect workload `/proc` entries for process/binary-aware network policy. |
 
 Short-lived setup containers still have the permissions needed to prepare the
 pod:
@@ -126,8 +126,12 @@ The pod contains these OpenShell-managed pieces:
 
 In this topology, the agent container defaults to `runAsNonRoot: true`,
 `allowPrivilegeEscalation: false`, and `capabilities.drop: ["ALL"]`. The
-long-running network sidecar always drops all Linux capabilities. The root init
-container keeps the setup capabilities needed to configure pod networking.
+long-running network sidecar drops default Linux capabilities and adds only
+`SYS_PTRACE` for workload process identity resolution by default. Setting
+`supervisor.sidecar.processBinaryAwareNetworkPolicy=false` omits that capability
+and downgrades network policy to endpoint/L7 enforcement without binary
+matching. The root init container keeps the setup capabilities needed to
+configure pod networking.
 
 Sidecar mode preserves gateway session behavior, including SSH connectivity,
 because the network sidecar owns the gateway session and bridges relay requests
@@ -208,11 +212,17 @@ supervisor:
   topology: sidecar
   sidecar:
     proxyUid: 1337
+    processBinaryAwareNetworkPolicy: true
 ```
 
 Leave `topology` unset, or set it to `combined`, to keep the original
 single-container supervisor path. For Helm installs, leave
 `supervisor.topology` unset or set it to `combined`.
+
+Set `supervisor.sidecar.processBinaryAwareNetworkPolicy=false` only when you
+accept downgrading sidecar network policy to endpoint/L7 enforcement without
+matching `policy.binaries`. This removes the sidecar's `SYS_PTRACE` capability,
+which is used for cross-UID `/proc` inspection.
 
 ## Next Steps
 
