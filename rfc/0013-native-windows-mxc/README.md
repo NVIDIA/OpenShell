@@ -4,6 +4,7 @@ authors:
 state: review
 links:
   - https://github.com/NVIDIA/OpenShell/issues/2050
+  - https://github.com/NVIDIA/OpenShell/pull/2071
 ---
 
 # RFC 0013 - Native Windows Support via the MXC Compute Driver
@@ -19,14 +20,15 @@ ARM64) without a Linux VM, Docker Desktop, or WSL. It will produce a new
 compute driver, `openshell-driver-mxc`, that will use Microsoft
 Execution Containers (MXC, via `wxc-exec.exe`) as the sandbox primitive.
 
-The central architectural conclusion is that OpenShell does not need to port its
-Linux in-sandbox supervisor to Windows. The value layers the supervisor delivers
-on Linux — egress policy enforcement (OPA), L7 HTTP inspection — are relocated to
-the host by running OpenShell's existing CONNECT proxy inside the driver process
-and pointing MXC's built-in `network.proxy` redirect at it. The integration therefore collapses to
-three moving parts: the OpenShell gateway (largely unchanged from Linux), a
-Windows-only MXC compute driver crate, and an unmodified `wxc-exec` binary, with
-no OpenShell binary running inside the sandbox.
+The central architectural conclusion is that OpenShell rejects porting its Linux
+in-sandbox supervisor to Windows as part of this design. The value layers the
+supervisor delivers on Linux — egress policy enforcement (OPA), L7 HTTP
+inspection — are relocated to the host by running OpenShell's existing CONNECT
+proxy inside the driver process and pointing MXC's built-in `network.proxy`
+redirect at it. The integration therefore collapses to three moving parts: the
+native Windows OpenShell gateway, a Windows-only MXC compute driver crate, and an
+unmodified `wxc-exec` binary, with no OpenShell binary running inside the
+sandbox.
 
 ## Motivation
 
@@ -34,10 +36,11 @@ OpenShell sandboxes autonomous AI agents. On Linux it does so through the
 Docker, Podman, Kubernetes, and libkrun-VM compute drivers, each pairing a
 compute backend with an in-sandbox `openshell-sandbox` supervisor that enforces
 policy and runs the agent. None of those drivers give a first-class experience on
-Windows: Docker Desktop pulls in a Linux VM and licensing constraints, WSL2 adds
-install and networking complexity, and Hyper-V/Windows Sandbox are heavy and
-require elevation. Today a Windows developer or enterprise host cannot run an
-OpenShell sandbox without standing up a Linux runtime underneath it.
+Windows: Docker Desktop uses a WSL2-backed VM for Linux containers and adds
+licensing and resource overhead, WSL2 adds install and networking complexity, and
+Hyper-V/Windows Sandbox are heavy and require elevation. Today a Windows
+developer or enterprise host cannot run an OpenShell sandbox without standing up
+a Linux runtime underneath it.
 
 Windows is a primary environment for the agents OpenShell targets, particularly
 for GeForce and enterprise Windows users. We want native, OS-level isolation
@@ -62,10 +65,12 @@ the Windows work continues to live outside the public project.
 ## Non-goals
 
 - Porting `openshell-sandbox` (the Linux supervisor) to Windows, or shipping any
-  in-sandbox OpenShell binary. Defense-in-depth via an in-sandbox enforcer
-  is explicitly deferred.
+  in-sandbox OpenShell binary. This RFC rejects that path for native Windows.
 - Making Windows a Docker, Podman, Kubernetes, or VM runtime host. Those drivers
   remain compile-only configuration stubs that return an unsupported error.
+- Starting MXC sandboxes from OCI images or Dockerfiles in the MVP. MXC runs
+  against the host Windows OS with policy/configuration, not a separate Linux
+  container image.
 - Named-pipe driver IPC, a cross-process MXC driver binary, or a tonic
   `ComputeDriverService` adapter for MXC. The driver is in-process.
 - Full L7/port/binary-scoped policy enforcement inside MXC itself. MXC network
@@ -111,6 +116,11 @@ inspection, inference routing, and the privacy router — live on the host insid
 the gateway process, not inside the sandbox. A native Windows agent therefore
 gets the Linux feature set without an in-sandbox supervisor.
 
+This still allows the existing supervisor networking code to be reused as a
+host-side proxy component. The boundary is that Windows does not run
+`ConnectSupervisor`, a sandbox relay, or any OpenShell process inside the MXC
+sandbox.
+
 ### Part 1 - Native Windows build
 
 This effort compiles the gateway and CLI for
@@ -138,6 +148,12 @@ library entry points and configuration structs on both platforms.
   unsupported-driver contract tests on `windows-2025`; ARM64 is scaffolded and
   disabled until an ARM64 runner is available.
 
+The Windows build target intentionally includes both `openshell.exe` and
+`openshell-gateway.exe`. Running the gateway only as a Linux container while a
+remote Windows MXC driver manages native sandboxes would keep the main repo's
+Windows target smaller, but it would reintroduce a Linux container/VM dependency
+and does not meet the native, low-overhead client-system goal of this RFC.
+
 ### Part 2 - The MXC compute driver
 
 `openshell-driver-mxc` is a library crate entirely behind
@@ -152,6 +168,20 @@ trait — there is no separate binary, no surrogate, and no tonic adapter.
 | `mxc.rs` | Builds MXC config JSON, base64-encodes it, runs `wxc-exec`, parses envelopes; encapsulates exec-vs-non-exec stdout semantics and error-code mapping. |
 | `policy.rs` | Translates the `SandboxPolicy` proto → MXC config and rejects unenforceable rules. Delegates to the embedded policy mapper (see Part 3). |
 | `proxy.rs` | Hosts the existing OpenShell CONNECT proxy on `127.0.0.1:N`, attributes inbound loopback connections to a sandbox, applies that sandbox's policy. Reuses the Linux proxy/OPA/L7/router code unchanged. |
+
+#### Workload and software availability
+
+MXC does not consume the `openshell sandbox create --from Dockerfile` / OCI image
+model used by Linux container runtimes. For current support, the sandbox runs Windows
+software already present on the host or made available through explicit MXC
+filesystem grants, with the driver supplying the agent command, working
+directory, environment, credentials, and policy-derived MXC configuration.
+
+That is different from Linux, where a sandbox image can carry a separate userland
+and dependency set. The MXC `processcontainer` and AppContainer paths share the
+host Windows OS; the policy/configuration creates the isolation boundary. If MXC
+later grows a Windows VM-backed image model, OpenShell can add a separate
+bootstrap/image workflow for that backend.
 
 #### The `wxc-exec` interface contract
 
@@ -195,17 +225,32 @@ then runs `provision → start → exec`. Live `connect`/`exec` spawns a fresh
 `wxc-exec phase=exec` in a ConPTY and bridges the gateway's bidi stream to its
 stdin/stdout — no `ConnectSupervisor`, no in-sandbox SSH server, no relay socket.
 
+There is currently no reconciliation loop in the MVP. If an operator deletes an
+OpenShell-managed MXC/AppContainer resource outside OpenShell, `get`, `list`, and
+`watch` will continue to reflect the driver's registry until a later operation
+touches the missing MXC resource and can mark the sandbox failed or not found.
+Durable reconciliation is follow-up work: persist the OpenShell sandbox id ⇄ MXC
+session id mapping in SQLite, probe or deprovision known sessions on startup, and
+add a periodic reconcile loop when MXC exposes a list/inspect API.
+
 #### Governed egress
 
 Governed egress is the core value layer. When the agent opens a connection, MXC's
 `network.proxy = { localhost: N }` redirect sends it to the host CONNECT proxy on
 `127.0.0.1:N` (loopback inside an AppContainer is host loopback). The proxy
-attributes the connection to a sandbox (source-port → sandbox mapping), loads
-that sandbox's policy, evaluates L4 host:port allow/deny via OPA, intercepts
-`inference.local` (terminate TLS with the sandbox CA, run the privacy router,
-route via `openshell-router`), applies L7 method/path rules for other HTTPS, and
-emits OCSF events. Because the default `processcontainer` backend already honors
-`network.proxy`, governed egress works with no MXC changes.
+attributes the connection to a sandbox, loads that sandbox's policy, evaluates L4
+host:port allow/deny via OPA, intercepts `inference.local` (terminate TLS with
+the sandbox CA, run the privacy router, route via `openshell-router`), applies
+L7 method/path rules for other HTTPS, and emits OCSF events. Because the default
+`processcontainer` backend already honors `network.proxy`, governed egress works
+with no MXC changes.
+
+The intended topology is many sandboxes to one host-side proxy, with per-sandbox
+attribution in the proxy before policy evaluation. That avoids running one full
+proxy stack per sandbox on client systems. If MXC cannot provide reliable
+attribution for shared loopback traffic, the implementation can fall back to a
+one-proxy-per-sandbox or per-sandbox loopback port/address model while still
+keeping the proxy on the host.
 
 ### Part 3 - Policy translation between OpenShell and MXC
 
@@ -224,21 +269,29 @@ vs exec-time split.
 | process (uid/gid/seccomp) | — (no analog) | reject (default) | — |
 | network (OPA / L7 / inference / privacy) | host CONNECT proxy | `network.proxy = { localhost: N }` redirect | provision |
 
-The driving constraint is that MXC network filtering is host/IP/CIDR-level only:
-it cannot encode ports, protocols, per-binary scope, or L7 rules. The mapper
-therefore emits the coarsest safe approximation and a structured loss report.
-Critically, MXC defaults to `defaultPolicy: "allow"` when the network block is
-omitted, so the mapper must always emit `network.defaultPolicy: "block"`.
+The primary governed-egress design does **not** try to map the full OpenShell
+network policy into MXC network policy. MXC receives a fail-closed redirect
+layer: `network.defaultPolicy = "block"`, empty direct allowlists, and
+`network.proxy = { localhost: N }`. The original OpenShell `network_policies`
+are preserved and handed to the host CONNECT proxy, which remains responsible
+for ports, binaries, L7 rules, `inference.local`, privacy routing, and audit.
 
-Across the five OpenShell example policies, every generated MXC config is
+The coarse MXC-only mapper is a separate fallback and analysis path for cases
+where no proxy is in the loop. In that mode, MXC can roughly express literal
+host/IP/CIDR allowlists, but it cannot encode ports, protocols, per-binary scope,
+TLS inspection behavior, credential rewrite, inference routing, or REST,
+WebSocket, and GraphQL rules. The mapper emits a structured loss report and
+rejects error-severity losses rather than silently broadening access. Critically,
+MXC defaults to `defaultPolicy: "allow"` when the network block is omitted, so
+both paths must explicitly emit `network.defaultPolicy: "block"`.
+
+Across the five OpenShell example policies, the MXC-only coarse mapping is
 schema-valid but lossy: an aggregate of 64 access-broadening errors, 32
 warnings, and 4 info items. The dominant gaps are binary-scoped network policy,
 port-scoped outbound policy, protocol-aware (REST/WebSocket/GraphQL) policy, and
-access presets. The mapper's fail-safe posture is: always emit
-`defaultPolicy: "block"`, never silently broaden access, and treat binary scoping
-and L7 rules as strict-mode failures. The unenforceable remainder is what the
-host CONNECT proxy enforces; the MXC-only path is a coarse kernel-level
-allowlist beneath it.
+access presets. Those losses do not apply to the governed-egress split because
+the host CONNECT proxy receives and enforces the original OpenShell network
+policy.
 
 To consume OpenShell policy more faithfully over time, MXC would need
 kernel-enforceable additions such as port-scoped network endpoints, a filesystem
@@ -257,12 +310,12 @@ kernel-level defense-in-depth.
   Windows Sandbox/Hyper-V. MXC is OS-native, needs no VM, and runs unelevated.
   Default backend `processcontainer`; `isolation_session` opt-in. Requires
   Windows 11 build ≥ 26100 and `wxc-exec.exe` present.
-- **D2 — Do not port the supervisor** (host proxy + MXC
-  `network.proxy` redirect - supported by MXC), (host-side surrogate behavior in the
-  driver) for credentials and exec, and no in-sandbox OpenShell binary.
-  Consequence: governed egress on the opt-in `isolation_session` backend depends
-  on Microsoft extending `network.proxy` to that backend; until then the design
-  defaults to `processcontainer`, where it works today.
+- **D2 — Reject porting the supervisor for native Windows.** Use a host proxy +
+  MXC `network.proxy` redirect for governed egress, plus driver-owned host-side
+  behavior for credentials and exec. No in-sandbox OpenShell binary is part of
+  this RFC. Consequence: governed egress on the opt-in `isolation_session`
+  backend depends on Microsoft extending `network.proxy` to that backend; until
+  then the design defaults to `processcontainer`, where it works today.
 - **D3 — Gateway as a long-lived Windows Service** under
   `NT AUTHORITY\NetworkService`. Clients connect over gRPC (loopback or remote
   mTLS). SQLite at `%ProgramData%\OpenShell\openshell.db`, Windows Event Log
@@ -290,8 +343,9 @@ are never affected and the changes can land additively.
   Service with SQLite under `%ProgramData%`, Windows Event Log integration, and
   mTLS bootstrap on first run.
 - **Hardening.** Confirm reliable per-sandbox loopback attribution and
-  `processcontainer` concurrency, and persist the sandbox-id ⇄ session-id mapping
-  so a gateway restart can reconcile or clean up orphaned sessions.
+  `processcontainer` concurrency. Persist the sandbox-id ⇄ session-id mapping so
+  a gateway restart can reconcile or clean up orphaned sessions, and add a
+  periodic reconcile loop once MXC exposes a list/inspect API.
 - **Opt-in `isolation_session` egress.** Becomes available if and when Microsoft
   extends `network.proxy` to that backend; the same host proxy then governs its
   egress.
@@ -313,7 +367,7 @@ config reference and the architecture docs.
 | `--config-base64` carries credentials in argv (briefly visible in process listings). | Zero-fill after invocation; prefer passing config on stdin. |
 | Concurrency: `isolation_session` is single-session; `processcontainer` limits are unverified. | Validate `processcontainer` concurrency and document any cap. |
 | OCSF fidelity: with no in-sandbox supervisor, arbitrary in-process events are not visible (only network + lifecycle). | Accept reduced fidelity; an ETW/callback hook from the Microsoft MXC team will help restore in-process visibility later. |
-| Restart durability: the registry is in-memory; a gateway restart orphans live sessions. | Persist the sandbox-id ⇄ session-id mapping in SQLite and reconcile or deprovision orphans on startup. |
+| Restart and external deletion: the registry is in-memory, so a gateway restart or out-of-band MXC deletion is not immediately reflected in OpenShell state. | Persist the sandbox-id ⇄ session-id mapping in SQLite, reconcile or deprovision orphans on startup, and add periodic reconcile when MXC exposes list/inspect. |
 | Policy fidelity: MXC cannot enforce port/binary/L7 policy, so the MXC-only tier is a coarse approximation. | Fail-safe mapper (always `block`, never silently broaden) + host proxy as the real enforcer + a published loss report. |
 | Microsoft dependency: several deepening improvements are outside OpenShell's control. | Ship the host-enforced design with no MXC changes required; treat MXC enhancements as optional, not blockers. |
 
@@ -328,8 +382,18 @@ config reference and the architecture docs.
   Linux parity and defense-in-depth, but requires Windows analogs of
   Landlock/seccomp/netns, a Windows relay protocol, and an in-sandbox binary —
   far more surface for the same user-visible feature set, which the host-proxy
-  design already delivers. Kept as future hardening, not the chosen
-  path.
+  design already delivers. This RFC rejects that path; any future
+  defense-in-depth revisit should be a new design rather than assumed follow-up
+  work.
+- **Out-of-tree remote MXC driver with a containerized Linux gateway.** This
+  would reduce the main repo's Windows build surface to the CLI if the gateway
+  could stay containerized. It does not meet this RFC's native Windows goal:
+  the MXC driver needs Windows-host access to `wxc-exec`, AppContainer/MXC
+  state, loopback proxy routing, and Windows credentials, while a Linux
+  containerized gateway would reintroduce the VM/container dependency this RFC
+  is removing. It would also require extending the remote driver protocol to
+  carry policy and proxy state that the current in-process design can share
+  directly.
 - **Cross-compile the Windows binaries from Linux only.** Cheaper CI, but cannot
   validate runtime correctness on real Windows hardware, which is essential for
   MXC integration.
