@@ -80,7 +80,7 @@ pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 
 /// Compute backends the gateway can orchestrate sandboxes through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputeDriverKind {
     Kubernetes,
