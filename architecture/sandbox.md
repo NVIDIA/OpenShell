@@ -183,10 +183,14 @@ original construction error.
 This holds even when the initial policy is enriched with baseline paths during
 startup: the enriched revision the supervisor synced back to the gateway is the
 revision it acknowledges, so a successfully constructed initial policy never
-remains `Pending`. The acknowledgement is delivered with bounded retries and is
-non-fatal: a transient delivery failure does not fail an otherwise healthy
-sandbox, and the pending acknowledgement is retried before any newer revision is
-processed so policy history is never reordered.
+remains `Pending`. If the first poll returns a different revision, the supervisor
+processes it through the normal reload path instead of treating it as already
+loaded.
+
+Policy status delivery uses a FIFO background worker with bounded retries. This
+preserves report order without blocking policy polling, enforcement, settings,
+or provider refreshes when the status endpoint is unavailable. Delivery failure
+is non-fatal and logged after the retry bound is exhausted.
 
 Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
 zero) are acknowledged. Global policies and local-file development policies do

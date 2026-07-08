@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import threading
 import time
+from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1610,6 +1613,43 @@ def test_sandbox_ref_stays_hashable_with_labels_excluded_from_identity() -> None
     # Labels are excluded from identity: same (id, name, status) compares equal.
     assert ref_a == ref_b
     assert {ref_a, ref_b} == {ref_a}
+
+
+def test_sandbox_ref_labels_support_standard_serialization() -> None:
+    ref = _sandbox_ref(
+        _make_sandbox_proto("sandbox-1", "job-1", {"aiq": "deep-research"})
+    )
+
+    assert asdict(ref)["labels"] == {"aiq": "deep-research"}
+    assert dict(deepcopy(ref).labels) == {"aiq": "deep-research"}
+    assert dict(pickle.loads(pickle.dumps(ref)).labels) == {"aiq": "deep-research"}
+
+
+def test_default_sandbox_ref_labels_support_standard_serialization() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+
+    assert asdict(ref)["labels"] == {}
+    assert dict(deepcopy(ref).labels) == {}
+    assert dict(pickle.loads(pickle.dumps(ref)).labels) == {}
+
+
+def test_direct_sandbox_ref_copies_and_freezes_labels() -> None:
+    labels = {"aiq": "deep-research"}
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+        labels=labels,
+    )
+    labels["aiq"] = "mutated"
+
+    assert dict(ref.labels) == {"aiq": "deep-research"}
+    with pytest.raises(TypeError):
+        ref.labels["mutated"] = "nope"  # type: ignore[index]
 
 
 def test_high_level_creation_forwards_name_and_labels(

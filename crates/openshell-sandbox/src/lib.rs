@@ -1625,6 +1625,51 @@ struct InitialPolicyAck {
     config_revision: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PolicyStatusUpdate {
+    version: u32,
+    loaded: bool,
+    error: String,
+    initial_policy_hash: Option<String>,
+}
+
+const POLICY_STATUS_QUEUE_CAPACITY: usize = 32;
+
+impl PolicyStatusUpdate {
+    fn initial_loaded(ack: &InitialPolicyAck) -> Self {
+        Self {
+            version: ack.version,
+            loaded: true,
+            error: String::new(),
+            initial_policy_hash: Some(ack.policy_hash.clone()),
+        }
+    }
+
+    fn loaded(version: u32) -> Self {
+        Self {
+            version,
+            loaded: true,
+            error: String::new(),
+            initial_policy_hash: None,
+        }
+    }
+
+    fn failed(version: u32, error: String) -> Self {
+        Self {
+            version,
+            loaded: false,
+            error,
+            initial_policy_hash: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum InitialPollDisposition {
+    Acknowledge(InitialPolicyAck),
+    Reconcile,
+}
+
 /// Determine whether the initially loaded policy corresponds to an
 /// authoritative sandbox-scoped revision that must be acknowledged.
 ///
@@ -1655,6 +1700,16 @@ fn initial_policy_ack_candidate(
     })
 }
 
+fn initial_poll_disposition(
+    loaded: Option<&openshell_core::proto::SandboxPolicy>,
+    canonical: &openshell_core::grpc_client::SettingsPollResult,
+) -> InitialPollDisposition {
+    initial_policy_ack_candidate(loaded, canonical).map_or(
+        InitialPollDisposition::Reconcile,
+        InitialPollDisposition::Acknowledge,
+    )
+}
+
 /// Compare two sandbox policies for enforcement-equivalent content.
 ///
 /// The policy `version` field and provider-managed rule names are ignored:
@@ -1674,27 +1729,76 @@ fn policies_structurally_match(
     a == b
 }
 
-/// Report a successfully constructed initial policy revision as loaded,
-/// using the shared bounded gRPC retry. Returns whether delivery succeeded;
-/// a transient failure is non-fatal and retried later by the poll loop.
-async fn report_initial_policy_ack(
-    client: &openshell_core::grpc_client::CachedOpenShellClient,
-    sandbox_id: &str,
-    ack: &InitialPolicyAck,
-) -> bool {
-    grpc_retry("Initial policy acknowledgement", || {
-        let client = client.clone();
-        async move {
-            client
-                .report_policy_status(sandbox_id, ack.version, true, "")
-                .await
+/// Deliver policy status updates independently from policy reconciliation.
+///
+/// The channel is FIFO, so a delayed older status can never arrive after a
+/// newer status and move the gateway's active version backward. Delivery uses
+/// the existing bounded retry, but failures never delay policy enforcement.
+async fn run_policy_status_reporter(
+    client: openshell_core::grpc_client::CachedOpenShellClient,
+    sandbox_id: String,
+    mut updates: tokio::sync::mpsc::Receiver<PolicyStatusUpdate>,
+) {
+    while let Some(update) = updates.recv().await {
+        let operation = if update.initial_policy_hash.is_some() {
+            "Initial policy acknowledgement"
+        } else {
+            "Policy status report"
+        };
+        let version = update.version;
+        let loaded = update.loaded;
+        let result = grpc_retry(operation, || {
+            let sandbox_id = sandbox_id.clone();
+            let error = update.error.clone();
+            let client = client.clone();
+            async move {
+                client
+                    .report_policy_status(&sandbox_id, version, loaded, &error)
+                    .await
+            }
+        })
+        .await;
+
+        if let Err(error) = result {
+            warn!(
+                %error,
+                version = update.version,
+                loaded = update.loaded,
+                "Failed to deliver policy status update; continuing enforcement"
+            );
+            continue;
         }
-    })
-    .await
-    .inspect_err(|e| {
-        warn!(error = %e, version = ack.version, "Failed to acknowledge initial policy revision");
-    })
-    .is_ok()
+
+        if let Some(policy_hash) = update.initial_policy_hash {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "loaded")
+                    .unmapped("version", serde_json::json!(update.version))
+                    .unmapped("policy_hash", serde_json::json!(policy_hash))
+                    .message(format!(
+                        "Acknowledged initial policy revision as loaded [version:{}]",
+                        update.version
+                    ))
+                    .build()
+            );
+        }
+    }
+}
+
+fn enqueue_policy_status(
+    sender: &tokio::sync::mpsc::Sender<PolicyStatusUpdate>,
+    update: PolicyStatusUpdate,
+) {
+    let version = update.version;
+    if let Err(error) = sender.try_send(update) {
+        warn!(
+            %error,
+            version,
+            "Policy status reporter unavailable; dropping update"
+        );
+    }
 }
 
 /// Best-effort `FAILED` acknowledgement when initial policy construction or
@@ -1766,17 +1870,19 @@ struct PolicyPollLoopContext {
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
 }
 
-/// Maximum attempts to deliver a pending initial policy acknowledgement before
-/// giving up and resuming normal polling, so a permanently undeliverable ack
-/// cannot stall later hot-reloads.
-const MAX_PENDING_ACK_ATTEMPTS: u32 = 6;
-
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
     use std::sync::atomic::Ordering;
 
     let client = CachedOpenShellClient::connect(&ctx.endpoint).await?;
+    let (status_sender, status_receiver) = tokio::sync::mpsc::channel(POLICY_STATUS_QUEUE_CAPACITY);
+    tokio::spawn(run_policy_status_reporter(
+        client.clone(),
+        ctx.sandbox_id.clone(),
+        status_receiver,
+    ));
+
     let mut current_config_revision: u64 = 0;
     let mut current_provider_env_revision: u64 = ctx.provider_credentials.snapshot().revision;
     let mut current_policy_hash = String::new();
@@ -1785,53 +1891,32 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         openshell_core::proto::EffectiveSetting,
     > = std::collections::HashMap::new();
 
-    // A sandbox-scoped initial revision that was built successfully but whose
-    // acknowledgement has not yet been delivered. Held so a transient
-    // status-report failure never fails a healthy sandbox, and so a newer
-    // revision cannot be acknowledged ahead of the one actually loaded.
-    let mut pending_initial_ack: Option<InitialPolicyAck> = None;
-    // Bounded so a permanently-undeliverable initial acknowledgement (e.g. the
-    // revision was superseded before it could be reported) cannot block newer
-    // policy revisions and provider-env refreshes forever.
-    let mut pending_ack_attempts: u32 = 0;
+    // A first poll that does not match the policy already loaded into OPA must
+    // pass through the normal reconciliation path immediately. It must never
+    // seed the applied-state trackers before OPA actually loads it.
+    let mut pending_result = None;
 
     // Initialize revision from the first poll and acknowledge the initial
-    // policy revision the supervisor actually loaded. Seeding the loop from
-    // that revision is what prevents it from being re-reported on later polls.
+    // policy revision the supervisor actually loaded. A mismatched result is
+    // reconciled below instead of being recorded as already applied.
     match client.poll_settings(&ctx.sandbox_id).await {
-        Ok(result) => {
-            apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-            current_config_revision = result.config_revision;
-            current_policy_hash = result.policy_hash.clone();
-
-            if let Some(candidate) =
-                initial_policy_ack_candidate(ctx.loaded_policy.as_ref(), &result)
-            {
-                if report_initial_policy_ack(&client, &ctx.sandbox_id, &candidate).await {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .unmapped("version", serde_json::json!(candidate.version))
-                            .unmapped("policy_hash", serde_json::json!(&candidate.policy_hash))
-                            .message(format!(
-                                "Acknowledged initial policy revision as loaded [version:{}]",
-                                candidate.version
-                            ))
-                            .build()
-                    );
-                } else {
-                    pending_initial_ack = Some(candidate);
-                }
+        Ok(result) => match initial_poll_disposition(ctx.loaded_policy.as_ref(), &result) {
+            InitialPollDisposition::Acknowledge(candidate) => {
+                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                current_config_revision = candidate.config_revision;
+                current_policy_hash.clone_from(&candidate.policy_hash);
+                current_settings = result.settings;
+                enqueue_policy_status(
+                    &status_sender,
+                    PolicyStatusUpdate::initial_loaded(&candidate),
+                );
+                debug!(
+                    config_revision = current_config_revision,
+                    "Settings poll: initial policy matches loaded revision"
+                );
             }
-
-            current_settings = result.settings;
-            debug!(
-                config_revision = current_config_revision,
-                "Settings poll: initial config revision"
-            );
-        }
+            InitialPollDisposition::Reconcile => pending_result = Some(result),
+        },
         Err(e) => {
             warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
         }
@@ -1839,38 +1924,16 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
     let interval = Duration::from_secs(ctx.interval_secs);
     loop {
-        tokio::time::sleep(interval).await;
-
-        // Deliver any pending initial acknowledgement before processing newer
-        // revisions, so the revision actually loaded is acknowledged first and
-        // policy history is never reordered. Bounded: after a fixed number of
-        // failed attempts, give up and resume normal polling so a permanently
-        // undeliverable ack cannot stall later hot-reloads.
-        if let Some(candidate) = pending_initial_ack.clone() {
-            if report_initial_policy_ack(&client, &ctx.sandbox_id, &candidate).await {
-                pending_initial_ack = None;
-                pending_ack_attempts = 0;
-            } else {
-                pending_ack_attempts += 1;
-                if pending_ack_attempts >= MAX_PENDING_ACK_ATTEMPTS {
-                    warn!(
-                        version = candidate.version,
-                        attempts = pending_ack_attempts,
-                        "Giving up on pending initial policy acknowledgement; resuming normal polling"
-                    );
-                    pending_initial_ack = None;
-                    pending_ack_attempts = 0;
-                } else {
+        let result = if let Some(result) = pending_result.take() {
+            result
+        } else {
+            tokio::time::sleep(interval).await;
+            match client.poll_settings(&ctx.sandbox_id).await {
+                Ok(result) => result,
+                Err(e) => {
+                    debug!(error = %e, "Settings poll: server unreachable, will retry");
                     continue;
                 }
-            }
-        }
-
-        let result = match client.poll_settings(&ctx.sandbox_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                debug!(error = %e, "Settings poll: server unreachable, will retry");
-                continue;
             }
         };
 
@@ -1986,13 +2049,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                                 .build()
                         );
                     }
-                    if result.version > 0
-                        && result.policy_source == PolicySource::Sandbox
-                        && let Err(e) = client
-                            .report_policy_status(&ctx.sandbox_id, result.version, true, "")
-                            .await
-                    {
-                        warn!(error = %e, "Failed to report policy load success");
+                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                        enqueue_policy_status(
+                            &status_sender,
+                            PolicyStatusUpdate::loaded(result.version),
+                        );
                     }
                 }
                 Err(e) => {
@@ -2007,18 +2068,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                             result.version
                         ))
                         .build());
-                    if result.version > 0
-                        && result.policy_source == PolicySource::Sandbox
-                        && let Err(report_err) = client
-                            .report_policy_status(
-                                &ctx.sandbox_id,
-                                result.version,
-                                false,
-                                &e.to_string(),
-                            )
-                            .await
-                    {
-                        warn!(error = %report_err, "Failed to report policy load failure");
+                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                        enqueue_policy_status(
+                            &status_sender,
+                            PolicyStatusUpdate::failed(result.version, e.to_string()),
+                        );
                     }
                 }
             }
@@ -2402,6 +2456,39 @@ filesystem_policy:
         );
 
         assert!(initial_policy_ack_candidate(Some(&loaded), &canonical).is_none());
+    }
+
+    #[test]
+    fn initial_poll_reconciles_policy_that_was_not_loaded() {
+        let loaded = proto_policy_fixture();
+        let mut newer = proto_policy_fixture();
+        newer.network_policies.insert(
+            "new_deny_rule".to_string(),
+            openshell_core::proto::NetworkPolicyRule::default(),
+        );
+        let canonical =
+            settings_poll_result(Some(newer), 2, openshell_core::proto::PolicySource::Sandbox);
+
+        assert_eq!(
+            initial_poll_disposition(Some(&loaded), &canonical),
+            InitialPollDisposition::Reconcile
+        );
+    }
+
+    #[test]
+    fn policy_status_queue_preserves_revision_order() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        enqueue_policy_status(&sender, PolicyStatusUpdate::loaded(1));
+        enqueue_policy_status(
+            &sender,
+            PolicyStatusUpdate::failed(2, "invalid policy".to_string()),
+        );
+
+        assert_eq!(receiver.try_recv().unwrap(), PolicyStatusUpdate::loaded(1));
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            PolicyStatusUpdate::failed(2, "invalid policy".to_string())
+        );
     }
 
     #[test]

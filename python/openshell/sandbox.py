@@ -14,8 +14,7 @@ import threading
 import time
 from collections import namedtuple
 from dataclasses import dataclass, field
-from types import MappingProxyType
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, Never, SupportsIndex, cast
 from urllib.parse import urlparse
 
 import grpc
@@ -131,16 +130,42 @@ class SandboxStatusRef:
     current_policy_version: int
 
 
+class _ImmutableLabels(dict[str, str]):
+    """A read-only, copy- and pickle-safe label mapping."""
+
+    def _deny_mutation(self, *args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        raise TypeError("sandbox labels are immutable")
+
+    __setitem__ = _deny_mutation
+    __delitem__ = _deny_mutation
+    clear = _deny_mutation
+    pop = _deny_mutation
+    popitem = _deny_mutation
+    setdefault = _deny_mutation
+    update = _deny_mutation
+    __ior__ = _deny_mutation
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _ImmutableLabels:
+        del memo
+        return type(self)(self)
+
+    def __reduce_ex__(self, protocol: SupportsIndex, /) -> str | tuple[Any, ...]:
+        del protocol
+        return type(self), (dict(self),)
+
+
 @dataclass(frozen=True)
 class SandboxRef:
     id: str
     name: str
     status: SandboxStatusRef
-    # Excluded from equality/hash so SandboxRef stays hashable (MappingProxyType
-    # is unhashable) and keeps its original (id, name, status) identity.
-    labels: Mapping[str, str] = field(
-        default_factory=lambda: MappingProxyType({}), compare=False
-    )
+    # Excluded from equality/hash to preserve the original identity while the
+    # immutable mapping remains safe for deepcopy, pickle, and asdict.
+    labels: Mapping[str, str] = field(default_factory=_ImmutableLabels, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
 
     @property
     def phase(self) -> int:
@@ -864,9 +889,7 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
             phase=status.phase if status else 0,
             current_policy_version=status.current_policy_version if status else 0,
         ),
-        labels=MappingProxyType(
-            dict(sandbox.metadata.labels) if sandbox.metadata else {}
-        ),
+        labels=sandbox.metadata.labels if sandbox.metadata else {},
     )
 
 
