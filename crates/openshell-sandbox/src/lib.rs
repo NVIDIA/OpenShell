@@ -1808,17 +1808,19 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                 initial_policy_ack_candidate(ctx.loaded_policy.as_ref(), &result)
             {
                 if report_initial_policy_ack(&client, &ctx.sandbox_id, &candidate).await {
-                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Informational)
-                        .status(StatusId::Success)
-                        .state(StateId::Enabled, "loaded")
-                        .unmapped("version", serde_json::json!(candidate.version))
-                        .unmapped("policy_hash", serde_json::json!(&candidate.policy_hash))
-                        .message(format!(
-                            "Acknowledged initial policy revision as loaded [version:{}]",
-                            candidate.version
-                        ))
-                        .build());
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped("version", serde_json::json!(candidate.version))
+                            .unmapped("policy_hash", serde_json::json!(&candidate.policy_hash))
+                            .message(format!(
+                                "Acknowledged initial policy revision as loaded [version:{}]",
+                                candidate.version
+                            ))
+                            .build()
+                    );
                 } else {
                     pending_initial_ack = Some(candidate);
                 }
@@ -2380,8 +2382,7 @@ filesystem_policy:
     #[test]
     fn initial_ack_candidate_rejects_missing_canonical_policy() {
         let loaded = proto_policy_fixture();
-        let canonical =
-            settings_poll_result(None, 2, openshell_core::proto::PolicySource::Sandbox);
+        let canonical = settings_poll_result(None, 2, openshell_core::proto::PolicySource::Sandbox);
 
         assert!(initial_policy_ack_candidate(Some(&loaded), &canonical).is_none());
     }
@@ -2394,8 +2395,11 @@ filesystem_policy:
             "user_rule".to_string(),
             openshell_core::proto::NetworkPolicyRule::default(),
         );
-        let canonical =
-            settings_poll_result(Some(different), 2, openshell_core::proto::PolicySource::Sandbox);
+        let canonical = settings_poll_result(
+            Some(different),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
 
         assert!(initial_policy_ack_candidate(Some(&loaded), &canonical).is_none());
     }

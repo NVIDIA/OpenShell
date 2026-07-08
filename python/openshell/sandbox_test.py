@@ -66,7 +66,7 @@ class _FakeInferenceStub:
         return _Response()
 
 
-def _client_with_fake_stub(stub: _FakeStub) -> SandboxClient:
+def _client_with_fake_stub(stub: object) -> SandboxClient:
     client = cast("SandboxClient", object.__new__(SandboxClient))
     client._timeout = 30.0
     client._stub = cast("Any", stub)
@@ -1428,7 +1428,7 @@ def _make_sandbox_proto(
     id_: str,
     name: str,
     labels: dict[str, str] | None = None,
-    phase: int = openshell_pb2.SANDBOX_PHASE_READY,
+    phase: openshell_pb2.SandboxPhase = openshell_pb2.SANDBOX_PHASE_READY,
     version: int = 0,
 ) -> openshell_pb2.Sandbox:
     sandbox = openshell_pb2.Sandbox()
