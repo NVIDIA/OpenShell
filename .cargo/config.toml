@@ -6,3 +6,6 @@
 # the header lives in /usr/include/z3/ rather than /usr/include/. The extra -I
 # is harmless on systems where the path doesn't exist.
 BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/include/z3"
+
+[alias]
+xtask = "run --package xtask --"
