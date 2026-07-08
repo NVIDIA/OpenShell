@@ -162,6 +162,13 @@ pub struct Networking {
     _transparent_tcp: Option<crate::proxy::TransparentTcpHandle>,
 }
 
+#[cfg(not(target_os = "linux"))]
+fn current_exe_static_identity_path() -> Result<std::path::PathBuf> {
+    std::env::current_exe().map_err(|e| {
+        miette::miette!("failed to resolve supervisor executable for static proxy identity: {e}")
+    })
+}
+
 /// Set up the networking stack: ephemeral CA + TLS state, proxy server,
 /// and the SSH-side proxy URL / netns FD.
 ///
@@ -441,9 +448,9 @@ pub async fn run_networking(
             ProxyIdentityMode::procfs(cache, entrypoint_pid.clone())
         };
         #[cfg(target_os = "windows")]
-        let identity_mode = ProxyIdentityMode::static_binary("openshell-windows-host-proxy");
+        let identity_mode = ProxyIdentityMode::static_binary(current_exe_static_identity_path()?)?;
         #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
-        let identity_mode = ProxyIdentityMode::static_binary("openshell-supervisor-host-proxy");
+        let identity_mode = ProxyIdentityMode::static_binary(current_exe_static_identity_path()?)?;
 
         let proxy_handle = ProxyHandle::start_with_bind_addr(
             proxy_policy,

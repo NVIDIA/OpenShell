@@ -268,11 +268,13 @@ impl ProxyIdentityMode {
         }
     }
 
-    pub(crate) fn static_binary(path: impl Into<PathBuf>) -> Self {
-        Self::Static {
-            binary_path: path.into(),
-            binary_sha256: "openshell-host-proxy-static-identity".to_string(),
-        }
+    pub(crate) fn static_binary(path: impl Into<PathBuf>) -> Result<Self> {
+        let binary_path = path.into();
+        let binary_sha256 = crate::procfs::file_sha256(&binary_path)?;
+        Ok(Self::Static {
+            binary_path,
+            binary_sha256,
+        })
     }
 
     fn entrypoint_pid(&self) -> u32 {
@@ -6614,8 +6616,7 @@ network_policies: {}
         Box::pin(handle_tcp_connection(
             server,
             engine,
-            Arc::new(BinaryIdentityCache::new()),
-            Arc::new(AtomicU32::new(std::process::id())),
+            Arc::new(ProxyIdentityMode::static_binary(std::env::current_exe().unwrap()).unwrap()),
             None,
             None,
             None,
@@ -6729,8 +6730,9 @@ network_policies:
                 request.len(),
                 &mut proxy_connection,
                 engine,
-                Arc::new(BinaryIdentityCache::new()),
-                Arc::new(AtomicU32::new(std::process::id())),
+                Arc::new(
+                    ProxyIdentityMode::static_binary(std::env::current_exe().unwrap()).unwrap(),
+                ),
                 None,
                 AgentProposals::default(),
                 Arc::new(None),
@@ -6862,8 +6864,9 @@ network_policies:
                 request.len(),
                 &mut proxy_connection,
                 engine,
-                Arc::new(BinaryIdentityCache::new()),
-                Arc::new(AtomicU32::new(std::process::id())),
+                Arc::new(
+                    ProxyIdentityMode::static_binary(std::env::current_exe().unwrap()).unwrap(),
+                ),
                 None,
                 AgentProposals::default(),
                 Arc::new(None),
@@ -7428,6 +7431,27 @@ network_policies:
             classify_tunnel_protocol(b"SSH-2.0-OpenSSH\r\n"),
             TunnelProtocol::Unsupported
         );
+    }
+
+    #[test]
+    fn static_binary_hashes_configured_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"abc").unwrap();
+
+        match ProxyIdentityMode::static_binary(tmp.path()).unwrap() {
+            ProxyIdentityMode::Static {
+                binary_path,
+                binary_sha256,
+            } => {
+                assert_eq!(binary_path, tmp.path());
+                assert_eq!(
+                    binary_sha256,
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                );
+            }
+            #[cfg(target_os = "linux")]
+            ProxyIdentityMode::Procfs { .. } => panic!("expected static identity mode"),
+        }
     }
 
     #[test]
@@ -12175,8 +12199,7 @@ network_policies:
         });
 
         let (server, _peer) = listener.accept().await.unwrap();
-        let entrypoint_pid = Arc::new(AtomicU32::new(std::process::id()));
-        let cache = Arc::new(BinaryIdentityCache::new());
+        let identity_mode = Arc::new(ProxyIdentityMode::static_binary(exe).unwrap());
         let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
 
         let completed = tokio::time::timeout(
@@ -12184,8 +12207,7 @@ network_policies:
             Box::pin(handle_tcp_connection(
                 server,
                 engine,
-                cache,
-                entrypoint_pid,
+                identity_mode,
                 None,                      // tls_state — ephemeral CA unavailable
                 None,                      // inference_ctx
                 None,                      // policy_local_ctx
@@ -12251,8 +12273,7 @@ network_policies:
         Box::pin(handle_tcp_connection(
             server,
             engine,
-            Arc::new(BinaryIdentityCache::new()),
-            Arc::new(AtomicU32::new(std::process::id())),
+            Arc::new(ProxyIdentityMode::static_binary(exe).unwrap()),
             None,
             None,
             None,
