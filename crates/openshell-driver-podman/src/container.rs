@@ -14,6 +14,7 @@ use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 /// Returns `true` when `SELinux` is enabled (enforcing or permissive).
