@@ -128,7 +128,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (mut policy, opa_engine, retained_proto, loaded_policy_revision) = load_policy(
+    let (mut policy, opa_engine, retained_proto, loaded_policy_origin) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -418,7 +418,7 @@ pub async fn run_sandbox(
             endpoint: poll_endpoint,
             sandbox_id: poll_id,
             opa_engine: poll_engine,
-            loaded_policy_revision,
+            loaded_policy_origin,
             entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
@@ -1371,7 +1371,7 @@ async fn load_policy(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
     Option<openshell_core::proto::SandboxPolicy>,
-    Option<LoadedPolicyRevision>,
+    LoadedPolicyOrigin,
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -1401,7 +1401,12 @@ async fn load_policy(
             process: config.process,
         };
         enrich_sandbox_baseline_paths(&mut policy);
-        return Ok((policy, Some(Arc::new(engine)), None, None));
+        return Ok((
+            policy,
+            Some(Arc::new(engine)),
+            None,
+            LoadedPolicyOrigin::LocalOverride,
+        ));
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -1534,7 +1539,9 @@ async fn load_policy(
             policy,
             opa_engine,
             Some(proto_policy),
-            loaded_policy_revision,
+            LoadedPolicyOrigin::Gateway {
+                revision: loaded_policy_revision,
+            },
         ));
     }
 
@@ -1663,6 +1670,28 @@ struct LoadedPolicyRevision {
     policy_source: openshell_core::proto::PolicySource,
 }
 
+/// Identifies where the policy currently loaded into OPA came from.
+///
+/// A missing gateway revision means the policy was loaded from the gateway but
+/// could not be bound to an authoritative snapshot (for example, enrichment
+/// sync failed). That state must reconcile on the first successful poll. A
+/// local-file override is different: gateway policy revisions are observed for
+/// settings/provider refreshes but must never replace the explicit local OPA
+/// policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LoadedPolicyOrigin {
+    LocalOverride,
+    Gateway {
+        revision: Option<LoadedPolicyRevision>,
+    },
+}
+
+impl LoadedPolicyOrigin {
+    fn allows_gateway_policy_reload(&self) -> bool {
+        matches!(self, Self::Gateway { .. })
+    }
+}
+
 impl LoadedPolicyRevision {
     fn from_snapshot(snapshot: &openshell_core::grpc_client::SettingsPollResult) -> Self {
         Self {
@@ -1724,6 +1753,7 @@ impl PolicyStatusUpdate {
 enum InitialPollDisposition {
     Acknowledge(InitialPolicyAck),
     Reconcile,
+    TrackOnly,
 }
 
 /// Determine whether the initially loaded policy corresponds to an
@@ -1761,13 +1791,18 @@ fn initial_policy_ack_candidate(
 }
 
 fn initial_poll_disposition(
-    loaded: Option<&LoadedPolicyRevision>,
+    origin: &LoadedPolicyOrigin,
     canonical: &openshell_core::grpc_client::SettingsPollResult,
 ) -> InitialPollDisposition {
-    initial_policy_ack_candidate(loaded, canonical).map_or(
-        InitialPollDisposition::Reconcile,
-        InitialPollDisposition::Acknowledge,
-    )
+    match origin {
+        LoadedPolicyOrigin::LocalOverride => InitialPollDisposition::TrackOnly,
+        LoadedPolicyOrigin::Gateway { revision } => {
+            initial_policy_ack_candidate(revision.as_ref(), canonical).map_or(
+                InitialPollDisposition::Reconcile,
+                InitialPollDisposition::Acknowledge,
+            )
+        }
+    }
 }
 
 /// Deliver policy status updates independently from policy reconciliation.
@@ -1903,9 +1938,10 @@ struct PolicyPollLoopContext {
     endpoint: String,
     sandbox_id: String,
     opa_engine: Arc<OpaEngine>,
-    /// Gateway identity captured with the exact policy used to construct OPA.
-    /// `None` when the loaded policy could not be bound to a gateway revision.
-    loaded_policy_revision: Option<LoadedPolicyRevision>,
+    /// Source of the policy currently loaded into OPA. This distinguishes an
+    /// explicit local-file override from an unbound gateway revision so the
+    /// former is never replaced by policy polling.
+    loaded_policy_origin: LoadedPolicyOrigin,
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -1943,25 +1979,33 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     // policy revision the supervisor actually loaded. A mismatched result is
     // reconciled below instead of being recorded as already applied.
     match client.poll_settings(&ctx.sandbox_id).await {
-        Ok(result) => {
-            match initial_poll_disposition(ctx.loaded_policy_revision.as_ref(), &result) {
-                InitialPollDisposition::Acknowledge(candidate) => {
-                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                    current_config_revision = candidate.config_revision;
-                    current_policy_hash.clone_from(&candidate.policy_hash);
-                    current_settings = result.settings;
-                    enqueue_policy_status(
-                        &status_sender,
-                        PolicyStatusUpdate::initial_loaded(&candidate),
-                    );
-                    debug!(
-                        config_revision = current_config_revision,
-                        "Settings poll: initial policy matches loaded revision"
-                    );
-                }
-                InitialPollDisposition::Reconcile => pending_result = Some(result),
+        Ok(result) => match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
+            InitialPollDisposition::Acknowledge(candidate) => {
+                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                current_config_revision = candidate.config_revision;
+                current_policy_hash.clone_from(&candidate.policy_hash);
+                current_settings = result.settings;
+                enqueue_policy_status(
+                    &status_sender,
+                    PolicyStatusUpdate::initial_loaded(&candidate),
+                );
+                debug!(
+                    config_revision = current_config_revision,
+                    "Settings poll: initial policy matches loaded revision"
+                );
             }
-        }
+            InitialPollDisposition::Reconcile => pending_result = Some(result),
+            InitialPollDisposition::TrackOnly => {
+                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                current_config_revision = result.config_revision;
+                current_policy_hash = result.policy_hash.clone();
+                current_settings = result.settings;
+                debug!(
+                    config_revision = current_config_revision,
+                    "Settings poll: tracking gateway config while preserving local policy override"
+                );
+            }
+        },
         Err(e) => {
             warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
         }
@@ -2047,7 +2091,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         }
 
         // Only reload OPA when the policy payload actually changed.
-        if policy_changed {
+        if policy_changed && ctx.loaded_policy_origin.allows_gateway_policy_reload() {
             let Some(policy) = result.policy.as_ref() else {
                 ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                     .severity(SeverityId::Medium)
@@ -2517,9 +2561,45 @@ filesystem_policy:
         };
 
         assert_eq!(
-            initial_poll_disposition(Some(&loaded), &canonical),
+            initial_poll_disposition(
+                &LoadedPolicyOrigin::Gateway {
+                    revision: Some(loaded),
+                },
+                &canonical,
+            ),
             InitialPollDisposition::Reconcile
         );
+    }
+
+    #[test]
+    fn initial_poll_tracks_local_override_without_reconciliation() {
+        let canonical = settings_poll_result(
+            Some(proto_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+
+        assert_eq!(
+            initial_poll_disposition(&LoadedPolicyOrigin::LocalOverride, &canonical),
+            InitialPollDisposition::TrackOnly
+        );
+        assert!(!LoadedPolicyOrigin::LocalOverride.allows_gateway_policy_reload());
+    }
+
+    #[test]
+    fn initial_poll_reconciles_unbound_gateway_policy() {
+        let canonical = settings_poll_result(
+            Some(proto_policy_fixture()),
+            2,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let origin = LoadedPolicyOrigin::Gateway { revision: None };
+
+        assert_eq!(
+            initial_poll_disposition(&origin, &canonical),
+            InitialPollDisposition::Reconcile
+        );
+        assert!(origin.allows_gateway_policy_reload());
     }
 
     #[test]

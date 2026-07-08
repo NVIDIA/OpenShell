@@ -198,7 +198,10 @@ refreshes and cannot permanently lose the initial acknowledgement.
 
 Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
 zero) are acknowledged. Global policies and local-file development policies do
-not use the sandbox revision API and produce no acknowledgement.
+not use the sandbox revision API and produce no acknowledgement. When explicit
+local Rego and data files are configured, the supervisor continues polling the
+gateway for settings and provider refreshes but never replaces the local OPA
+engine with a gateway policy revision.
 
 ## Failure Behavior
 
