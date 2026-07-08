@@ -319,11 +319,12 @@ topology, the agent container runs as the resolved sandbox UID/GID with no added
 Linux capabilities. A root init container performs the nftables setup, and the
 long-running sidecar runs non-root with no added Linux capabilities. The
 network sidecar owns gateway authentication and writes local policy/provider
-snapshots for the process supervisor, so the agent container does not mount the
-sandbox bootstrap token or client TLS secret in the default sidecar path. The
-provider environment snapshot is refreshed by the network sidecar after
-settings polls so future child processes can see updated provider env without
-gateway access in the agent container.
+state to the process supervisor over a local control socket, so the agent
+container does not mount the sandbox bootstrap token or client TLS secret in
+the default sidecar path. The provider environment is refreshed by the network
+sidecar after settings polls and streamed to the process supervisor so future
+child processes can see updated provider env without gateway access in the
+agent container.
 Sidecar mode keeps gateway session and SSH behavior. The process supervisor
 applies Landlock filesystem policy and child seccomp filters where supported,
 but it does not perform root-to-sandbox privilege dropping or supervisor

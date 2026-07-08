@@ -60,6 +60,7 @@ pub async fn run_process(
     policy: &SandboxPolicy,
     enforcement_mode: ProcessEnforcementMode,
     entrypoint_pid: Arc<AtomicU32>,
+    entrypoint_started_tx: Option<tokio::sync::oneshot::Sender<u32>>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
@@ -333,8 +334,8 @@ pub async fn run_process(
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
-    if let Some(path) = entrypoint_pid_file() {
-        write_entrypoint_pid_file(&path, handle.pid())?;
+    if let Some(tx) = entrypoint_started_tx {
+        let _ = tx.send(handle.pid());
     }
     ocsf_emit!(
         ProcessActivityBuilder::new(ocsf_ctx())
@@ -386,25 +387,6 @@ pub async fn run_process(
     );
 
     Ok(status.code())
-}
-
-fn entrypoint_pid_file() -> Option<String> {
-    std::env::var(openshell_core::sandbox_env::ENTRYPOINT_PID_FILE)
-        .ok()
-        .filter(|value| !value.is_empty())
-}
-
-fn write_entrypoint_pid_file(path: &str, pid: u32) -> Result<()> {
-    let pid_path = std::path::Path::new(path);
-    if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent).into_diagnostic()?;
-    }
-    std::fs::write(pid_path, format!("{pid}\n")).into_diagnostic()?;
-    info!(
-        path,
-        pid, "Published workload entrypoint PID for network sidecar"
-    );
-    Ok(())
 }
 
 fn ssh_proxy_url_for_policy(

@@ -111,8 +111,8 @@ flowchart TB
   Workload -->|"egress redirected on loopback"| NetworkSidecar
   NetworkSidecar -->|"gateway session + relays"| Gateway
   NetworkSidecar -->|"policy-enforced egress"| External
-  NetworkSidecar -->|"policy/provider snapshots"| State
-  ProcessSupervisor -->|"reads snapshots"| State
+  NetworkSidecar -->|"control socket + proxy TLS"| State
+  ProcessSupervisor -->|"bootstrap + updates"| State
   NetworkSidecar --- State
 ```
 
@@ -121,7 +121,7 @@ The pod contains these OpenShell-managed pieces:
 | Component | Runs as | Purpose |
 |---|---|---|
 | Network init container | Root with setup capabilities | Installs pod-level nftables rules and prepares shared sidecar state. |
-| Network sidecar | `supervisor.sidecar.proxyUid` | Runs the proxy, enforces network policy, owns gateway authentication and the gateway session, and writes proxy TLS plus local policy/provider snapshots. |
+| Network sidecar | `supervisor.sidecar.proxyUid` | Runs the proxy, enforces network policy, owns gateway authentication and the gateway session, and serves local policy/provider state over the sidecar control socket. |
 | Agent container | Resolved sandbox UID/GID | Runs the process supervisor and launches the user workload. |
 
 In this topology, the agent container defaults to `runAsNonRoot: true`,
@@ -154,20 +154,15 @@ container does not mount the projected ServiceAccount token used for sandbox
 token bootstrap, does not mount the sandbox client TLS secret, and does not get
 gateway callback environment variables.
 
-The network sidecar writes local snapshots that the process supervisor needs:
-
-- A protobuf policy snapshot.
-- A workload-facing provider environment snapshot.
-
-The provider snapshot contains the environment variables OpenShell intentionally
-injects into the workload. The process supervisor loads it at startup and
-watches for newer revisions that the network sidecar writes after settings
-polls, so future child processes can see refreshed provider env without giving
-the agent container gateway authentication material. This does not mutate the
-environment of the already-running workload entrypoint. Use `combined` topology
-when you need the full single-supervisor enforcement path; use additional
-runtime isolation when you need a stronger container boundary around sidecar
-workloads.
+The network sidecar serves the policy and workload-facing provider environment
+over a Unix control socket in the shared sidecar state volume. The process
+supervisor connects to that socket at startup, receives bootstrap state, and
+then listens for provider-environment updates after settings polls. Future child
+processes can see refreshed provider env without giving the agent container
+gateway authentication material. This does not mutate the environment of the
+already-running workload entrypoint. Use `combined` topology when you need the
+full single-supervisor enforcement path; use additional runtime isolation when
+you need a stronger container boundary around sidecar workloads.
 
 ## RuntimeClass Isolation
 

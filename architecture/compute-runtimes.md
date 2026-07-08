@@ -94,10 +94,10 @@ sidecar topology. Combined mode keeps network and process supervision in the
 agent container. Sidecar mode runs network enforcement, the proxy, and gateway
 session in a dedicated sidecar, while the agent container runs only the
 process-supervision leaf and launches the user workload after the sidecar
-signals readiness. The sidecar writes local policy and provider-environment
-snapshots into shared state so the process leaf can start without gateway
-credentials. The network sidecar also refreshes the workload-facing provider
-environment snapshot after settings polls so future process sessions see
+serves bootstrap state over a local control socket. The network sidecar owns
+gateway credentials and sends policy plus workload-facing provider environment
+state to the process leaf over that socket. It also streams provider
+environment updates after settings polls so future process sessions see
 updated provider env without giving the process leaf gateway access. In sidecar
 mode, an init container performs the privileged pod-network nftables setup with
 `NET_ADMIN` and hands shared state ownership to the configured proxy UID; the

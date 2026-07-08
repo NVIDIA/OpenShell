@@ -1049,18 +1049,15 @@ const SUPERVISOR_NETWORK_INIT_CONTAINER_NAME: &str = "openshell-network-init";
 /// Container name for the network-only supervisor sidecar.
 const SUPERVISOR_NETWORK_SIDECAR_NAME: &str = "openshell-supervisor-network";
 
-/// Shared volume used by the network sidecar to signal readiness to the
-/// process-only supervisor in the agent container.
+/// Shared volume used by the network sidecar and process-only supervisor for
+/// local coordination in sidecar topology.
 const SIDECAR_STATE_VOLUME_NAME: &str = "openshell-sidecar-state";
 const SIDECAR_STATE_MOUNT_PATH: &str = "/run/openshell-sidecar";
-const SIDECAR_READY_FILE: &str = "/run/openshell-sidecar/supervisor.ready";
-const SIDECAR_ENTRYPOINT_PID_FILE: &str = "/run/openshell-sidecar/entrypoint.pid";
+const SIDECAR_CONTROL_SOCKET: &str = "/run/openshell-sidecar/control.sock";
 const SIDECAR_SSH_SOCKET_FILE: &str = "/run/openshell-sidecar/ssh.sock";
-const SIDECAR_POLICY_SNAPSHOT_FILE: &str = "/run/openshell-sidecar/policy.pb";
-const SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE: &str = "/run/openshell-sidecar/provider-env.json";
 
 /// Shared TLS work directory. The network sidecar writes the proxy CA bundle
-/// here, while the agent container consumes it after the readiness file exists.
+/// here, while the agent container consumes it after sidecar bootstrap.
 const SIDECAR_TLS_VOLUME_NAME: &str = "openshell-supervisor-tls";
 const SIDECAR_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy";
 const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy/client";
@@ -1336,28 +1333,13 @@ fn supervisor_sidecar_env(
     );
     upsert_env(
         &mut env,
-        openshell_core::sandbox_env::SUPERVISOR_READY_FILE,
-        SIDECAR_READY_FILE,
-    );
-    upsert_env(
-        &mut env,
-        openshell_core::sandbox_env::ENTRYPOINT_PID_FILE,
-        SIDECAR_ENTRYPOINT_PID_FILE,
+        openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET,
+        SIDECAR_CONTROL_SOCKET,
     );
     upsert_env(
         &mut env,
         openshell_core::sandbox_env::SSH_SOCKET_PATH,
         SIDECAR_SSH_SOCKET_FILE,
-    );
-    upsert_env(
-        &mut env,
-        openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE,
-        SIDECAR_POLICY_SNAPSHOT_FILE,
-    );
-    upsert_env(
-        &mut env,
-        openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE,
-        SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE,
     );
     upsert_env(
         &mut env,
@@ -1608,23 +1590,8 @@ fn apply_supervisor_sidecar_topology(
             );
             upsert_env(
                 env,
-                openshell_core::sandbox_env::SUPERVISOR_READY_FILE,
-                SIDECAR_READY_FILE,
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::ENTRYPOINT_PID_FILE,
-                SIDECAR_ENTRYPOINT_PID_FILE,
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE,
-                SIDECAR_POLICY_SNAPSHOT_FILE,
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE,
-                SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE,
+                openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET,
+                SIDECAR_CONTROL_SOCKET,
             );
             upsert_env(
                 env,
@@ -3168,26 +3135,18 @@ mod tests {
             Some(SIDECAR_SSH_SOCKET_FILE)
         );
         assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::SUPERVISOR_READY_FILE),
-            Some(SIDECAR_READY_FILE)
+            rendered_env(agent, openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET),
+            Some(SIDECAR_CONTROL_SOCKET)
+        );
+        assert_eq!(rendered_env(agent, "OPENSHELL_SUPERVISOR_READY_FILE"), None);
+        assert_eq!(rendered_env(agent, "OPENSHELL_ENTRYPOINT_PID_FILE"), None);
+        assert_eq!(
+            rendered_env(agent, "OPENSHELL_SIDECAR_POLICY_SNAPSHOT_FILE"),
+            None
         );
         assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::ENTRYPOINT_PID_FILE),
-            Some(SIDECAR_ENTRYPOINT_PID_FILE)
-        );
-        assert_eq!(
-            rendered_env(
-                agent,
-                openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE
-            ),
-            Some(SIDECAR_POLICY_SNAPSHOT_FILE)
-        );
-        assert_eq!(
-            rendered_env(
-                agent,
-                openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE
-            ),
-            Some(SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE)
+            rendered_env(agent, "OPENSHELL_SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE"),
+            None
         );
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::PROXY_TLS_DIR),
@@ -3226,18 +3185,16 @@ mod tests {
             Some(SIDECAR_SSH_SOCKET_FILE)
         );
         assert_eq!(
-            rendered_env(
-                sidecar,
-                openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE
-            ),
-            Some(SIDECAR_POLICY_SNAPSHOT_FILE)
+            rendered_env(sidecar, openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET),
+            Some(SIDECAR_CONTROL_SOCKET)
         );
         assert_eq!(
-            rendered_env(
-                sidecar,
-                openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE
-            ),
-            Some(SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE)
+            rendered_env(sidecar, "OPENSHELL_SIDECAR_POLICY_SNAPSHOT_FILE"),
+            None
+        );
+        assert_eq!(
+            rendered_env(sidecar, "OPENSHELL_SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE"),
+            None
         );
         assert_eq!(
             rendered_env(
@@ -3246,10 +3203,7 @@ mod tests {
             ),
             None
         );
-        assert_eq!(
-            rendered_env(sidecar, openshell_core::sandbox_env::ENTRYPOINT_PID_FILE),
-            Some(SIDECAR_ENTRYPOINT_PID_FILE)
-        );
+        assert_eq!(rendered_env(sidecar, "OPENSHELL_ENTRYPOINT_PID_FILE"), None);
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::PROXY_TLS_DIR),
             Some(SIDECAR_TLS_MOUNT_PATH)

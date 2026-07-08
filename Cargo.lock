@@ -3835,6 +3835,7 @@ dependencies = [
  "openshell-supervisor-process",
  "prost",
  "rustls",
+ "serde",
  "serde_json",
  "temp-env",
  "tempfile",

@@ -67,8 +67,8 @@ impl ProviderCredentialState {
     /// environment snapshot.
     ///
     /// Kubernetes sidecar topology uses this in the process-only supervisor:
-    /// the network sidecar owns provider credential resolvers and writes the
-    /// workload-facing env map into a shared local snapshot. The process leaf
+    /// the network sidecar owns provider credential resolvers and sends the
+    /// workload-facing env map over a local control channel. The process leaf
     /// must inject that map into child processes without re-placeholderizing it
     /// or holding the gateway-side resolver material.
     pub fn from_child_env_snapshot(revision: u64, child_env: HashMap<String, String>) -> Self {

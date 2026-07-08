@@ -72,7 +72,9 @@ process/binary identity through `/proc/<entrypoint-pid>`.
 Sidecar mode keeps gateway credentials in the network sidecar. The agent
 container does not mount the projected service-account token used for sandbox
 token bootstrap, does not mount the sandbox client TLS secret, and does not get
-gateway callback environment variables.
+gateway callback environment variables. The process supervisor receives policy
+and provider environment state from the sidecar over a local control socket in
+the shared sidecar state volume.
 
 The driver can request a Kubernetes AppArmor profile through
 `app_armor_profile`.

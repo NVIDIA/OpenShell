@@ -12,12 +12,12 @@ mod google_cloud_metadata;
 mod mechanistic_mapper;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod metadata_server;
+mod sidecar_control;
 
-use miette::{IntoDiagnostic, Result, WrapErr};
-use prost::Message;
+use miette::{IntoDiagnostic, Result};
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -136,43 +136,49 @@ pub async fn run_sandbox(
 
     let sidecar_network_enforcement = sidecar_network_enforcement_enabled();
     let process_enforcement_mode = process_enforcement_mode();
-    let sidecar_ready_file = supervisor_ready_file();
-    if process_enabled
-        && !network_enabled
-        && let Some(path) = sidecar_ready_file.as_deref()
-    {
-        wait_for_supervisor_ready(path).await?;
-    }
+    let process_uses_sidecar_control =
+        process_enabled && !network_enabled && sidecar_network_enforcement;
+    let mut process_control_connection = None;
+    let sidecar_bootstrap = if process_uses_sidecar_control {
+        let socket = sidecar_control_socket().ok_or_else(|| {
+            miette::miette!(
+                "{} is required for process-only sidecar topology",
+                openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET
+            )
+        })?;
+        let (bootstrap, connection) = sidecar_control::connect_process_client(
+            &socket,
+            Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS),
+        )
+        .await?;
+        process_control_connection = Some(connection);
+        Some(bootstrap)
+    } else {
+        None
+    };
 
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let process_uses_sidecar_snapshots =
-        process_enabled && !network_enabled && sidecar_network_enforcement;
-    let (mut policy, opa_engine, retained_proto, loaded_policy_origin) = if process_uses_sidecar_snapshots {
-        let snapshot_path = sidecar_policy_snapshot_file().ok_or_else(|| {
-            miette::miette!(
-                "{} is required for process-only sidecar topology",
-                openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE
+    let (mut policy, opa_engine, retained_proto, loaded_policy_origin) =
+        if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
+            let (policy, engine, proto) = load_policy_from_sidecar_bootstrap(bootstrap)?;
+            (
+                policy,
+                engine,
+                proto,
+                LoadedPolicyOrigin::Gateway { revision: None },
             )
-        })?;
-        let (policy, engine, proto) = load_policy_from_sidecar_snapshot(&snapshot_path)?;
-        (
-            policy,
-            engine,
-            proto,
-            LoadedPolicyOrigin::Gateway { revision: None },
-        )
-    } else {
-        load_policy(
-            sandbox_id.clone(),
-            sandbox,
-            openshell_endpoint.clone(),
-            policy_rules,
-            policy_data,
-        )
-        .await?
-    };
+        } else {
+            load_policy(
+                sandbox_id.clone(),
+                sandbox,
+                openshell_endpoint.clone(),
+                policy_rules,
+                policy_data,
+            )
+            .await?
+        };
 
     // Override the policy's process identity with the driver-resolved UID/GID
     // from the pod environment. The policy defaults to the name "sandbox" which
@@ -207,86 +213,86 @@ pub async fn run_sandbox(
         policy.process.run_as_group = Some(gid);
     }
 
-    let mut process_sidecar_provider_snapshot_path = None;
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let (provider_credentials, mut provider_env) = if process_uses_sidecar_snapshots {
-        let snapshot_path = sidecar_provider_env_snapshot_file().ok_or_else(|| {
-            miette::miette!(
-                "{} is required for process-only sidecar topology",
-                openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE
-            )
-        })?;
-        process_sidecar_provider_snapshot_path = Some(snapshot_path.clone());
-        read_sidecar_provider_env_snapshot(&snapshot_path)?
-    } else {
-        // Fetch provider environment variables from the server.
-        // This is done after loading the policy so the sandbox can still start
-        // even if provider env fetch fails (graceful degradation).
-        let (
-            provider_env_revision,
-            provider_env,
-            provider_credential_expires_at_ms,
-            dynamic_credentials,
-        ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
-                Ok(result) => {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .message(format!(
-                                "Fetched provider environment [env_count:{}]",
-                                result.environment.len()
-                            ))
-                            .build()
-                    );
-                    (
-                        result.provider_env_revision,
-                        result.environment,
-                        result.credential_expires_at_ms,
-                        result.dynamic_credentials,
-                    )
-                }
-                Err(e) => {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .state(StateId::Other, "degraded")
-                            .message(format!(
-                                "Failed to fetch provider environment, continuing without: {e}"
-                            ))
-                            .build()
-                    );
-                    (
-                        0,
-                        std::collections::HashMap::new(),
-                        std::collections::HashMap::new(),
-                        std::collections::HashMap::new(),
-                    )
-                }
-            }
+    let (provider_credentials, mut provider_env) =
+        if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
+            let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
+                bootstrap.provider_env_revision,
+                bootstrap.provider_child_env.clone(),
+            );
+            (provider_credentials, bootstrap.provider_child_env.clone())
         } else {
-            (
-                0,
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-            )
-        };
+            // Fetch provider environment variables from the server.
+            // This is done after loading the policy so the sandbox can still start
+            // even if provider env fetch fails (graceful degradation).
+            let (
+                provider_env_revision,
+                provider_env,
+                provider_credential_expires_at_ms,
+                dynamic_credentials,
+            ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+                match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
+                    Ok(result) => {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .message(format!(
+                                    "Fetched provider environment [env_count:{}]",
+                                    result.environment.len()
+                                ))
+                                .build()
+                        );
+                        (
+                            result.provider_env_revision,
+                            result.environment,
+                            result.credential_expires_at_ms,
+                            result.dynamic_credentials,
+                        )
+                    }
+                    Err(e) => {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Medium)
+                                .status(StatusId::Failure)
+                                .state(StateId::Other, "degraded")
+                                .message(format!(
+                                    "Failed to fetch provider environment, continuing without: {e}"
+                                ))
+                                .build()
+                        );
+                        (
+                            0,
+                            std::collections::HashMap::new(),
+                            std::collections::HashMap::new(),
+                            std::collections::HashMap::new(),
+                        )
+                    }
+                }
+            } else {
+                (
+                    0,
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
+                )
+            };
 
-        let provider_credentials = ProviderCredentialState::from_environment(
-            provider_env_revision,
-            provider_env,
-            provider_credential_expires_at_ms,
-            dynamic_credentials,
-        );
-        let provider_env = provider_credentials.child_env_with_gcp_resolved();
-        (provider_credentials, provider_env)
-    };
-    if let Some(snapshot_path) = process_sidecar_provider_snapshot_path {
-        spawn_sidecar_provider_env_snapshot_watcher(snapshot_path, provider_credentials.clone());
+            let provider_credentials = ProviderCredentialState::from_environment(
+                provider_env_revision,
+                provider_env,
+                provider_credential_expires_at_ms,
+                dynamic_credentials,
+            );
+            let provider_env = provider_credentials.child_env_with_gcp_resolved();
+            (provider_credentials, provider_env)
+        };
+    let process_control_writer = process_control_connection
+        .as_ref()
+        .map(|connection| connection.writer.clone());
+    if let Some(connection) = process_control_connection {
+        spawn_sidecar_control_update_watcher(connection.updates, provider_credentials.clone());
     }
 
     // Initialize the agent-proposals feature flag. Default false until the
@@ -304,12 +310,6 @@ pub async fn run_sandbox(
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
-    if network_enabled
-        && !process_enabled
-        && let Some(path) = entrypoint_pid_file()
-    {
-        spawn_entrypoint_pid_file_watcher(path, entrypoint_pid.clone());
-    }
 
     // Create the workload's network namespace. It is shared infrastructure:
     // the proxy binds to its host-side veth IP, the bypass monitor reads
@@ -387,60 +387,57 @@ pub async fn run_sandbox(
         None
     };
 
-    if network_enabled && sidecar_network_enforcement {
-        let policy_snapshot_path = sidecar_policy_snapshot_file().ok_or_else(|| {
-            miette::miette!(
-                "{} is required for sidecar process snapshots",
-                openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE
-            )
-        })?;
-        let provider_snapshot_path = sidecar_provider_env_snapshot_file().ok_or_else(|| {
-            miette::miette!(
-                "{} is required for sidecar provider snapshots",
-                openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE
-            )
-        })?;
-        let proto = retained_proto.as_ref().ok_or_else(|| {
-            miette::miette!(
-                "sidecar topology requires a gateway policy snapshot for the process supervisor"
-            )
-        })?;
-        write_sidecar_policy_snapshot(&policy_snapshot_path, proto)?;
-        write_sidecar_provider_env_snapshot(
-            &provider_snapshot_path,
-            provider_credentials.snapshot().revision,
-            &provider_env,
-        )?;
-    }
-
     #[cfg(target_os = "linux")]
-    if network_enabled && sidecar_network_enforcement {
+    let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
         if !matches!(policy.network.mode, NetworkMode::Proxy) {
             return Err(miette::miette!(
                 "sidecar network enforcement requires proxy network mode"
             ));
         }
-        if let Some(path) = sidecar_ready_file.as_deref() {
-            write_supervisor_ready(path)?;
-        }
-    }
+        let socket = sidecar_control_socket().ok_or_else(|| {
+            miette::miette!(
+                "{} is required for sidecar topology",
+                openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET
+            )
+        })?;
+        let proto = retained_proto.as_ref().ok_or_else(|| {
+            miette::miette!(
+                "sidecar topology requires gateway policy data for the process supervisor"
+            )
+        })?;
+        let ca_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
+        Some(sidecar_control::spawn_server(
+            &socket,
+            sidecar_control::BootstrapData {
+                policy_proto: proto.clone(),
+                provider_env_revision: provider_credentials.snapshot().revision,
+                provider_child_env: provider_env.clone(),
+                proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
+                proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
+            },
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let sidecar_control_server: Option<sidecar_control::ServerHandle> = None;
 
-    if network_enabled
-        && sidecar_network_enforcement
-        && let (Some(endpoint), Some(id), Some(socket)) = (
-            openshell_endpoint.as_deref(),
-            sandbox_id.as_deref(),
-            ssh_socket_path.as_ref(),
-        )
-    {
-        wait_for_sidecar_ssh_socket(socket).await?;
-        openshell_supervisor_process::supervisor_session::spawn(
-            endpoint.to_string(),
-            id.to_string(),
-            std::path::PathBuf::from(socket),
-            None,
-        );
-        info!("sidecar supervisor session task spawned");
+    let sidecar_control_publisher = sidecar_control_server
+        .as_ref()
+        .map(sidecar_control::ServerHandle::publisher);
+
+    #[cfg(target_os = "linux")]
+    if network_enabled && sidecar_network_enforcement {
+        if let Some(server) = sidecar_control_server {
+            spawn_sidecar_entrypoint_handler(
+                server.into_entrypoint_receiver(),
+                entrypoint_pid.clone(),
+                opa_engine.clone(),
+                retained_proto.clone(),
+                openshell_endpoint.clone(),
+                sandbox_id.clone(),
+            );
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -520,7 +517,7 @@ pub async fn run_sandbox(
     }
 
     // Spawn background policy poll task (gRPC mode only).
-    if !process_uses_sidecar_snapshots
+    if !process_uses_sidecar_control
         && let (Some(id), Some(endpoint), Some(engine)) = (
             sandbox_id.as_deref(),
             openshell_endpoint.as_deref(),
@@ -534,10 +531,6 @@ pub async fn run_sandbox(
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = networking.as_ref().map(|n| n.policy_local_ctx.clone());
-        let poll_sidecar_provider_env_snapshot_path = (network_enabled
-            && sidecar_network_enforcement)
-            .then(sidecar_provider_env_snapshot_file)
-            .flatten();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -552,7 +545,7 @@ pub async fn run_sandbox(
             ocsf_enabled: poll_ocsf_enabled,
             provider_credentials: poll_provider_credentials,
             policy_local_ctx: poll_policy_local,
-            sidecar_provider_env_snapshot_path: poll_sidecar_provider_env_snapshot_path,
+            sidecar_control_publisher: sidecar_control_publisher.clone(),
         };
 
         tokio::spawn(async move {
@@ -609,16 +602,58 @@ pub async fn run_sandbox(
     }
 
     let process_policy = process_policy_for_topology(&policy, sidecar_network_enforcement)?;
+    let sidecar_bootstrap_ca_file_paths = sidecar_bootstrap.as_ref().and_then(|bootstrap| {
+        bootstrap
+            .proxy_ca_cert_path
+            .clone()
+            .zip(bootstrap.proxy_ca_bundle_path.clone())
+    });
 
     let exit_code = if process_enabled {
         let ca_file_paths = networking
             .as_ref()
             .and_then(|n| n.ca_file_paths.clone())
             .or_else(|| {
-                sidecar_network_enforcement
-                    .then(sidecar_ca_file_paths)
-                    .flatten()
+                if sidecar_network_enforcement {
+                    sidecar_bootstrap_ca_file_paths
+                        .clone()
+                        .or_else(sidecar_ca_file_paths)
+                } else {
+                    None
+                }
             });
+
+        let entrypoint_started_tx =
+            if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
+                let ssh_socket = ssh_socket_path.clone().ok_or_else(|| {
+                    miette::miette!(
+                        "{} is required for process-only sidecar topology",
+                        openshell_core::sandbox_env::SSH_SOCKET_PATH
+                    )
+                })?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    match rx.await {
+                        Ok(pid) => {
+                            if let Err(err) = sidecar_control::send_entrypoint_started(
+                                &writer,
+                                pid,
+                                std::path::Path::new(&ssh_socket),
+                            )
+                            .await
+                            {
+                                warn!(error = %err, "Failed to send sidecar entrypoint event");
+                            }
+                        }
+                        Err(_closed) => {
+                            debug!("Entrypoint exited before sidecar entrypoint event was sent");
+                        }
+                    }
+                });
+                Some(tx)
+            } else {
+                None
+            };
 
         openshell_supervisor_process::run::run_process(
             program,
@@ -633,6 +668,7 @@ pub async fn run_sandbox(
             &process_policy,
             process_enforcement_mode,
             entrypoint_pid,
+            entrypoint_started_tx,
             provider_credentials,
             provider_env,
             ca_file_paths,
@@ -707,258 +743,43 @@ fn process_enforcement_mode() -> ProcessEnforcementMode {
     }
 }
 
-fn supervisor_ready_file() -> Option<String> {
-    std::env::var(openshell_core::sandbox_env::SUPERVISOR_READY_FILE)
-        .ok()
-        .filter(|value| !value.is_empty())
-}
-
-fn entrypoint_pid_file() -> Option<String> {
-    std::env::var(openshell_core::sandbox_env::ENTRYPOINT_PID_FILE)
-        .ok()
-        .filter(|value| !value.is_empty())
-}
-
-fn spawn_entrypoint_pid_file_watcher(path: String, entrypoint_pid: Arc<AtomicU32>) {
-    tokio::spawn(async move {
-        let pid_path = std::path::PathBuf::from(&path);
-        loop {
-            match std::fs::read_to_string(&pid_path) {
-                Ok(contents) => match contents.trim().parse::<u32>() {
-                    Ok(pid) if pid > 0 => {
-                        entrypoint_pid.store(pid, Ordering::Release);
-                        info!(path, pid, "Loaded sidecar workload entrypoint PID");
-                        return;
-                    }
-                    Ok(_) | Err(_) => {
-                        debug!(path, contents = %contents.trim(), "Ignoring invalid entrypoint PID file contents");
-                    }
-                },
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    debug!(path, error = %err, "Failed to read entrypoint PID file");
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
-}
-
-async fn wait_for_supervisor_ready(path: &str) -> Result<()> {
-    let ready_path = std::path::Path::new(path);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS);
-    loop {
-        if ready_path.exists() {
-            info!(path, "Network supervisor sidecar is ready");
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(miette::miette!(
-                "timed out waiting for network supervisor sidecar readiness file {path}"
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn write_supervisor_ready(path: &str) -> Result<()> {
-    let ready_path = std::path::Path::new(path);
-    if let Some(parent) = ready_path.parent() {
-        std::fs::create_dir_all(parent).into_diagnostic()?;
-    }
-    std::fs::write(ready_path, b"ready\n").into_diagnostic()?;
-    info!(path, "Network supervisor sidecar readiness file written");
-    Ok(())
-}
-
-async fn wait_for_sidecar_ssh_socket(path: &str) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if sidecar_ssh_socket_ready(path) {
-            info!(path, "Sidecar SSH socket is ready for gateway relay");
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(miette::miette!(
-                "timed out waiting for process supervisor SSH socket {path}"
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-#[cfg(unix)]
-fn sidecar_ssh_socket_ready(path: &str) -> bool {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return false;
-    };
-    metadata.file_type().is_socket() && metadata.permissions().mode() & 0o060 == 0o060
-}
-
-#[cfg(not(unix))]
-fn sidecar_ssh_socket_ready(path: &str) -> bool {
-    std::path::Path::new(path).exists()
-}
-
-fn sidecar_policy_snapshot_file() -> Option<String> {
-    std::env::var(openshell_core::sandbox_env::SIDECAR_POLICY_SNAPSHOT_FILE)
+fn sidecar_control_socket() -> Option<std::path::PathBuf> {
+    std::env::var(openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET)
         .ok()
         .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
-fn sidecar_provider_env_snapshot_file() -> Option<String> {
-    std::env::var(openshell_core::sandbox_env::SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE)
-        .ok()
-        .filter(|path| !path.is_empty())
-}
-
-fn load_policy_from_sidecar_snapshot(
-    path: &str,
+fn load_policy_from_sidecar_bootstrap(
+    bootstrap: &sidecar_control::BootstrapData,
 ) -> Result<(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
     Option<openshell_core::proto::SandboxPolicy>,
 )> {
-    let bytes = std::fs::read(path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read sidecar policy snapshot from {path}"))?;
-    let proto = openshell_core::proto::SandboxPolicy::decode(bytes.as_slice())
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to decode sidecar policy snapshot from {path}"))?;
+    let proto = bootstrap.policy_proto.clone();
     let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto)?));
     let policy = SandboxPolicy::try_from(proto.clone())?;
-    info!(path, "Loaded sidecar policy snapshot");
+    info!("Loaded sidecar policy from control socket bootstrap");
     Ok((policy, opa_engine, Some(proto)))
 }
 
-fn write_sidecar_policy_snapshot(
-    path: &str,
-    proto: &openshell_core::proto::SandboxPolicy,
-) -> Result<()> {
-    let snapshot_path = std::path::Path::new(path);
-    if let Some(parent) = snapshot_path.parent() {
-        std::fs::create_dir_all(parent).into_diagnostic()?;
-    }
-    std::fs::write(snapshot_path, proto.encode_to_vec())
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to write sidecar policy snapshot to {path}"))?;
-    info!(path, "Wrote sidecar policy snapshot");
-    Ok(())
-}
-
-struct SidecarProviderEnvSnapshot {
-    revision: u64,
-    child_env: std::collections::HashMap<String, String>,
-}
-
-fn read_sidecar_provider_env_snapshot(
-    path: &str,
-) -> Result<(
-    ProviderCredentialState,
-    std::collections::HashMap<String, String>,
-)> {
-    let snapshot = read_sidecar_provider_env_snapshot_data(path)?;
-    let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
-        snapshot.revision,
-        snapshot.child_env.clone(),
-    );
-    info!(
-        path,
-        env_count = snapshot.child_env.len(),
-        "Loaded sidecar provider env snapshot"
-    );
-    Ok((provider_credentials, snapshot.child_env))
-}
-
-fn read_sidecar_provider_env_snapshot_data(path: &str) -> Result<SidecarProviderEnvSnapshot> {
-    let bytes = std::fs::read(path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read sidecar provider env snapshot from {path}"))?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to parse sidecar provider env snapshot from {path}"))?;
-    let revision = value
-        .get("revision")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or_default();
-    let child_env: std::collections::HashMap<String, String> =
-        serde_json::from_value(value.get("child_env").cloned().unwrap_or_default())
-            .into_diagnostic()
-            .wrap_err_with(|| {
-                format!("failed to decode child_env from sidecar provider env snapshot {path}")
-            })?;
-    Ok(SidecarProviderEnvSnapshot {
-        revision,
-        child_env,
-    })
-}
-
-fn write_sidecar_provider_env_snapshot(
-    path: &str,
-    revision: u64,
-    child_env: &std::collections::HashMap<String, String>,
-) -> Result<()> {
-    let snapshot_path = std::path::Path::new(path);
-    if let Some(parent) = snapshot_path.parent() {
-        std::fs::create_dir_all(parent).into_diagnostic()?;
-    }
-    let value = serde_json::json!({
-        "revision": revision,
-        "child_env": child_env,
-    });
-    let bytes = serde_json::to_vec(&value).into_diagnostic()?;
-    write_atomic(snapshot_path, &bytes)
-        .wrap_err_with(|| format!("failed to write sidecar provider env snapshot to {path}"))?;
-    info!(
-        path,
-        env_count = child_env.len(),
-        "Wrote sidecar provider env snapshot"
-    );
-    Ok(())
-}
-
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).into_diagnostic()?;
-    }
-    let file_name = path
-        .file_name()
-        .and_then(std::ffi::OsStr::to_str)
-        .unwrap_or("snapshot");
-    let tmp_path = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp_path, bytes).into_diagnostic()?;
-    std::fs::rename(&tmp_path, path).into_diagnostic()?;
-    Ok(())
-}
-
-fn refresh_sidecar_provider_env_snapshot(
-    path: &str,
-    provider_credentials: &ProviderCredentialState,
-) -> Result<Option<(u64, usize)>> {
-    let snapshot = read_sidecar_provider_env_snapshot_data(path)?;
-    let current_revision = provider_credentials.snapshot().revision;
-    if snapshot.revision <= current_revision {
-        return Ok(None);
-    }
-    let env_count =
-        provider_credentials.install_child_env_snapshot(snapshot.revision, snapshot.child_env);
-    Ok(Some((snapshot.revision, env_count)))
-}
-
-fn spawn_sidecar_provider_env_snapshot_watcher(
-    path: String,
+fn spawn_sidecar_control_update_watcher(
+    mut updates: tokio::sync::mpsc::UnboundedReceiver<sidecar_control::ControlUpdate>,
     provider_credentials: ProviderCredentialState,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            match refresh_sidecar_provider_env_snapshot(&path, &provider_credentials) {
-                Ok(Some((revision, env_count))) => {
+        while let Some(update) = updates.recv().await {
+            match update {
+                sidecar_control::ControlUpdate::ProviderEnvUpdated {
+                    revision,
+                    provider_child_env,
+                } => {
+                    if revision <= provider_credentials.snapshot().revision {
+                        continue;
+                    }
+                    let env_count = provider_credentials
+                        .install_child_env_snapshot(revision, provider_child_env);
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
@@ -966,22 +787,73 @@ fn spawn_sidecar_provider_env_snapshot_watcher(
                             .state(StateId::Enabled, "loaded")
                             .unmapped("provider_env_revision", serde_json::json!(revision))
                             .message(format!(
-                                "Sidecar provider environment snapshot refreshed [revision:{revision} env_count:{env_count}]"
+                                "Sidecar provider environment refreshed [revision:{revision} env_count:{env_count}]"
                             ))
                             .build()
                     );
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        path,
-                        "Failed to refresh sidecar provider environment snapshot"
+                sidecar_control::ControlUpdate::PolicyUpdated {
+                    policy_proto,
+                    policy_hash,
+                    config_revision,
+                } => {
+                    debug!(
+                        version = policy_proto.version,
+                        policy_hash,
+                        config_revision,
+                        "Received sidecar policy update for process supervisor"
                     );
                 }
             }
         }
     })
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_sidecar_entrypoint_handler(
+    mut entrypoint_rx: tokio::sync::mpsc::UnboundedReceiver<sidecar_control::EntrypointStarted>,
+    entrypoint_pid: Arc<AtomicU32>,
+    opa_engine: Option<Arc<OpaEngine>>,
+    retained_proto: Option<openshell_core::proto::SandboxPolicy>,
+    openshell_endpoint: Option<String>,
+    sandbox_id: Option<String>,
+) {
+    tokio::spawn(async move {
+        let Some(started) = entrypoint_rx.recv().await else {
+            return;
+        };
+
+        entrypoint_pid.store(started.pid, std::sync::atomic::Ordering::Release);
+        info!(
+            pid = started.pid,
+            ssh_socket = %started.ssh_socket_path.display(),
+            "Sidecar process supervisor reported entrypoint start"
+        );
+
+        if let (Some(engine), Some(proto)) = (opa_engine.as_ref(), retained_proto.as_ref()) {
+            match engine.reload_from_proto_with_pid(proto, started.pid) {
+                Ok(()) => info!(
+                    pid = started.pid,
+                    "Policy binary symlink resolution complete for sidecar entrypoint"
+                ),
+                Err(err) => warn!(
+                    error = %err,
+                    pid = started.pid,
+                    "Failed to rebuild OPA engine with sidecar entrypoint PID"
+                ),
+            }
+        }
+
+        if let (Some(endpoint), Some(id)) = (openshell_endpoint, sandbox_id) {
+            openshell_supervisor_process::supervisor_session::spawn(
+                endpoint,
+                id,
+                started.ssh_socket_path,
+                None,
+            );
+            info!("sidecar supervisor session task spawned");
+        }
+    });
 }
 
 fn sidecar_ca_file_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
@@ -2404,7 +2276,7 @@ struct PolicyPollLoopContext {
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
-    sidecar_provider_env_snapshot_path: Option<String>,
+    sidecar_control_publisher: Option<sidecar_control::Publisher>,
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
@@ -2524,30 +2396,13 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     );
                     let child_env = ctx.provider_credentials.child_env_with_gcp_resolved();
                     let env_count = child_env.len();
-                    let snapshot_write_ok = match ctx.sidecar_provider_env_snapshot_path.as_deref()
-                    {
-                        Some(snapshot_path) => {
-                            match write_sidecar_provider_env_snapshot(
-                                snapshot_path,
-                                env_result.provider_env_revision,
-                                &child_env,
-                            ) {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    warn!(
-                                        error = %e,
-                                        path = snapshot_path,
-                                        "Settings poll: failed to write sidecar provider environment snapshot"
-                                    );
-                                    false
-                                }
-                            }
-                        }
-                        None => true,
-                    };
-                    if snapshot_write_ok {
-                        current_provider_env_revision = env_result.provider_env_revision;
+                    if let Some(publisher) = ctx.sidecar_control_publisher.as_ref() {
+                        publisher.publish_provider_env(
+                            env_result.provider_env_revision,
+                            child_env.clone(),
+                        );
                     }
+                    current_provider_env_revision = env_result.provider_env_revision;
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Informational)
@@ -2594,6 +2449,13 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                 Ok(()) => {
                     if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
                         policy_local_ctx.set_current_policy(policy.clone()).await;
+                    }
+                    if let Some(publisher) = ctx.sidecar_control_publisher.as_ref() {
+                        publisher.publish_policy(
+                            policy.clone(),
+                            result.policy_hash.clone(),
+                            result.config_revision,
+                        );
                     }
                     if result.global_policy_version > 0 {
                         ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -2869,27 +2731,34 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sidecar_provider_env_snapshot_refresh_installs_newer_revision() {
-        let dir = tempfile::tempdir().unwrap();
-        let snapshot_path = dir.path().join("provider-env.json");
-        let snapshot_path = snapshot_path.to_str().unwrap();
+    #[tokio::test]
+    async fn sidecar_control_provider_env_update_installs_newer_revision() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let provider_credentials = ProviderCredentialState::from_child_env_snapshot(
             1,
             std::collections::HashMap::from([("TOKEN".to_string(), "old".to_string())]),
         );
+        let handle = spawn_sidecar_control_update_watcher(rx, provider_credentials.clone());
 
-        write_sidecar_provider_env_snapshot(
-            snapshot_path,
-            2,
-            &std::collections::HashMap::from([("TOKEN".to_string(), "new".to_string())]),
-        )
+        tx.send(sidecar_control::ControlUpdate::ProviderEnvUpdated {
+            revision: 2,
+            provider_child_env: std::collections::HashMap::from([(
+                "TOKEN".to_string(),
+                "new".to_string(),
+            )]),
+        })
         .unwrap();
 
-        assert_eq!(
-            refresh_sidecar_provider_env_snapshot(snapshot_path, &provider_credentials).unwrap(),
-            Some((2, 1))
-        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if provider_credentials.snapshot().revision == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         let snapshot = provider_credentials.snapshot();
         assert_eq!(snapshot.revision, 2);
         assert_eq!(
@@ -2897,16 +2766,15 @@ mod tests {
             Some("new")
         );
 
-        write_sidecar_provider_env_snapshot(
-            snapshot_path,
-            1,
-            &std::collections::HashMap::from([("TOKEN".to_string(), "stale".to_string())]),
-        )
+        tx.send(sidecar_control::ControlUpdate::ProviderEnvUpdated {
+            revision: 1,
+            provider_child_env: std::collections::HashMap::from([(
+                "TOKEN".to_string(),
+                "stale".to_string(),
+            )]),
+        })
         .unwrap();
-        assert_eq!(
-            refresh_sidecar_provider_env_snapshot(snapshot_path, &provider_credentials).unwrap(),
-            None
-        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
             provider_credentials
                 .snapshot()
@@ -2915,6 +2783,7 @@ mod tests {
                 .map(String::as_str),
             Some("new")
         );
+        handle.abort();
     }
 
     #[test]

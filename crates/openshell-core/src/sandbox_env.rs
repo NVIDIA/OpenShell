@@ -43,20 +43,12 @@ pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
 /// `/proc` identity binding.
 pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
 
-/// File written by the network supervisor when sidecar networking is ready.
-pub const SUPERVISOR_READY_FILE: &str = "OPENSHELL_SUPERVISOR_READY_FILE";
-
-/// File written by the process supervisor with the workload entrypoint PID and
-/// read by the network sidecar for process/binary-bound network policy checks.
-pub const ENTRYPOINT_PID_FILE: &str = "OPENSHELL_ENTRYPOINT_PID_FILE";
-
-/// Local protobuf policy snapshot written by the network sidecar and read by
-/// the process-only supervisor in Kubernetes sidecar topology.
-pub const SIDECAR_POLICY_SNAPSHOT_FILE: &str = "OPENSHELL_SIDECAR_POLICY_SNAPSHOT_FILE";
-
-/// Local provider environment snapshot written by the network sidecar and read
-/// by the process-only supervisor in Kubernetes sidecar topology.
-pub const SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE: &str = "OPENSHELL_SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE";
+/// Unix socket used by Kubernetes sidecar topology for local coordination.
+///
+/// The network sidecar owns gateway credentials and serves policy/provider
+/// state over this socket instead of exposing gateway credentials to the agent
+/// container.
+pub const SIDECAR_CONTROL_SOCKET: &str = "OPENSHELL_SIDECAR_CONTROL_SOCKET";
 
 /// Optional TLS server name override used when connecting to the gateway.
 pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
