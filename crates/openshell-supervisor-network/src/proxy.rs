@@ -3738,12 +3738,23 @@ fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
 /// `host.openshell.internal`, if present and safe.
 ///
 /// This is called once before user code runs, so the returned value is immune
-/// to later hosts-file tampering by sandbox workloads. Returns `None` if no
-/// entry exists, the entry cannot be parsed, or the mapped IP is a cloud
-/// metadata address.
+/// to later hosts-file tampering by sandbox workloads. Returns `None` if the
+/// hosts file cannot be read, no entry exists, the entry cannot be parsed, or
+/// the mapped IP is a cloud metadata address.
 #[cfg(any(target_os = "linux", target_os = "windows", test))]
 pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
-    let contents = std::fs::read_to_string(platform_hosts_path()).ok()?;
+    let hosts_path = platform_hosts_path();
+    let contents = match std::fs::read_to_string(&hosts_path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            warn!(
+                path = %hosts_path.display(),
+                %error,
+                "failed to read platform hosts file; trusted-gateway SSRF exemption disabled"
+            );
+            return None;
+        }
+    };
     let ips = parse_hosts_file_for_host(&contents, "host.openshell.internal");
 
     // Multiple distinct IPs for the alias is unexpected — compute drivers
@@ -3795,18 +3806,30 @@ pub(crate) fn detect_trusted_host_gateway() -> Option<IpAddr> {
 }
 
 #[cfg(target_os = "linux")]
-fn platform_hosts_path() -> &'static str {
-    "/etc/hosts"
+fn platform_hosts_path() -> PathBuf {
+    PathBuf::from("/etc/hosts")
 }
 
 #[cfg(target_os = "windows")]
-fn platform_hosts_path() -> &'static str {
-    r"C:\Windows\System32\drivers\etc\hosts"
+fn platform_hosts_path() -> PathBuf {
+    windows_hosts_path_from_system_root(std::env::var("SystemRoot").ok().as_deref())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_hosts_path_from_system_root(system_root: Option<&str>) -> PathBuf {
+    let root = system_root
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(r"C:\Windows");
+    PathBuf::from(root)
+        .join("System32")
+        .join("drivers")
+        .join("etc")
+        .join("hosts")
 }
 
 #[cfg(all(test, not(any(target_os = "linux", target_os = "windows"))))]
-fn platform_hosts_path() -> &'static str {
-    "/etc/hosts"
+fn platform_hosts_path() -> PathBuf {
+    PathBuf::from("/etc/hosts")
 }
 
 /// Resolve `host:port` and validate that every resolved address matches the
