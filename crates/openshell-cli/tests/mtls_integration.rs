@@ -668,6 +668,7 @@ async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_
 
 #[tokio::test]
 async fn cli_connects_with_client_cert() {
+    let _env = EnvVarGuard::set(&[]);
     install_rustls_provider();
 
     let (ca, ca_key) = build_ca();
@@ -741,6 +742,7 @@ async fn run_server_no_client_auth(
 
 #[tokio::test]
 async fn cli_connects_with_gateway_insecure() {
+    let _env = EnvVarGuard::set(&[]);
     install_rustls_provider();
 
     let (ca, ca_key) = build_ca();
