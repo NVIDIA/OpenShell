@@ -1514,38 +1514,54 @@ mod tests {
         );
     }
 
-    /// When a built-in driver was compiled out, resolving it must fail with a
-    /// message that names both the driver and the Cargo flag that re-enables
-    /// it. Iterates over every compiled-out kind so a single test run under
-    /// e.g. `--no-default-features` exercises all four rejection messages;
-    /// the default build has every driver and the loop body is skipped.
+    /// Exercise both directions of the compile-time driver gate. A driver
+    /// compiled *in* must resolve to `ConfiguredComputeDriver::Builtin(kind)`;
+    /// a driver compiled *out* must fail with a message that names both the
+    /// driver and the Cargo flag that re-enables it.
     #[test]
-    fn configured_compute_driver_rejects_compiled_out_builtin() {
-        let missing = [
-            (
-                cfg!(feature = "driver-kubernetes"),
-                ComputeDriverKind::Kubernetes,
-            ),
-            (cfg!(feature = "driver-docker"), ComputeDriverKind::Docker),
-            (cfg!(feature = "driver-podman"), ComputeDriverKind::Podman),
-            (cfg!(feature = "driver-vm"), ComputeDriverKind::Vm),
+    fn configured_compute_driver_matches_compiled_features() {
+        // Exhaustive match to ensure that the test is updated if a new driver is added.
+        fn compiled_in(kind: ComputeDriverKind) -> bool {
+            match kind {
+                ComputeDriverKind::Kubernetes => cfg!(feature = "driver-kubernetes"),
+                ComputeDriverKind::Docker => cfg!(feature = "driver-docker"),
+                ComputeDriverKind::Podman => cfg!(feature = "driver-podman"),
+                ComputeDriverKind::Vm => cfg!(feature = "driver-vm"),
+            }
+        }
+
+        let driver_features: std::collections::HashMap<ComputeDriverKind, bool> = [
+            ComputeDriverKind::Kubernetes,
+            ComputeDriverKind::Docker,
+            ComputeDriverKind::Podman,
+            ComputeDriverKind::Vm,
         ]
         .into_iter()
-        .filter_map(|(present, kind)| (!present).then_some(kind));
+        .map(|kind| (kind, compiled_in(kind)))
+        .collect();
 
-        for kind in missing {
+        for (&kind, &present) in &driver_features {
             let config = Config::new(None).with_compute_drivers([kind]);
-            let err =
-                configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
-            let msg = err.to_string();
-            assert!(
-                msg.contains("not compiled into this gateway"),
-                "driver {kind:?}: unexpected error: {msg}"
-            );
-            assert!(
-                msg.contains(&format!("--features driver-{}", kind.as_str())),
-                "driver {kind:?}: error must name the Cargo flag that re-enables the driver: {msg}"
-            );
+            let result = configured_compute_driver(&config, test_driver_startup(&config, None));
+
+            if present {
+                let driver = result.unwrap();
+                assert!(
+                    matches!(driver, ConfiguredComputeDriver::Builtin(k) if k == kind),
+                    "driver {kind:?}: expected Builtin({kind:?}), got {driver:?}"
+                );
+            } else {
+                let err = result.expect_err("must reject compiled-out driver");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("not compiled into this gateway"),
+                    "driver {kind:?}: unexpected error: {msg}"
+                );
+                assert!(
+                    msg.contains(&format!("--features driver-{}", kind.as_str())),
+                    "driver {kind:?}: error must name the Cargo flag that re-enables the driver: {msg}"
+                );
+            }
         }
     }
 }
