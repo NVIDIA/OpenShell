@@ -946,8 +946,7 @@ fn resolve_configured_compute_driver(
     if let Some(kind) = driver_kind {
         if !driver_compiled_in(kind) {
             return Err(Error::config(format!(
-                "compute driver '{name}' is not compiled into this gateway; \
-                 rebuild openshell-server with --features driver-{name} to enable it"
+                "compute driver '{name}' is not supported by this gateway build"
             )));
         }
         return Ok(ConfiguredComputeDriver::Builtin(kind));
@@ -1535,8 +1534,8 @@ mod tests {
 
     /// Exercise both directions of the compile-time driver gate. A driver
     /// compiled *in* must resolve to `ConfiguredComputeDriver::Builtin(kind)`;
-    /// a driver compiled *out* must fail with a message that names both the
-    /// driver and the Cargo flag that re-enables it.
+    /// a driver compiled *out* must fail with a message that names the
+    /// specific driver and states it is not supported by this gateway build.
     #[test]
     fn configured_compute_driver_matches_compiled_features() {
         // Exhaustive match to ensure that the test is updated if a new driver is added.
@@ -1573,12 +1572,12 @@ mod tests {
                 let err = result.expect_err("must reject compiled-out driver");
                 let msg = err.to_string();
                 assert!(
-                    msg.contains("not compiled into this gateway"),
+                    msg.contains("not supported by this gateway build"),
                     "driver {kind:?}: unexpected error: {msg}"
                 );
                 assert!(
-                    msg.contains(&format!("--features driver-{}", kind.as_str())),
-                    "driver {kind:?}: error must name the Cargo flag that re-enables the driver: {msg}"
+                    msg.contains(kind.as_str()),
+                    "driver {kind:?}: error must name the specific driver: {msg}"
                 );
             }
         }
