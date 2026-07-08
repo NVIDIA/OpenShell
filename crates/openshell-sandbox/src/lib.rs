@@ -1766,6 +1766,11 @@ struct PolicyPollLoopContext {
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
 }
 
+/// Maximum attempts to deliver a pending initial policy acknowledgement before
+/// giving up and resuming normal polling, so a permanently undeliverable ack
+/// cannot stall later hot-reloads.
+const MAX_PENDING_ACK_ATTEMPTS: u32 = 6;
+
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
@@ -1785,6 +1790,10 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     // status-report failure never fails a healthy sandbox, and so a newer
     // revision cannot be acknowledged ahead of the one actually loaded.
     let mut pending_initial_ack: Option<InitialPolicyAck> = None;
+    // Bounded so a permanently-undeliverable initial acknowledgement (e.g. the
+    // revision was superseded before it could be reported) cannot block newer
+    // policy revisions and provider-env refreshes forever.
+    let mut pending_ack_attempts: u32 = 0;
 
     // Initialize revision from the first poll and acknowledge the initial
     // policy revision the supervisor actually loaded. Seeding the loop from
@@ -1832,12 +1841,26 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
         // Deliver any pending initial acknowledgement before processing newer
         // revisions, so the revision actually loaded is acknowledged first and
-        // policy history is never reordered.
+        // policy history is never reordered. Bounded: after a fixed number of
+        // failed attempts, give up and resume normal polling so a permanently
+        // undeliverable ack cannot stall later hot-reloads.
         if let Some(candidate) = pending_initial_ack.clone() {
             if report_initial_policy_ack(&client, &ctx.sandbox_id, &candidate).await {
                 pending_initial_ack = None;
+                pending_ack_attempts = 0;
             } else {
-                continue;
+                pending_ack_attempts += 1;
+                if pending_ack_attempts >= MAX_PENDING_ACK_ATTEMPTS {
+                    warn!(
+                        version = candidate.version,
+                        attempts = pending_ack_attempts,
+                        "Giving up on pending initial policy acknowledgement; resuming normal polling"
+                    );
+                    pending_initial_ack = None;
+                    pending_ack_attempts = 0;
+                } else {
+                    continue;
+                }
             }
         }
 
