@@ -1258,7 +1258,7 @@ async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
     .await
     .expect("provider create");
 
-    // The env value overrides the `--material` duplicate and is auto-marked secret.
+    // The env value reaches the request and is auto-marked secret.
     let guard = EnvVarGuard::set(&[("OPENSHELL_ITEST_SME_PRIVATE_KEY", "pem-from-env")]);
     run::provider_refresh_config(
         &ts.endpoint,
@@ -1266,10 +1266,7 @@ async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
             name: "gc-bridge",
             credential_key: "GOOGLE_CHAT_ACCESS_TOKEN",
             strategy: "google_service_account_jwt",
-            material: &[
-                "client_email=bot@p.iam.gserviceaccount.com".to_string(),
-                "private_key=argv-value-must-be-overridden".to_string(),
-            ],
+            material: &["client_email=bot@p.iam.gserviceaccount.com".to_string()],
             secret_material_env: &["private_key=OPENSHELL_ITEST_SME_PRIVATE_KEY".to_string()],
             secret_material_keys: &[],
             credential_expires_at_ms: None,
@@ -1297,6 +1294,36 @@ async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
             expires_at_ms: None,
         }]
     );
+}
+
+#[tokio::test]
+async fn provider_refresh_configure_rejects_key_supplied_via_both_material_and_env() {
+    let ts = run_server().await;
+
+    let guard = EnvVarGuard::set(&[("OPENSHELL_ITEST_SME_DUP_KEY", "pem-from-env")]);
+    let err = run::provider_refresh_config(
+        &ts.endpoint,
+        run::ProviderRefreshConfigInput {
+            name: "gc-bridge",
+            credential_key: "GOOGLE_CHAT_ACCESS_TOKEN",
+            strategy: "google_service_account_jwt",
+            material: &["private_key=argv-value".to_string()],
+            secret_material_env: &["private_key=OPENSHELL_ITEST_SME_DUP_KEY".to_string()],
+            secret_material_keys: &[],
+            credential_expires_at_ms: None,
+        },
+        &ts.tls,
+    )
+    .await
+    .expect_err("duplicate key across --material and --secret-material-env should fail");
+    drop(guard);
+
+    assert!(
+        err.to_string()
+            .contains("duplicate material key 'private_key'")
+    );
+    // Rejected client-side: nothing reached the gateway.
+    assert!(ts.state.refresh_requests.lock().await.is_empty());
 }
 
 #[tokio::test]

@@ -4037,6 +4037,11 @@ pub fn parse_secret_material_env_pairs(items: &[String]) -> Result<HashMap<Strin
             ));
         }
 
+        if map.contains_key(key) {
+            return Err(miette::miette!(
+                "--secret-material-env key '{key}' supplied more than once"
+            ));
+        }
         map.insert(key.to_string(), value);
     }
 
@@ -5331,8 +5336,14 @@ pub async fn provider_refresh_config(
     let strategy = provider_refresh_strategy(input.strategy)?;
     let mut material = parse_key_value_pairs(input.material, "--material")?;
     let mut secret_material_keys = input.secret_material_keys.to_vec();
-    // Env-resolved secrets override `--material` duplicates and are auto-marked secret.
+    // Env-resolved secrets are auto-marked secret; duplicate keys are an
+    // error rather than a precedence order.
     for (key, value) in parse_secret_material_env_pairs(input.secret_material_env)? {
+        if material.contains_key(&key) {
+            return Err(miette!(
+                "duplicate material key '{key}': supplied via both --material and --secret-material-env"
+            ));
+        }
         if !secret_material_keys.contains(&key) {
             secret_material_keys.push(key.clone());
         }
@@ -8089,6 +8100,21 @@ mod tests {
         let err = parse_secret_material_env_pairs(&["=NAV_PARSE_SME_NO_KEY".to_string()])
             .expect_err("empty key should error");
         assert!(err.to_string().contains("key cannot be empty"));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_duplicate_keys() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_DUP", "value");
+
+        let err = parse_secret_material_env_pairs(&[
+            "private_key=NAV_PARSE_SME_DUP".to_string(),
+            "private_key=NAV_PARSE_SME_DUP".to_string(),
+        ])
+        .expect_err("duplicate key should error");
+        assert!(
+            err.to_string()
+                .contains("key 'private_key' supplied more than once")
+        );
     }
 
     #[test]
