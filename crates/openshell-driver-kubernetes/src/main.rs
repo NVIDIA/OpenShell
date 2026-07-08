@@ -81,12 +81,7 @@ struct Args {
     )]
     supervisor_sideload_method: SupervisorSideloadMethod,
 
-    #[arg(
-        long,
-        alias = "supervisor-topology",
-        env = "OPENSHELL_K8S_TOPOLOGY",
-        default_value = "combined"
-    )]
+    #[arg(long, env = "OPENSHELL_K8S_TOPOLOGY", default_value = "combined")]
     topology: SupervisorTopology,
 
     #[arg(

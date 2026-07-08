@@ -563,7 +563,7 @@ impl KubernetesComputeDriver {
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
-            supervisor_topology: self.config.topology,
+            topology: self.config.topology,
             proxy_uid: self.config.sidecar.proxy_uid,
             process_binary_aware_network_policy: self
                 .config
@@ -1786,7 +1786,7 @@ struct SandboxPodParams<'a> {
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
-    supervisor_topology: SupervisorTopology,
+    topology: SupervisorTopology,
     proxy_uid: u32,
     process_binary_aware_network_policy: bool,
     service_account_name: &'a str,
@@ -1820,7 +1820,7 @@ impl Default for SandboxPodParams<'_> {
             supervisor_image: "",
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
-            supervisor_topology: SupervisorTopology::default(),
+            topology: SupervisorTopology::default(),
             proxy_uid: DEFAULT_PROXY_UID,
             process_binary_aware_network_policy: true,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
@@ -1846,9 +1846,7 @@ impl Default for SandboxPodParams<'_> {
 fn validate_sidecar_proxy_identity(
     params: &SandboxPodParams<'_>,
 ) -> Result<(), KubernetesDriverError> {
-    if params.supervisor_topology == SupervisorTopology::Sidecar
-        && params.proxy_uid == params.sandbox_uid
-    {
+    if params.topology == SupervisorTopology::Sidecar && params.proxy_uid == params.sandbox_uid {
         return Err(KubernetesDriverError::Precondition(format!(
             "proxy_uid ({}) must not match sandbox_uid ({}) in sidecar topology",
             params.proxy_uid, params.sandbox_uid
@@ -2153,7 +2151,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     // pod fsGroup + 0440 to preserve gateway session and SSH control behavior.
     let mut volumes: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
-        let client_tls_default_mode = match params.supervisor_topology {
+        let client_tls_default_mode = match params.topology {
             SupervisorTopology::Combined => 0o400,
             SupervisorTopology::Sidecar => 0o440,
         };
@@ -2179,7 +2177,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     // it automatically. The supervisor exchanges this for a gateway-minted
     // JWT via `IssueSandboxToken` once at startup. In sidecar topology both
     // supervisor containers run with the sandbox GID and need group-read access.
-    let sa_token_default_mode = match params.supervisor_topology {
+    let sa_token_default_mode = match params.topology {
         SupervisorTopology::Combined => 0o400,
         SupervisorTopology::Sidecar => 0o440,
     };
@@ -2217,7 +2215,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
 
     let mut result = serde_json::Value::Object(template_value);
 
-    match params.supervisor_topology {
+    match params.topology {
         SupervisorTopology::Combined => {
             apply_supervisor_sideload(
                 &mut result,
@@ -3087,7 +3085,7 @@ mod tests {
     #[test]
     fn sidecar_topology_renders_process_agent_and_network_sidecar() {
         let params = SandboxPodParams {
-            supervisor_topology: SupervisorTopology::Sidecar,
+            topology: SupervisorTopology::Sidecar,
             supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
             supervisor_image: "supervisor-image:latest",
             supervisor_image_pull_policy: "IfNotPresent",
@@ -3305,7 +3303,7 @@ mod tests {
     #[test]
     fn sidecar_topology_can_relax_process_binary_aware_network_policy() {
         let params = SandboxPodParams {
-            supervisor_topology: SupervisorTopology::Sidecar,
+            topology: SupervisorTopology::Sidecar,
             supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
             supervisor_image: "supervisor-image:latest",
             proxy_uid: 2200,
@@ -3348,7 +3346,7 @@ mod tests {
     #[test]
     fn sidecar_topology_adds_shared_state_and_tls_volumes() {
         let params = SandboxPodParams {
-            supervisor_topology: SupervisorTopology::Sidecar,
+            topology: SupervisorTopology::Sidecar,
             supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
             supervisor_image: "supervisor-image:latest",
             grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
@@ -3398,7 +3396,7 @@ mod tests {
     #[test]
     fn sidecar_topology_rejects_proxy_uid_matching_sandbox_uid() {
         let params = SandboxPodParams {
-            supervisor_topology: SupervisorTopology::Sidecar,
+            topology: SupervisorTopology::Sidecar,
             proxy_uid: 1500,
             sandbox_uid: 1500,
             ..SandboxPodParams::default()

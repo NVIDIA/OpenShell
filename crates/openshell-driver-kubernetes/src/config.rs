@@ -83,7 +83,7 @@ impl FromStr for SupervisorTopology {
         match s {
             "combined" => Ok(Self::Combined),
             "sidecar" => Ok(Self::Sidecar),
-            other => Err(format!("unknown supervisor topology '{other}'")),
+            other => Err(format!("unknown topology '{other}'")),
         }
     }
 }
