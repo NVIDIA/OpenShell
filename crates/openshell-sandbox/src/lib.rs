@@ -69,7 +69,7 @@ use openshell_supervisor_process::process::ProcessEnforcementMode;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
 use tokio::sync::mpsc::UnboundedSender;
-#[cfg(target_os = "linux")]
+#[cfg(any(test, target_os = "linux"))]
 use tokio::time::timeout;
 
 const SIDECAR_NETWORK_ENFORCEMENT_MODE: &str = "sidecar-nftables";
@@ -2761,7 +2761,7 @@ mod tests {
         })
         .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        timeout(Duration::from_secs(1), async {
             loop {
                 if provider_credentials.snapshot().revision == 2 {
                     break;
