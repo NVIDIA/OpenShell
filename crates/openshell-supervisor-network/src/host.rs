@@ -100,7 +100,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         &proxy_policy,
         Some(config.bind_addr),
         engine,
-        Arc::new(ProxyIdentityMode::static_binary(config.binary_path)),
+        Arc::new(ProxyIdentityMode::static_binary(config.binary_path)?),
         // Host mode does not install a CA into the sandbox yet; L4 policy and
         // plaintext/forward-proxy L7 paths are active, while HTTPS MITM is a
         // follow-up once MXC has a trust-bootstrap story.
