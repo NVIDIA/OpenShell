@@ -427,17 +427,18 @@ pub async fn run_sandbox(
         .map(sidecar_control::ServerHandle::publisher);
 
     #[cfg(target_os = "linux")]
-    if network_enabled && sidecar_network_enforcement {
-        if let Some(server) = sidecar_control_server {
-            spawn_sidecar_entrypoint_handler(
-                server.into_entrypoint_receiver(),
-                entrypoint_pid.clone(),
-                opa_engine.clone(),
-                retained_proto.clone(),
-                openshell_endpoint.clone(),
-                sandbox_id.clone(),
-            );
-        }
+    if network_enabled
+        && sidecar_network_enforcement
+        && let Some(server) = sidecar_control_server
+    {
+        spawn_sidecar_entrypoint_handler(
+            server.into_entrypoint_receiver(),
+            entrypoint_pid.clone(),
+            opa_engine.clone(),
+            retained_proto.clone(),
+            openshell_endpoint.clone(),
+            sandbox_id.clone(),
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
