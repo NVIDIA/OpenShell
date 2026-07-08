@@ -147,10 +147,16 @@ openshell provider refresh configure my-graph \
   --strategy oauth2-client-credentials \
   --material tenant_id="$TENANT_ID" \
   --material client_id="$CLIENT_ID" \
-  --material client_secret="$CLIENT_SECRET" \
-  --secret-material-key client_secret \
+  --secret-material-env client_secret=CLIENT_SECRET \
   --credential-expires-at 1767225600000
 ```
+
+Pass secret material with `--secret-material-env KEY[=ENVVAR]` (`ENVVAR`
+defaults to `KEY`): the CLI reads the value from its own environment, so the
+secret never appears in the host process table the way an expanded
+`--material KEY="$VALUE"` argument would, and `KEY` is automatically marked
+secret. Keep non-secret material on `--material`; `--secret-material-key KEY`
+still marks a key supplied through `--material` as secret.
 
 Check refresh status:
 

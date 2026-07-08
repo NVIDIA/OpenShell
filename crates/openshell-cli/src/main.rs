@@ -898,6 +898,11 @@ enum ProviderRefreshCommands {
         #[arg(long = "material", value_name = "KEY=VALUE")]
         material: Vec<String>,
 
+        /// Secret refresh material resolved from the CLI environment
+        /// (`ENVVAR` defaults to `KEY`); `KEY` is auto-marked secret.
+        #[arg(long = "secret-material-env", value_name = "KEY[=ENVVAR]")]
+        secret_material_env: Vec<String>,
+
         /// Material keys that are secret and must not be exposed.
         #[arg(long = "secret-material-key", value_name = "KEY")]
         secret_material_keys: Vec<String>,
@@ -2922,6 +2927,7 @@ async fn main() -> Result<()> {
                         credential_key,
                         strategy,
                         material,
+                        secret_material_env,
                         secret_material_keys,
                         credential_expires_at,
                     } => {
@@ -2932,6 +2938,7 @@ async fn main() -> Result<()> {
                                 credential_key: &credential_key,
                                 strategy: strategy.as_str(),
                                 material: &material,
+                                secret_material_env: &secret_material_env,
                                 secret_material_keys: &secret_material_keys,
                                 credential_expires_at_ms: credential_expires_at,
                             },
@@ -4189,6 +4196,8 @@ mod tests {
             "oauth2-client-credentials",
             "--material",
             "tenant_id=abc",
+            "--secret-material-env",
+            "client_secret=GRAPH_CLIENT_SECRET",
             "--secret-material-key",
             "client_secret",
             "--credential-expires-at",
@@ -4202,10 +4211,11 @@ mod tests {
                     ProviderRefreshCommands::Configure {
                         strategy: CliProviderRefreshStrategy::Oauth2ClientCredentials,
                         credential_expires_at: Some(1_767_225_600_000),
+                        ref secret_material_env,
                         ..
                     }
                 ))
-            })
+            }) if secret_material_env == &["client_secret=GRAPH_CLIENT_SECRET".to_string()]
         ));
 
         let rotate = Cli::try_parse_from([

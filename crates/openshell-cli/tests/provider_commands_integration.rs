@@ -62,6 +62,8 @@ enum ProviderRefreshRequestLog {
     Configure {
         provider_name: String,
         credential_key: String,
+        material: HashMap<String, String>,
+        secret_material_keys: Vec<String>,
         expires_at_ms: Option<i64>,
     },
     Rotate {
@@ -661,6 +663,8 @@ impl OpenShell for TestOpenShell {
             .push(ProviderRefreshRequestLog::Configure {
                 provider_name: request.provider.clone(),
                 credential_key: request.credential_key.clone(),
+                material: request.material.clone(),
+                secret_material_keys: request.secret_material_keys.clone(),
                 expires_at_ms: request.expires_at_ms,
             });
         let configure_failure = self
@@ -1187,6 +1191,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
             credential_key: "MS_GRAPH_ACCESS_TOKEN",
             strategy: "oauth2_client_credentials",
             material: &["tenant_id=tenant".to_string()],
+            secret_material_env: &[],
             secret_material_keys: &["client_secret".to_string()],
             credential_expires_at_ms: Some(1_767_225_600_000),
         },
@@ -1216,6 +1221,8 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
             ProviderRefreshRequestLog::Configure {
                 provider_name: "my-graph".to_string(),
                 credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                material: HashMap::from([("tenant_id".to_string(), "tenant".to_string())]),
+                secret_material_keys: vec!["client_secret".to_string()],
                 expires_at_ms: Some(1_767_225_600_000),
             },
             ProviderRefreshRequestLog::Status {
@@ -1232,6 +1239,91 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
             },
         ]
     );
+}
+
+#[tokio::test]
+async fn provider_refresh_configure_reads_secret_material_from_env_off_argv() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "gc-bridge",
+        "outlook",
+        false,
+        &["GOOGLE_CHAT_ACCESS_TOKEN=pending".to_string()],
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    // The env value overrides the `--material` duplicate and is auto-marked secret.
+    let guard = EnvVarGuard::set(&[("OPENSHELL_ITEST_SME_PRIVATE_KEY", "pem-from-env")]);
+    run::provider_refresh_config(
+        &ts.endpoint,
+        run::ProviderRefreshConfigInput {
+            name: "gc-bridge",
+            credential_key: "GOOGLE_CHAT_ACCESS_TOKEN",
+            strategy: "google_service_account_jwt",
+            material: &[
+                "client_email=bot@p.iam.gserviceaccount.com".to_string(),
+                "private_key=argv-value-must-be-overridden".to_string(),
+            ],
+            secret_material_env: &["private_key=OPENSHELL_ITEST_SME_PRIVATE_KEY".to_string()],
+            secret_material_keys: &[],
+            credential_expires_at_ms: None,
+        },
+        &ts.tls,
+    )
+    .await
+    .expect("provider refresh configure");
+    drop(guard);
+
+    let requests = ts.state.refresh_requests.lock().await.clone();
+    assert_eq!(
+        requests,
+        vec![ProviderRefreshRequestLog::Configure {
+            provider_name: "gc-bridge".to_string(),
+            credential_key: "GOOGLE_CHAT_ACCESS_TOKEN".to_string(),
+            material: HashMap::from([
+                (
+                    "client_email".to_string(),
+                    "bot@p.iam.gserviceaccount.com".to_string()
+                ),
+                ("private_key".to_string(), "pem-from-env".to_string()),
+            ]),
+            secret_material_keys: vec!["private_key".to_string()],
+            expires_at_ms: None,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn provider_refresh_configure_fails_closed_when_secret_material_env_is_unset() {
+    let ts = run_server().await;
+
+    let err = run::provider_refresh_config(
+        &ts.endpoint,
+        run::ProviderRefreshConfigInput {
+            name: "gc-bridge",
+            credential_key: "GOOGLE_CHAT_ACCESS_TOKEN",
+            strategy: "google_service_account_jwt",
+            material: &[],
+            secret_material_env: &["private_key=OPENSHELL_ITEST_SME_DEFINITELY_UNSET".to_string()],
+            secret_material_keys: &[],
+            credential_expires_at_ms: None,
+        },
+        &ts.tls,
+    )
+    .await
+    .expect_err("unset env should fail before any request is sent");
+
+    assert!(err.to_string().contains(
+        "requires local env var 'OPENSHELL_ITEST_SME_DEFINITELY_UNSET' to be set to a non-empty value"
+    ));
+    // Fails closed on the client side: nothing reached the gateway.
+    assert!(ts.state.refresh_requests.lock().await.is_empty());
 }
 
 #[tokio::test]
@@ -2197,14 +2289,15 @@ async fn provider_create_from_gcloud_adc_happy_path() {
         2,
         "expected configure + rotate refresh requests"
     );
-    assert_eq!(
-        requests[0],
+    assert!(matches!(
+        &requests[0],
         ProviderRefreshRequestLog::Configure {
-            provider_name: "my-vertex".to_string(),
-            credential_key: "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+            provider_name,
+            credential_key,
             expires_at_ms: None,
-        }
-    );
+            ..
+        } if provider_name == "my-vertex" && credential_key == "GOOGLE_VERTEX_AI_TOKEN"
+    ));
     assert_eq!(
         requests[1],
         ProviderRefreshRequestLog::Rotate {
@@ -2577,14 +2670,15 @@ async fn provider_create_from_gcloud_adc_with_config_keys() {
         2,
         "exactly one configure call and one rotate call expected"
     );
-    assert_eq!(
-        refresh_requests[0],
+    assert!(matches!(
+        &refresh_requests[0],
         ProviderRefreshRequestLog::Configure {
-            provider_name: "vertex-with-config".to_string(),
-            credential_key: "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+            provider_name,
+            credential_key,
             expires_at_ms: None,
-        }
-    );
+            ..
+        } if provider_name == "vertex-with-config" && credential_key == "GOOGLE_VERTEX_AI_TOKEN"
+    ));
     assert_eq!(
         refresh_requests[1],
         ProviderRefreshRequestLog::Rotate {
