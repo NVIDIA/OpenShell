@@ -76,6 +76,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
 | Reviewing       | `review-security-issue`   | Assess security issues for severity and remediation                                                 |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
+| Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
 | Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
