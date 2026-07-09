@@ -1076,7 +1076,9 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      packages: write
+      # read-only: needed to pull the private CI image from ghcr, not to
+      # publish. The SDK publishes to public npm (registry.npmjs.org).
+      packages: read
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -1093,18 +1095,14 @@ jobs:
       - name: Install tools
         run: mise install --locked
 
-      - name: Configure npm auth for GitHub Packages
+      - name: Configure npm auth for npmjs.org
         working-directory: ./sdk/typescript
-        run: |
-          {
-            echo "@nvidia:registry=https://npm.pkg.github.com"
-            echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
-          } > .npmrc
+        run: echo '//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}' > .npmrc
 
       - name: Publish
         env:
           OPENSHELL_NPM_VERSION: ${{ needs.compute-versions.outputs.npm_version }}
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: mise run sdk:ts:publish
 
   release-helm:

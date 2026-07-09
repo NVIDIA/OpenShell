@@ -1,5 +1,5 @@
 {
-  "name": "@nvidia/openshell-sdk",
+  "name": "openshell-sdk",
   "version": "0.0.0",
   "description": "Official TypeScript SDK for the OpenShell gateway.",
   "license": "Apache-2.0",
@@ -11,7 +11,7 @@
     "directory": "sdk/typescript"
   },
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
+    "registry": "https://registry.npmjs.org"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
