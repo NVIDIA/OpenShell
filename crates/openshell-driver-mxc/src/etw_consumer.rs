@@ -974,12 +974,24 @@ fn process_event(index: &Mutex<AttributionIndex>, ev: DecodedEtwEvent) {
                 tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
             }
         }
-        // Config [5019]: several distinct config/hardening state changes. Each is
-        // a genuine audit-worthy config event; `SandboxConfig` is the richest but
+        // Process [1007]: `ProcessLaunched` is the confirmation twin of
+        // `CreateProcessInSandbox` — it carries the *actual* `processId`/`threadId`
+        // of the started in-sandbox process (the create event only has the request +
+        // command line). We emit it as a distinct PROC row so the trail records both
+        // the launch request (with cmd line) and the confirmed start (with real pid).
+        "ProcessLaunched" => {
+            let ctx = etw_ctx(&sandbox_id, &sandbox_name);
+            emit_ocsf(&sandbox_id, map_process_started(&ctx, &ev));
+        }
+        // Config [5019]: several distinct config/hardening/setup state changes. Each
+        // is a genuine audit-worthy config event; `SandboxConfig` is the richest but
         // drops intermittently, so the reliably-captured hardening events
         // (`Win32kLockdownApplied`, `ApplyUILimits`, `EnforceOsPolicy`) guarantee
-        // coverage.
-        "SandboxConfig" | "Win32kLockdownApplied" | "ApplyUILimits" | "EnforceOsPolicy" => {
+        // coverage. `SandboxProxyConfigured` (network/proxy setup — the one
+        // network-plane event the provider emits) and `SandboxConsoleReferencePlumbed`
+        // (console-handle plumbing) are additional per-sandbox setup state changes.
+        "SandboxConfig" | "Win32kLockdownApplied" | "ApplyUILimits" | "EnforceOsPolicy"
+        | "SandboxProxyConfigured" | "SandboxConsoleReferencePlumbed" => {
             let ctx = etw_ctx(&sandbox_id, &sandbox_name);
             emit_ocsf(&sandbox_id, map_config_state(&ctx, &ev));
         }
@@ -1012,12 +1024,15 @@ fn map_lifecycle_create(ctx: &SandboxContext, sandbox_name: &str) -> OcsfEvent {
         .build()
 }
 
-/// A sandbox config/hardening ETW event → Device Config State Change [5019].
+/// A sandbox config/hardening/setup ETW event → Device Config State Change [5019].
 ///
-/// Handles both `SandboxConfig` (full posture snapshot) and
-/// `Win32kLockdownApplied` (agentic win32k lockdown): whichever config-ish
-/// fields the event carries ride along as `unmapped`, and `security_level`
-/// reflects any hardening signal present.
+/// Handles the full family of per-sandbox config state changes the Sandboxing
+/// provider emits: `SandboxConfig` (full posture snapshot), the hardening events
+/// (`Win32kLockdownApplied`, `ApplyUILimits`, `EnforceOsPolicy`),
+/// `SandboxProxyConfigured` (network/proxy setup) and
+/// `SandboxConsoleReferencePlumbed` (console-handle plumbing). Whichever
+/// config-ish fields the event carries ride along as `unmapped`, and
+/// `security_level` reflects any hardening signal present.
 fn map_config_state(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
     let flag = |k: &str| ev.get(k).map(|v| v == "1").unwrap_or(false);
     let nonzero = |k: &str| ev.get(k).map(|v| v != "0").unwrap_or(false);
@@ -1029,10 +1044,17 @@ fn map_config_state(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
     };
 
     let message = match ev.event_name.as_deref().unwrap_or("") {
-        "Win32kLockdownApplied" => "MXC sandbox win32k lockdown applied",
-        "ApplyUILimits" => "MXC sandbox UI restrictions applied",
-        "EnforceOsPolicy" => "MXC sandbox OS policy enforced",
-        _ => "MXC sandbox OS policy configured",
+        "Win32kLockdownApplied" => "MXC sandbox win32k lockdown applied".to_string(),
+        "ApplyUILimits" => "MXC sandbox UI restrictions applied".to_string(),
+        "EnforceOsPolicy" => "MXC sandbox OS policy enforced".to_string(),
+        "SandboxConsoleReferencePlumbed" => "MXC sandbox console reference plumbed".to_string(),
+        // The one network-plane event the provider emits; `proxyPort=0` means no
+        // proxy was configured. Surface the port so the CONFIG row is self-describing.
+        "SandboxProxyConfigured" => match ev.get_unquoted("proxyPort").as_deref() {
+            Some("0") | None => "MXC sandbox proxy configured (no proxy)".to_string(),
+            Some(port) => format!("MXC sandbox proxy configured (port {port})"),
+        },
+        _ => "MXC sandbox OS policy configured".to_string(),
     };
 
     let mut builder = ConfigStateChangeBuilder::new(ctx)
@@ -1042,7 +1064,7 @@ fn map_config_state(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
         .status(StatusId::Success)
         .message(message);
 
-    // Superset of config-ish fields across both event shapes; only present
+    // Superset of config-ish fields across all event shapes; only present
     // fields are attached.
     for key in [
         "useAppContainer",
@@ -1055,6 +1077,9 @@ fn map_config_state(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
         "capabilities",
         "agenticFlags",
         "processId",
+        "proxyPort",
+        "hasConsoleReference",
+        "creationFlags",
     ] {
         if let Some(v) = ev.get(key) {
             builder = builder.unmapped(key, v.trim_matches('"').to_string());
@@ -1088,6 +1113,38 @@ fn map_process_launch(ctx: &SandboxContext, ev: &DecodedEtwEvent, cmd_line: &str
             "MXC sandbox launched process: {}{cwd_suffix}",
             truncate(cmd_line, 160)
         ))
+        .build()
+}
+
+/// `ProcessLaunched` → Process Activity [1007] "Launch" (confirmed start).
+///
+/// Unlike `CreateProcessInSandbox` (the request, which carries the command line
+/// but not the resulting pid), this event carries the real `processId`/`threadId`
+/// of the process that actually started. We give the process a distinct name
+/// (`sandboxed-process`) so the shorthand row is visibly the confirmed-start twin,
+/// not a duplicate of the launch-request row.
+fn map_process_started(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
+    let pid = ev
+        .get("processId")
+        .map(|v| v.trim_matches('"'))
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let tid = ev.get_unquoted("threadId").unwrap_or_default();
+    let tid_suffix = if tid.is_empty() {
+        String::new()
+    } else {
+        format!(", tid: {tid}")
+    };
+    ProcessActivityBuilder::new(ctx)
+        .activity(ActivityId::Open) // process label = "Launch"
+        .launch_type(LaunchTypeId::Spawn)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .process(Process::new("sandboxed-process", pid))
+        .actor_process(Process::new("wxc-exec", i64::from(ev.process_id)))
+        .message(format!("MXC sandbox process started (pid: {pid}{tid_suffix})"))
         .build()
 }
 
