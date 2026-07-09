@@ -1,27 +1,19 @@
-# @nvidia/openshell-sdk
+# openshell-sdk
 
 TypeScript client for the OpenShell gateway — thin, idiomatic bindings generated from the OpenShell protobufs.
 
-Distributed via GitHub Packages during pre-GA. Public npm (`@openshell/sdk`) follows at GA; the public API is unchanged across the move, so only the install specifier changes.
+Published on public npm.
 
 ## Install
 
-Published to GitHub Packages, so add a project `.npmrc`:
-
 ```shell
-@nvidia:registry=https://npm.pkg.github.com
-```
-
-Authenticate with a GitHub token that has `read:packages`, then:
-
-```shell
-npm install @nvidia/openshell-sdk
+npm install openshell-sdk
 ```
 
 ## Usage
 
 ```ts
-import { OpenShellClient } from '@nvidia/openshell-sdk'
+import { OpenShellClient } from 'openshell-sdk'
 
 const client = await OpenShellClient.connect({
   gateway: 'https://gateway.example.com',
@@ -45,7 +37,7 @@ await client.sandbox.delete(sandbox.name)
 directly — same API, one less hop:
 
 ```ts
-import { SandboxClient } from '@nvidia/openshell-sdk'
+import { SandboxClient } from 'openshell-sdk'
 
 const sandbox = await SandboxClient.connect({ gateway, oidcToken })
 await sandbox.create({ image })
@@ -56,7 +48,7 @@ await sandbox.create({ image })
 The version field is a `0.0.0` placeholder; CI stamps the real version from the git release tag at publish time, matching the Rust and Python packages.
 
 ```shell
-mise run sdk:ts:proto       # generate stubs from proto/ (protoc + protoc-gen-es)
+mise run sdk:ts:proto       # generate stubs from proto/ with buf
 mise run sdk:ts:typecheck   # tsc --noEmit
 mise run sdk:ts:build       # emit dist/
 ```
