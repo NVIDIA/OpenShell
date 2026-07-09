@@ -115,6 +115,19 @@ helmctl() {
   helm --kube-context "${KUBE_CONTEXT}" "$@"
 }
 
+# Return the kubectl resource reference (e.g. "sts/openshell" or "deploy/openshell")
+# for the deployed gateway workload. The chart deploys a StatefulSet by default
+# and a Deployment when workload.kind=deployment (external DB / HA mode).
+kube_workload_ref() {
+  local name="$1"
+  local ns="${2:-${NAMESPACE}}"
+  if kctl -n "${ns}" get statefulset "${name}" >/dev/null 2>&1; then
+    echo "sts/${name}"
+  else
+    echo "deploy/${name}"
+  fi
+}
+
 deploy_postgres_fixture() {
   local secret_name="$1"
   local pg_uri
@@ -320,8 +333,10 @@ run_scenario() {
   fi
 
   HEALTH_LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward sts/${RELEASE_NAME} ${HEALTH_LOCAL_PORT}:health..."
-  kctl -n "${NAMESPACE}" port-forward "sts/${RELEASE_NAME}" \
+  local workload_ref
+  workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
+  echo "Starting kubectl port-forward ${workload_ref} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "${workload_ref}" \
     "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
   PORTFORWARD_HEALTH_PID=$!
 
@@ -652,8 +667,9 @@ else
   fi
 
   HEALTH_LOCAL_PORT="$(e2e_pick_port)"
-  echo "Starting kubectl port-forward sts/${RELEASE_NAME} ${HEALTH_LOCAL_PORT}:health..."
-  kctl -n "${NAMESPACE}" port-forward "sts/${RELEASE_NAME}" \
+  WORKLOAD_REF="$(kube_workload_ref "${RELEASE_NAME}")"
+  echo "Starting kubectl port-forward ${WORKLOAD_REF} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "${WORKLOAD_REF}" \
     "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
   PORTFORWARD_HEALTH_PID=$!
 
