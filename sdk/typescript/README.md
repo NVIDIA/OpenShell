@@ -1,19 +1,27 @@
-# openshell-sdk
+# @nvidia/openshell-sdk
 
 TypeScript client for the OpenShell gateway — thin, idiomatic bindings generated from the OpenShell protobufs.
 
-Published on public npm.
+Distributed via GitHub Packages. A public npm release under the same name follows once the npm org is in place; the install specifier and API are unchanged across that move.
 
 ## Install
 
+Published to GitHub Packages, so point the `@nvidia` scope at it with a project `.npmrc`:
+
 ```shell
-npm install openshell-sdk
+@nvidia:registry=https://npm.pkg.github.com
+```
+
+Authenticate with a GitHub token that has `read:packages`, then:
+
+```shell
+npm install @nvidia/openshell-sdk
 ```
 
 ## Usage
 
 ```ts
-import { OpenShellClient } from 'openshell-sdk'
+import { OpenShellClient } from '@nvidia/openshell-sdk'
 
 const client = await OpenShellClient.connect({
   gateway: 'https://gateway.example.com',
@@ -37,7 +45,7 @@ await client.sandbox.delete(sandbox.name)
 directly — same API, one less hop:
 
 ```ts
-import { SandboxClient } from 'openshell-sdk'
+import { SandboxClient } from '@nvidia/openshell-sdk'
 
 const sandbox = await SandboxClient.connect({ gateway, oidcToken })
 await sandbox.create({ image })
