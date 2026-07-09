@@ -48,6 +48,13 @@
             llvmPackages.libclang
             # system dependency for openshell-prover
             z3
+            # mise dependencies
+            mise
+            cmakeMinimal
+            zlib
+            openssl_3_5
+            xz
+            gh
           ];
 
           env = {
