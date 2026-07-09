@@ -766,16 +766,6 @@ async fn run_lifecycle(
     };
     info!(sandbox = %sandbox_name, command = %command_line, backend = ?config.backend, "MXC agent launched");
 
-    // Seed ETW attribution: the wxc-exec pid we just spawned is the
-    // collision-proof anchor that ties the `Sandboxing` provider's events back
-    // to this `sandbox_id` (command line is a fallback matcher). No-op unless
-    // the ETW consumer is running.
-    if let Some(pid) = child.id() {
-        if let Ok(mut idx) = attribution.lock() {
-            idx.register_launch(&sandbox_id, &sandbox_name, pid, &command_line);
-        }
-    }
-
     let ready_sandbox = make_sandbox_with_condition(
         &sandbox,
         &DriverCondition {
@@ -793,19 +783,37 @@ async fn run_lifecycle(
         // process exit. Holding the registry lock while spawning prevents a
         // completed child from being overwritten with AgentRunning.
         let mut registry_guard = registry.lock().await;
-        if let Some(entry) = registry_guard.get_mut(&sandbox_id) {
-            entry.sandbox = ready_sandbox.clone();
-            entry.phase_state = PhaseState::Running;
-            entry.monitor_cancel = Some(cancel_tx);
-            entry.monitor_task = Some(tokio::spawn(monitor_exec(
-                registry.clone(),
-                watch_tx.clone(),
-                sandbox.clone(),
-                sandbox_id.clone(),
-                cancel_rx,
-                child,
-            )));
+        let Some(entry) = registry_guard.get_mut(&sandbox_id) else {
+            // The sandbox was deleted between agent launch and readiness. Bail
+            // without seeding ETW attribution (a stale key would misroute later
+            // events to a dead sandbox), without reporting Ready, and without
+            // spawning the exec monitor. `delete` already tore down the process.
+            return;
+        };
+
+        // Seed ETW attribution while holding the registry lock so a concurrent
+        // `delete` cannot remove the sandbox after we register (which would leave
+        // a stale key). The `wxc-exec` pid we just spawned is the collision-proof
+        // anchor that ties the `Sandboxing` provider's events back to this
+        // `sandbox_id` (command line is a fallback matcher). No-op unless the ETW
+        // consumer is running.
+        if let Some(pid) = child.id() {
+            if let Ok(mut idx) = attribution.lock() {
+                idx.register_launch(&sandbox_id, &sandbox_name, pid, &command_line);
+            }
         }
+
+        entry.sandbox = ready_sandbox.clone();
+        entry.phase_state = PhaseState::Running;
+        entry.monitor_cancel = Some(cancel_tx);
+        entry.monitor_task = Some(tokio::spawn(monitor_exec(
+            registry.clone(),
+            watch_tx.clone(),
+            sandbox.clone(),
+            sandbox_id.clone(),
+            cancel_rx,
+            child,
+        )));
     }
     let _ = watch_tx.send(sandbox_event(ready_sandbox));
 }

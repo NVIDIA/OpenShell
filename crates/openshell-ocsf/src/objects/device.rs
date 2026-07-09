@@ -75,4 +75,23 @@ mod tests {
         assert_eq!(json["hostname"], "sandbox-abc123");
         assert_eq!(json["os"]["name"], "Linux");
     }
+
+    #[test]
+    fn test_device_windows() {
+        let device = Device::windows("gateway-host");
+        let json = serde_json::to_value(&device).unwrap();
+        assert_eq!(json["hostname"], "gateway-host");
+        assert_eq!(json["os"]["name"], "Windows");
+    }
+
+    #[test]
+    fn test_device_for_current_os() {
+        let device = Device::for_current_os("host");
+        let json = serde_json::to_value(&device).unwrap();
+        assert_eq!(json["hostname"], "host");
+        #[cfg(target_os = "windows")]
+        assert_eq!(json["os"]["name"], "Windows");
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(json["os"]["name"], "Linux");
+    }
 }
