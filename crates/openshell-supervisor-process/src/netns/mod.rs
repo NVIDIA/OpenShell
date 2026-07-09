@@ -485,6 +485,7 @@ fn install_sidecar_nft_bypass_rules(proxy_uid: u32) -> Result<()> {
 }
 
 const SIDECAR_IPTABLES_CHAIN: &str = "OPENSHELL_SIDECAR_BYPASS";
+const PROC_NET_IF_INET6_PATH: &str = "/proc/net/if_inet6";
 
 fn install_sidecar_iptables_legacy_bypass_rules(proxy_uid: u32) -> Result<()> {
     let ipv4_filter_tool = find_iptables_legacy().ok_or_else(|| {
@@ -492,36 +493,67 @@ fn install_sidecar_iptables_legacy_bypass_rules(proxy_uid: u32) -> Result<()> {
             "trusted iptables-legacy helper not found; sidecar network enforcement fallback unavailable"
         )
     })?;
-    let ipv6_fence_tool = find_ip6tables_legacy().ok_or_else(|| {
-        miette::miette!(
-            "trusted ip6tables-legacy helper not found; sidecar network enforcement fallback cannot fence IPv6"
-        )
-    })?;
 
-    cleanup_sidecar_iptables_legacy_rules(&ipv4_filter_tool);
-    cleanup_sidecar_iptables_legacy_rules(&ipv6_fence_tool);
+    let ipv6_fence_tool = if current_namespace_has_non_loopback_ipv6()? {
+        Some(find_ip6tables_legacy().ok_or_else(|| {
+            miette::miette!(
+                "trusted ip6tables-legacy helper not found; sidecar network enforcement fallback cannot fence IPv6"
+            )
+        })?)
+    } else {
+        warn!(
+            "Skipping IPv6 sidecar iptables-legacy fallback because the current namespace has no non-loopback IPv6 interface"
+        );
+        None
+    };
+
+    cleanup_sidecar_iptables_legacy_rule_families(&ipv4_filter_tool, ipv6_fence_tool.as_deref());
 
     if let Err(e) = install_sidecar_iptables_legacy_family_rules(
         &ipv4_filter_tool,
         proxy_uid,
         "icmp-port-unreachable",
     ) {
-        cleanup_sidecar_iptables_legacy_rules(&ipv4_filter_tool);
-        cleanup_sidecar_iptables_legacy_rules(&ipv6_fence_tool);
+        cleanup_sidecar_iptables_legacy_rule_families(
+            &ipv4_filter_tool,
+            ipv6_fence_tool.as_deref(),
+        );
         return Err(e);
     }
 
-    if let Err(e) = install_sidecar_iptables_legacy_family_rules(
-        &ipv6_fence_tool,
-        proxy_uid,
-        "icmp6-port-unreachable",
-    ) {
-        cleanup_sidecar_iptables_legacy_rules(&ipv4_filter_tool);
-        cleanup_sidecar_iptables_legacy_rules(&ipv6_fence_tool);
-        return Err(e);
+    if let Some(ipv6_fence_tool) = ipv6_fence_tool {
+        if let Err(e) = install_sidecar_iptables_legacy_family_rules(
+            &ipv6_fence_tool,
+            proxy_uid,
+            "icmp6-port-unreachable",
+        ) {
+            cleanup_sidecar_iptables_legacy_rule_families(
+                &ipv4_filter_tool,
+                Some(&ipv6_fence_tool),
+            );
+            return Err(e);
+        }
     }
 
     Ok(())
+}
+
+fn current_namespace_has_non_loopback_ipv6() -> Result<bool> {
+    match std::fs::read_to_string(PROC_NET_IF_INET6_PATH) {
+        Ok(content) => Ok(has_non_loopback_ipv6_interface(&content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(miette::miette!(
+            "failed to inspect {PROC_NET_IF_INET6_PATH} before installing sidecar IPv6 fence: {e}"
+        )),
+    }
+}
+
+fn has_non_loopback_ipv6_interface(content: &str) -> bool {
+    content.lines().any(|line| {
+        line.split_whitespace()
+            .nth(5)
+            .is_some_and(|iface| iface != "lo")
+    })
 }
 
 fn install_sidecar_iptables_legacy_family_rules(
@@ -595,6 +627,13 @@ fn cleanup_sidecar_iptables_legacy_rules(iptables_cmd: &str) {
     {}
     let _ = run_iptables_legacy_current_namespace(iptables_cmd, &["-F", SIDECAR_IPTABLES_CHAIN]);
     let _ = run_iptables_legacy_current_namespace(iptables_cmd, &["-X", SIDECAR_IPTABLES_CHAIN]);
+}
+
+fn cleanup_sidecar_iptables_legacy_rule_families(ipv4_cmd: &str, ipv6_cmd: Option<&str>) {
+    cleanup_sidecar_iptables_legacy_rules(ipv4_cmd);
+    if let Some(ipv6_cmd) = ipv6_cmd {
+        cleanup_sidecar_iptables_legacy_rules(ipv6_cmd);
+    }
 }
 
 /// Run an `ip` command on the host.
@@ -904,6 +943,29 @@ mod tests {
                 "IP6TABLES_LEGACY_SEARCH_PATHS entry must be absolute: {path}"
             );
         }
+    }
+
+    #[test]
+    fn non_loopback_ipv6_detector_ignores_empty_input() {
+        assert!(!has_non_loopback_ipv6_interface(""));
+        assert!(!has_non_loopback_ipv6_interface("\n\n"));
+    }
+
+    #[test]
+    fn non_loopback_ipv6_detector_ignores_loopback() {
+        let content = "00000000000000000000000000000001 01 80 10 80 lo\n";
+
+        assert!(!has_non_loopback_ipv6_interface(content));
+    }
+
+    #[test]
+    fn non_loopback_ipv6_detector_detects_pod_interface() {
+        let content = "\
+00000000000000000000000000000001 01 80 10 80 lo
+fe800000000000000000000000000001 02 40 20 80 eth0
+";
+
+        assert!(has_non_loopback_ipv6_interface(content));
     }
 
     #[test]
