@@ -521,18 +521,15 @@ fn install_sidecar_iptables_legacy_bypass_rules(proxy_uid: u32) -> Result<()> {
         return Err(e);
     }
 
-    if let Some(ipv6_fence_tool) = ipv6_fence_tool {
-        if let Err(e) = install_sidecar_iptables_legacy_family_rules(
+    if let Some(ipv6_fence_tool) = ipv6_fence_tool
+        && let Err(e) = install_sidecar_iptables_legacy_family_rules(
             &ipv6_fence_tool,
             proxy_uid,
             "icmp6-port-unreachable",
-        ) {
-            cleanup_sidecar_iptables_legacy_rule_families(
-                &ipv4_filter_tool,
-                Some(&ipv6_fence_tool),
-            );
-            return Err(e);
-        }
+        )
+    {
+        cleanup_sidecar_iptables_legacy_rule_families(&ipv4_filter_tool, Some(&ipv6_fence_tool));
+        return Err(e);
     }
 
     Ok(())
