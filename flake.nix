@@ -60,6 +60,13 @@
           pkg-config
           # Coverage.
           lcov
+          # mise dependencies
+          mise
+          cmakeMinimal
+          zlib
+          openssl_3_5
+          xz
+          gh
           kubernetes-helm
           syft
           trivy
