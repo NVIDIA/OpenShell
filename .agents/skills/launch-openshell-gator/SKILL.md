@@ -1,6 +1,6 @@
 ---
 name: launch-openshell-gator
-description: Launch and supervise OpenShell gator agents via scripts/agents/run.sh. Use when starting gator on issues or PRs, checking gator sandboxes, validating gateway readiness, building the gator sandbox image, restarting stuck gators, or experimenting with gator harness/model overrides. Trigger keywords - launch gator, start gator, run gator, gator sandbox, supervised gator, gator logs, restart gator, gpt-5.6-sol gator.
+description: Launch and supervise OpenShell gator agents. Use when starting gator on issues or PRs, checking gator sandboxes, building the gator sandbox image, restarting stuck gators, inspecting gator logs, or experimenting with gator harness/model overrides. Trigger keywords - launch gator, start gator, run gator, gator sandbox, supervised gator, gator logs, restart gator.
 ---
 
 # Launch OpenShell Gator
