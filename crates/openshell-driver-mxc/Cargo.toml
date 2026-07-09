@@ -15,6 +15,10 @@ name = "openshell_driver_mxc"
 
 [dependencies]
 openshell-core = { path = "../openshell-core" }
+# OCSF builders + emit target used by the Windows ETW audit consumer. OS-agnostic
+# crate (no windows deps), so safe to depend on from all targets; only the
+# windows-gated `etw_consumer` module actually uses it.
+openshell-ocsf = { path = "../openshell-ocsf" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 futures = { workspace = true }
@@ -25,6 +29,11 @@ base64 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+
+# ETW/TDH real-time consumer (Plane A audit). Windows-only so the Linux/WSL
+# build stays an empty stub.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

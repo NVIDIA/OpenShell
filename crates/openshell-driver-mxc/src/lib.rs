@@ -27,6 +27,11 @@ mod policy;
 // crate). Windows-only — MXC and the policy mapper are not built for Linux/WSL.
 #[cfg(target_os = "windows")]
 mod policy_map;
+// Real-time ETW → OCSF audit consumer (Plane A). Consumes the OS Sandboxing
+// provider MXC drives and emits OCSF through the gateway's tracing sink.
+// Windows-only.
+#[cfg(target_os = "windows")]
+mod etw_consumer;
 
 #[cfg(target_os = "windows")]
 pub use driver::{MxcBackend, MxcComputeBackend, MxcComputeConfig};
