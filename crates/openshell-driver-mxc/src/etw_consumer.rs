@@ -990,8 +990,12 @@ fn process_event(index: &Mutex<AttributionIndex>, ev: DecodedEtwEvent) {
         // coverage. `SandboxProxyConfigured` (network/proxy setup — the one
         // network-plane event the provider emits) and `SandboxConsoleReferencePlumbed`
         // (console-handle plumbing) are additional per-sandbox setup state changes.
-        "SandboxConfig" | "Win32kLockdownApplied" | "ApplyUILimits" | "EnforceOsPolicy"
-        | "SandboxProxyConfigured" | "SandboxConsoleReferencePlumbed" => {
+        "SandboxConfig"
+        | "Win32kLockdownApplied"
+        | "ApplyUILimits"
+        | "EnforceOsPolicy"
+        | "SandboxProxyConfigured"
+        | "SandboxConsoleReferencePlumbed" => {
             let ctx = etw_ctx(&sandbox_id, &sandbox_name);
             emit_ocsf(&sandbox_id, map_config_state(&ctx, &ev));
         }
@@ -1144,7 +1148,9 @@ fn map_process_started(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent 
         .status(StatusId::Success)
         .process(Process::new("sandboxed-process", pid))
         .actor_process(Process::new("wxc-exec", i64::from(ev.process_id)))
-        .message(format!("MXC sandbox process started (pid: {pid}{tid_suffix})"))
+        .message(format!(
+            "MXC sandbox process started (pid: {pid}{tid_suffix})"
+        ))
         .build()
 }
 
