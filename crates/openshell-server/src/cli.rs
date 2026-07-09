@@ -14,6 +14,11 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::certgen;
+#[cfg(any(
+    feature = "driver-docker",
+    feature = "driver-podman",
+    feature = "driver-vm"
+))]
 use crate::compute::driver_config::GuestTlsPaths;
 use crate::config_file::{self, ConfigFile, GatewayFileSection};
 use crate::defaults::{self, LocalTlsPaths};
@@ -247,8 +252,13 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
     }
     normalize_compute_driver_socket_args(args, matches)?;
 
-    let local_tls = apply_runtime_defaults(args)?;
-    let guest_tls = local_tls.as_ref().map(GuestTlsPaths::from);
+    apply_runtime_defaults(args)?;
+    #[cfg(any(
+        feature = "driver-docker",
+        feature = "driver-podman",
+        feature = "driver-vm"
+    ))]
+    let guest_tls = resolved_local_tls(args)?.as_ref().map(GuestTlsPaths::from);
     let local_jwt = defaults::complete_local_jwt_config()?;
 
     let bind = SocketAddr::new(args.bind_address, args.port);
@@ -421,6 +431,11 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
     Ok(ServerStartupConfig {
         config,
         config_file: file,
+        #[cfg(any(
+            feature = "driver-docker",
+            feature = "driver-podman",
+            feature = "driver-vm"
+        ))]
         guest_tls,
     })
 }
@@ -494,12 +509,8 @@ fn resolve_config_path(args: &RunArgs) -> Result<Option<PathBuf>> {
     Ok(default_path.is_file().then_some(default_path))
 }
 
-fn apply_runtime_defaults(args: &mut RunArgs) -> Result<Option<LocalTlsPaths>> {
-    let local_tls = if args.disable_tls {
-        None
-    } else {
-        defaults::complete_local_tls_paths()?
-    };
+fn apply_runtime_defaults(args: &mut RunArgs) -> Result<()> {
+    let local_tls = resolved_local_tls(args)?;
 
     if args.db_url.is_none() {
         args.db_url = Some(defaults::default_database_url()?);
@@ -516,7 +527,17 @@ fn apply_runtime_defaults(args: &mut RunArgs) -> Result<Option<LocalTlsPaths>> {
         args.tls_client_ca = Some(paths.ca.clone());
     }
 
-    Ok(local_tls)
+    Ok(())
+}
+
+/// Read the local TLS bundle if TLS is not disabled and a complete bundle
+/// exists on disk.
+fn resolved_local_tls(args: &RunArgs) -> Result<Option<LocalTlsPaths>> {
+    if args.disable_tls {
+        Ok(None)
+    } else {
+        defaults::complete_local_tls_paths()
+    }
 }
 
 /// Returns `true` when an argument's value came from clap's built-in default
@@ -1156,7 +1177,8 @@ mod tests {
         let _g2 = EnvVarGuard::set("XDG_STATE_HOME", tmp.path().to_str().unwrap());
 
         let (mut args, _) = parse_with_args(&["openshell-gateway", "--disable-tls"]);
-        let local_tls = super::apply_runtime_defaults(&mut args).unwrap();
+        super::apply_runtime_defaults(&mut args).unwrap();
+        let local_tls = super::resolved_local_tls(&args).unwrap();
 
         let expected = format!(
             "sqlite:{}",
@@ -1195,7 +1217,8 @@ mod tests {
         }
 
         let (mut args, _) = parse_with_args(&["openshell-gateway"]);
-        let local_tls = super::apply_runtime_defaults(&mut args)
+        super::apply_runtime_defaults(&mut args).unwrap();
+        let local_tls = super::resolved_local_tls(&args)
             .unwrap()
             .expect("complete bundle should be returned");
 
@@ -1764,6 +1787,7 @@ mem_mib = "not-a-number"
     }
 
     #[test]
+    #[cfg(feature = "driver-kubernetes")]
     fn driver_inherits_shared_image_from_gateway_section() {
         // [openshell.gateway].default_image inherits into the K8s driver
         // table when the driver-specific table does not set it.
@@ -1789,6 +1813,7 @@ namespace = "agents"
     }
 
     #[test]
+    #[cfg(feature = "driver-kubernetes")]
     fn driver_specific_value_overrides_gateway_inheritance() {
         let file = config_file_from_toml(
             r#"

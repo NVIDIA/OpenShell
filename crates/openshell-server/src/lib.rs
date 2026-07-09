@@ -80,6 +80,11 @@ use tracing_bus::TracingLogBus;
 pub(crate) struct ServerStartupConfig {
     pub config: Config,
     pub config_file: Option<config_file::ConfigFile>,
+    #[cfg(any(
+        feature = "driver-docker",
+        feature = "driver-podman",
+        feature = "driver-vm"
+    ))]
     pub guest_tls: Option<compute::driver_config::GuestTlsPaths>,
 }
 
@@ -143,6 +148,7 @@ pub struct ServerState {
     /// Optional K8s `ServiceAccount` authenticator that backs the
     /// `IssueSandboxToken` bootstrap path. Only present when the gateway
     /// runs in-cluster.
+    #[cfg(feature = "driver-kubernetes")]
     pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
@@ -195,6 +201,7 @@ impl ServerState {
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
+            #[cfg(feature = "driver-kubernetes")]
             k8s_sa_authenticator: None,
             grpc_rate_limiter,
         }
@@ -215,6 +222,11 @@ pub(crate) async fn run_server(
     let ServerStartupConfig {
         config,
         config_file,
+        #[cfg(any(
+            feature = "driver-docker",
+            feature = "driver-podman",
+            feature = "driver-vm"
+        ))]
         guest_tls,
     } = startup;
 
@@ -248,8 +260,15 @@ pub(crate) async fn run_server(
     let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
     let driver_startup = compute::driver_config::DriverStartupContext {
         file: config_file.as_ref(),
+        #[cfg(any(
+            feature = "driver-docker",
+            feature = "driver-podman",
+            feature = "driver-vm"
+        ))]
         guest_tls: guest_tls.as_ref(),
+        #[cfg(any(feature = "driver-podman", feature = "driver-vm"))]
         gateway_port: config.bind_address.port(),
+        #[cfg(feature = "driver-vm")]
         gateway_tls_enabled: config.tls.is_some(),
         endpoint_overrides: &config.compute_driver_endpoints,
     };
@@ -330,6 +349,7 @@ pub(crate) async fn run_server(
     // env var) and has a sandbox JWT issuer to mint replacements against;
     // outside the cluster we can't call the apiserver's TokenReview API,
     // and without the issuer there's nothing to exchange the SA token for.
+    #[cfg(feature = "driver-kubernetes")]
     if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
         // Pod lookups and TokenReview identity checks must match the sandbox
         // namespace and service account used by the Kubernetes driver.
@@ -740,6 +760,7 @@ async fn build_compute_runtime(
     info!(driver = %driver.name(), "Using compute driver");
 
     let runtime = match driver {
+        #[cfg(feature = "driver-kubernetes")]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes) => {
             warn_if_kubernetes_sandbox_jwt_expiry_disabled(config);
             let k8s_config =
@@ -754,6 +775,7 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(feature = "driver-docker")]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Docker) => {
             let docker_config = compute::driver_config::docker_config_from_context(driver_startup)?;
             ComputeRuntime::new_docker(
@@ -767,6 +789,7 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(feature = "driver-podman")]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Podman) => {
             let podman_config = compute::driver_config::podman_config_from_context(driver_startup)?;
             ComputeRuntime::new_podman(
@@ -779,6 +802,7 @@ async fn build_compute_runtime(
             )
             .await
         }
+        #[cfg(feature = "driver-vm")]
         ConfiguredComputeDriver::Builtin(ComputeDriverKind::Vm) => {
             let vm_config = compute::driver_config::vm_config_from_context(driver_startup)?;
             let endpoint = compute::vm::spawn(config, &vm_config).await?;
@@ -813,6 +837,16 @@ async fn build_compute_runtime(
             )
             .await
         }
+        // Unreachable at runtime: config validation in `configured_compute_driver`
+        // rejects builtins whose feature was compiled out, so a `Builtin` variant
+        // reaching here means validation and dispatch got out of sync.
+        // `#[allow(unreachable_patterns)]` silences the lint in the default
+        // build where every concrete arm above is compiled in and this
+        // catch-all is unreachable at compile time.
+        #[allow(unreachable_patterns)]
+        _ => unreachable!(
+            "configured compute driver passed startup validation but is not compiled into this gateway"
+        ),
     };
 
     runtime.map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
@@ -838,14 +872,16 @@ fn configured_compute_driver(
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
     match config.compute_drivers.as_slice() {
-        [] => match openshell_core::config::detect_driver() {
+        [] => match filtered_detect_driver() {
             Some(ComputeDriverKind::Vm) => Err(Error::config(
                 "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
             )),
             Some(driver) => Ok(ConfiguredComputeDriver::Builtin(driver)),
             None => Err(Error::config(
                 "no compute driver configured and auto-detection found no suitable driver; \
-                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
+                 set --drivers or OPENSHELL_DRIVERS to a supported driver, \
+                 or to an extension driver name with a matching \
+                 [openshell.drivers.<name>].socket_path",
             )),
         },
         [driver] => resolve_configured_compute_driver(driver, driver_startup),
@@ -870,16 +906,46 @@ fn resolve_configured_compute_driver(
     }
 
     if let Some(kind) = driver_kind {
+        if !driver_compiled_in(kind) {
+            return Err(Error::config(format!(
+                "compute driver '{name}' is not supported by this gateway build"
+            )));
+        }
         return Ok(ConfiguredComputeDriver::Builtin(kind));
     }
 
     Ok(ConfiguredComputeDriver::Remote { name })
 }
 
+/// Whether the built-in driver `kind` was compiled into this gateway.
+///
+/// Third-party drivers reached via `--compute-driver-socket` are handled
+/// through the remote path and are always available regardless of features.
+const fn driver_compiled_in(kind: ComputeDriverKind) -> bool {
+    match kind {
+        ComputeDriverKind::Kubernetes => cfg!(feature = "driver-kubernetes"),
+        ComputeDriverKind::Docker => cfg!(feature = "driver-docker"),
+        ComputeDriverKind::Podman => cfg!(feature = "driver-podman"),
+        ComputeDriverKind::Vm => cfg!(feature = "driver-vm"),
+    }
+}
+
+/// Auto-detect a driver, ignoring any that were compiled out.
+///
+/// Wraps [`openshell_core::config::detect_driver`]; if the environment's
+/// preferred driver is not compiled in, the caller falls back to the
+/// standard "no driver configured" error rather than silently starting a
+/// different backend.
+fn filtered_detect_driver() -> Option<ComputeDriverKind> {
+    let kind = openshell_core::config::detect_driver()?;
+    driver_compiled_in(kind).then_some(kind)
+}
+
 fn builtin_compute_driver(name: &str) -> Option<ComputeDriverKind> {
     name.parse().ok()
 }
 
+#[cfg(feature = "driver-kubernetes")]
 fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
     config
         .gateway_jwt
@@ -887,6 +953,7 @@ fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
         .is_some_and(|jwt| jwt.ttl_secs == 0)
 }
 
+#[cfg(feature = "driver-kubernetes")]
 fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
     if kubernetes_sandbox_jwt_expiry_disabled(config) {
         warn!(
@@ -897,11 +964,12 @@ fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "driver-kubernetes")]
+    use super::kubernetes_sandbox_jwt_expiry_disabled;
     use super::{
         ConfiguredComputeDriver, ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_addresses, is_benign_tls_handshake_failure,
-        kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
+        gateway_listener_addresses, is_benign_tls_handshake_failure, serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -924,8 +992,15 @@ mod tests {
     ) -> crate::compute::driver_config::DriverStartupContext<'a> {
         crate::compute::driver_config::DriverStartupContext {
             file,
+            #[cfg(any(
+                feature = "driver-docker",
+                feature = "driver-podman",
+                feature = "driver-vm"
+            ))]
             guest_tls: None,
+            #[cfg(any(feature = "driver-podman", feature = "driver-vm"))]
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            #[cfg(feature = "driver-vm")]
             gateway_tls_enabled: false,
             endpoint_overrides: &config.compute_driver_endpoints,
         }
@@ -1254,6 +1329,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(any(
+        feature = "driver-kubernetes",
+        feature = "driver-docker",
+        feature = "driver-podman",
+        feature = "driver-vm",
+    )))]
+    fn configured_compute_driver_empty_points_at_extensions_when_no_builtins() {
+        let config = Config::new(None).with_compute_drivers(std::iter::empty::<String>());
+        let err =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("socket_path"),
+            "expected extension socket_path guidance, got: {msg}"
+        );
+    }
+
+    #[test]
     fn configured_compute_driver_rejects_multiple_entries() {
         let config = Config::new(None)
             .with_compute_drivers([ComputeDriverKind::Kubernetes, ComputeDriverKind::Podman]);
@@ -1267,6 +1360,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "driver-podman")]
     fn configured_compute_driver_accepts_podman() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
         let driver =
@@ -1278,6 +1372,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "driver-vm")]
     fn configured_compute_driver_accepts_vm() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
         let driver =
@@ -1289,6 +1384,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "driver-docker")]
     fn configured_compute_driver_accepts_docker() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
         let driver =
@@ -1349,6 +1445,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "driver-kubernetes")]
     fn kubernetes_sandbox_jwt_expiry_disabled_warns_for_zero_ttl() {
         fn config_with_jwt_ttl(ttl_secs: u64) -> Config {
             let mut config = Config::new(None);
@@ -1391,5 +1488,56 @@ mod tests {
             gateway_listener_addresses(primary, &[docker, docker]),
             vec![primary, docker]
         );
+    }
+
+    /// Exercise both directions of the compile-time driver gate. A driver
+    /// compiled *in* must resolve to `ConfiguredComputeDriver::Builtin(kind)`;
+    /// a driver compiled *out* must fail with a message that names the
+    /// specific driver and states it is not supported by this gateway build.
+    #[test]
+    fn configured_compute_driver_matches_compiled_features() {
+        // Exhaustive match to ensure that the test is updated if a new driver is added.
+        fn compiled_in(kind: ComputeDriverKind) -> bool {
+            match kind {
+                ComputeDriverKind::Kubernetes => cfg!(feature = "driver-kubernetes"),
+                ComputeDriverKind::Docker => cfg!(feature = "driver-docker"),
+                ComputeDriverKind::Podman => cfg!(feature = "driver-podman"),
+                ComputeDriverKind::Vm => cfg!(feature = "driver-vm"),
+            }
+        }
+
+        let driver_features: std::collections::HashMap<ComputeDriverKind, bool> = [
+            ComputeDriverKind::Kubernetes,
+            ComputeDriverKind::Docker,
+            ComputeDriverKind::Podman,
+            ComputeDriverKind::Vm,
+        ]
+        .into_iter()
+        .map(|kind| (kind, compiled_in(kind)))
+        .collect();
+
+        for (&kind, &present) in &driver_features {
+            let config = Config::new(None).with_compute_drivers([kind]);
+            let result = configured_compute_driver(&config, test_driver_startup(&config, None));
+
+            if present {
+                let driver = result.unwrap();
+                assert!(
+                    matches!(driver, ConfiguredComputeDriver::Builtin(k) if k == kind),
+                    "driver {kind:?}: expected Builtin({kind:?}), got {driver:?}"
+                );
+            } else {
+                let err = result.expect_err("must reject compiled-out driver");
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("not supported by this gateway build"),
+                    "driver {kind:?}: unexpected error: {msg}"
+                );
+                assert!(
+                    msg.contains(kind.as_str()),
+                    "driver {kind:?}: error must name the specific driver: {msg}"
+                );
+            }
+        }
     }
 }

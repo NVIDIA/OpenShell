@@ -8,17 +8,38 @@
 //! It does not acquire, connect to, or start compute drivers.
 
 use crate::config_file;
+#[cfg(any(
+    feature = "driver-docker",
+    feature = "driver-podman",
+    feature = "driver-vm"
+))]
 use crate::defaults::LocalTlsPaths;
-use openshell_core::{ComputeDriverKind, Error, Result};
+#[cfg(any(
+    feature = "driver-kubernetes",
+    feature = "driver-docker",
+    feature = "driver-podman",
+    feature = "driver-vm",
+))]
+use openshell_core::ComputeDriverKind;
+use openshell_core::{Error, Result};
+#[cfg(feature = "driver-docker")]
 use openshell_driver_docker::DockerComputeConfig;
+#[cfg(feature = "driver-kubernetes")]
 use openshell_driver_kubernetes::KubernetesComputeConfig;
+#[cfg(feature = "driver-podman")]
 use openshell_driver_podman::PodmanComputeConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+#[cfg(feature = "driver-vm")]
 use super::VmComputeConfig;
 
+#[cfg(any(
+    feature = "driver-docker",
+    feature = "driver-podman",
+    feature = "driver-vm"
+))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestTlsPaths {
     ca: PathBuf,
@@ -26,6 +47,11 @@ pub struct GuestTlsPaths {
     key: PathBuf,
 }
 
+#[cfg(any(
+    feature = "driver-docker",
+    feature = "driver-podman",
+    feature = "driver-vm"
+))]
 impl From<&LocalTlsPaths> for GuestTlsPaths {
     fn from(paths: &LocalTlsPaths) -> Self {
         Self {
@@ -39,13 +65,22 @@ impl From<&LocalTlsPaths> for GuestTlsPaths {
 #[derive(Clone, Copy)]
 pub struct DriverStartupContext<'a> {
     pub file: Option<&'a config_file::ConfigFile>,
+    // Consumed only by the docker/podman/vm runtime-defaults helpers below.
+    #[cfg(any(
+        feature = "driver-docker",
+        feature = "driver-podman",
+        feature = "driver-vm"
+    ))]
     pub guest_tls: Option<&'a GuestTlsPaths>,
+    #[cfg(any(feature = "driver-podman", feature = "driver-vm"))]
     pub gateway_port: u16,
+    #[cfg(feature = "driver-vm")]
     pub gateway_tls_enabled: bool,
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
 }
 
 /// Build the selected Kubernetes config from TOML plus runtime defaults.
+#[cfg(feature = "driver-kubernetes")]
 pub fn kubernetes_config_from_context(
     context: DriverStartupContext<'_>,
 ) -> Result<KubernetesComputeConfig> {
@@ -54,6 +89,7 @@ pub fn kubernetes_config_from_context(
     Ok(cfg)
 }
 
+#[cfg(feature = "driver-kubernetes")]
 pub fn kubernetes_config_for_k8s_sa_bootstrap(
     file: Option<&config_file::ConfigFile>,
 ) -> Result<KubernetesComputeConfig> {
@@ -71,6 +107,7 @@ pub fn kubernetes_config_for_k8s_sa_bootstrap(
 }
 
 /// Build the selected Podman config from TOML plus runtime defaults.
+#[cfg(feature = "driver-podman")]
 pub fn podman_config_from_context(
     context: DriverStartupContext<'_>,
 ) -> Result<PodmanComputeConfig> {
@@ -80,6 +117,7 @@ pub fn podman_config_from_context(
 }
 
 /// Build the selected Docker config from TOML plus runtime defaults.
+#[cfg(feature = "driver-docker")]
 pub fn docker_config_from_context(
     context: DriverStartupContext<'_>,
 ) -> Result<DockerComputeConfig> {
@@ -89,6 +127,7 @@ pub fn docker_config_from_context(
 }
 
 /// Build the selected VM config from TOML plus runtime defaults.
+#[cfg(feature = "driver-vm")]
 pub fn vm_config_from_context(context: DriverStartupContext<'_>) -> Result<VmComputeConfig> {
     let mut cfg = driver_config_from_context(context, ComputeDriverKind::Vm.as_str())?;
     apply_vm_runtime_defaults(&mut cfg, context);
@@ -141,12 +180,14 @@ where
     })
 }
 
+#[cfg(feature = "driver-kubernetes")]
 fn apply_kubernetes_runtime_defaults(k8s: &mut KubernetesComputeConfig) {
     if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
         k8s.workspace_default_storage_size = size;
     }
 }
 
+#[cfg(feature = "driver-podman")]
 fn apply_podman_runtime_defaults(
     podman: &mut PodmanComputeConfig,
     context: DriverStartupContext<'_>,
@@ -161,6 +202,7 @@ fn apply_podman_runtime_defaults(
     );
 }
 
+#[cfg(feature = "driver-docker")]
 fn apply_docker_runtime_defaults(cfg: &mut DockerComputeConfig, context: DriverStartupContext<'_>) {
     apply_guest_tls_defaults_to_split_fields(
         &mut cfg.guest_tls_ca,
@@ -170,6 +212,7 @@ fn apply_docker_runtime_defaults(cfg: &mut DockerComputeConfig, context: DriverS
     );
 }
 
+#[cfg(feature = "driver-vm")]
 fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupContext<'_>) {
     if cfg.state_dir.as_os_str().is_empty() {
         cfg.state_dir = VmComputeConfig::default_state_dir();
@@ -193,6 +236,7 @@ fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupCo
     );
 }
 
+#[cfg(feature = "driver-podman")]
 fn apply_podman_env_overrides(podman: &mut PodmanComputeConfig) {
     if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
         podman.socket_path = PathBuf::from(p);
@@ -221,6 +265,11 @@ fn validate_remote_driver_config(cfg: &RemoteDriverConfig, name: &str) -> Result
     )))
 }
 
+#[cfg(any(
+    feature = "driver-docker",
+    feature = "driver-podman",
+    feature = "driver-vm"
+))]
 fn apply_guest_tls_defaults_to_split_fields(
     ca: &mut Option<PathBuf>,
     cert: &mut Option<PathBuf>,
@@ -255,14 +304,22 @@ mod tests {
     ) -> DriverStartupContext<'a> {
         DriverStartupContext {
             file,
+            #[cfg(any(
+                feature = "driver-docker",
+                feature = "driver-podman",
+                feature = "driver-vm"
+            ))]
             guest_tls: None,
+            #[cfg(any(feature = "driver-podman", feature = "driver-vm"))]
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
+            #[cfg(feature = "driver-vm")]
             gateway_tls_enabled: false,
             endpoint_overrides,
         }
     }
 
     #[test]
+    #[cfg(feature = "driver-kubernetes")]
     fn k8s_sa_bootstrap_rejects_missing_kubernetes_driver_config() {
         let err = kubernetes_config_for_k8s_sa_bootstrap(None).unwrap_err();
         assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
@@ -274,6 +331,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "driver-kubernetes")]
     fn k8s_sa_bootstrap_uses_configured_namespace_and_service_account() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
@@ -292,6 +350,7 @@ service_account_name = "sandbox-sa"
     }
 
     #[test]
+    #[cfg(feature = "driver-podman")]
     fn podman_config_reads_bind_mount_opt_in_from_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r"
@@ -307,6 +366,7 @@ enable_bind_mounts = true
     }
 
     #[test]
+    #[cfg(feature = "driver-docker")]
     fn docker_config_reads_bind_mount_opt_in_from_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r"
@@ -383,6 +443,7 @@ socket_path = "/run/openshell/kyma.sock"
     }
 
     #[test]
+    #[cfg(feature = "driver-docker")]
     fn docker_config_reports_selected_invalid_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r"
@@ -401,6 +462,7 @@ unknown_docker_key = true
     }
 
     #[test]
+    #[cfg(feature = "driver-vm")]
     fn vm_config_reports_selected_invalid_driver_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
