@@ -6,7 +6,7 @@
 mod auth_rpc;
 pub mod policy;
 pub mod provider;
-mod sandbox;
+pub mod sandbox;
 mod service;
 mod validation;
 

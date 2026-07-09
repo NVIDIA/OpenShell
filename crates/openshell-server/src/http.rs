@@ -181,6 +181,7 @@ async fn render_metrics(State(handle): State<PrometheusHandle>) -> impl IntoResp
 pub fn http_router(state: Arc<crate::ServerState>) -> Router {
     crate::ws_tunnel::router(state.clone())
         .merge(crate::auth::router(state.clone()))
+        .merge(crate::web_ui::router(state.clone()))
         .layer(middleware::from_fn_with_state(
             state,
             sandbox_service_routing_first,

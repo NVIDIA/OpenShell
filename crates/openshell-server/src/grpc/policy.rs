@@ -1912,7 +1912,7 @@ async fn handle_update_config_inner(
 // Policy status handlers
 // ---------------------------------------------------------------------------
 
-pub(super) async fn handle_get_sandbox_policy_status(
+pub async fn handle_get_sandbox_policy_status(
     state: &Arc<ServerState>,
     request: Request<GetSandboxPolicyStatusRequest>,
 ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
@@ -1963,7 +1963,7 @@ pub(super) async fn handle_get_sandbox_policy_status(
     }))
 }
 
-pub(super) async fn handle_list_sandbox_policies(
+pub async fn handle_list_sandbox_policies(
     state: &Arc<ServerState>,
     request: Request<ListSandboxPoliciesRequest>,
 ) -> Result<Response<ListSandboxPoliciesResponse>, Status> {
@@ -2084,7 +2084,7 @@ pub(super) async fn handle_report_policy_status(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::unused_async)] // Must be async to match the trait signature
-pub(super) async fn handle_get_sandbox_logs(
+pub async fn handle_get_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<GetSandboxLogsRequest>,
 ) -> Result<Response<GetSandboxLogsResponse>, Status> {

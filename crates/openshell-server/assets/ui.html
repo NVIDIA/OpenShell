@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenShell Console</title>
+<style>
+  :root {
+    --bg: #0C120C;
+    --panel: #121A12;
+    --line: #223022;
+    --text: #D6E2D0;
+    --muted: #7C8E7A;
+    --accent: #76B900;
+    --accent-dim: #4A7400;
+    --warn: #E0A64B;
+    --err: #E5484D;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+    overflow: hidden;
+  }
+  a { color: var(--accent); }
+  button { font-family: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  .app { display: grid; grid-template-columns: 264px 1fr; height: 100vh; }
+
+  /* ---------------- rail ---------------- */
+  .rail {
+    border-right: 1px solid var(--line);
+    background: var(--panel);
+    display: flex; flex-direction: column;
+    min-height: 0;
+  }
+  .brand {
+    padding: 14px 16px 10px;
+    border-bottom: 1px solid var(--line);
+  }
+  .brand h1 {
+    font-size: 14px; font-weight: 700; letter-spacing: 0.08em;
+  }
+  .brand h1 .tail { color: var(--accent); }
+  .brand .sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .gw {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--line);
+    font-size: 11px; color: var(--muted);
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .gw .row { display: flex; justify-content: space-between; }
+  .gw .row b { color: var(--text); font-weight: 400; }
+  .rail-label {
+    padding: 12px 16px 6px;
+    font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--muted);
+  }
+  .sb-list { overflow-y: auto; flex: 1; }
+  .sb-item {
+    width: 100%; text-align: left; display: block;
+    padding: 10px 16px;
+    background: none; border: none; border-left: 2px solid transparent;
+    color: var(--text); cursor: pointer; font-size: 13px;
+  }
+  .sb-item:hover { background: rgba(118, 185, 0, 0.06); }
+  .sb-item.sel { background: rgba(118, 185, 0, 0.10); border-left-color: var(--accent); }
+  .sb-item .meta { display: flex; gap: 8px; align-items: center; margin-top: 2px; }
+  .sb-item .meta small { color: var(--muted); font-size: 11px; }
+  .led { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
+  .led.Ready { background: var(--accent); box-shadow: 0 0 6px rgba(118,185,0,0.7); }
+  .led.Provisioning { background: var(--warn); }
+  .led.Error, .led.Unknown { background: var(--err); }
+  .led.Deleting { background: var(--muted); }
+  .rail-empty { padding: 16px; color: var(--muted); font-size: 12px; }
+  .rail-empty code { color: var(--text); }
+  .rail-foot {
+    border-top: 1px solid var(--line);
+    padding: 8px 16px; font-size: 10px; color: var(--muted);
+  }
+  .rail-foot kbd {
+    border: 1px solid var(--line); border-radius: 3px;
+    padding: 0 4px; font-size: 10px; color: var(--text);
+  }
+
+  /* ---------------- main ---------------- */
+  .main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .head {
+    display: flex; align-items: baseline; gap: 14px;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+    flex-wrap: wrap;
+  }
+  .head .name { font-size: 16px; font-weight: 700; }
+  .head .chip {
+    font-size: 11px; padding: 1px 8px; border-radius: 3px;
+    border: 1px solid var(--line); color: var(--muted);
+  }
+  .head .chip.phase-Ready { color: var(--accent); border-color: var(--accent-dim); }
+  .head .chip.phase-Provisioning { color: var(--warn); }
+  .head .chip.phase-Error { color: var(--err); }
+  .head .spacer { flex: 1; }
+  .tabs { display: flex; gap: 2px; }
+  .tab {
+    background: none; border: 1px solid var(--line); border-bottom: none;
+    color: var(--muted); padding: 3px 14px; cursor: pointer;
+    font-size: 12px; border-radius: 4px 4px 0 0;
+  }
+  .tab.sel { color: var(--bg); background: var(--accent); border-color: var(--accent); font-weight: 700; }
+
+  .body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .pane { flex: 1; min-height: 0; display: none; flex-direction: column; }
+  .pane.sel { display: flex; }
+
+  /* ---------------- live pane ---------------- */
+  .pulse-track {
+    height: 3px; background: var(--panel); position: relative; overflow: hidden;
+    border-bottom: 1px solid var(--line);
+  }
+  .pulse-track .tick {
+    position: absolute; top: 0; bottom: 0; width: 40px;
+    background: linear-gradient(90deg, transparent, var(--accent));
+    animation: sweep 0.9s linear forwards;
+  }
+  .pulse-track .tick.deny { background: linear-gradient(90deg, transparent, var(--warn)); }
+  @keyframes sweep { from { left: -40px; } to { left: 100%; } }
+
+  .live-grid {
+    flex: 1; min-height: 0;
+    display: grid; grid-template-rows: minmax(120px, 42%) 1fr;
+  }
+  .board { overflow-y: auto; padding: 10px 20px; }
+  .board-label, .tail-label {
+    font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 6px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .strip {
+    display: flex; align-items: center; gap: 10px;
+    border: 1px solid var(--line); border-left-width: 3px;
+    border-radius: 3px; padding: 4px 10px; margin-bottom: 4px;
+    background: var(--panel);
+  }
+  .strip.allow { border-left-color: var(--accent); }
+  .strip.deny  { border-left-color: var(--warn); background: rgba(224,166,75,0.07); }
+  .strip.fail  { border-left-color: var(--err); background: rgba(229,72,77,0.07); }
+  @media (prefers-reduced-motion: no-preference) {
+    .strip.fresh { animation: land 0.35s ease-out; }
+    @keyframes land { from { transform: translateY(-4px); opacity: 0; } to { transform: none; opacity: 1; } }
+  }
+  .strip .verdict { font-weight: 700; font-size: 11px; width: 56px; flex: none; }
+  .strip.allow .verdict { color: var(--accent); }
+  .strip.deny .verdict  { color: var(--warn); }
+  .strip.fail .verdict  { color: var(--err); }
+  .strip .bin { color: var(--muted); max-width: 34%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .strip .arrow { color: var(--muted); flex: none; }
+  .strip .dst { font-weight: 700; }
+  .strip .pol { margin-left: auto; color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .strip .t { color: var(--muted); font-size: 10px; flex: none; width: 60px; }
+  .board-empty { color: var(--muted); padding: 18px 0; font-size: 12px; }
+
+  .tail-wrap {
+    border-top: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .tail-label { padding: 8px 20px 0; margin-bottom: 0; }
+  .tail-controls { display: flex; gap: 6px; }
+  .fchip {
+    background: none; border: 1px solid var(--line); border-radius: 10px;
+    color: var(--muted); font-size: 10px; padding: 0 8px; cursor: pointer;
+  }
+  .fchip.on { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+  .tail { flex: 1; overflow-y: auto; padding: 6px 20px 14px; font-size: 12px; }
+  .ln { white-space: pre-wrap; word-break: break-all; }
+  .ln .ts { color: var(--muted); }
+  .ln .lv-WARN { color: var(--warn); }
+  .ln .lv-ERROR { color: var(--err); }
+  .ln .lv-INFO { color: var(--accent-dim); }
+  .ln .src { color: var(--muted); }
+
+  /* ---------------- policy pane ---------------- */
+  .policy-grid {
+    flex: 1; min-height: 0;
+    display: grid; grid-template-columns: 1fr 380px; gap: 0;
+  }
+  .yaml { overflow: auto; padding: 14px 20px; border-right: 1px solid var(--line); }
+  .yaml pre { font-size: 12px; line-height: 1.55; }
+  .yaml .k { color: var(--accent); }
+  .revs { overflow-y: auto; padding: 14px 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th {
+    text-align: left; font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--muted); font-weight: 400; padding: 4px 8px 6px;
+    border-bottom: 1px solid var(--line);
+  }
+  td { padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  td.st-Loaded, td.st-Effective { color: var(--accent); }
+  td.st-Failed { color: var(--err); }
+  td .err-detail { color: var(--err); font-size: 11px; }
+  tr.active-rev td:first-child::after { content: " ●"; color: var(--accent); }
+
+  .placeholder {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); flex-direction: column; gap: 8px;
+  }
+  .placeholder .big { font-size: 15px; color: var(--text); }
+  .conn-warn {
+    padding: 6px 20px; font-size: 11px; color: var(--err);
+    border-bottom: 1px solid var(--line); display: none;
+  }
+  .conn-warn.show { display: block; }
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="rail">
+    <div class="brand">
+      <h1>OPEN<span class="tail">SHELL</span></h1>
+      <div class="sub">gateway console</div>
+    </div>
+    <div class="gw" id="gw">
+      <div class="row"><span>gateway</span><b id="gw-version">—</b></div>
+      <div class="row"><span>sandboxes</span><b id="gw-count">—</b></div>
+    </div>
+    <div class="rail-label">Sandboxes</div>
+    <div class="sb-list" id="sb-list" role="listbox" aria-label="Sandboxes"></div>
+    <div class="rail-foot"><kbd>j</kbd>/<kbd>k</kbd> select · <kbd>1</kbd> live · <kbd>2</kbd> policy</div>
+  </nav>
+
+  <main class="main">
+    <div class="conn-warn" id="conn-warn">Gateway unreachable — retrying…</div>
+    <div id="placeholder" class="placeholder">
+      <div class="big">Select a sandbox</div>
+      <div>Live network decisions, logs, and policy will appear here.</div>
+    </div>
+
+    <div id="detail" style="display:none; flex:1; min-height:0; flex-direction:column;">
+      <div class="head">
+        <span class="name" id="d-name">—</span>
+        <span class="chip" id="d-phase">—</span>
+        <span class="chip" id="d-policy">policy v—</span>
+        <span class="chip" id="d-image">—</span>
+        <span class="spacer"></span>
+        <div class="tabs">
+          <button class="tab sel" id="tab-live" onclick="selectTab('live')">Live</button>
+          <button class="tab" id="tab-policy" onclick="selectTab('policy')">Policy</button>
+        </div>
+      </div>
+
+      <div class="body">
+        <section class="pane sel" id="pane-live">
+          <div class="pulse-track" id="pulse"></div>
+          <div class="live-grid">
+            <div class="board">
+              <div class="board-label"><span>Network decisions</span><span id="board-count"></span></div>
+              <div id="board"><div class="board-empty">No network activity observed yet.</div></div>
+            </div>
+            <div class="tail-wrap">
+              <div class="tail-label">
+                <span>Log tail</span>
+                <span class="tail-controls">
+                  <button class="fchip on" data-src="all">all</button>
+                  <button class="fchip" data-src="sandbox">sandbox</button>
+                  <button class="fchip" data-src="gateway">gateway</button>
+                  <button class="fchip" id="follow-chip" onclick="toggleFollow()">following</button>
+                </span>
+              </div>
+              <div class="tail" id="tail"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="pane" id="pane-policy">
+          <div class="policy-grid">
+            <div class="yaml"><pre id="yaml">—</pre></div>
+            <div class="revs">
+              <table>
+                <thead><tr><th>ver</th><th>status</th><th>hash</th><th>loaded</th></tr></thead>
+                <tbody id="rev-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+const state = {
+  sandboxes: [],
+  selected: null,     // sandbox name
+  selectedId: null,   // sandbox uuid
+  es: null,           // EventSource
+  follow: true,
+  srcFilter: "all",
+  stripCount: 0,
+};
+
+// ---------------- data plumbing ----------------
+
+async function jget(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function refreshRail() {
+  try {
+    const [ov, sbs] = await Promise.all([
+      jget("/ui/api/overview"),
+      jget("/ui/api/sandboxes"),
+    ]);
+    $("conn-warn").classList.remove("show");
+    $("gw-version").textContent = "v" + ov.version;
+    $("gw-count").textContent = ov.ready_count + "/" + ov.sandbox_count + " ready";
+    state.sandboxes = sbs;
+    renderRail();
+    if (state.selected) {
+      const cur = sbs.find((s) => s.name === state.selected);
+      if (cur) renderHead(cur);
+    }
+  } catch {
+    $("conn-warn").classList.add("show");
+  }
+}
+
+function renderRail() {
+  const el = $("sb-list");
+  if (!state.sandboxes.length) {
+    el.innerHTML = '<div class="rail-empty">No sandboxes yet.<br>Create one with <code>openshell sandbox create</code>.</div>';
+    return;
+  }
+  el.innerHTML = "";
+  for (const sb of state.sandboxes) {
+    const b = document.createElement("button");
+    b.className = "sb-item" + (sb.name === state.selected ? " sel" : "");
+    b.setAttribute("role", "option");
+    b.onclick = () => selectSandbox(sb.name);
+    const age = fmtAge(Date.now() - sb.created_at_ms);
+    b.innerHTML = '<div>' + esc(sb.name) + '</div>' +
+      '<div class="meta"><span class="led ' + esc(sb.phase) + '"></span>' +
+      '<small>' + esc(sb.phase) + ' · ' + age + '</small></div>';
+    el.appendChild(b);
+  }
+}
+
+async function selectSandbox(name) {
+  state.selected = name;
+  renderRail();
+  $("placeholder").style.display = "none";
+  const d = $("detail");
+  d.style.display = "flex";
+  $("board").innerHTML = '<div class="board-empty">No network activity observed yet.</div>';
+  state.stripCount = 0;
+  $("board-count").textContent = "";
+  $("tail").innerHTML = "";
+
+  try {
+    const detail = await jget("/ui/api/sandboxes/" + encodeURIComponent(name));
+    state.selectedId = detail.sandbox.id;
+    renderHead(detail.sandbox);
+    renderPolicy(detail);
+    const logs = await jget("/ui/api/sandboxes/" + encodeURIComponent(name) + "/logs?lines=200");
+    for (const line of logs) ingest(line, false);
+    scrollTail(true);
+    openStream(name);
+  } catch (e) {
+    $("tail").innerHTML = '<div class="ln lv-ERROR">Failed to load sandbox: ' + esc(String(e.message || e)) + '</div>';
+  }
+}
+
+function openStream(name) {
+  if (state.es) { state.es.close(); state.es = null; }
+  const es = new EventSource("/ui/api/sandboxes/" + encodeURIComponent(name) + "/stream");
+  es.onmessage = (ev) => {
+    try { ingest(JSON.parse(ev.data), true); } catch { /* skip */ }
+  };
+  state.es = es;
+}
+
+// ---------------- rendering ----------------
+
+function renderHead(sb) {
+  $("d-name").textContent = sb.name;
+  const ph = $("d-phase");
+  ph.textContent = sb.phase;
+  ph.className = "chip phase-" + sb.phase;
+  $("d-policy").textContent = "policy v" + sb.active_policy_version;
+  $("d-image").textContent = shortImage(sb.image);
+}
+
+function renderPolicy(detail) {
+  $("yaml").innerHTML = hlYaml(detail.policy_yaml || "# no policy payload");
+  const tb = $("rev-body");
+  tb.innerHTML = "";
+  const active = detail.sandbox.active_policy_version;
+  for (const r of detail.revisions) {
+    const tr = document.createElement("tr");
+    if (r.version === active) tr.className = "active-rev";
+    const loaded = r.loaded_at_ms ? fmtTime(r.loaded_at_ms) : "—";
+    const err = r.load_error ? '<div class="err-detail">' + esc(r.load_error) + "</div>" : "";
+    tr.innerHTML = "<td>" + r.version + "</td>" +
+      '<td class="st-' + esc(r.status) + '">' + esc(r.status) + err + "</td>" +
+      "<td>" + esc(r.hash.slice(0, 8)) + "</td>" +
+      "<td>" + loaded + "</td>";
+    tb.appendChild(tr);
+  }
+}
+
+// OCSF shorthand examples:
+//   "ALLOWED /usr/bin/curl(85) -> pypi.org:443 [policy:allow_pypi engine:opa]"
+//   "CONNECT denied example.com:443"  /  "NET:FAIL ..." arrives as message text
+const DECISION_RE = /(ALLOWED|DENIED)\s+(\S+?)\((\d+)\)\s+->\s+(\S+)(?:\s+\[policy:([^\s\]]+))?/;
+
+function ingest(line, live) {
+  // 1) decision board strips
+  const m = DECISION_RE.exec(line.message);
+  const isFail = line.message.includes("NET:FAIL") || (line.fields && line.fields.activity === "Fail");
+  if (m) {
+    addStrip({
+      verdict: m[1] === "ALLOWED" ? "allow" : "deny",
+      label: m[1],
+      bin: m[2],
+      dst: m[4],
+      pol: m[5] || "",
+      ts: line.timestamp_ms,
+    }, live);
+  } else if (isFail) {
+    const dst = (line.message.match(/(\S+:\d+)/) || [])[1] || "";
+    addStrip({ verdict: "fail", label: "FAIL", bin: "", dst, pol: "", ts: line.timestamp_ms }, live);
+  }
+
+  // 2) log tail
+  if (state.srcFilter !== "all" && (line.source || "gateway") !== state.srcFilter) return;
+  appendTailLine(line);
+  if (live) scrollTail();
+}
+
+function addStrip(s, live) {
+  const board = $("board");
+  const empty = board.querySelector(".board-empty");
+  if (empty) empty.remove();
+  const div = document.createElement("div");
+  div.className = "strip " + s.verdict + (live ? " fresh" : "");
+  div.innerHTML =
+    '<span class="t">' + fmtTime(s.ts) + "</span>" +
+    '<span class="verdict">' + esc(s.label) + "</span>" +
+    '<span class="bin">' + esc(s.bin) + "</span>" +
+    (s.bin ? '<span class="arrow">→</span>' : "") +
+    '<span class="dst">' + esc(s.dst) + "</span>" +
+    '<span class="pol">' + esc(s.pol) + "</span>";
+  board.prepend(div);
+  state.stripCount++;
+  $("board-count").textContent = state.stripCount + " events";
+  while (board.children.length > 200) board.lastChild.remove();
+  if (live) pulse(s.verdict !== "allow");
+}
+
+function appendTailLine(line) {
+  const tail = $("tail");
+  const div = document.createElement("div");
+  div.className = "ln";
+  const lv = (line.level || "").toUpperCase();
+  div.innerHTML =
+    '<span class="ts">' + fmtTime(line.timestamp_ms) + "</span> " +
+    '<span class="src">[' + esc(line.source || "gateway") + "]</span> " +
+    '<span class="lv-' + esc(lv) + '">' + esc(lv.padEnd(5)) + "</span> " +
+    esc(line.message);
+  tail.appendChild(div);
+  while (tail.children.length > 1000) tail.firstChild.remove();
+}
+
+function pulse(deny) {
+  const track = $("pulse");
+  const tick = document.createElement("div");
+  tick.className = "tick" + (deny ? " deny" : "");
+  track.appendChild(tick);
+  setTimeout(() => tick.remove(), 1000);
+}
+
+function scrollTail(force) {
+  if (!state.follow && !force) return;
+  const t = $("tail");
+  t.scrollTop = t.scrollHeight;
+}
+
+function toggleFollow() {
+  state.follow = !state.follow;
+  const chip = $("follow-chip");
+  chip.textContent = state.follow ? "following" : "paused";
+  chip.classList.toggle("on", state.follow);
+  if (state.follow) scrollTail(true);
+}
+
+function selectTab(which) {
+  for (const t of ["live", "policy"]) {
+    $("tab-" + t).classList.toggle("sel", t === which);
+    $("pane-" + t).classList.toggle("sel", t === which);
+  }
+}
+
+// ---------------- helpers ----------------
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+function fmtTime(ms) {
+  if (!ms) return "—";
+  return new Date(ms).toTimeString().slice(0, 8);
+}
+function fmtAge(ms) {
+  const m = Math.floor(ms / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return m + "m";
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + "h";
+  return Math.floor(h / 24) + "d";
+}
+function shortImage(img) {
+  if (!img) return "no image";
+  const parts = img.split("/");
+  return parts[parts.length - 1];
+}
+function hlYaml(y) {
+  return esc(y).replace(/^(\s*)([\w.-]+)(:)/gm, '$1<span class="k">$2</span>$3');
+}
+
+// ---------------- keyboard ----------------
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+  if (e.key === "1") selectTab("live");
+  if (e.key === "2") selectTab("policy");
+  if (e.key === "j" || e.key === "k") {
+    if (!state.sandboxes.length) return;
+    let idx = state.sandboxes.findIndex((s) => s.name === state.selected);
+    idx = e.key === "j" ? Math.min(idx + 1, state.sandboxes.length - 1) : Math.max(idx - 1, 0);
+    selectSandbox(state.sandboxes[idx].name);
+  }
+});
+
+// source filter chips
+for (const chip of document.querySelectorAll(".fchip[data-src]")) {
+  chip.onclick = () => {
+    state.srcFilter = chip.dataset.src;
+    for (const c of document.querySelectorAll(".fchip[data-src]")) {
+      c.classList.toggle("on", c === chip);
+    }
+    if (state.selected) selectSandbox(state.selected);
+  };
+}
+
+// pause follow when the user scrolls up
+$("tail").addEventListener("scroll", () => {
+  const t = $("tail");
+  const atBottom = t.scrollHeight - t.scrollTop - t.clientHeight < 30;
+  if (!atBottom && state.follow) toggleFollow();
+  else if (atBottom && !state.follow) toggleFollow();
+});
+
+// ---------------- boot ----------------
+refreshRail();
+setInterval(refreshRail, 3000);
+</script>
+</body>
+</html>

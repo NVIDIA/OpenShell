@@ -232,7 +232,7 @@ async fn handle_create_sandbox_inner(
     }))
 }
 
-pub(super) async fn handle_get_sandbox(
+pub async fn handle_get_sandbox(
     state: &Arc<ServerState>,
     request: Request<GetSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
@@ -253,7 +253,7 @@ pub(super) async fn handle_get_sandbox(
     }))
 }
 
-pub(super) async fn handle_list_sandboxes(
+pub async fn handle_list_sandboxes(
     state: &Arc<ServerState>,
     request: Request<ListSandboxesRequest>,
 ) -> Result<Response<ListSandboxesResponse>, Status> {
