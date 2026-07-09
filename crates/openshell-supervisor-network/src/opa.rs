@@ -179,6 +179,46 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    fn network_input_json(input: &NetworkInput, endpoint_only: bool) -> serde_json::Value {
+        let ancestor_strs: Vec<String> = input
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let cmdline_strs: Vec<String> = input
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        serde_json::json!({
+            "exec": {
+                "path": input.binary_path.to_string_lossy(),
+                "ancestors": ancestor_strs,
+                "cmdline_paths": cmdline_strs,
+                "endpoint_only": endpoint_only,
+            },
+            "network": {
+                "host": input.host,
+                "port": input.port,
+            }
+        })
+    }
+
+    fn endpoint_only_input_json(host: &str, port: u16) -> serde_json::Value {
+        serde_json::json!({
+            "exec": {
+                "path": "",
+                "ancestors": [],
+                "cmdline_paths": [],
+                "endpoint_only": true,
+            },
+            "network": {
+                "host": host,
+                "port": port,
+            }
+        })
+    }
+
     /// Load policy from a `.rego` rules file and data from a YAML file.
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
@@ -317,27 +357,7 @@ impl OpaEngine {
     /// `allow_network` rule, and returns a `PolicyDecision` with the result,
     /// deny reason, and matched policy name.
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<PolicyDecision> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        let input_json = Self::network_input_json(input, false);
 
         let mut engine = self
             .engine
@@ -387,28 +407,23 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
-        let ancestor_strs: Vec<String> = input
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let cmdline_strs: Vec<String> = input
-            .cmdline_paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        let input_json = serde_json::json!({
-            "exec": {
-                "path": input.binary_path.to_string_lossy(),
-                "ancestors": ancestor_strs,
-                "cmdline_paths": cmdline_strs,
-            },
-            "network": {
-                "host": input.host,
-                "port": input.port,
-            }
-        });
+        self.evaluate_network_action_json_with_generation(Self::network_input_json(input, false))
+    }
 
+    pub fn evaluate_endpoint_only_network_action_with_generation(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<(NetworkAction, u64)> {
+        self.evaluate_network_action_json_with_generation(Self::endpoint_only_input_json(
+            host, port,
+        ))
+    }
+
+    fn evaluate_network_action_json_with_generation(
+        &self,
+        input_json: serde_json::Value,
+    ) -> Result<(NetworkAction, u64)> {
         let mut engine = self
             .engine
             .lock()

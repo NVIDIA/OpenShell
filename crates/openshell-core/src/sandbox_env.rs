@@ -29,8 +29,9 @@ pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
 /// Deployment-controlled telemetry toggle propagated to the sandbox supervisor.
 pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
 
-/// Supervisor pod/runtime topology. Kubernetes sidecar mode sets this to
-/// `"sidecar"`; the default combined supervisor path omits it.
+/// Supervisor pod/runtime topology. Kubernetes sidecar modes set this to
+/// `"sidecar"` or `"network-sidecar"`; the default combined supervisor path
+/// omits it.
 pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
 
 /// Network enforcement backend selected by the compute driver.
@@ -43,7 +44,7 @@ pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
 /// `/proc` identity binding.
 pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
 
-/// Unix socket used by Kubernetes sidecar topology for local coordination.
+/// Unix socket used by Kubernetes process-sidecar topology for local coordination.
 ///
 /// The network sidecar owns gateway credentials and serves policy/provider
 /// state over this socket instead of exposing gateway credentials to the agent

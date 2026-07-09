@@ -83,6 +83,17 @@ gateway callback environment variables. The process supervisor receives policy
 and provider environment state from the sidecar over a local control socket in
 the shared sidecar state volume.
 
+The `network-sidecar` topology keeps the root network init container and
+network sidecar, but leaves the agent image entrypoint unchanged and does not
+run a process supervisor in the agent container. It forces egress through the
+sidecar proxy. In process/binary-aware mode, the network sidecar uses UID 0 with
+`SYS_PTRACE` and `DAC_READ_SEARCH` plus the shared process namespace for
+best-effort process/binary-aware network policy. If the sidecar cannot discover
+the agent entrypoint PID, it evaluates endpoint/L7 policy without process or
+binary matching for that request. This topology does not provide OpenShell SSH,
+exec, file sync, Landlock filesystem policy, child seccomp policy, or provider
+environment injection into the workload.
+
 The driver can request a Kubernetes AppArmor profile through
 `app_armor_profile`.
 

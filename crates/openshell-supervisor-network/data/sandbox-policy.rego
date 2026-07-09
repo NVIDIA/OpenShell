@@ -141,6 +141,10 @@ binary_allowed(_, _) if {
 	not binary_identity_required
 }
 
+binary_allowed(_, exec) if {
+	object.get(exec, "endpoint_only", false)
+}
+
 # Binary matching: exact path.
 # SHA256 integrity is enforced in Rust via trust-on-first-use (TOFU) cache,
 # not in Rego. The proxy computes and caches binary hashes at runtime.
@@ -173,6 +177,10 @@ binary_allowed(policy, exec) if {
 
 user_declared_binary_allowed(_, _) if {
 	not binary_identity_required
+}
+
+user_declared_binary_allowed(_, exec) if {
+	object.get(exec, "endpoint_only", false)
 }
 
 user_declared_binary_allowed(policy, exec) if {

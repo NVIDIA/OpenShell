@@ -135,9 +135,12 @@ pub async fn run_sandbox(
     }
 
     let sidecar_network_enforcement = sidecar_network_enforcement_enabled();
+    let process_sidecar_topology = process_sidecar_topology_enabled();
     let process_enforcement_mode = process_enforcement_mode();
-    let process_uses_sidecar_control =
-        process_enabled && !network_enabled && sidecar_network_enforcement;
+    let process_uses_sidecar_control = process_enabled
+        && !network_enabled
+        && sidecar_network_enforcement
+        && process_sidecar_topology;
     let mut process_control_connection = None;
     let sidecar_bootstrap = if process_uses_sidecar_control {
         let socket = sidecar_control_socket().ok_or_else(|| {
@@ -382,37 +385,38 @@ pub async fn run_sandbox(
     };
 
     #[cfg(target_os = "linux")]
-    let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
-        if !matches!(policy.network.mode, NetworkMode::Proxy) {
-            return Err(miette::miette!(
-                "sidecar network enforcement requires proxy network mode"
-            ));
-        }
-        let socket = sidecar_control_socket().ok_or_else(|| {
-            miette::miette!(
-                "{} is required for sidecar topology",
-                openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET
-            )
-        })?;
-        let proto = retained_proto.as_ref().ok_or_else(|| {
-            miette::miette!(
-                "sidecar topology requires gateway policy data for the process supervisor"
-            )
-        })?;
-        let ca_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
-        Some(sidecar_control::spawn_server(
-            &socket,
-            sidecar_control::BootstrapData {
-                policy_proto: proto.clone(),
-                provider_env_revision: provider_credentials.snapshot().revision,
-                provider_child_env: provider_env.clone(),
-                proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
-                proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
-            },
-        )?)
-    } else {
-        None
-    };
+    let sidecar_control_server =
+        if network_enabled && sidecar_network_enforcement && process_sidecar_topology {
+            if !matches!(policy.network.mode, NetworkMode::Proxy) {
+                return Err(miette::miette!(
+                    "sidecar network enforcement requires proxy network mode"
+                ));
+            }
+            let socket = sidecar_control_socket().ok_or_else(|| {
+                miette::miette!(
+                    "{} is required for sidecar topology",
+                    openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET
+                )
+            })?;
+            let proto = retained_proto.as_ref().ok_or_else(|| {
+                miette::miette!(
+                    "sidecar topology requires gateway policy data for the process supervisor"
+                )
+            })?;
+            let ca_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
+            Some(sidecar_control::spawn_server(
+                &socket,
+                sidecar_control::BootstrapData {
+                    policy_proto: proto.clone(),
+                    provider_env_revision: provider_credentials.snapshot().revision,
+                    provider_child_env: provider_env.clone(),
+                    proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
+                    proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
+                },
+            )?)
+        } else {
+            None
+        };
     #[cfg(not(target_os = "linux"))]
     let sidecar_control_server: Option<sidecar_control::ServerHandle> = None;
 
@@ -728,12 +732,17 @@ fn sidecar_network_enforcement_enabled() -> bool {
         .is_ok_and(|value| value == SIDECAR_NETWORK_ENFORCEMENT_MODE)
 }
 
+fn process_sidecar_topology_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
+        .is_ok_and(|value| value == "sidecar")
+}
+
 fn process_enforcement_mode() -> ProcessEnforcementMode {
     match std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
         .ok()
         .as_deref()
     {
-        Some("sidecar") => ProcessEnforcementMode::NetworkOnly,
+        Some("sidecar" | "network-sidecar") => ProcessEnforcementMode::NetworkOnly,
         _ => ProcessEnforcementMode::Full,
     }
 }

@@ -3,25 +3,27 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Kubernetes Sandbox Topology"
 sidebar-title: "Topology"
-description: "Choose between combined and sidecar supervisor topology for Kubernetes sandbox pods."
+description: "Choose between combined, sidecar, and network-sidecar supervisor topology for Kubernetes sandbox pods."
 keywords: "Generative AI, Cybersecurity, Kubernetes, Sandboxing, Sidecar, Network Policy, RuntimeClass"
 position: 2
 ---
 
-Kubernetes sandbox pods can run the OpenShell supervisor in `combined` or
-`sidecar` topology. Choose the topology based on which controls you need inside
-the pod and how much privilege your cluster allows on the agent container.
+Kubernetes sandbox pods can run the OpenShell supervisor in `combined`,
+`sidecar`, or `network-sidecar` topology. Choose the topology based on which
+controls you need inside the pod and how much privilege your cluster allows on
+the agent container.
 
 ## Choose a Topology
 
 The default `combined` topology preserves the full OpenShell enforcement model.
-Use `sidecar` only when you accept network-focused enforcement in exchange for a
-lower-privilege agent container.
+Use the sidecar topologies only when you accept network-focused enforcement in
+exchange for a lower-privilege agent container.
 
 | Topology | Use when | Main tradeoff |
 |---|---|---|
 | `combined` | You need OpenShell network, filesystem, and process controls in the sandbox workload. | The agent container carries the Linux capabilities the supervisor needs. |
 | `sidecar` | You need the agent container to run as non-root without added Linux capabilities, and network policy is the primary control. | Privilege-dropping and supervisor mount isolation do not run in the agent container. |
+| `network-sidecar` | You need forced egress through the OpenShell proxy while preserving the agent image entrypoint. | No process supervisor runs in the agent container, so SSH/exec/file sync, filesystem policy, syscall policy, and provider env injection are unavailable. |
 
 ## Privilege Model
 
@@ -32,6 +34,8 @@ The long-running container permissions differ by topology:
 | `combined` | Agent container, which also runs the supervisor | Not forced by topology | Not explicitly disabled by the driver | Adds `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG`; adds `SETUID`, `SETGID`, and `DAC_READ_SEARCH` when user namespaces are enabled | Full supervisor controls run in the agent container. |
 | `sidecar` | Agent container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
 | `sidecar` | Network supervisor sidecar | `proxyUid:sandbox_gid` | `false` | Drops `ALL`; adds `SYS_PTRACE` by default | Long-running proxy sidecar is non-root and can inspect workload `/proc` entries for process/binary-aware network policy. |
+| `network-sidecar` | Agent container | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | The original image entrypoint runs directly without a process supervisor. |
+| `network-sidecar` | Network supervisor sidecar | `proxyUid:sandbox_gid` | `false` | Drops `ALL`; adds `SYS_PTRACE` by default | Long-running proxy sidecar enforces egress policy and best-effort process/binary-aware network policy. |
 
 Short-lived setup containers still have the permissions needed to prepare the
 pod:
@@ -40,6 +44,7 @@ pod:
 |---|---|---|---|---|---|
 | `combined` | Supervisor install init container | `0` | Not set | Not set | Copies the supervisor binary into the agent container volume. |
 | `sidecar` | Network init container | `0` | `false` | Drops `ALL`; adds `NET_ADMIN`, `NET_RAW`, `CHOWN`, and `FOWNER` | Installs pod-local nftables rules and prepares shared sidecar state. |
+| `network-sidecar` | Network init container | `0` | `false` | Drops `ALL`; adds `NET_ADMIN`, `NET_RAW`, `CHOWN`, and `FOWNER` | Installs pod-local nftables rules and prepares shared sidecar state. |
 
 ## Combined Topology
 
@@ -151,9 +156,66 @@ Sidecar pods use `shareProcessNamespace: true` so the network sidecar can
 resolve workload process and binary identity through `/proc/<entrypoint-pid>`.
 </Warning>
 
+## Network-Sidecar Topology
+
+Network-sidecar topology keeps only the network supervisor sidecar. The agent
+container runs the image entrypoint directly.
+
+```mermaid
+flowchart TB
+  Sandbox["agents.x-k8s.io Sandbox"]
+
+  subgraph Pod["Sandbox pod"]
+    Init["network init container<br/>root setup capabilities"]
+    TLS["shared proxy TLS volume"]
+    NetNS["pod network namespace"]
+
+    subgraph Agent["agent container"]
+      Workload["Image entrypoint<br/>agent workload"]
+    end
+
+    NetworkSidecar["network supervisor sidecar<br/>proxyUid"]
+  end
+
+  Gateway["OpenShell Gateway"]
+  External["External services"]
+
+  Sandbox --> Pod
+  Init -->|"installs nftables rules"| NetNS
+  Workload -->|"egress redirected on loopback"| NetworkSidecar
+  NetworkSidecar -->|"policy sync"| Gateway
+  NetworkSidecar -->|"policy-enforced egress"| External
+  NetworkSidecar -->|"proxy CA files"| TLS
+  Workload -.->|"trust-store env points here"| TLS
+```
+
+The pod contains these OpenShell-managed pieces:
+
+| Component | Runs as | Purpose |
+|---|---|---|
+| Network init container | Root with setup capabilities | Installs pod-level nftables rules and prepares sidecar state and proxy TLS directories. |
+| Network sidecar | `supervisor.sidecar.proxyUid` | Runs the proxy, enforces network policy, owns gateway authentication, and polls policy/provider settings. |
+| Agent container | Resolved sandbox UID/GID | Runs the original image entrypoint directly. The driver injects proxy and trust-store environment variables, but does not install a process supervisor. |
+
+This topology forces pod egress through the proxy and keeps gateway credentials
+out of the agent container. Process/binary-aware network policy is best effort:
+the sidecar uses `shareProcessNamespace: true` and `SYS_PTRACE` by default to
+discover the agent entrypoint and resolve socket owners through `/proc`. If PID
+discovery is unavailable, the sidecar logs a warning and evaluates endpoint/L7
+policy without process or binary matching for that request.
+
+<Warning>
+Network-sidecar topology does not provide OpenShell SSH, exec, file sync,
+Landlock filesystem policy, child seccomp policy, supervisor privilege
+dropping, or provider environment injection into the already-running workload.
+Use `combined` when you need the full OpenShell sandbox contract, or `sidecar`
+when you need the gateway session and process supervisor but want network
+enforcement moved out of the agent container.
+</Warning>
+
 ## Credential Exposure
 
-Sidecar topology keeps gateway credentials in the network sidecar. The agent
+Sidecar topologies keep gateway credentials in the network sidecar. The agent
 container does not mount the projected ServiceAccount token used for sandbox
 token bootstrap, does not mount the sandbox client TLS secret, and does not get
 gateway callback environment variables.
@@ -168,15 +230,20 @@ already-running workload entrypoint. Use `combined` topology when you need the
 full single-supervisor enforcement path; use additional runtime isolation when
 you need a stronger container boundary around sidecar workloads.
 
+`network-sidecar` does not start a process supervisor, so it does not create the
+sidecar control socket and cannot stream provider environment updates into the
+workload. Provider credentials remain available to the network sidecar for L7
+credential resolution and policy enforcement.
+
 ## RuntimeClass Isolation
 
-Sidecar topology pairs well with runtime classes such as gVisor or Kata
+Sidecar topologies pair well with runtime classes such as gVisor or Kata
 Containers when the cluster supports them. A sandboxed runtime strengthens the
 container boundary while OpenShell focuses on network policy enforcement from
 the sidecar.
 
 Runtime classes do not re-enable the OpenShell privilege-drop or supervisor
-mount-isolation controls that sidecar mode relaxes. Use them as an additional
+mount-isolation controls that sidecar modes relax. Use them as an additional
 workload boundary, not as a replacement for the combined topology's full
 supervisor controls.
 
@@ -189,7 +256,7 @@ openshell sandbox create \
   -- claude
 ```
 
-## Enable Sidecar Mode
+## Enable Sidecar Modes
 
 For direct gateway TOML configuration, set the Kubernetes driver fields:
 
@@ -200,6 +267,9 @@ topology = "sidecar"
 [openshell.drivers.kubernetes.sidecar]
 proxy_uid = 1337
 ```
+
+Use `topology = "network-sidecar"` to run only the network sidecar and leave the
+agent image entrypoint unchanged.
 
 `proxy_uid` must be a non-root UID and must not match the sandbox UID.
 The network init container exempts this UID from proxy redirection so the
@@ -214,6 +284,8 @@ supervisor:
     proxyUid: 1337
     processBinaryAwareNetworkPolicy: true
 ```
+
+Set `supervisor.topology: network-sidecar` for the network-only sidecar mode.
 
 Leave `topology` unset, or set it to `combined`, to keep the original
 single-container supervisor path. For Helm installs, leave

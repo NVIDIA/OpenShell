@@ -44,6 +44,8 @@ const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const INFERENCE_LOCAL_PORT: u16 = 443;
 #[cfg(target_os = "linux")]
 const SIDECAR_SUPERVISOR_TOPOLOGY: &str = "sidecar";
+#[cfg(target_os = "linux")]
+const NETWORK_SIDECAR_SUPERVISOR_TOPOLOGY: &str = "network-sidecar";
 
 /// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
 /// machine. Traffic to these names is eligible for the trusted-gateway SSRF
@@ -1615,6 +1617,10 @@ fn evaluate_opa_tcp(
 
     let entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
     let Some(proc_net_anchor_pid) = proc_net_anchor_pid(entrypoint_pid) else {
+        if network_sidecar_topology_enabled() {
+            warn_network_sidecar_identity_degraded();
+            return evaluate_endpoint_only_opa(engine, host, port);
+        }
         return deny(
             "entrypoint process not yet spawned".into(),
             None,
@@ -1686,6 +1692,9 @@ fn proc_net_anchor_pid(entrypoint_pid: u32) -> Option<u32> {
     if entrypoint_pid != 0 {
         return Some(entrypoint_pid);
     }
+    if network_sidecar_topology_enabled() {
+        return discover_network_sidecar_entrypoint_pid();
+    }
     sidecar_topology_enabled().then(std::process::id)
 }
 
@@ -1695,17 +1704,55 @@ fn sidecar_topology_enabled() -> bool {
         .is_ok_and(|value| value == SIDECAR_SUPERVISOR_TOPOLOGY)
 }
 
-fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> ConnectDecision {
-    let input = crate::opa::NetworkInput {
-        host: host.to_string(),
-        port,
-        binary_path: PathBuf::new(),
-        binary_sha256: String::new(),
-        ancestors: vec![],
-        cmdline_paths: vec![],
-    };
+#[cfg(target_os = "linux")]
+fn network_sidecar_topology_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
+        .is_ok_and(|value| value == NETWORK_SIDECAR_SUPERVISOR_TOPOLOGY)
+}
 
-    match engine.evaluate_network_action_with_generation(&input) {
+#[cfg(target_os = "linux")]
+fn discover_network_sidecar_entrypoint_pid() -> Option<u32> {
+    static DISCOVERED_PID: AtomicU32 = AtomicU32::new(0);
+
+    let cached = DISCOVERED_PID.load(Ordering::Acquire);
+    if cached != 0 && std::path::Path::new(&format!("/proc/{cached}")).exists() {
+        return Some(cached);
+    }
+
+    match crate::procfs::discover_shared_pid_agent_entrypoint_pid() {
+        Ok(Some(pid)) => {
+            DISCOVERED_PID.store(pid, Ordering::Release);
+            debug!(
+                pid,
+                "Discovered network-sidecar agent entrypoint PID in shared process namespace"
+            );
+            Some(pid)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to discover network-sidecar agent entrypoint PID"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn warn_network_sidecar_identity_degraded() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    if !WARNED.swap(true, Ordering::AcqRel) {
+        warn!(
+            "network-sidecar could not discover an agent entrypoint PID; \
+             evaluating network policy without process/binary identity"
+        );
+    }
+}
+
+fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> ConnectDecision {
+    match engine.evaluate_endpoint_only_network_action_with_generation(host, port) {
         Ok((action, generation)) => ConnectDecision {
             action,
             generation,
@@ -4569,6 +4616,36 @@ network_policies:
             matches!(denied.action, NetworkAction::Deny { .. }),
             "endpoint-only mode must still deny undeclared endpoints"
         );
+    }
+
+    #[test]
+    fn endpoint_only_opa_can_degrade_strict_binary_identity_runtime() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let data = r#"
+version: 1
+network_policies:
+  test_l7:
+    name: test_l7
+    endpoints:
+      - host: host.k3d.internal
+        port: 56123
+        protocol: rest
+        enforcement: enforce
+        access: full
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let engine = OpaEngine::from_strings_with_binary_identity_required(policy, data, true)
+            .expect("strict engine");
+
+        let decision = evaluate_endpoint_only_opa(&engine, "host.k3d.internal", 56123);
+        assert_eq!(
+            decision.action,
+            NetworkAction::Allow {
+                matched_policy: Some("test_l7".to_string()),
+            }
+        );
+        assert!(decision.binary.is_none());
     }
 
     fn websocket_l7_config(

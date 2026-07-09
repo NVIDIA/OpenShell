@@ -268,15 +268,18 @@ kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\
 kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
 ```
 
-If `topology = "sidecar"` is rendered under `[openshell.drivers.kubernetes]`,
-sandbox pods should have an `openshell-network-init` init container running
-`--mode=network-init`, an `agent` container running
-`openshell-sandbox --mode=process`, and an `openshell-supervisor-network`
-container running `--mode=network`. The init container owns nftables setup and
-should be the only sidecar topology container with `NET_ADMIN`. It also needs
-`CHOWN`/`FOWNER` to hand shared emptyDir state to `proxy_uid`. The long-running
-network sidecar runs as `proxy_uid` with primary GID `sandbox_gid`; the pod
-`fsGroup` is also set to `sandbox_gid`.
+If `topology = "sidecar"` or `topology = "network-sidecar"` is rendered under
+`[openshell.drivers.kubernetes]`, sandbox pods should have an
+`openshell-network-init` init container running `--mode=network-init` and an
+`openshell-supervisor-network` container running `--mode=network`. The existing
+`sidecar` topology also rewrites the `agent` container command to
+`openshell-sandbox --mode=process`; `network-sidecar` leaves the agent image
+entrypoint unchanged and does not mount the supervisor binary into the agent.
+The init container owns nftables setup and should be the only sidecar topology
+container with `NET_ADMIN`. It also needs `CHOWN`/`FOWNER` to hand shared
+emptyDir state to `proxy_uid`. The long-running network sidecar runs as
+`proxy_uid` with primary GID `sandbox_gid`; the pod `fsGroup` is also set to
+`sandbox_gid`.
 
 In sidecar topology only the network sidecar should mount the gateway bootstrap
 credentials (`openshell-sa-token` and `openshell-client-tls`). The process
@@ -299,7 +302,12 @@ denied, inspect the sidecar control logs and confirm the pod has
 The shared state directory should preserve `sandbox_gid` inheritance
 (`02775`), and the SSH socket should be group-connectable (`0660`) so the
 network sidecar can bridge gateway relay requests to the process supervisor.
-Inspect all three when sandbox registration or egress enforcement fails:
+In `network-sidecar`, there is no control socket client or SSH socket. The
+network sidecar discovers the agent entrypoint PID from the shared process
+namespace on demand; if that fails, it logs a degradation warning and evaluates
+endpoint/L7 policy without process or binary matching for that request.
+Inspect the rendered topology and relevant pod containers when sandbox
+registration or egress enforcement fails:
 
 ```bash
 kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E '^\[openshell\.drivers\.kubernetes\]|^topology\s*='

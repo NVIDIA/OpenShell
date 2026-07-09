@@ -121,6 +121,8 @@ deploy:
           #- ci/values-spire.yaml
           # To exercise the Kubernetes supervisor sidecar topology:
           #- ci/values-sidecar.yaml
+          # To exercise the Kubernetes network-only sidecar topology:
+          #- ci/values-network-sidecar.yaml
           # To test multi-replica external PostgreSQL behavior:
           #- ci/values-high-availability.yaml
         setValueTemplates:
@@ -134,6 +136,11 @@ profiles:
       - op: add
         path: /deploy/helm/releases/0/valuesFiles/-
         value: ci/values-sidecar.yaml
+  - name: network-sidecar
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-network-sidecar.yaml
   - name: sidecar-mtls
     patches:
       - op: add

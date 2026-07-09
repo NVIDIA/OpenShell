@@ -65,6 +65,9 @@ pub enum SupervisorTopology {
     /// Run network supervision in a privileged sidecar and process supervision
     /// as a low-capability wrapper in the agent container.
     Sidecar,
+    /// Run only network supervision in a sidecar and leave the agent
+    /// container entrypoint unchanged.
+    NetworkSidecar,
 }
 
 impl std::fmt::Display for SupervisorTopology {
@@ -72,6 +75,7 @@ impl std::fmt::Display for SupervisorTopology {
         match self {
             Self::Combined => f.write_str("combined"),
             Self::Sidecar => f.write_str("sidecar"),
+            Self::NetworkSidecar => f.write_str("network-sidecar"),
         }
     }
 }
@@ -83,6 +87,7 @@ impl FromStr for SupervisorTopology {
         match s {
             "combined" => Ok(Self::Combined),
             "sidecar" => Ok(Self::Sidecar),
+            "network-sidecar" => Ok(Self::NetworkSidecar),
             other => Err(format!("unknown topology '{other}'")),
         }
     }
@@ -91,14 +96,14 @@ impl FromStr for SupervisorTopology {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSidecarConfig {
-    /// UID used by relaxed long-running network sidecars in `sidecar`
-    /// topology. The network init container installs nftables rules that
+    /// UID used by relaxed long-running network sidecars in sidecar
+    /// topologies. The network init container installs nftables rules that
     /// exempt this UID, so it must not match the sandbox workload UID.
     /// Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants
     /// the requested `/proc` inspection capabilities into the effective set.
     pub proxy_uid: u32,
     /// Require process/binary-aware network policy enforcement in sidecar
-    /// topology. When disabled, the network sidecar runs as `proxy_uid`,
+    /// topologies. When disabled, the network sidecar runs as `proxy_uid`,
     /// drops the extra `/proc` inspection permissions, and evaluates
     /// endpoint/L7 policy without matching `policy.binaries`.
     pub process_binary_aware_network_policy: bool,
@@ -251,7 +256,7 @@ pub struct KubernetesComputeConfig {
     pub supervisor_sideload_method: SupervisorSideloadMethod,
     /// How the supervisor is arranged for Kubernetes sandbox pods.
     pub topology: SupervisorTopology,
-    /// Sidecar-only settings used when `topology = "sidecar"`.
+    /// Sidecar-only settings used by sidecar topologies.
     pub sidecar: KubernetesSidecarConfig,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
@@ -540,6 +545,16 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.topology, SupervisorTopology::Sidecar);
+    }
+
+    #[test]
+    fn serde_override_topology_network_sidecar() {
+        let json = serde_json::json!({
+            "topology": "network-sidecar"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.topology, SupervisorTopology::NetworkSidecar);
+        assert_eq!(cfg.topology.to_string(), "network-sidecar");
     }
 
     #[test]

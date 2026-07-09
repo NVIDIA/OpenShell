@@ -182,6 +182,100 @@ pub fn read_ppid(pid: u32) -> Option<u32> {
     None
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+struct SharedPidProcessCandidate {
+    pid: u32,
+    ppid: u32,
+    comm: String,
+    cmdline: String,
+    exe: String,
+}
+
+/// Best-effort discovery of the sandbox agent entrypoint in a shared pod PID namespace.
+///
+/// The network-only sidecar topology does not have a process supervisor to
+/// publish the workload PID. In Kubernetes shared-process pods, each
+/// container's first process is normally a child of PID 1, so select the first
+/// non-OpenShell, non-pause process from that level and fall back to the
+/// lowest eligible PID if the runtime uses a different parent shape.
+#[cfg(target_os = "linux")]
+pub fn discover_shared_pid_agent_entrypoint_pid() -> Result<Option<u32>> {
+    let self_pid = std::process::id();
+    let mut candidates = Vec::new();
+    let entries = std::fs::read_dir("/proc")
+        .map_err(|e| miette::miette!("failed to scan /proc for agent entrypoint: {e}"))?;
+
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 1 || pid == self_pid {
+            continue;
+        }
+
+        let candidate = SharedPidProcessCandidate {
+            pid,
+            ppid: read_ppid(pid).unwrap_or_default(),
+            comm: read_proc_comm(pid),
+            cmdline: read_proc_cmdline_text(pid),
+            exe: read_proc_exe_text(pid),
+        };
+        if is_shared_pid_agent_candidate(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates.sort_by_key(|candidate| (candidate.ppid != 1, candidate.pid));
+    Ok(candidates.first().map(|candidate| candidate.pid))
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_comm(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_cmdline_text(pid: u32) -> String {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return String::new();
+    };
+    cmdline
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_exe_text(pid: u32) -> String {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|path| path.display().to_string())
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn is_shared_pid_agent_candidate(candidate: &SharedPidProcessCandidate) -> bool {
+    let comm = candidate.comm.to_ascii_lowercase();
+    if comm == "pause" || comm == "pod" {
+        return false;
+    }
+
+    let haystack = format!("{} {}", candidate.exe, candidate.cmdline).to_ascii_lowercase();
+    if haystack.contains("openshell-sandbox") || haystack.contains("openshell-supervisor") {
+        return false;
+    }
+
+    !(candidate.comm.is_empty() && candidate.cmdline.is_empty() && candidate.exe.is_empty())
+}
+
 /// Walk the process tree upward from `pid`, collecting the binary path of each ancestor.
 ///
 /// Stops at PID 1 (init), `stop_pid` (the entrypoint process), or after 64 ancestors

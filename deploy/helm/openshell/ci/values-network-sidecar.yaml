@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI/dev overlay for exercising the Kubernetes network-sidecar topology.
+#
+# Merge after values.yaml and ci/values-skaffold.yaml:
+#   helm install ... -f values.yaml -f ci/values-skaffold.yaml -f ci/values-network-sidecar.yaml
+#
+# Or set:
+#   OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-network-sidecar.yaml
+# before running `mise run e2e:kubernetes`.
+supervisor:
+  topology: network-sidecar
+  sidecar:
+    # Keep strict process/binary-aware network policy enabled so CI/dev can
+    # exercise shared-PID agent entrypoint discovery. Set this false only when
+    # intentionally validating the endpoint/L7-only downgrade mode.
+    processBinaryAwareNetworkPolicy: true
