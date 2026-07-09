@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: image-prepull
+  namespace: default
+  labels:
+    app.kubernetes.io/name: image-prepull
+    app.kubernetes.io/part-of: openshell-warm-pool
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: image-prepull
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: image-prepull
+    spec:
+      initContainers:
+      - name: pull-sandbox
+        image: ghcr.io/nvidia/openshell/sandbox:latest
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/true"]
+      containers:
+      - name: pause
+        image: registry.k8s.io/pause:3.10
+        resources:
+          requests:
+            cpu: "1m"
+            memory: "4Mi"
+          limits:
+            cpu: "1m"
+            memory: "4Mi"
+      tolerations:
+      - operator: Exists

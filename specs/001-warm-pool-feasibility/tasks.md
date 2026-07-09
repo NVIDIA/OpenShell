@@ -22,7 +22,7 @@
 - [ ] T003 Verify all four CRDs are registered: Sandbox, SandboxTemplate, SandboxWarmPool, SandboxClaim via `kubectl api-resources | grep agents`
 - [ ] T004 Deploy OpenShell on the cluster using the OpenShift deploy wrapper (github.com/2000krysztof/Openshell-Openshift-Deploy)
 - [ ] T005 Validate cold-start sandbox creation works end-to-end via `openshell sandbox create --from base`
-- [ ] T006 Create image pre-pull DaemonSet to pre-pull sandbox images on all worker nodes in `experiments/manifests/image-prepull-daemonset.yaml`
+- [X] T006 Create image pre-pull DaemonSet to pre-pull sandbox images on all worker nodes in `experiments/manifests/image-prepull-daemonset.yaml`
 - [ ] T007 Apply pre-pull DaemonSet and verify images are cached on all 3 nodes
 
 **Checkpoint**: Cluster running, operator installed, OpenShell functional, images pre-pulled
@@ -33,12 +33,12 @@
 
 **Purpose**: Shared measurement infrastructure that all experiments depend on
 
-- [ ] T008 Create `experiments/` directory structure per plan.md project structure
-- [ ] T009 Implement shared measurement functions (timestamp capture, CSV output, pod event collection) in `experiments/lib/common.sh`
-- [ ] T010 Implement pod readiness wait with configurable timeout in `experiments/lib/wait-ready.sh`
-- [ ] T011 [P] Create SandboxTemplate manifest for warm pool experiments in `experiments/manifests/sandbox-template.yaml`
-- [ ] T012 [P] Create SandboxWarmPool manifest (5 replicas, configurable readiness) in `experiments/manifests/warm-pool.yaml`
-- [ ] T013 [P] Create SandboxClaim manifest template (with/without env vars) in `experiments/manifests/sandbox-claim.yaml`
+- [X] T008 Create `experiments/` directory structure per plan.md project structure
+- [X] T009 Implement shared measurement functions (timestamp capture, CSV output, pod event collection) in `experiments/lib/common.sh`
+- [X] T010 Implement pod readiness wait with configurable timeout in `experiments/lib/wait-ready.sh`
+- [X] T011 [P] Create SandboxTemplate manifest for warm pool experiments in `experiments/manifests/sandbox-template.yaml`
+- [X] T012 [P] Create SandboxWarmPool manifest (5 replicas, configurable readiness) in `experiments/manifests/warm-pool.yaml`
+- [X] T013 [P] Create SandboxClaim manifest template (with/without env vars) in `experiments/manifests/sandbox-claim.yaml`
 
 **Checkpoint**: Measurement library ready, manifests templated. Experiment scripts can now be built.
 
@@ -50,7 +50,7 @@
 
 **Independent Test**: Run 10+ sandboxes on the cluster and verify CSV output contains per-phase timestamps with computed p50/p90.
 
-- [ ] T014 [US1] Implement cold-start measurement script that creates sandboxes via `openshell sandbox create --from base`, captures per-phase timestamps (scheduled, image pulled, init complete, supervisor ready, SSH available), and outputs CSV in `experiments/measure-cold-start.sh`
+- [X] T014 [US1] Implement cold-start measurement script that creates sandboxes via `openshell sandbox create --from base`, captures per-phase timestamps (scheduled, image pulled, init complete, supervisor ready, SSH available), and outputs CSV in `experiments/measure-cold-start.sh`
 - [ ] T015 [US1] Run Experiment 1a: 10 cold-start runs with pre-pulled images, save results to `experiments/results/cold-start-prepulled.csv`
 - [ ] T016 [US1] Run Experiment 1b: 5 cold-start runs without pre-pulled images, save results to `experiments/results/cold-start-noprepull.csv`
 - [ ] T017 [US1] Run Experiment 1c: 10 vanilla Agent Sandbox creates (no OpenShell) to isolate OpenShell overhead, save results to `experiments/results/cold-start-vanilla.csv`
@@ -66,7 +66,7 @@
 
 **Independent Test**: Create SandboxTemplate + SandboxWarmPool, issue SandboxClaims, verify claim-to-ready CSV output with latency data.
 
-- [ ] T019 [US2] Implement warm pool measurement script that creates SandboxClaims against a running warm pool, captures claim-to-ready timestamps, and outputs CSV in `experiments/measure-warm-pool.sh`
+- [X] T019 [US2] Implement warm pool measurement script that creates SandboxClaims against a running warm pool, captures claim-to-ready timestamps, and outputs CSV in `experiments/measure-warm-pool.sh`
 - [ ] T020 [US2] Deploy SandboxWarmPool with 5 replicas and verify all replicas reach provisioned state
 - [ ] T021 [US2] Run Experiment 2a: 10 claims with default readiness probes (10s periodSeconds), save results to `experiments/results/warm-pool-default.csv`
 - [ ] T022 [US2] Run Experiment 2b: 10 claims with aggressive readiness probes (1s periodSeconds), save results to `experiments/results/warm-pool-aggressive.csv`
@@ -84,13 +84,13 @@
 
 **Independent Test**: Deploy pods with ReadinessGate conditions and sidecar containers, measure condition-flip-to-Ready latency.
 
-- [ ] T026 [P] [US3] Create pod manifest with custom ReadinessGate condition (`sandbox.openshell.io/claimed`) in `experiments/manifests/readiness-gate-pod.yaml`
-- [ ] T027 [P] [US3] Implement sidecar readiness binary (Go, HTTP 503/200, signal file watch) in `experiments/sidecar/main.go`
-- [ ] T028 [P] [US3] Create Dockerfile for sidecar binary (multi-stage, scratch base) in `experiments/sidecar/Dockerfile`
+- [X] T026 [P] [US3] Create pod manifest with custom ReadinessGate condition (`sandbox.openshell.io/claimed`) in `experiments/manifests/readiness-gate-pod.yaml`
+- [X] T027 [P] [US3] Implement sidecar readiness binary (Go, HTTP 503/200, signal file watch) in `experiments/sidecar/main.go`
+- [X] T028 [P] [US3] Create Dockerfile for sidecar binary (multi-stage, scratch base) in `experiments/sidecar/Dockerfile`
 - [ ] T029 [US3] Build and push sidecar readiness image to ghcr.io via `experiments/sidecar/Makefile`
-- [ ] T030 [US3] Create sidecar readiness pod manifest (init container with restartPolicy: Always, shared emptyDir) in `experiments/manifests/sidecar-readiness.yaml`
-- [ ] T031 [US3] Implement readiness gate measurement script that patches ReadinessGate condition and measures flip-to-Ready latency in `experiments/measure-readiness-gates.sh`
-- [ ] T032 [US3] Implement sidecar readiness measurement script that triggers signal file and measures flip-to-Ready latency in `experiments/measure-sidecar-readiness.sh`
+- [X] T030 [US3] Create sidecar readiness pod manifest (init container with restartPolicy: Always, shared emptyDir) in `experiments/manifests/sidecar-readiness.yaml`
+- [X] T031 [US3] Implement readiness gate measurement script that patches ReadinessGate condition and measures flip-to-Ready latency in `experiments/measure-readiness-gates.sh`
+- [X] T032 [US3] Implement sidecar readiness measurement script that triggers signal file and measures flip-to-Ready latency in `experiments/measure-sidecar-readiness.sh`
 - [ ] T033 [US3] Run Experiment 3a: 10 readiness gate measurements, save to `experiments/results/readiness-gates.csv`
 - [ ] T034 [US3] Run Experiment 3b: 10 sidecar readiness measurements, save to `experiments/results/sidecar-readiness.csv`
 - [ ] T035 [US3] Create comparison table: default probes vs aggressive probes vs readiness gates vs sidecar pattern
@@ -105,11 +105,11 @@
 
 **Independent Test**: Create SandboxTemplate with `envVarsInjectionPolicy: Allowed`, issue SandboxClaim with env vars, observe warm adoption.
 
-- [ ] T036 [US4] Update SandboxTemplate manifest with `envVarsInjectionPolicy: Allowed` variant in `experiments/manifests/sandbox-template.yaml`
-- [ ] T037 [US4] Implement env var injection measurement script in `experiments/measure-env-injection.sh`
+- [X] T036 [US4] Update SandboxTemplate manifest with `envVarsInjectionPolicy: Allowed` variant in `experiments/manifests/sandbox-template.yaml`
+- [X] T037 [US4] Implement env var injection measurement script in `experiments/measure-env-injection.sh`
 - [ ] T038 [US4] Run Experiment 5a: 5 claims with env vars and Allowed policy, verify warm adoption, save to `experiments/results/env-injection-allowed.csv`
 - [ ] T039 [US4] Run Experiment 5b: Document behavior with Disallowed policy (rejection vs cold fallback)
-- [ ] T040 [US4] Implement combined measurement script (best readiness pattern + env injection) in `experiments/measure-combined.sh`
+- [X] T040 [US4] Implement combined measurement script (best readiness pattern + env injection) in `experiments/measure-combined.sh`
 - [ ] T041 [US4] Run Experiment 6: 10 combined measurements, save to `experiments/results/combined.csv`
 
 **Checkpoint**: Env var injection behavior conclusively documented. Combined best-case latency measured.
@@ -122,7 +122,7 @@
 
 **Independent Test**: RFC contains raw data tables, per-configuration comparisons, and a clear recommendation for OpenShell warm pool integration.
 
-- [ ] T042 [US5] Create RFC directory structure `rfc/NNNN-warm-pool-feasibility/README.md` (number TBD by maintainers, use placeholder)
+- [X] T042 [US5] Create RFC directory structure `rfc/NNNN-warm-pool-feasibility/README.md` (number TBD by maintainers, use placeholder)
 - [ ] T043 [US5] Write RFC Executive Summary section: can warm pooling hit sub-2s? What is the dominant bottleneck?
 - [ ] T044 [US5] Write RFC Experiment Setup section: cluster config, operator version, OpenShell version, image pre-pull status
 - [ ] T045 [US5] Write RFC Results section: compile all CSV data into p50/p90 tables per configuration with comparison charts

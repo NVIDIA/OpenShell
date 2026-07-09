@@ -1,0 +1,8 @@
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: openshell-warm-pool
+spec:
+  templateRef:
+    name: openshell-warm
+  replicas: 5

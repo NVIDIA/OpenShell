@@ -1,0 +1,17 @@
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxClaim
+metadata:
+  name: claim-PLACEHOLDER
+spec:
+  warmPoolRef:
+    name: openshell-warm-pool
+
+# Variant with env var injection (requires envVarsInjectionPolicy: Allowed on template):
+# spec:
+#   warmPoolRef:
+#     name: openshell-warm-pool
+#   env:
+#   - name: AGENT_ID
+#     value: "agent-001"
+#   - name: SESSION_TOKEN
+#     value: "tok-xxx"

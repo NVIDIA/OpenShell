@@ -1,0 +1,25 @@
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: openshell-warm
+spec:
+  podTemplateSpec:
+    spec:
+      containers:
+      - name: sandbox
+        image: ghcr.io/nvidia/openshell/sandbox:latest
+        ports:
+        - containerPort: 2222
+          name: ssh
+        readinessProbe:
+          tcpSocket:
+            port: 2222
+          initialDelaySeconds: 2
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"

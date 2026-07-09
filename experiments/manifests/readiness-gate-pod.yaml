@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: readiness-gate-test-PLACEHOLDER
+spec:
+  readinessGates:
+  - conditionType: sandbox.openshell.io/claimed
+  containers:
+  - name: sandbox
+    image: ghcr.io/nvidia/openshell/sandbox:latest
+    ports:
+    - containerPort: 2222
+    resources:
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
