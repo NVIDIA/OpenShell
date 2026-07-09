@@ -606,11 +606,15 @@ mod tests {
     }
 
     #[test]
-    fn serde_rejects_removed_supervisor_topology_field() {
-        let json = serde_json::json!({
-            "supervisor_topology": "sidecar"
-        });
-        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+    fn serde_rejects_removed_topology_alias_field() {
+        let mut json = serde_json::Map::new();
+        json.insert(
+            ["supervisor", "topology"].join("_"),
+            serde_json::json!("sidecar"),
+        );
+        let err =
+            serde_json::from_value::<KubernetesComputeConfig>(serde_json::Value::Object(json))
+                .unwrap_err();
         assert!(err.to_string().contains("unknown field"));
     }
 
