@@ -21,10 +21,8 @@ use tracing::debug;
 #[derive(Clone)]
 struct FileFingerprint {
     len: u64,
-    mtime_sec: i64,
-    mtime_nsec: i64,
-    ctime_sec: i64,
-    ctime_nsec: i64,
+    mtime: Option<(i64, i64)>,
+    ctime: Option<(i64, i64)>,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -34,32 +32,19 @@ struct FileFingerprint {
 impl FileFingerprint {
     fn from_metadata(metadata: &Metadata) -> Self {
         #[cfg(unix)]
-        let (mtime_sec, mtime_nsec, ctime_sec, ctime_nsec) = (
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
+        let (mtime, ctime) = (
+            Some((metadata.mtime(), metadata.mtime_nsec())),
+            Some((metadata.ctime(), metadata.ctime_nsec())),
         );
         #[cfg(not(unix))]
-        let (mtime_sec, mtime_nsec, ctime_sec, ctime_nsec) = {
-            let (mtime_sec, mtime_nsec) = metadata
-                .modified()
-                .ok()
-                .and_then(system_time_parts)
-                .unwrap_or_default();
-            let (ctime_sec, ctime_nsec) = metadata
-                .created()
-                .ok()
-                .and_then(system_time_parts)
-                .unwrap_or_default();
-            (mtime_sec, mtime_nsec, ctime_sec, ctime_nsec)
-        };
+        let (mtime, ctime) = (
+            metadata.modified().ok().and_then(system_time_parts),
+            metadata.created().ok().and_then(system_time_parts),
+        );
         Self {
             len: metadata.len(),
-            mtime_sec,
-            mtime_nsec,
-            ctime_sec,
-            ctime_nsec,
+            mtime,
+            ctime,
             #[cfg(unix)]
             dev: metadata.dev(),
             #[cfg(unix)]
@@ -80,10 +65,12 @@ fn system_time_parts(time: std::time::SystemTime) -> Option<(i64, i64)> {
 impl PartialEq for FileFingerprint {
     fn eq(&self, other: &Self) -> bool {
         self.len == other.len
-            && self.mtime_sec == other.mtime_sec
-            && self.mtime_nsec == other.mtime_nsec
-            && self.ctime_sec == other.ctime_sec
-            && self.ctime_nsec == other.ctime_nsec
+            && self.mtime.is_some()
+            && other.mtime.is_some()
+            && self.mtime == other.mtime
+            && self.ctime.is_some()
+            && other.ctime.is_some()
+            && self.ctime == other.ctime
             && {
                 #[cfg(unix)]
                 {
