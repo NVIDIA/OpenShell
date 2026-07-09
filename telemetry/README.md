@@ -2,13 +2,15 @@
 
 OpenShell collects anonymous, aggregate usage telemetry (see the [Telemetry section](../README.md#telemetry) of the main README for what's collected and how to opt out). We publish a summary of the trends here every two weeks so the community can see how the project is being used.
 
+Telemetry collection landed in [#1433](https://github.com/NVIDIA/OpenShell/pull/1433) on **June 1, 2026**, so all "All-time" figures are cumulative from that date.
+
 Numbers are aggregate counts only — no user data, code, prompts, or command contents are collected. Reports are listed newest first.
 
 ---
 
 ## Update — July 8, 2026
 
-First public telemetry update. The **Last 2 weeks** column covers the trailing two-week window; **All-time** is cumulative since we began collecting telemetry. Telemetry is new, so a large share of all-time activity falls within this first window.
+First public telemetry update. The **Last 2 weeks** column covers the trailing two-week window; **All-time** is cumulative since telemetry landed on June 1, 2026 (~5 weeks). A large share of all-time activity falls within this first two-week window.
 
 | Metric | Last 2 weeks | All-time |
 |---|---:|---:|
