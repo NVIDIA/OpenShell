@@ -1575,6 +1575,40 @@ mod tests {
         assert!(!decision.allowed);
     }
 
+    // -- wildcard host: malformed hostname regression tests --
+
+    #[test]
+    fn wildcard_host_nul_byte_causes_opa_error() {
+        let engine = wildcard_host_engine();
+        let result = engine.evaluate_network(&wildcard_input("sub\0.example.com"));
+        assert!(
+            result.is_err(),
+            "NUL byte is an internal glob placeholder — OPA rejects it (fail closed)"
+        );
+    }
+
+    #[test]
+    fn wildcard_host_nul_byte_extra_label_causes_opa_error() {
+        let engine = wildcard_host_engine();
+        let result = engine.evaluate_network(&wildcard_input("evil.com\0.example.com"));
+        assert!(
+            result.is_err(),
+            "NUL byte in hostname causes OPA evaluation failure (fail closed)"
+        );
+    }
+
+    #[test]
+    fn wildcard_host_percent_encoded_dot_no_match() {
+        let engine = wildcard_host_engine();
+        let decision = engine
+            .evaluate_network(&wildcard_input("evil%2eexample.com"))
+            .unwrap();
+        assert!(
+            !decision.allowed,
+            "percent-encoded dot should not be decoded by OPA glob"
+        );
+    }
+
     #[test]
     fn query_sandbox_config_extracts_filesystem() {
         let engine = test_engine();
@@ -6443,5 +6477,34 @@ network_policies:
         .unwrap();
         let input = l7_input("h.test", 80, "HEAD", "/protected");
         assert!(!eval_l7(&engine, &input));
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test Utilities
+    // ---------------------------------------------------------------------------
+
+    fn wildcard_host_engine() -> OpaEngine {
+        let data = r#"
+network_policies:
+  wildcard_test:
+    name: wildcard_test
+    endpoints:
+      - host: "*.example.com"
+        port: 443
+    binaries:
+      - path: /usr/bin/test
+"#;
+        OpaEngine::from_strings(TEST_POLICY, data).expect("failed to load wildcard test policy")
+    }
+
+    fn wildcard_input(host: &str) -> NetworkInput {
+        NetworkInput {
+            host: host.into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/test"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        }
     }
 }

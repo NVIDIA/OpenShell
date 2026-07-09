@@ -7110,6 +7110,195 @@ network_policies:
         assert!(result.is_err());
     }
 
+    // -- parse_target: CONNECT target parser regression tests --
+
+    #[test]
+    fn test_parse_target_valid_baseline() {
+        let (host, port) = parse_target("example.com:443").unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn test_parse_target_preserves_case() {
+        let (host, port) = parse_target("EXAMPLE.COM:443").unwrap();
+        assert_eq!(host, "EXAMPLE.COM", "parse_target should preserve case");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn test_parse_target_accepts_empty_host() {
+        let (host, port) = parse_target(":443").unwrap();
+        assert!(host.is_empty(), "empty host accepted without validation");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn test_parse_target_nul_byte_passes_through() {
+        let (host, _) = parse_target("evil.com\0.safe.com:443").unwrap();
+        assert_eq!(
+            host, "evil.com\0.safe.com",
+            "NUL byte not stripped or rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_control_char_passes_through() {
+        let (host, _) = parse_target("evil\x01.com:443").unwrap();
+        assert!(
+            host.contains('\x01'),
+            "control characters pass through without validation"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_percent_encoded_dot_is_literal() {
+        let (host, _) = parse_target("evil%2ecom:443").unwrap();
+        assert_eq!(
+            host, "evil%2ecom",
+            "percent-encoded dot not decoded — literal %2e in host"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_percent_encoded_nul_is_literal() {
+        let (host, _) = parse_target("evil%00.safe.com:443").unwrap();
+        assert_eq!(
+            host, "evil%00.safe.com",
+            "percent-encoded NUL not decoded — literal %00 in host"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_rejects_missing_port_separator() {
+        assert!(
+            parse_target("hostonly").is_err(),
+            "missing colon should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_rejects_non_numeric_port() {
+        assert!(
+            parse_target("host:notaport").is_err(),
+            "non-numeric port should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_rejects_port_overflow() {
+        assert!(
+            parse_target("host:65536").is_err(),
+            "port > 65535 should be rejected by u16 parse"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_accepts_port_zero() {
+        let (_, port) = parse_target("host:0").unwrap();
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn test_parse_target_accepts_port_max() {
+        let (_, port) = parse_target("host:65535").unwrap();
+        assert_eq!(port, 65535);
+    }
+
+    #[test]
+    fn test_parse_target_bracket_chars_pass_through() {
+        let (host, _) = parse_target("a]b[c:443").unwrap();
+        assert_eq!(host, "a]b[c", "brackets pass through without validation");
+    }
+
+    #[test]
+    fn test_parse_target_oversized_hostname_accepted() {
+        let long_host = "a".repeat(254);
+        let target = format!("{long_host}:443");
+        let (host, _) = parse_target(&target).unwrap();
+        assert_eq!(
+            host.len(),
+            254,
+            "hostname exceeding DNS 253-char limit not rejected"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_backslash_passes_through() {
+        let (host, _) = parse_target("evil.com\\..safe.com:443").unwrap();
+        assert!(
+            host.contains('\\'),
+            "backslash passes through without validation"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_slash_passes_through() {
+        let (host, _) = parse_target("evil.com/../safe.com:443").unwrap();
+        assert!(
+            host.contains('/'),
+            "forward slash passes through without validation"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_extra_colon_fails_port_parse() {
+        assert!(
+            parse_target("host:80:extra").is_err(),
+            "trailing content after port should fail u16 parse"
+        );
+    }
+
+    #[test]
+    fn test_parse_target_ipv6_bracket_notation_fails() {
+        assert!(
+            parse_target("[::1]:443").is_err(),
+            "split_once splits at first colon inside brackets — port parse fails"
+        );
+    }
+
+    // -- parse_proxy_uri: hostname parser regression tests --
+
+    #[test]
+    fn test_parse_proxy_uri_nul_byte_in_host() {
+        let (_, host, port, _) = parse_proxy_uri("http://evil.com\0.safe.com:80/path").unwrap();
+        assert_eq!(
+            host, "evil.com\0.safe.com",
+            "NUL byte not stripped or rejected in forward proxy URI"
+        );
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_control_char_in_host() {
+        let (_, host, _, _) = parse_proxy_uri("http://evil\x01.com:80/").unwrap();
+        assert!(
+            host.contains('\x01'),
+            "control characters pass through without validation"
+        );
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_percent_encoded_dot_in_host() {
+        let (_, host, _, _) = parse_proxy_uri("http://evil%2ecom:80/").unwrap();
+        assert_eq!(
+            host, "evil%2ecom",
+            "percent-encoded dot not decoded — literal %2e in host"
+        );
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_oversized_hostname() {
+        let long_host = "a".repeat(254);
+        let uri = format!("http://{long_host}:80/");
+        let (_, host, _, _) = parse_proxy_uri(&uri).unwrap();
+        assert_eq!(
+            host.len(),
+            254,
+            "hostname exceeding DNS 253-char limit not rejected"
+        );
+    }
+
     // --- rewrite_forward_request tests ---
 
     #[tokio::test]
@@ -7609,6 +7798,28 @@ network_policies:
         assert!(
             err.contains("always-blocked"),
             "expected 'always-blocked' in error: {err}"
+        );
+    }
+
+    // -- SSRF: malformed hostname resolution regression tests --
+
+    #[tokio::test]
+    async fn test_resolve_reject_internal_fails_closed_on_nul_hostname() {
+        let result = resolve_and_reject_internal("evil.com\0.safe.com", 443, 0).await;
+        assert!(
+            result.is_err(),
+            "NUL-containing hostname should fail DNS resolution (fail closed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_allowed_ips_fails_closed_on_nul_hostname() {
+        let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()])
+            .unwrap_or_else(|_| vec!["0.0.0.0/0".parse::<ipnet::IpNet>().unwrap()]);
+        let result = resolve_and_check_allowed_ips("evil.com\0.safe.com", 443, &nets, 0).await;
+        assert!(
+            result.is_err(),
+            "NUL-containing hostname should fail DNS resolution (fail closed)"
         );
     }
 
