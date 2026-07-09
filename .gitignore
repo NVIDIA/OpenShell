@@ -229,3 +229,10 @@ scripts/lint-mermaid/node_modules/
 # Nix
 /result
 /result-*
+
+# spex: generated/local files (only constitution is committed)
+# Use worktree-specific pattern to avoid shadowing root .claude/ tracked files
+.claude/worktrees/*/.claude/
+**/.specify/**
+!**/.specify/memory/
+!**/.specify/memory/constitution.md
