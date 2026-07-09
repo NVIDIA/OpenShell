@@ -222,10 +222,11 @@ impl SandboxContext {
         }
     }
 
-    /// Build the OCSF `Device` object.
+    /// Build the OCSF `Device` object, stamped with the host OS this build runs
+    /// on (Linux for the in-sandbox supervisor, Windows for the MXC gateway).
     #[must_use]
     pub fn device(&self) -> Device {
-        Device::linux(&self.hostname)
+        Device::for_current_os(&self.hostname)
     }
 
     /// Build the `proxy_endpoint` object for the Network Proxy profile.

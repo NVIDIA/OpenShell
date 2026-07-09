@@ -68,6 +68,10 @@ pub struct MxcComputeConfig {
 
     /// Enable `--debug` flag on `wxc-exec` invocations.
     pub debug: bool,
+    /// Enable the in-process ETW → OCSF audit consumer (Plane A). Consumes the OS
+    /// Sandboxing provider MXC drives and emits OCSF into the gateway trail.
+    /// Requires the gateway account to be in "Performance Log Users" (or admin).
+    pub etw_audit: bool,
 }
 
 impl Default for MxcComputeConfig {
@@ -80,6 +84,7 @@ impl Default for MxcComputeConfig {
             default_configuration_id: crate::mxc::DEFAULT_CONFIGURATION_ID.into(),
 
             debug: false,
+            etw_audit: false,
         }
     }
 }
@@ -184,6 +189,17 @@ pub struct MxcComputeBackend {
     /// immediately before dispatching to this backend's `create_sandbox`, which
     /// removes/consumes it.
     pending_policies: Arc<Mutex<HashMap<String, SandboxPolicy>>>,
+    /// In-process ETW → OCSF audit consumer (Plane A). `Some` only when
+    /// `config.etw_audit` is set and the session started; kept alive here so it
+    /// stops when the backend is dropped (held purely for its `Drop`, hence
+    /// never read directly).
+    #[allow(dead_code)]
+    etw_session: Option<crate::etw_consumer::EtwSession>,
+    /// Shared MXC-ETW → `sandbox_id` attribution index. Seeded by the driver
+    /// (`pid → sandbox_id`) as it launches sandboxes and read by the ETW
+    /// consumer thread to map/emit OCSF. `Arc` even when audit is off so the
+    /// launch path is branch-free.
+    attribution: Arc<std::sync::Mutex<crate::etw_consumer::AttributionIndex>>,
 }
 
 impl std::fmt::Debug for MxcComputeBackend {
@@ -271,6 +287,26 @@ impl MxcComputeBackend {
     pub fn new(config: MxcComputeConfig) -> Self {
         let invoker = WxcExecInvoker::new(&config.wxc_exec_path, config.debug);
         let (watch_tx, _) = broadcast::channel(256);
+
+        // Start the Plane-A ETW → OCSF consumer if enabled. The consumer thread
+        // attributes each event to a `sandbox_id` via `attribution` (seeded by
+        // the launch path) and emits OCSF for the mapped classes.
+        // Failure is non-fatal — the driver still runs, just without ETW audit.
+        let attribution = Arc::new(std::sync::Mutex::new(
+            crate::etw_consumer::AttributionIndex::new(),
+        ));
+        let etw_session = if config.etw_audit {
+            match crate::etw_consumer::start_session(attribution.clone()) {
+                Ok(session) => Some(session),
+                Err(e) => {
+                    warn!(error = %e, "MXC ETW audit consumer failed to start; continuing without it");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             invoker,
             config,
@@ -280,6 +316,8 @@ impl MxcComputeBackend {
             // mapper before any MXC lifecycle side effects begin.
             policy_mapper: Arc::new(EmbeddedPolicyMapper),
             pending_policies: Arc::new(Mutex::new(HashMap::new())),
+            etw_session,
+            attribution,
         }
     }
 
@@ -420,6 +458,7 @@ impl MxcComputeBackend {
         let config = self.config.clone();
         let registry = self.registry.clone();
         let watch_tx = self.watch_tx.clone();
+        let attribution = self.attribution.clone();
         let sandbox = sandbox.clone();
         tokio::spawn(async move {
             run_lifecycle(
@@ -427,6 +466,7 @@ impl MxcComputeBackend {
                 config,
                 registry,
                 watch_tx,
+                attribution,
                 sandbox,
                 sandbox_config,
                 mapped,
@@ -558,6 +598,9 @@ impl MxcComputeBackend {
 
         let mut registry = self.registry.lock().await;
         if registry.remove(sandbox_id).is_some() {
+            if let Ok(mut idx) = self.attribution.lock() {
+                idx.forget(sandbox_id);
+            }
             let _ = self.watch_tx.send(deleted_event(sandbox_id.to_string()));
             return Ok(true);
         }
@@ -619,6 +662,7 @@ async fn run_lifecycle(
     config: MxcComputeConfig,
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
+    attribution: Arc<std::sync::Mutex<crate::etw_consumer::AttributionIndex>>,
     sandbox: DriverSandbox,
     sandbox_config: MxcSandboxConfig,
     mapped: MappedConfig,
@@ -721,6 +765,16 @@ async fn run_lifecycle(
         }
     };
     info!(sandbox = %sandbox_name, command = %command_line, backend = ?config.backend, "MXC agent launched");
+
+    // Seed ETW attribution: the wxc-exec pid we just spawned is the
+    // collision-proof anchor that ties the `Sandboxing` provider's events back
+    // to this `sandbox_id` (command line is a fallback matcher). No-op unless
+    // the ETW consumer is running.
+    if let Some(pid) = child.id() {
+        if let Ok(mut idx) = attribution.lock() {
+            idx.register_launch(&sandbox_id, &sandbox_name, pid, &command_line);
+        }
+    }
 
     let ready_sandbox = make_sandbox_with_condition(
         &sandbox,

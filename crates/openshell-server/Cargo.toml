@@ -72,6 +72,7 @@ anyhow = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 
 # OpenTelemetry (OTLP trace export, opt-in via [openshell.gateway.otlp])
 opentelemetry = { workspace = true }
