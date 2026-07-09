@@ -1053,6 +1053,10 @@ const SUPERVISOR_NETWORK_INIT_CONTAINER_NAME: &str = "openshell-network-init";
 /// Container name for the network-only supervisor sidecar.
 const SUPERVISOR_NETWORK_SIDECAR_NAME: &str = "openshell-supervisor-network";
 
+/// UID used by strict process/binary-aware sidecars so Kubernetes grants the
+/// requested capability set into the effective set without privilege escalation.
+const BINARY_AWARE_SIDECAR_PROXY_UID: u32 = 0;
+
 /// Shared volume used by the network sidecar and process-only supervisor for
 /// local coordination in sidecar topology.
 const SIDECAR_STATE_VOLUME_NAME: &str = "openshell-sidecar-state";
@@ -1365,10 +1369,11 @@ fn supervisor_sidecar_container(
     spec_environment: &std::collections::HashMap<String, String>,
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
+    let proxy_uid = effective_sidecar_proxy_uid(params);
     let capabilities = if params.process_binary_aware_network_policy {
         serde_json::json!({
             "drop": ["ALL"],
-            "add": ["SYS_PTRACE"]
+            "add": ["SYS_PTRACE", "DAC_READ_SEARCH"]
         })
     } else {
         serde_json::json!({
@@ -1384,9 +1389,9 @@ fn supervisor_sidecar_container(
         ],
         "env": supervisor_sidecar_env(template_environment, spec_environment, params),
         "securityContext": {
-            "runAsUser": params.proxy_uid,
+            "runAsUser": proxy_uid,
             "runAsGroup": params.sandbox_gid,
-            "runAsNonRoot": true,
+            "runAsNonRoot": proxy_uid != 0,
             "allowPrivilegeEscalation": false,
             "capabilities": capabilities
         },
@@ -1419,7 +1424,16 @@ fn supervisor_sidecar_container(
     container
 }
 
+fn effective_sidecar_proxy_uid(params: &SandboxPodParams<'_>) -> u32 {
+    if params.process_binary_aware_network_policy {
+        BINARY_AWARE_SIDECAR_PROXY_UID
+    } else {
+        params.proxy_uid
+    }
+}
+
 fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_json::Value {
+    let proxy_uid = effective_sidecar_proxy_uid(params);
     let mut container = serde_json::json!({
         "name": SUPERVISOR_NETWORK_INIT_CONTAINER_NAME,
         "image": params.supervisor_image,
@@ -1427,7 +1441,7 @@ fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_jso
             SUPERVISOR_IMAGE_BINARY_PATH,
             "--mode=network-init",
             "--proxy-uid",
-            params.proxy_uid.to_string(),
+            proxy_uid.to_string(),
             "--proxy-gid",
             params.sandbox_gid.to_string(),
             "--sidecar-state-dir",
@@ -3186,14 +3200,18 @@ mod tests {
             sidecar["command"],
             serde_json::json!([SUPERVISOR_IMAGE_BINARY_PATH, "--mode=network"])
         );
-        assert_eq!(sidecar["securityContext"]["runAsUser"], 2200);
+        assert_eq!(sidecar["securityContext"]["runAsUser"], 0);
         assert_eq!(sidecar["securityContext"]["runAsGroup"], 1500);
-        assert_eq!(sidecar["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(sidecar["securityContext"]["runAsNonRoot"], false);
+        assert_eq!(
+            sidecar["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
         assert_eq!(
             sidecar["securityContext"]["capabilities"],
             serde_json::json!({
                 "drop": ["ALL"],
-                "add": ["SYS_PTRACE"]
+                "add": ["SYS_PTRACE", "DAC_READ_SEARCH"]
             })
         );
         assert_eq!(
@@ -3277,7 +3295,7 @@ mod tests {
                 SUPERVISOR_IMAGE_BINARY_PATH,
                 "--mode=network-init",
                 "--proxy-uid",
-                "2200",
+                "0",
                 "--proxy-gid",
                 "1500",
                 "--sidecar-state-dir",
@@ -3328,6 +3346,13 @@ mod tests {
             .iter()
             .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
             .unwrap();
+        assert_eq!(sidecar["securityContext"]["runAsUser"], 2200);
+        assert_eq!(sidecar["securityContext"]["runAsGroup"], 1500);
+        assert_eq!(sidecar["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            sidecar["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
         assert_eq!(
             sidecar["securityContext"]["capabilities"],
             serde_json::json!({
@@ -3341,6 +3366,12 @@ mod tests {
             ),
             Some("relaxed")
         );
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        let network_init = init_containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+            .unwrap();
+        assert_eq!(network_init["command"][3], "2200");
     }
 
     #[test]
@@ -3376,6 +3407,25 @@ mod tests {
         }));
 
         let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(
+            sidecar["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"],
+                "add": ["SYS_PTRACE", "DAC_READ_SEARCH"]
+            })
+        );
+        assert_eq!(sidecar["securityContext"]["runAsUser"], 0);
+        assert_eq!(sidecar["securityContext"]["runAsGroup"], 1000);
+        assert_eq!(sidecar["securityContext"]["runAsNonRoot"], false);
+        assert_eq!(
+            sidecar["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
+
         for container_name in ["agent", SUPERVISOR_NETWORK_SIDECAR_NAME] {
             let container = containers
                 .iter()
@@ -3391,6 +3441,12 @@ mod tests {
                     && mount["mountPath"] == SIDECAR_TLS_MOUNT_PATH
             }));
         }
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        let network_init = init_containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+            .unwrap();
+        assert_eq!(network_init["command"][3], "0");
     }
 
     #[test]

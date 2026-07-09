@@ -15,7 +15,7 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
-/// Default UID for the long-running Kubernetes network supervisor sidecar.
+/// Default non-root UID for relaxed Kubernetes network supervisor sidecars.
 pub const DEFAULT_PROXY_UID: u32 = 1337;
 
 /// How the supervisor binary is delivered into sandbox pods.
@@ -91,14 +91,16 @@ impl FromStr for SupervisorTopology {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSidecarConfig {
-    /// UID used by the long-running network sidecar in `sidecar` topology.
-    /// The network init container installs nftables rules that exempt this
-    /// UID, so it must not match the sandbox workload UID.
+    /// UID used by relaxed long-running network sidecars in `sidecar`
+    /// topology. The network init container installs nftables rules that
+    /// exempt this UID, so it must not match the sandbox workload UID.
+    /// Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants
+    /// the requested `/proc` inspection capabilities into the effective set.
     pub proxy_uid: u32,
     /// Require process/binary-aware network policy enforcement in sidecar
-    /// topology. When disabled, the network sidecar drops the extra `/proc`
-    /// inspection permission and evaluates endpoint/L7 policy without
-    /// matching `policy.binaries`.
+    /// topology. When disabled, the network sidecar runs as `proxy_uid`,
+    /// drops the extra `/proc` inspection permissions, and evaluates
+    /// endpoint/L7 policy without matching `policy.binaries`.
     pub process_binary_aware_network_policy: bool,
 }
 

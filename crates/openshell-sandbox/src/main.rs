@@ -366,18 +366,7 @@ fn run_network_init(
     sidecar_state_dir: &str,
     sidecar_tls_dir: &str,
 ) -> Result<()> {
-    if proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
-        return Err(miette::miette!(
-            "--proxy-uid must be at least {}",
-            openshell_policy::MIN_SANDBOX_UID
-        ));
-    }
-    if proxy_primary_group_id < openshell_policy::MIN_SANDBOX_UID {
-        return Err(miette::miette!(
-            "--proxy-gid must be at least {}",
-            openshell_policy::MIN_SANDBOX_UID
-        ));
-    }
+    validate_network_init_ids(proxy_user_id, proxy_primary_group_id)?;
 
     let sidecar_state_dir = Path::new(sidecar_state_dir);
     let sidecar_tls_dir = Path::new(sidecar_tls_dir);
@@ -404,6 +393,23 @@ fn run_network_init(
         SIDECAR_TLS_DIR_MODE,
     )?;
     openshell_supervisor_process::netns::install_sidecar_bypass_rules(proxy_user_id)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_network_init_ids(proxy_user_id: u32, proxy_primary_group_id: u32) -> Result<()> {
+    if proxy_user_id != 0 && proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
+        return Err(miette::miette!(
+            "--proxy-uid must be 0 or at least {}",
+            openshell_policy::MIN_SANDBOX_UID
+        ));
+    }
+    if proxy_primary_group_id < openshell_policy::MIN_SANDBOX_UID {
+        return Err(miette::miette!(
+            "--proxy-gid must be at least {}",
+            openshell_policy::MIN_SANDBOX_UID
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -683,5 +689,22 @@ mod tests {
         assert_eq!(SIDECAR_TLS_STAGING_DIR_MODE, 0o700);
         assert_eq!(SIDECAR_CLIENT_TLS_DIR_MODE, 0o750);
         assert_eq!(SIDECAR_CLIENT_TLS_FILE_MODE, 0o400);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_accepts_root_proxy_uid_for_binary_aware_sidecar() {
+        validate_network_init_ids(0, openshell_policy::MIN_SANDBOX_UID).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_still_rejects_low_non_root_proxy_ids() {
+        let uid_err =
+            validate_network_init_ids(999, openshell_policy::MIN_SANDBOX_UID).unwrap_err();
+        assert!(uid_err.to_string().contains("--proxy-uid"));
+
+        let gid_err = validate_network_init_ids(0, 999).unwrap_err();
+        assert!(gid_err.to_string().contains("--proxy-gid"));
     }
 }

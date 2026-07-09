@@ -208,12 +208,15 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # sandbox_gid = 1500
 
 [openshell.drivers.kubernetes.sidecar]
-# UID used by the long-running network sidecar. In sidecar topology the
-# network init container installs nftables rules that exempt this UID.
+# UID used by relaxed long-running network sidecars. Strict process/binary-aware
+# sidecars run as UID 0 so Kubernetes grants the required /proc inspection
+# capabilities into the effective set. In sidecar topology the network init
+# container installs nftables rules that exempt the effective sidecar UID.
 proxy_uid                      = 1337
 # Keep process/binary-aware network policy enabled in sidecar topology. Set
-# false to drop the sidecar's SYS_PTRACE capability used for cross-UID /proc
-# inspection and enforce endpoint/L7 policy without matching policy.binaries.
+# false to run the sidecar as proxy_uid, drop the sidecar's extra /proc
+# inspection capabilities, and enforce endpoint/L7 policy without matching
+# policy.binaries.
 process_binary_aware_network_policy = true
 ```
 

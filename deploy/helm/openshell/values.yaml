@@ -50,13 +50,16 @@ supervisor:
   # supervisor as a low-capability wrapper in the agent container.
   topology: "combined"
   sidecar:
-    # -- UID for the long-running network sidecar in sidecar topology. The
-    # network init container installs nftables rules that exempt this UID.
+    # -- UID for relaxed long-running network sidecars in sidecar topology.
+    # Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants
+    # the required /proc inspection capabilities into the effective set. The
+    # network init container installs nftables rules that exempt the effective
+    # sidecar UID.
     proxyUid: 1337
     # -- Keep process/binary-aware network policy enabled in sidecar topology.
-    # When false, the network sidecar drops the SYS_PTRACE capability used for
-    # cross-UID /proc inspection and enforces endpoint/L7 policy without
-    # matching policy.binaries.
+    # When false, the network sidecar runs as proxyUid, drops the extra /proc
+    # inspection capabilities, and enforces endpoint/L7 policy without matching
+    # policy.binaries.
     processBinaryAwareNetworkPolicy: true
 
 # -- Image pull secrets attached to gateway and helper pods.
