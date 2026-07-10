@@ -111,11 +111,19 @@ Every middleware binding declares the largest request or replacement body it sup
 
 The gateway rejects a registration whose operator limit exceeds the service capability instead of silently clamping it. At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. A body larger than every stage limit cannot be inspected at all and is denied unless every selected stage is `fail_open`.
 
-## Add Request Headers
+## Mutate Request Headers
 
-A middleware result can add new request headers before OpenShell injects credentials. Header names are case-insensitive and must start with `x-openshell-middleware-`. Values must not contain control characters.
+A middleware result can return ordered header mutations before OpenShell injects credentials. A `write` mutation adds a value when the case-insensitive header name is absent and selects one behavior when it is already present:
 
-A result that rewrites an existing request header, uses a name outside the required prefix, or carries an unsafe value is treated as a middleware failure and follows that config's `on_error` behavior. The failure reason names the offending header. Protected headers, including `authorization`, `cookie`, `host`, `content-length`, `transfer-encoding`, and OpenShell credential and signature headers, are always rejected.
+- `append` adds another field value.
+- `overwrite` removes every existing value before adding the new value.
+- `skip` leaves existing values unchanged.
+
+A `remove` mutation removes every value for a case-insensitive header name. OpenShell applies each successful stage's mutations before invoking the next middleware, so later stages observe the accumulated header state.
+
+Header writes must use the `x-openshell-middleware-` prefix. Removes may target other middleware-visible request headers. Protected credential, routing, framing, and hop-by-hop headers are always rejected. Header values must not contain control characters.
+
+OpenShell validates and applies each stage's mutations atomically. An invalid operation discards every mutation from that stage and follows its `on_error` behavior. The failure reason names the offending header.
 
 ## Operate Middleware Services
 

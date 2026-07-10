@@ -182,7 +182,7 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         &req,
         &buffered.headers,
         &outcome.body,
-        &outcome.added_headers,
+        &outcome.header_mutations,
     )?;
     Ok(MiddlewareApplyResult::Allowed(rebuilt))
 }

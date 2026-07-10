@@ -3987,7 +3987,7 @@ network_policies:
             // The transformed body still holds the raw secret; emission must never
             // serialize it.
             body: format!(r#"{{"api_key":"{RAW_SECRET}"}}"#).into_bytes(),
-            added_headers: BTreeMap::new(),
+            header_mutations: Vec::new(),
             findings: vec![NamespacedFinding {
                 middleware: "redact-secrets".into(),
                 finding: openshell_core::proto::Finding {
@@ -4039,7 +4039,7 @@ network_policies:
             allowed: false,
             reason: "request matched configured policy".into(),
             body: Vec::new(),
-            added_headers: BTreeMap::new(),
+            header_mutations: Vec::new(),
             findings: Vec::new(),
             metadata: BTreeMap::new(),
             applied: vec![MiddlewareInvocation {

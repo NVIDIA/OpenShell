@@ -105,6 +105,11 @@ policy generation. Each replacement is reclassified and evaluated before the
 next stage runs. Hard-deny classification is shared by CONNECT relays,
 route-selected relays, and forward proxying; evaluator failures become
 structured fail-closed outcomes instead of escaping the middleware pipeline.
+Each middleware stage can also return ordered header write and remove
+operations. Rust validates and applies a stage atomically to the logical header
+state before the next stage runs, then replays the validated operations against
+the raw request before credential injection. Credential, routing, framing, and
+hop-by-hop headers remain supervisor-owned and cannot be mutated.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:

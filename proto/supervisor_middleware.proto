@@ -164,6 +164,39 @@ message Finding {
   string severity = 5;
 }
 
+// ExistingHeaderAction controls how a header write behaves when the
+// case-insensitive header name is already present. Every action writes the
+// value when the header is absent.
+enum ExistingHeaderAction {
+  EXISTING_HEADER_ACTION_UNSPECIFIED = 0;
+  // Add another field value without changing existing values.
+  EXISTING_HEADER_ACTION_APPEND = 1;
+  // Remove every existing value, then add the new value.
+  EXISTING_HEADER_ACTION_OVERWRITE = 2;
+  // Leave the existing values unchanged.
+  EXISTING_HEADER_ACTION_SKIP = 3;
+}
+
+// WriteHeader proposes one header value and defines collision behavior.
+message WriteHeader {
+  string name = 1;
+  string value = 2;
+  ExistingHeaderAction on_existing = 3;
+}
+
+// RemoveHeader removes every value for a case-insensitive header name.
+message RemoveHeader {
+  string name = 1;
+}
+
+// HeaderMutation is one ordered request-header operation.
+message HeaderMutation {
+  oneof operation {
+    WriteHeader write = 1;
+    RemoveHeader remove = 2;
+  }
+}
+
 // HttpRequestResult contains the decision and optional request mutations.
 message HttpRequestResult {
   // Allow or deny decision for this request.
@@ -176,13 +209,13 @@ message HttpRequestResult {
   bytes body = 3;
   // True when body should replace the request body, including with an empty body.
   bool has_body = 4;
-  // Request headers to add before forwarding. Only new headers whose
-  // case-insensitive names start with "x-openshell-middleware-" are accepted.
-  // Existing request headers cannot be rewritten, protected headers such as
-  // authorization or transfer-encoding are always rejected, and values must
-  // not contain control characters. A violating result is a middleware
-  // failure handled according to the policy failure mode.
-  map<string, string> add_headers = 5;
+  // Ordered request-header mutations applied before the next middleware and
+  // before forwarding. Header writes are restricted to the
+  // "x-openshell-middleware-" namespace. Removes may target other visible
+  // request headers, but credential, routing, framing, and hop-by-hop headers
+  // are always protected. A violating result is a middleware failure handled
+  // according to the policy failure mode.
+  repeated HeaderMutation header_mutations = 5;
   // Audit-safe findings produced during evaluation.
   repeated Finding findings = 6;
   // Non-secret service-defined metadata included in diagnostics.

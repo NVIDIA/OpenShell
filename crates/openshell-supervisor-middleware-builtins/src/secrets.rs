@@ -92,7 +92,7 @@ pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpR
         reason: String::new(),
         body: body.into_bytes(),
         has_body: !matches.is_empty(),
-        add_headers: HashMap::new(),
+        header_mutations: Vec::new(),
         findings: Vec::new(),
         metadata: HashMap::new(),
     };

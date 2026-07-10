@@ -3,17 +3,20 @@
 
 //! Supervisor middleware registration and chain execution.
 
+mod headers;
 mod remote;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use miette::{Result, miette};
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
-    Decision, Finding, HttpHeader, HttpRequestEvaluation, HttpRequestTarget, MiddlewareBinding,
-    MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
+    Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
+    MiddlewareBinding, MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
     SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
     ValidateConfigRequest,
 };
@@ -146,7 +149,8 @@ pub struct ChainOutcome {
     pub allowed: bool,
     pub reason: String,
     pub body: Vec<u8>,
-    pub added_headers: BTreeMap<String, String>,
+    /// Ordered, validated mutations to replay against the original raw request.
+    pub header_mutations: Vec<HeaderMutation>,
     pub findings: Vec<NamespacedFinding>,
     pub metadata: BTreeMap<String, BTreeMap<String, String>>,
     pub applied: Vec<MiddlewareInvocation>,
@@ -690,7 +694,7 @@ impl ChainRunner {
     ) -> Result<ChainOutcome> {
         let mut headers = input.headers.clone();
         let mut body = input.body.clone();
-        let mut added_headers = BTreeMap::new();
+        let mut header_mutations = Vec::new();
         let mut findings = Vec::new();
         let mut metadata = BTreeMap::new();
         let mut applied = Vec::new();
@@ -704,7 +708,7 @@ impl ChainRunner {
                             allowed: false,
                             reason,
                             body,
-                            added_headers,
+                            header_mutations,
                             findings,
                             metadata,
                             applied,
@@ -720,7 +724,7 @@ impl ChainRunner {
                             allowed: false,
                             reason,
                             body,
-                            added_headers,
+                            header_mutations,
                             findings,
                             metadata,
                             applied,
@@ -746,7 +750,7 @@ impl ChainRunner {
                                 allowed: false,
                                 reason,
                                 body,
-                                added_headers,
+                                header_mutations,
                                 findings,
                                 metadata,
                                 applied,
@@ -766,7 +770,7 @@ impl ChainRunner {
                                 allowed: false,
                                 reason,
                                 body,
-                                added_headers,
+                                header_mutations,
                                 findings,
                                 metadata,
                                 applied,
@@ -800,7 +804,7 @@ impl ChainRunner {
                     allowed: false,
                     reason: safe_reason(&result.reason),
                     body,
-                    added_headers,
+                    header_mutations,
                     findings,
                     metadata,
                     applied,
@@ -815,7 +819,7 @@ impl ChainRunner {
                             allowed: false,
                             reason,
                             body,
-                            added_headers,
+                            header_mutations,
                             findings,
                             metadata,
                             applied,
@@ -824,32 +828,34 @@ impl ChainRunner {
                 }
             }
 
-            // A result proposing unsafe header mutations is a malformed response:
-            // route it through `on_error` instead of applying any of it. The
-            // validation error names the offending header and the required
-            // x-openshell-middleware- prefix so operators can fix the service.
-            if let Err(error) = validate_header_mutations(&headers, &result.add_headers) {
-                match apply_on_error(entry, &safe_reason(&error.to_string()), &mut applied) {
-                    OnErrorAction::FailOpen => continue,
-                    OnErrorAction::FailClosed(reason) => {
-                        return Ok(ChainOutcome {
-                            allowed: false,
-                            reason,
-                            body,
-                            added_headers,
-                            findings,
-                            metadata,
-                            applied,
-                        });
+            // Validate and apply the entire stage atomically. Under fail-open,
+            // one malformed mutation must not leave earlier mutations from the
+            // same response visible to later middleware.
+            let updated_headers = match headers::apply(&headers, &result.header_mutations) {
+                Ok(updated) => updated,
+                Err(error) => {
+                    match apply_on_error(entry, &safe_reason(&error.to_string()), &mut applied) {
+                        OnErrorAction::FailOpen => continue,
+                        OnErrorAction::FailClosed(reason) => {
+                            return Ok(ChainOutcome {
+                                allowed: false,
+                                reason,
+                                body,
+                                header_mutations,
+                                findings,
+                                metadata,
+                                applied,
+                            });
+                        }
                     }
                 }
-            }
-            for (name, value) in &result.add_headers {
-                headers.push((name.to_ascii_lowercase(), value.clone()));
-                added_headers.insert(name.to_ascii_lowercase(), value.clone());
-            }
-            let transformed = result.has_body;
-            if result.has_body {
+            };
+            let headers_transformed = updated_headers != headers;
+            headers = updated_headers;
+            header_mutations.extend(result.header_mutations.iter().cloned());
+
+            let body_transformed = result.has_body;
+            if body_transformed {
                 result.body.clone_into(&mut body);
             }
             for finding in result.findings {
@@ -868,7 +874,7 @@ impl ChainRunner {
                 name: entry.entry.name.clone(),
                 implementation: entry.entry.implementation.clone(),
                 decision,
-                transformed,
+                transformed: body_transformed || headers_transformed,
                 failed: false,
             });
 
@@ -876,7 +882,7 @@ impl ChainRunner {
             // sandbox policy the original body was admitted under. Re-check now,
             // before the next stage or the upstream sees the replaced body. A
             // policy deny here is a hard deny, independent of `on_error`.
-            if transformed
+            if body_transformed
                 && let TransformedBodyPolicy::Reevaluate(validate) = transformed_body_policy
             {
                 let denied = match validate(&body) {
@@ -891,7 +897,7 @@ impl ChainRunner {
                         allowed: false,
                         reason,
                         body,
-                        added_headers,
+                        header_mutations,
                         findings,
                         metadata,
                         applied,
@@ -904,7 +910,7 @@ impl ChainRunner {
             allowed: true,
             reason: String::new(),
             body,
-            added_headers,
+            header_mutations,
             findings,
             metadata,
             applied,
@@ -956,61 +962,6 @@ fn build_evaluation(
     }
 }
 
-fn validate_header_mutations(
-    existing_headers: &[(String, String)],
-    mutations: &HashMap<String, String>,
-) -> Result<()> {
-    let mut seen = HashSet::new();
-    for (name, value) in mutations {
-        let lower = name.to_ascii_lowercase();
-        if !seen.insert(lower.clone()) || existing_headers.iter().any(|(name, _)| *name == lower) {
-            return Err(miette!(
-                "middleware cannot rewrite existing header '{name}'"
-            ));
-        }
-        if !is_safe_append_header(&lower) {
-            return Err(miette!(
-                "middleware can only append new request headers prefixed with \
-                 x-openshell-middleware- and cannot append '{name}'"
-            ));
-        }
-        // Reject CR/LF and other control characters in the value: writing them
-        // verbatim into the upstream header block would enable header injection
-        // and request smuggling past the credential boundary.
-        if !is_safe_header_value(value) {
-            return Err(miette!(
-                "middleware cannot append header '{name}' with an unsafe value"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// A header value is safe to append only if it contains no control characters.
-/// Horizontal tab, printable ASCII, and obs-text (>= 0x80) are permitted; CR, LF,
-/// NUL, and other control bytes are rejected.
-fn is_safe_header_value(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b) || b >= 0x80)
-}
-
-fn is_safe_append_header(name: &str) -> bool {
-    if name.is_empty()
-        || name.contains(':')
-        || name.bytes().any(|b| b <= 0x20 || b >= 0x7f)
-        || matches!(
-            name,
-            "authorization" | "cookie" | "host" | "content-length" | "transfer-encoding"
-        )
-        || name.starts_with("x-amz-")
-        || name.starts_with("x-openshell-credential")
-    {
-        return false;
-    }
-    name.starts_with("x-openshell-middleware-")
-}
-
 pub(crate) fn safe_reason(reason: &str) -> String {
     reason
         .chars()
@@ -1025,6 +976,7 @@ mod tests {
     use openshell_core::proto::middleware::v1::supervisor_middleware_server::{
         SupervisorMiddleware, SupervisorMiddlewareServer,
     };
+    use openshell_core::proto::{ExistingHeaderAction, header_mutation};
     use openshell_supervisor_middleware_builtins::{BUILTIN_SECRETS, services};
     use tokio_stream::wrappers::TcpListenerStream;
 
@@ -1067,6 +1019,18 @@ mod tests {
             query: String::new(),
             headers: Vec::new(),
             body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn write_header(name: &str, value: &str, on_existing: ExistingHeaderAction) -> HeaderMutation {
+        HeaderMutation {
+            operation: Some(header_mutation::Operation::Write(
+                openshell_core::proto::WriteHeader {
+                    name: name.into(),
+                    value: value.into(),
+                    on_existing: on_existing as i32,
+                },
+            )),
         }
     }
 
@@ -1232,33 +1196,6 @@ mod tests {
             .await
             .expect_err("duplicate injected binding must fail registry construction");
         assert!(error.to_string().contains("more than one service"));
-    }
-
-    #[test]
-    fn unsafe_header_mutation_is_rejected() {
-        let err = validate_header_mutations(
-            &[],
-            &std::iter::once(("Authorization".into(), "Bearer nope".into())).collect(),
-        )
-        .expect_err("unsafe header");
-        assert!(err.to_string().contains("x-openshell-middleware-"));
-        assert!(err.to_string().contains("'Authorization'"));
-    }
-
-    #[test]
-    fn header_value_with_crlf_is_rejected() {
-        // A safe header *name* with a CRLF-bearing value must still be rejected,
-        // otherwise it would inject extra headers into the upstream request.
-        let err = validate_header_mutations(
-            &[],
-            &std::iter::once((
-                "x-openshell-middleware-inject".into(),
-                "ok\r\nAuthorization: Bearer evil".into(),
-            ))
-            .collect(),
-        )
-        .expect_err("crlf value");
-        assert!(err.to_string().contains("unsafe value"));
     }
 
     /// A mock middleware that returns a fixed, caller-supplied result for every
@@ -1540,7 +1477,7 @@ mod tests {
             reason: String::new(),
             body: Vec::new(),
             has_body: false,
-            add_headers: HashMap::new(),
+            header_mutations: Vec::new(),
             findings: Vec::new(),
             metadata: HashMap::new(),
         }
@@ -1600,6 +1537,130 @@ mod tests {
         }
     }
 
+    /// Three-stage service used to verify that each stage observes the header
+    /// state produced by all preceding stages.
+    struct HeaderChainService {
+        second_action: ExistingHeaderAction,
+        received: std::sync::Mutex<Vec<HttpRequestEvaluation>>,
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for HeaderChainService {
+        async fn describe(
+            &self,
+            _request: Request<()>,
+        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            Ok(tonic::Response::new(MiddlewareManifest {
+                name: "test/header-chain".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    id: "example/header-chain".into(),
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 4096,
+                }],
+            }))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            let evaluation = request.into_inner();
+            let invocation = {
+                let mut received = self.received.lock().expect("header chain lock");
+                let invocation = received.len();
+                received.push(evaluation);
+                invocation
+            };
+            let mut result = allow_result();
+            if invocation == 0 {
+                result.header_mutations.push(write_header(
+                    "x-openshell-middleware-chain",
+                    "first",
+                    ExistingHeaderAction::Overwrite,
+                ));
+            } else if invocation == 1 {
+                result.header_mutations.push(write_header(
+                    "x-openshell-middleware-chain",
+                    "second",
+                    self.second_action,
+                ));
+            }
+            Ok(tonic::Response::new(result))
+        }
+    }
+
+    #[tokio::test]
+    async fn later_middleware_observes_prior_header_mutations() {
+        for (action, expected) in [
+            (ExistingHeaderAction::Append, vec!["first", "second"]),
+            (ExistingHeaderAction::Overwrite, vec!["second"]),
+            (ExistingHeaderAction::Skip, vec!["first"]),
+        ] {
+            let service = Arc::new(HeaderChainService {
+                second_action: action,
+                received: std::sync::Mutex::new(Vec::new()),
+            });
+            let runner = ChainRunner::new(service.clone());
+            let entries = [
+                ChainEntry {
+                    name: "first".into(),
+                    implementation: "example/header-chain".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                },
+                ChainEntry {
+                    name: "second".into(),
+                    implementation: "example/header-chain".into(),
+                    order: 10,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                },
+                ChainEntry {
+                    name: "observer".into(),
+                    implementation: "example/header-chain".into(),
+                    order: 20,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                },
+            ];
+
+            let outcome = runner
+                .evaluate(&entries, input("payload"))
+                .await
+                .expect("evaluate header chain");
+            assert!(outcome.allowed);
+            let received = service.received.lock().expect("recorded header chain");
+            let observed: Vec<&str> = received[2]
+                .headers
+                .iter()
+                .filter(|header| header.name == "x-openshell-middleware-chain")
+                .map(|header| header.value.as_str())
+                .collect();
+            assert_eq!(observed, expected, "action {action:?}");
+        }
+    }
+
     #[tokio::test]
     async fn repeated_request_headers_reach_middleware_in_wire_order() {
         // A map contract would collapse repeated header names to one value
@@ -1646,22 +1707,6 @@ mod tests {
                 ("x-api-key", "second-value"),
             ]
         );
-    }
-
-    #[test]
-    fn existing_header_rewrite_is_rejected() {
-        // Any occurrence of an existing name blocks the mutation, including
-        // repeated names where only one entry matches.
-        let existing = [
-            ("x-openshell-middleware-tag".to_string(), "one".to_string()),
-            ("accept".to_string(), "application/json".to_string()),
-        ];
-        let err = validate_header_mutations(
-            &existing,
-            &std::iter::once(("X-OpenShell-Middleware-Tag".into(), "two".into())).collect(),
-        )
-        .expect_err("rewrite of existing header");
-        assert!(err.to_string().contains("cannot rewrite existing header"));
     }
 
     fn external_registration(max_body_bytes: u64) -> SupervisorMiddlewareService {
@@ -2066,11 +2111,11 @@ mod tests {
             openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
                 reason: "blocked_by_policy".into(),
-                add_headers: std::iter::once((
-                    "x-openshell-middleware-inject".to_string(),
-                    "ok\r\nHost: evil".to_string(),
-                ))
-                .collect(),
+                header_mutations: vec![write_header(
+                    "x-openshell-middleware-inject",
+                    "ok\r\nHost: evil",
+                    ExistingHeaderAction::Append,
+                )],
                 ..allow_result()
             },
         )));
@@ -2082,7 +2127,7 @@ mod tests {
 
         assert!(!outcome.allowed);
         assert_eq!(outcome.reason, "blocked_by_policy");
-        assert!(outcome.added_headers.is_empty());
+        assert!(outcome.header_mutations.is_empty());
         assert_eq!(outcome.applied.len(), 1);
         assert_eq!(outcome.applied[0].decision, Decision::Deny);
         assert!(!outcome.applied[0].failed);
@@ -2157,11 +2202,18 @@ mod tests {
 
     fn unsafe_header_service() -> ScriptedService {
         scripted_service(openshell_core::proto::HttpRequestResult {
-            add_headers: std::iter::once((
-                "x-openshell-middleware-inject".to_string(),
-                "ok\r\nHost: evil".to_string(),
-            ))
-            .collect(),
+            header_mutations: vec![
+                write_header(
+                    "x-openshell-middleware-safe",
+                    "safe",
+                    ExistingHeaderAction::Append,
+                ),
+                write_header(
+                    "x-openshell-middleware-inject",
+                    "ok\r\nHost: evil",
+                    ExistingHeaderAction::Append,
+                ),
+            ],
             ..allow_result()
         })
     }
@@ -2183,8 +2235,9 @@ mod tests {
             outcome.reason
         );
         assert!(outcome.applied.iter().any(|inv| inv.failed));
-        // The unsafe header is never forwarded.
-        assert!(outcome.added_headers.is_empty());
+        // The stage is atomic: neither the unsafe mutation nor the safe
+        // mutation preceding it is forwarded.
+        assert!(outcome.header_mutations.is_empty());
     }
 
     #[tokio::test]
@@ -2196,7 +2249,7 @@ mod tests {
             .expect("evaluate");
         assert!(outcome.allowed);
         assert_eq!(outcome.body, b"hello");
-        assert!(outcome.added_headers.is_empty());
+        assert!(outcome.header_mutations.is_empty());
         assert_eq!(outcome.applied.len(), 1);
         assert!(outcome.applied[0].failed);
     }

@@ -12,6 +12,7 @@ use crate::opa::PolicyGenerationGuard;
 use aws_sigv4::http_request::SignableBody;
 use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
+use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, header_mutation};
 use openshell_core::secrets::{
     SecretResolver, contains_reserved_credential_marker, rewrite_http_header_block,
 };
@@ -933,11 +934,11 @@ pub(crate) fn rebuild_request_with_buffered_body(
     req: &L7Request,
     headers: &[u8],
     body: &[u8],
-    add_headers: &std::collections::BTreeMap<String, String>,
+    header_mutations: &[HeaderMutation],
 ) -> Result<L7Request> {
     let mut header_bytes = set_content_length(headers, body.len())?;
     header_bytes = strip_header(&header_bytes, "transfer-encoding")?;
-    header_bytes = append_headers(&header_bytes, add_headers);
+    header_bytes = apply_header_mutations(&header_bytes, header_mutations)?;
     header_bytes.extend_from_slice(body);
     Ok(L7Request {
         action: req.action.clone(),
@@ -1403,27 +1404,59 @@ fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
-fn append_headers(
-    headers: &[u8],
-    add_headers: &std::collections::BTreeMap<String, String>,
-) -> Vec<u8> {
-    if add_headers.is_empty() {
-        return headers.to_vec();
-    }
+fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
     let split = headers
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(headers.len(), |pos| pos);
-    let mut out = Vec::with_capacity(headers.len() + add_headers.len() * 32);
+    let mut out = Vec::with_capacity(headers.len() + name.len() + value.len() + 4);
     out.extend_from_slice(&headers[..split]);
-    for (name, value) in add_headers {
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
-    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(b": ");
+    out.extend_from_slice(value.as_bytes());
     out.extend_from_slice(b"\r\n\r\n");
     out
+}
+
+fn apply_header_mutations(headers: &[u8], mutations: &[HeaderMutation]) -> Result<Vec<u8>> {
+    let mut out = headers.to_vec();
+    for mutation in mutations {
+        match mutation.operation.as_ref() {
+            Some(header_mutation::Operation::Write(write)) => {
+                let action = ExistingHeaderAction::try_from(write.on_existing)
+                    .map_err(|_| miette!("invalid middleware header on_existing action"))?;
+                if action == ExistingHeaderAction::Unspecified {
+                    return Err(miette!(
+                        "middleware header mutation has unspecified on_existing action"
+                    ));
+                }
+                let exists = has_header(&out, &write.name)?;
+                if !exists || action == ExistingHeaderAction::Append {
+                    out = append_header(&out, &write.name, &write.value);
+                } else if action == ExistingHeaderAction::Overwrite {
+                    out = strip_header(&out, &write.name)?;
+                    out = append_header(&out, &write.name, &write.value);
+                } else if action != ExistingHeaderAction::Skip {
+                    return Err(miette!("unsupported middleware header on_existing action"));
+                }
+            }
+            Some(header_mutation::Operation::Remove(remove)) => {
+                out = strip_header(&out, &remove.name)?;
+            }
+            None => return Err(miette!("empty middleware header mutation")),
+        }
+    }
+    Ok(out)
+}
+
+fn has_header(headers: &[u8], name: &str) -> Result<bool> {
+    let header_str =
+        std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    Ok(header_str.lines().skip(1).any(|line| {
+        line.split_once(':')
+            .is_some_and(|(candidate, _)| candidate.trim().eq_ignore_ascii_case(name))
+    }))
 }
 
 pub(crate) fn request_is_websocket_upgrade(raw_header: &[u8]) -> bool {
@@ -2686,6 +2719,71 @@ mod tests {
     const VALID_WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
     const VALID_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
     const TEXT_OPCODE: u8 = 0x1;
+
+    fn write_header(name: &str, value: &str, on_existing: ExistingHeaderAction) -> HeaderMutation {
+        HeaderMutation {
+            operation: Some(header_mutation::Operation::Write(
+                openshell_core::proto::WriteHeader {
+                    name: name.into(),
+                    value: value.into(),
+                    on_existing: on_existing as i32,
+                },
+            )),
+        }
+    }
+
+    fn remove_header(name: &str) -> HeaderMutation {
+        HeaderMutation {
+            operation: Some(header_mutation::Operation::Remove(
+                openshell_core::proto::RemoveHeader { name: name.into() },
+            )),
+        }
+    }
+
+    #[test]
+    fn ordered_header_mutations_replay_against_raw_request() {
+        let raw = b"GET / HTTP/1.1\r\nHost: example.test\r\nX-OpenShell-Middleware-Chain: first\r\nX-Drop: one\r\nX-Drop: two\r\n\r\n";
+        let mutations = [
+            write_header(
+                "x-openshell-middleware-chain",
+                "second",
+                ExistingHeaderAction::Append,
+            ),
+            write_header(
+                "x-openshell-middleware-chain",
+                "ignored",
+                ExistingHeaderAction::Skip,
+            ),
+            write_header(
+                "x-openshell-middleware-chain",
+                "replacement",
+                ExistingHeaderAction::Overwrite,
+            ),
+            write_header(
+                "x-openshell-middleware-chain",
+                "tail",
+                ExistingHeaderAction::Append,
+            ),
+            remove_header("x-drop"),
+        ];
+
+        let updated = String::from_utf8(
+            apply_header_mutations(raw, &mutations).expect("apply ordered header mutations"),
+        )
+        .expect("UTF-8 request");
+        let values: Vec<&str> = updated
+            .lines()
+            .filter_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("x-openshell-middleware-chain")
+                        .then_some(value.trim())
+                })
+            })
+            .collect();
+        assert_eq!(values, vec!["replacement", "tail"]);
+        assert!(!updated.to_ascii_lowercase().contains("x-drop:"));
+        assert!(updated.contains("Host: example.test"));
+    }
 
     #[derive(Debug)]
     struct CapturedFrame {
