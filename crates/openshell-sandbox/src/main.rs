@@ -153,7 +153,8 @@ struct Args {
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 
-    /// Filesystem path to the Unix socket the embedded SSH daemon binds.
+    /// Unix socket the embedded SSH daemon binds. On Linux, a value beginning
+    /// with `@` selects an abstract socket in the network namespace.
     /// The supervisor bridges `RelayStream` traffic from the gateway onto
     /// this socket; nothing else should connect to it.
     #[arg(long, env = openshell_core::sandbox_env::SSH_SOCKET_PATH)]

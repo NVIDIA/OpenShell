@@ -98,14 +98,20 @@ serves bootstrap state over a local control socket. The network sidecar owns
 gateway credentials and sends policy plus workload-facing provider environment
 state to the process leaf over that socket. It also streams provider
 environment updates after settings polls so future process sessions see
-updated provider env without giving the process leaf gateway access. In sidecar
+updated provider env without giving the process leaf gateway access. The
+pre-workload process supervisor is the only accepted control client: the
+network sidecar verifies its UID, GID, and PID with peer credentials, removes
+the listener after accepting it, and ignores workload-supplied relay targets.
+SSH relays use a Linux abstract socket and verify its peer PID against that
+authenticated process-supervisor connection, so workload filesystem access
+cannot replace the relay endpoint. In sidecar
 mode, an init container performs the privileged pod-network nftables setup with
-`NET_ADMIN` and hands shared state ownership to the configured proxy UID; the
-long-running network sidecar runs as that UID, does not keep `NET_ADMIN`, and
-adds only `SYS_PTRACE` so it can resolve workload process/binary identity
-through shared `/proc`. Operators can set the sidecar
-`process_binary_aware_network_policy` flag false to omit `SYS_PTRACE`; that
-downgrades network policy to endpoint/L7 matching without `policy.binaries`.
+`NET_ADMIN`. The default binary-aware network sidecar runs as UID 0 without
+`NET_ADMIN` and adds `SYS_PTRACE` plus `DAC_READ_SEARCH` so it can resolve
+cross-UID workload process/binary identity through shared `/proc`. Operators
+can set the sidecar `process_binary_aware_network_policy` flag false to run the
+sidecar as the configured non-root proxy UID, omit both inspection capabilities,
+and downgrade network policy to endpoint/L7 matching without `policy.binaries`.
 The init path applies nftables as individual commands so optional conntrack and
 log expressions can fail without rolling back the required table, chain, and
 reject rules.

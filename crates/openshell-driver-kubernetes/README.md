@@ -81,7 +81,10 @@ container does not mount the projected service-account token used for sandbox
 token bootstrap, does not mount the sandbox client TLS secret, and does not get
 gateway callback environment variables. The process supervisor receives policy
 and provider environment state from the sidecar over a local control socket in
-the shared sidecar state volume.
+the shared sidecar state volume. The sidecar accepts only the pre-workload
+process-supervisor connection, authenticates its UID/GID/PID with peer
+credentials, and removes the listener afterward. SSH relays use a Linux
+abstract socket whose peer PID must match that authenticated supervisor.
 
 The driver can request a Kubernetes AppArmor profile through
 `app_armor_profile`.

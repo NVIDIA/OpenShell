@@ -14,7 +14,7 @@ mod mechanistic_mapper;
 mod metadata_server;
 mod sidecar_control;
 
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -162,13 +162,7 @@ pub async fn run_sandbox(
     let sandbox_name_for_agg = sandbox.clone();
     let (mut policy, opa_engine, retained_proto, loaded_policy_origin) =
         if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
-            let (policy, engine, proto) = load_policy_from_sidecar_bootstrap(bootstrap)?;
-            (
-                policy,
-                engine,
-                proto,
-                LoadedPolicyOrigin::Gateway { revision: None },
-            )
+            load_policy_from_sidecar_bootstrap(bootstrap)?
         } else {
             load_policy(
                 sandbox_id.clone(),
@@ -415,6 +409,7 @@ pub async fn run_sandbox(
                 proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
                 proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
             },
+            sidecar_expected_peer()?,
         )?)
     } else {
         None
@@ -427,17 +422,29 @@ pub async fn run_sandbox(
         .map(sidecar_control::ServerHandle::publisher);
 
     #[cfg(target_os = "linux")]
+    let mut sidecar_control_task = None;
+
+    #[cfg(target_os = "linux")]
     if network_enabled
         && sidecar_network_enforcement
         && let Some(server) = sidecar_control_server
     {
+        let trusted_ssh_socket_path = ssh_socket_path.clone().ok_or_else(|| {
+            miette::miette!(
+                "{} is required for sidecar network topology",
+                openshell_core::sandbox_env::SSH_SOCKET_PATH
+            )
+        })?;
+        let (entrypoint_rx, connection_task) = server.into_runtime_parts();
+        sidecar_control_task = Some(connection_task);
         spawn_sidecar_entrypoint_handler(
-            server.into_entrypoint_receiver(),
+            entrypoint_rx,
             entrypoint_pid.clone(),
             opa_engine.clone(),
             retained_proto.clone(),
             openshell_endpoint.clone(),
             sandbox_id.clone(),
+            std::path::PathBuf::from(trusted_ssh_socket_path),
         );
     }
 
@@ -626,22 +633,12 @@ pub async fn run_sandbox(
 
         let entrypoint_started_tx =
             if process_uses_sidecar_control && let Some(writer) = process_control_writer.clone() {
-                let ssh_socket = ssh_socket_path.clone().ok_or_else(|| {
-                    miette::miette!(
-                        "{} is required for process-only sidecar topology",
-                        openshell_core::sandbox_env::SSH_SOCKET_PATH
-                    )
-                })?;
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 tokio::spawn(async move {
                     match rx.await {
                         Ok(pid) => {
-                            if let Err(err) = sidecar_control::send_entrypoint_started(
-                                &writer,
-                                pid,
-                                std::path::Path::new(&ssh_socket),
-                            )
-                            .await
+                            if let Err(err) =
+                                sidecar_control::send_entrypoint_started(&writer, pid).await
                             {
                                 warn!(error = %err, "Failed to send sidecar entrypoint event");
                             }
@@ -683,10 +680,28 @@ pub async fn run_sandbox(
         .await?
     } else {
         // Network-only sidecar mode: keep the proxy and its background
-        // tasks alive (held via the `networking` value) until SIGINT or
-        // SIGTERM. Exit 0 on clean shutdown.
-        wait_for_shutdown_signal().await;
-        0
+        // tasks alive (held via the `networking` value) until shutdown. If the
+        // sole authenticated process-supervisor control connection closes,
+        // exit non-zero so Kubernetes restarts the network sidecar and creates
+        // a fresh one-client bootstrap listener for the restarted agent.
+        #[cfg(target_os = "linux")]
+        if let Some(control_task) = sidecar_control_task {
+            tokio::select! {
+                () = wait_for_shutdown_signal() => 0,
+                result = control_task => {
+                    warn!(?result, "Authoritative sidecar control channel exited; restarting sidecar");
+                    1
+                }
+            }
+        } else {
+            wait_for_shutdown_signal().await;
+            0
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            wait_for_shutdown_signal().await;
+            0
+        }
     };
 
     // Drop networking explicitly so the proxy + bypass monitor RAII
@@ -751,18 +766,43 @@ fn sidecar_control_socket() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-fn load_policy_from_sidecar_bootstrap(
-    bootstrap: &sidecar_control::BootstrapData,
-) -> Result<(
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn sidecar_expected_peer() -> Result<sidecar_control::ExpectedPeer> {
+    fn required_numeric_env(name: &str) -> Result<u32> {
+        let value = std::env::var(name)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("{name} is required for sidecar control authentication"))?;
+        value.parse::<u32>().into_diagnostic().wrap_err_with(|| {
+            format!("{name} must be a numeric ID for sidecar control authentication")
+        })
+    }
+
+    Ok(sidecar_control::ExpectedPeer {
+        uid: required_numeric_env(openshell_core::sandbox_env::SANDBOX_UID)?,
+        gid: required_numeric_env(openshell_core::sandbox_env::SANDBOX_GID)?,
+    })
+}
+
+type LoadedPolicyBundle = (
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
     Option<openshell_core::proto::SandboxPolicy>,
-)> {
+    LoadedPolicyOrigin,
+);
+
+fn load_policy_from_sidecar_bootstrap(
+    bootstrap: &sidecar_control::BootstrapData,
+) -> Result<LoadedPolicyBundle> {
     let proto = bootstrap.policy_proto.clone();
     let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto)?));
     let policy = SandboxPolicy::try_from(proto.clone())?;
     info!("Loaded sidecar policy from control socket bootstrap");
-    Ok((policy, opa_engine, Some(proto)))
+    Ok((
+        policy,
+        opa_engine,
+        Some(proto),
+        LoadedPolicyOrigin::Gateway { revision: None },
+    ))
 }
 
 fn spawn_sidecar_control_update_watcher(
@@ -812,24 +852,27 @@ fn spawn_sidecar_control_update_watcher(
 
 #[cfg(target_os = "linux")]
 fn spawn_sidecar_entrypoint_handler(
-    mut entrypoint_rx: tokio::sync::mpsc::UnboundedReceiver<sidecar_control::EntrypointStarted>,
+    mut entrypoint_rx: tokio::sync::mpsc::Receiver<sidecar_control::EntrypointStarted>,
     entrypoint_pid: Arc<AtomicU32>,
     opa_engine: Option<Arc<OpaEngine>>,
     retained_proto: Option<openshell_core::proto::SandboxPolicy>,
     openshell_endpoint: Option<String>,
     sandbox_id: Option<String>,
+    trusted_ssh_socket_path: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
         let mut session_started = false;
+        let mut trusted_supervisor_pid = None;
         while let Some(started) = entrypoint_rx.recv().await {
             entrypoint_pid.store(started.pid, std::sync::atomic::Ordering::Release);
             if started.start_session {
                 info!(
                     pid = started.pid,
-                    ssh_socket = %started.ssh_socket_path.display(),
+                    ssh_socket = %trusted_ssh_socket_path.display(),
                     "Sidecar process supervisor reported entrypoint start"
                 );
             } else {
+                trusted_supervisor_pid = Some(started.pid);
                 info!(
                     pid = started.pid,
                     "Sidecar process supervisor reported initial process anchor"
@@ -855,11 +898,19 @@ fn spawn_sidecar_entrypoint_handler(
                 && let (Some(endpoint), Some(id)) =
                     (openshell_endpoint.as_ref(), sandbox_id.as_ref())
             {
+                let Some(supervisor_pid) = trusted_supervisor_pid else {
+                    warn!(
+                        pid = started.pid,
+                        "Ignoring sidecar entrypoint event before authenticated supervisor anchor"
+                    );
+                    continue;
+                };
                 openshell_supervisor_process::supervisor_session::spawn(
                     endpoint.clone(),
                     id.clone(),
-                    started.ssh_socket_path,
+                    trusted_ssh_socket_path.clone(),
                     None,
+                    Some(supervisor_pid),
                 );
                 session_started = true;
                 info!("sidecar supervisor session task spawned");

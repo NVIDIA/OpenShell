@@ -33,8 +33,13 @@ pub struct BootstrapData {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct EntrypointStarted {
     pub pid: u32,
-    pub ssh_socket_path: PathBuf,
     pub start_session: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExpectedPeer {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +100,8 @@ impl Publisher {
 pub struct ServerHandle {
     publisher: Publisher,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    entrypoint_rx: mpsc::UnboundedReceiver<EntrypointStarted>,
+    entrypoint_rx: mpsc::Receiver<EntrypointStarted>,
+    connection_task: tokio::task::JoinHandle<()>,
 }
 
 impl ServerHandle {
@@ -103,9 +109,19 @@ impl ServerHandle {
         self.publisher.clone()
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn into_entrypoint_receiver(self) -> mpsc::UnboundedReceiver<EntrypointStarted> {
+    #[cfg(test)]
+    pub fn into_entrypoint_receiver(self) -> mpsc::Receiver<EntrypointStarted> {
         self.entrypoint_rx
+    }
+
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn into_runtime_parts(
+        self,
+    ) -> (
+        mpsc::Receiver<EntrypointStarted>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        (self.entrypoint_rx, self.connection_task)
     }
 }
 
@@ -117,8 +133,8 @@ pub struct ProcessConnection {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireClientMessage {
-    BootstrapRequest { supervisor_pid: Option<u32> },
-    EntrypointStarted { pid: u32, ssh_socket_path: String },
+    BootstrapRequest { supervisor_pid: u32 },
+    EntrypointStarted { pid: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,7 +243,11 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn spawn_server(path: &Path, bootstrap: BootstrapData) -> Result<ServerHandle> {
+pub fn spawn_server(
+    path: &Path,
+    bootstrap: BootstrapData,
+    expected_peer: ExpectedPeer,
+) -> Result<ServerHandle> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .into_diagnostic()
@@ -270,55 +290,93 @@ pub fn spawn_server(path: &Path, bootstrap: BootstrapData) -> Result<ServerHandl
 
     let state = Arc::new(RwLock::new(bootstrap));
     let (updates, _) = broadcast::channel(32);
-    let (entrypoint_tx, entrypoint_rx) = mpsc::unbounded_channel();
+    let (entrypoint_tx, entrypoint_rx) = mpsc::channel(8);
     let publisher = Publisher {
         state: state.clone(),
         updates: updates.clone(),
     };
 
-    tokio::spawn(accept_loop(listener, state, updates, entrypoint_tx));
+    let connection_task = tokio::spawn(accept_authoritative_connection(
+        listener,
+        path.to_path_buf(),
+        expected_peer,
+        state,
+        updates,
+        entrypoint_tx,
+    ));
     info!(path = %path.display(), "Sidecar control socket listening");
 
     Ok(ServerHandle {
         publisher,
         entrypoint_rx,
+        connection_task,
     })
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-async fn accept_loop(
+async fn accept_authoritative_connection(
     listener: UnixListener,
+    socket_path: PathBuf,
+    expected_peer: ExpectedPeer,
     state: Arc<RwLock<BootstrapData>>,
     updates: broadcast::Sender<WireServerMessage>,
-    entrypoint_tx: mpsc::UnboundedSender<EntrypointStarted>,
+    entrypoint_tx: mpsc::Sender<EntrypointStarted>,
 ) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let state = state.clone();
-                let updates = updates.clone();
-                let entrypoint_tx = entrypoint_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, state, updates, entrypoint_tx).await
-                    {
-                        debug!(error = %err, "Sidecar control connection closed");
-                    }
-                });
-            }
-            Err(err) => {
-                warn!(error = %err, "Failed to accept sidecar control connection");
-            }
+    let stream = match listener.accept().await {
+        Ok((stream, _addr)) => stream,
+        Err(err) => {
+            warn!(error = %err, "Failed to accept authoritative sidecar control connection");
+            return;
         }
+    };
+
+    // The process supervisor connects before it launches the workload. Drop
+    // the listener and unlink its pathname after that first accept so workload
+    // processes can neither open a second control channel nor impersonate a
+    // restarted server at the trusted path.
+    drop(listener);
+    if let Err(err) = std::fs::remove_file(&socket_path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            path = %socket_path.display(),
+            error = %err,
+            "Failed to unlink accepted sidecar control socket"
+        );
+    }
+
+    if let Err(err) = handle_connection(stream, expected_peer, state, updates, entrypoint_tx).await
+    {
+        warn!(error = %err, "Authoritative sidecar control connection closed");
     }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
+    expected_peer: ExpectedPeer,
     state: Arc<RwLock<BootstrapData>>,
     updates: broadcast::Sender<WireServerMessage>,
-    entrypoint_tx: mpsc::UnboundedSender<EntrypointStarted>,
+    entrypoint_tx: mpsc::Sender<EntrypointStarted>,
 ) -> Result<()> {
+    let credentials = stream
+        .peer_cred()
+        .into_diagnostic()
+        .wrap_err("failed to read sidecar control peer credentials")?;
+    if credentials.uid() != expected_peer.uid || credentials.gid() != expected_peer.gid {
+        return Err(miette::miette!(
+            "sidecar control peer identity mismatch: expected uid:gid {}:{}, got {}:{}",
+            expected_peer.uid,
+            expected_peer.gid,
+            credentials.uid(),
+            credentials.gid(),
+        ));
+    }
+    let peer_pid = credentials
+        .pid()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| miette::miette!("sidecar control peer PID is unavailable"))?;
+
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -328,13 +386,18 @@ async fn handle_connection(
         })?;
     match decode_client_message(&first_line)? {
         WireClientMessage::BootstrapRequest { supervisor_pid } => {
-            if let Some(pid) = supervisor_pid.filter(|pid| *pid != 0) {
-                let _ = entrypoint_tx.send(EntrypointStarted {
-                    pid,
-                    ssh_socket_path: PathBuf::new(),
-                    start_session: false,
-                });
+            if supervisor_pid == 0 || supervisor_pid != peer_pid {
+                return Err(miette::miette!(
+                    "sidecar bootstrap PID mismatch: peer PID {peer_pid}, claimed PID {supervisor_pid}"
+                ));
             }
+            entrypoint_tx
+                .send(EntrypointStarted {
+                    pid: supervisor_pid,
+                    start_session: false,
+                })
+                .await
+                .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
         }
         WireClientMessage::EntrypointStarted { .. } => {
             return Err(miette::miette!(
@@ -360,16 +423,18 @@ async fn handle_connection(
                     WireClientMessage::BootstrapRequest { .. } => {
                         debug!("Ignoring duplicate sidecar bootstrap request");
                     }
-                    WireClientMessage::EntrypointStarted { pid, ssh_socket_path } => {
+                    WireClientMessage::EntrypointStarted { pid } => {
                         if pid == 0 {
                             warn!("Ignoring sidecar entrypoint event with pid=0");
                             continue;
                         }
-                        let _ = entrypoint_tx.send(EntrypointStarted {
-                            pid,
-                            ssh_socket_path: PathBuf::from(ssh_socket_path),
-                            start_session: true,
-                        });
+                        entrypoint_tx
+                            .send(EntrypointStarted {
+                                pid,
+                                start_session: true,
+                            })
+                            .await
+                            .map_err(|_| miette::miette!("sidecar entrypoint receiver closed"))?;
                     }
                 }
             }
@@ -395,7 +460,7 @@ pub async fn connect_process_client(
     write_json_line(
         &mut writer,
         &WireClientMessage::BootstrapRequest {
-            supervisor_pid: Some(std::process::id()),
+            supervisor_pid: std::process::id(),
         },
     )
     .await?;
@@ -458,15 +523,8 @@ async fn connect_with_retry(path: &Path, timeout: Duration) -> Result<tokio::net
     }
 }
 
-pub async fn send_entrypoint_started(
-    writer: &Arc<Mutex<OwnedWriteHalf>>,
-    pid: u32,
-    ssh_socket_path: &Path,
-) -> Result<()> {
-    let message = WireClientMessage::EntrypointStarted {
-        pid,
-        ssh_socket_path: ssh_socket_path.display().to_string(),
-    };
+pub async fn send_entrypoint_started(writer: &Arc<Mutex<OwnedWriteHalf>>, pid: u32) -> Result<()> {
+    let message = WireClientMessage::EntrypointStarted { pid };
     let mut writer = writer.lock().await;
     write_json_line(&mut *writer, &message).await
 }
@@ -501,6 +559,13 @@ mod tests {
     use super::*;
     use openshell_core::proto::SandboxPolicy;
 
+    fn current_peer() -> ExpectedPeer {
+        ExpectedPeer {
+            uid: nix::unistd::Uid::current().as_raw(),
+            gid: nix::unistd::Gid::current().as_raw(),
+        }
+    }
+
     #[tokio::test]
     async fn bootstrap_round_trips_policy_and_provider_env() {
         let dir = tempfile::tempdir().unwrap();
@@ -518,7 +583,7 @@ mod tests {
             proxy_ca_bundle_path: Some(PathBuf::from("/tmp/bundle.pem")),
         };
 
-        let _server = spawn_server(&socket, bootstrap).unwrap();
+        let _server = spawn_server(&socket, bootstrap, current_peer()).unwrap();
         let (received, _connection) = connect_process_client(&socket, Duration::from_secs(1))
             .await
             .unwrap();
@@ -549,6 +614,7 @@ mod tests {
                 proxy_ca_cert_path: None,
                 proxy_ca_bundle_path: None,
             },
+            current_peer(),
         )
         .unwrap();
         let mut entrypoint_rx = server.into_entrypoint_receiver();
@@ -563,24 +629,114 @@ mod tests {
         assert_eq!(anchor.pid, std::process::id());
         assert!(!anchor.start_session);
 
-        send_entrypoint_started(
-            &connection.writer,
-            4242,
-            Path::new("/run/openshell-sidecar/ssh.sock"),
-        )
-        .await
-        .unwrap();
+        send_entrypoint_started(&connection.writer, 4242)
+            .await
+            .unwrap();
 
         let started = tokio::time::timeout(Duration::from_secs(1), entrypoint_rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(started.pid, 4242);
-        assert_eq!(
-            started.ssh_socket_path,
-            PathBuf::from("/run/openshell-sidecar/ssh.sock")
-        );
         assert!(started.start_session);
+    }
+
+    #[tokio::test]
+    async fn second_control_client_is_rejected_after_authoritative_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let _server = spawn_server(
+            &socket,
+            BootstrapData {
+                policy_proto: SandboxPolicy::default(),
+                provider_env_revision: 0,
+                provider_child_env: HashMap::new(),
+                proxy_ca_cert_path: None,
+                proxy_ca_bundle_path: None,
+            },
+            current_peer(),
+        )
+        .unwrap();
+
+        let (_bootstrap, _connection) = connect_process_client(&socket, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        let err = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect_err("control listener must be removed after the first bootstrap");
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ),
+            "unexpected second-client error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authoritative_connection_task_ends_when_process_supervisor_disconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let server = spawn_server(
+            &socket,
+            BootstrapData {
+                policy_proto: SandboxPolicy::default(),
+                provider_env_revision: 0,
+                provider_child_env: HashMap::new(),
+                proxy_ca_cert_path: None,
+                proxy_ca_bundle_path: None,
+            },
+            current_peer(),
+        )
+        .unwrap();
+        let (_entrypoint_rx, connection_task) = server.into_runtime_parts();
+        let (_bootstrap, connection) = connect_process_client(&socket, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(1), connection_task)
+            .await
+            .expect("server must observe authoritative client disconnect")
+            .expect("control task must not panic");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_rejects_claimed_pid_that_does_not_match_peer_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let server = spawn_server(
+            &socket,
+            BootstrapData {
+                policy_proto: SandboxPolicy::default(),
+                provider_env_revision: 0,
+                provider_child_env: HashMap::new(),
+                proxy_ca_cert_path: None,
+                proxy_ca_bundle_path: None,
+            },
+            current_peer(),
+        )
+        .unwrap();
+        let mut entrypoint_rx = server.into_entrypoint_receiver();
+
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        write_json_line(
+            &mut stream,
+            &WireClientMessage::BootstrapRequest {
+                supervisor_pid: std::process::id().saturating_add(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), entrypoint_rx.recv())
+                .await
+                .unwrap()
+                .is_none(),
+            "mismatched bootstrap must not publish a process anchor"
+        );
     }
 
     #[test]

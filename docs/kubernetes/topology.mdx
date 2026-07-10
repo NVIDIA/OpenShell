@@ -31,7 +31,8 @@ The long-running container permissions differ by topology:
 |---|---|---|---|---|---|
 | `combined` | Agent container, which also runs the supervisor | Not forced by topology | Not explicitly disabled by the driver | Adds `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG`; adds `SETUID`, `SETGID`, and `DAC_READ_SEARCH` when user namespaces are enabled | Full supervisor controls run in the agent container. |
 | `sidecar` | Agent container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
-| `sidecar` | Network supervisor sidecar | `proxyUid:sandbox_gid` | `false` | Drops `ALL`; adds `SYS_PTRACE` by default | Long-running proxy sidecar is non-root and can inspect workload `/proc` entries for process/binary-aware network policy. |
+| `sidecar` | Network supervisor sidecar, binary-aware mode (default) | `0:sandbox_gid` | `false` | Drops `ALL`; adds `SYS_PTRACE` and `DAC_READ_SEARCH` | Root sidecar inspects cross-UID workload `/proc` entries. The nftables fence exempts UID 0, so do not inject other root containers into these pods. |
+| `sidecar` | Network supervisor sidecar, endpoint/L7-only mode | `proxyUid:sandbox_gid` | `false` | Drops `ALL` | Non-root sidecar enforces endpoint and L7 policy without matching `policy.binaries`. |
 
 Short-lived setup containers still have the permissions needed to prepare the
 pod:
@@ -99,7 +100,8 @@ flowchart TB
       Workload["Agent workload"]
     end
 
-    NetworkSidecar["network supervisor sidecar<br/>proxyUid"]
+    NetworkSidecar["network supervisor sidecar<br/>UID 0 by default"]
+    SshEndpoint["abstract SSH relay socket<br/>peer-PID authenticated"]
   end
 
   Gateway["OpenShell Gateway"]
@@ -113,6 +115,8 @@ flowchart TB
   NetworkSidecar -->|"policy-enforced egress"| External
   NetworkSidecar -->|"control socket + proxy TLS"| State
   ProcessSupervisor -->|"bootstrap + updates"| State
+  ProcessSupervisor --> SshEndpoint
+  NetworkSidecar -->|"SSH relay"| SshEndpoint
   NetworkSidecar --- State
 ```
 
@@ -121,21 +125,24 @@ The pod contains these OpenShell-managed pieces:
 | Component | Runs as | Purpose |
 |---|---|---|
 | Network init container | Root with setup capabilities | Installs pod-level nftables rules and prepares shared sidecar state. |
-| Network sidecar | `supervisor.sidecar.proxyUid` | Runs the proxy, enforces network policy, owns gateway authentication and the gateway session, and serves local policy/provider state over the sidecar control socket. |
+| Network sidecar | UID 0 by default; `supervisor.sidecar.proxyUid` when binary-aware policy is disabled | Runs the proxy, enforces network policy, owns gateway authentication and the gateway session, and serves local policy/provider state over the sidecar control socket. |
 | Agent container | Resolved sandbox UID/GID | Runs the process supervisor and launches the user workload. |
 
 In this topology, the agent container defaults to `runAsNonRoot: true`,
 `allowPrivilegeEscalation: false`, and `capabilities.drop: ["ALL"]`. The
-long-running network sidecar drops default Linux capabilities and adds only
-`SYS_PTRACE` for workload process identity resolution by default. Setting
-`supervisor.sidecar.processBinaryAwareNetworkPolicy=false` omits that capability
-and downgrades network policy to endpoint/L7 enforcement without binary
-matching. The root init container keeps the setup capabilities needed to
-configure pod networking.
+default binary-aware network sidecar runs as UID 0, drops default Linux
+capabilities, and adds `SYS_PTRACE` plus `DAC_READ_SEARCH` for cross-UID workload
+process identity resolution. Setting
+`supervisor.sidecar.processBinaryAwareNetworkPolicy=false` runs the sidecar as
+the configured non-root `proxyUid`, omits both capabilities, and downgrades
+network policy to endpoint/L7 enforcement without binary matching. The root
+init container keeps the setup capabilities needed to configure pod networking.
 
 Sidecar mode preserves gateway session behavior, including SSH connectivity,
 because the network sidecar owns the gateway session and bridges relay requests
-to the process supervisor's local SSH socket. The agent container does not get a
+to a Linux abstract SSH socket owned by the process supervisor. The relay
+verifies the socket peer PID against the authenticated control connection, so
+the workload cannot replace the relay endpoint. The agent container does not get a
 gateway endpoint, gateway TLS material, or the sandbox bootstrap token in the
 default sidecar path.
 
@@ -159,9 +166,13 @@ token bootstrap, does not mount the sandbox client TLS secret, and does not get
 gateway callback environment variables.
 
 The network sidecar serves the policy and workload-facing provider environment
-over a Unix control socket in the shared sidecar state volume. The process
-supervisor connects to that socket at startup, receives bootstrap state, and
-then listens for provider-environment updates after settings polls. Future child
+over a Unix control socket in the shared sidecar state volume. Before launching
+the workload, the process supervisor establishes the only accepted connection.
+The sidecar validates its UID, GID, and PID with peer credentials, unlinks the
+listener, derives the SSH target from trusted configuration, and rejects later
+clients. The connection receives bootstrap state and provider-environment
+updates after settings polls. If it closes, the network sidecar exits so
+Kubernetes recreates the one-client bootstrap listener. Future child
 processes can see refreshed provider env without giving the agent container
 gateway authentication material. This does not mutate the environment of the
 already-running workload entrypoint. Use `combined` topology when you need the
@@ -170,10 +181,11 @@ you need a stronger container boundary around sidecar workloads.
 
 ## RuntimeClass Isolation
 
-Sidecar topology pairs well with runtime classes such as gVisor or Kata
-Containers when the cluster supports them. A sandboxed runtime strengthens the
-container boundary while OpenShell focuses on network policy enforcement from
-the sidecar.
+Sidecar topology has been validated with Kata Containers. It does not currently
+support gVisor because sidecar mode requires pod-local nftables setup, which
+gVisor does not provide to the init container. A supported sandboxed runtime
+strengthens the container boundary while OpenShell focuses on network policy
+enforcement from the sidecar.
 
 Runtime classes do not re-enable the OpenShell privilege-drop or supervisor
 mount-isolation controls that sidecar mode relaxes. Use them as an additional
@@ -201,9 +213,11 @@ topology = "sidecar"
 proxy_uid = 1337
 ```
 
-`proxy_uid` must be a non-root UID and must not match the sandbox UID.
-The network init container exempts this UID from proxy redirection so the
-sidecar can reach the gateway.
+`proxy_uid` configures only the relaxed endpoint/L7-only sidecar. It must be a
+non-root UID and must not match the sandbox UID. The default binary-aware mode
+runs the sidecar as UID 0 instead. The network init container exempts the
+effective sidecar UID from proxy redirection so the sidecar can reach the
+gateway.
 
 When the Helm chart renders `gateway.toml`, set the equivalent chart values:
 
@@ -221,8 +235,9 @@ single-container supervisor path. For Helm installs, leave
 
 Set `supervisor.sidecar.processBinaryAwareNetworkPolicy=false` only when you
 accept downgrading sidecar network policy to endpoint/L7 enforcement without
-matching `policy.binaries`. This removes the sidecar's `SYS_PTRACE` capability,
-which is used for cross-UID `/proc` inspection.
+matching `policy.binaries`. This changes the sidecar from UID 0 to `proxyUid`
+and removes its `SYS_PTRACE` and `DAC_READ_SEARCH` capabilities, which are used
+for cross-UID `/proc` inspection.
 
 ## Next Steps
 

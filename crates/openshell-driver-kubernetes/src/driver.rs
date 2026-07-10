@@ -1062,7 +1062,10 @@ const BINARY_AWARE_SIDECAR_PROXY_UID: u32 = 0;
 const SIDECAR_STATE_VOLUME_NAME: &str = "openshell-sidecar-state";
 const SIDECAR_STATE_MOUNT_PATH: &str = "/run/openshell-sidecar";
 const SIDECAR_CONTROL_SOCKET: &str = "/run/openshell-sidecar/control.sock";
-const SIDECAR_SSH_SOCKET_FILE: &str = "/run/openshell-sidecar/ssh.sock";
+// Linux abstract socket names are scoped to the pod's shared network namespace.
+// Unlike a filesystem socket in the shared state volume, the workload cannot
+// unlink and replace this relay endpoint after the trusted supervisor binds it.
+const SIDECAR_SSH_SOCKET_FILE: &str = "@openshell-sidecar-ssh";
 
 /// Shared TLS work directory. The network sidecar writes the proxy CA bundle
 /// here, while the agent container consumes it after sidecar bootstrap.
@@ -1353,6 +1356,16 @@ fn supervisor_sidecar_env(
         &mut env,
         openshell_core::sandbox_env::PROXY_TLS_DIR,
         SIDECAR_TLS_MOUNT_PATH,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SANDBOX_UID,
+        &params.sandbox_uid.to_string(),
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SANDBOX_GID,
+        &params.sandbox_gid.to_string(),
     );
     if !params.process_binary_aware_network_policy {
         upsert_env(
@@ -3221,6 +3234,18 @@ mod tests {
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::SSH_SOCKET_PATH),
             Some(SIDECAR_SSH_SOCKET_FILE)
+        );
+        assert!(
+            SIDECAR_SSH_SOCKET_FILE.starts_with('@'),
+            "sidecar SSH relay must use a Linux abstract socket"
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::SANDBOX_UID),
+            Some("1500")
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::SANDBOX_GID),
+            Some("1500")
         );
         assert_eq!(
             rendered_env(sidecar, openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET),

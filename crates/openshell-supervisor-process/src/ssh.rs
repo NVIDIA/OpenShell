@@ -61,8 +61,10 @@ fn ssh_server_init(
     // isolate the SSH socket in a root-only directory before spawning
     // unprivileged children. Sidecar topology is different: the gateway relay
     // runs in the network sidecar as a different UID, so the shared sidecar
-    // state directory must stay group-accessible.
-    if let Some(parent) = listen_path.parent() {
+    // state directory must stay group-accessible. Sidecar mode uses a Linux
+    // abstract socket instead, so the workload cannot unlink the relay target.
+    let abstract_socket = crate::unix_socket::is_abstract(listen_path);
+    if !abstract_socket && let Some(parent) = listen_path.parent() {
         std::fs::create_dir_all(parent).into_diagnostic()?;
         #[cfg(unix)]
         if enforcement_mode.uses_privileged_process_setup() && !shared_socket {
@@ -73,16 +75,16 @@ fn ssh_server_init(
     }
 
     // Remove any stale socket from a previous run before binding.
-    if listen_path.exists() {
+    if !abstract_socket && listen_path.exists() {
         std::fs::remove_file(listen_path).into_diagnostic()?;
     }
-    let listener = UnixListener::bind(listen_path).into_diagnostic()?;
+    let runtime_path = crate::unix_socket::runtime_path(listen_path);
+    let listener = UnixListener::bind(runtime_path.as_ref()).into_diagnostic()?;
 
-    // Tighten permissions so only the supervisor owner can connect in combined
-    // mode. In sidecar mode, allow the shared sandbox GID so the network
-    // sidecar's relay can connect to the process supervisor's SSH socket.
+    // Tighten filesystem-socket permissions. Abstract sockets have no inode;
+    // sidecar relay connections authenticate the listener with SO_PEERCRED.
     #[cfg(unix)]
-    {
+    if !abstract_socket {
         use std::os::unix::fs::PermissionsExt;
         let mode = if shared_socket { 0o660 } else { 0o600 };
         let perms = std::fs::Permissions::from_mode(mode);
@@ -1366,6 +1368,25 @@ mod tests {
 
         assert_eq!(file_mode(&parent), 0o775);
         assert_eq!(file_mode(&socket), 0o660);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ssh_server_abstract_socket_cannot_be_replaced_while_bound() {
+        let socket = PathBuf::from(format!("@openshell-ssh-test-{}", uuid::Uuid::new_v4()));
+        let (listener, _, _) =
+            ssh_server_init(&socket, &None, ProcessEnforcementMode::NetworkOnly, true).unwrap();
+
+        assert!(
+            !socket.exists(),
+            "abstract socket must not create a filesystem inode"
+        );
+        let runtime_path = crate::unix_socket::runtime_path(&socket);
+        let err = UnixListener::bind(runtime_path.as_ref())
+            .expect_err("a workload must not be able to replace the bound abstract socket");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+
+        drop(listener);
     }
 
     /// Verify that dropping the input sender (the operation `channel_eof`
