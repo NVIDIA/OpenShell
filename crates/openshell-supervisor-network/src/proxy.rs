@@ -266,6 +266,11 @@ impl ProxyHandle {
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
+                        // Proxied frames are relayed as they arrive; Nagle's
+                        // algorithm would delay every small response.
+                        if let Err(e) = stream.set_nodelay(true) {
+                            tracing::debug!(error = %e, "failed to set TCP_NODELAY on accepted proxy connection");
+                        }
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
@@ -771,9 +776,7 @@ async fn handle_tcp_connection(
         // addresses (used by rootless Podman with pasta) are not hard-blocked.
         // Cloud metadata IPs and control-plane ports are still rejected.
         match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
-            Ok(addrs) => TcpStream::connect(addrs.as_slice())
-                .await
-                .into_diagnostic()?,
+            Ok(addrs) => connect_upstream(addrs.as_slice()).await.into_diagnostic()?,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -827,9 +830,7 @@ async fn handle_tcp_connection(
                 match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
                     .await
                 {
-                    Ok(addrs) => TcpStream::connect(addrs.as_slice())
-                        .await
-                        .into_diagnostic()?,
+                    Ok(addrs) => connect_upstream(addrs.as_slice()).await.into_diagnostic()?,
                     Err(reason) => {
                         {
                             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -929,9 +930,7 @@ async fn handle_tcp_connection(
         // the resolved IP in allowed_ips. Always-blocked addresses and
         // control-plane ports remain denied.
         match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => TcpStream::connect(addrs.as_slice())
-                .await
-                .into_diagnostic()?,
+            Ok(addrs) => connect_upstream(addrs.as_slice()).await.into_diagnostic()?,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -981,9 +980,7 @@ async fn handle_tcp_connection(
     } else {
         // Default: reject all internal IPs (loopback, RFC 1918, link-local).
         match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => TcpStream::connect(addrs.as_slice())
-                .await
-                .into_diagnostic()?,
+            Ok(addrs) => connect_upstream(addrs.as_slice()).await.into_diagnostic()?,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -2095,6 +2092,17 @@ async fn write_all(writer: &mut (impl tokio::io::AsyncWrite + Unpin), data: &[u8
     writer.write_all(data).await.into_diagnostic()?;
     writer.flush().await.into_diagnostic()?;
     Ok(())
+}
+
+/// Connect to an upstream address with `TCP_NODELAY` set.
+///
+/// Tunneled request/response bytes are relayed as they arrive; without
+/// `TCP_NODELAY`, Nagle's algorithm holds back every sub-MSS write and adds
+/// milliseconds of latency to each small request/response round trip.
+async fn connect_upstream(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect(addrs).await?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 #[derive(Debug, Clone)]
@@ -4121,7 +4129,7 @@ async fn handle_forward_proxy(
     }
 
     // 6. Connect upstream
-    let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
+    let mut upstream = match connect_upstream(addrs.as_slice()).await {
         Ok(s) => s,
         Err(e) => {
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -4378,6 +4386,18 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    /// Regression test: upstream connections must disable Nagle's algorithm,
+    /// otherwise every small tunneled request waits on delayed ACKs and adds
+    /// milliseconds of latency per round trip.
+    #[tokio::test]
+    async fn connect_upstream_sets_tcp_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let stream = connect_upstream(&[addr]).await.expect("connect");
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
+    }
 
     fn websocket_l7_config(
         protocol: crate::l7::L7Protocol,

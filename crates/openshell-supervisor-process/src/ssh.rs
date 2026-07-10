@@ -629,13 +629,18 @@ pub async fn connect_in_netns(
             .await
             .map_err(|_| std::io::Error::other("netns connect thread panicked"))??;
         std_stream.set_nonblocking(true)?;
+        // Forwarded frames are small and latency-sensitive; without
+        // TCP_NODELAY, Nagle's algorithm delays every sub-MSS response.
+        std_stream.set_nodelay(true)?;
         return tokio::net::TcpStream::from_std(std_stream);
     }
 
     #[cfg(not(target_os = "linux"))]
     let _ = netns_fd;
 
-    tokio::net::TcpStream::connect(addr).await
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 #[derive(Clone)]
@@ -1274,6 +1279,22 @@ fn is_loopback_host(host: &str) -> bool {
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    /// Regression test: direct-tcpip forwards must disable Nagle's algorithm,
+    /// otherwise every small response from a sandbox service waits on delayed
+    /// ACKs and adds milliseconds of latency per round trip.
+    #[tokio::test]
+    async fn connect_in_netns_sets_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let stream = connect_in_netns(&addr.to_string(), None)
+            .await
+            .expect("connect");
+        assert!(stream.nodelay().expect("query TCP_NODELAY"));
+    }
 
     /// Verify that dropping the input sender (the operation `channel_eof`
     /// performs) causes the stdin writer loop to exit and close the child's
