@@ -296,11 +296,9 @@ openshell logs <sandbox-name>
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
-| `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
-| HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
-| HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
-
-## Reporting
+| `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and a `gatewayApi` resource is enabled |
+| TLSRoute remains unaccepted or port 443 is not exposed | The referenced Gateway has no compatible TLS passthrough listener, or the Gateway API controller does not support TLSRoute | Check `kubectl describe tlsroute -n <namespace>` and `kubectl describe gateway -n <namespace>`; with a chart-created Gateway, verify both `gatewayApi.gateway.create=true` and `gatewayApi.routes.tls.enabled=true` |
+| TLS passthrough connection fails during the handshake | The gateway server is running plaintext or its certificate does not cover the external SNI hostname | Keep `server.disableTls=false`, verify the server certificate SAN, and configure `pkiInitJob.serverDnsNames` or `certManager.serverDnsNames` before issuing the certificate |
 
 When handing results back to the user, include:
 

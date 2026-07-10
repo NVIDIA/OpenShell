@@ -1,33 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{{- if and .Values.grpcRoute.enabled .Values.grpcRoute.gateway.create }}
+{{- if .Values.gatewayApi.gateway.create }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
-  name: {{ default (include "openshell.fullname" .) .Values.grpcRoute.gateway.name }}
-  namespace: {{ .Release.Namespace }}
+  name: {{ include "openshell.gatewayApiGatewayName" . }}
+  namespace: {{ include "openshell.gatewayApiGatewayNamespace" . }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
-  gatewayClassName: {{ .Values.grpcRoute.gateway.className }}
+  gatewayClassName: {{ .Values.gatewayApi.gateway.className }}
   listeners:
-    - name: {{ ternary "https" "http" (eq .Values.grpcRoute.gateway.listener.protocol "HTTPS") }}
-      port: {{ .Values.grpcRoute.gateway.listener.port }}
-      protocol: {{ .Values.grpcRoute.gateway.listener.protocol }}
-      {{- if eq .Values.grpcRoute.gateway.listener.protocol "HTTPS" }}
-      {{- if not .Values.grpcRoute.gateway.listener.tls.certificateRefs }}
-      {{- fail "grpcRoute.gateway.listener.tls.certificateRefs is required when grpcRoute.gateway.listener.protocol is HTTPS" }}
-      {{- end }}
-      {{- if not .Values.server.disableTls }}
-      {{- fail "grpcRoute.gateway.listener.protocol=HTTPS terminates TLS at Envoy Gateway, which forwards plaintext gRPC to the gateway pod; set server.disableTls=true so the pod listens plaintext (this chart does not render a BackendTLSPolicy for re-encryption to a TLS backend)" }}
-      {{- end }}
+    - name: http
+      port: 80
+      protocol: HTTP
+    {{- if .Values.gatewayApi.routes.tls.enabled }}
+    - name: tls
+      port: 443
+      protocol: TLS
       tls:
-        mode: Terminate
-        certificateRefs:
-          {{- toYaml .Values.grpcRoute.gateway.listener.tls.certificateRefs | nindent 10 }}
-      {{- end }}
-      allowedRoutes:
-        namespaces:
-          from: {{ .Values.grpcRoute.gateway.listener.allowedRoutes }}
+        mode: Passthrough
+    {{- end }}
 {{- end }}

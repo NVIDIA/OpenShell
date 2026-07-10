@@ -1,33 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Gateway API overlay with TLS termination at the Envoy Gateway listener.
-#
-# Exercises the HTTPS listener branch of templates/gateway.yaml for
-# `helm template`/lint coverage. Envoy Gateway terminates TLS using the
-# referenced kubernetes.io/tls Secret and forwards plaintext to the gateway pod,
-# so the gateway runs with TLS disabled and uses OIDC for client identity.
-#
-# The certificate Secret (openshell-ingress-tls) and the OIDC issuer below are
-# placeholders for render coverage; a real deployment must provide a valid TLS
-# Secret in the release namespace and a reachable OIDC issuer.
+# Gateway API overlay with TLS passthrough to the OpenShell gateway server.
+# Envoy routes by SNI without terminating TLS, preserving server TLS and mTLS.
 
-grpcRoute:
-  enabled: true
+gatewayApi:
   gateway:
     create: true
     className: "eg"
-    listener:
-      port: 443
-      protocol: HTTPS
-      tls:
-        certificateRefs:
-          - name: openshell-ingress-tls
-  hostnames: []
+  routes:
+    tls:
+      enabled: true
+      hostnames:
+        - openshell.example.com
 
-server:
-  # Envoy terminates TLS at the edge; the gateway listens plaintext behind it.
-  disableTls: true
-  oidc:
-    issuer: "https://keycloak.example.com/realms/openshell"
-    audience: "openshell-cli"
+# Include the external hostname in certificates generated for fresh installs.
+pkiInitJob:
+  serverDnsNames:
+    - openshell.example.com

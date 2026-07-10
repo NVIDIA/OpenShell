@@ -71,14 +71,14 @@ deploy:
       #    crds.enabled: true
       # Envoy Gateway — Kubernetes Gateway API implementation.
       # Installs the Gateway API CRDs and the "eg" GatewayClass.
-      # Required when grpcRoute.enabled is true in the openshell release.
+      # Required when Gateway API routes are enabled in the openshell release.
       #- name: envoy-gateway
       #  remoteChart: oci://docker.io/envoyproxy/gateway-helm
-      #  version: v1.7.2
+      #  version: v1.8.1
       #  namespace: envoy-gateway-system
       #  createNamespace: true
       #  # wait ensures Gateway API CRDs are registered before the openshell
-      #  # release attempts to create Gateway and HTTPRoute resources.
+      #  # release attempts to create Gateway and route resources.
       #  wait: true
       # SPIRE — installs SPIRE Server, Agent, Controller Manager, CSI Driver,
       # and OIDC Discovery Provider using the SPIFFE hardened charts.
@@ -114,8 +114,10 @@ deploy:
           # setup task first, then uncomment the line below:
           #   mise run keycloak:k8s:setup
           #- ci/values-keycloak.yaml
-          # To enable the Gateway API HTTPRoute (requires Envoy Gateway above):
+          # To enable the Gateway API Gateway and GRPCRoute (requires Envoy Gateway above):
           #- ci/values-gateway.yaml
+          # To enable TLS passthrough instead (requires Envoy Gateway above):
+          #- ci/values-gateway-tls.yaml
           # To enable SPIFFE/SPIRE provider token grants (requires the
           # spire-crds and spire releases above):
           #- ci/values-spire.yaml

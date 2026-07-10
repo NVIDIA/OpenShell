@@ -15,12 +15,14 @@
 #   kubectl -n openshell port-forward svc/<envoy-service> 8080:80
 #   # then: grpcurl -plaintext localhost:8080 ...
 
-grpcRoute:
-  enabled: true
+gatewayApi:
   gateway:
     create: true
     className: "eg"
-  # Set one or more hostnames to scope the route, e.g.:
-  #   hostnames:
-  #     - openshell.example.com
-  hostnames: []
+  routes:
+    grpc:
+      enabled: true
+      # Set one or more hostnames to scope the route, e.g.:
+      #   hostnames:
+      #     - openshell.example.com
+      hostnames: []

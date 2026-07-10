@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{{- if .Values.gatewayApi.routes.grpc.enabled }}
+{{- if .Values.gatewayApi.routes.tls.enabled }}
 apiVersion: gateway.networking.k8s.io/v1
-kind: GRPCRoute
+kind: TLSRoute
 metadata:
   name: {{ include "openshell.fullname" . }}
   namespace: {{ .Release.Namespace }}
@@ -13,9 +13,9 @@ spec:
   parentRefs:
     - name: {{ include "openshell.gatewayApiGatewayName" . }}
       namespace: {{ include "openshell.gatewayApiGatewayNamespace" . }}
-  {{- if .Values.gatewayApi.routes.grpc.hostnames }}
+  {{- if .Values.gatewayApi.routes.tls.hostnames }}
   hostnames:
-    {{- toYaml .Values.gatewayApi.routes.grpc.hostnames | nindent 4 }}
+    {{- toYaml .Values.gatewayApi.routes.tls.hostnames | nindent 4 }}
   {{- end }}
   rules:
     - backendRefs:

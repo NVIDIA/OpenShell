@@ -110,6 +110,26 @@ Name of the Secret holding gateway-minted sandbox JWT signing material.
 {{- end }}
 
 {{/*
+Name of the Kubernetes Gateway API Gateway resource created or referenced by
+the chart.
+*/}}
+{{- define "openshell.gatewayApiGatewayName" -}}
+{{- .Values.gatewayApi.gateway.name | default (include "openshell.fullname" .) -}}
+{{- end }}
+
+{{/*
+Namespace of the Kubernetes Gateway API Gateway resource created or referenced
+by the chart.
+*/}}
+{{- define "openshell.gatewayApiGatewayNamespace" -}}
+{{- if .Values.gatewayApi.gateway.create -}}
+{{- .Release.Namespace -}}
+{{- else -}}
+{{- .Values.gatewayApi.gateway.namespace | default .Release.Namespace -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 gRPC endpoint sandbox pods use to call back into the gateway. An explicit
 .Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
 the in-cluster Service DNS, release namespace, service port, and disableTls
@@ -178,6 +198,12 @@ database requires persistent per-pod storage.
 Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}
+{{- if hasKey .Values "grpcRoute" -}}
+{{- fail "grpcRoute values were replaced by gatewayApi; configure Gateway creation under gatewayApi.gateway and GRPCRoute creation under gatewayApi.routes.grpc." -}}
+{{- end -}}
+{{- if and .Values.gatewayApi.routes.tls.enabled .Values.server.disableTls -}}
+{{- fail "gatewayApi.routes.tls.enabled requires server.disableTls=false because TLS passthrough forwards the encrypted connection to the gateway server." -}}
+{{- end -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}
 {{- $replicaCount := int (default 1 .Values.replicaCount) -}}
