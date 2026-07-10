@@ -285,7 +285,9 @@ pub async fn run_sandbox(
     let process_control_writer = process_control_connection
         .as_ref()
         .map(|connection| connection.writer.clone());
+    let mut process_control_closed = None;
     if let Some(connection) = process_control_connection {
+        process_control_closed = Some(connection.closed);
         spawn_sidecar_control_update_watcher(connection.updates, provider_credentials.clone());
     }
 
@@ -653,7 +655,7 @@ pub async fn run_sandbox(
                 None
             };
 
-        openshell_supervisor_process::run::run_process(
+        let process = openshell_supervisor_process::run::run_process(
             program,
             args,
             workdir.as_deref(),
@@ -676,8 +678,30 @@ pub async fn run_sandbox(
             bypass_denial_tx,
             #[cfg(target_os = "linux")]
             bypass_activity_tx,
-        )
-        .await?
+        );
+
+        if let Some(control_closed) = process_control_closed.as_mut() {
+            tokio::select! {
+                result = process => result?,
+                _ = control_closed => {
+                    ocsf_emit!(
+                        AppLifecycleBuilder::new(ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::High)
+                            .status(StatusId::Failure)
+                            .message(
+                                "Authoritative network-sidecar control channel closed; terminating process container"
+                            )
+                            .build()
+                    );
+                    return Err(miette::miette!(
+                        "authoritative network-sidecar control channel closed"
+                    ));
+                }
+            }
+        } else {
+            process.await?
+        }
     } else {
         // Network-only sidecar mode: keep the proxy and its background
         // tasks alive (held via the `networking` value) until shutdown. If the

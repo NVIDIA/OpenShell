@@ -104,8 +104,11 @@ network sidecar verifies its UID, GID, and PID with peer credentials, removes
 the listener after accepting it, and ignores workload-supplied relay targets.
 SSH relays use a Linux abstract socket and verify its peer PID against that
 authenticated process-supervisor connection, so workload filesystem access
-cannot replace the relay endpoint. In sidecar
-mode, an init container performs the privileged pod-network nftables setup with
+cannot replace the relay endpoint. Either supervisor exits when this control
+connection closes. This couples their restart lifecycle and prevents a workload
+that survives an isolated network-sidecar restart from becoming the next
+authoritative control client. In sidecar mode, an init container performs the
+privileged pod-network nftables setup with
 `NET_ADMIN`. The default binary-aware network sidecar runs as UID 0 without
 `NET_ADMIN` and adds `SYS_PTRACE` plus `DAC_READ_SEARCH` so it can resolve
 cross-UID workload process/binary identity through shared `/proc`. Operators

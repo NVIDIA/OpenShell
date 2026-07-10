@@ -172,12 +172,15 @@ The sidecar validates its UID, GID, and PID with peer credentials, unlinks the
 listener, derives the SSH target from trusted configuration, and rejects later
 clients. The connection receives bootstrap state and provider-environment
 updates after settings polls. If it closes, the network sidecar exits so
-Kubernetes recreates the one-client bootstrap listener. Future child
-processes can see refreshed provider env without giving the agent container
-gateway authentication material. This does not mutate the environment of the
-already-running workload entrypoint. Use `combined` topology when you need the
-full single-supervisor enforcement path; use additional runtime isolation when
-you need a stronger container boundary around sidecar workloads.
+Kubernetes recreates the one-client bootstrap listener, and the process
+supervisor exits so Kubernetes terminates the workload and restarts the agent
+container. This symmetric failure behavior prevents a surviving workload from
+claiming the new control listener after an isolated sidecar restart. Future
+child processes can see refreshed provider env without giving the agent
+container gateway authentication material. This does not mutate the environment
+of the already-running workload entrypoint. Use `combined` topology when you
+need the full single-supervisor enforcement path; use additional runtime
+isolation when you need a stronger container boundary around sidecar workloads.
 
 ## RuntimeClass Isolation
 

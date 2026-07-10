@@ -128,6 +128,7 @@ impl ServerHandle {
 pub struct ProcessConnection {
     pub writer: Arc<Mutex<OwnedWriteHalf>>,
     pub updates: mpsc::UnboundedReceiver<ControlUpdate>,
+    pub closed: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -474,12 +475,13 @@ pub async fn connect_process_client(
     let bootstrap = BootstrapData::try_from(decode_server_message(&first_line)?)?;
 
     let (update_tx, updates) = mpsc::unbounded_channel();
+    let (closed_tx, closed) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         while let Ok(Some(line)) = lines.next_line().await {
             match decode_server_message(&line).and_then(ControlUpdate::try_from) {
                 Ok(update) => {
                     if update_tx.send(update).is_err() {
-                        return;
+                        break;
                     }
                 }
                 Err(err) => {
@@ -487,6 +489,7 @@ pub async fn connect_process_client(
                 }
             }
         }
+        let _ = closed_tx.send(());
     });
 
     Ok((
@@ -494,6 +497,7 @@ pub async fn connect_process_client(
         ProcessConnection {
             writer: Arc::new(Mutex::new(writer)),
             updates,
+            closed,
         },
     ))
 }
@@ -700,6 +704,35 @@ mod tests {
             .await
             .expect("server must observe authoritative client disconnect")
             .expect("control task must not panic");
+    }
+
+    #[tokio::test]
+    async fn process_client_reports_network_sidecar_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let server = spawn_server(
+            &socket,
+            BootstrapData {
+                policy_proto: SandboxPolicy::default(),
+                provider_env_revision: 0,
+                provider_child_env: HashMap::new(),
+                proxy_ca_cert_path: None,
+                proxy_ca_bundle_path: None,
+            },
+            current_peer(),
+        )
+        .unwrap();
+        let (_entrypoint_rx, connection_task) = server.into_runtime_parts();
+        let (_bootstrap, connection) = connect_process_client(&socket, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        connection_task.abort();
+        let _ = connection_task.await;
+        tokio::time::timeout(Duration::from_secs(1), connection.closed)
+            .await
+            .expect("process supervisor must observe network sidecar disconnect")
+            .expect("disconnect notifier must remain live");
     }
 
     #[tokio::test]

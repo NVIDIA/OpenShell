@@ -88,7 +88,10 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"combined"'
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?topology\s*=\s*"combined"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor[_]topology\s*='
 
   - it: uses the gateway built-in supervisor image by default
     template: templates/gateway-config.yaml

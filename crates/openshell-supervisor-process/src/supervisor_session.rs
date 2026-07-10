@@ -958,16 +958,15 @@ mod ocsf_event_tests {
             .expect("matching peer PID should be accepted");
         drop(trusted);
 
-        let err = match open_target(
+        let Err(err) = open_target(
             &relay,
             &socket,
             None,
             Some(std::process::id().saturating_add(1)),
         )
         .await
-        {
-            Ok(_) => panic!("mismatched peer PID must be rejected"),
-            Err(err) => err,
+        else {
+            panic!("mismatched peer PID must be rejected");
         };
         assert!(err.to_string().contains("peer PID mismatch"));
         accept_task.await.unwrap();

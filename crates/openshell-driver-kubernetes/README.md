@@ -84,7 +84,9 @@ and provider environment state from the sidecar over a local control socket in
 the shared sidecar state volume. The sidecar accepts only the pre-workload
 process-supervisor connection, authenticates its UID/GID/PID with peer
 credentials, and removes the listener afterward. SSH relays use a Linux
-abstract socket whose peer PID must match that authenticated supervisor.
+abstract socket whose peer PID must match that authenticated supervisor. Both
+supervisors exit if the control connection closes, coupling their container
+restart lifecycle before a new authoritative client can be established.
 
 The driver can request a Kubernetes AppArmor profile through
 `app_armor_profile`.
