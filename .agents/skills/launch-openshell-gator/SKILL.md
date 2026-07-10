@@ -80,11 +80,16 @@ If this fails, run the local Codex login flow outside the gator launch. If Codex
 
 ### Step 5: Verify Gateway Is Registered And Alive
 
-Use the target gateway, usually `docker-dev` for local gators.
+Use the target gateway from the operator request or current session context. Do not assume a gateway name. If the operator did not specify one, list registered gateways and ask before launching when the correct target is ambiguous.
 
 ```bash
-openshell --gateway docker-dev status
-openshell --gateway docker-dev sandbox list
+openshell gateway list
+
+gateway_name="<selected-gateway-name>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
+
+openshell --gateway "$gateway_name" status
+openshell --gateway "$gateway_name" sandbox list
 ```
 
 Expected result: status returns successfully and sandbox listing completes. If the gateway is unreachable, the runtime cannot create sandboxes, or sandbox listing hangs, switch to `debug-openshell-cluster` and fix the gateway before launching gator.
@@ -94,14 +99,24 @@ Expected result: status returns successfully and sandbox listing completes. If t
 Avoid duplicate gators for the same PR unless intentionally replacing a stuck or stale one.
 
 ```bash
-openshell --gateway docker-dev sandbox list
+gateway_name="<selected-gateway-name>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
+
+openshell --gateway "$gateway_name" sandbox list
 ```
 
 Look for names like `gator-pr-<number>-supervised`. If one exists, inspect its log before deleting or relaunching.
 
 ## Input Normalization
 
-Never paste raw operator text into shell arguments such as `--name`, `--from`, issue numbers, or PR numbers. Normalize values before constructing launch commands.
+Never paste raw operator text into shell arguments such as `--gateway`, `--name`, `--from`, issue numbers, or PR numbers. Normalize values before constructing launch commands.
+
+Use the operator-specified gateway or a gateway selected from `openshell gateway list`:
+
+```bash
+gateway_name="<selected-gateway-name>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
+```
 
 Use digits only for issue and PR numbers:
 
@@ -126,14 +141,16 @@ For local image contexts passed to `--from`, use an agent-created path such as `
 Use a stable, scoped name and a prompt that names exactly what gator should do.
 
 ```bash
+gateway_name="<selected-gateway-name>"
 pr_number="<digits-only>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-supervised"
 [[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
-  --gateway docker-dev \
+  --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
   --background \
@@ -145,14 +162,16 @@ The launcher builds the gator sandbox image when needed, stages the immutable pa
 ### Launch An Issue Or Issue/PR Pair
 
 ```bash
+gateway_name="<selected-gateway-name>"
 issue_number="<digits-only>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$issue_number" =~ ^[0-9]+$ ]] || { echo "invalid issue number" >&2; exit 1; }
 sandbox_name="gator-issue-${issue_number}-supervised"
 [[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
-  --gateway docker-dev \
+  --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
   --background \
@@ -162,8 +181,10 @@ sandbox_name="gator-issue-${issue_number}-supervised"
 For a linked pair:
 
 ```bash
+gateway_name="<selected-gateway-name>"
 pr_number="<digits-only>"
 issue_number="<digits-only>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 [[ "$issue_number" =~ ^[0-9]+$ ]] || { echo "invalid issue number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-supervised"
@@ -171,7 +192,7 @@ sandbox_name="gator-pr-${pr_number}-supervised"
 
 ./scripts/agents/run.sh \
   --agent gator \
-  --gateway docker-dev \
+  --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
   --background \
@@ -183,14 +204,16 @@ sandbox_name="gator-pr-${pr_number}-supervised"
 Only include authorization in the prompt when the operator explicitly gave it.
 
 ```bash
+gateway_name="<selected-gateway-name>"
 pr_number="<digits-only>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-supervised"
 [[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
-  --gateway docker-dev \
+  --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
   --background \
@@ -202,7 +225,9 @@ sandbox_name="gator-pr-${pr_number}-supervised"
 Use environment overrides. Do not edit `agent.yaml` for temporary experiments.
 
 ```bash
+gateway_name="<selected-gateway-name>"
 pr_number="<digits-only>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
 [[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
@@ -210,7 +235,7 @@ sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
 CODEX_MODEL=gpt-5.6-sol \
 ./scripts/agents/run.sh \
   --agent gator \
-  --gateway docker-dev \
+  --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
   --background \
@@ -222,7 +247,9 @@ If the installed Codex CLI is too old for a model, create a temporary copy of `s
 Example shape:
 
 ```bash
+gateway_name="<selected-gateway-name>"
 pr_number="<digits-only>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
 [[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
@@ -232,7 +259,7 @@ cp -R scripts/agents/gator/. "$tmp_context"/
 CODEX_MODEL=gpt-5.6-sol \
 ./scripts/agents/run.sh \
   --agent gator \
-  --gateway docker-dev \
+  --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --from "$tmp_context" \
   --watch \
@@ -262,8 +289,13 @@ Read that file directly. Important markers:
 ### Inspect Active Sandboxes
 
 ```bash
-openshell --gateway docker-dev sandbox list
-openshell --gateway docker-dev sandbox get <sandbox-name>
+gateway_name="<selected-gateway-name>"
+sandbox_name="<safe-sandbox-name>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+
+openshell --gateway "$gateway_name" sandbox list
+openshell --gateway "$gateway_name" sandbox get "$sandbox_name"
 ```
 
 If `sandbox get` is not supported by the local CLI shape, use `openshell sandbox --help` and follow the current command help.
@@ -285,13 +317,15 @@ Restart when the payload must change, the sandbox is wedged without a sentinel, 
 Before deleting, check that the sandbox is truly stale or that the operator asked for a restart. If a bounded review cycle is actively running and still producing useful output, prefer leaving it alone.
 
 ```bash
+gateway_name="<selected-gateway-name>"
 sandbox_name="<safe-sandbox-name>"
+[[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
-openshell --gateway docker-dev sandbox delete "$sandbox_name"
+openshell --gateway "$gateway_name" sandbox delete "$sandbox_name"
 ./scripts/agents/run.sh \
   --agent gator \
-  --gateway docker-dev \
+  --gateway "$gateway_name" \
   --name "$sandbox_name" \
   --watch \
   --background \
