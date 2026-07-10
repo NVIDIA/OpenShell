@@ -34,7 +34,9 @@ data:
     log_level             = {{ .Values.server.logLevel | quote }}
     sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
     default_image         = {{ .Values.server.sandboxImage | quote }}
+    {{- if include "openshell.supervisorImageOverrideEnabled" . }}
     supervisor_image      = {{ include "openshell.supervisorImage" . | quote }}
+    {{- end }}
     {{- if .Values.server.hostGatewayIP }}
     host_gateway_ip       = {{ .Values.server.hostGatewayIP | quote }}
     {{- end }}

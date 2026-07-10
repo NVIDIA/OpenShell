@@ -98,6 +98,9 @@ Runtime layout:
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
+The Helm chart omits the supervisor image from gateway configuration unless an
+operator supplies a repository or tag override, preserving that build-time
+pairing for Kubernetes sandboxes as well.
 Package formulas also pin Docker supervisor extraction to the matching release
 image tag so standalone gateway binaries do not infer image tags from package
 versions.

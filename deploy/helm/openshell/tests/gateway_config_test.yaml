@@ -90,6 +90,42 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"combined"'
 
+  - it: uses the gateway built-in supervisor image by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*='
+
+  - it: renders a supervisor tag override with the official repository
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.image.tag: 1.2.3
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*=\s*"ghcr\.io/nvidia/openshell/supervisor:1\.2\.3"'
+
+  - it: renders a supervisor repository override with the effective gateway tag
+    template: templates/gateway-config.yaml
+    set:
+      image.tag: gateway-build
+      supervisor.image.repository: registry.example.com/openshell/supervisor
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:gateway-build"'
+
+  - it: renders complete supervisor repository and tag overrides
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.image.repository: registry.example.com/openshell/supervisor
+      supervisor.image.tag: supervisor-build
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:supervisor-build"'
+
   - it: renders explicit combined supervisor topology under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:
