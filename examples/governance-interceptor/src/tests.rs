@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use openshell_core::proto::gateway_interceptor::v1::{
+    ModifyOperationEvaluation, PostCommitEvaluation, ValidateEvaluation,
+};
 use serde_json::json;
 
 fn service() -> GovernanceInterceptorService {
@@ -14,15 +17,33 @@ fn evaluation(
     phase: GatewayInterceptorPhase,
     operation: Value,
 ) -> InterceptorEvaluation {
+    let proposed_operation = Some(json_to_struct(&operation).unwrap());
+    let phase = match phase {
+        GatewayInterceptorPhase::ModifyOperation => {
+            interceptor_evaluation::Phase::ModifyOperation(ModifyOperationEvaluation {
+                proposed_operation,
+            })
+        }
+        GatewayInterceptorPhase::Validate => {
+            interceptor_evaluation::Phase::Validate(ValidateEvaluation {
+                proposed_operation,
+                current_state: None,
+            })
+        }
+        GatewayInterceptorPhase::PostCommit => {
+            interceptor_evaluation::Phase::PostCommit(PostCommitEvaluation {
+                committed_response: proposed_operation,
+            })
+        }
+        GatewayInterceptorPhase::Unspecified => panic!("test evaluation phase must be specified"),
+    };
     InterceptorEvaluation {
         interceptor_name: "test".to_string(),
         binding_id: "binding".to_string(),
         service: SERVICE.to_string(),
         method: method.to_string(),
-        phase: phase as i32,
-        operation: Some(json_to_struct(&operation).unwrap()),
-        current_state: Some(Struct::default()),
         principal: HashMap::new(),
+        phase: Some(phase),
     }
 }
 
@@ -32,6 +53,39 @@ fn managed_profile_ids(service: &GovernanceInterceptorService) -> Vec<String> {
 
 fn policy_state(service: &GovernanceInterceptorService) -> PolicyState {
     service.current_policy_state()
+}
+
+#[test]
+fn evaluation_requires_a_phase_payload() {
+    let service = service();
+    let mut request = evaluation(
+        "CreateProvider",
+        GatewayInterceptorPhase::Validate,
+        json!({}),
+    );
+    request.phase = None;
+
+    let error = service.evaluate_inner(&request).unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(error.message(), "interceptor phase is required");
+}
+
+#[test]
+fn evaluation_requires_a_proposed_operation() {
+    let service = service();
+    let mut request = evaluation(
+        "CreateProvider",
+        GatewayInterceptorPhase::Validate,
+        json!({}),
+    );
+    let Some(interceptor_evaluation::Phase::Validate(payload)) = request.phase.as_mut() else {
+        panic!("expected validate payload");
+    };
+    payload.proposed_operation = None;
+
+    let error = service.evaluate_inner(&request).unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(error.message(), "phase payload is required");
 }
 
 fn assert_signed_profile(service: &GovernanceInterceptorService, profile: &ProviderProfile) {

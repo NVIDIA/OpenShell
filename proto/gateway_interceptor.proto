@@ -45,14 +45,35 @@ message InterceptorEvaluation {
   string service = 3;
   // Public gRPC method name, e.g. "CreateSandbox".
   string method = 4;
-  // Evaluation phase.
-  GatewayInterceptorPhase phase = 5;
-  // Protobuf JSON-shaped operation payload.
-  google.protobuf.Struct operation = 6;
-  // Read-only gateway state relevant to the operation.
-  google.protobuf.Struct current_state = 7;
   // Caller identity summary. Values are intentionally non-secret.
-  map<string, string> principal = 8;
+  map<string, string> principal = 5;
+
+  // Exactly one phase payload is set for each evaluation.
+  oneof phase {
+    // Evaluation that may modify the prepared gateway operation.
+    ModifyOperationEvaluation modify_operation = 6;
+    // Evaluation that may reject, but not mutate, the prepared operation.
+    ValidateEvaluation validate = 7;
+    // Evaluation after the gateway operation has completed successfully.
+    PostCommitEvaluation post_commit = 8;
+  }
+}
+
+message ModifyOperationEvaluation {
+  // Gateway-prepared operation the gateway proposes to execute.
+  google.protobuf.Struct proposed_operation = 1;
+}
+
+message ValidateEvaluation {
+  // Gateway-prepared operation after earlier interceptor modifications.
+  google.protobuf.Struct proposed_operation = 1;
+  // Optional read-only gateway state loaded before applying the operation.
+  google.protobuf.Struct current_state = 2;
+}
+
+message PostCommitEvaluation {
+  // Protobuf JSON-shaped response returned by the committed gateway operation.
+  google.protobuf.Struct committed_response = 1;
 }
 
 message InterceptorResult {

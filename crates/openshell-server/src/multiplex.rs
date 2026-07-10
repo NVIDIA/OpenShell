@@ -9,7 +9,7 @@
 use bytes::Bytes;
 use http::{Extensions, HeaderValue, Request, Response};
 use http_body::Body;
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited, StreamBody};
 use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -295,9 +295,20 @@ where
             );
             let response = inner.ready().await?.call(req).await?;
 
-            if grpc_status_from_response(&response) == "0"
+            if grpc_status_from_response(&response) != "0"
+                || !interceptors.has_post_commit(&intercepted)
+            {
+                return Ok(response);
+            }
+
+            let (response, response_body, trailers) =
+                match collect_intercepted_grpc_response(response).await {
+                    Ok(response) => response,
+                    Err(status) => return Ok(status.into_http()),
+                };
+            if grpc_status_from_response_and_trailers(&response, trailers.as_ref()) == "0"
                 && let Err(status) = interceptors
-                    .evaluate_post_commit(&intercepted, &context)
+                    .evaluate_post_commit(&intercepted, &response_body, &context)
                     .await
             {
                 return Ok(status.into_http());
@@ -333,12 +344,41 @@ fn boxed_body_from_bytes(bytes: Bytes) -> BoxBody {
     BoxBody(body)
 }
 
+async fn collect_intercepted_grpc_response(
+    response: Response<tonic::body::Body>,
+) -> Result<(Response<tonic::body::Body>, Bytes, Option<http::HeaderMap>), tonic::Status> {
+    let (parts, body) = response.into_parts();
+    let collected = body.collect().await.map_err(|err| {
+        tonic::Status::internal(format!(
+            "failed to read gRPC response for post-commit evaluation: {err}"
+        ))
+    })?;
+    let trailers = collected.trailers().cloned();
+    let bytes = collected.to_bytes();
+    let body = tonic_body_from_bytes_and_trailers(bytes.clone(), trailers.clone());
+    Ok((Response::from_parts(parts, body), bytes, trailers))
+}
+
+fn tonic_body_from_bytes_and_trailers(
+    bytes: Bytes,
+    trailers: Option<http::HeaderMap>,
+) -> tonic::body::Body {
+    let mut frames: Vec<Result<http_body::Frame<Bytes>, tonic::Status>> = Vec::with_capacity(2);
+    if !bytes.is_empty() {
+        frames.push(Ok(http_body::Frame::data(bytes)));
+    }
+    if let Some(trailers) = trailers {
+        frames.push(Ok(http_body::Frame::trailers(trailers)));
+    }
+    tonic::body::Body::new(StreamBody::new(futures::stream::iter(frames)))
+}
+
 fn gateway_interceptor_context(extensions: &Extensions) -> EvaluationContext {
     EvaluationContext {
         principal: extensions
             .get::<Principal>()
             .map_or_else(unknown_gateway_principal, gateway_principal_fields),
-        current_state: None,
+        validate_current_state: None,
     }
 }
 
@@ -908,6 +948,17 @@ fn grpc_status_from_response<B>(res: &Response<B>) -> String {
         .map_or_else(|| "0".to_string(), ToString::to_string)
 }
 
+fn grpc_status_from_response_and_trailers<B>(
+    res: &Response<B>,
+    trailers: Option<&http::HeaderMap>,
+) -> String {
+    trailers
+        .and_then(|trailers| trailers.get("grpc-status"))
+        .or_else(|| res.headers().get("grpc-status"))
+        .and_then(|value| value.to_str().ok())
+        .map_or_else(|| "0".to_string(), ToString::to_string)
+}
+
 fn normalize_http_path(path: &str) -> &'static str {
     match path {
         p if p.starts_with("/_ws_tunnel") => "/_ws_tunnel",
@@ -1071,6 +1122,46 @@ mod tests {
             .expect_err("oversized body should be rejected");
 
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn intercepted_grpc_response_preserves_body_and_trailers() {
+        let bytes = Bytes::from_static(b"committed-response");
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let response = Response::new(tonic_body_from_bytes_and_trailers(
+            bytes.clone(),
+            Some(trailers.clone()),
+        ));
+
+        let (response, observed, observed_trailers) =
+            collect_intercepted_grpc_response(response).await.unwrap();
+
+        assert_eq!(observed, bytes);
+        assert_eq!(observed_trailers.as_ref(), Some(&trailers));
+        assert_eq!(
+            grpc_status_from_response_and_trailers(&response, observed_trailers.as_ref()),
+            "0"
+        );
+
+        let collected = response.into_body().collect().await.unwrap();
+        assert_eq!(collected.trailers(), Some(&trailers));
+        assert_eq!(collected.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn grpc_trailer_status_takes_precedence_over_headers() {
+        let response = Response::builder()
+            .header("grpc-status", "0")
+            .body(())
+            .unwrap();
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("7"));
+
+        assert_eq!(
+            grpc_status_from_response_and_trailers(&response, Some(&trailers)),
+            "7"
+        );
     }
 
     #[tokio::test]

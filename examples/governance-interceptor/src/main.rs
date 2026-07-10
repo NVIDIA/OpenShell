@@ -17,6 +17,7 @@ use openshell_core::proto::gateway_interceptor::v1::{
     InterceptorManifest, InterceptorResult, InterceptorSelector, JsonPatch,
     ProviderProfileSnapshot, ProviderProfileSnapshotRequest,
     gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
+    interceptor_evaluation,
 };
 use openshell_core::proto::{
     ListSandboxesRequest, ProviderProfile, Sandbox, SandboxPhase, SandboxPolicy,
@@ -31,7 +32,7 @@ use prost_types::ListValue;
 use prost_types::{Struct, Value as ProtoValue, value::Kind};
 use rcgen::{KeyPair, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Number, Value, json};
+use serde_json::{Number, Value, json};
 use sha2::{Digest, Sha256};
 use tonic::Code;
 use tonic::transport::{Channel, Server};
@@ -319,40 +320,52 @@ impl GovernanceInterceptorService {
     ) -> Result<InterceptorResult, Status> {
         let profile_state = self.current_profile_state();
         let policy_state = self.current_policy_state();
-        let phase = GatewayInterceptorPhase::try_from(evaluation.phase)
-            .map_err(|_| Status::invalid_argument("unknown interceptor phase"))?;
-        let operation = evaluation
-            .operation
+        let phase = evaluation
+            .phase
             .as_ref()
-            .map(struct_to_json)
-            .unwrap_or_else(|| Value::Object(Map::new()));
+            .ok_or_else(|| Status::invalid_argument("interceptor phase is required"))?;
+        let proposed_operation = match phase {
+            interceptor_evaluation::Phase::ModifyOperation(payload) => {
+                payload.proposed_operation.as_ref()
+            }
+            interceptor_evaluation::Phase::Validate(payload) => payload.proposed_operation.as_ref(),
+            interceptor_evaluation::Phase::PostCommit(payload) => {
+                payload.committed_response.as_ref()
+            }
+        }
+        .ok_or_else(|| Status::invalid_argument("phase payload is required"))?;
+        let operation = struct_to_json(proposed_operation);
 
         match (evaluation.method.as_str(), phase) {
-            ("CreateSandbox", GatewayInterceptorPhase::ModifyOperation) => {
+            ("CreateSandbox", interceptor_evaluation::Phase::ModifyOperation(_)) => {
                 Self::patch_create_sandbox(&operation, &policy_state)
             }
-            ("CreateSandbox", GatewayInterceptorPhase::Validate) => Ok(validate_create_sandbox(
-                &operation,
-                &profile_state.ids,
-                &policy_state,
-                &self.policy_signer,
-            )),
-            ("CreateProvider", GatewayInterceptorPhase::Validate) => {
+            ("CreateSandbox", interceptor_evaluation::Phase::Validate(_)) => {
+                Ok(validate_create_sandbox(
+                    &operation,
+                    &profile_state.ids,
+                    &policy_state,
+                    &self.policy_signer,
+                ))
+            }
+            ("CreateProvider", interceptor_evaluation::Phase::Validate(_)) => {
                 Ok(self.validate_create_provider(&operation, &profile_state.ids))
             }
-            ("UpdateConfig", GatewayInterceptorPhase::Validate) => Ok(validate_update_config(
-                &operation,
-                &evaluation.principal,
-                &policy_state,
-                &self.policy_signer,
-            )),
-            ("ImportProviderProfiles", GatewayInterceptorPhase::Validate) => {
+            ("UpdateConfig", interceptor_evaluation::Phase::Validate(_)) => {
+                Ok(validate_update_config(
+                    &operation,
+                    &evaluation.principal,
+                    &policy_state,
+                    &self.policy_signer,
+                ))
+            }
+            ("ImportProviderProfiles", interceptor_evaluation::Phase::Validate(_)) => {
                 Ok(self.validate_import_provider_profiles(&operation, &profile_state.ids))
             }
-            ("UpdateProviderProfiles", GatewayInterceptorPhase::Validate) => {
+            ("UpdateProviderProfiles", interceptor_evaluation::Phase::Validate(_)) => {
                 Ok(self.validate_update_provider_profiles(&operation, &profile_state.ids))
             }
-            ("DeleteProviderProfile", GatewayInterceptorPhase::Validate) => {
+            ("DeleteProviderProfile", interceptor_evaluation::Phase::Validate(_)) => {
                 Ok(validate_delete_provider_profile())
             }
             _ => Ok(allow()),

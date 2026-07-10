@@ -52,6 +52,17 @@ phases, and re-encoded before the handler sees the request. This keeps
 interception centralized: adding an interceptable unary RPC does not require
 method-specific gateway instrumentation.
 
+Each interceptor evaluation selects exactly one phase payload:
+`modify_operation`, `validate`, or `post_commit`. Modification and validation
+payloads carry the protobuf JSON operation entering that phase. Post-commit
+payloads carry the successful committed response instead of echoing the
+request. Only the `validate` payload can also carry optional read-only
+`current_state`; modification and post-commit evaluations never receive it. The
+gateway does not yet load method-specific state, so the field remains absent;
+an absent state is distinct from an explicitly empty object. Method-specific
+state schemas and persistence-version binding are deferred until a concrete
+consumer requires them.
+
 Interceptor manifests can also vend provider profile catalogs. The gateway
 always starts with the in-tree built-in catalog source, then merges any
 interceptor-declared sources. An authoritative interceptor catalog becomes the

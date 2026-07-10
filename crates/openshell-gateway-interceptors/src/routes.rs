@@ -54,6 +54,7 @@ pub struct OpenShellRouteIndex {
     all_methods: BTreeSet<String>,
     unary_methods: BTreeSet<String>,
     input_types: BTreeMap<String, String>,
+    output_types: BTreeMap<String, String>,
 }
 
 impl OpenShellRouteIndex {
@@ -63,6 +64,7 @@ impl OpenShellRouteIndex {
         let mut all_methods = BTreeSet::new();
         let mut unary_methods = BTreeSet::new();
         let mut input_types = BTreeMap::new();
+        let mut output_types = BTreeMap::new();
 
         for file in &set.file {
             if file.package.as_deref() != Some("openshell.v1") {
@@ -85,8 +87,16 @@ impl OpenShellRouteIndex {
                             .strip_prefix('.')
                             .unwrap_or_else(|| method.input_type.as_deref().unwrap_or_default())
                             .to_string();
+                        let output_type = method
+                            .output_type
+                            .as_deref()
+                            .unwrap_or_default()
+                            .strip_prefix('.')
+                            .unwrap_or_else(|| method.output_type.as_deref().unwrap_or_default())
+                            .to_string();
                         unary_methods.insert(name.clone());
-                        input_types.insert(name, input_type);
+                        input_types.insert(name.clone(), input_type);
+                        output_types.insert(name, output_type);
                     }
                 }
             }
@@ -96,6 +106,7 @@ impl OpenShellRouteIndex {
             all_methods,
             unary_methods,
             input_types,
+            output_types,
         };
         index.validate_non_interceptable_list()?;
         Ok(index)
@@ -112,6 +123,15 @@ impl OpenShellRouteIndex {
     pub fn input_type(&self, service: &str, method: &str) -> Option<&str> {
         if service == SERVICE_OPEN_SHELL && self.unary_methods.contains(method) {
             self.input_types.get(method).map(String::as_str)
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn output_type(&self, service: &str, method: &str) -> Option<&str> {
+        if service == SERVICE_OPEN_SHELL && self.unary_methods.contains(method) {
+            self.output_types.get(method).map(String::as_str)
         } else {
             None
         }
@@ -150,5 +170,9 @@ mod tests {
         assert!(index.is_interceptable("openshell.v1.OpenShell", "UpdateConfig"));
         assert!(!index.is_interceptable("openshell.v1.OpenShell", "GetSandbox"));
         assert!(!index.is_interceptable("openshell.v1.OpenShell", "WatchSandbox"));
+        assert_eq!(
+            index.output_type("openshell.v1.OpenShell", "CreateSandbox"),
+            Some("openshell.v1.SandboxResponse")
+        );
     }
 }

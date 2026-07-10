@@ -27,8 +27,9 @@ use openshell_core::config::{
 use openshell_core::proto::ProviderProfile;
 use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
-    InterceptorResult, InterceptorSelector, JsonPatch, ProviderProfileSnapshotRequest,
-    gateway_interceptor_client::GatewayInterceptorClient,
+    InterceptorResult, InterceptorSelector, JsonPatch, ModifyOperationEvaluation,
+    PostCommitEvaluation, ProviderProfileSnapshotRequest, ValidateEvaluation,
+    gateway_interceptor_client::GatewayInterceptorClient, interceptor_evaluation,
 };
 use prost::Message;
 use prost_types::{
@@ -109,15 +110,6 @@ impl Phase {
             Self::ModifyOperation => "modify_operation",
             Self::Validate => "validate",
             Self::PostCommit => "post_commit",
-        }
-    }
-
-    #[must_use]
-    pub const fn to_proto(self) -> GatewayInterceptorPhase {
-        match self {
-            Self::ModifyOperation => GatewayInterceptorPhase::ModifyOperation,
-            Self::Validate => GatewayInterceptorPhase::Validate,
-            Self::PostCommit => GatewayInterceptorPhase::PostCommit,
         }
     }
 }
@@ -239,14 +231,13 @@ pub struct GatewayInterceptorRuntime {
 #[derive(Debug, Clone)]
 pub struct EvaluationContext {
     pub principal: BTreeMap<String, String>,
-    pub current_state: Option<Value>,
+    pub validate_current_state: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
 pub struct InterceptedRequest {
     pub body: Vec<u8>,
     selector: RpcSelector,
-    operation: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -505,26 +496,38 @@ impl GatewayInterceptorRuntime {
         .encode()
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
-        Ok(InterceptedRequest {
-            body,
-            selector,
-            operation,
-        })
+        Ok(InterceptedRequest { body, selector })
     }
 
     pub async fn evaluate_post_commit(
         &self,
         intercepted: &InterceptedRequest,
+        response_body: &[u8],
         context: &EvaluationContext,
     ) -> std::result::Result<(), Status> {
+        let output_type = self
+            .routes
+            .output_type(&intercepted.selector.service, &intercepted.selector.method)
+            .ok_or_else(|| Status::invalid_argument("unknown OpenShell method"))?;
+        let frame = GrpcFrame::decode(response_body)?;
+        let committed_response = self
+            .descriptors
+            .decode_message_to_json(output_type, &frame.message)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
         self.evaluate_phase(
             &intercepted.selector,
             Phase::PostCommit,
-            intercepted.operation.clone(),
+            committed_response,
             context,
         )
         .await
         .map(|_| ())
+    }
+
+    #[must_use]
+    pub fn has_post_commit(&self, intercepted: &InterceptedRequest) -> bool {
+        self.bindings
+            .contains_key(&(intercepted.selector.clone(), Phase::PostCommit))
     }
 
     async fn evaluate_phase(
@@ -868,21 +871,22 @@ async fn evaluate_plan(
     context: &EvaluationContext,
 ) -> Result<InterceptorResult> {
     let operation = json_to_struct(operation)?;
-    let current_state = context
-        .current_state
-        .clone()
-        .map(json_to_struct)
-        .transpose()?
-        .unwrap_or_default();
+    let current_state = if plan.phase == Phase::Validate {
+        context
+            .validate_current_state
+            .clone()
+            .map(json_to_struct)
+            .transpose()?
+    } else {
+        None
+    };
     let request = InterceptorEvaluation {
         interceptor_name: plan.interceptor_name.clone(),
         binding_id: plan.binding_id.clone(),
         service: plan.selector.service.clone(),
         method: plan.selector.method.clone(),
-        phase: plan.phase.to_proto() as i32,
-        operation: Some(operation),
-        current_state: Some(current_state),
         principal: context.principal.clone().into_iter().collect(),
+        phase: Some(phase_evaluation(plan.phase, operation, current_state)),
     };
 
     let start = Instant::now();
@@ -904,6 +908,27 @@ async fn evaluate_plan(
         )));
     }
     Ok(result)
+}
+
+fn phase_evaluation(
+    phase: Phase,
+    proposed_operation: Struct,
+    current_state: Option<Struct>,
+) -> interceptor_evaluation::Phase {
+    match phase {
+        Phase::ModifyOperation => {
+            interceptor_evaluation::Phase::ModifyOperation(ModifyOperationEvaluation {
+                proposed_operation: Some(proposed_operation),
+            })
+        }
+        Phase::Validate => interceptor_evaluation::Phase::Validate(ValidateEvaluation {
+            proposed_operation: Some(proposed_operation),
+            current_state,
+        }),
+        Phase::PostCommit => interceptor_evaluation::Phase::PostCommit(PostCommitEvaluation {
+            committed_response: Some(proposed_operation),
+        }),
+    }
 }
 
 fn apply_failure_policy(
@@ -1061,18 +1086,18 @@ struct GrpcFrame {
 impl GrpcFrame {
     fn decode(body: &[u8]) -> std::result::Result<Self, Status> {
         if body.len() < GRPC_HEADER_LEN {
-            return Err(Status::invalid_argument("gRPC request frame is too short"));
+            return Err(Status::invalid_argument("gRPC frame is too short"));
         }
         let compressed = body[0] != 0;
         if compressed {
             return Err(Status::unimplemented(
-                "gateway interceptors do not support compressed gRPC requests",
+                "gateway interceptors do not support compressed gRPC frames",
             ));
         }
         let len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
         if body.len() != GRPC_HEADER_LEN + len {
             return Err(Status::invalid_argument(
-                "gRPC request must contain exactly one frame",
+                "gRPC body must contain exactly one frame",
             ));
         }
         Ok(Self {
@@ -2138,6 +2163,49 @@ mod tests {
             err.to_string(),
             "invalid interceptor config: unsupported failure_policy 'ignore'"
         );
+    }
+
+    #[test]
+    fn phase_evaluations_use_the_matching_oneof_variant() {
+        let operation = json_to_struct(json!({"name": "demo"})).unwrap();
+
+        let modify = phase_evaluation(Phase::ModifyOperation, operation.clone(), None);
+        let interceptor_evaluation::Phase::ModifyOperation(payload) = modify else {
+            panic!("expected modify_operation payload");
+        };
+        assert_eq!(payload.proposed_operation, Some(operation.clone()));
+
+        let validate = phase_evaluation(Phase::Validate, operation.clone(), None);
+        let interceptor_evaluation::Phase::Validate(payload) = validate else {
+            panic!("expected validate payload");
+        };
+        assert_eq!(payload.proposed_operation, Some(operation.clone()));
+        assert!(payload.current_state.is_none());
+
+        let validate =
+            phase_evaluation(Phase::Validate, operation.clone(), Some(Struct::default()));
+        let interceptor_evaluation::Phase::Validate(payload) = validate else {
+            panic!("expected validate payload");
+        };
+        assert_eq!(payload.current_state, Some(Struct::default()));
+
+        let current_state = json_to_struct(json!({"resourceVersion": "7"})).unwrap();
+        let validate = phase_evaluation(
+            Phase::Validate,
+            operation.clone(),
+            Some(current_state.clone()),
+        );
+        let interceptor_evaluation::Phase::Validate(payload) = validate else {
+            panic!("expected validate payload");
+        };
+        assert_eq!(payload.current_state, Some(current_state.clone()));
+
+        let post_commit =
+            phase_evaluation(Phase::PostCommit, operation.clone(), Some(current_state));
+        let interceptor_evaluation::Phase::PostCommit(payload) = post_commit else {
+            panic!("expected post_commit payload");
+        };
+        assert_eq!(payload.committed_response, Some(operation));
     }
 
     #[tokio::test]
