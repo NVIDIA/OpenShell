@@ -223,7 +223,7 @@ impl std::fmt::Debug for BindingPlan {
 #[derive(Debug, Clone)]
 pub struct GatewayInterceptorRuntime {
     bindings: Arc<BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>>>,
-    profile_sources: Arc<Vec<ProfileSourcePlan>>,
+    profile_sources: Arc<BTreeMap<String, GatewayInterceptorProfileSource>>,
     routes: Arc<routes::OpenShellRouteIndex>,
     descriptors: Arc<ProtoDescriptors>,
 }
@@ -242,22 +242,21 @@ pub struct InterceptedRequest {
 
 #[derive(Debug, Clone)]
 pub struct ProviderProfileSourceSnapshot {
-    pub source_id: String,
     pub revision: String,
     pub profiles: Vec<ProviderProfile>,
 }
 
 #[derive(Clone)]
-struct ProfileSourcePlan {
+pub struct GatewayInterceptorProfileSource {
     interceptor_name: String,
     source_id: String,
     timeout: Duration,
     client: GatewayInterceptorClient<Channel>,
 }
 
-impl std::fmt::Debug for ProfileSourcePlan {
+impl std::fmt::Debug for GatewayInterceptorProfileSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProfileSourcePlan")
+        f.debug_struct("GatewayInterceptorProfileSource")
             .field("interceptor_name", &self.interceptor_name)
             .field("source_id", &self.source_id)
             .field("timeout", &self.timeout)
@@ -278,6 +277,7 @@ pub async fn initialize(
 
 impl GatewayInterceptorRuntime {
     async fn build(mut configs: Vec<GatewayInterceptorConfig>) -> Result<Self> {
+        validate_interceptor_configs(&configs)?;
         configs.sort_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
 
         let routes =
@@ -285,11 +285,9 @@ impl GatewayInterceptorRuntime {
         let descriptors =
             ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET)?;
         let mut bindings: BTreeMap<(RpcSelector, Phase), Vec<BindingPlan>> = BTreeMap::new();
-        let mut profile_sources = Vec::new();
-        let mut profile_source_ids = BTreeSet::new();
+        let mut profile_sources = BTreeMap::new();
 
         for config in configs {
-            validate_service_config(&config)?;
             let channel = connect_endpoint(&config.grpc_endpoint).await?;
             let timeout = match config.timeout.as_deref() {
                 Some(timeout) => parse_duration(timeout)?,
@@ -371,18 +369,16 @@ impl GatewayInterceptorRuntime {
 
             if manifest.provider_profiles {
                 let source_id = format!("interceptor/{}", config.name);
-                if !profile_source_ids.insert(source_id.clone()) {
-                    return Err(InterceptorError::Config(format!(
-                        "duplicate provider profile source id '{source_id}'"
-                    )));
-                }
-                profile_sources.push(ProfileSourcePlan {
-                    interceptor_name: config.name.clone(),
-                    source_id,
-                    timeout,
-                    client: GatewayInterceptorClient::new(channel.clone())
-                        .max_decoding_message_size(max_response_bytes),
-                });
+                profile_sources.insert(
+                    config.name.clone(),
+                    GatewayInterceptorProfileSource {
+                        interceptor_name: config.name.clone(),
+                        source_id,
+                        timeout,
+                        client: GatewayInterceptorClient::new(channel.clone())
+                            .max_decoding_message_size(max_response_bytes),
+                    },
+                );
             }
         }
 
@@ -401,45 +397,11 @@ impl GatewayInterceptorRuntime {
     }
 
     #[must_use]
-    pub fn has_profile_sources(&self) -> bool {
-        !self.profile_sources.is_empty()
-    }
-
-    pub async fn provider_profile_snapshots(&self) -> Result<Vec<ProviderProfileSourceSnapshot>> {
-        let mut snapshots = Vec::with_capacity(self.profile_sources.len());
-        for source in self.profile_sources.iter() {
-            let mut client = source.client.clone();
-            let response = tokio::time::timeout(
-                source.timeout,
-                client.snapshot_provider_profiles(Request::new(ProviderProfileSnapshotRequest {})),
-            )
-            .await
-            .map_err(|_| {
-                InterceptorError::Transport(format!(
-                    "SnapshotProviderProfiles timed out for '{}'",
-                    source.interceptor_name
-                ))
-            })?
-            .map_err(|status| {
-                InterceptorError::Transport(format!(
-                    "SnapshotProviderProfiles failed for '{}': {status}",
-                    source.interceptor_name
-                ))
-            })?
-            .into_inner();
-
-            let revision = if response.revision.trim().is_empty() {
-                provider_profile_snapshot_revision(&response.profiles)
-            } else {
-                response.revision
-            };
-            snapshots.push(ProviderProfileSourceSnapshot {
-                source_id: source.source_id.clone(),
-                revision,
-                profiles: response.profiles,
-            });
-        }
-        Ok(snapshots)
+    pub fn provider_profile_source(
+        &self,
+        interceptor_name: &str,
+    ) -> Option<GatewayInterceptorProfileSource> {
+        self.profile_sources.get(interceptor_name).cloned()
     }
 
     #[must_use]
@@ -589,6 +551,45 @@ impl GatewayInterceptorRuntime {
     }
 }
 
+impl GatewayInterceptorProfileSource {
+    #[must_use]
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
+    pub async fn snapshot(&self) -> Result<ProviderProfileSourceSnapshot> {
+        let mut client = self.client.clone();
+        let response = tokio::time::timeout(
+            self.timeout,
+            client.snapshot_provider_profiles(Request::new(ProviderProfileSnapshotRequest {})),
+        )
+        .await
+        .map_err(|_| {
+            InterceptorError::Transport(format!(
+                "SnapshotProviderProfiles timed out for '{}'",
+                self.interceptor_name
+            ))
+        })?
+        .map_err(|status| {
+            InterceptorError::Transport(format!(
+                "SnapshotProviderProfiles failed for '{}': {status}",
+                self.interceptor_name
+            ))
+        })?
+        .into_inner();
+
+        let revision = if response.revision.trim().is_empty() {
+            provider_profile_snapshot_revision(&response.profiles)
+        } else {
+            response.revision
+        };
+        Ok(ProviderProfileSourceSnapshot {
+            revision,
+            profiles: response.profiles,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NormalizedBinding {
     binding_id: String,
@@ -653,6 +654,20 @@ fn validate_service_config(config: &GatewayInterceptorConfig) -> Result<()> {
     }
     if let Some(timeout) = config.timeout.as_deref() {
         parse_duration(timeout)?;
+    }
+    Ok(())
+}
+
+fn validate_interceptor_configs(configs: &[GatewayInterceptorConfig]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    for config in configs {
+        validate_service_config(config)?;
+        if !names.insert(config.name.clone()) {
+            return Err(InterceptorError::Config(format!(
+                "duplicate interceptor instance name '{}'",
+                config.name
+            )));
+        }
     }
     Ok(())
 }
@@ -2138,6 +2153,21 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "invalid interceptor config: unsupported failure_policy 'ignore'"
+        );
+    }
+
+    #[test]
+    fn duplicate_interceptor_instance_names_are_invalid() {
+        let config = GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            grpc_endpoint: "http://127.0.0.1:18081".to_string(),
+            ..GatewayInterceptorConfig::default()
+        };
+        let err = validate_interceptor_configs(&[config.clone(), config]).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "invalid interceptor config: duplicate interceptor instance name 'governance'"
         );
     }
 

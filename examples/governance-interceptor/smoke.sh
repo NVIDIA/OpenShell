@@ -325,6 +325,11 @@ write_gateway_config() {
 [openshell]
 version = 1
 
+[openshell.gateway]
+provider_profile_sources = [
+  { type = "interceptor", name = "provider-governance" },
+]
+
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
 

@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
 use openshell_core::{
-    GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig,
-    TlsConfig,
+    GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
+    GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig, TlsConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -151,6 +151,8 @@ pub struct GatewayFileSection {
     pub auth: Option<GatewayAuthConfig>,
     #[serde(default)]
     pub interceptors: Vec<GatewayInterceptorConfig>,
+    #[serde(default)]
+    pub provider_profile_sources: Option<Vec<GatewayProviderProfileSourceConfig>>,
     #[serde(default)]
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
@@ -404,6 +406,30 @@ allow_unauthenticated_users = true
         let file = load(tmp.path()).expect("valid auth config parses");
         let auth = file.openshell.gateway.auth.expect("auth config");
         assert!(auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn parses_provider_profile_source_composition() {
+        let toml = r#"
+[openshell.gateway]
+provider_profile_sources = [
+  { type = "builtin" },
+  { type = "user" },
+  { type = "interceptor", name = "provider-governance" },
+]
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid provider profile sources parse");
+        assert_eq!(
+            file.openshell.gateway.provider_profile_sources,
+            Some(vec![
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+                GatewayProviderProfileSourceConfig::Interceptor {
+                    name: "provider-governance".to_string(),
+                },
+            ])
+        );
     }
 
     #[test]

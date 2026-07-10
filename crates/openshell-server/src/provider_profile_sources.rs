@@ -4,10 +4,15 @@
 //! Gateway-local provider profile sources.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use openshell_core::GatewayProviderProfileSourceConfig;
 use openshell_core::proto::{ProviderProfile, StoredProviderProfile};
-use openshell_gateway_interceptors::ProviderProfileSourceSnapshot as InterceptorProfileSnapshot;
+use openshell_gateway_interceptors::{
+    GatewayInterceptorProfileSource, GatewayInterceptorRuntime,
+    ProviderProfileSourceSnapshot as InterceptorProfileSnapshot,
+};
 use openshell_providers::{
     ProfileValidationDiagnostic, ProviderTypeProfile, builtin_profiles, normalize_profile_id,
     validate_profile_set,
@@ -29,15 +34,15 @@ impl ObjectType for StoredProviderProfile {
 
 #[derive(Debug, Clone)]
 pub struct ProviderProfileSnapshot {
-    source_id: String,
     revision: String,
     profiles: Vec<ProviderProfile>,
-    user_managed: bool,
-    allow_empty: bool,
 }
 
 #[async_trait]
-pub trait ProviderProfileSource: Send + Sync {
+pub trait ProviderProfileSource: Send + Sync + std::fmt::Debug {
+    fn source_id(&self) -> &str;
+    fn user_managed(&self) -> bool;
+    fn allow_empty(&self) -> bool;
     async fn snapshot(&self, store: &Store) -> Result<ProviderProfileSnapshot, Status>;
 }
 
@@ -46,17 +51,26 @@ struct BuiltinProviderProfileSource;
 
 #[async_trait]
 impl ProviderProfileSource for BuiltinProviderProfileSource {
+    fn source_id(&self) -> &str {
+        BUILTIN_SOURCE_ID
+    }
+
+    fn user_managed(&self) -> bool {
+        false
+    }
+
+    fn allow_empty(&self) -> bool {
+        false
+    }
+
     async fn snapshot(&self, _store: &Store) -> Result<ProviderProfileSnapshot, Status> {
         let profiles = builtin_profiles()
             .iter()
             .map(ProviderTypeProfile::to_proto)
             .collect::<Vec<_>>();
         Ok(ProviderProfileSnapshot {
-            source_id: BUILTIN_SOURCE_ID.to_string(),
             revision: profile_snapshot_revision(&profiles),
             profiles,
-            user_managed: false,
-            allow_empty: false,
         })
     }
 }
@@ -66,6 +80,18 @@ struct UserProviderProfileSource;
 
 #[async_trait]
 impl ProviderProfileSource for UserProviderProfileSource {
+    fn source_id(&self) -> &str {
+        USER_SOURCE_ID
+    }
+
+    fn user_managed(&self) -> bool {
+        true
+    }
+
+    fn allow_empty(&self) -> bool {
+        true
+    }
+
     async fn snapshot(&self, store: &Store) -> Result<ProviderProfileSnapshot, Status> {
         let stored = user_provider_profiles(store).await?;
         let mut profiles = Vec::new();
@@ -81,27 +107,50 @@ impl ProviderProfileSource for UserProviderProfileSource {
             }
         }
         Ok(ProviderProfileSnapshot {
-            source_id: USER_SOURCE_ID.to_string(),
             revision: format!("sha256:{:x}", hasher.finalize()),
             profiles,
-            user_managed: true,
-            allow_empty: true,
         })
     }
 }
 
-#[derive(Debug, Clone)]
-enum ConfiguredProviderProfileSource {
-    Builtin(BuiltinProviderProfileSource),
-    User(UserProviderProfileSource),
-    Interceptors(openshell_gateway_interceptors::GatewayInterceptorRuntime),
-    #[cfg(test)]
-    Static(ProviderProfileSnapshot),
+#[async_trait]
+impl ProviderProfileSource for GatewayInterceptorProfileSource {
+    fn source_id(&self) -> &str {
+        Self::source_id(self)
+    }
+
+    fn user_managed(&self) -> bool {
+        false
+    }
+
+    fn allow_empty(&self) -> bool {
+        false
+    }
+
+    async fn snapshot(&self, _store: &Store) -> Result<ProviderProfileSnapshot, Status> {
+        let InterceptorProfileSnapshot { revision, profiles } =
+            Self::snapshot(self).await.map_err(|err| {
+                Status::unavailable(format!(
+                    "provider profile source '{}' snapshot failed: {err}",
+                    self.source_id()
+                ))
+            })?;
+        Ok(ProviderProfileSnapshot { revision, profiles })
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ProviderProfileSources {
-    sources: Vec<ConfiguredProviderProfileSource>,
+    sources: Vec<Arc<dyn ProviderProfileSource>>,
+}
+
+#[derive(Debug, Clone)]
+struct CollectedProviderProfileSnapshot {
+    source_id: String,
+    revision: String,
+    profiles: Vec<ProviderProfile>,
+    user_managed: bool,
+    allow_empty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -122,37 +171,70 @@ impl ProviderProfileSources {
     pub fn with_default_sources() -> Self {
         Self {
             sources: vec![
-                ConfiguredProviderProfileSource::Builtin(BuiltinProviderProfileSource),
-                ConfiguredProviderProfileSource::User(UserProviderProfileSource),
+                Arc::new(BuiltinProviderProfileSource),
+                Arc::new(UserProviderProfileSource),
             ],
         }
     }
 
-    pub fn from_gateway_interceptors(
-        runtime: Option<openshell_gateway_interceptors::GatewayInterceptorRuntime>,
-    ) -> Self {
-        if let Some(runtime) = runtime
-            && runtime.has_profile_sources()
-        {
-            return Self {
-                sources: vec![ConfiguredProviderProfileSource::Interceptors(runtime)],
-            };
+    pub fn from_config(
+        configured: &[GatewayProviderProfileSourceConfig],
+        runtime: Option<&GatewayInterceptorRuntime>,
+    ) -> Result<Self, String> {
+        if configured.is_empty() {
+            return Err("provider_profile_sources must contain at least one source".to_string());
         }
-        Self::with_default_sources()
+
+        let mut source_ids = BTreeSet::new();
+        let mut sources: Vec<Arc<dyn ProviderProfileSource>> = Vec::with_capacity(configured.len());
+        for source in configured {
+            let source: Arc<dyn ProviderProfileSource> = match source {
+                GatewayProviderProfileSourceConfig::Builtin => {
+                    Arc::new(BuiltinProviderProfileSource)
+                }
+                GatewayProviderProfileSourceConfig::User => Arc::new(UserProviderProfileSource),
+                GatewayProviderProfileSourceConfig::Interceptor { name } => {
+                    if name.trim().is_empty() {
+                        return Err("provider profile interceptor source name must not be empty"
+                            .to_string());
+                    }
+                    let source = runtime
+                        .and_then(|runtime| runtime.provider_profile_source(name))
+                        .ok_or_else(|| {
+                            format!(
+                                "provider profile source interceptor '{name}' is not configured or does not advertise provider_profiles"
+                            )
+                        })?;
+                    Arc::new(source)
+                }
+            };
+            let source_id = source.source_id().to_string();
+            if !source_ids.insert(source_id.clone()) {
+                return Err(format!(
+                    "duplicate provider profile source '{source_id}' in provider_profile_sources"
+                ));
+            }
+            sources.push(source);
+        }
+        Ok(Self { sources })
+    }
+
+    pub fn source_ids(&self) -> Vec<&str> {
+        self.sources
+            .iter()
+            .map(|source| source.source_id())
+            .collect()
     }
 
     #[cfg(test)]
     pub(crate) fn from_test_profiles(profiles: Vec<ProviderProfile>) -> Self {
         Self {
-            sources: vec![ConfiguredProviderProfileSource::Static(
-                ProviderProfileSnapshot {
-                    source_id: "test".to_string(),
+            sources: vec![Arc::new(StaticProviderProfileSource {
+                snapshot: ProviderProfileSnapshot {
                     revision: profile_snapshot_revision(&profiles),
                     profiles,
-                    user_managed: false,
-                    allow_empty: false,
                 },
-            )],
+            })],
         }
     }
 
@@ -249,49 +331,30 @@ impl ProviderProfileSources {
         build_effective_profiles(snapshots)
     }
 
-    async fn snapshots(&self, store: &Store) -> Result<Vec<ProviderProfileSnapshot>, Status> {
-        let mut snapshots = Vec::new();
+    async fn snapshots(
+        &self,
+        store: &Store,
+    ) -> Result<Vec<CollectedProviderProfileSnapshot>, Status> {
+        let mut snapshots = Vec::with_capacity(self.sources.len());
         for source in &self.sources {
-            match source {
-                ConfiguredProviderProfileSource::Builtin(source) => {
-                    snapshots.push(source.snapshot(store).await?);
-                }
-                ConfiguredProviderProfileSource::User(source) => {
-                    snapshots.push(source.snapshot(store).await?);
-                }
-                ConfiguredProviderProfileSource::Interceptors(runtime) => {
-                    let external = runtime.provider_profile_snapshots().await.map_err(|err| {
-                        Status::unavailable(format!(
-                            "provider profile source snapshot failed: {err}"
-                        ))
-                    })?;
-                    snapshots.extend(external.into_iter().map(interceptor_snapshot));
-                }
-                #[cfg(test)]
-                ConfiguredProviderProfileSource::Static(snapshot) => {
-                    snapshots.push(snapshot.clone());
-                }
-            }
+            let snapshot = source.snapshot(store).await?;
+            snapshots.push(CollectedProviderProfileSnapshot {
+                source_id: source.source_id().to_string(),
+                revision: snapshot.revision,
+                profiles: snapshot.profiles,
+                user_managed: source.user_managed(),
+                allow_empty: source.allow_empty(),
+            });
         }
         Ok(snapshots)
     }
 }
 
-fn interceptor_snapshot(snapshot: InterceptorProfileSnapshot) -> ProviderProfileSnapshot {
-    ProviderProfileSnapshot {
-        source_id: snapshot.source_id,
-        revision: snapshot.revision,
-        profiles: snapshot.profiles,
-        user_managed: false,
-        allow_empty: false,
-    }
-}
-
 fn build_effective_profiles(
-    snapshots: Vec<ProviderProfileSnapshot>,
+    snapshots: Vec<CollectedProviderProfileSnapshot>,
 ) -> Result<EffectiveProviderProfiles, Status> {
     let mut source_ids = BTreeSet::new();
-    let mut profiles = BTreeMap::new();
+    let mut profiles: BTreeMap<String, EffectiveProfileEntry> = BTreeMap::new();
 
     for snapshot in snapshots {
         let source_id = snapshot.source_id.trim();
@@ -330,9 +393,17 @@ fn build_effective_profiles(
                     profile.id, source_id
                 ))
             })?;
-            if profiles.contains_key(&id) {
+            if let Some(existing) = profiles.get(&id) {
+                let location = if existing.source_id == source_id {
+                    format!("within source '{source_id}'")
+                } else {
+                    format!(
+                        "across configured sources '{}' and '{source_id}'",
+                        existing.source_id
+                    )
+                };
                 return Err(Status::failed_precondition(format!(
-                    "duplicate provider profile id '{id}' across configured sources"
+                    "duplicate provider profile id '{id}' {location}"
                 )));
             }
             profiles.insert(
@@ -436,8 +507,111 @@ pub fn stored_profile_resource_version(stored: &StoredProviderProfile) -> u64 {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone)]
+struct StaticProviderProfileSource {
+    snapshot: ProviderProfileSnapshot,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ProviderProfileSource for StaticProviderProfileSource {
+    fn source_id(&self) -> &'static str {
+        "test"
+    }
+
+    fn user_managed(&self) -> bool {
+        false
+    }
+
+    fn allow_empty(&self) -> bool {
+        false
+    }
+
+    async fn snapshot(&self, _store: &Store) -> Result<ProviderProfileSnapshot, Status> {
+        Ok(self.snapshot.clone())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::GatewayInterceptorConfig;
+    use openshell_core::proto::gateway_interceptor::v1::{
+        DescribeRequest, InterceptorEvaluation, InterceptorManifest, InterceptorResult,
+        ProviderProfileSnapshot as ProtoProviderProfileSnapshot, ProviderProfileSnapshotRequest,
+        gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
+    };
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response};
+
+    #[derive(Clone)]
+    struct MockProfileInterceptor {
+        advertises_profiles: bool,
+        snapshot: ProtoProviderProfileSnapshot,
+    }
+
+    #[tonic::async_trait]
+    impl GatewayInterceptor for MockProfileInterceptor {
+        async fn describe(
+            &self,
+            _request: Request<DescribeRequest>,
+        ) -> Result<Response<InterceptorManifest>, Status> {
+            Ok(Response::new(InterceptorManifest {
+                name: "mock-profile-source".to_string(),
+                provider_profiles: self.advertises_profiles,
+                ..InterceptorManifest::default()
+            }))
+        }
+
+        async fn evaluate(
+            &self,
+            _request: Request<InterceptorEvaluation>,
+        ) -> Result<Response<InterceptorResult>, Status> {
+            Ok(Response::new(InterceptorResult {
+                allowed: true,
+                ..InterceptorResult::default()
+            }))
+        }
+
+        async fn snapshot_provider_profiles(
+            &self,
+            _request: Request<ProviderProfileSnapshotRequest>,
+        ) -> Result<Response<ProtoProviderProfileSnapshot>, Status> {
+            if self.snapshot.revision == "test:unavailable" {
+                return Err(Status::unavailable("mock profile source unavailable"));
+            }
+            Ok(Response::new(self.snapshot.clone()))
+        }
+    }
+
+    async fn interceptor_runtime(
+        snapshot: ProtoProviderProfileSnapshot,
+        advertises_profiles: bool,
+    ) -> (GatewayInterceptorRuntime, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(GatewayInterceptorServer::new(MockProfileInterceptor {
+                    advertises_profiles,
+                    snapshot,
+                }))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let runtime = openshell_gateway_interceptors::initialize(vec![GatewayInterceptorConfig {
+            name: "governance".to_string(),
+            grpc_endpoint: format!("http://{address}"),
+            ..GatewayInterceptorConfig::default()
+        }])
+        .await
+        .unwrap()
+        .unwrap();
+        (runtime, task)
+    }
 
     fn profile(id: &str) -> ProviderProfile {
         let mut profile = builtin_profiles()
@@ -453,14 +627,14 @@ mod tests {
     #[test]
     fn duplicate_profile_ids_across_sources_are_invalid() {
         let err = build_effective_profiles(vec![
-            ProviderProfileSnapshot {
+            CollectedProviderProfileSnapshot {
                 source_id: "source-a".to_string(),
                 revision: "a".to_string(),
                 profiles: vec![profile("github")],
                 user_managed: false,
                 allow_empty: false,
             },
-            ProviderProfileSnapshot {
+            CollectedProviderProfileSnapshot {
                 source_id: "source-b".to_string(),
                 revision: "b".to_string(),
                 profiles: vec![profile("github")],
@@ -474,8 +648,307 @@ mod tests {
     }
 
     #[test]
+    fn configured_local_sources_preserve_order() {
+        let sources = ProviderProfileSources::from_config(
+            &[
+                GatewayProviderProfileSourceConfig::User,
+                GatewayProviderProfileSourceConfig::Builtin,
+            ],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(sources.source_ids(), vec!["user", "builtin"]);
+    }
+
+    #[test]
+    fn configured_sources_must_not_be_empty() {
+        let err = ProviderProfileSources::from_config(&[], None).unwrap_err();
+        assert!(err.contains("at least one source"));
+    }
+
+    #[test]
+    fn configured_sources_must_be_unique() {
+        let err = ProviderProfileSources::from_config(
+            &[
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::Builtin,
+            ],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate provider profile source 'builtin'"));
+    }
+
+    #[test]
+    fn configured_interceptor_must_advertise_profile_capability() {
+        let err = ProviderProfileSources::from_config(
+            &[GatewayProviderProfileSourceConfig::Interceptor {
+                name: "governance".to_string(),
+            }],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("not configured or does not advertise provider_profiles"));
+    }
+
+    #[test]
+    fn source_that_disallows_empty_snapshots_fails_closed() {
+        let err = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "interceptor/test".to_string(),
+            revision: "empty".to_string(),
+            profiles: Vec::new(),
+            user_managed: false,
+            allow_empty: false,
+        }])
+        .unwrap_err();
+
+        assert!(err.message().contains("returned no profiles"));
+    }
+
+    #[test]
+    fn user_source_may_return_an_empty_snapshot() {
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "empty".to_string(),
+            profiles: Vec::new(),
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        assert!(catalog.profiles.is_empty());
+    }
+
+    #[test]
+    fn invalid_profile_semantics_fail_closed() {
+        let err = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "interceptor/test".to_string(),
+            revision: "invalid".to_string(),
+            profiles: vec![profile("GitHub")],
+            user_managed: false,
+            allow_empty: false,
+        }])
+        .unwrap_err();
+
+        assert!(
+            err.message()
+                .contains("provider profile source 'interceptor/test' is invalid")
+        );
+    }
+
+    #[tokio::test]
+    async fn interceptor_snapshot_passes_through_adapter_and_validation_boundary() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: String::new(),
+                profiles: vec![profile("github")],
+            },
+            true,
+        )
+        .await;
+        let sources = ProviderProfileSources::from_config(
+            &[GatewayProviderProfileSourceConfig::Interceptor {
+                name: "governance".to_string(),
+            }],
+            Some(&runtime),
+        )
+        .unwrap();
+        let store = crate::persistence::test_store().await;
+
+        let profiles = sources.list_profiles(&store).await.unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "github");
+        let snapshot = runtime
+            .provider_profile_source("governance")
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap();
+        assert!(snapshot.revision.starts_with("sha256:"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_interceptor_snapshot_received_over_adapter_fails_closed() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: "empty".to_string(),
+                profiles: Vec::new(),
+            },
+            true,
+        )
+        .await;
+        let sources = ProviderProfileSources::from_config(
+            &[GatewayProviderProfileSourceConfig::Interceptor {
+                name: "governance".to_string(),
+            }],
+            Some(&runtime),
+        )
+        .unwrap();
+        let store = crate::persistence::test_store().await;
+
+        let err = sources.list_profiles(&store).await.unwrap_err();
+        assert!(err.message().contains("returned no profiles"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_interceptor_snapshot_received_over_adapter_fails_closed() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: "invalid".to_string(),
+                profiles: vec![profile("GitHub")],
+            },
+            true,
+        )
+        .await;
+        let sources = ProviderProfileSources::from_config(
+            &[GatewayProviderProfileSourceConfig::Interceptor {
+                name: "governance".to_string(),
+            }],
+            Some(&runtime),
+        )
+        .unwrap();
+        let store = crate::persistence::test_store().await;
+
+        let err = sources.list_profiles(&store).await.unwrap_err();
+        assert!(err.message().contains("is invalid"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn distinct_local_and_interceptor_profiles_compose() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: "external".to_string(),
+                profiles: vec![profile("governed-github")],
+            },
+            true,
+        )
+        .await;
+        let sources = ProviderProfileSources::from_config(
+            &[
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::Interceptor {
+                    name: "governance".to_string(),
+                },
+            ],
+            Some(&runtime),
+        )
+        .unwrap();
+        let store = crate::persistence::test_store().await;
+
+        let profiles = sources.list_profiles(&store).await.unwrap();
+        assert!(profiles.iter().any(|profile| profile.id == "github"));
+        assert!(
+            profiles
+                .iter()
+                .any(|profile| profile.id == "governed-github")
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn duplicate_profile_ids_across_local_and_interceptor_sources_fail_closed() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: "external".to_string(),
+                profiles: vec![profile("github")],
+            },
+            true,
+        )
+        .await;
+        let sources = ProviderProfileSources::from_config(
+            &[
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::Interceptor {
+                    name: "governance".to_string(),
+                },
+            ],
+            Some(&runtime),
+        )
+        .unwrap();
+        let store = crate::persistence::test_store().await;
+
+        let err = sources.list_profiles(&store).await.unwrap_err();
+        assert!(
+            err.message()
+                .contains("duplicate provider profile id 'github'")
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn duplicate_profiles_within_interceptor_snapshot_fail_closed() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: "duplicates".to_string(),
+                profiles: vec![profile("github"), profile("github")],
+            },
+            true,
+        )
+        .await;
+        let sources = ProviderProfileSources::from_config(
+            &[GatewayProviderProfileSourceConfig::Interceptor {
+                name: "governance".to_string(),
+            }],
+            Some(&runtime),
+        )
+        .unwrap();
+        let store = crate::persistence::test_store().await;
+
+        let err = sources.list_profiles(&store).await.unwrap_err();
+        assert!(err.message().contains("duplicate provider profile id"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_selected_interceptor_does_not_fall_back() {
+        let (runtime, task) = interceptor_runtime(
+            ProtoProviderProfileSnapshot {
+                revision: "test:unavailable".to_string(),
+                profiles: vec![profile("governed-github")],
+            },
+            true,
+        )
+        .await;
+        let sources = ProviderProfileSources::from_config(
+            &[
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::Interceptor {
+                    name: "governance".to_string(),
+                },
+            ],
+            Some(&runtime),
+        )
+        .unwrap();
+        let store = crate::persistence::test_store().await;
+
+        let err = sources.list_profiles(&store).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn interceptor_without_profile_capability_cannot_be_selected() {
+        let (runtime, task) =
+            interceptor_runtime(ProtoProviderProfileSnapshot::default(), false).await;
+        let err = ProviderProfileSources::from_config(
+            &[GatewayProviderProfileSourceConfig::Interceptor {
+                name: "governance".to_string(),
+            }],
+            Some(&runtime),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("does not advertise provider_profiles"));
+        task.abort();
+    }
+
+    #[test]
     fn source_managed_profiles_report_static_source() {
-        let catalog = build_effective_profiles(vec![ProviderProfileSnapshot {
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
             source_id: "interceptor/test".to_string(),
             revision: "test".to_string(),
             profiles: vec![profile("slack")],

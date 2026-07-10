@@ -281,10 +281,19 @@ pub(crate) async fn run_server(
             .map_err(|e| {
                 Error::config(format!("gateway interceptor initialization failed: {e}"))
             })?;
-    let provider_profile_sources =
-        provider_profile_sources::ProviderProfileSources::from_gateway_interceptors(
-            gateway_interceptors.clone(),
-        );
+    let provider_profile_sources = provider_profile_sources::ProviderProfileSources::from_config(
+        &config.provider_profile_sources,
+        gateway_interceptors.as_ref(),
+    )
+    .map_err(|err| {
+        Error::config(format!(
+            "provider profile source configuration failed: {err}"
+        ))
+    })?;
+    info!(
+        sources = ?provider_profile_sources.source_ids(),
+        "provider profile sources configured"
+    );
     let mut state = ServerState::new(
         config.clone(),
         store.clone(),

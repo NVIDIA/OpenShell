@@ -63,12 +63,15 @@ an absent state is distinct from an explicitly empty object. Method-specific
 state schemas and persistence-version binding are deferred until a concrete
 consumer requires them.
 
-Interceptor manifests can also vend provider profile catalogs. The gateway
-always starts with the in-tree built-in catalog source, then merges any
-interceptor-declared sources. An authoritative interceptor catalog becomes the
-visible provider profile source of truth for that gateway and hides built-in
-and user-imported profiles from profile resolution, while append catalogs add
-static profiles alongside the built-in/user catalog.
+Interceptor manifests can also vend provider profile catalogs. Gateway
+configuration selects the exact ordered source set from the in-tree built-in
+source, the stored user source, and named profile-capable interceptors. Omitting
+the setting selects `builtin + user`; selecting only an interceptor makes it
+authoritative by omission. Every selected source uses the same snapshot,
+semantic-validation, and duplicate-detection path. Duplicate normalized profile
+IDs fail instead of creating source precedence. The gateway treats configured
+interceptors as trusted sources and does not verify signature annotations in
+their profile payloads.
 
 Supported auth modes:
 

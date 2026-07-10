@@ -57,21 +57,27 @@ profile ID `github`, and `profiles/slack.yaml` becomes profile ID `slack`. The
 YAML files do not need an `id` field; if one is present, the filename still wins.
 
 The interceptor advertises `provider_profiles = true` in its manifest and vends
-the current profile set through `SnapshotProviderProfiles`. While the
-interceptor is attached, the gateway uses that snapshot as the profile source:
-`provider list-profiles` shows only `github` and `slack`, and built-in/user
-sources are omitted. The example signs each profile's canonical protobuf
-payload and exposes the JWT under
+the current profile set through `SnapshotProviderProfiles`. The gateway config
+selects the interceptor as its only provider profile source, so
+`provider list-profiles` shows only `github` and `slack`; built-in and user
+sources are omitted. The example signs each profile's canonical protobuf payload
+and exposes the JWT under
 `annotations["openshell.nvidia.com/profile-signature"]`; the signed hash and key
-ID are exposed beside it. Valid edits to files under `profiles/` change the
-profile signature and snapshot revision, so running sandboxes that use the
-edited provider profile reload their effective provider-derived policy through
-the normal gateway config polling path. Invalid edits keep the last valid
-snapshot active.
+ID are exposed beside it. These annotations demonstrate logic an interceptor
+can own; the gateway treats them as opaque metadata and does not verify them.
+Valid edits to files under `profiles/` change the profile signature and snapshot
+revision, so running sandboxes that use the edited provider profile reload their
+effective provider-derived policy through the normal gateway config polling
+path. Invalid edits keep the last valid snapshot active.
 
 Gateway TOML snippet:
 
 ```toml
+[openshell.gateway]
+provider_profile_sources = [
+  { type = "interceptor", name = "provider-governance" },
+]
+
 [[openshell.gateway.interceptors]]
 name               = "provider-governance"
 grpc_endpoint      = "http://127.0.0.1:18081"

@@ -104,6 +104,13 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 grpc_rate_limit_requests       = 120
 grpc_rate_limit_window_seconds = 60
 
+# Optional exact provider-profile source composition. When omitted, the
+# gateway uses builtin + user.
+provider_profile_sources = [
+  { type = "builtin" },
+  { type = "user" },
+]
+
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
@@ -160,6 +167,19 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
 `[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target unary OpenShell methods that are not on the built-in supervisor, streaming, read-only, or introspection allowlist. Request bodies are exposed as protobuf JSON objects, so adding a new unary RPC does not require handler-specific interceptor code.
+
+`provider_profile_sources` selects the exact ordered provider-profile source set. Omit it to use the built-in and user-managed sources. Use `{ type = "builtin" }`, `{ type = "user" }`, and `{ type = "interceptor", name = "<configured-interceptor-name>" }` entries to compose a catalog. An interceptor entry must reference a configured service whose manifest advertises `provider_profiles = true`. Selecting only an interceptor makes that catalog authoritative; include local sources explicitly to compose them. Empty or duplicate source lists, unknown interceptor names, and duplicate normalized profile IDs fail closed. Source order controls collection and diagnostics, not override precedence.
+
+For an authoritative interceptor catalog, select only that interceptor:
+
+```toml
+[openshell.gateway]
+provider_profile_sources = [
+  { type = "interceptor", name = "provider-governance" },
+]
+```
+
+The gateway validates snapshot structure and provider-profile semantics. It treats a configured interceptor as the source trust boundary and does not verify signature, hash, or key annotations in profile payloads.
 
 `failure_policy` accepts `fail_closed` or `fail_open`. `timeout` accepts `ms` and `s` suffixes. Binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
 

@@ -387,6 +387,9 @@ pub struct Config {
     /// Disabled-by-default gateway interceptor service configs.
     pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
 
+    /// Ordered provider-profile sources used to build the effective catalog.
+    pub provider_profile_sources: Vec<GatewayProviderProfileSourceConfig>,
+
     /// mTLS user authentication configuration. When enabled, a verified TLS
     /// client certificate can authenticate CLI/SDK callers as a
     /// `Principal::User`. This is for local single-user gateways only;
@@ -580,6 +583,18 @@ pub struct GatewayInterceptorConfig {
     pub bindings: Vec<GatewayInterceptorBindingOverride>,
 }
 
+/// One configured source in the gateway's effective provider-profile catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayProviderProfileSourceConfig {
+    /// Profiles bundled with the `OpenShell` build.
+    Builtin,
+    /// Profiles managed through the provider profile mutation APIs.
+    User,
+    /// Profiles vended by a configured gateway interceptor instance.
+    Interceptor { name: String },
+}
+
 /// Failure behavior when an interceptor evaluation cannot produce a valid
 /// result.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -686,6 +701,10 @@ impl Config {
             oidc: None,
             auth: GatewayAuthConfig::default(),
             gateway_interceptors: Vec::new(),
+            provider_profile_sources: vec![
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+            ],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
@@ -783,6 +802,16 @@ impl Config {
         I: IntoIterator<Item = GatewayInterceptorConfig>,
     {
         self.gateway_interceptors = interceptors.into_iter().collect();
+        self
+    }
+
+    /// Set the ordered provider-profile sources used by the gateway.
+    #[must_use]
+    pub fn with_provider_profile_sources<I>(mut self, sources: I) -> Self
+    where
+        I: IntoIterator<Item = GatewayProviderProfileSourceConfig>,
+    {
+        self.provider_profile_sources = sources.into_iter().collect();
         self
     }
 
@@ -911,8 +940,9 @@ mod tests {
     use super::is_reachable_unix_socket;
     use super::{
         ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorFailurePolicy,
-        GatewayJwtConfig, detect_driver, docker_host_unix_socket_path, is_unix_socket,
-        normalize_compute_driver_name, podman_socket_candidates_from_env, podman_socket_responds,
+        GatewayJwtConfig, GatewayProviderProfileSourceConfig, detect_driver,
+        docker_host_unix_socket_path, is_unix_socket, normalize_compute_driver_name,
+        podman_socket_candidates_from_env, podman_socket_responds,
     };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
@@ -976,6 +1006,18 @@ mod tests {
     fn config_disables_unauthenticated_users_by_default() {
         let cfg = Config::new(None);
         assert!(!cfg.auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn config_defaults_to_builtin_and_user_provider_profile_sources() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.provider_profile_sources,
+            vec![
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+            ]
+        );
     }
 
     #[test]
