@@ -8,7 +8,7 @@ pub mod grpc;
 pub use config::{
     AppArmorProfile, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, KubernetesProxyPodConfig,
-    KubernetesSidecarConfig, SupervisorSideloadMethod, SupervisorTopology,
+    KubernetesSidecarConfig, ProxyPodAffinity, SupervisorSideloadMethod, SupervisorTopology,
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;

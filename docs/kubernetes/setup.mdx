@@ -163,6 +163,7 @@ The most commonly changed values are:
 | `supervisor.topology` | Sandbox pod topology. Refer to [Topology](/kubernetes/topology). |
 | `supervisor.sidecar.proxyUid` | Non-root UID used when sidecar process/binary-aware network policy is disabled. The default binary-aware sidecar runs as UID 0 instead. The configured UID must not match the sandbox UID. |
 | `supervisor.proxyPod.proxyUid` | Non-root UID used by the proxy-pod network supervisor. The UID must not match the sandbox UID. |
+| `supervisor.proxyPod.affinity` | Same-node placement policy for workload and proxy pods: `disabled` (default), `preferred`, or `required`. |
 
 Use a values file for repeatable deployments:
 

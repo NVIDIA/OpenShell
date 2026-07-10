@@ -90,11 +90,14 @@ restart lifecycle before a new authoritative client can be established.
 
 The `proxy-pod` supervisor topology runs network enforcement and gateway
 forwarding in a separate supervisor Deployment with one pod. The agent pod runs
-only the process-mode supervisor and reaches the supervisor through a
-per-sandbox headless Service. The driver creates an owner-referenced supervisor
+the sandbox image directly and reaches the supervisor through a per-sandbox
+headless Service. The driver creates an owner-referenced supervisor
 Deployment with one replica plus Service, proxy CA Secret, and NetworkPolicy
 resources so agent egress is limited to its paired supervisor pod plus DNS. If
-the supervisor pod is deleted, the Deployment recreates it.
+the supervisor pod is deleted, the Deployment recreates it. The workload pod
+does not mount gateway credentials or the supervisor binary. This topology
+intentionally omits filesystem/process/binary enforcement, SSH/exec,
+upload/download, sync, and provider environment injection.
 
 The driver can request a Kubernetes AppArmor profile through
 `app_armor_profile`.

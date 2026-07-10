@@ -50,10 +50,6 @@ pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
 /// container.
 pub const SIDECAR_CONTROL_SOCKET: &str = "OPENSHELL_SIDECAR_CONTROL_SOCKET";
 
-/// TCP address the process supervisor waits for before starting when the
-/// network supervisor runs outside the agent process.
-pub const SUPERVISOR_READY_ADDR: &str = "OPENSHELL_SUPERVISOR_READY_ADDR";
-
 /// Address where an external network supervisor forwards gateway gRPC traffic.
 pub const GATEWAY_FORWARD_ADDR: &str = "OPENSHELL_GATEWAY_FORWARD_ADDR";
 

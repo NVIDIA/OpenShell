@@ -224,6 +224,8 @@ process_binary_aware_network_policy = true
 [openshell.drivers.kubernetes.proxy_pod]
 # UID used by the network supervisor pod. It must not match the sandbox UID.
 proxy_uid = 1337
+# Same-node workload/supervisor placement: disabled, preferred, or required.
+affinity = "disabled"
 ```
 
 ### Docker

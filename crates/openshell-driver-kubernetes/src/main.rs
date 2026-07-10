@@ -12,7 +12,7 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesProxyPodConfig,
-    KubernetesSidecarConfig, SupervisorSideloadMethod, SupervisorTopology,
+    KubernetesSidecarConfig, ProxyPodAffinity, SupervisorSideloadMethod, SupervisorTopology,
 };
 
 #[derive(Parser, Debug)]
@@ -107,6 +107,13 @@ struct Args {
     )]
     proxy_pod_proxy_uid: u32,
 
+    #[arg(
+        long = "proxy-pod-affinity",
+        env = "OPENSHELL_K8S_PROXY_POD_AFFINITY",
+        default_value = "disabled"
+    )]
+    proxy_pod_affinity: ProxyPodAffinity,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -157,6 +164,7 @@ async fn main() -> Result<()> {
         },
         proxy_pod: KubernetesProxyPodConfig {
             proxy_uid: args.proxy_pod_proxy_uid,
+            affinity: args.proxy_pod_affinity,
         },
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,

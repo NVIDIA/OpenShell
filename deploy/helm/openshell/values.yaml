@@ -67,6 +67,9 @@ supervisor:
     # -- UID for the network supervisor in proxy-pod topology. The configured
     # UID must not match the sandbox UID.
     proxyUid: 1337
+    # -- Same-node scheduling relationship between the workload pod and its
+    # paired proxy supervisor: disabled, preferred, or required.
+    affinity: disabled
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []
