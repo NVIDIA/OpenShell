@@ -95,6 +95,8 @@ enum ConfiguredProviderProfileSource {
     Builtin(BuiltinProviderProfileSource),
     User(UserProviderProfileSource),
     Interceptors(openshell_gateway_interceptors::GatewayInterceptorRuntime),
+    #[cfg(test)]
+    Static(ProviderProfileSnapshot),
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +139,21 @@ impl ProviderProfileSources {
             };
         }
         Self::with_default_sources()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_profiles(profiles: Vec<ProviderProfile>) -> Self {
+        Self {
+            sources: vec![ConfiguredProviderProfileSource::Static(
+                ProviderProfileSnapshot {
+                    source_id: "test".to_string(),
+                    revision: profile_snapshot_revision(&profiles),
+                    profiles,
+                    user_managed: false,
+                    allow_empty: false,
+                },
+            )],
+        }
     }
 
     pub async fn list_profiles(&self, store: &Store) -> Result<Vec<ProviderProfile>, Status> {
@@ -249,6 +266,10 @@ impl ProviderProfileSources {
                         ))
                     })?;
                     snapshots.extend(external.into_iter().map(interceptor_snapshot));
+                }
+                #[cfg(test)]
+                ConfiguredProviderProfileSource::Static(snapshot) => {
+                    snapshots.push(snapshot.clone());
                 }
             }
         }

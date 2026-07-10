@@ -192,6 +192,7 @@ pub(super) async fn list_provider_records(
         .collect())
 }
 
+#[cfg(test)]
 pub(super) async fn update_provider_record(
     store: &Store,
     provider: Provider,
@@ -2237,7 +2238,12 @@ pub(super) async fn handle_configure_provider_refresh(
                 expires_at_ms,
             )]),
         };
-        update_provider_record(state.store.as_ref(), updated).await?;
+        update_provider_record_with_catalog(
+            state.store.as_ref(),
+            &state.provider_profile_sources,
+            updated,
+        )
+        .await?;
     }
 
     Ok(Response::new(ConfigureProviderRefreshResponse {
@@ -2333,7 +2339,12 @@ pub(super) async fn handle_delete_provider_refresh(
                 0,
             )]),
         };
-        update_provider_record(state.store.as_ref(), updated).await?;
+        update_provider_record_with_catalog(
+            state.store.as_ref(),
+            &state.provider_profile_sources,
+            updated,
+        )
+        .await?;
     }
 
     Ok(Response::new(DeleteProviderRefreshResponse {
@@ -3813,6 +3824,138 @@ mod tests {
             !provider_after_delete
                 .credential_expires_at_ms
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
+        );
+    }
+
+    async fn state_with_authoritative_profiles_over_default_grants() -> Arc<ServerState> {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-a", "api.example.com", 443, "/v1/**").await;
+        import_token_grant_profile(&state, "grant-b", "api.example.com", 443, "/v1/**").await;
+        create_empty_token_grant_provider(store, "provider-a", "grant-a").await;
+        create_empty_token_grant_provider(store, "provider-b", "grant-b").await;
+        store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-authoritative-profiles-id".to_string(),
+                    name: "sandbox-authoritative-profiles".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut state = Arc::into_inner(state).expect("test server state should be uniquely owned");
+        state.provider_profile_sources = ProviderProfileSources::from_test_profiles(vec![
+            custom_profile("grant-a"),
+            custom_profile("grant-b"),
+        ]);
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_uses_authoritative_profile_sources_for_expiry_update() {
+        let state = state_with_authoritative_profiles_over_default_grants().await;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+
+        handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "provider-a".to_string(),
+                credential_key: "REFRESH_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: Some(expires_at_ms),
+            }),
+        )
+        .await
+        .expect("authoritative profiles should govern the provider expiry update");
+
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("provider-a")
+            .await
+            .unwrap()
+            .expect("provider-a");
+        assert_eq!(
+            provider.credential_expires_at_ms.get("REFRESH_TOKEN"),
+            Some(&expires_at_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_provider_refresh_uses_authoritative_profile_sources_for_expiry_update() {
+        let state = state_with_authoritative_profiles_over_default_grants().await;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+        let updated = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "provider-a".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+            }),
+            r#type: String::new(),
+            credentials: HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::from([("REFRESH_TOKEN".to_string(), expires_at_ms)]),
+        };
+        let provider = update_provider_record_with_catalog(
+            state.store.as_ref(),
+            &state.provider_profile_sources,
+            updated,
+        )
+        .await
+        .unwrap();
+        let refresh_state = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "REFRESH_TOKEN",
+            crate::provider_refresh::NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 0,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .unwrap();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &refresh_state)
+            .await
+            .unwrap();
+
+        handle_delete_provider_refresh(
+            &state,
+            Request::new(DeleteProviderRefreshRequest {
+                provider: "provider-a".to_string(),
+                credential_key: "REFRESH_TOKEN".to_string(),
+            }),
+        )
+        .await
+        .expect("authoritative profiles should govern the provider expiry update");
+
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("provider-a")
+            .await
+            .unwrap()
+            .expect("provider-a");
+        assert!(
+            !provider
+                .credential_expires_at_ms
+                .contains_key("REFRESH_TOKEN")
         );
     }
 
