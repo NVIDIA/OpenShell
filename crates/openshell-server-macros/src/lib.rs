@@ -59,6 +59,24 @@ enum AuthMode {
     Peer,
 }
 
+const EXPECTED_AUTH_MODES: &str = "`unauthenticated`, `sandbox`, `bearer`, `dual`, `peer`";
+
+impl AuthMode {
+    fn to_tokens(self) -> proc_macro2::TokenStream {
+        // Keep this exhaustive so adding an auth mode requires explicitly
+        // mapping it to the runtime authorization enum.
+        match self {
+            Self::Unauthenticated => {
+                quote! { crate::auth::method_authz::AuthMode::Unauthenticated }
+            }
+            Self::Sandbox => quote! { crate::auth::method_authz::AuthMode::Sandbox },
+            Self::Bearer => quote! { crate::auth::method_authz::AuthMode::Bearer },
+            Self::Dual => quote! { crate::auth::method_authz::AuthMode::Dual },
+            Self::Peer => quote! { crate::auth::method_authz::AuthMode::Peer },
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RoleLit {
     Admin,
@@ -116,6 +134,8 @@ impl RpcAuth {
             return Err(Error::new(span, "`#[rpc_auth]` requires `auth = \"...\"`"));
         };
 
+        // Keep this exhaustive so every new auth mode makes an explicit
+        // decision about whether Bearer scope and role metadata apply.
         match mode {
             AuthMode::Unauthenticated | AuthMode::Sandbox | AuthMode::Peer => {
                 if let Some(ref s) = scope {
@@ -160,9 +180,7 @@ fn parse_auth_mode(value: &LitStr) -> Result<AuthMode> {
         "peer" => Ok(AuthMode::Peer),
         other => Err(Error::new(
             value.span(),
-            format!(
-                "invalid auth mode `{other}`; expected one of `unauthenticated`, `sandbox`, `bearer`, `dual`, `peer`"
-            ),
+            format!("invalid auth mode `{other}`; expected one of {EXPECTED_AUTH_MODES}"),
         )),
     }
 }
@@ -283,17 +301,7 @@ fn expand(args: &AuthzArgs, item: &mut ItemImpl) -> Result<proc_macro2::TokenStr
         }
         seen_paths.push(method_path.clone());
 
-        let mode_tokens = match auth.mode {
-            AuthMode::Unauthenticated => {
-                quote! { crate::auth::method_authz::AuthMode::Unauthenticated }
-            }
-            AuthMode::Sandbox => {
-                quote! { crate::auth::method_authz::AuthMode::Sandbox }
-            }
-            AuthMode::Bearer => quote! { crate::auth::method_authz::AuthMode::Bearer },
-            AuthMode::Dual => quote! { crate::auth::method_authz::AuthMode::Dual },
-            AuthMode::Peer => quote! { crate::auth::method_authz::AuthMode::Peer },
-        };
+        let mode_tokens = auth.mode.to_tokens();
 
         let scope_tokens = match &auth.scope {
             Some(s) => quote! { ::core::option::Option::Some(#s) },
