@@ -5,7 +5,7 @@
 
 [test]
 description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python", "test:sbom", "test:install-sh", "test:packaging-assets", "test:docs-website"]
+depends = ["test:rust", "test:python", "test:sbom", "test:install-sh", "test:build-env", "test:packaging-assets", "test:docs-website"]
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"
@@ -21,6 +21,11 @@ hide = true
 ["test:install-sh"]
 description = "Run focused install.sh shell tests"
 run = "tasks/scripts/test-install-sh.sh"
+hide = true
+
+["test:build-env"]
+description = "Run build-env.sh helper shell tests"
+run = "tasks/scripts/test-build-env.sh"
 hide = true
 
 ["test:packaging-assets"]
