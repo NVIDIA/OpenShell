@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Short local names for the static release platforms; toolchain selection
+# happens via the platforms' @zig_sdk//libc:musl constraint.
+platform(
+    name = "linux_amd64_musl",
+    parents = ["@zig_sdk//libc_aware/platform:linux_amd64_musl"],
+)
+
+platform(
+    name = "linux_arm64_musl",
+    parents = ["@zig_sdk//libc_aware/platform:linux_arm64_musl"],
+)
