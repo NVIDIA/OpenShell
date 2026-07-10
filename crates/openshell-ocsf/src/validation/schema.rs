@@ -4,38 +4,70 @@
 //! Schema loading and validation helpers.
 
 use serde_json::Value;
-use std::fs;
 
 /// Load a vendored OCSF class schema by name.
 ///
 /// # Panics
 ///
-/// Panics if the schema file is missing or contains invalid JSON.
+/// Panics if the schema name is unknown or the file contains invalid JSON.
 #[must_use]
 pub fn load_class_schema(class: &str) -> Value {
-    let path = format!(
-        "{}/schemas/ocsf/v1.7.0/classes/{class}.json",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let data =
-        fs::read_to_string(&path).unwrap_or_else(|_| panic!("Missing vendored schema: {path}"));
-    serde_json::from_str(&data).unwrap_or_else(|e| panic!("Invalid JSON in {path}: {e}"))
+    let data = match class {
+        "application_lifecycle" => {
+            include_str!("../../schemas/ocsf/v1.7.0/classes/application_lifecycle.json")
+        }
+        "base_event" => include_str!("../../schemas/ocsf/v1.7.0/classes/base_event.json"),
+        "detection_finding" => {
+            include_str!("../../schemas/ocsf/v1.7.0/classes/detection_finding.json")
+        }
+        "device_config_state_change" => {
+            include_str!("../../schemas/ocsf/v1.7.0/classes/device_config_state_change.json")
+        }
+        "http_activity" => include_str!("../../schemas/ocsf/v1.7.0/classes/http_activity.json"),
+        "network_activity" => {
+            include_str!("../../schemas/ocsf/v1.7.0/classes/network_activity.json")
+        }
+        "process_activity" => {
+            include_str!("../../schemas/ocsf/v1.7.0/classes/process_activity.json")
+        }
+        "ssh_activity" => include_str!("../../schemas/ocsf/v1.7.0/classes/ssh_activity.json"),
+        _ => panic!("Unknown OCSF class schema: {class}"),
+    };
+    serde_json::from_str(data).unwrap_or_else(|e| panic!("Invalid JSON in schema {class}: {e}"))
 }
 
 /// Load a vendored OCSF object schema by name.
 ///
 /// # Panics
 ///
-/// Panics if the schema file is missing or contains invalid JSON.
+/// Panics if the schema name is unknown or the file contains invalid JSON.
 #[must_use]
 pub fn load_object_schema(object: &str) -> Value {
-    let path = format!(
-        "{}/schemas/ocsf/v1.7.0/objects/{object}.json",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let data =
-        fs::read_to_string(&path).unwrap_or_else(|_| panic!("Missing vendored schema: {path}"));
-    serde_json::from_str(&data).unwrap_or_else(|e| panic!("Invalid JSON in {path}: {e}"))
+    let data = match object {
+        "actor" => include_str!("../../schemas/ocsf/v1.7.0/objects/actor.json"),
+        "attack" => include_str!("../../schemas/ocsf/v1.7.0/objects/attack.json"),
+        "connection_info" => {
+            include_str!("../../schemas/ocsf/v1.7.0/objects/connection_info.json")
+        }
+        "container" => include_str!("../../schemas/ocsf/v1.7.0/objects/container.json"),
+        "device" => include_str!("../../schemas/ocsf/v1.7.0/objects/device.json"),
+        "evidences" => include_str!("../../schemas/ocsf/v1.7.0/objects/evidences.json"),
+        "finding_info" => include_str!("../../schemas/ocsf/v1.7.0/objects/finding_info.json"),
+        "firewall_rule" => include_str!("../../schemas/ocsf/v1.7.0/objects/firewall_rule.json"),
+        "http_request" => include_str!("../../schemas/ocsf/v1.7.0/objects/http_request.json"),
+        "http_response" => include_str!("../../schemas/ocsf/v1.7.0/objects/http_response.json"),
+        "metadata" => include_str!("../../schemas/ocsf/v1.7.0/objects/metadata.json"),
+        "network_endpoint" => {
+            include_str!("../../schemas/ocsf/v1.7.0/objects/network_endpoint.json")
+        }
+        "network_proxy" => include_str!("../../schemas/ocsf/v1.7.0/objects/network_proxy.json"),
+        "process" => include_str!("../../schemas/ocsf/v1.7.0/objects/process.json"),
+        "product" => include_str!("../../schemas/ocsf/v1.7.0/objects/product.json"),
+        "remediation" => include_str!("../../schemas/ocsf/v1.7.0/objects/remediation.json"),
+        "url" => include_str!("../../schemas/ocsf/v1.7.0/objects/url.json"),
+        _ => panic!("Unknown OCSF object schema: {object}"),
+    };
+    serde_json::from_str(data).unwrap_or_else(|e| panic!("Invalid JSON in schema {object}: {e}"))
 }
 
 /// Validate that all required fields from the schema are present in the event JSON.
