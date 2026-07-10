@@ -7,18 +7,6 @@ description: Launch and supervise OpenShell gator agents. Use when starting gato
 
 Launch and supervise the repository's headless gator sandbox agent through OpenShell. This skill covers the operator workflow around `scripts/agents/run.sh`; the in-sandbox review and state-machine policy remains the `gator-gate` skill baked into the gator payload.
 
-## When To Use
-
-Use this skill when the user wants to:
-
-- Start gator on a GitHub issue or PR.
-- Keep a PR under supervised gator watch.
-- Verify the OpenShell gateway and local prerequisites before launching gator.
-- Build or rebuild the gator sandbox image through the launcher.
-- Inspect gator logs, active gator sandboxes, or stuck supervised cycles.
-- Restart a gator with an updated payload after changing gator prompt, skill, policy, wrapper, runtime, or Dockerfile files.
-- Launch a model experiment with `CODEX_MODEL=...` without changing `scripts/agents/gator/agent.yaml`.
-
 For gator's PR/issue validation policy, load `gator-gate` inside the launched sandbox. For generic sandbox CLI usage, use `openshell-cli`. For unhealthy gateways or sandbox startup failures, use `debug-openshell-cluster` after the launch preflight identifies a gateway/runtime problem.
 
 ## Non-Negotiable Rules
