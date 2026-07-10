@@ -29,16 +29,21 @@ const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
 #[cfg(test)]
 async fn max_middleware_body_bytes() -> usize {
-    let chain = openshell_supervisor_middleware::ChainRunner::default()
-        .describe_chain(&[openshell_supervisor_middleware::ChainEntry {
-            name: "test".into(),
-            implementation: openshell_supervisor_middleware::BUILTIN_SECRETS.into(),
-            order: 0,
-            config: prost_types::Struct::default(),
-            on_error: openshell_supervisor_middleware::OnError::FailClosed,
-        }])
-        .await
-        .expect("describe built-in middleware");
+    let chain = openshell_supervisor_middleware::ChainRunner::new(
+        openshell_supervisor_middleware_builtins::services()
+            .into_iter()
+            .next()
+            .expect("built-in middleware service"),
+    )
+    .describe_chain(&[openshell_supervisor_middleware::ChainEntry {
+        name: "test".into(),
+        implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+        order: 0,
+        config: prost_types::Struct::default(),
+        on_error: openshell_supervisor_middleware::OnError::FailClosed,
+    }])
+    .await
+    .expect("describe built-in middleware");
     chain[0].max_body_bytes()
 }
 const RELAY_BUF_SIZE: usize = 8192;

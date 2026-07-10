@@ -3772,6 +3772,7 @@ version = "0.0.0"
 dependencies = [
  "miette",
  "openshell-core",
+ "prost-types",
  "serde",
  "serde_json",
  "serde_yml",
@@ -3832,8 +3833,10 @@ dependencies = [
  "openshell-ocsf",
  "openshell-policy",
  "openshell-supervisor-middleware",
+ "openshell-supervisor-middleware-builtins",
  "openshell-supervisor-network",
  "openshell-supervisor-process",
+ "prost-types",
  "rustls",
  "serde_json",
  "temp-env",
@@ -3887,6 +3890,7 @@ dependencies = [
  "openshell-router",
  "openshell-server-macros",
  "openshell-supervisor-middleware",
+ "openshell-supervisor-middleware-builtins",
  "petname",
  "pin-project-lite",
  "prost",
@@ -3935,10 +3939,24 @@ version = "0.0.0"
 dependencies = [
  "miette",
  "openshell-core",
+ "openshell-supervisor-middleware-builtins",
  "prost-types",
- "regex",
  "tokio",
  "tokio-stream",
+ "tonic",
+]
+
+[[package]]
+name = "openshell-supervisor-middleware-builtins"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "openshell-core",
+ "prost-types",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
  "tonic",
 ]
 
@@ -3965,6 +3983,7 @@ dependencies = [
  "openshell-policy",
  "openshell-router",
  "openshell-supervisor-middleware",
+ "openshell-supervisor-middleware-builtins",
  "prost-types",
  "rcgen",
  "regorus",

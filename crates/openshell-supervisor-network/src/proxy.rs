@@ -4933,7 +4933,12 @@ network_policies:
             dynamic_credentials: None,
             token_grant_resolver: None,
         };
-        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let runner = openshell_supervisor_middleware::ChainRunner::new(
+            openshell_supervisor_middleware_builtins::services()
+                .into_iter()
+                .next()
+                .expect("built-in middleware service"),
+        );
         let pipeline = ForwardMiddlewarePipeline {
             ctx: &ctx,
             scheme: "http",
@@ -4947,7 +4952,7 @@ network_policies:
         };
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "redactor".into(),
-            implementation: openshell_supervisor_middleware::BUILTIN_SECRETS.into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,

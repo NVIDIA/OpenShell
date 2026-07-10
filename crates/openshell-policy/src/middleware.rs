@@ -127,6 +127,18 @@ pub fn from_proto(middlewares: &[NetworkMiddlewareConfig]) -> Vec<NetworkMiddlew
 /// Validate middleware configuration from the supervisor's runtime policy
 /// JSON through the same typed validator used for protobuf policies.
 pub fn validate_json(data: &serde_json::Value) -> Result<Vec<PolicyViolation>, String> {
+    validate_json_with_config(data, |_implementation, _config| Ok(()))
+}
+
+/// Validate middleware policy structure and delegate implementation-owned
+/// configuration to the supplied registry or catalog.
+pub fn validate_json_with_config<F>(
+    data: &serde_json::Value,
+    validate_config: F,
+) -> Result<Vec<PolicyViolation>, String>
+where
+    F: Fn(&str, &prost_types::Struct) -> Result<(), String>,
+{
     let definition: MiddlewareValidationPolicyDef = serde_json::from_value(data.clone())
         .map_err(|error| format!("failed to parse network middleware policy: {error}"))?;
     let network_middlewares = into_proto(definition.network_middlewares)
@@ -151,11 +163,22 @@ pub fn validate_json(data: &serde_json::Value) -> Result<Vec<PolicyViolation>, S
             (key, rule)
         })
         .collect();
-    Ok(validate(&SandboxPolicy {
+    let policy = SandboxPolicy {
         network_middlewares,
         network_policies,
         ..Default::default()
-    }))
+    };
+    let mut violations = validate(&policy);
+    for middleware in &policy.network_middlewares {
+        let config = middleware.config.clone().unwrap_or_default();
+        if let Err(reason) = validate_config(&middleware.middleware, &config) {
+            violations.push(PolicyViolation::InvalidMiddlewareConfig {
+                name: middleware.name.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(violations)
 }
 
 pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
@@ -178,13 +201,6 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
             violations.push(PolicyViolation::InvalidMiddlewareConfig {
                 name: middleware.name.clone(),
                 reason: "implementation must not be empty".to_string(),
-            });
-        } else if middleware.middleware.starts_with("openshell/")
-            && middleware.middleware != openshell_core::middleware::BUILTIN_SECRETS
-        {
-            violations.push(PolicyViolation::InvalidMiddlewareConfig {
-                name: middleware.name.clone(),
-                reason: format!("unsupported built-in '{}'", middleware.middleware),
             });
         }
 
@@ -226,18 +242,6 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
         } else {
             None
         };
-
-        if middleware.middleware == openshell_core::middleware::BUILTIN_SECRETS {
-            let config = middleware.config.clone().unwrap_or_default();
-            if let Err(error) =
-                openshell_core::middleware::validate_builtin_config(&middleware.middleware, &config)
-            {
-                violations.push(PolicyViolation::InvalidBuiltinMiddlewareConfig {
-                    name: middleware.name.clone(),
-                    reason: error.to_string(),
-                });
-            }
-        }
 
         for (key, rule) in &policy.network_policies {
             let policy_name = if rule.name.is_empty() {

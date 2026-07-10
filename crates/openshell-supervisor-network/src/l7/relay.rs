@@ -2203,6 +2203,15 @@ mod tests {
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
+    fn install_builtin_middleware(engine: &OpaEngine) {
+        engine.set_middleware_runner_for_tests(openshell_supervisor_middleware::ChainRunner::new(
+            openshell_supervisor_middleware_builtins::services()
+                .into_iter()
+                .next()
+                .expect("built-in middleware service"),
+        ));
+    }
+
     fn rest_token_grant_relay_context(
         resolver_response: std::result::Result<&str, &str>,
     ) -> (
@@ -2309,6 +2318,7 @@ network_policies:
 "#
         );
         let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+        install_builtin_middleware(&engine);
         let input = NetworkInput {
             host: "api.example.test".into(),
             port: 8080,
@@ -3146,7 +3156,7 @@ network_policies:
 
         let resolved = ChainEntry {
             name: "redact".into(),
-            implementation: openshell_supervisor_middleware::BUILTIN_SECRETS.into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -3161,10 +3171,15 @@ network_policies:
 
         // A single unresolved (0-limit) entry must not drag the chain limit to
         // zero: the buffer limit reflects only the resolved built-in.
-        let mixed = ChainRunner::default()
-            .describe_chain(&[resolved, unresolved.clone()])
-            .await
-            .expect("describe mixed chain");
+        let mixed = ChainRunner::new(
+            openshell_supervisor_middleware_builtins::services()
+                .into_iter()
+                .next()
+                .expect("built-in middleware service"),
+        )
+        .describe_chain(&[resolved, unresolved.clone()])
+        .await
+        .expect("describe mixed chain");
         assert_eq!(middleware_chain_body_limit(&mixed), Some(256 * 1024));
 
         // When nothing resolves, there is no body limit and the caller skips
@@ -4057,6 +4072,7 @@ network_policies:
       - { path: /usr/bin/curl }
 "#;
         let engine = Arc::new(OpaEngine::from_strings(TEST_POLICY, data).unwrap());
+        install_builtin_middleware(engine.as_ref());
         let generation_guard = engine
             .generation_guard(engine.current_generation())
             .unwrap();

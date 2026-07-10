@@ -51,6 +51,7 @@ webpki-roots = { workspace = true }
 
 [dev-dependencies]
 openshell-core = { path = "../openshell-core", features = ["test-helpers"] }
+openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 tempfile = "3"
 tonic = { workspace = true }
 temp-env = "0.3"

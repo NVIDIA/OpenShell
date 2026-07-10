@@ -24,7 +24,6 @@ pub mod host_pattern;
 pub mod image;
 pub mod inference;
 pub mod metadata;
-pub mod middleware;
 pub mod net;
 pub mod paths;
 pub mod policy;

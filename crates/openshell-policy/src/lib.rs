@@ -35,6 +35,7 @@ pub use merge::{
 };
 pub use middleware::middleware_host_matches;
 pub use middleware::validate_json as validate_network_middleware_json;
+pub use middleware::validate_json_with_config as validate_network_middleware_json_with_config;
 
 // ---------------------------------------------------------------------------
 // YAML serde types (canonical — used for both parsing and serialization)
@@ -1133,8 +1134,6 @@ pub enum PolicyViolation {
     },
     /// `credential_signing` and `request_body_credential_rewrite` are both set.
     CredentialSigningWithBodyRewrite { policy_name: String, host: String },
-    /// A built-in middleware configuration is invalid.
-    InvalidBuiltinMiddlewareConfig { name: String, reason: String },
     /// A middleware configuration is structurally invalid.
     InvalidMiddlewareConfig { name: String, reason: String },
     /// Middleware configuration names must be unique.
@@ -1209,8 +1208,7 @@ impl fmt::Display for PolicyViolation {
                      and request_body_credential_rewrite set; these options are mutually exclusive"
                 )
             }
-            Self::InvalidBuiltinMiddlewareConfig { name, reason }
-            | Self::InvalidMiddlewareConfig { name, reason } => {
+            Self::InvalidMiddlewareConfig { name, reason } => {
                 write!(f, "middleware config '{name}' is invalid: {reason}")
             }
             Self::DuplicateMiddlewareConfigName { name } => {
@@ -1799,6 +1797,45 @@ network_policies:
     }
 
     #[test]
+    fn structural_validation_defers_implementation_owned_config() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("future", "openshell/future");
+        middleware.config = Some(
+            openshell_core::proto_struct::json_object_to_struct(
+                std::iter::once(("implementation_field".into(), serde_json::json!(42))).collect(),
+            )
+            .unwrap(),
+        );
+        policy.network_middlewares.push(middleware);
+
+        validate_sandbox_policy(&policy)
+            .expect("generic policy validation must not select installed implementations");
+    }
+
+    #[test]
+    fn json_validation_delegates_implementation_owned_config() {
+        let data = serde_json::json!({
+            "network_middlewares": [{
+                "name": "future",
+                "middleware": "openshell/future",
+                "config": {"implementation_field": 42},
+                "endpoints": {"include": ["api.example.com"]}
+            }]
+        });
+
+        let violations =
+            validate_network_middleware_json_with_config(&data, |implementation, _config| {
+                Err(format!("{implementation} is not installed"))
+            })
+            .expect("parse middleware policy");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::InvalidMiddlewareConfig { name, reason }
+                if name == "future" && reason.contains("not installed")
+        )));
+    }
+
+    #[test]
     fn validate_rejects_root_run_as_user() {
         let mut policy = restrictive_default_policy();
         policy.process = Some(ProcessPolicy {
@@ -1827,27 +1864,6 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_invalid_builtin_middleware_config() {
-        let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redact-secrets", "openshell/secrets");
-        middleware.config = Some(
-            openshell_core::proto_struct::json_object_to_struct(
-                std::iter::once(("secrets".into(), serde_json::Value::String("allow".into())))
-                    .collect(),
-            )
-            .unwrap(),
-        );
-        policy.network_middlewares.push(middleware);
-
-        let violations = validate_sandbox_policy(&policy).expect_err("invalid config");
-        assert!(violations.iter().any(|violation| matches!(
-            violation,
-            PolicyViolation::InvalidBuiltinMiddlewareConfig { name, .. }
-                if name == "redact-secrets"
-        )));
-    }
-
-    #[test]
     fn validate_rejects_invalid_middleware_control_fields() {
         let cases = [
             (
@@ -1857,10 +1873,6 @@ network_policies:
             (
                 middleware_config("redactor", ""),
                 "implementation must not be empty",
-            ),
-            (
-                middleware_config("redactor", "openshell/unknown"),
-                "unsupported built-in",
             ),
             (
                 {

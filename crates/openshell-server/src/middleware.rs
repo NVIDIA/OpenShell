@@ -40,4 +40,37 @@ mod tests {
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(error.message().contains("not registered"));
     }
+
+    #[tokio::test]
+    async fn invalid_builtin_config_is_rejected_by_implementation() {
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        let policy = SandboxPolicy {
+            network_middlewares: vec![NetworkMiddlewareConfig {
+                name: "redactor".into(),
+                middleware: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+                config: Some(prost_types::Struct {
+                    fields: std::iter::once((
+                        "secrets".into(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::StringValue("allow".into())),
+                        },
+                    ))
+                    .collect(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = validate_policy(&registry, &policy)
+            .await
+            .expect_err("invalid built-in config must fail admission");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("supports only secrets: redact"));
+    }
 }

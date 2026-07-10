@@ -26,6 +26,11 @@ use std::sync::{
 /// passthroughs. They reference `data.sandbox.*` for policy data.
 const BAKED_POLICY_RULES: &str = include_str!("../data/sandbox-policy.rego");
 
+/// Implementation-owned middleware config validation supplied by the active
+/// in-process catalog for local policy files.
+pub type MiddlewareConfigValidator =
+    dyn Fn(&str, &prost_types::Struct) -> Result<(), String> + Send + Sync;
+
 /// Result of evaluating a network access request against OPA policy.
 pub struct PolicyDecision {
     pub allowed: bool,
@@ -156,6 +161,16 @@ impl OpaEngine {
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
     pub fn from_files(policy_path: &Path, data_path: &Path) -> Result<Self> {
+        Self::from_files_with_middleware_config(policy_path, data_path, None)
+    }
+
+    /// Load local policy files and validate implementation-owned middleware
+    /// config through the catalog installed by the supervisor.
+    pub fn from_files_with_middleware_config(
+        policy_path: &Path,
+        data_path: &Path,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
         let yaml_str = std::fs::read_to_string(data_path).map_err(|e| {
             miette::miette!("failed to read YAML data from {}: {e}", data_path.display())
         })?;
@@ -163,7 +178,7 @@ impl OpaEngine {
         engine
             .add_policy_from_file(policy_path)
             .map_err(|e| miette::miette!("{e}"))?;
-        let data_json = preprocess_yaml_data(&yaml_str)?;
+        let data_json = preprocess_yaml_data(&yaml_str, validate_middleware_config)?;
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
@@ -178,11 +193,19 @@ impl OpaEngine {
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
     pub fn from_strings(policy: &str, data_yaml: &str) -> Result<Self> {
+        Self::from_strings_with_middleware_config(policy, data_yaml, None)
+    }
+
+    pub fn from_strings_with_middleware_config(
+        policy: &str,
+        data_yaml: &str,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
         let mut engine = regorus::Engine::new();
         engine
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|e| miette::miette!("{e}"))?;
-        let data_json = preprocess_yaml_data(data_yaml)?;
+        let data_json = preprocess_yaml_data(data_yaml, validate_middleware_config)?;
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
@@ -856,7 +879,10 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
 }
 
 /// Preprocess YAML policy data: parse, normalize, validate, expand access presets, return JSON.
-fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
+fn preprocess_yaml_data(
+    yaml_str: &str,
+    validate_middleware_config: Option<&MiddlewareConfigValidator>,
+) -> Result<String> {
     let mut data: serde_json::Value = serde_yml::from_str(yaml_str)
         .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
 
@@ -871,7 +897,13 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
     }
 
     // Validate BEFORE expanding presets (catches user errors like rules+access)
-    let middleware_errors = openshell_policy::validate_network_middleware_json(&data)
+    let middleware_errors = validate_middleware_config
+        .map_or_else(
+            || openshell_policy::validate_network_middleware_json(&data),
+            |validate| {
+                openshell_policy::validate_network_middleware_json_with_config(&data, validate)
+            },
+        )
         .map_err(|error| miette::miette!(error))?;
     if !middleware_errors.is_empty() {
         return Err(miette::miette!(
@@ -6808,17 +6840,6 @@ network_middlewares:
                 "duplicate middleware config 'redactor'",
             ),
             (
-                "reserved builtin",
-                r#"
-network_middlewares:
-  - name: sigv4
-    middleware: openshell/sigv4
-    endpoints:
-      include: ["api.example.com"]
-"#,
-                "unsupported built-in",
-            ),
-            (
                 "missing selector",
                 r#"
 network_middlewares:
@@ -6886,6 +6907,50 @@ network_policies:
             assert!(
                 err.contains(expected),
                 "{name}: expected {expected:?} in {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn middleware_catalog_validation_rejects_unknown_or_invalid_builtins() {
+        let validate = |implementation: &str, config: &prost_types::Struct| {
+            openshell_supervisor_middleware_builtins::validate_config(implementation, config)
+                .map_err(|error| error.to_string())
+        };
+        for (name, data, expected) in [
+            (
+                "unknown built-in",
+                r#"
+network_middlewares:
+  - name: unknown
+    middleware: openshell/unknown
+    endpoints:
+      include: ["api.example.com"]
+"#,
+                "not a registered OpenShell built-in",
+            ),
+            (
+                "invalid secrets config",
+                r#"
+network_middlewares:
+  - name: redactor
+    middleware: openshell/secrets
+    config:
+      secrets: allow
+    endpoints:
+      include: ["api.example.com"]
+"#,
+                "supports only secrets: redact",
+            ),
+        ] {
+            let error =
+                OpaEngine::from_strings_with_middleware_config(TEST_POLICY, data, Some(&validate))
+                    .err()
+                    .unwrap_or_else(|| panic!("{name}: expected catalog validation failure"))
+                    .to_string();
+            assert!(
+                error.contains(expected),
+                "{name}: expected {expected:?} in {error:?}"
             );
         }
     }

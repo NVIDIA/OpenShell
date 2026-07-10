@@ -73,17 +73,23 @@ values with stable name tie-breaking, and the gRPC contract represents operation
 and phases as enums. Built-ins run in-process;
 operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
-service capabilities and policy-owned config before delivery. Supervisors keep
-the last-known-good service registry when a live config reload fails. Built-in
-middleware identifiers live in `openshell-core::middleware`; reusable compiled
-DNS host patterns and selectors live in the neutral
-`openshell-core::host_pattern` module. Structural policy validation lives in
-`openshell-policy`; the supervisor's local-file path projects its JSON into the
-same typed validator instead of maintaining an OPA-specific copy. Rego exposes
-the middleware list as policy data, but Rust performs selector validation,
-overlap detection, matching, and chain ordering. The policy and runtime also
-share the core JSON/protobuf adapter for middleware configuration, keeping
-serialization consistent across that boundary.
+service capabilities and implementation-owned config before delivery.
+Supervisors keep the last-known-good service registry when a live config reload
+fails. The generic registry and chain runner live in
+`openshell-supervisor-middleware`;
+first-party implementations and their config schemas live in
+`openshell-supervisor-middleware-builtins`. The gateway and supervisor inject
+those services explicitly and discover their binding IDs through the same
+`Describe` contract used by external services. Reusable compiled DNS host
+patterns and selectors remain in `openshell-core::host_pattern`.
+
+`openshell-policy` validates policy-owned middleware structure without knowing
+which implementations are installed. The active middleware registry validates
+implementation-owned config before gateway admission. The supervisor's
+local-file path supplies its built-in catalog to the same JSON projection so it
+retains early config validation. Rego exposes the middleware list as policy
+data, but Rust performs selector validation, overlap detection, matching, chain
+ordering, implementation discovery, and config validation.
 
 The Rust HTTP pipeline makes transformed-body handling explicit for every
 middleware invocation: body-independent protocols select a no-recheck mode,

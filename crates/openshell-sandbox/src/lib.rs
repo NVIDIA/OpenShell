@@ -1388,10 +1388,22 @@ async fn load_policy(
                 "Loading OPA policy engine from local files [rules:{policy_file} data:{data_file}]"
             ))
             .build());
-        let engine = OpaEngine::from_files(
+        let validate_middleware_config = |implementation: &str, config: &prost_types::Struct| {
+            openshell_supervisor_middleware_builtins::validate_config(implementation, config)
+                .map_err(|error| error.to_string())
+        };
+        let engine = OpaEngine::from_files_with_middleware_config(
             std::path::Path::new(policy_file),
             std::path::Path::new(data_file),
+            Some(&validate_middleware_config),
         )?;
+        let middleware_registry =
+            openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+                openshell_supervisor_middleware_builtins::services(),
+                Vec::new(),
+            )
+            .await?;
+        engine.replace_middleware_registry(middleware_registry)?;
         let config = engine.query_sandbox_config()?;
         let mut policy = SandboxPolicy {
             version: 1,
@@ -1539,6 +1551,7 @@ async fn load_policy(
         let middleware_services = snapshot.supervisor_middleware_services.clone();
         let middleware_registry_status = match grpc_retry("Middleware connect", || {
             openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+                openshell_supervisor_middleware_builtins::services(),
                 middleware_services.clone(),
             )
         })
@@ -2009,6 +2022,7 @@ async fn reconcile_middleware_registry(
     }
 
     match openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+        openshell_supervisor_middleware_builtins::services(),
         desired_services.to_vec(),
     )
     .await

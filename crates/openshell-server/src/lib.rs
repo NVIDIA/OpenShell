@@ -241,9 +241,12 @@ pub(crate) async fn run_server(
         })
         .unwrap_or_default();
     let middleware_registry = Arc::new(
-        MiddlewareRegistry::connect_services(middleware_registrations)
-            .await
-            .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
+        MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            middleware_registrations,
+        )
+        .await
+        .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
     );
 
     let store = Arc::new(Store::connect(database_url).await?);
