@@ -2891,6 +2891,11 @@ pub async fn service_forward_tcp(
                 let (socket, peer) = accepted
                     .into_diagnostic()
                     .wrap_err("failed to accept local forward connection")?;
+                // Forwarded request/response bytes are relayed in small frames;
+                // Nagle's algorithm would add per-write latency.
+                if let Err(err) = socket.set_nodelay(true) {
+                    tracing::debug!(peer = %peer, error = %err, "failed to set TCP_NODELAY");
+                }
                 let mut client = client.clone();
                 let sandbox_id = sandbox_id.clone();
                 let target_host = target_host.to_string();

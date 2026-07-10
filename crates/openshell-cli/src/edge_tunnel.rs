@@ -101,6 +101,11 @@ async fn accept_loop(listener: TcpListener, config: Arc<TunnelConfig>) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 debug!(peer = %peer, "accepted local tunnel connection");
+                // Small gRPC frames must flush immediately; Nagle's algorithm
+                // otherwise adds per-write latency on this loopback hop.
+                if let Err(e) = stream.set_nodelay(true) {
+                    debug!(peer = %peer, error = %e, "failed to set TCP_NODELAY");
+                }
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(stream, &config).await {
@@ -173,6 +178,21 @@ async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream
     let (ws_stream, response) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|e| miette::miette!("WebSocket connect failed: {e}"))?;
+
+    // Disable Nagle's algorithm on the WebSocket's underlying TCP stream:
+    // tunneled gRPC frames are small and latency-sensitive.
+    let tcp = match ws_stream.get_ref() {
+        MaybeTlsStream::Plain(tcp) => Some(tcp),
+        MaybeTlsStream::Rustls(tls) => Some(tls.get_ref().0),
+        _ => None,
+    };
+    if let Some(tcp) = tcp {
+        if let Err(e) = tcp.set_nodelay(true) {
+            debug!(error = %e, "failed to set TCP_NODELAY on WebSocket stream");
+        }
+    } else {
+        debug!("unknown WebSocket stream variant; skipping TCP_NODELAY");
+    }
 
     debug!(
         status = %response.status(),
