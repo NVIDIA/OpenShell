@@ -169,15 +169,6 @@ pub async fn run_sandbox(
     } else {
         None
     };
-    let supervisor_ready_addr = supervisor_ready_addr();
-    if process_enabled
-        && !network_enabled
-        && proxy_pod_network_enforcement
-        && let Some(addr) = supervisor_ready_addr.as_deref()
-    {
-        wait_for_supervisor_ready_addr(addr).await?;
-    }
-
     // Extension credentials are owned by this supervisor and shared by every
     // gateway connection it opens, so the middleware registry's bearer slots
     // and the policy poll loop that rotates them stay the same objects.
@@ -1068,30 +1059,6 @@ fn sidecar_control_socket() -> Option<std::path::PathBuf> {
         .ok()
         .filter(|path| !path.is_empty())
         .map(std::path::PathBuf::from)
-}
-
-fn supervisor_ready_addr() -> Option<String> {
-    std::env::var(openshell_core::sandbox_env::SUPERVISOR_READY_ADDR)
-        .ok()
-        .filter(|value| !value.is_empty())
-}
-
-async fn wait_for_supervisor_ready_addr(addr: &str) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(SIDECAR_READY_TIMEOUT_SECS);
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(_) => {
-                info!(addr, "Network supervisor TCP endpoint is ready");
-                return Ok(());
-            }
-            Err(err) if tokio::time::Instant::now() >= deadline => {
-                return Err(miette::miette!(
-                    "timed out waiting for network supervisor TCP endpoint {addr}: {err}"
-                ));
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
-        }
-    }
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

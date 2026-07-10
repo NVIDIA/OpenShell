@@ -7,8 +7,8 @@ use super::AppArmorProfile;
 use crate::config::{
     DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
     DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, OperatorNamespaceAllowlist,
-    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, validate_managed_namespace_name,
+    ProxyPodAffinity, SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
+    is_dns_1123_label, managed_namespace, validate_managed_namespace_name,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::apps::v1::Deployment;
@@ -1425,6 +1425,7 @@ impl KubernetesComputeDriver {
             proxy_auth_secret_key: self.config.proxy_auth_secret_key.as_deref(),
             proxy_auth_allow_insecure: self.config.proxy_auth_allow_insecure == Some(true),
             proxy_connect_by_hostname: self.config.proxy_connect_by_hostname == Some(true),
+            proxy_pod_affinity: self.config.proxy_pod.affinity,
             namespace: &self.config.namespace,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
@@ -2576,7 +2577,6 @@ const PROXY_POD_NETWORK_ENFORCEMENT_MODE: &str = "proxy-pod";
 const PROXY_POD_CA_SECRET_MOUNT_PATH: &str = "/var/run/openshell-proxy-ca";
 const PROXY_POD_CA_CERT_FILE: &str = "openshell-ca.pem";
 const PROXY_POD_CA_KEY_FILE: &str = "openshell-ca-key.pem";
-const PROXY_POD_SSH_SOCKET_FILE: &str = "/tmp/openshell/ssh.sock";
 
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
@@ -2868,22 +2868,6 @@ fn sidecar_tls_volume_mount() -> serde_json::Value {
     })
 }
 
-fn gateway_tls_server_name(grpc_endpoint: &str) -> Option<String> {
-    let rest = grpc_endpoint.strip_prefix("https://")?;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.is_empty() {
-        return None;
-    }
-    if let Some(bracketed) = authority.strip_prefix('[') {
-        return bracketed.split(']').next().map(str::to_string);
-    }
-    authority
-        .split(':')
-        .next()
-        .filter(|host| !host.is_empty())
-        .map(str::to_string)
-}
-
 #[derive(Debug, Clone)]
 struct ProxyPodResourceNames {
     supervisor_deployment: String,
@@ -2941,16 +2925,6 @@ fn dns_label_name(prefix: &str, name: &str) -> String {
 
 fn proxy_pod_service_dns(service_name: &str, namespace: &str) -> String {
     format!("{service_name}.{namespace}.svc.cluster.local")
-}
-
-fn proxy_pod_process_gateway_endpoint(service_dns: &str, grpc_endpoint: &str) -> String {
-    if grpc_endpoint.is_empty() {
-        String::new()
-    } else if grpc_endpoint.starts_with("https://") {
-        format!("https://{service_dns}:{PROXY_POD_GATEWAY_FORWARD_PORT}")
-    } else {
-        format!("http://{service_dns}:{PROXY_POD_GATEWAY_FORWARD_PORT}")
-    }
 }
 
 fn proxy_pod_proxy_url(service_dns: &str) -> String {
@@ -3408,10 +3382,18 @@ fn proxy_pod_ca_init_container(
 fn apply_proxy_pod_affinity(
     spec: &mut serde_json::Map<String, serde_json::Value>,
     sandbox_id: &str,
+    mode: ProxyPodAffinity,
 ) {
-    if sandbox_id.is_empty() {
+    if sandbox_id.is_empty() || mode == ProxyPodAffinity::Disabled {
         return;
     }
+
+    let term = serde_json::json!({
+        "labelSelector": {
+            "matchLabels": proxy_pod_match_labels(sandbox_id, SANDBOX_ROLE_SUPERVISOR)
+        },
+        "topologyKey": "kubernetes.io/hostname"
+    });
 
     let affinity = spec
         .entry("affinity".to_string())
@@ -3431,19 +3413,33 @@ fn apply_proxy_pod_affinity(
     let pod_affinity = pod_affinity
         .as_object_mut()
         .expect("podAffinity was converted to object");
-    let required = pod_affinity
-        .entry("requiredDuringSchedulingIgnoredDuringExecution".to_string())
-        .or_insert_with(|| serde_json::json!([]));
-    if !required.is_array() {
-        *required = serde_json::json!([]);
-    }
-    if let Some(required) = required.as_array_mut() {
-        required.push(serde_json::json!({
-            "labelSelector": {
-                "matchLabels": proxy_pod_match_labels(sandbox_id, SANDBOX_ROLE_SUPERVISOR)
-            },
-            "topologyKey": "kubernetes.io/hostname"
-        }));
+    match mode {
+        ProxyPodAffinity::Disabled => {}
+        ProxyPodAffinity::Preferred => {
+            let preferred = pod_affinity
+                .entry("preferredDuringSchedulingIgnoredDuringExecution".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if !preferred.is_array() {
+                *preferred = serde_json::json!([]);
+            }
+            if let Some(preferred) = preferred.as_array_mut() {
+                preferred.push(serde_json::json!({
+                    "weight": 100,
+                    "podAffinityTerm": term,
+                }));
+            }
+        }
+        ProxyPodAffinity::Required => {
+            let required = pod_affinity
+                .entry("requiredDuringSchedulingIgnoredDuringExecution".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if !required.is_array() {
+                *required = serde_json::json!([]);
+            }
+            if let Some(required) = required.as_array_mut() {
+                required.push(term);
+            }
+        }
     }
 }
 
@@ -3462,14 +3458,7 @@ fn apply_supervisor_proxy_pod_topology(
         sc.insert("fsGroup".to_string(), serde_json::json!(params.sandbox_gid));
     }
 
-    apply_supervisor_binary_source(
-        spec,
-        params.supervisor_image,
-        params.supervisor_image_pull_policy,
-        params.supervisor_sideload_method,
-    );
-
-    apply_proxy_pod_affinity(spec, params.sandbox_id);
+    apply_proxy_pod_affinity(spec, params.sandbox_id, params.proxy_pod_affinity);
 
     let names = proxy_pod_resource_names(params.sandbox_name);
     let service_dns = proxy_pod_service_dns(&names.service, params.namespace);
@@ -3496,22 +3485,14 @@ fn apply_supervisor_proxy_pod_topology(
         }));
     }
 
-    let image = spec
-        .get("containers")
-        .and_then(|v| v.as_array())
-        .and_then(|containers| containers.first())
-        .and_then(|container| container.get("image"))
-        .and_then(|value| value.as_str())
-        .unwrap_or(params.default_image)
-        .to_string();
     let init_containers = spec
         .entry("initContainers")
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut();
     if let Some(init_containers) = init_containers {
         init_containers.push(proxy_pod_ca_init_container(
-            &image,
-            params.image_pull_policy,
+            params.supervisor_image,
+            params.supervisor_image_pull_policy,
             params.sandbox_gid,
         ));
     }
@@ -3527,17 +3508,12 @@ fn apply_supervisor_proxy_pod_topology(
         .get_mut(target_index)
         .and_then(|v| v.as_object_mut())
     {
-        container.insert(
-            "command".to_string(),
-            serde_json::json!([
-                format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
-                "--mode=process"
-            ]),
-        );
-
         let security_context = container
             .entry("securityContext")
             .or_insert_with(|| serde_json::json!({}));
+        if !security_context.is_object() {
+            *security_context = serde_json::json!({});
+        }
         if let Some(sc) = security_context.as_object_mut() {
             sc.insert(
                 "runAsUser".to_string(),
@@ -3554,9 +3530,7 @@ fn apply_supervisor_proxy_pod_topology(
             );
             sc.insert(
                 "capabilities".to_string(),
-                serde_json::json!({
-                    "drop": ["ALL"]
-                }),
+                serde_json::json!({ "drop": ["ALL"] }),
             );
         }
 
@@ -3565,7 +3539,9 @@ fn apply_supervisor_proxy_pod_topology(
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(volume_mounts) = volume_mounts {
-            volume_mounts.push(supervisor_volume_mount());
+            remove_volume_mount(volume_mounts, SERVICE_ACCOUNT_TOKEN_VOLUME_NAME);
+            remove_volume_mount(volume_mounts, CLIENT_TLS_VOLUME_NAME);
+            remove_volume_mount(volume_mounts, SPIFFE_WORKLOAD_API_VOLUME_NAME);
             volume_mounts.push(proxy_pod_ca_tls_volume_mount());
         }
 
@@ -3574,61 +3550,67 @@ fn apply_supervisor_proxy_pod_topology(
             .or_insert_with(|| serde_json::json!([]))
             .as_array_mut();
         if let Some(env) = env {
-            let process_endpoint =
-                proxy_pod_process_gateway_endpoint(&service_dns, params.grpc_endpoint);
-            upsert_env(
-                env,
+            for name in [
+                openshell_core::sandbox_env::SANDBOX_ID,
+                openshell_core::sandbox_env::SANDBOX,
                 openshell_core::sandbox_env::ENDPOINT,
-                &process_endpoint,
-            );
-            if let Some(server_name) = gateway_tls_server_name(params.grpc_endpoint) {
-                upsert_env(
-                    env,
-                    openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
-                    &server_name,
-                );
-            }
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
-                "proxy-pod",
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
-                PROXY_POD_NETWORK_ENFORCEMENT_MODE,
-            );
-            upsert_env(
-                env,
+                openshell_core::sandbox_env::SANDBOX_COMMAND,
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
                 openshell_core::sandbox_env::SSH_SOCKET_PATH,
-                PROXY_POD_SSH_SOCKET_FILE,
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::PROXY_URL,
-                &proxy_pod_proxy_url(&service_dns),
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SUPERVISOR_READY_ADDR,
-                &format!("{service_dns}:{PROXY_POD_PROXY_PORT}"),
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::PROXY_TLS_DIR,
-                SIDECAR_TLS_MOUNT_PATH,
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SANDBOX_UID,
-                &params.sandbox_uid.to_string(),
-            );
-            upsert_env(
-                env,
-                openshell_core::sandbox_env::SANDBOX_GID,
-                &params.sandbox_gid.to_string(),
-            );
+                openshell_core::sandbox_env::TLS_CA,
+                openshell_core::sandbox_env::TLS_CERT,
+                openshell_core::sandbox_env::TLS_KEY,
+                openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
+                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+            ] {
+                remove_env(env, name);
+            }
+            let proxy_url = proxy_pod_proxy_url(&service_dns);
+            for name in [
+                "ALL_PROXY",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "grpc_proxy",
+            ] {
+                upsert_env(env, name, &proxy_url);
+            }
+            for name in ["NO_PROXY", "no_proxy"] {
+                upsert_env(env, name, "127.0.0.1,localhost,::1");
+            }
+            upsert_env(env, "NODE_USE_ENV_PROXY", "1");
+
+            let ca_cert = format!("{SIDECAR_TLS_MOUNT_PATH}/{PROXY_POD_CA_CERT_FILE}");
+            let ca_bundle = format!("{SIDECAR_TLS_MOUNT_PATH}/ca-bundle.pem");
+            for name in ["NODE_EXTRA_CA_CERTS", "DENO_CERT"] {
+                upsert_env(env, name, &ca_cert);
+            }
+            for name in [
+                "SSL_CERT_FILE",
+                "REQUESTS_CA_BUNDLE",
+                "CURL_CA_BUNDLE",
+                "GIT_SSL_CAINFO",
+            ] {
+                upsert_env(env, name, &ca_bundle);
+            }
         }
+    }
+
+    if let Some(volumes) = spec
+        .get_mut("volumes")
+        .and_then(|value| value.as_array_mut())
+    {
+        volumes.retain(|volume| {
+            !matches!(
+                volume.get("name").and_then(|value| value.as_str()),
+                Some(
+                    SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
+                        | CLIENT_TLS_VOLUME_NAME
+                        | SPIFFE_WORKLOAD_API_VOLUME_NAME
+                )
+            )
+        });
     }
 }
 
@@ -3803,6 +3785,7 @@ struct SandboxPodParams<'a> {
     proxy_auth_secret_key: Option<&'a str>,
     proxy_auth_allow_insecure: bool,
     proxy_connect_by_hostname: bool,
+    proxy_pod_affinity: ProxyPodAffinity,
     namespace: &'a str,
     service_account_name: &'a str,
     sandbox_id: &'a str,
@@ -3845,6 +3828,7 @@ impl Default for SandboxPodParams<'_> {
             proxy_auth_secret_key: None,
             proxy_auth_allow_insecure: false,
             proxy_connect_by_hostname: false,
+            proxy_pod_affinity: ProxyPodAffinity::Disabled,
             namespace: "default",
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
@@ -7214,7 +7198,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_pod_topology_renders_process_agent_with_proxy_service() {
+    fn proxy_pod_topology_runs_workload_directly_through_proxy_service() {
         let params = SandboxPodParams {
             topology: SupervisorTopology::ProxyPod,
             supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
@@ -7248,36 +7232,30 @@ mod tests {
             pod_template["metadata"]["labels"][LABEL_SANDBOX_ROLE],
             SANDBOX_ROLE_AGENT
         );
-        assert_eq!(
-            agent["command"],
-            serde_json::json!([
-                format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
-                "--mode=process"
-            ])
-        );
+        assert!(agent.get("command").is_none());
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::ENDPOINT),
-            Some(format!("https://{service_dns}:18080").as_str())
+            None
         );
         assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME),
-            Some("openshell-gateway.openshell.svc")
-        );
-        assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::PROXY_URL),
+            rendered_env(agent, "HTTP_PROXY"),
             Some(format!("http://{service_dns}:3128").as_str())
         );
         assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::SUPERVISOR_READY_ADDR),
-            Some(format!("{service_dns}:3128").as_str())
+            rendered_env(agent, "SSL_CERT_FILE"),
+            Some("/etc/openshell-tls/proxy/ca-bundle.pem")
         );
         assert_eq!(
-            rendered_env(agent, openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE),
-            Some(PROXY_POD_NETWORK_ENFORCEMENT_MODE)
+            rendered_env(agent, openshell_core::sandbox_env::K8S_SA_TOKEN_FILE),
+            None
         );
         assert_eq!(
             rendered_env(agent, openshell_core::sandbox_env::SSH_SOCKET_PATH),
-            Some(PROXY_POD_SSH_SOCKET_FILE)
+            None
+        );
+        assert_eq!(
+            agent["securityContext"]["capabilities"]["drop"],
+            serde_json::json!(["ALL"])
         );
 
         let containers = pod_template["spec"]["containers"].as_array().unwrap();
@@ -7290,14 +7268,73 @@ mod tests {
         assert!(volumes.iter().any(|volume| {
             volume["name"] == "openshell-proxy-pod-tls" && volume["emptyDir"].is_object()
         }));
+        assert!(!volumes.iter().any(|volume| {
+            matches!(
+                volume["name"].as_str(),
+                Some(
+                    SUPERVISOR_VOLUME_NAME
+                        | SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
+                        | CLIENT_TLS_VOLUME_NAME
+                        | SPIFFE_WORKLOAD_API_VOLUME_NAME
+                )
+            )
+        }));
 
-        let affinity = &pod_template["spec"]["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
-            [0];
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        assert!(init_containers.iter().any(|container| {
+            container["name"] == "openshell-proxy-ca-install"
+                && container["image"] == "supervisor-image:latest"
+        }));
+        assert!(
+            !init_containers
+                .iter()
+                .any(|container| container["name"] == SUPERVISOR_INIT_CONTAINER_NAME)
+        );
+
+        assert!(pod_template["spec"].get("affinity").is_none());
+    }
+
+    #[test]
+    fn proxy_pod_topology_supports_preferred_affinity() {
+        let mut spec = serde_json::Map::new();
+        apply_proxy_pod_affinity(&mut spec, "sandbox-123", ProxyPodAffinity::Preferred);
+
+        let preferred =
+            &spec["affinity"]["podAffinity"]["preferredDuringSchedulingIgnoredDuringExecution"][0];
+        assert_eq!(preferred["weight"], 100);
         assert_eq!(
-            affinity["labelSelector"]["matchLabels"][LABEL_SANDBOX_ROLE],
+            preferred["podAffinityTerm"]["labelSelector"]["matchLabels"][LABEL_SANDBOX_ROLE],
             SANDBOX_ROLE_SUPERVISOR
         );
-        assert_eq!(affinity["topologyKey"], "kubernetes.io/hostname");
+        assert_eq!(
+            preferred["podAffinityTerm"]["topologyKey"],
+            "kubernetes.io/hostname"
+        );
+    }
+
+    #[test]
+    fn proxy_pod_topology_supports_required_affinity_without_replacing_existing_terms() {
+        let mut spec = serde_json::json!({
+            "affinity": {
+                "podAffinity": {
+                    "requiredDuringSchedulingIgnoredDuringExecution": [{
+                        "topologyKey": "topology.kubernetes.io/zone"
+                    }]
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_proxy_pod_affinity(&mut spec, "sandbox-123", ProxyPodAffinity::Required);
+
+        let required =
+            spec["affinity"]["podAffinity"]["requiredDuringSchedulingIgnoredDuringExecution"]
+                .as_array()
+                .unwrap();
+        assert_eq!(required.len(), 2);
+        assert_eq!(required[0]["topologyKey"], "topology.kubernetes.io/zone");
+        assert_eq!(required[1]["topologyKey"], "kubernetes.io/hostname");
     }
 
     #[test]

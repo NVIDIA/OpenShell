@@ -182,18 +182,61 @@ impl KubernetesSidecarConfig {
     }
 }
 
+/// Scheduling relationship between a proxy-pod workload and its paired
+/// network-supervisor pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyPodAffinity {
+    /// Do not add an OpenShell-managed pod-affinity term.
+    #[default]
+    Disabled,
+    /// Prefer same-node placement without making it a scheduling requirement.
+    Preferred,
+    /// Require the workload and network supervisor to run on the same node.
+    Required,
+}
+
+impl std::fmt::Display for ProxyPodAffinity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("disabled"),
+            Self::Preferred => f.write_str("preferred"),
+            Self::Required => f.write_str("required"),
+        }
+    }
+}
+
+impl FromStr for ProxyPodAffinity {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "disabled" => Ok(Self::Disabled),
+            "preferred" => Ok(Self::Preferred),
+            "required" => Ok(Self::Required),
+            other => Err(format!(
+                "unknown proxy-pod affinity '{other}'; expected 'disabled', 'preferred', or 'required'"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesProxyPodConfig {
     /// UID used by the network supervisor in `proxy-pod` topology. It must not
     /// match the sandbox workload UID.
     pub proxy_uid: u32,
+    /// Whether same-node placement with the paired supervisor is disabled,
+    /// preferred, or required.
+    pub affinity: ProxyPodAffinity,
 }
 
 impl Default for KubernetesProxyPodConfig {
     fn default() -> Self {
         Self {
             proxy_uid: DEFAULT_PROXY_UID,
+            affinity: ProxyPodAffinity::Disabled,
         }
     }
 }
@@ -957,6 +1000,7 @@ mod tests {
     fn default_proxy_uid_is_dedicated_non_root_uid() {
         let cfg = KubernetesComputeConfig::default();
         assert_eq!(cfg.sidecar.proxy_uid, DEFAULT_PROXY_UID);
+        assert_eq!(cfg.proxy_pod.affinity, ProxyPodAffinity::Disabled);
     }
 
     #[test]
@@ -997,12 +1041,25 @@ mod tests {
     fn serde_override_proxy_pod_proxy_uid_nested() {
         let json = serde_json::json!({
             "proxy_pod": {
-                "proxy_uid": 2000
+                "proxy_uid": 2000,
+                "affinity": "preferred"
             }
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.proxy_pod.proxy_uid, 2000);
+        assert_eq!(cfg.proxy_pod.affinity, ProxyPodAffinity::Preferred);
         cfg.validate_proxy_uid().unwrap();
+    }
+
+    #[test]
+    fn serde_rejects_invalid_proxy_pod_affinity() {
+        let json = serde_json::json!({
+            "proxy_pod": {
+                "affinity": "sometimes"
+            }
+        });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
     }
 
     #[test]

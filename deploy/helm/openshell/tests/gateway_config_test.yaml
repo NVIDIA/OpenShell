@@ -220,6 +220,15 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.proxy_pod\].*?proxy_uid\s*=\s*2300'
 
+  - it: renders proxy pod affinity under [openshell.drivers.kubernetes.proxy_pod]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.proxyPod.affinity: preferred
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.proxy_pod\].*?affinity\s*=\s*"preferred"'
+
   - it: renders process binary aware network policy under [openshell.drivers.kubernetes.sidecar]
     template: templates/gateway-config.yaml
     set:

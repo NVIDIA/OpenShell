@@ -178,6 +178,7 @@ The most commonly changed values are:
 | `supervisor.sidecar.proxyUid` | Non-root UID used when sidecar process/binary-aware network policy is disabled. The default binary-aware sidecar runs as UID 0 instead. The configured UID must not match the sandbox UID. |
 | `upstreamProxy` | Operator-owned corporate HTTP forward proxy for policy-approved TLS egress. Refer to [Configure a Corporate Upstream Proxy](#configure-a-corporate-upstream-proxy). |
 | `supervisor.proxyPod.proxyUid` | Non-root UID used by the proxy-pod network supervisor. The UID must not match the sandbox UID. |
+| `supervisor.proxyPod.affinity` | Same-node placement policy for workload and proxy pods: `disabled` (default), `preferred`, or `required`. |
 
 Use a values file for repeatable deployments:
 

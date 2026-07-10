@@ -390,6 +390,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `proxy_pod.proxy_uid` | `supervisor.proxyPod.proxyUid` | Dedicated UID of at least `1000` used by the network supervisor in `proxy-pod` topology. It must not match the workload UID. |
 | `sidecar.process_binary_aware_network_policy` | `supervisor.sidecar.processBinaryAwareNetworkPolicy` | Keep process/binary-aware network policy enabled in `sidecar` topology. The default runs the sidecar as UID 0 with `SYS_PTRACE` and `DAC_READ_SEARCH`. Set false to run as `proxy_uid`, drop both capabilities, and enforce endpoint/L7 policy without matching `policy.binaries`. |
 | `proxy_pod.proxy_uid` | `supervisor.proxyPod.proxyUid` | Non-root UID used by the proxy-pod network supervisor. It must not match the sandbox UID. |
+| `proxy_pod.affinity` | `supervisor.proxyPod.affinity` | Configure same-node workload/supervisor placement as `disabled` (default), `preferred`, or `required`. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
@@ -430,9 +431,11 @@ process/binary identity through `/proc/<entrypoint-pid>`.
 In `proxy-pod` topology, network enforcement runs in a separate non-root
 supervisor Deployment with one pod, a headless Service, a proxy CA Secret, and
 per-sandbox NetworkPolicies. The Deployment recreates the supervisor pod if it
-is deleted. The agent process supervisor runs in `network-only` mode; use
-`combined` topology when you need combined-mode process/filesystem guards in the
-agent container.
+is deleted. The sandbox container runs its image directly with proxy and CA
+environment; it does not mount or execute the supervisor. Filesystem/process
+policy, binary detection, SSH/exec, upload/download, sync, and provider
+environment injection are therefore unavailable. Use `combined` or `sidecar`
+when those process-supervisor features are required.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 

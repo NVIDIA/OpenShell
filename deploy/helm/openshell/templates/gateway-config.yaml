@@ -208,6 +208,7 @@ data:
 
     [openshell.drivers.kubernetes.proxy_pod]
     proxy_uid                    = {{ .Values.supervisor.proxyPod.proxyUid | default 1337 }}
+    affinity                     = {{ .Values.supervisor.proxyPod.affinity | default "disabled" | quote }}
 
     {{- if not $credentialDrivers }}
 

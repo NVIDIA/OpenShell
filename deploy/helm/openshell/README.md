@@ -284,6 +284,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | supervisor.image.pullPolicy | string | `""` | Supervisor image pull policy. Defaults to the gateway image pull policy when empty. |
 | supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set. |
 | supervisor.image.tag | string | `""` | Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
+| supervisor.proxyPod.affinity | string | `"disabled"` | Same-node scheduling relationship between the workload pod and its paired proxy supervisor: disabled, preferred, or required. |
 | supervisor.proxyPod.proxyUid | int | `1337` | UID for the network supervisor in proxy-pod topology. The configured UID must not match the sandbox UID. |
 | supervisor.sidecar.processBinaryAwareNetworkPolicy | bool | `true` | Keep process/binary-aware network policy enabled in sidecar topology. When false, the network sidecar runs as proxyUid, drops the extra /proc inspection capabilities, and enforces endpoint/L7 policy without matching policy.binaries. |
 | supervisor.sidecar.proxyUid | int | `1337` | UID for relaxed long-running network sidecars in sidecar topology. Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants the required /proc inspection capabilities into the effective set. The network init container installs nftables rules that exempt the effective sidecar UID. |

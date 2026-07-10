@@ -26,6 +26,9 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
+/// Shell command to run inside the sandbox.
+pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
+
 /// Versioned specification for the exact canonical main process.
 ///
 /// Most drivers use JSON directly. Transports that cannot preserve spaces in
@@ -142,10 +145,6 @@ pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
 /// state over this socket instead of exposing gateway credentials to the agent
 /// container.
 pub const SIDECAR_CONTROL_SOCKET: &str = "OPENSHELL_SIDECAR_CONTROL_SOCKET";
-
-/// TCP address the process supervisor waits for before starting when the
-/// network supervisor runs outside the agent process.
-pub const SUPERVISOR_READY_ADDR: &str = "OPENSHELL_SUPERVISOR_READY_ADDR";
 
 /// Address where an external network supervisor forwards gateway gRPC traffic.
 pub const GATEWAY_FORWARD_ADDR: &str = "OPENSHELL_GATEWAY_FORWARD_ADDR";
