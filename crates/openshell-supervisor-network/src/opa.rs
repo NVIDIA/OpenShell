@@ -439,6 +439,41 @@ impl OpaEngine {
         Ok(())
     }
 
+    /// Reload the policy and middleware registry as one runtime generation.
+    ///
+    /// Both replacements are prepared before the live locks are acquired. The
+    /// engine and runner are then swapped while holding both locks, followed by
+    /// a single generation increment. A preparation or lock failure leaves the
+    /// live pair and generation untouched.
+    pub fn reload_policy_and_middleware_from_proto_with_pid(
+        &self,
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+        registry: MiddlewareRegistry,
+    ) -> Result<()> {
+        let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
+        let new_engine = new
+            .engine
+            .into_inner()
+            .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
+        let new_runner = ChainRunner::from_registry(registry);
+
+        // Match clone_engine_for_tunnel's lock order (engine, then runner) so
+        // readers can observe only the old pair or the new pair.
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let mut runner = self
+            .middleware_runner
+            .write()
+            .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
+        *engine = new_engine;
+        *runner = new_runner;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
     /// Current policy generation. Successful reloads increment this value.
     pub fn current_generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
@@ -1583,7 +1618,7 @@ mod tests {
 
     use openshell_core::proto::{
         FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, NetworkBinary,
-        NetworkEndpoint, NetworkPolicyRule, ProcessPolicy as ProtoProc,
+        NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy as ProtoProc,
         SandboxPolicy as ProtoSandboxPolicy,
     };
 
@@ -6302,6 +6337,181 @@ network_policies:
         );
     }
 
+    #[tokio::test]
+    async fn policy_and_middleware_reload_commit_as_one_generation() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let mut new_proto = proto;
+        new_proto.network_policies.insert(
+            "python_api".to_string(),
+            NetworkPolicyRule {
+                name: "python_api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "pypi.org".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/python3".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&new_proto, 0, registry)
+            .expect("combined reload");
+
+        assert_eq!(engine.current_generation(), 1);
+        let python_input = NetworkInput {
+            host: "pypi.org".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&python_input).unwrap().allowed);
+
+        let entry = ChainEntry {
+            name: "secrets".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let described = engine
+            .middleware_runner()
+            .expect("middleware runner")
+            .describe_chain(&[entry])
+            .await
+            .expect("describe chain");
+        assert!(described[0].is_resolved());
+    }
+
+    #[tokio::test]
+    async fn policy_only_reload_keeps_connected_middleware_registry() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let registry = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        engine
+            .replace_middleware_registry(registry)
+            .expect("install registry");
+        let generation_with_registry = engine.current_generation();
+
+        let mut new_proto = proto;
+        new_proto.network_policies.insert(
+            "python_api".to_string(),
+            NetworkPolicyRule {
+                name: "python_api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "pypi.org".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/python3".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        engine
+            .reload_from_proto_with_pid(&new_proto, 0)
+            .expect("policy-only reload");
+
+        assert_eq!(engine.current_generation(), generation_with_registry + 1);
+        let python_input = NetworkInput {
+            host: "pypi.org".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&python_input).unwrap().allowed);
+
+        let entry = ChainEntry {
+            name: "secrets".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let described = engine
+            .middleware_runner()
+            .expect("middleware runner")
+            .describe_chain(&[entry])
+            .await
+            .expect("describe chain");
+        assert!(described[0].is_resolved());
+    }
+
+    #[tokio::test]
+    async fn failed_combined_reload_preserves_policy_registry_and_generation() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("initial load should succeed");
+        let builtins = MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            Vec::new(),
+        )
+        .await
+        .expect("built-in registry");
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&proto, 0, builtins)
+            .expect("install last-known-good runtime");
+
+        let mut invalid = proto;
+        invalid.network_middlewares.push(NetworkMiddlewareConfig {
+            name: String::new(),
+            middleware: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            ..Default::default()
+        });
+        let empty_registry = MiddlewareRegistry::connect_services(Vec::new(), Vec::new())
+            .await
+            .expect("empty registry");
+
+        engine
+            .reload_policy_and_middleware_from_proto_with_pid(&invalid, 0, empty_registry)
+            .expect_err("invalid policy must reject the combined reload");
+
+        assert_eq!(engine.current_generation(), 1);
+        let claude_input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&claude_input).unwrap().allowed);
+
+        let entry = ChainEntry {
+            name: "secrets".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        };
+        let described = engine
+            .middleware_runner()
+            .expect("middleware runner")
+            .describe_chain(&[entry])
+            .await
+            .expect("describe chain");
+        assert!(described[0].is_resolved());
+    }
+
     #[test]
     fn deny_reason_includes_symlink_hint() {
         // Verify the deny reason includes an actionable symlink hint
@@ -6958,17 +7168,15 @@ network_middlewares:
     #[test]
     fn from_proto_revalidates_middleware_policy() {
         let mut policy = openshell_policy::restrictive_default_policy();
-        policy
-            .network_middlewares
-            .push(openshell_core::proto::NetworkMiddlewareConfig {
-                name: "redactor".into(),
-                middleware: "openshell/secrets".into(),
-                endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
-                    include: vec!["api[.example.com".into()],
-                    exclude: Vec::new(),
-                }),
-                ..Default::default()
-            });
+        policy.network_middlewares.push(NetworkMiddlewareConfig {
+            name: "redactor".into(),
+            middleware: "openshell/secrets".into(),
+            endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
+                include: vec!["api[.example.com".into()],
+                exclude: Vec::new(),
+            }),
+            ..Default::default()
+        });
 
         let error = OpaEngine::from_proto(&policy)
             .err()

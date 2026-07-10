@@ -74,8 +74,15 @@ and phases as enums. Built-ins run in-process;
 operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
 service capabilities and implementation-owned config before delivery.
-Supervisors keep the last-known-good service registry when a live config reload
-fails. The generic registry and chain runner live in
+For a gateway policy snapshot, the supervisor prepares replacements off to the
+side and installs them as one runtime generation. A policy-only change swaps
+the policy engine alone and reuses the connected registry, so middleware
+reachability cannot block it. The registry is rebuilt, reconnecting every
+delivered service, only when the delivered service set changes or the installed
+registry is degraded; that rebuild commits together with the policy engine.
+A failure preserves the complete last-known-good runtime and leaves its applied
+hash and registrations unchanged so the snapshot is retried. The generic
+registry and chain runner live in
 `openshell-supervisor-middleware`;
 first-party implementations and their config schemas live in
 `openshell-supervisor-middleware-builtins`. The gateway and supervisor inject
@@ -239,8 +246,8 @@ engine with a gateway policy revision.
 ## Failure Behavior
 
 - If gateway config polling fails, the sandbox keeps its last-known-good policy.
-- If a live policy update is invalid, the supervisor rejects it and keeps the
-  current policy.
+- If a live policy or middleware-registry update is invalid, the supervisor
+  rejects the combined update and keeps the current runtime pair.
 - If an operator-run middleware call fails, the selected config's `on_error`
   behavior decides whether to deny the request or continue without that stage.
 - Existing raw byte streams are connection scoped. Dynamic policy changes apply
