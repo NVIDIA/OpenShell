@@ -99,6 +99,26 @@ openshell --gateway docker-dev sandbox list
 
 Look for names like `gator-pr-<number>-supervised`. If one exists, inspect its log before deleting or relaunching.
 
+## Input Normalization
+
+Never paste raw operator text into shell arguments such as `--name`, `--from`, issue numbers, or PR numbers. Normalize values before constructing launch commands.
+
+Use digits only for issue and PR numbers:
+
+```bash
+pr_number="<digits-only>"
+[[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
+```
+
+Use a restricted sandbox-name character set:
+
+```bash
+sandbox_name="gator-pr-${pr_number}-supervised"
+[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+```
+
+For local image contexts passed to `--from`, use an agent-created path such as `mktemp -d`; do not pass raw user-supplied paths without validating that they are expected local Dockerfile contexts.
+
 ## Standard Launches
 
 ### Launch A PR Watcher
@@ -106,13 +126,18 @@ Look for names like `gator-pr-<number>-supervised`. If one exists, inspect its l
 Use a stable, scoped name and a prompt that names exactly what gator should do.
 
 ```bash
+pr_number="<digits-only>"
+[[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
+sandbox_name="gator-pr-${pr_number}-supervised"
+[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+
 ./scripts/agents/run.sh \
   --agent gator \
   --gateway docker-dev \
-  --name gator-pr-<pr>-supervised \
+  --name "$sandbox_name" \
   --watch \
   --background \
-  "Review and monitor PR #<pr> through the gator-gate workflow. Scope this invocation only to PR #<pr>."
+  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
 The launcher builds the gator sandbox image when needed, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, creates the sandbox, and writes a background log under `scripts/agents/gator/logs/`.
@@ -120,25 +145,37 @@ The launcher builds the gator sandbox image when needed, stages the immutable pa
 ### Launch An Issue Or Issue/PR Pair
 
 ```bash
+issue_number="<digits-only>"
+[[ "$issue_number" =~ ^[0-9]+$ ]] || { echo "invalid issue number" >&2; exit 1; }
+sandbox_name="gator-issue-${issue_number}-supervised"
+[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+
 ./scripts/agents/run.sh \
   --agent gator \
   --gateway docker-dev \
-  --name gator-issue-<issue>-supervised \
+  --name "$sandbox_name" \
   --watch \
   --background \
-  "Run gator on issue #<issue>. Scope this invocation only to issue #<issue>."
+  "Run gator on issue #${issue_number}. Scope this invocation only to issue #${issue_number}."
 ```
 
 For a linked pair:
 
 ```bash
+pr_number="<digits-only>"
+issue_number="<digits-only>"
+[[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
+[[ "$issue_number" =~ ^[0-9]+$ ]] || { echo "invalid issue number" >&2; exit 1; }
+sandbox_name="gator-pr-${pr_number}-supervised"
+[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+
 ./scripts/agents/run.sh \
   --agent gator \
   --gateway docker-dev \
-  --name gator-pr-<pr>-supervised \
+  --name "$sandbox_name" \
   --watch \
   --background \
-  "Review and monitor PR #<pr> with linked issue #<issue> through the gator-gate workflow. Scope this invocation only to PR #<pr> and issue #<issue>."
+  "Review and monitor PR #${pr_number} with linked issue #${issue_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number} and issue #${issue_number}."
 ```
 
 ### Launch With Explicit Maintainer Authorization
@@ -146,13 +183,18 @@ For a linked pair:
 Only include authorization in the prompt when the operator explicitly gave it.
 
 ```bash
+pr_number="<digits-only>"
+[[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
+sandbox_name="gator-pr-${pr_number}-supervised"
+[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+
 ./scripts/agents/run.sh \
   --agent gator \
   --gateway docker-dev \
-  --name gator-pr-<pr>-supervised \
+  --name "$sandbox_name" \
   --watch \
   --background \
-  "Review and monitor PR #<pr> through the gator-gate workflow. Scope this invocation only to PR #<pr>. The operator explicitly authorizes applying the test:e2e label and posting /ok to test for the current head SHA if gator determines that is required."
+  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. The operator explicitly authorizes applying the test:e2e label and posting /ok to test for the current head SHA if gator determines that is required."
 ```
 
 ## Model Or Image Experiments
@@ -160,30 +202,42 @@ Only include authorization in the prompt when the operator explicitly gave it.
 Use environment overrides. Do not edit `agent.yaml` for temporary experiments.
 
 ```bash
+pr_number="<digits-only>"
+[[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
+sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
+[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+
 CODEX_MODEL=gpt-5.6-sol \
 ./scripts/agents/run.sh \
   --agent gator \
   --gateway docker-dev \
-  --name gator-pr-<pr>-gpt56sol-supervised \
+  --name "$sandbox_name" \
   --watch \
   --background \
-  "Review and monitor PR #<pr> through the gator-gate workflow. Scope this invocation only to PR #<pr>. This launch is intentionally testing Codex model gpt-5.6-sol via the CLI launcher."
+  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}. This launch is intentionally testing Codex model gpt-5.6-sol via the CLI launcher."
 ```
 
-If the installed Codex CLI is too old for a model, create a temporary copy of `scripts/agents/gator/` under `/var/folders/52/ygrbs0zn7pxgfcppwggvgklm0000gp/T/opencode` or another approved temp directory, adjust only that temporary Dockerfile, and launch with `--from <temp-context>`. Keep the repo Dockerfile unchanged unless the version bump is the intended code change.
+If the installed Codex CLI is too old for a model, create a temporary copy of `scripts/agents/gator/`, adjust only that temporary Dockerfile, and launch with that generated context. Keep the repo Dockerfile unchanged unless the version bump is the intended code change.
 
 Example shape:
 
 ```bash
+pr_number="<digits-only>"
+[[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
+sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
+[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+tmp_context="$(mktemp -d "${TMPDIR:-/tmp}/gator-codex-XXXXXX")"
+cp -R scripts/agents/gator/. "$tmp_context"/
+
 CODEX_MODEL=gpt-5.6-sol \
 ./scripts/agents/run.sh \
   --agent gator \
   --gateway docker-dev \
-  --name gator-pr-<pr>-gpt56sol-supervised \
-  --from /var/folders/52/ygrbs0zn7pxgfcppwggvgklm0000gp/T/opencode/gator-codex-<version> \
+  --name "$sandbox_name" \
+  --from "$tmp_context" \
   --watch \
   --background \
-  "Review and monitor PR #<pr> through the gator-gate workflow. Scope this invocation only to PR #<pr>."
+  "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
 ## Monitoring
@@ -231,11 +285,14 @@ Restart when the payload must change, the sandbox is wedged without a sentinel, 
 Before deleting, check that the sandbox is truly stale or that the operator asked for a restart. If a bounded review cycle is actively running and still producing useful output, prefer leaving it alone.
 
 ```bash
-openshell --gateway docker-dev sandbox delete <sandbox-name>
+sandbox_name="<safe-sandbox-name>"
+[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+
+openshell --gateway docker-dev sandbox delete "$sandbox_name"
 ./scripts/agents/run.sh \
   --agent gator \
   --gateway docker-dev \
-  --name <sandbox-name> \
+  --name "$sandbox_name" \
   --watch \
   --background \
   "<same scoped operator prompt, updated only with the reason for relaunch>"
