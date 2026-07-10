@@ -305,4 +305,4 @@ DCO sign-off is separate from cryptographic commit signing. CI requires signing 
 
 ## CI
 
-How PR CI runs, the `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
+How PR CI runs, the `test:e2e`, `test:e2e-gpu`, `test:e2e-kubernetes`, and `test:e2e-centos` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).

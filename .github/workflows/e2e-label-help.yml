@@ -19,7 +19,7 @@ permissions: {}
 jobs:
   hint:
     name: Post next-step hint for E2E label
-    if: github.event.label.name == 'test:e2e' || github.event.label.name == 'test:e2e-gpu' || github.event.label.name == 'test:e2e-kubernetes'
+    if: github.event.label.name == 'test:e2e' || github.event.label.name == 'test:e2e-gpu' || github.event.label.name == 'test:e2e-kubernetes' || github.event.label.name == 'test:e2e-centos'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -54,6 +54,11 @@ jobs:
               suite_summary="Kubernetes HA E2E"
               build_summary="gateway and supervisor images"
               status_summary="This is an optional proof-of-life suite; failures are visible in the workflow run but do not publish a required CI gate status."
+              ;;
+            test:e2e-centos)
+              suite_summary="the CentOS Stream 10 Docker/Podman/SELinux compatibility suite"
+              build_summary="gateway and supervisor images"
+              status_summary="This is an optional suite that boots a VM inside the job; failures are visible in the workflow run but do not publish a required CI gate status."
               ;;
             *) echo "Unrecognized label $LABEL_NAME"; exit 1 ;;
           esac

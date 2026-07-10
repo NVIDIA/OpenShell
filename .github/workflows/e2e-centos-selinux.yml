@@ -1,0 +1,342 @@
+name: CentOS Stream 10 Docker/Podman/SELinux Compatibility
+
+# Exercises the Docker and Podman compute drivers on CentOS Stream 10 with
+# SELinux enforcing. This is the cross-compatibility check requested in
+# https://github.com/NVIDIA/OpenShell/pull/2092: RHEL-family distros ship
+# Podman but not Docker, so this job installs both engines, confirms they
+# coexist on one host, and runs the standard Docker/Podman e2e suites
+# against a real SELinux-enforcing kernel (unlike the Ubuntu-based
+# `ghcr.io/nvidia/openshell/ci` image used by e2e-test.yml, which does not
+# enforce SELinux). This gives bind-mount relabeling changes (e.g. the
+# `selinux_label`/`:z`/`:Z` support added in #2092) a host that can
+# actually deny mislabeled mounts.
+#
+# Unlike a bare RHEL 10 runner, this does NOT require an org admin to
+# provision a new GitHub-hosted runner class. Instead, it boots a real
+# CentOS Stream 10 guest under QEMU/KVM on the existing self-hosted
+# `linux-amd64-cpu8` runner (the same runner class already used by
+# driver-vm-linux.yml with `--privileged`), and drives the guest entirely
+# over SSH. This does require that runner class to expose `/dev/kvm`; the
+# `create` step below fails fast with a clear error if it doesn't.
+#
+# The guest is created and torn down with
+# `tasks/scripts/vm/centos-selinux-vm.sh`, the same script contributors can
+# run locally (`mise run vm:centos-selinux:create`) to reproduce this
+# environment outside CI.
+#
+# The host job itself runs in the same Ubuntu-based CI container as the
+# rest of the suite; only the guest VM is CentOS Stream 10 with SELinux
+# enforcing.
+
+on:
+  workflow_call:
+    inputs:
+      image-tag:
+        description: "Image tag to test (typically the commit SHA)"
+        required: true
+        type: string
+      runner:
+        description: "GitHub Actions runner label for the host job (must expose /dev/kvm)"
+        required: false
+        type: string
+        default: "linux-amd64-cpu8"
+      checkout-ref:
+        description: "Git ref to check out for test inputs (defaults to the workflow SHA)"
+        required: false
+        type: string
+        default: ""
+      mise-version:
+        description: "mise version to install in the CentOS Stream guest"
+        required: false
+        type: string
+        default: "v2026.4.25"
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  centos-selinux-compat:
+    name: CentOS Stream 10 Docker + Podman + SELinux
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged --device=/dev/kvm
+    env:
+      MISE_VERSION: ${{ inputs.mise-version }}
+      IMAGE_TAG: ${{ inputs.image-tag }}
+      OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
+      OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+      OPENSHELL_REGISTRY_HOST: ghcr.io
+      OPENSHELL_REGISTRY_NAMESPACE: nvidia/openshell
+      OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
+      OPENSHELL_CENTOS_SELINUX_VM_STATE_DIR: /tmp/openshell-e2e-centos
+      VM_BOOT_TIMEOUT_MINUTES: "10"
+      SSH_PORT: "2222"
+      GUEST_USER: e2e
+      GUEST_WORKDIR: /home/e2e/openshell
+      SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+
+      - name: Record host facts
+        run: |
+          set -euo pipefail
+          cat /etc/os-release
+          uname -a
+          ls -l /dev/kvm || echo "/dev/kvm not present"
+
+      - name: Install host VM tooling
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-utils \
+            genisoimage \
+            openssh-client \
+            curl \
+            ca-certificates
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Create the CentOS Stream 10 VM
+        # VM_ACCEL=kvm makes this fail fast (instead of silently falling back
+        # to slow software emulation) if the runner doesn't expose /dev/kvm.
+        env:
+          VM_ACCEL: kvm
+        run: tasks/scripts/vm/centos-selinux-vm.sh create
+
+      - name: Load guest connection details
+        run: |
+          set -euo pipefail
+          cat "${OPENSHELL_CENTOS_SELINUX_VM_STATE_DIR}/connection.env" >> "$GITHUB_ENV"
+
+      - name: Copy repository into the guest
+        run: |
+          set -euo pipefail
+          tar -C "${GITHUB_WORKSPACE}" -czf /tmp/openshell-e2e-centos/repo.tar.gz --exclude=.git .
+          # shellcheck disable=SC2086
+          scp -P "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} \
+            /tmp/openshell-e2e-centos/repo.tar.gz "${GUEST_USER}@127.0.0.1:/tmp/repo.tar.gz"
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" \
+            "mkdir -p '${GUEST_WORKDIR}' && tar -xzf /tmp/repo.tar.gz -C '${GUEST_WORKDIR}'"
+
+      - name: Write guest environment file
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086,SC2087
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" \
+            "cat > '${GUEST_WORKDIR}/.e2e.env' && chmod 600 '${GUEST_WORKDIR}/.e2e.env'" <<EOF
+          MISE_GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          MISE_VERSION=${MISE_VERSION}
+          IMAGE_TAG=${IMAGE_TAG}
+          OPENSHELL_SUPERVISOR_IMAGE=${OPENSHELL_SUPERVISOR_IMAGE}
+          OPENSHELL_REGISTRY=${OPENSHELL_REGISTRY}
+          OPENSHELL_REGISTRY_HOST=${OPENSHELL_REGISTRY_HOST}
+          OPENSHELL_REGISTRY_NAMESPACE=${OPENSHELL_REGISTRY_NAMESPACE}
+          OPENSHELL_REGISTRY_USERNAME=${OPENSHELL_REGISTRY_USERNAME}
+          OPENSHELL_REGISTRY_PASSWORD=${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN=${{ secrets.GITHUB_TOKEN }}
+          EOF
+
+      - name: Require SELinux enforcing in the guest
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          mode="$(getenforce)"
+          echo "SELinux mode: ${mode}"
+          if [ "${mode}" != "Enforcing" ]; then
+            echo "::error::SELinux must be Enforcing in the guest for the compatibility check to be meaningful (got: ${mode})"
+            exit 1
+          fi
+          REMOTE
+
+      - name: Record guest audit window start
+        id: audit_window
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          start="$(ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" date -u '+%m/%d/%Y %H:%M:%S')"
+          echo "start=${start}" >> "$GITHUB_OUTPUT"
+
+      - name: Install build and test dependencies (guest)
+        run: |
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          sudo dnf install -y \
+            ca-certificates \
+            curl \
+            git \
+            gcc \
+            gcc-c++ \
+            make \
+            clang \
+            clang-devel \
+            z3-devel \
+            pkgconf-pkg-config \
+            openssl-devel \
+            openssh-clients \
+            python3 \
+            cmake \
+            socat \
+            unzip \
+            xz \
+            jq \
+            rsync \
+            zstd \
+            audit \
+            policycoreutils
+          REMOTE
+
+      - name: Install Docker Engine and Podman (guest)
+        # CentOS Stream's GenericCloud image ships neither by default, per
+        # the RHEL-family cross-compatibility check requested in
+        # https://github.com/NVIDIA/OpenShell/pull/2092#issuecomment-4856873804.
+        run: |
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          curl -fsSL https://get.docker.com | sudo bash
+          sudo sed -i "s#/usr/bin/dockerd#/usr/bin/dockerd --ip-forward-no-drop#g" /usr/lib/systemd/system/docker.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now docker
+          sudo dnf install -y podman
+          REMOTE
+
+      - name: Grant guest user access to the Docker socket
+        run: |
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          sudo groupadd -f docker
+          sudo usermod -aG docker "$(id -un)"
+          sudo chmod 666 /var/run/docker.sock
+          REMOTE
+
+      - name: Verify Docker and Podman coexist (guest)
+        run: |
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          docker version
+          docker info
+          podman version
+          podman info
+          REMOTE
+
+      - name: Install mise (guest)
+        run: |
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          source ~/openshell/.e2e.env
+          curl https://mise.run | MISE_VERSION="${MISE_VERSION}" sh
+          REMOTE
+
+      - name: Install tools (guest)
+        run: |
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          source ~/openshell/.e2e.env
+          export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+          cd ~/openshell
+          mise install --locked
+          REMOTE
+
+      - name: Log in to GHCR with Docker (guest)
+        run: |
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          source ~/openshell/.e2e.env
+          echo "${OPENSHELL_REGISTRY_PASSWORD}" | docker login ghcr.io -u "${OPENSHELL_REGISTRY_USERNAME}" --password-stdin
+          REMOTE
+
+      - name: Log in to GHCR with Podman (guest)
+        run: |
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          source ~/openshell/.e2e.env
+          echo "${OPENSHELL_REGISTRY_PASSWORD}" | podman login ghcr.io -u "${OPENSHELL_REGISTRY_USERNAME}" --password-stdin
+          REMOTE
+
+      - name: Run Docker-backed e2e suite (guest)
+        run: |
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          source ~/openshell/.e2e.env
+          export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+          cd ~/openshell
+          mise run --no-deps --skip-deps e2e:docker
+          REMOTE
+
+      - name: Run Podman-backed e2e suite (guest)
+        run: |
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" bash -s <<'REMOTE'
+          set -euo pipefail
+          source ~/openshell/.e2e.env
+          export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+          cd ~/openshell
+          mise run --no-deps --skip-deps e2e:podman
+          REMOTE
+
+      - name: Check for unexpected SELinux denials (guest)
+        env:
+          AUDIT_WINDOW_START: ${{ steps.audit_window.outputs.start }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" \
+            "AUDIT_WINDOW_START='${AUDIT_WINDOW_START}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          echo "Searching audit log for AVC denials since ${AUDIT_WINDOW_START}"
+          if sudo ausearch -m avc,user_avc -ts "${AUDIT_WINDOW_START}" 2>/dev/null | tee /tmp/avc-denials.log | grep -q .; then
+            echo "::error::SELinux denied one or more operations during the e2e suites; see the log below"
+            cat /tmp/avc-denials.log
+            exit 1
+          fi
+          echo "No SELinux denials recorded."
+          REMOTE
+
+      - name: Collect SELinux/audit context on failure (guest)
+        if: failure()
+        env:
+          AUDIT_WINDOW_START: ${{ steps.audit_window.outputs.start }}
+        run: |
+          set +e
+          # shellcheck disable=SC2086
+          ssh -p "${SSH_PORT}" -i "${GUEST_KEY}" ${SSH_OPTS} "${GUEST_USER}@127.0.0.1" \
+            "AUDIT_WINDOW_START='${AUDIT_WINDOW_START}' bash -s" <<'REMOTE'
+          echo "=== getenforce ==="
+          getenforce
+          echo "=== recent AVC denials ==="
+          sudo ausearch -m avc,user_avc -ts "${AUDIT_WINDOW_START}" 2>/dev/null
+          echo "=== dockerd status ==="
+          sudo systemctl status docker --no-pager
+          echo "=== recent kernel log ==="
+          sudo journalctl -k --no-pager | tail -n 200
+          REMOTE
+          echo "=== host QEMU console log ==="
+          cat /tmp/openshell-e2e-centos/console.log
+          exit 0
+
+      - name: Destroy the CentOS Stream VM
+        if: always()
+        run: tasks/scripts/vm/centos-selinux-vm.sh destroy || true

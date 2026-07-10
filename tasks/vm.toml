@@ -11,6 +11,11 @@
 #
 # See tasks/gateway.toml for `gateway:vm`,
 # crates/openshell-driver-vm/README.md for the VM driver workflow.
+#
+# `vm:centos-selinux:*` is unrelated to the driver above: it boots a CentOS
+# Stream 10 guest under QEMU for the Docker/Podman/SELinux compatibility
+# suite (`.github/workflows/e2e-centos-selinux.yml`), and can be reproduced
+# locally with the same script.
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main Commands
@@ -27,3 +32,23 @@ run = "tasks/scripts/vm/build-supervisor-bundle.sh"
 ["vm:smoke:orphan-cleanup"]
 description = "Smoke test: start gateway+driver, create a sandbox, signal the gateway, assert no orphaned processes survive"
 run = "tasks/scripts/vm/smoke-orphan-cleanup.sh"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CentOS Stream 10 Docker/Podman/SELinux compatibility VM
+# ═══════════════════════════════════════════════════════════════════════════
+
+["vm:centos-selinux:create"]
+description = "Boot a CentOS Stream 10 VM under QEMU for Docker/Podman/SELinux compatibility testing (see e2e-centos-selinux.yml)"
+run = "tasks/scripts/vm/centos-selinux-vm.sh create"
+
+["vm:centos-selinux:status"]
+description = "Show whether the CentOS Stream 10 SELinux compat VM is running"
+run = "tasks/scripts/vm/centos-selinux-vm.sh status"
+
+["vm:centos-selinux:ssh"]
+description = "SSH into the running CentOS Stream 10 SELinux compat VM"
+run = "tasks/scripts/vm/centos-selinux-vm.sh ssh"
+
+["vm:centos-selinux:destroy"]
+description = "Power off and remove the CentOS Stream 10 SELinux compat VM"
+run = "tasks/scripts/vm/centos-selinux-vm.sh destroy"

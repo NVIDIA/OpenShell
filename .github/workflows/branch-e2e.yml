@@ -24,6 +24,7 @@ jobs:
       run_core_e2e: ${{ steps.labels.outputs.run_core_e2e }}
       run_gpu_e2e: ${{ steps.labels.outputs.run_gpu_e2e }}
       run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
+      run_centos_selinux_e2e: ${{ steps.labels.outputs.run_centos_selinux_e2e }}
       run_any_e2e: ${{ steps.labels.outputs.run_any_e2e }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -41,12 +42,14 @@ jobs:
             run_core_e2e=true
             run_gpu_e2e=true
             run_kubernetes_ha_e2e=true
+            run_centos_selinux_e2e=true
           else
             run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
             run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
             run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
+            run_centos_selinux_e2e="$(jq -r 'index("test:e2e-centos") != null' <<< "$LABELS_JSON")"
           fi
-          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ]; then
+          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_centos_selinux_e2e" = "true" ]; then
             run_any_e2e=true
           else
             run_any_e2e=false
@@ -55,6 +58,7 @@ jobs:
             echo "run_core_e2e=$run_core_e2e"
             echo "run_gpu_e2e=$run_gpu_e2e"
             echo "run_kubernetes_ha_e2e=$run_kubernetes_ha_e2e"
+            echo "run_centos_selinux_e2e=$run_centos_selinux_e2e"
             echo "run_any_e2e=$run_any_e2e"
           } >> "$GITHUB_OUTPUT"
 
@@ -145,6 +149,16 @@ jobs:
       extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
       external-postgres-secret: openshell-ha-pg
 
+  centos-selinux-e2e:
+    needs: [pr_metadata, build-supervisor]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_centos_selinux_e2e == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-centos-selinux.yml
+    with:
+      image-tag: ${{ github.sha }}
+
   core-e2e-result:
     name: Core E2E result
     needs: [pr_metadata, build-gateway, build-supervisor, e2e, kubernetes-e2e]
@@ -217,6 +231,31 @@ jobs:
             "build-gateway:$BUILD_GATEWAY_RESULT" \
             "build-supervisor:$BUILD_SUPERVISOR_RESULT" \
             "kubernetes-ha-e2e:$KUBERNETES_HA_E2E_RESULT"; do
+            name="${item%%:*}"
+            result="${item#*:}"
+            if [ "$result" != "success" ]; then
+              echo "::error::$name concluded $result"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  centos-selinux-e2e-result:
+    name: CentOS Stream 10 SELinux E2E result
+    needs: [pr_metadata, build-supervisor, centos-selinux-e2e]
+    if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_centos_selinux_e2e == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify CentOS Stream 10 SELinux E2E jobs
+        env:
+          BUILD_SUPERVISOR_RESULT: ${{ needs.build-supervisor.result }}
+          CENTOS_SELINUX_E2E_RESULT: ${{ needs.centos-selinux-e2e.result }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for item in \
+            "build-supervisor:$BUILD_SUPERVISOR_RESULT" \
+            "centos-selinux-e2e:$CENTOS_SELINUX_E2E_RESULT"; do
             name="${item%%:*}"
             result="${item#*:}"
             if [ "$result" != "success" ]; then

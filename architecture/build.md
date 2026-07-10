@@ -144,7 +144,7 @@ The high-level CI model:
 
 1. PR-context gate jobs publish required statuses for the PR head commit.
 2. Standard branch checks run from trusted mirror branches.
-3. Label-gated E2E, GPU, and Kubernetes checks run from trusted mirror branches.
+3. Label-gated E2E, GPU, Kubernetes, and CentOS Stream/SELinux compatibility checks run from trusted mirror branches.
 4. Gate jobs verify that the mirror branch matches the PR head and that the expected non-gate workflow actually ran.
 5. Release workflows rebuild and publish binaries, wheels, images, and docs.
 
