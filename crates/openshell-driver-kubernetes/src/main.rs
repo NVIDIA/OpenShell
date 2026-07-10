@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use miette::{IntoDiagnostic, Result};
 use std::net::SocketAddr;
 use tracing::info;
@@ -10,8 +10,9 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
-    AppArmorProfile, ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    KubernetesComputeConfig, KubernetesComputeDriver, SupervisorSideloadMethod, SupervisorTopology,
+    AppArmorProfile, ComputeDriverService, DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
+    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesSidecarConfig,
+    SupervisorSideloadMethod, SupervisorTopology,
 };
 
 #[derive(Parser, Debug)]
@@ -80,12 +81,24 @@ struct Args {
     )]
     supervisor_sideload_method: SupervisorSideloadMethod,
 
+    #[arg(long, env = "OPENSHELL_K8S_TOPOLOGY", default_value = "combined")]
+    topology: SupervisorTopology,
+
     #[arg(
-        long,
-        env = "OPENSHELL_SUPERVISOR_TOPOLOGY",
-        default_value = "combined"
+        long = "sidecar-proxy-uid",
+        alias = "proxy-uid",
+        env = "OPENSHELL_K8S_SIDECAR_PROXY_UID",
+        default_value_t = DEFAULT_PROXY_UID
     )]
-    supervisor_topology: SupervisorTopology,
+    sidecar_proxy_uid: u32,
+
+    #[arg(
+        long = "sidecar-process-binary-aware-network-policy",
+        env = "OPENSHELL_K8S_SIDECAR_PROCESS_BINARY_AWARE_NETWORK_POLICY",
+        default_value_t = true,
+        action = ArgAction::Set
+    )]
+    sidecar_process_binary_aware_network_policy: bool,
 
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
@@ -127,10 +140,14 @@ async fn main() -> Result<()> {
         image_pull_secrets: args.sandbox_image_pull_secrets,
         supervisor_image: args
             .supervisor_image
-            .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string()),
+            .unwrap_or_else(openshell_core::config::default_supervisor_image),
         supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
         supervisor_sideload_method: args.supervisor_sideload_method,
-        supervisor_topology: args.supervisor_topology,
+        topology: args.topology,
+        sidecar: KubernetesSidecarConfig {
+            proxy_uid: args.sidecar_proxy_uid,
+            process_binary_aware_network_policy: args.sidecar_process_binary_aware_network_policy,
+        },
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),

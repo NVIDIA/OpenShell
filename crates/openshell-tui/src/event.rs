@@ -51,6 +51,8 @@ pub enum Event {
     SandboxSettingSetResult(Result<u64, String>),
     /// Sandbox setting delete result: `Ok(revision)` or `Err(message)`.
     SandboxSettingDeleteResult(Result<u64, String>),
+    /// Non-fatal warnings from port-forward setup after sandbox creation.
+    ForwardWarnings(Vec<String>),
 }
 
 pub struct EventHandler {

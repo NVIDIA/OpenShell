@@ -28,10 +28,55 @@ use std::sync::OnceLock;
 use tokio::process::{Child, Command};
 use tracing::{debug, info};
 
+/// Process/filesystem enforcement performed by the process supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessEnforcementMode {
+    /// Preserve the existing supervisor behavior: prepare filesystem policy,
+    /// drop privileges, and apply Landlock/seccomp to workload processes.
+    Full,
+    /// Preserve process launch and SSH/session behavior, but skip controls
+    /// that require root or extra Linux capabilities. Kubernetes sidecar mode
+    /// uses this when network policy is enforced by the network sidecar.
+    NetworkOnly,
+}
+
+impl ProcessEnforcementMode {
+    #[must_use]
+    pub const fn uses_privileged_process_setup(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    #[must_use]
+    pub const fn enforces_child_sandbox(self) -> bool {
+        matches!(self, Self::Full | Self::NetworkOnly)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_child_sandbox(
+    policy: &SandboxPolicy,
+    workdir: Option<&str>,
+    enforcement_mode: ProcessEnforcementMode,
+) -> Result<Option<sandbox::linux::PreparedSandbox>> {
+    if !enforcement_mode.enforces_child_sandbox() {
+        return Ok(None);
+    }
+
+    let prepared = if enforcement_mode.uses_privileged_process_setup() {
+        sandbox::linux::prepare(policy, workdir)
+    } else {
+        sandbox::linux::prepare_current_user(policy, workdir)
+    }?;
+    Ok(Some(prepared))
+}
+
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::SANDBOX_TOKEN,
     openshell_core::sandbox_env::SANDBOX_TOKEN_FILE,
     openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
+    openshell_core::sandbox_env::TLS_CA,
+    openshell_core::sandbox_env::TLS_CERT,
+    openshell_core::sandbox_env::TLS_KEY,
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
 ];
 
@@ -443,6 +488,7 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        enforcement_mode: ProcessEnforcementMode,
         netns: Option<&NetworkNamespace>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
@@ -453,6 +499,7 @@ impl ProcessHandle {
             workdir,
             interactive,
             policy,
+            enforcement_mode,
             netns.and_then(NetworkNamespace::ns_fd),
             ca_paths,
             provider_env,
@@ -465,12 +512,14 @@ impl ProcessHandle {
     ///
     /// Returns an error if the process fails to start.
     #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         program: &str,
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        enforcement_mode: ProcessEnforcementMode,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -480,6 +529,7 @@ impl ProcessHandle {
             workdir,
             interactive,
             policy,
+            enforcement_mode,
             ca_paths,
             provider_env,
         )
@@ -493,6 +543,7 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        enforcement_mode: ProcessEnforcementMode,
         netns_fd: Option<RawFd>,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
@@ -552,18 +603,26 @@ impl ProcessHandle {
         // process where the tracing subscriber is functional. The child's
         // pre_exec context cannot reliably emit structured logs.
         #[cfg(target_os = "linux")]
-        sandbox::linux::log_sandbox_readiness(policy, workdir);
+        if enforcement_mode.enforces_child_sandbox() {
+            sandbox::linux::log_sandbox_readiness(policy, workdir);
+        }
 
-        // Phase 1 (as root): Prepare Landlock ruleset by opening PathFds.
-        // This MUST happen before drop_privileges() so that root-only paths
-        // (e.g. mode 700 directories) can be opened. See issue #803.
+        // Phase 1: Prepare Landlock ruleset by opening PathFds.
+        // In full mode this runs before drop_privileges() so root-only paths
+        // can be opened. In sidecar network-only mode the container already
+        // runs as the sandbox UID, so inaccessible paths are unavailable to
+        // the workload and best-effort compatibility skips them.
         #[cfg(target_os = "linux")]
-        let prepared_sandbox = sandbox::linux::prepare(policy, workdir)
+        let prepared_sandbox = prepare_child_sandbox(policy, workdir, enforcement_mode)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
-        let supervisor_identity_mount = supervisor_identity_mount_from_env().map_err(|err| {
-            miette::miette!("Failed to prepare supervisor identity isolation: {err}")
-        })?;
+        let supervisor_identity_mount = if enforcement_mode.uses_privileged_process_setup() {
+            supervisor_identity_mount_from_env().map_err(|err| {
+                miette::miette!("Failed to prepare supervisor identity isolation: {err}")
+            })?
+        } else {
+            None
+        };
 
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
@@ -575,7 +634,7 @@ impl ProcessHandle {
             // Wrap in Option so we can .take() it out of the FnMut closure.
             // pre_exec is only called once (after fork, before exec).
             #[cfg(target_os = "linux")]
-            let mut prepared_sandbox = Some(prepared_sandbox);
+            let mut prepared_sandbox = prepared_sandbox;
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
@@ -600,8 +659,10 @@ impl ProcessHandle {
                     // Drop privileges. initgroups/setgid/setuid need access to
                     // /etc/group and /etc/passwd which would be blocked if
                     // Landlock were already enforced.
-                    drop_privileges(&policy)
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if enforcement_mode.uses_privileged_process_setup() {
+                        drop_privileges(&policy)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
 
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
 
@@ -629,12 +690,14 @@ impl ProcessHandle {
     }
 
     #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
     fn spawn_impl(
         program: &str,
         args: &[String],
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        enforcement_mode: ProcessEnforcementMode,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -697,13 +760,17 @@ impl ProcessHandle {
                     // Drop privileges before applying sandbox restrictions.
                     // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
                     // which may be blocked by Landlock.
-                    drop_privileges(&policy)
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if enforcement_mode.uses_privileged_process_setup() {
+                        drop_privileges(&policy)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
 
                     harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
 
-                    sandbox::apply(&policy, workdir.as_deref())
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    if enforcement_mode.enforces_child_sandbox() {
+                        sandbox::apply(&policy, workdir.as_deref())
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
 
                     Ok(())
                 });
@@ -1454,6 +1521,18 @@ mod tests {
                 || msg.contains("No such file or directory"),
             "expected unknown user/group lookup failure (…not found… or ENOENT): {msg}"
         );
+    }
+
+    #[test]
+    fn full_enforcement_uses_privileged_setup_and_child_sandbox() {
+        assert!(ProcessEnforcementMode::Full.uses_privileged_process_setup());
+        assert!(ProcessEnforcementMode::Full.enforces_child_sandbox());
+    }
+
+    #[test]
+    fn network_only_enforcement_keeps_child_sandbox_without_privileged_setup() {
+        assert!(!ProcessEnforcementMode::NetworkOnly.uses_privileged_process_setup());
+        assert!(ProcessEnforcementMode::NetworkOnly.enforces_child_sandbox());
     }
 
     #[cfg(target_os = "linux")]

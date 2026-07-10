@@ -51,7 +51,7 @@ Query all open issues with the `state:triage-needed` label and process them in s
 gh issue list --label "state:triage-needed" --state open --json number,title --jq '.[].number'
 ```
 
-For each issue returned, run the full triage workflow (Steps 1-6). Report a summary at the end listing each issue and its classification.
+For each issue returned, run the full triage workflow (Steps 1-7). Report a summary at the end listing each issue and its classification.
 
 ## Step 1: Fetch the Issue
 
@@ -89,7 +89,23 @@ Check whether the issue body contains a substantive agent diagnostic section. Lo
 
 **If the diagnostic section is substantive**, proceed to Step 4.
 
-## Step 4: Diagnose and Validate
+## Step 4: Check Reported Version and Known Fixes
+
+Before deeper diagnosis, determine whether the report may already be fixed in a newer release.
+
+1. Extract the reported OpenShell version from the issue body, Agent Diagnostic, environment section, logs, and comments. If no version is provided, record that as missing context and continue.
+2. Check current release information and known fixes when available:
+   - `gh release list --limit 10`
+   - `gh release view <tag>`
+   - linked issues, merged PRs, release notes, and local git tags/history
+3. If network access or release metadata is unavailable, state the limitation in the triage comment instead of guessing.
+
+If the issue targets an older OpenShell release and a newer release or merged PR appears to address the same behavior:
+
+- If the reporter has already reproduced the issue on the fixed/current release, continue to Step 5.
+- If the reporter has not tested the fixed/current release, use the `fixed-in-release` classification in Step 6. Reference the fixing version and PR/issue when known, and ask for a fresh report or reopen if the issue still reproduces on that version.
+
+## Step 5: Diagnose and Validate
 
 Assess the report by investigating the codebase. Use the `principal-engineer-reviewer` sub-agent via the Task tool:
 
@@ -114,7 +130,7 @@ Based on the sub-agent's analysis, also attempt to validate the report directly:
 - For inference and provider-topology issues: reference the `debug-inference` skill's known failure patterns
 - For CLI/usage issues: reference the `openshell-cli` skill's command reference
 
-## Step 5: Classify
+## Step 6: Classify
 
 Based on the investigation, classify the issue into one of these categories:
 
@@ -122,12 +138,13 @@ Based on the investigation, classify the issue into one of these categories:
 |---------------|----------|--------|
 | **bug-confirmed** | Agent diagnostic and codebase analysis confirm a real defect | Apply relevant `area:*` or `topic:*` labels as needed, remove `state:triage-needed`, and assign the built-in `Bug` issue type manually if needed |
 | **feature-valid** | Design proposal is sound, feasible given the architecture | Apply relevant `area:*` or `topic:*` labels as needed, remove `state:triage-needed`, and assign the built-in `Feature` issue type manually if needed |
+| **fixed-in-release** | Report targets an older OpenShell release and a newer release or merged PR appears to address the behavior; no fixed/current-release reproduction is provided | Comment with the fixing version and PR/issue when known. Close as completed when the fix is clear, or request a retest if confirmation is still needed. Remove `state:triage-needed` when closing |
 | **duplicate** | An existing open issue covers this | Link the duplicate, close with comment |
 | **user-error** | The reported behavior is expected, or the issue is a misconfiguration | Comment with explanation and guidance, close |
 | **needs-more-info** | Report is substantive but missing critical reproduction details | Comment requesting specifics, keep `state:triage-needed` |
 | **needs-investigation** | Report appears valid but requires deeper analysis (spike candidate) | Label `spike`, remove `state:triage-needed` |
 
-## Step 6: Post Triage Comment
+## Step 7: Post Triage Comment
 
 Post a structured comment with the triage marker:
 
@@ -136,7 +153,7 @@ Post a structured comment with the triage marker:
 >
 > ## Triage Assessment
 >
-> **Classification:** <classification from Step 5>
+> **Classification:** <classification from Step 6>
 >
 > ### Summary
 > <2-3 sentences: what was found, whether the report is valid>
@@ -148,7 +165,7 @@ Post a structured comment with the triage marker:
 > <Next steps: ready for spike, needs more info from reporter, can be closed, etc.>
 ```
 
-Apply the appropriate labels as determined in Step 5.
+Apply the appropriate labels as determined in Step 6.
 
 **Do not apply `state:agent-ready`.** That is always a human decision.
 

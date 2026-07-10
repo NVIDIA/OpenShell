@@ -78,12 +78,29 @@ so a released chart automatically pulls the matching image without extra overrid
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
 {{- end }}
 
+{{/* Official supervisor repository used by the gateway's built-in default. */}}
+{{- define "openshell.defaultSupervisorRepository" -}}
+ghcr.io/nvidia/openshell/supervisor
+{{- end }}
+
 {{/*
-Supervisor image reference. Same appVersion fallback as openshell.image so
-the supervisor and gateway images stay in sync across releases.
+Whether Helm must propagate a supervisor image override into gateway.toml.
+The chart's documented repository and empty tag are the gateway-owned default.
+*/}}
+{{- define "openshell.supervisorImageOverrideEnabled" -}}
+{{- $defaultRepository := include "openshell.defaultSupervisorRepository" . -}}
+{{- $repository := .Values.supervisor.image.repository | default $defaultRepository -}}
+{{- if or (ne $repository $defaultRepository) .Values.supervisor.image.tag -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Supervisor image override. A tag-only override uses the official repository;
+a repository-only override uses the effective gateway image tag.
 */}}
 {{- define "openshell.supervisorImage" -}}
-{{- printf "%s:%s" .Values.supervisor.image.repository (.Values.supervisor.image.tag | default .Chart.AppVersion) }}
+{{- $repository := .Values.supervisor.image.repository | default (include "openshell.defaultSupervisorRepository" .) -}}
+{{- $tag := .Values.supervisor.image.tag | default .Values.image.tag | default .Chart.AppVersion -}}
+{{- printf "%s:%s" $repository $tag }}
 {{- end }}
 
 {{/*

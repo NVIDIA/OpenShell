@@ -25,6 +25,8 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
 
 ## Install on OpenShift
 
+See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) for details. Quick start:
+
 ```shell
 # Precreate the openshell namespace so we can create the SCC cluster role
 oc create ns openshell
@@ -235,10 +237,12 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | serviceAccount.create | bool | `true` | Create a service account for the gateway. |
 | serviceAccount.name | string | `""` | Existing service account name to use when serviceAccount.create is false. |
 | supervisor.image.pullPolicy | string | `""` | Supervisor image pull policy. Defaults to the gateway image pull policy when empty. |
-| supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. |
-| supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.image.repository | string | `"ghcr.io/nvidia/openshell/supervisor"` | Supervisor image repository. Changing it uses the effective gateway image tag unless tag is also set. |
+| supervisor.image.tag | string | `""` | Supervisor image tag override. Empty uses the version pinned into the gateway unless repository is changed. |
+| supervisor.sidecar.processBinaryAwareNetworkPolicy | bool | `true` | Keep process/binary-aware network policy enabled in sidecar topology. When false, the network sidecar runs as proxyUid, drops the extra /proc inspection capabilities, and enforces endpoint/L7 policy without matching policy.binaries. |
+| supervisor.sidecar.proxyUid | int | `1337` | UID for relaxed long-running network sidecars in sidecar topology. Strict process/binary-aware sidecars run as UID 0 so Kubernetes grants the required /proc inspection capabilities into the effective set. The network init container installs nftables rules that exempt the effective sidecar UID. |
 | supervisor.sideloadMethod | string | `""` | How the supervisor binary is delivered into sandbox pods. Empty (default) = auto-detect from cluster version:   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)   K8s < v1.35 -> "init-container" (copies via init container + emptyDir) On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled, set this to "image-volume" explicitly. |
-| supervisor.topology | string | `"combined"` | Supervisor pod topology for Kubernetes sandboxes. "combined" runs networking and process supervision in the agent container. |
+| supervisor.topology | string | `"combined"` | Supervisor pod topology for Kubernetes sandboxes. "combined" runs the current single supervisor container in the agent pod. "sidecar" runs network enforcement in a dedicated sidecar and the process supervisor as a low-capability wrapper in the agent container. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | workload.allowMultiReplicaStatefulSet | bool | `false` | Allow replicaCount > 1 while rendering a StatefulSet. Prefer workload.kind=deployment for external database-backed multi-replica gateways; this override exists for operators who explicitly require StatefulSet identity or storage semantics. |
 | workload.kind | string | `"statefulset"` | Gateway workload controller kind. Use `statefulset` for the default SQLite database, or `deployment` when server.externalDbSecret points at an external database. |

@@ -393,6 +393,21 @@ require_cmd() {
   fi
 }
 
+configure_fixture_container_engine() {
+  [ -n "${CONTAINER_ENGINE:-}" ] || return 0
+  local selected_engine
+  selected_engine="$(printf '%s' "${CONTAINER_ENGINE}" | tr '[:upper:]' '[:lower:]')"
+  case "${selected_engine}" in
+    docker|podman)
+      ;;
+    *)
+      echo "ERROR: CONTAINER_ENGINE=${CONTAINER_ENGINE} is invalid; expected docker or podman" >&2
+      exit 2
+      ;;
+  esac
+  export CONTAINER_ENGINE="${selected_engine}"
+}
+
 require_cmd helm
 require_cmd kubectl
 require_cmd curl
@@ -422,6 +437,8 @@ else
   export KUBECONFIG="${WORKDIR}/kubeconfig"
   KUBE_CONTEXT="k3d-${CLUSTER_NAME}"
 fi
+
+configure_fixture_container_engine
 
 if [ -z "${OPENSHELL_E2E_KUBE_BUILD_IMAGES+x}" ]; then
   if [ "${CLUSTER_CREATED_BY_US}" = "1" ]; then
@@ -501,7 +518,7 @@ if [ -z "${HOST_GATEWAY_IP}" ] \
     # is unreachable for the typical test-host listener (0.0.0.0 bind).
     detected="$(docker network inspect "${net}" \
       -f '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' 2>/dev/null \
-      | awk '/^[0-9.]+$/ { print; exit }')"
+      | awk '/^[0-9.]+$/ { print; exit }' || true)"
     if [ -n "${detected}" ]; then
       HOST_GATEWAY_IP="${detected}"
       echo "Detected host gateway IP ${HOST_GATEWAY_IP} from docker network '${net}'."

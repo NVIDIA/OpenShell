@@ -29,6 +29,34 @@ pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
 /// Deployment-controlled telemetry toggle propagated to the sandbox supervisor.
 pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
 
+/// Supervisor pod/runtime topology. Kubernetes sidecar mode sets this to
+/// `"sidecar"`; the default combined supervisor path omits it.
+pub const SUPERVISOR_TOPOLOGY: &str = "OPENSHELL_SUPERVISOR_TOPOLOGY";
+
+/// Network enforcement backend selected by the compute driver.
+pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
+
+/// Whether network policy evaluation must bind requests to the peer binary.
+///
+/// The default when unset is `"required"`. Kubernetes sidecar experiments may
+/// set this to `"relaxed"` to enforce endpoint and L7 policy without per-binary
+/// `/proc` identity binding.
+pub const NETWORK_BINARY_IDENTITY: &str = "OPENSHELL_NETWORK_BINARY_IDENTITY";
+
+/// Unix socket used by Kubernetes sidecar topology for local coordination.
+///
+/// The network sidecar owns gateway credentials and serves policy/provider
+/// state over this socket instead of exposing gateway credentials to the agent
+/// container.
+pub const SIDECAR_CONTROL_SOCKET: &str = "OPENSHELL_SIDECAR_CONTROL_SOCKET";
+
+/// Optional TLS server name override used when connecting to the gateway.
+pub const GATEWAY_TLS_SERVER_NAME: &str = "OPENSHELL_GATEWAY_TLS_SERVER_NAME";
+
+/// Directory where the network supervisor writes the proxy CA files consumed
+/// by workload child processes.
+pub const PROXY_TLS_DIR: &str = "OPENSHELL_PROXY_TLS_DIR";
+
 /// Path to the CA certificate for mTLS communication with the gateway.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";
 

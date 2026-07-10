@@ -81,13 +81,51 @@ The supervisor must be available inside each sandbox workload:
 |---|---|
 | Docker | Bind-mounted local supervisor binary, or a binary extracted from the configured supervisor image. |
 | Podman | Read-only OCI image volume containing the supervisor binary. |
-| Kubernetes | Sandbox pod image or pod template configuration. |
+| Kubernetes | Supervisor image side-loaded into the sandbox pod by image volume or init container. |
 | VM | Embedded in the guest rootfs bundle. |
 | Extension | Defined by the out-of-tree driver. |
 
 Driver-controlled environment variables must override sandbox image or template
 values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
 paths, and command metadata.
+
+Kubernetes can run the supervisor in the default combined topology or in a
+sidecar topology. Combined mode keeps network and process supervision in the
+agent container. Sidecar mode runs network enforcement, the proxy, and gateway
+session in a dedicated sidecar, while the agent container runs only the
+process-supervision leaf and launches the user workload after the sidecar
+serves bootstrap state over a local control socket. The network sidecar owns
+gateway credentials and sends policy plus workload-facing provider environment
+state to the process leaf over that socket. It also streams provider
+environment updates after settings polls so future process sessions see
+updated provider env without giving the process leaf gateway access. The
+pre-workload process supervisor is the only accepted control client: the
+network sidecar verifies its UID, GID, and PID with peer credentials, removes
+the listener after accepting it, and ignores workload-supplied relay targets.
+SSH relays use a Linux abstract socket and verify its peer PID against that
+authenticated process-supervisor connection, so workload filesystem access
+cannot replace the relay endpoint. Either supervisor exits when this control
+connection closes. This couples their restart lifecycle and prevents a workload
+that survives an isolated network-sidecar restart from becoming the next
+authoritative control client. In sidecar mode, an init container performs the
+privileged pod-network nftables setup with
+`NET_ADMIN`. The default binary-aware network sidecar runs as UID 0 without
+`NET_ADMIN` and adds `SYS_PTRACE` plus `DAC_READ_SEARCH` so it can resolve
+cross-UID workload process/binary identity through shared `/proc`. Operators
+can set the sidecar `process_binary_aware_network_policy` flag false to run the
+sidecar as the configured non-root proxy UID, omit both inspection capabilities,
+and downgrade network policy to endpoint/L7 matching without `policy.binaries`.
+The init path applies nftables as individual commands so optional conntrack and
+log expressions can fail without rolling back the required table, chain, and
+reject rules.
+The agent container runs as the resolved sandbox UID/GID with no added Linux
+capabilities. Sidecar mode preserves gateway session and SSH behavior, but
+treats the process leaf as network-only: Landlock filesystem policy and child
+seccomp still apply where supported, while process privilege dropping and
+supervisor identity mount isolation do not run because the agent container is
+already unprivileged. Sidecar pods use a shared process namespace so the
+network sidecar can resolve workload process and binary identity through
+`/proc/<entrypoint-pid>`.
 
 ## Images
 

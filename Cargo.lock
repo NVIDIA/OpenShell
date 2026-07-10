@@ -3829,6 +3829,7 @@ dependencies = [
  "clap",
  "futures",
  "miette",
+ "nix",
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
@@ -3836,8 +3837,10 @@ dependencies = [
  "openshell-supervisor-middleware-builtins",
  "openshell-supervisor-network",
  "openshell-supervisor-process",
+ "prost",
  "prost-types",
  "rustls",
+ "serde",
  "serde_json",
  "temp-env",
  "tempfile",
@@ -4057,7 +4060,6 @@ dependencies = [
  "terminal-colorsaurus",
  "tokio",
  "tonic",
- "tracing",
  "url",
 ]
 
