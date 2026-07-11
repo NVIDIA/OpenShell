@@ -1,0 +1,96 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Error Handling"
+description: "SDK error types, gRPC status code mapping, and retry patterns."
+keywords: "Go SDK, Errors, gRPC, Status Codes, Retry, Error Handling"
+---
+
+The SDK translates gRPC status codes into typed Go errors. All errors
+returned by client methods can be inspected with `errors.As` to extract
+structured details.
+
+## StatusError
+
+The primary error type is `types.StatusError`:
+
+```go
+import "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
+
+sandbox, err := client.Sandboxes().Get(ctx, "missing")
+if err != nil {
+    var se *types.StatusError
+    if errors.As(err, &se) {
+        fmt.Printf("Code: %d, Message: %s\n", se.Code, se.Message)
+    }
+}
+```
+
+## Error Codes
+
+The SDK defines error codes that map to gRPC status codes:
+
+| SDK Error Code | gRPC Status | Meaning |
+|----------------|-------------|---------|
+| `ErrorNotFound` | `NOT_FOUND` | Resource does not exist |
+| `ErrorAlreadyExists` | `ALREADY_EXISTS` | Resource name conflict |
+| `ErrorInvalidArgument` | `INVALID_ARGUMENT` | Bad request parameters |
+| `ErrorPermissionDenied` | `PERMISSION_DENIED` | Insufficient credentials |
+| `ErrorUnavailable` | `UNAVAILABLE` | Gateway is unreachable |
+| `ErrorDeadlineExceeded` | `DEADLINE_EXCEEDED` | Request timed out |
+| `ErrorCancelled` | `CANCELLED` | Request was cancelled |
+| `ErrorInternal` | `INTERNAL` | Server-side failure |
+| `ErrorUnimplemented` | `UNIMPLEMENTED` | Operation not supported |
+| `ErrorConflict` | `ABORTED` / `FAILED_PRECONDITION` | Conflicting operation |
+
+## Checking Error Types
+
+Use helper functions or direct comparison:
+
+```go
+if err != nil {
+    var se *types.StatusError
+    if errors.As(err, &se) {
+        switch se.Code {
+        case types.ErrorNotFound:
+            // Handle missing resource
+        case types.ErrorUnavailable:
+            // Retry or fail over
+        default:
+            // Log and return
+        }
+    }
+}
+```
+
+## Retry Configuration
+
+Configure automatic retries for transient failures:
+
+```go
+client, err := gateway.NewClient("my-gateway",
+    gateway.WithRetryPolicy(&types.RetryPolicy{
+        MaxRetries: 3,
+        InitialWait: 100 * time.Millisecond,
+    }),
+)
+```
+
+The retry policy applies to `Unavailable` and `DeadlineExceeded` errors.
+Other error codes are returned immediately without retrying.
+
+## Context Cancellation
+
+All client methods accept a `context.Context`. Cancelled or timed-out
+contexts produce standard Go `context.Canceled` or
+`context.DeadlineExceeded` errors:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+sandboxes, err := client.Sandboxes().List(ctx)
+if errors.Is(err, context.DeadlineExceeded) {
+    // Request timed out
+}
+```

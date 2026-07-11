@@ -1,0 +1,105 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Architecture"
+description: "Module structure, gRPC transport layer, and proto isolation pattern in the Go SDK."
+keywords: "Go SDK, Architecture, gRPC, Protobuf, Module Structure, Transport"
+---
+
+The Go SDK follows a layered architecture that keeps protocol details
+internal while exposing idiomatic Go types to consumers.
+
+## Module Structure
+
+```
+sdk/go/
+├── openshell/v1/           # Public API surface
+│   ├── client.go           # Top-level Client with sub-clients
+│   ├── gateway/            # Gateway client factory (reads CLI config)
+│   ├── edge/               # Edge API client
+│   ├── fake/               # In-memory fakes for testing
+│   ├── types/              # Domain types (Config, errors, options)
+│   ├── oidc/               # OIDC authentication
+│   └── internal/           # Internal helpers (not importable)
+│       ├── converter/      # Proto-to-SDK type conversion
+│       └── grpc/           # gRPC connection management
+└── proto/                  # Proto definitions + generated code
+    ├── openshellv1/        # Generated .pb.go files
+    ├── datamodelv1/
+    └── sandboxv1/
+```
+
+## Transport Layer
+
+The SDK communicates with the OpenShell gateway over gRPC. The transport
+is fully internal, and consumers interact only with Go types.
+
+```
+Consumer Code
+    │
+    ▼
+openshell/v1.Client         ← Public API (Go types)
+    │
+    ▼
+internal/converter          ← Proto ↔ SDK type conversion
+    │
+    ▼
+internal/grpc               ← Connection management, TLS, auth
+    │
+    ▼
+gRPC transport              ← Wire protocol
+```
+
+## Proto Isolation
+
+Generated protobuf types live in `proto/` packages and are never exposed
+through the public API. The `internal/converter` package handles all
+translation between proto messages and SDK domain types.
+
+This means:
+
+- Consumers never import `proto/` packages directly.
+- Proto schema changes do not break the public API.
+- Deep copies happen at the boundary, so returned values are safe to mutate.
+
+## Sub-Clients
+
+The top-level `Client` provides access to domain-specific sub-clients:
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `Sandboxes()` | `SandboxInterface` | Create, list, get, delete sandboxes |
+| `Providers()` | `ProviderInterface` | List and inspect compute providers |
+| `Services()` | `ServiceInterface` | Manage sandbox services |
+| `Exec()` | `ExecInterface` | Execute commands in sandboxes |
+| `Files()` | `FileInterface` | Upload and download files |
+| `Health()` | `HealthInterface` | Gateway health checks |
+| `SSH()` | `SSHInterface` | SSH tunnel management |
+| `TCP()` | `TCPInterface` | TCP port forwarding |
+| `Config()` | `ConfigInterface` | Sandbox configuration management |
+| `Policy()` | `PolicyInterface` | Network policy management |
+
+## Client Construction
+
+There are two ways to create a client:
+
+**From gateway configuration** (reads `~/.config/openshell/`):
+
+```go
+client, err := gateway.NewClient("my-gateway")
+```
+
+**From explicit configuration**:
+
+```go
+client, err := v1.NewClient(types.Config{
+    Address: "localhost:8080",
+    Auth:    myAuthProvider,
+})
+```
+
+## Concurrency
+
+All client methods are safe for concurrent use. The underlying gRPC
+connection handles multiplexing. Call `client.Close()` when done to
+release resources.

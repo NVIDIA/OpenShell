@@ -1,0 +1,97 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Authentication"
+description: "OIDC authentication, token refresh, and gateway auth configuration for the Go SDK."
+keywords: "Go SDK, Authentication, OIDC, Token Refresh, TLS, Security"
+---
+
+The Go SDK supports multiple authentication modes depending on how the
+gateway is configured. The gateway client reads auth settings from the
+CLI configuration automatically.
+
+## Authentication Modes
+
+| Mode | When to Use | Configuration |
+|------|-------------|---------------|
+| **OIDC** | Production gateways with identity provider | `openshell gateway auth` configures tokens |
+| **API Key** | Simple deployments, development | Set via gateway config or `WithAuth` option |
+| **None** | Local development, insecure gateways | Default when no auth is configured |
+
+## Automatic Auth (Recommended)
+
+When using `gateway.NewClient()`, authentication is resolved automatically
+from the CLI configuration:
+
+```go
+// Auth is read from ~/.config/openshell/<gateway>/config.yaml
+client, err := gateway.NewClient("my-gateway")
+```
+
+The CLI stores OIDC tokens after `openshell gateway auth`. The SDK reads
+these tokens from disk and wraps them with `RefreshableToken` for
+automatic re-reading when the token file is updated.
+
+## Token Refresh
+
+You can wrap any auth provider with `NewTokenRefresher` to add
+token-expiry-aware refresh logic with configurable leeway:
+
+```go
+import v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
+
+refresher := v1.NewTokenRefresher(baseAuth,
+    v1.WithLeeway(30 * time.Second),
+    v1.WithLogger(myLogger),
+)
+
+client, err := gateway.NewClient("my-gateway",
+    gateway.WithAuth(refresher),
+)
+```
+
+## Custom Auth Provider
+
+For programmatic authentication, implement the `AuthProvider` interface
+or use the built-in providers:
+
+```go
+// Static API key
+client, err := gateway.NewClient("my-gateway",
+    gateway.WithAuth(v1.StaticToken("my-api-key")),
+)
+```
+
+The `AuthProvider` interface provides gRPC per-RPC credentials. Each
+call attaches the token to the request metadata automatically.
+
+## TLS Configuration
+
+Control TLS settings when connecting to gateways:
+
+```go
+client, err := gateway.NewClient("my-gateway",
+    gateway.WithTLS(&types.TLSConfig{
+        Insecure: false,
+        CAFile:   "/path/to/ca.crt",
+    }),
+)
+```
+
+For local development with self-signed certificates, you can skip
+verification, but this should never be used in production.
+
+## Testing with Fakes
+
+The fake client does not require authentication. Use it in tests to
+avoid gateway dependencies:
+
+```go
+import "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/fake"
+
+func TestMyFeature(t *testing.T) {
+    client := fake.NewClient()
+    // Use client.Sandboxes(), client.Exec(), etc.
+    // No gateway connection or auth needed.
+}
+```

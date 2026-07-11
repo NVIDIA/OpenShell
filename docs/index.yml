@@ -23,6 +23,20 @@ navigation:
   title: "Observability"
 - folder: kubernetes
   title: "Kubernetes"
+- section: "SDKs"
+  slug: sdks
+  contents:
+  - section: "Go SDK"
+    slug: go
+    contents:
+    - page: "Getting Started"
+      path: sdks/go/getting-started.mdx
+    - page: "Architecture"
+      path: sdks/go/architecture.mdx
+    - page: "Error Handling"
+      path: sdks/go/error-handling.mdx
+    - page: "Authentication"
+      path: sdks/go/authentication.mdx
 - folder: reference
   title: "Reference"
 - folder: security

@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[tasks."go:proto"]
+description = "Regenerate Go protobuf bindings"
+dir = "sdk/go"
+run = "mise run proto:gen"
+
+[tasks."go:proto:check"]
+description = "Verify generated Go protobuf files are up to date"
+dir = "sdk/go"
+run = "mise run proto:check"
+
+[tasks."go:lint"]
+description = "Run Go linter"
+dir = "sdk/go"
+run = "mise run lint"
+
+[tasks."go:build"]
+description = "Build Go SDK packages"
+dir = "sdk/go"
+run = "mise run build"
+
+[tasks."go:test"]
+description = "Run Go SDK tests"
+dir = "sdk/go"
+run = "mise run test"

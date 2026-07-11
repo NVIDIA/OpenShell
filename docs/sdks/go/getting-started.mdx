@@ -1,0 +1,101 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Getting Started"
+description: "Install the OpenShell Go SDK, connect to a gateway, and make your first API call."
+keywords: "Go SDK, Installation, Quickstart, Gateway, gRPC, Sandbox"
+---
+
+The Go SDK provides typed clients for the OpenShell gateway and edge APIs.
+It wraps gRPC transport and exposes idiomatic Go types with functional option
+configuration.
+
+## Installation
+
+```shell
+go get github.com/NVIDIA/OpenShell/sdk/go@latest
+```
+
+Requires Go 1.24 or later.
+
+## Connect to a Gateway
+
+The gateway client reads connection details from the CLI configuration
+(`~/.config/openshell/`). Pass the gateway name or leave it empty to use
+the active gateway.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/gateway"
+)
+
+func main() {
+    // Connect to the active gateway (configured via `openshell gateway use`).
+    client, err := gateway.NewClient("")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer client.Close()
+
+    // List sandboxes.
+    ctx := context.Background()
+    sandboxes, err := client.Sandboxes().List(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, sb := range sandboxes {
+        fmt.Printf("Sandbox: %s (phase: %s)\n", sb.Name, sb.Status.Phase)
+    }
+}
+```
+
+## Create a Sandbox
+
+```go
+sandbox, err := client.Sandboxes().Create(ctx, "my-sandbox", &types.SandboxSpec{
+    Template: types.SandboxTemplate{
+        Image: "ubuntu:24.04",
+    },
+}, nil)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("Created sandbox %s\n", sandbox.Name)
+```
+
+## Run a Command
+
+```go
+result, err := client.Exec().Run(ctx, "my-sandbox", []string{"echo", "hello"})
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(string(result.Stdout))
+```
+
+## Client Options
+
+Configure the client with functional options:
+
+```go
+client, err := gateway.NewClient("my-gateway",
+    gateway.WithTimeout(30 * time.Second),
+    gateway.WithLogger(myLogger),
+    gateway.WithRetryPolicy(&types.RetryPolicy{
+        MaxRetries: 3,
+        InitialWait: 100 * time.Millisecond,
+    }),
+)
+```
+
+## Next Steps
+
+- [Architecture](/sdks/go/architecture) for module structure and transport details
+- [Error Handling](/sdks/go/error-handling) for SDK error types and retry patterns
+- [Authentication](/sdks/go/authentication) for OIDC and token configuration

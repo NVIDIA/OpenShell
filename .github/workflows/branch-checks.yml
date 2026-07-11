@@ -190,3 +190,31 @@ jobs:
 
       - name: Lint
         run: mise run markdown:lint
+
+  go:
+    name: Go
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Lint
+        run: mise run go:lint
+
+      - name: Build
+        run: mise run go:build
+
+      - name: Test
+        run: mise run go:test
+
+      - name: Proto check
+        run: mise run go:proto:check
