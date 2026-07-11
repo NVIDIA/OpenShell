@@ -2891,8 +2891,8 @@ pub async fn service_forward_tcp(
                 let (socket, peer) = accepted
                     .into_diagnostic()
                     .wrap_err("failed to accept local forward connection")?;
-                // Forwarded request/response bytes are relayed in small frames;
-                // Nagle's algorithm would add per-write latency.
+                // set TCP_NODELAY so small forwarded writes are not delayed. Okay if it
+                // fails; things just go a bit slower in some cases, so we log and continue.
                 if let Err(err) = socket.set_nodelay(true) {
                     tracing::debug!(peer = %peer, error = %err, "failed to set TCP_NODELAY");
                 }

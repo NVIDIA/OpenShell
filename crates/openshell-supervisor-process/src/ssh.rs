@@ -630,7 +630,7 @@ pub async fn connect_in_netns(
             .map_err(|_| std::io::Error::other("netns connect thread panicked"))??;
         std_stream.set_nonblocking(true)?;
         let stream = tokio::net::TcpStream::from_std(std_stream)?;
-        crate::supervisor_session::set_relay_nodelay(&stream);
+        crate::net::set_nodelay_best_effort(&stream);
         return Ok(stream);
     }
 
@@ -638,7 +638,7 @@ pub async fn connect_in_netns(
     let _ = netns_fd;
 
     let stream = tokio::net::TcpStream::connect(addr).await?;
-    crate::supervisor_session::set_relay_nodelay(&stream);
+    crate::net::set_nodelay_best_effort(&stream);
     Ok(stream)
 }
 
@@ -1279,9 +1279,7 @@ mod tests {
     use super::*;
     use std::process::Stdio;
 
-    /// Regression test: direct-tcpip forwards must disable Nagle's algorithm,
-    /// otherwise every small response from a sandbox service waits on delayed
-    /// ACKs and adds milliseconds of latency per round trip.
+    /// Regression test: the direct-tcpip connect path sets `TCP_NODELAY`.
     #[tokio::test]
     async fn connect_in_netns_sets_tcp_nodelay() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

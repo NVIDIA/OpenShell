@@ -101,8 +101,8 @@ async fn accept_loop(listener: TcpListener, config: Arc<TunnelConfig>) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 debug!(peer = %peer, "accepted local tunnel connection");
-                // Small gRPC frames must flush immediately; Nagle's algorithm
-                // otherwise adds per-write latency on this loopback hop.
+                // set TCP_NODELAY so small gRPC frames are not delayed. Okay if it fails;
+                // things just go a bit slower in some cases, so we log and continue.
                 if let Err(e) = stream.set_nodelay(true) {
                     debug!(peer = %peer, error = %e, "failed to set TCP_NODELAY");
                 }
@@ -179,8 +179,9 @@ async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream
         .await
         .map_err(|e| miette::miette!("WebSocket connect failed: {e}"))?;
 
-    // Disable Nagle's algorithm on the WebSocket's underlying TCP stream:
-    // tunneled gRPC frames are small and latency-sensitive.
+    // set TCP_NODELAY on the WebSocket's TCP stream so small gRPC frames are
+    // not delayed. Okay if it fails; things just go a bit slower in some
+    // cases, so we log and continue.
     let tcp = match ws_stream.get_ref() {
         MaybeTlsStream::Plain(tcp) => Some(tcp),
         MaybeTlsStream::Rustls(tls) => Some(tls.get_ref().0),

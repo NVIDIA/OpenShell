@@ -266,8 +266,9 @@ impl ProxyHandle {
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
-                        // Proxied frames are relayed as they arrive; Nagle's
-                        // algorithm would delay every small response.
+                        // set TCP_NODELAY so small relayed writes are not delayed. Okay
+                        // if it fails; things just go a bit slower in some cases, so we
+                        // log and continue.
                         if let Err(e) = stream.set_nodelay(true) {
                             tracing::debug!(error = %e, "failed to set TCP_NODELAY on accepted proxy connection");
                         }
@@ -2094,12 +2095,9 @@ async fn write_all(writer: &mut (impl tokio::io::AsyncWrite + Unpin), data: &[u8
     Ok(())
 }
 
-/// Connect to an upstream address with `TCP_NODELAY` set.
-///
-/// Tunneled request/response bytes are relayed as they arrive; without
-/// `TCP_NODELAY`, Nagle's algorithm holds back every sub-MSS write and adds
-/// milliseconds of latency to each small request/response round trip. Setting
-/// it is best-effort: a failure only costs latency, so we log and continue.
+/// Connect to `addrs` with `TCP_NODELAY` set so small relayed writes are not
+/// delayed. Best-effort: okay if it fails, things just go a bit slower, so we
+/// log and continue.
 async fn connect_upstream(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
     let stream = TcpStream::connect(addrs).await?;
     if let Err(e) = stream.set_nodelay(true) {
@@ -4390,9 +4388,7 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    /// Regression test: upstream connections must disable Nagle's algorithm,
-    /// otherwise every small tunneled request waits on delayed ACKs and adds
-    /// milliseconds of latency per round trip.
+    /// Regression test: the upstream connect path sets `TCP_NODELAY`.
     #[tokio::test]
     async fn connect_upstream_sets_tcp_nodelay() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

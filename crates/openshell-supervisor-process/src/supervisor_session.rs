@@ -621,12 +621,12 @@ async fn connect_tcp_target(
             .map_err(|_| "netns tcp connect thread panicked")??;
         stream.set_nonblocking(true)?;
         let stream = tokio::net::TcpStream::from_std(stream)?;
-        set_relay_nodelay(&stream);
+        crate::net::set_nodelay_best_effort(&stream);
         return Ok(stream);
     }
 
     let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
-    set_relay_nodelay(&stream);
+    crate::net::set_nodelay_best_effort(&stream);
     Ok(stream)
 }
 
@@ -637,20 +637,8 @@ async fn connect_tcp_target(
     _netns_fd: Option<i32>,
 ) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
     let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
-    set_relay_nodelay(&stream);
+    crate::net::set_nodelay_best_effort(&stream);
     Ok(stream)
-}
-
-/// Disable Nagle's algorithm on a relayed TCP target, best-effort.
-///
-/// Relayed request/response bytes are small and latency-sensitive; without
-/// `TCP_NODELAY` every sub-MSS write waits on a delayed ACK, adding
-/// milliseconds per round trip. A failure here only costs latency, so we log
-/// and continue rather than fail the connection.
-pub(crate) fn set_relay_nodelay(stream: &tokio::net::TcpStream) {
-    if let Err(e) = stream.set_nodelay(true) {
-        debug!(error = %e, "failed to set TCP_NODELAY on relay target");
-    }
 }
 
 #[cfg(test)]
@@ -692,9 +680,7 @@ mod target_tests {
         }
     }
 
-    /// Regression test: relayed TCP targets must disable Nagle's algorithm,
-    /// otherwise every small tunneled request waits on delayed ACKs and adds
-    /// milliseconds of latency per round trip.
+    /// Regression test: the TCP relay connect path sets `TCP_NODELAY`.
     #[tokio::test]
     async fn connect_tcp_target_sets_tcp_nodelay() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

@@ -549,8 +549,8 @@ async fn serve_gateway_listener(
             }
         };
 
-        // Disable Nagle's algorithm: gateway responses and tunnel relay frames
-        // are small, latency-sensitive writes that must not wait for delayed ACKs.
+        // set TCP_NODELAY so small gRPC frames are not delayed. Okay if it fails;
+        // things just go a bit slower in some cases, so we log and continue.
         if let Err(e) = stream.set_nodelay(true) {
             debug!(error = %e, client = %addr, "Failed to set TCP_NODELAY on accepted connection");
         }
