@@ -1,0 +1,24 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+package types
+
+import "time"
+
+// Provider represents an AI provider registration.
+type Provider struct {
+	ID              string
+	Name            string
+	Type            string
+	CreatedAt       time.Time
+	Labels          map[string]string
+	ResourceVersion uint64
+	Spec            ProviderSpec
+}
+
+// ProviderSpec holds provider-specific configuration and credentials.
+type ProviderSpec struct {
+	Credentials         map[string]string
+	Config              map[string]string
+	CredentialExpiresAt map[string]time.Time
+}
