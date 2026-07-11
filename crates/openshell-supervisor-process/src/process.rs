@@ -234,10 +234,85 @@ fn validate_capability_bounding_set_clear(
                 "Failed to clear unknown child capability bounding set entries: {unknown_err}"
             )),
         },
+        Err(err) if err.code() == libc::EPERM => Err(miette::miette!(
+            "Failed to clear child capability bounding set: CAP_SETPCAP is not in the \
+             effective set (EPERM) and capabilities remain raised: {remaining:?}; \
+             configure the container runtime to grant CAP_SETPCAP to the supervisor"
+        )),
         Err(err) => Err(miette::miette!(
             "Failed to clear child capability bounding set: {err}"
         )),
     }
+}
+
+/// Preflight check for the child capability bounding-set clear, run in the
+/// parent before `fork()`. The clear is fail-closed inside `pre_exec`, a
+/// context that cannot reliably emit structured logs — without this check a
+/// blocked clear surfaces only as an opaque child exit.
+///
+/// The probe tries a non-destructive `bounding::drop()` on a capability
+/// that is already absent from the bounding set. This triggers the same
+/// `prctl(PR_CAPBSET_DROP)` syscall that `bounding::clear()` uses, so
+/// environments where `CAP_SETPCAP` is missing from the effective set
+/// (e.g. container runtimes that do not grant it, LSM restrictions) are
+/// detected here. On detection, emit an OCSF `DetectionFinding` and refuse
+/// the spawn with a diagnostic error.
+#[cfg(target_os = "linux")]
+fn check_capability_bounding_set_readiness() -> Result<()> {
+    // The child clears the bounding set only when it starts as root.
+    if !nix::unistd::geteuid().is_root() {
+        return Ok(());
+    }
+
+    let bounding = capctl::caps::bounding::probe();
+    // An EPERM clear is tolerated when the set is already empty.
+    if bounding.is_empty() {
+        return Ok(());
+    }
+
+    // Find a capability NOT in the bounding set so that drop() is a no-op
+    // when the syscall is permitted.  If every known capability is raised
+    // (unusual), skip the probe — clear() is attempted in the child and
+    // fails the spawn there.
+    let probe_cap = capctl::caps::Cap::iter().find(|cap| !bounding.has(*cap));
+    let clear_blocked = probe_cap.is_some_and(|cap| {
+        capctl::caps::bounding::drop(cap).is_err_and(|e| e.code() == libc::EPERM)
+    });
+
+    if !clear_blocked {
+        return Ok(());
+    }
+
+    openshell_ocsf::ocsf_emit!(
+        openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(openshell_ocsf::ActivityId::Open)
+            .severity(openshell_ocsf::SeverityId::High)
+            .confidence(openshell_ocsf::ConfidenceId::High)
+            .is_alert(true)
+            .finding_info(
+                openshell_ocsf::FindingInfo::new(
+                    "bounding-set-clear-blocked",
+                    "Capability Bounding Set Clear Blocked",
+                )
+                .with_desc(
+                    "The supervisor cannot clear the child capability bounding set \
+                     because PR_CAPBSET_DROP returns EPERM — CAP_SETPCAP is not \
+                     in the effective set. The spawn is refused to keep privilege \
+                     drop fail-closed. Configure the container runtime to grant \
+                     CAP_SETPCAP to the supervisor.",
+                ),
+            )
+            .message(format!(
+                "PR_CAPBSET_DROP blocked, refusing spawn with non-empty capability bounding set: {bounding:?}"
+            ))
+            .build()
+    );
+
+    Err(miette::miette!(
+        "Cannot clear the child capability bounding set: PR_CAPBSET_DROP returns EPERM \
+         (CAP_SETPCAP is not in the effective set) and capabilities remain raised: {bounding:?}; \
+         configure the container runtime to grant CAP_SETPCAP to the supervisor"
+    ))
 }
 
 // Pins the pre-seccomp child mount namespace where supervisor identity sockets
@@ -605,6 +680,15 @@ impl ProcessHandle {
         #[cfg(target_os = "linux")]
         if enforcement_mode.enforces_child_sandbox() {
             sandbox::linux::log_sandbox_readiness(policy, workdir);
+        }
+
+        // Fail fast when the child's capability bounding-set clear would
+        // fail: the clear is fail-closed inside pre_exec, which cannot emit
+        // structured logs, so the parent probes first and refuses the spawn
+        // with a diagnostic error and an OCSF finding.
+        #[cfg(target_os = "linux")]
+        if enforcement_mode.uses_privileged_process_setup() {
+            check_capability_bounding_set_readiness()?;
         }
 
         // Phase 1: Prepare Landlock ruleset by opening PathFds.
@@ -1544,6 +1628,21 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
+    fn capability_bounding_set_readiness_matches_clear_availability() {
+        let result = check_capability_bounding_set_readiness();
+        if !nix::unistd::geteuid().is_root()
+            || capctl::caps::bounding::probe().is_empty()
+            || capability_bounding_set_clear_available()
+        {
+            assert!(result.is_ok(), "readiness check failed: {result:?}");
+        } else {
+            let msg = format!("{}", result.unwrap_err());
+            assert!(msg.contains("CAP_SETPCAP"), "unexpected error: {msg}");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn capability_bounding_set_clear_accepts_empty_eperm() {
         let remaining = capctl::caps::CapSet::empty();
 
@@ -1570,12 +1669,9 @@ mod tests {
         );
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Failed to clear child capability bounding set")
-        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Failed to clear child capability bounding set"));
+        assert!(msg.contains("CAP_SETPCAP"));
     }
 
     #[test]

@@ -19,7 +19,11 @@ capability bounding set during privilege drop so later execs cannot regain
 container-granted capabilities. This is fail-closed: the supervisor retains
 `CAP_SETPCAP` solely to perform the clear, and spawning the workload or SSH shell
 aborts unless the bounding set ends up empty. A `setpcap` `EPERM` is tolerated
-only when the set is already empty; any other outcome fails the spawn.
+only when the set is already empty; any other outcome fails the spawn. Because
+the clear runs inside `pre_exec`, which cannot emit structured logs, the parent
+probes `PR_CAPBSET_DROP` availability before forking and refuses the spawn with
+a diagnostic error and an OCSF `DetectionFinding` when `CAP_SETPCAP` is
+unavailable (for example, when the container runtime did not grant it).
 
 ## Startup Flow
 
