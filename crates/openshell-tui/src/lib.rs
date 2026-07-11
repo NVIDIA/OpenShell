@@ -142,8 +142,7 @@ pub async fn run(
                 }
                 if app.pending_shell_connect {
                     app.pending_shell_connect = false;
-                    handle_shell_connect(&mut app, &mut terminal, &events).await?;
-                    refresh_data(&mut app).await;
+                    handle_shell_connect(&mut app, &mut terminal, &mut events).await?;
                 }
                 // --- Draft actions ---
                 if app.pending_draft_approve {
@@ -366,7 +365,7 @@ pub async fn run(
                                     handle_exec_command(
                                         &mut app,
                                         &mut terminal,
-                                        &events,
+                                        &mut events,
                                         &name,
                                         &command,
                                     )
@@ -841,7 +840,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
 async fn handle_shell_connect(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    events: &EventHandler,
+    events: &mut EventHandler,
 ) -> Result<()> {
     let sandbox_name = match app.selected_sandbox_name() {
         Some(n) => n.to_string(),
@@ -973,7 +972,7 @@ async fn handle_shell_connect(
         }
     }
 
-    // Step 9: Resume and draw the TUI before the caller refreshes gateway data.
+    // Step 9: Resume and draw the TUI before accepting new terminal input.
     enable_raw_mode().into_diagnostic()?;
     execute!(
         terminal.backend_mut(),
@@ -985,6 +984,7 @@ async fn handle_shell_connect(
     terminal
         .draw(|frame| ui::draw(frame, app))
         .into_diagnostic()?;
+    events.discard_pending();
     events.resume();
 
     Ok(())
@@ -998,7 +998,7 @@ async fn handle_shell_connect(
 async fn handle_exec_command(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    events: &EventHandler,
+    events: &mut EventHandler,
     sandbox_name: &str,
     command: &str,
 ) -> Result<()> {
@@ -1140,6 +1140,7 @@ async fn handle_exec_command(
     )
     .into_diagnostic()?;
     terminal.clear().into_diagnostic()?;
+    events.discard_pending();
     events.resume();
 
     Ok(())
