@@ -118,6 +118,8 @@ message InterceptorBinding {
   repeated GatewayInterceptorPhase phases = 3;
   // Optional binding-specific failure policy.
   // Supported values are "fail_closed" and "fail_open".
+  // Bindings that include post_commit must resolve to "fail_open" because the
+  // gateway operation has already committed before that phase runs.
   string failure_policy = 4;
 }
 

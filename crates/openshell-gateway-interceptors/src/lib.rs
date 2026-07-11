@@ -735,6 +735,13 @@ fn normalize_binding(
         }
     }
 
+    if phases.contains(&Phase::PostCommit) && failure_policy != FailurePolicy::FailOpen {
+        return Err(InterceptorError::Config(format!(
+            "interceptor '{interceptor_name}' binding '{binding_id}' uses failure_policy={} for post_commit; post_commit must use fail_open",
+            failure_policy.as_str()
+        )));
+    }
+
     Ok(Some(NormalizedBinding {
         binding_id: binding_id.to_string(),
         selector,
@@ -2193,6 +2200,62 @@ mod tests {
             err.to_string(),
             "invalid interceptor config: unsupported failure_policy 'ignore'"
         );
+    }
+
+    #[test]
+    fn post_commit_binding_rejects_fail_closed() {
+        let overrides = Vec::new();
+        let override_index = OverrideIndex::new(&overrides).unwrap();
+        let binding = InterceptorBinding {
+            id: "audit-create-sandbox".to_string(),
+            selector: Some(InterceptorSelector {
+                rpc: "openshell.v1.OpenShell/CreateSandbox".to_string(),
+                service: String::new(),
+                method: String::new(),
+            }),
+            phases: vec![GatewayInterceptorPhase::PostCommit as i32],
+            failure_policy: "fail_closed".to_string(),
+        };
+
+        let err = normalize_binding(
+            "audit",
+            &binding,
+            FailurePolicy::FailClosed,
+            &override_index,
+        )
+        .expect_err("post_commit must not fail closed after an operation commits");
+
+        assert_eq!(
+            err.to_string(),
+            "invalid interceptor config: interceptor 'audit' binding 'audit-create-sandbox' uses failure_policy=fail_closed for post_commit; post_commit must use fail_open"
+        );
+    }
+
+    #[test]
+    fn post_commit_binding_accepts_fail_open() {
+        let overrides = Vec::new();
+        let override_index = OverrideIndex::new(&overrides).unwrap();
+        let binding = InterceptorBinding {
+            id: "audit-create-sandbox".to_string(),
+            selector: Some(InterceptorSelector {
+                rpc: "openshell.v1.OpenShell/CreateSandbox".to_string(),
+                service: String::new(),
+                method: String::new(),
+            }),
+            phases: vec![GatewayInterceptorPhase::PostCommit as i32],
+            failure_policy: "fail_open".to_string(),
+        };
+
+        let normalized = normalize_binding(
+            "audit",
+            &binding,
+            FailurePolicy::FailClosed,
+            &override_index,
+        )
+        .expect("fail-open post_commit binding should be valid")
+        .expect("binding should be enabled");
+
+        assert_eq!(normalized.failure_policy, FailurePolicy::FailOpen);
     }
 
     #[test]

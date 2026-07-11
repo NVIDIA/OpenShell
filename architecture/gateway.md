@@ -63,6 +63,15 @@ an absent state is distinct from an explicitly empty object. Method-specific
 state schemas and persistence-version binding are deferred until a concrete
 consumer requires them.
 
+Post-commit evaluation is strictly observational. A binding that includes
+`post_commit` must resolve to `fail_open`, or interceptor initialization fails.
+After a handler returns success, failures never replace the committed response.
+Binding failures emit the standard fail-open warning and counter; response
+observation or evaluation failures outside binding policy emit warnings and the
+`openshell_gateway_interceptor_post_commit_observation_failures_total` metric.
+The gateway reconstructs the original response frames, including trailers and
+body errors, before evaluating the observer.
+
 Interceptor manifests can also vend provider profile catalogs. Gateway
 configuration selects the exact ordered source set from the in-tree built-in
 source, the stored user source, and named profile-capable interceptors. Omitting

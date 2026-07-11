@@ -6,7 +6,7 @@
 //! This module implements connection-level multiplexing that routes requests
 //! to either the gRPC service or HTTP endpoints based on the request headers.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{Extensions, HeaderValue, Request, Response};
 use http_body::Body;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited, StreamBody};
@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower::ServiceExt;
 use tower_http::request_id::{MakeRequestId, RequestId};
-use tracing::Span;
+use tracing::{Span, warn};
 
 use crate::{
     OpenShellService, ServerState,
@@ -301,17 +301,36 @@ where
                 return Ok(response);
             }
 
-            let (response, response_body, trailers) =
-                match collect_intercepted_grpc_response(response).await {
-                    Ok(response) => response,
-                    Err(status) => return Ok(status.into_http()),
-                };
+            let (response, observation) = observe_intercepted_grpc_response(response).await;
+            let (response_body, trailers) = match observation {
+                Ok(observation) => observation,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "gateway post-commit response observation failed; preserving committed response"
+                    );
+                    counter!(
+                        "openshell_gateway_interceptor_post_commit_observation_failures_total",
+                        "stage" => "response_body"
+                    )
+                    .increment(1);
+                    return Ok(response);
+                }
+            };
             if grpc_status_from_response_and_trailers(&response, trailers.as_ref()) == "0"
                 && let Err(status) = interceptors
                     .evaluate_post_commit(&intercepted, &response_body, &context)
                     .await
             {
-                return Ok(status.into_http());
+                warn!(
+                    error = %status,
+                    "gateway post-commit evaluation failed; preserving committed response"
+                );
+                counter!(
+                    "openshell_gateway_interceptor_post_commit_observation_failures_total",
+                    "stage" => "evaluation"
+                )
+                .increment(1);
             }
 
             Ok(response)
@@ -344,21 +363,47 @@ fn boxed_body_from_bytes(bytes: Bytes) -> BoxBody {
     BoxBody(body)
 }
 
-async fn collect_intercepted_grpc_response(
+async fn observe_intercepted_grpc_response(
     response: Response<tonic::body::Body>,
-) -> Result<(Response<tonic::body::Body>, Bytes, Option<http::HeaderMap>), tonic::Status> {
-    let (parts, body) = response.into_parts();
-    let collected = body.collect().await.map_err(|err| {
-        tonic::Status::internal(format!(
-            "failed to read gRPC response for post-commit evaluation: {err}"
-        ))
-    })?;
-    let trailers = collected.trailers().cloned();
-    let bytes = collected.to_bytes();
-    let body = tonic_body_from_bytes_and_trailers(bytes.clone(), trailers.clone());
-    Ok((Response::from_parts(parts, body), bytes, trailers))
+) -> (
+    Response<tonic::body::Body>,
+    Result<(Bytes, Option<http::HeaderMap>), String>,
+) {
+    let (parts, mut body) = response.into_parts();
+    let mut frames = Vec::new();
+    let mut bytes = BytesMut::new();
+    let mut trailers = None;
+
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    bytes.extend_from_slice(data);
+                }
+                if let Some(frame_trailers) = frame.trailers_ref() {
+                    trailers = Some(frame_trailers.clone());
+                }
+                frames.push(Ok(frame));
+            }
+            Err(status) => {
+                let error =
+                    format!("failed to read gRPC response for post-commit evaluation: {status}");
+                frames.push(Err(status));
+                return (
+                    Response::from_parts(parts, tonic_body_from_frames(frames)),
+                    Err(error),
+                );
+            }
+        }
+    }
+
+    (
+        Response::from_parts(parts, tonic_body_from_frames(frames)),
+        Ok((bytes.freeze(), trailers)),
+    )
 }
 
+#[cfg(test)]
 fn tonic_body_from_bytes_and_trailers(
     bytes: Bytes,
     trailers: Option<http::HeaderMap>,
@@ -370,6 +415,12 @@ fn tonic_body_from_bytes_and_trailers(
     if let Some(trailers) = trailers {
         frames.push(Ok(http_body::Frame::trailers(trailers)));
     }
+    tonic_body_from_frames(frames)
+}
+
+fn tonic_body_from_frames(
+    frames: Vec<Result<http_body::Frame<Bytes>, tonic::Status>>,
+) -> tonic::body::Body {
     tonic::body::Body::new(StreamBody::new(futures::stream::iter(frames)))
 }
 
@@ -1034,9 +1085,94 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http_body_util::Empty;
+    use openshell_core::GatewayInterceptorConfig;
+    use openshell_core::proto::CreateSandboxRequest;
+    use openshell_core::proto::gateway_interceptor::v1::{
+        DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorEvaluation,
+        InterceptorManifest, InterceptorResult, InterceptorSelector, ProviderProfileSnapshot,
+        ProviderProfileSnapshotRequest,
+        gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
+    };
+    use prost::Message as _;
+    use std::convert::Infallible;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_stream::wrappers::TcpListenerStream;
     use tower::Service;
+
+    #[derive(Clone)]
+    struct PostCommitTestInterceptor;
+
+    #[tonic::async_trait]
+    impl GatewayInterceptor for PostCommitTestInterceptor {
+        async fn describe(
+            &self,
+            _request: tonic::Request<DescribeRequest>,
+        ) -> Result<tonic::Response<InterceptorManifest>, tonic::Status> {
+            Ok(tonic::Response::new(InterceptorManifest {
+                name: "post-commit-test".to_string(),
+                failure_policy: "fail_open".to_string(),
+                bindings: vec![InterceptorBinding {
+                    id: "audit-create-sandbox".to_string(),
+                    selector: Some(InterceptorSelector {
+                        rpc: "openshell.v1.OpenShell/CreateSandbox".to_string(),
+                        service: String::new(),
+                        method: String::new(),
+                    }),
+                    phases: vec![GatewayInterceptorPhase::PostCommit as i32],
+                    failure_policy: "fail_open".to_string(),
+                }],
+                provider_profiles: false,
+            }))
+        }
+
+        async fn evaluate(
+            &self,
+            _request: tonic::Request<InterceptorEvaluation>,
+        ) -> Result<tonic::Response<InterceptorResult>, tonic::Status> {
+            Ok(tonic::Response::new(InterceptorResult {
+                allowed: true,
+                ..InterceptorResult::default()
+            }))
+        }
+
+        async fn snapshot_provider_profiles(
+            &self,
+            _request: tonic::Request<ProviderProfileSnapshotRequest>,
+        ) -> Result<tonic::Response<ProviderProfileSnapshot>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not a profile source"))
+        }
+    }
+
+    fn grpc_frame(message: &[u8]) -> Bytes {
+        let mut frame = Vec::with_capacity(5 + message.len());
+        frame.push(0);
+        frame.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(message);
+        Bytes::from(frame)
+    }
+
+    async fn post_commit_test_runtime() -> (GatewayInterceptorRuntime, tokio::task::JoinHandle<()>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(GatewayInterceptorServer::new(PostCommitTestInterceptor))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let runtime = openshell_gateway_interceptors::initialize(vec![GatewayInterceptorConfig {
+            name: "post-commit-test".to_string(),
+            grpc_endpoint: format!("http://{address}"),
+            ..GatewayInterceptorConfig::default()
+        }])
+        .await
+        .unwrap()
+        .unwrap();
+        (runtime, task)
+    }
 
     #[test]
     fn uuid_request_id_generates_valid_uuid() {
@@ -1134,8 +1270,8 @@ mod tests {
             Some(trailers.clone()),
         ));
 
-        let (response, observed, observed_trailers) =
-            collect_intercepted_grpc_response(response).await.unwrap();
+        let (response, observation) = observe_intercepted_grpc_response(response).await;
+        let (observed, observed_trailers) = observation.unwrap();
 
         assert_eq!(observed, bytes);
         assert_eq!(observed_trailers.as_ref(), Some(&trailers));
@@ -1147,6 +1283,63 @@ mod tests {
         let collected = response.into_body().collect().await.unwrap();
         assert_eq!(collected.trailers(), Some(&trailers));
         assert_eq!(collected.to_bytes(), bytes);
+    }
+
+    #[tokio::test]
+    async fn intercepted_grpc_response_preserves_body_error() {
+        let bytes = Bytes::from_static(b"committed-response-prefix");
+        let response = Response::new(tonic_body_from_frames(vec![
+            Ok(http_body::Frame::data(bytes.clone())),
+            Err(tonic::Status::unavailable("response stream failed")),
+        ]));
+
+        let (response, observation) = observe_intercepted_grpc_response(response).await;
+
+        let observation_error = observation.unwrap_err();
+        assert!(observation_error.contains("failed to read gRPC response"));
+        assert!(observation_error.contains("response stream failed"));
+        let mut body = response.into_body();
+        let data = body.frame().await.unwrap().unwrap();
+        assert_eq!(data.data_ref(), Some(&bytes));
+        let status = body.frame().await.unwrap().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "response stream failed");
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn post_commit_decode_failure_preserves_committed_response() {
+        let (runtime, interceptor_task) = post_commit_test_runtime().await;
+        let committed = Arc::new(AtomicUsize::new(0));
+        let committed_for_service = committed.clone();
+        let committed_body = Bytes::from_static(b"malformed committed gRPC response");
+        let committed_body_for_service = committed_body.clone();
+        let inner = tower::service_fn(move |_request: Request<BoxBody>| {
+            let committed = committed_for_service.clone();
+            let body = committed_body_for_service.clone();
+            async move {
+                committed.fetch_add(1, Ordering::SeqCst);
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("grpc-status", HeaderValue::from_static("0"));
+                Ok::<_, Infallible>(Response::new(tonic_body_from_bytes_and_trailers(
+                    body,
+                    Some(trailers),
+                )))
+            }
+        });
+        let mut service = GatewayInterceptorGrpcService::new(inner, Some(runtime));
+        let request_body = grpc_frame(&CreateSandboxRequest::default().encode_to_vec());
+        let request = Request::builder()
+            .uri("/openshell.v1.OpenShell/CreateSandbox")
+            .body(boxed_body_from_bytes(request_body))
+            .unwrap();
+
+        let response = service.ready().await.unwrap().call(request).await.unwrap();
+
+        assert_eq!(committed.load(Ordering::SeqCst), 1);
+        let collected = response.into_body().collect().await.unwrap();
+        assert_eq!(collected.to_bytes(), committed_body);
+        interceptor_task.abort();
     }
 
     #[test]
