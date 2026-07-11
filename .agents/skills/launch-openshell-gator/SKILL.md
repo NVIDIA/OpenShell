@@ -13,11 +13,9 @@ For gator's PR/issue validation policy, load `gator-gate` inside the launched sa
 
 - Keep normal gator launches supervised: use `--watch --background` and let the in-sandbox supervisor own sleeping and relaunching bounded cycles.
 - Do not add passive `sleep` loops in the operator session to watch gator. Check logs or status once, then report the current state or launch a proper watcher outside the model session only when explicitly asked.
-- Do not use `--keep` for normal supervised gators. The launcher already keeps watch-mode sandboxes alive through the supervisor.
 - Do not change the default gator model in `scripts/agents/gator/agent.yaml` for experiments. Use `CODEX_MODEL=...` and, if needed, a temporary `--from` Docker context or `--codex-bin` override.
 - Do not push to contributor branches, approve, merge, post `/ok to test`, or broaden gator scope unless the operator explicitly authorized that action.
 - Scope each launch prompt to the requested issue/PR set. Avoid repo-wide gator scans unless the operator asked for repo-wide processing.
-- Treat `/etc/openshell/agent-payload` as immutable once a sandbox is created. After prompt/skill/runtime/image changes, delete and relaunch the affected gator instead of trying to patch files in-place.
 - Leave unrelated local files alone, including `.opencode/` artifacts and old gator logs unless the user asks for cleanup.
 
 ## Key Paths
