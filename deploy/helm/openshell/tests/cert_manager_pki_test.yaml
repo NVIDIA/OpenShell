@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: cert-manager PKI
+templates:
+  - templates/cert-manager-pki.yaml
+release:
+  name: custom-release
+  namespace: my-namespace
+
+tests:
+  - it: renders release-aware server SANs without stale namespace defaults
+    set:
+      certManager.enabled: true
+    asserts:
+      - equal:
+          path: spec.dnsNames
+          value:
+            - custom-release-openshell
+            - custom-release-openshell.my-namespace.svc
+            - custom-release-openshell.my-namespace.svc.cluster.local
+            - localhost
+            - custom-release-openshell.localhost
+            - "*.custom-release-openshell.localhost"
+            - host.docker.internal
+            - host.containers.internal
+        documentIndex: 3
+      - equal:
+          path: spec.ipAddresses
+          value:
+            - 127.0.0.1
+        documentIndex: 3
+
+  - it: appends configured DNS and IP SANs
+    set:
+      certManager.enabled: true
+      certManager.serverDnsNames:
+        - extra.example.test
+      certManager.serverIpAddresses:
+        - 192.0.2.10
+    asserts:
+      - contains:
+          path: spec.dnsNames
+          content: extra.example.test
+        documentIndex: 3
+      - equal:
+          path: spec.ipAddresses
+          value:
+            - 192.0.2.10
+        documentIndex: 3

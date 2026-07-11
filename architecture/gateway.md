@@ -412,7 +412,10 @@ sandbox JWT signing material are created. Deployment paths use it as follows:
 On Kubernetes, the Helm chart runs the command via a pre-install/pre-upgrade
 hook Job using the gateway image itself -- no separate cert-generation image,
 no extra mirror burden in air-gapped environments. In the default built-in PKI
-path the hook creates TLS and sandbox JWT Secrets. When cert-manager is enabled,
+path the hook provides the complete release- and namespace-aware server SAN list;
+certgen treats that list as authoritative when creating TLS and sandbox JWT
+Secrets. Filesystem mode instead retains the local loopback and container-host
+SAN defaults and appends any caller-provided names. When cert-manager is enabled,
 cert-manager owns TLS Secrets and the hook runs with `--jwt-only` so the
 required sandbox JWT Secret still exists before the gateway workload mounts it,
 even if `pkiInitJob.enabled` remains true. On package-managed local
