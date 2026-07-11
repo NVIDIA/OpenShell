@@ -142,7 +142,7 @@ pub async fn run(
                 }
                 if app.pending_shell_connect {
                     app.pending_shell_connect = false;
-                    handle_shell_connect(&mut app, &mut terminal, &events).await;
+                    handle_shell_connect(&mut app, &mut terminal, &events).await?;
                     refresh_data(&mut app).await;
                 }
                 // --- Draft actions ---
@@ -370,7 +370,7 @@ pub async fn run(
                                         &name,
                                         &command,
                                     )
-                                    .await;
+                                    .await?;
                                 }
                             }
                             Some(Err(msg)) => {
@@ -842,10 +842,10 @@ async fn handle_shell_connect(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     events: &EventHandler,
-) {
+) -> Result<()> {
     let sandbox_name = match app.selected_sandbox_name() {
         Some(n) => n.to_string(),
-        None => return,
+        None => return Ok(()),
     };
 
     // Step 1: Get sandbox ID.
@@ -859,16 +859,16 @@ async fn handle_shell_connect(
                     s.object_id().to_string()
                 } else {
                     app.status_text = "sandbox not found".to_string();
-                    return;
+                    return Ok(());
                 }
             }
             Ok(Err(e)) => {
                 app.status_text = format!("failed to get sandbox: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "get sandbox timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
@@ -883,17 +883,17 @@ async fn handle_shell_connect(
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
                 app.status_text = format!("SSH session failed: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "SSH session request timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
     if let Err(err) = validate_ssh_session_response(&session) {
         app.status_text = format!("gateway returned invalid SSH session response: {err}");
-        return;
+        return Ok(());
     }
 
     // Step 3: Resolve gateway address (handle loopback override).
@@ -908,7 +908,7 @@ async fn handle_shell_connect(
         Ok(p) => p,
         Err(e) => {
             app.status_text = format!("failed to find executable: {e}");
-            return;
+            return Ok(());
         }
     };
     let proxy_command = build_proxy_command(
@@ -948,12 +948,13 @@ async fn handle_shell_connect(
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Step 7: Suspend TUI — leave alternate screen, disable raw mode.
-    let _ = execute!(
+    execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    );
-    let _ = disable_raw_mode();
+    )
+    .into_diagnostic()?;
+    disable_raw_mode().into_diagnostic()?;
 
     // Step 8: Spawn SSH as child process and wait.
     let status = tokio::task::spawn_blocking(move || command.status()).await;
@@ -972,15 +973,21 @@ async fn handle_shell_connect(
         }
     }
 
-    // Step 9: Resume TUI — re-enter alternate screen, enable raw mode, unpause events.
-    let _ = enable_raw_mode();
-    let _ = execute!(
+    // Step 9: Resume and draw the TUI before the caller refreshes gateway data.
+    enable_raw_mode().into_diagnostic()?;
+    execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
         EnableMouseCapture
-    );
-    let _ = terminal.clear();
+    )
+    .into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
+    terminal
+        .draw(|frame| ui::draw(frame, app))
+        .into_diagnostic()?;
     events.resume();
+
+    Ok(())
 }
 
 /// Suspend the TUI, execute a command on a sandbox via SSH, then resume.
@@ -994,7 +1001,7 @@ async fn handle_exec_command(
     events: &EventHandler,
     sandbox_name: &str,
     command: &str,
-) {
+) -> Result<()> {
     // Step 1: Resolve sandbox → SSH session (same as handle_shell_connect).
     let sandbox_id = {
         let req = openshell_core::proto::GetSandboxRequest {
@@ -1006,16 +1013,16 @@ async fn handle_exec_command(
                     s.object_id().to_string()
                 } else {
                     app.status_text = format!("exec: sandbox {sandbox_name} not found");
-                    return;
+                    return Ok(());
                 }
             }
             Ok(Err(e)) => {
                 app.status_text = format!("exec: failed to get sandbox: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "exec: get sandbox timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
@@ -1029,17 +1036,17 @@ async fn handle_exec_command(
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
                 app.status_text = format!("exec: SSH session failed: {}", e.message());
-                return;
+                return Ok(());
             }
             Err(_) => {
                 app.status_text = "exec: SSH session timed out".to_string();
-                return;
+                return Ok(());
             }
         }
     };
     if let Err(err) = validate_ssh_session_response(&session) {
         app.status_text = format!("exec: gateway returned invalid SSH session response: {err}");
-        return;
+        return Ok(());
     }
 
     // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
@@ -1053,7 +1060,7 @@ async fn handle_exec_command(
         Ok(p) => p,
         Err(e) => {
             app.status_text = format!("exec: failed to find executable: {e}");
-            return;
+            return Ok(());
         }
     };
     let proxy_command = build_proxy_command(
@@ -1099,12 +1106,13 @@ async fn handle_exec_command(
     events.pause();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let _ = execute!(
+    execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
-    );
-    let _ = disable_raw_mode();
+    )
+    .into_diagnostic()?;
+    disable_raw_mode().into_diagnostic()?;
 
     // Step 5: Run command — blocks until user Ctrl-C's or command exits.
     let status = tokio::task::spawn_blocking(move || ssh.status()).await;
@@ -1124,14 +1132,17 @@ async fn handle_exec_command(
     }
 
     // Step 6: Resume TUI.
-    let _ = enable_raw_mode();
-    let _ = execute!(
+    enable_raw_mode().into_diagnostic()?;
+    execute!(
         terminal.backend_mut(),
         EnterAlternateScreen,
         EnableMouseCapture
-    );
-    let _ = terminal.clear();
+    )
+    .into_diagnostic()?;
+    terminal.clear().into_diagnostic()?;
     events.resume();
+
+    Ok(())
 }
 
 // SSH utility functions are shared via openshell_core::forward.
