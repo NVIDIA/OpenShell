@@ -88,16 +88,76 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"combined"'
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?topology\s*=\s*"combined"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor[_]topology\s*='
 
-  - it: renders explicit combined supervisor topology under [openshell.drivers.kubernetes]
+  - it: uses the gateway built-in supervisor image by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*='
+
+  - it: renders a supervisor tag override with the official repository
     template: templates/gateway-config.yaml
     set:
-      supervisor.topology: combined
+      supervisor.image.tag: 1.2.3
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_topology\s*=\s*"combined"'
+          pattern: 'supervisor_image\s*=\s*"ghcr\.io/nvidia/openshell/supervisor:1\.2\.3"'
+
+  - it: renders a supervisor repository override with the effective gateway tag
+    template: templates/gateway-config.yaml
+    set:
+      image.tag: gateway-build
+      supervisor.image.repository: registry.example.com/openshell/supervisor
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:gateway-build"'
+
+  - it: renders complete supervisor repository and tag overrides
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.image.repository: registry.example.com/openshell/supervisor
+      supervisor.image.tag: supervisor-build
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_image\s*=\s*"registry\.example\.com/openshell/supervisor:supervisor-build"'
+
+  - it: renders sidecar supervisor topology under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.topology: sidecar
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?topology\s*=\s*"sidecar"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor[_]topology\s*='
+
+  - it: renders proxy uid under [openshell.drivers.kubernetes.sidecar]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.sidecar.proxyUid: 2200
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sidecar\].*?proxy_uid\s*=\s*2200'
+
+  - it: renders process binary aware network policy under [openshell.drivers.kubernetes.sidecar]
+    template: templates/gateway-config.yaml
+    set:
+      supervisor.sidecar.processBinaryAwareNetworkPolicy: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sidecar\].*?process_binary_aware_network_policy\s*=\s*false'
 
   - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml

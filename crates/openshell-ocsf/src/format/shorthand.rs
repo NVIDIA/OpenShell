@@ -218,7 +218,19 @@ impl OcsfEvent {
                     (false, true) => format!(" {action}"),
                     (false, false) => format!(" {action}{arrow}"),
                 };
-                format!("HTTP:{method} {sev}{detail}{rule_ctx}{reason_ctx}")
+                // Denied HTTP events surface their message through reason_ctx.
+                // Allowed MCP decisions also need the JSON-RPC message so the
+                // selected tool name is visible in the shorthand log stream.
+                let message_ctx = if action != "DENIED"
+                    && e.firewall_rule
+                        .as_ref()
+                        .is_some_and(|rule| rule.rule_type == "l7-mcp")
+                {
+                    message_tag(&e.base)
+                } else {
+                    String::new()
+                };
+                format!("HTTP:{method} {sev}{detail}{rule_ctx}{reason_ctx}{message_ctx}")
             }
 
             Self::SshActivity(e) => {
@@ -532,6 +544,62 @@ mod tests {
             shorthand,
             "HTTP:GET [INFO] ALLOWED curl(88) -> GET https://api.example.com/v1/data [policy:default-egress engine:mechanistic]"
         );
+    }
+
+    #[test]
+    fn test_http_activity_shorthand_mcp_shows_tool_for_allow_and_deny() {
+        let mut event_base = base(4002, "HTTP Activity", 4, "Network Activity", 0, "Other");
+        event_base.set_message(
+            "JSONRPC_L7_REQUEST decision=allow rule_methods=tools/call tools=move_head",
+        );
+        let event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base: event_base,
+            http_request: Some(HttpRequest::new(
+                "POST",
+                Url::new("http", "host.openshell.internal", "/mcp", 8766),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: Some(FirewallRule::new("reachy-mcp", "l7-mcp")),
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert!(shorthand.contains("engine:l7-mcp"));
+        assert!(shorthand.contains("tools=move_head"));
+
+        let mut denied_base = base(4002, "HTTP Activity", 4, "Network Activity", 0, "Other");
+        denied_base.severity = crate::enums::SeverityId::Medium;
+        denied_base.set_message(
+            "JSONRPC_L7_REQUEST decision=deny rule_methods=tools/call tools=move_head",
+        );
+        let denied_event = OcsfEvent::HttpActivity(HttpActivityEvent {
+            base: denied_base,
+            http_request: Some(HttpRequest::new(
+                "POST",
+                Url::new("http", "host.openshell.internal", "/mcp", 8766),
+            )),
+            http_response: None,
+            src_endpoint: None,
+            dst_endpoint: None,
+            proxy_endpoint: None,
+            actor: None,
+            firewall_rule: Some(FirewallRule::new("reachy-mcp", "l7-mcp")),
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
+            observation_point_id: None,
+            is_src_dst_assignment_known: None,
+        });
+
+        let denied_shorthand = denied_event.format_shorthand();
+        assert!(denied_shorthand.contains("[reason:"));
+        assert!(denied_shorthand.contains("tools=move_head"));
     }
 
     #[test]

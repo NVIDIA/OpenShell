@@ -285,43 +285,22 @@ impl NetworkNamespace {
         // monitor can see log entries from the sandbox namespace.
         enable_nf_log_all_netns();
 
-        // Try combined ruleset with log rules first. Log rules must appear
-        // before reject rules in the chain so packets are logged before being
-        // rejected. If the kernel lacks nft_log support, fall back to the
-        // reject-only ruleset.
-        let ruleset_with_log =
-            nft_ruleset::generate_bypass_ruleset(&host_ip_str, proxy_port, Some(&log_prefix));
+        let commands =
+            nft_ruleset::generate_bypass_commands(&host_ip_str, proxy_port, Some(&log_prefix));
 
-        if let Err(e) = run_nft_netns(&self.name, &nft_path, &ruleset_with_log) {
+        if let Err(e) = run_nft_commands_netns(&self.name, &nft_path, &commands) {
             openshell_ocsf::ocsf_emit!(
                 openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                    .severity(openshell_ocsf::SeverityId::Low)
+                    .severity(openshell_ocsf::SeverityId::Medium)
                     .status(openshell_ocsf::StatusId::Failure)
-                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .state(openshell_ocsf::StateId::Disabled, "failed")
                     .message(format!(
-                        "Failed to install bypass log rules (non-fatal), falling back to reject-only [ns:{}]: {e}",
+                        "Failed to install bypass detection rules [ns:{}]: {e}",
                         self.name
                     ))
                     .build()
             );
-
-            let ruleset_no_log =
-                nft_ruleset::generate_bypass_ruleset(&host_ip_str, proxy_port, None);
-
-            if let Err(e) = run_nft_netns(&self.name, &nft_path, &ruleset_no_log) {
-                openshell_ocsf::ocsf_emit!(
-                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                        .severity(openshell_ocsf::SeverityId::Medium)
-                        .status(openshell_ocsf::StatusId::Failure)
-                        .state(openshell_ocsf::StateId::Disabled, "failed")
-                        .message(format!(
-                            "Failed to install bypass detection rules [ns:{}]: {e}",
-                            self.name
-                        ))
-                        .build()
-                );
-                return Err(e);
-            }
+            return Err(e);
         }
 
         openshell_ocsf::ocsf_emit!(
@@ -467,6 +446,193 @@ pub fn create_netns_for_proxy(
     }
 }
 
+/// Install pod-network bypass enforcement for Kubernetes sidecar topology.
+///
+/// This runs in the current network namespace, not in a per-workload netns.
+/// The rules allow loopback and the sidecar proxy UID, then reject direct
+/// TCP/UDP egress from other UIDs so traffic must use the sidecar's local
+/// proxy.
+///
+/// # Errors
+///
+/// Returns an error when `nft` is unavailable or the ruleset cannot be loaded.
+pub fn install_sidecar_bypass_rules(proxy_uid: u32) -> Result<()> {
+    match install_sidecar_nft_bypass_rules(proxy_uid) {
+        Ok(()) => Ok(()),
+        Err(nft_error) => {
+            warn!(
+                error = %nft_error,
+                "Failed to install nftables sidecar rules; trying iptables-legacy fallback"
+            );
+            install_sidecar_iptables_legacy_bypass_rules(proxy_uid).map_err(|iptables_error| {
+                miette::miette!(
+                    "sidecar nft ruleset load failed: {nft_error}; sidecar iptables-legacy fallback failed: {iptables_error}"
+                )
+            })
+        }
+    }
+}
+
+fn install_sidecar_nft_bypass_rules(proxy_uid: u32) -> Result<()> {
+    let nft_cmd = find_nft().ok_or_else(|| {
+        miette::miette!(
+            "trusted nft helper not found; sidecar network enforcement requires nftables"
+        )
+    })?;
+    let log_prefix = Some("openshell:sidecar-bypass:");
+    let commands = nft_ruleset::generate_sidecar_bypass_commands(proxy_uid, log_prefix);
+    run_nft_commands_current_namespace(&nft_cmd, &commands)
+}
+
+const SIDECAR_IPTABLES_CHAIN: &str = "OPENSHELL_SIDECAR_BYPASS";
+const PROC_NET_IF_INET6_PATH: &str = "/proc/net/if_inet6";
+
+fn install_sidecar_iptables_legacy_bypass_rules(proxy_uid: u32) -> Result<()> {
+    let ipv4_filter_tool = find_iptables_legacy().ok_or_else(|| {
+        miette::miette!(
+            "trusted iptables-legacy helper not found; sidecar network enforcement fallback unavailable"
+        )
+    })?;
+
+    let ipv6_fence_tool = if current_namespace_has_non_loopback_ipv6()? {
+        Some(find_ip6tables_legacy().ok_or_else(|| {
+            miette::miette!(
+                "trusted ip6tables-legacy helper not found; sidecar network enforcement fallback cannot fence IPv6"
+            )
+        })?)
+    } else {
+        warn!(
+            "Skipping IPv6 sidecar iptables-legacy fallback because the current namespace has no non-loopback IPv6 interface"
+        );
+        None
+    };
+
+    cleanup_sidecar_iptables_legacy_rule_families(&ipv4_filter_tool, ipv6_fence_tool.as_deref());
+
+    if let Err(e) = install_sidecar_iptables_legacy_family_rules(
+        &ipv4_filter_tool,
+        proxy_uid,
+        "icmp-port-unreachable",
+    ) {
+        cleanup_sidecar_iptables_legacy_rule_families(
+            &ipv4_filter_tool,
+            ipv6_fence_tool.as_deref(),
+        );
+        return Err(e);
+    }
+
+    if let Some(ipv6_fence_tool) = ipv6_fence_tool
+        && let Err(e) = install_sidecar_iptables_legacy_family_rules(
+            &ipv6_fence_tool,
+            proxy_uid,
+            "icmp6-port-unreachable",
+        )
+    {
+        cleanup_sidecar_iptables_legacy_rule_families(&ipv4_filter_tool, Some(&ipv6_fence_tool));
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+fn current_namespace_has_non_loopback_ipv6() -> Result<bool> {
+    match std::fs::read_to_string(PROC_NET_IF_INET6_PATH) {
+        Ok(content) => Ok(has_non_loopback_ipv6_interface(&content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(miette::miette!(
+            "failed to inspect {PROC_NET_IF_INET6_PATH} before installing sidecar IPv6 fence: {e}"
+        )),
+    }
+}
+
+fn has_non_loopback_ipv6_interface(content: &str) -> bool {
+    content.lines().any(|line| {
+        line.split_whitespace()
+            .nth(5)
+            .is_some_and(|iface| iface != "lo")
+    })
+}
+
+fn install_sidecar_iptables_legacy_family_rules(
+    cmd: &str,
+    proxy_uid: u32,
+    udp_reject_with: &str,
+) -> Result<()> {
+    let proxy_uid_arg = proxy_uid.to_string();
+    let commands: Vec<Vec<&str>> = vec![
+        vec!["-N", SIDECAR_IPTABLES_CHAIN],
+        vec!["-A", SIDECAR_IPTABLES_CHAIN, "-o", "lo", "-j", "ACCEPT"],
+        vec![
+            "-A",
+            SIDECAR_IPTABLES_CHAIN,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "ESTABLISHED,RELATED",
+            "-j",
+            "ACCEPT",
+        ],
+        vec![
+            "-A",
+            SIDECAR_IPTABLES_CHAIN,
+            "-m",
+            "owner",
+            "--uid-owner",
+            &proxy_uid_arg,
+            "-j",
+            "ACCEPT",
+        ],
+        vec![
+            "-A",
+            SIDECAR_IPTABLES_CHAIN,
+            "-p",
+            "tcp",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            "tcp-reset",
+        ],
+        vec![
+            "-A",
+            SIDECAR_IPTABLES_CHAIN,
+            "-p",
+            "udp",
+            "-j",
+            "REJECT",
+            "--reject-with",
+            udp_reject_with,
+        ],
+        vec!["-A", "OUTPUT", "-j", SIDECAR_IPTABLES_CHAIN],
+    ];
+
+    for args in commands {
+        if let Err(e) = run_iptables_legacy_current_namespace(cmd, &args) {
+            cleanup_sidecar_iptables_legacy_rules(cmd);
+            return Err(e);
+        }
+    }
+
+    Ok(())
+}
+
+fn cleanup_sidecar_iptables_legacy_rules(iptables_cmd: &str) {
+    while run_iptables_legacy_current_namespace(
+        iptables_cmd,
+        &["-D", "OUTPUT", "-j", SIDECAR_IPTABLES_CHAIN],
+    )
+    .is_ok()
+    {}
+    let _ = run_iptables_legacy_current_namespace(iptables_cmd, &["-F", SIDECAR_IPTABLES_CHAIN]);
+    let _ = run_iptables_legacy_current_namespace(iptables_cmd, &["-X", SIDECAR_IPTABLES_CHAIN]);
+}
+
+fn cleanup_sidecar_iptables_legacy_rule_families(ipv4_cmd: &str, ipv6_cmd: Option<&str>) {
+    cleanup_sidecar_iptables_legacy_rules(ipv4_cmd);
+    if let Some(ipv6_cmd) = ipv6_cmd {
+        cleanup_sidecar_iptables_legacy_rules(ipv6_cmd);
+    }
+}
+
 /// Run an `ip` command on the host.
 fn run_ip(args: &[&str]) -> Result<()> {
     let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
@@ -487,6 +653,68 @@ fn run_ip(args: &[&str]) -> Result<()> {
         ));
     }
 
+    Ok(())
+}
+
+fn run_iptables_legacy_current_namespace(iptables_cmd: &str, args: &[&str]) -> Result<()> {
+    debug!(
+        command = %format!("{iptables_cmd} {}", args.join(" ")),
+        "Running iptables-legacy sidecar command"
+    );
+
+    let output = Command::new(iptables_cmd)
+        .args(args)
+        .output()
+        .into_diagnostic()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette::miette!(
+            "{iptables_cmd} {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Run a sequence of nft commands in the current network namespace.
+///
+/// Each command is executed as a separate `nft` invocation to avoid atomic
+/// batch rollback (where one unsupported expression like `ct state` or `log`
+/// causes the entire transaction, including table creation, to fail).
+///
+/// Commands marked as non-required are allowed to fail with a warning.
+/// Required commands that fail abort the sequence immediately.
+fn run_nft_commands_current_namespace(
+    nft_cmd: &str,
+    commands: &[nft_ruleset::NftCommand],
+) -> Result<()> {
+    for cmd in commands {
+        let args_str = cmd.args.join(" ");
+        debug!(command = %format!("{nft_cmd} {args_str}"), "Running nft command");
+
+        let output = Command::new(nft_cmd)
+            .args(&cmd.args)
+            .output()
+            .into_diagnostic()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if cmd.required {
+                return Err(miette::miette!(
+                    "{nft_cmd} {args_str} failed: {}",
+                    stderr.trim()
+                ));
+            }
+            warn!(
+                command = %args_str,
+                error = %stderr.trim(),
+                "non-required nft command failed (continuing)"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -532,47 +760,51 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Load an nftables ruleset inside a network namespace via `nsenter --net=`.
+/// Run a sequence of nft commands inside a network namespace via `nsenter --net=`.
 ///
-/// Writes the ruleset to a temp file and loads it with `nft -f <path>`.
-/// A temp file is used instead of piping to stdin (`nft -f -`) because
-/// `nft` resolves `-` to `/dev/stdin`, which may not exist in minimal
-/// VM guest environments (e.g. virtiofs rootfs without /proc mounted
-/// at nft invocation time).
-fn run_nft_netns(netns: &str, nft_cmd: &str, ruleset: &str) -> Result<()> {
-    use std::io::Write;
-    let mut tmp = tempfile::Builder::new()
-        .prefix("openshell-nft-")
-        .suffix(".conf")
-        .tempfile()
-        .into_diagnostic()?;
-    tmp.write_all(ruleset.as_bytes()).into_diagnostic()?;
-    let ruleset_path = tmp.path().to_string_lossy().to_string();
-
+/// Each command is executed as a separate invocation to avoid atomic batch
+/// rollback. See [`run_nft_commands_current_namespace`] for rationale.
+fn run_nft_commands_netns(
+    netns: &str,
+    nft_cmd: &str,
+    commands: &[nft_ruleset::NftCommand],
+) -> Result<()> {
     let nsenter_path = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
     let ns_path = format!("/var/run/netns/{netns}");
     let net_flag = format!("--net={ns_path}");
 
-    debug!(
-        command = %format!("{nsenter_path} {net_flag} -- {nft_cmd} -f {ruleset_path}"),
-        "Loading nftables ruleset in namespace"
-    );
+    for cmd in commands {
+        let args_str = cmd.args.join(" ");
+        debug!(
+            command = %format!("{nsenter_path} {net_flag} -- {nft_cmd} {args_str}"),
+            "Running nft command in namespace"
+        );
 
-    let output = Command::new(nsenter_path)
-        .args([net_flag.as_str(), "--", nft_cmd, "-f", &ruleset_path])
-        .output()
-        .into_diagnostic()?;
+        let mut full_args = vec![net_flag.as_str(), "--", nft_cmd];
+        let arg_refs: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
+        full_args.extend(&arg_refs);
 
-    drop(tmp);
+        let output = Command::new(nsenter_path)
+            .args(&full_args)
+            .output()
+            .into_diagnostic()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette::miette!(
-            "nft ruleset load failed in netns {netns}: {}",
-            stderr.trim()
-        ));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if cmd.required {
+                return Err(miette::miette!(
+                    "nft {args_str} failed in netns {netns}: {}",
+                    stderr.trim()
+                ));
+            }
+            warn!(
+                command = %args_str,
+                error = %stderr.trim(),
+                netns = %netns,
+                "non-required nft command failed in namespace (continuing)"
+            );
+        }
     }
-
     Ok(())
 }
 
@@ -605,6 +837,16 @@ fn enable_nf_log_all_netns() {
 
 /// Well-known paths where nft may be installed.
 const NFT_SEARCH_PATHS: &[&str] = &["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"];
+const IPTABLES_LEGACY_SEARCH_PATHS: &[&str] = &[
+    "/usr/sbin/iptables-legacy",
+    "/sbin/iptables-legacy",
+    "/usr/bin/iptables-legacy",
+];
+const IP6TABLES_LEGACY_SEARCH_PATHS: &[&str] = &[
+    "/usr/sbin/ip6tables-legacy",
+    "/sbin/ip6tables-legacy",
+    "/usr/bin/ip6tables-legacy",
+];
 
 fn find_trusted_binary<'a>(name: &str, paths: &'a [&str]) -> Result<&'a str> {
     paths
@@ -625,6 +867,18 @@ fn find_trusted_binary<'a>(name: &str, paths: &'a [&str]) -> Result<&'a str> {
 /// Find the nft binary path, checking well-known locations.
 fn find_nft() -> Option<String> {
     find_trusted_binary("nft", NFT_SEARCH_PATHS)
+        .ok()
+        .map(String::from)
+}
+
+fn find_iptables_legacy() -> Option<String> {
+    find_trusted_binary("iptables-legacy", IPTABLES_LEGACY_SEARCH_PATHS)
+        .ok()
+        .map(String::from)
+}
+
+fn find_ip6tables_legacy() -> Option<String> {
+    find_trusted_binary("ip6tables-legacy", IP6TABLES_LEGACY_SEARCH_PATHS)
         .ok()
         .map(String::from)
 }
@@ -666,6 +920,49 @@ mod tests {
                 "NFT_SEARCH_PATHS entry must be absolute: {path}"
             );
         }
+    }
+
+    #[test]
+    fn iptables_legacy_search_paths_are_absolute() {
+        for path in IPTABLES_LEGACY_SEARCH_PATHS {
+            assert!(
+                path.starts_with('/'),
+                "IPTABLES_LEGACY_SEARCH_PATHS entry must be absolute: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn ip6tables_legacy_search_paths_are_absolute() {
+        for path in IP6TABLES_LEGACY_SEARCH_PATHS {
+            assert!(
+                path.starts_with('/'),
+                "IP6TABLES_LEGACY_SEARCH_PATHS entry must be absolute: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_loopback_ipv6_detector_ignores_empty_input() {
+        assert!(!has_non_loopback_ipv6_interface(""));
+        assert!(!has_non_loopback_ipv6_interface("\n\n"));
+    }
+
+    #[test]
+    fn non_loopback_ipv6_detector_ignores_loopback() {
+        let content = "00000000000000000000000000000001 01 80 10 80 lo\n";
+
+        assert!(!has_non_loopback_ipv6_interface(content));
+    }
+
+    #[test]
+    fn non_loopback_ipv6_detector_detects_pod_interface() {
+        let content = "\
+00000000000000000000000000000001 01 80 10 80 lo
+fe800000000000000000000000000001 02 40 20 80 eth0
+";
+
+        assert!(has_non_loopback_ipv6_interface(content));
     }
 
     #[test]

@@ -4857,12 +4857,15 @@ mod tests {
         assert!(forwarded.contains("Host: integrate.api.nvidia.com\r\n"));
     }
 
-    /// Verifies that without a `SecretResolver` (i.e. the L4-only raw tunnel
-    /// path, or no TLS termination), credential placeholders pass through
-    /// unmodified. This documents the behavior that causes 401 errors when
-    /// `tls: terminate` is missing from the endpoint config.
+    /// Verifies that when a request carries a credential placeholder but no
+    /// `SecretResolver` is available to rewrite it, the relay fails closed
+    /// instead of forwarding the reserved token verbatim. A `None` resolver
+    /// here stands in for a degraded internal state (e.g. secrets could not be
+    /// wired up); forwarding the placeholder would leak it to the upstream and
+    /// cause 401s. The fail-closed scan in `rewrite_http_header_block` rejects
+    /// the request before any byte reaches upstream.
     #[tokio::test]
-    async fn relay_request_without_resolver_leaks_placeholders() {
+    async fn relay_request_without_resolver_fails_closed_on_placeholder() {
         let (child_env, _resolver) = SecretResolver::from_provider_env(
             [("NVIDIA_API_KEY".to_string(), "nvapi-secret".to_string())]
                 .into_iter()
@@ -4887,55 +4890,39 @@ mod tests {
             body_length: BodyLength::ContentLength(2),
         };
 
-        let upstream_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let mut total = 0;
-            loop {
-                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                total += n;
-                if let Some(hdr_end) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n") {
-                    if total >= hdr_end + 4 + 2 {
-                        break;
-                    }
-                }
-            }
-            upstream_side
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                .await
-                .unwrap();
-            upstream_side.flush().await.unwrap();
-            String::from_utf8_lossy(&buf[..total]).to_string()
-        });
-
-        // Pass `None` for the resolver — simulates the L4 path where no
-        // rewriting occurs.
+        // Pass `None` for the resolver — simulates a degraded state where no
+        // rewriting can occur. The relay must reject the request.
         let relay = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             relay_http_request_with_resolver(
                 &req,
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
-                None, // <-- No resolver, as in the L4 raw tunnel path
+                None,
             ),
         )
         .await
         .expect("relay must not deadlock");
-        relay.expect("relay should succeed");
 
-        let forwarded = upstream_task.await.expect("upstream task should complete");
-
-        // Without a resolver, the placeholder LEAKS to upstream — this is the
-        // documented behavior that causes 401s when `tls: terminate` is missing.
         assert!(
-            forwarded.contains("openshell:resolve:env:NVIDIA_API_KEY"),
-            "Expected placeholder to leak without resolver, got: {forwarded}"
+            relay.is_err(),
+            "relay must fail closed when a placeholder cannot be resolved"
         );
+
+        // The fail-closed scan rejects the request before any byte reaches
+        // upstream, so nothing at all must have been forwarded — a strictly
+        // stronger invariant than "the placeholder/secret did not appear". Drop
+        // the proxy write half so the read observes EOF instead of blocking.
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side
+            .read_to_end(&mut forwarded)
+            .await
+            .expect("upstream read should complete");
         assert!(
-            !forwarded.contains("nvapi-secret"),
-            "Real secret should NOT appear without resolver, got: {forwarded}"
+            forwarded.is_empty(),
+            "no bytes may reach upstream when the placeholder cannot be resolved; got: {}",
+            String::from_utf8_lossy(&forwarded)
         );
     }
 

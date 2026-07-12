@@ -268,6 +268,57 @@ kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\
 kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
 ```
 
+If `topology = "sidecar"` is rendered under `[openshell.drivers.kubernetes]`,
+sandbox pods should have an `openshell-network-init` init container running
+`--mode=network-init`, an `agent` container running
+`openshell-sandbox --mode=process`, and an `openshell-supervisor-network`
+container running `--mode=network`. The init container owns nftables setup and
+should be the only sidecar topology container with `NET_ADMIN`. It also needs
+`CHOWN`/`FOWNER` to hand shared emptyDir state to the effective sidecar UID. The
+default binary-aware network sidecar runs as UID 0 with primary GID
+`sandbox_gid` and adds `SYS_PTRACE` plus `DAC_READ_SEARCH`. When
+`process_binary_aware_network_policy = false`, it runs as the configured
+non-root `proxy_uid` without those inspection capabilities. The pod `fsGroup`
+is set to `sandbox_gid` in both modes.
+
+In sidecar topology only the network sidecar should mount the gateway bootstrap
+credentials (`openshell-sa-token` and `openshell-client-tls`). The process
+container should not receive `OPENSHELL_ENDPOINT`, gateway TLS env vars, the
+sandbox token file, or those credential mounts. Instead, the network sidecar
+serves policy and provider environment state over the Unix control socket from
+`OPENSHELL_SIDECAR_CONTROL_SOCKET` (`/run/openshell-sidecar/control.sock` by
+default). The process supervisor must be the first and only client. After
+validating its peer UID, GID, and PID, the sidecar unlinks the listener. If the
+connection later closes, the network sidecar exits non-zero so Kubernetes can
+restart it with a fresh listener. If the process supervisor fails before
+launching the workload,
+inspect both containers for control-socket bind, connect, bootstrap, or update
+errors. If new SSH/exec sessions do not pick up refreshed provider environment,
+inspect the network sidecar settings-poll logs and the process container logs
+for provider environment update handling; the process container should consume
+newer provider-env revisions without receiving gateway credentials.
+
+The process container reports the workload entrypoint PID over the same control
+socket, and the network sidecar uses that PID for binary-scoped policy
+decisions through `/proc`. If rules with `policy.binaries` are unexpectedly
+denied, inspect the sidecar control logs and confirm the pod has
+`shareProcessNamespace: true`.
+The shared state directory should preserve `sandbox_gid` inheritance
+(`02775`). Sidecar SSH uses the Linux abstract socket
+`@openshell-sidecar-ssh`; the network sidecar verifies its peer PID before
+bridging gateway relay requests. No `ssh.sock` file should appear in the shared
+state directory.
+Inspect all three when sandbox registration or egress enforcement fails:
+
+```bash
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E '^\[openshell\.drivers\.kubernetes\]|^topology\s*='
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.initContainers[*]}{.name}{" "}{.command}{"\n"}{end}'
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{range .spec.containers[*]}{.name}{" "}{.command}{"\n"}{end}'
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-network-init --tail=200
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-network --tail=200
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
+```
+
 ### Step 6: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:

@@ -9,15 +9,20 @@ body:
 
         OpenShell is an agent-first project. Before filing this bug, point your coding agent at the repo and have it investigate using the available skills (`debug-openshell-cluster`, `debug-inference`, `openshell-cli`, etc.). See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md) for the full skills table.
 
+        Please also check the latest OpenShell release and search existing issues for possible duplicates before filing. If you cannot upgrade, retest, or search existing issues, explain why in the diagnostic.
+
   - type: textarea
     id: agent-diagnostic
     attributes:
       label: Agent Diagnostic
       description: |
-        Paste the output from your agent's investigation of this bug. What skills did it load? What did it find? What did it try?
+        Paste the output from your agent's investigation of this bug. What skills did it load? What did it find? What did it try? Which OpenShell version did it test, and did it check the latest release, known fixes, and possible duplicates?
       placeholder: |
         Example:
         - Loaded `debug-inference` skill
+        - Tested OpenShell v0.x.x
+        - Checked latest release / known fixes: no matching fix found
+        - Searched existing issues for duplicates: no matching issue found
         - Ran `openshell inference get` and `openshell provider get ollama`
         - Found `OPENAI_BASE_URL=http://127.0.0.1:11434/v1`, which is unreachable from the gateway
         - Updated the provider to use `host.openshell.internal`, but the issue persists because the gateway is remote
@@ -47,11 +52,13 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: OS, Docker version, OpenShell version, and any other relevant details.
+      description: OS, Docker version, OpenShell version tested, whether the latest release and existing issues were checked, and any other relevant details.
       placeholder: |
         - OS: macOS 15.2 / Ubuntu 24.04 / Windows 11 + WSL2
         - Docker: Docker Desktop 4.x / Docker Engine 27.x
         - OpenShell: v0.x.x (output of `openshell --version`)
+        - Latest release checked: yes / no, because ...
+        - Possible duplicates checked: yes / no, because ...
     validations:
       required: true
 
@@ -74,6 +81,10 @@ body:
         - label: I pointed my agent at the repo and had it investigate this issue
           required: true
         - label: I loaded relevant skills (e.g., `debug-openshell-cluster`, `debug-inference`, `openshell-cli`)
+          required: true
+        - label: I checked the latest OpenShell release and either reproduced the issue there or explained why I cannot upgrade/test it
+          required: true
+        - label: I searched existing issues for possible duplicates or explained why I could not
           required: true
         - label: My agent could not resolve this — the diagnostic above explains why
           required: true

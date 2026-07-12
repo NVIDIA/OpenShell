@@ -303,12 +303,40 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image pull secrets to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
-| `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Set the supervisor image that provides the `openshell-sandbox` binary. |
+| `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Override the supervisor image that provides the `openshell-sandbox` binary. The default repository with an empty tag uses the version-pinned image built into the gateway. Changing the repository uses the effective gateway image tag, while setting a tag pins that version explicitly. |
 | `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
+| `topology` | `supervisor.topology` | Set `combined` for the default single supervisor path, or `sidecar` to move pod-level network enforcement and the gateway session into a dedicated sidecar. |
+| `sidecar.proxy_uid` | `supervisor.sidecar.proxyUid` | Non-root UID used by the relaxed sidecar when process/binary-aware network policy is disabled. The default binary-aware sidecar runs as UID 0. The network init container exempts the effective sidecar UID from proxy redirection. |
+| `sidecar.process_binary_aware_network_policy` | `supervisor.sidecar.processBinaryAwareNetworkPolicy` | Keep process/binary-aware network policy enabled in `sidecar` topology. The default runs the sidecar as UID 0 with `SYS_PTRACE` and `DAC_READ_SEARCH`. Set false to run as `proxy_uid`, drop both capabilities, and enforce endpoint/L7 policy without matching `policy.binaries`. |
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
+
+In `combined` topology, the agent container carries the Linux capabilities
+needed by the supervisor for network namespace setup, Landlock filesystem
+policy, process privilege changes, and network policy enforcement. In `sidecar`
+topology, the agent container runs as the resolved sandbox UID/GID with no added
+Linux capabilities. A root init container performs the nftables setup, and the
+long-running binary-aware sidecar runs as UID 0, drops default capabilities,
+and adds `SYS_PTRACE` plus `DAC_READ_SEARCH` for workload process identity
+resolution through shared `/proc`. The
+`sidecar.process_binary_aware_network_policy = false` setting runs it as the
+configured non-root `proxy_uid`, removes both capabilities, and relaxes network
+policy to endpoint/L7 matching only. The
+network sidecar owns gateway authentication and writes local policy/provider
+state to the process supervisor over a local control socket, so the agent
+container does not mount the sandbox bootstrap token or client TLS secret in
+the default sidecar path. The provider environment is refreshed by the network
+sidecar after settings polls and streamed to the process supervisor so future
+child processes can see updated provider env without gateway access in the
+agent container.
+Sidecar mode keeps gateway session and SSH behavior. The process supervisor
+applies Landlock filesystem policy and child seccomp filters where supported,
+but it does not perform root-to-sandbox privilege dropping or supervisor
+identity mount isolation. Network policy still runs in the sidecar, and sidecar
+pods set `shareProcessNamespace: true` so the network sidecar can resolve
+process/binary identity through `/proc/<entrypoint-pid>`.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 
@@ -317,6 +345,69 @@ If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the c
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
 </Note>
+
+### Kubernetes Driver Config PVC Mounts
+
+Kubernetes driver config can mount existing PersistentVolumeClaims into the
+agent container. Use this when storage is provisioned outside OpenShell and a
+sandbox should mount selected PVC subpaths instead of using the default
+OpenShell-created `/sandbox` workspace PVC.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "user-data",
+        "persistent_volume_claim": {
+          "claim_name": "pvc-user-data-123",
+          "read_only": false
+        }
+      }],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/workspace",
+              "sub_path": "workspace",
+              "read_only": false
+            },
+            {
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/memory",
+              "sub_path": "memory",
+              "read_only": false
+            }
+          ]
+        }
+      }
+    }
+  }' \
+  -- claude
+```
+
+Kubernetes PVC mount schema:
+
+| Field | Description |
+|---|---|
+| `volumes[].name` | Pod volume name. It must be a DNS-1123 label, unique, and not use OpenShell-managed volume names. |
+| `volumes[].persistent_volume_claim.claim_name` | Existing PVC name in the sandbox namespace. It must be a DNS-1123 subdomain name. |
+| `volumes[].persistent_volume_claim.read_only` | Optional. Defaults to `true`. Set `false` to allow read-write mounts. |
+| `containers.agent.volume_mounts[].name` | References a volume declared in `volumes`. |
+| `containers.agent.volume_mounts[].mount_path` | Absolute, normalized container path for the agent mount. |
+| `containers.agent.volume_mounts[].sub_path` | Optional relative PVC subpath. Absolute paths and `..` are rejected. |
+| `containers.agent.volume_mounts[].read_only` | Optional. Defaults to `true`. It cannot be `false` when the PVC volume is read-only. |
+
+OpenShell rejects duplicate volume names, mounts that reference unknown volumes,
+protected mount targets, and mounts that replace OpenShell TLS, supervisor,
+ServiceAccount token, or SPIFFE paths. Read-write PVC access requires
+`read_only: false` on both the PVC volume and each writable mount.
+
+Any driver-config mount under `/sandbox` disables the default `/sandbox`
+workspace PVC injection for that sandbox. Only the explicit mount paths persist
+through the external PVC; other `/sandbox` paths come from the current sandbox
+image.
 
 ## Sandbox User Identity
 

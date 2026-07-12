@@ -929,6 +929,20 @@ pub fn rewrite_http_header_block(
     resolver: Option<&SecretResolver>,
 ) -> Result<RewriteResult, UnresolvedPlaceholderError> {
     let Some(resolver) = resolver else {
+        // Fail-closed: with no resolver there is nothing that can rewrite a
+        // credential placeholder, so forwarding the block verbatim would leak
+        // the reserved token to the upstream. Scan the header region (mirroring
+        // the resolved-path scan below) and reject if any reserved marker is
+        // present. Marker-free traffic still passes through unchanged, which is
+        // the intended behavior when the endpoint injects no credentials.
+        let scan_end = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map_or(raw.len(), |p| raw.len().min(p + 4 + 256));
+        let header_region = String::from_utf8_lossy(&raw[..scan_end]);
+        if contains_reserved_credential_marker(&header_region) {
+            return Err(UnresolvedPlaceholderError { location: "header" });
+        }
         return Ok(RewriteResult {
             rewritten: raw.to_vec(),
             redacted_target: None,
@@ -1889,11 +1903,44 @@ mod tests {
     }
 
     #[test]
-    fn no_resolver_passes_through_without_scanning() {
-        // Even if placeholders are present, None resolver means no scanning
+    fn no_resolver_with_placeholder_in_request_line_fails_closed() {
+        // Fail-closed: a placeholder in the request line with no resolver must
+        // never be forwarded verbatim — it would leak the reserved token.
         let raw = b"GET /api/openshell:resolve:env:KEY HTTP/1.1\r\nHost: x\r\n\r\n";
-        let result = rewrite_http_header_block(raw, None).expect("should succeed");
-        assert_eq!(raw.as_slice(), result.rewritten.as_slice());
+        let err = rewrite_http_header_block(raw, None)
+            .expect_err("placeholder without resolver must fail closed");
+        assert_eq!(err.location, "header");
+    }
+
+    #[test]
+    fn no_resolver_with_placeholder_in_header_value_fails_closed() {
+        let raw =
+            b"GET / HTTP/1.1\r\nAuthorization: Bearer openshell:resolve:env:KEY\r\nHost: x\r\n\r\n";
+        let err = rewrite_http_header_block(raw, None)
+            .expect_err("placeholder without resolver must fail closed");
+        assert_eq!(err.location, "header");
+    }
+
+    #[test]
+    fn no_resolver_with_percent_encoded_marker_fails_closed() {
+        // Percent-encoded form of the canonical marker: a client (or an evasive
+        // sender) can URL-encode the reserved token, and the no-resolver scan
+        // must still catch it via the percent-decoded pass.
+        let raw = b"GET /api/openshell%3Aresolve%3Aenv%3AKEY HTTP/1.1\r\nHost: x\r\n\r\n";
+        let err = rewrite_http_header_block(raw, None)
+            .expect_err("percent-encoded placeholder without resolver must fail closed");
+        assert_eq!(err.location, "header");
+    }
+
+    #[test]
+    fn no_resolver_with_provider_alias_marker_fails_closed() {
+        // The provider-shaped alias marker is also a reserved credential token
+        // and must fail closed when no resolver can rewrite it.
+        let raw =
+            b"GET / HTTP/1.1\r\nX-Api-Key: OPENSHELL-RESOLVE-ENV-CUSTOM_TOKEN\r\nHost: x\r\n\r\n";
+        let err = rewrite_http_header_block(raw, None)
+            .expect_err("alias marker without resolver must fail closed");
+        assert_eq!(err.location, "header");
     }
 
     #[test]

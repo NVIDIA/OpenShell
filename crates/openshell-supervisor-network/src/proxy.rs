@@ -42,6 +42,8 @@ const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from
 const TUNNEL_PROTOCOL_PEEK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const INFERENCE_LOCAL_PORT: u16 = 443;
+#[cfg(target_os = "linux")]
+const SIDECAR_SUPERVISOR_TOPOLOGY: &str = "sidecar";
 
 /// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
 /// machine. Traffic to these names is eligible for the trusted-gateway SSRF
@@ -747,6 +749,15 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
+    // Resolve the route's TLS treatment up front. `query_tls_mode` reads only
+    // the policy decision + host/port (no peeked bytes), so it is valid before
+    // the `200`. The fail-closed refusal that consumes it runs after the SSRF/
+    // allowed_ips validation below — so an internal-address CONNECT still gets
+    // the SSRF 403 and telemetry in degraded state — but before the upstream
+    // connect and before `200 Connection Established`.
+    let effective_tls_skip =
+        query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
+
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
     // Query allowed_ips from the matched endpoint config (if any).
@@ -768,7 +779,7 @@ async fn handle_tcp_connection(
     // The "non-empty" branch is the explicit-allowlist path; reading it first
     // matches the policy decision narrative.
     #[allow(clippy::if_not_else)]
-    let mut upstream = if is_host_gateway_alias(&host_lc)
+    let validated_addrs = if is_host_gateway_alias(&host_lc)
         && let Some(gw) = *trusted_host_gateway
     {
         // Trusted host-gateway path. The compute driver injected this hostname
@@ -777,7 +788,7 @@ async fn handle_tcp_connection(
         // addresses (used by rootless Podman with pasta) are not hard-blocked.
         // Cloud metadata IPs and control-plane ports are still rejected.
         match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
-            Ok(addrs) => connect_upstream(addrs.as_slice()).await.into_diagnostic()?,
+            Ok(addrs) => addrs,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -831,7 +842,7 @@ async fn handle_tcp_connection(
                 match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
                     .await
                 {
-                    Ok(addrs) => connect_upstream(addrs.as_slice()).await.into_diagnostic()?,
+                    Ok(addrs) => addrs,
                     Err(reason) => {
                         {
                             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -931,7 +942,7 @@ async fn handle_tcp_connection(
         // the resolved IP in allowed_ips. Always-blocked addresses and
         // control-plane ports remain denied.
         match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => connect_upstream(addrs.as_slice()).await.into_diagnostic()?,
+            Ok(addrs) => addrs,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -981,7 +992,7 @@ async fn handle_tcp_connection(
     } else {
         // Default: reject all internal IPs (loopback, RFC 1918, link-local).
         match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
-            Ok(addrs) => connect_upstream(addrs.as_slice()).await.into_diagnostic()?,
+            Ok(addrs) => addrs,
             Err(reason) => {
                 {
                     let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -1029,6 +1040,52 @@ async fn handle_tcp_connection(
         }
     };
 
+    // Fail closed AFTER SSRF/allowed_ips validation (an internal-address CONNECT
+    // has already returned the SSRF 403 above) but BEFORE connecting upstream
+    // and BEFORE `200 Connection Established`. A terminating route with no TLS
+    // termination state cannot rewrite credential placeholders; the 503 must be
+    // the first bytes on the socket rather than a post-200 in-tunnel write the
+    // client would misread as a TLS error. No "allowed CONNECT" event is emitted
+    // for this path — that log lives after the `200` below.
+    if refuse_connect_when_tls_unavailable(&mut client, tls_state.is_some(), effective_tls_skip)
+        .await?
+    {
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .actor_process(
+                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                    .with_cmd_line(&cmdline_str),
+            )
+            .firewall_rule(policy_str, "tls")
+            .message(format!(
+                "CONNECT refused for {host_lc}:{port}: {TLS_TERMINATION_UNAVAILABLE_DETAIL}"
+            ))
+            .status_detail(TLS_TERMINATION_UNAVAILABLE_DETAIL)
+            .build();
+        ocsf_emit!(event);
+        emit_activity_simple(activity_tx.as_ref(), true, "tls_termination_unavailable");
+        emit_denial(
+            &denial_tx,
+            &host_lc,
+            port,
+            &binary_str,
+            &decision,
+            TLS_TERMINATION_UNAVAILABLE_DETAIL,
+            "connect-tls-termination-unavailable",
+        );
+        return Ok(());
+    }
+
+    let mut upstream = connect_upstream(validated_addrs.as_slice())
+        .await
+        .into_diagnostic()?;
+
     debug!(
         "handle_tcp_connection dns_resolve_and_tcp_connect: {}ms host={host_lc}",
         dns_connect_start.elapsed().as_millis()
@@ -1068,10 +1125,8 @@ async fn handle_tcp_connection(
     }
     emit_connect_activity_if_l4_only(&activity_tx, l7_route.as_ref());
 
-    // Determine effective TLS mode. Check the raw endpoint config for
-    // `tls: skip` independently of L7 config (which requires `protocol`).
-    let effective_tls_skip =
-        query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
+    // `effective_tls_skip` was resolved before the `200` above (the fail-closed
+    // gate needs it) and drives the raw-tunnel branch below.
 
     // Build L7 eval context (shared by TLS-terminated and plaintext paths).
     let ctx = crate::l7::relay::L7EvalContext {
@@ -1205,21 +1260,48 @@ async fn handle_tcp_connection(
                 }
             }
         } else {
-            {
-                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Fail)
-                    .severity(SeverityId::Low)
-                    .status(StatusId::Failure)
-                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                    .message(format!(
-                        "TLS detected but TLS state not configured for {host_lc}:{port}, falling back to raw tunnel"
-                    ))
-                    .build();
-                ocsf_emit!(event);
-            }
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
-                .await
-                .into_diagnostic()?;
+            // Defense in depth; unreachable in normal operation. The pre-200
+            // fail-closed gate already refuses terminating routes when no TLS
+            // termination state exists, and `tls: skip` routes raw-tunnel
+            // before this peek. Reaching here means a future refactor bypassed
+            // that gate. The `200 Connection Established` was already sent, so
+            // the tunnel is live: any HTTP bytes now would be decoded as a TLS
+            // protocol error, so we fail closed by DROPPING the connection
+            // rather than raw-tunneling (which would forward the client's TLS
+            // stream upstream and leak any `openshell:resolve:env:*`
+            // placeholder verbatim).
+            const DETAIL: &str = "TLS termination unavailable after tunnel establishment; \
+                 closing connection — credential rewrite would be bypassed";
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::High)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .firewall_rule(policy_str, "tls")
+                .message(format!("CONNECT refused for {host_lc}:{port}: {DETAIL}"))
+                .status_detail(DETAIL)
+                .build();
+            ocsf_emit!(event);
+            emit_activity_simple(activity_tx.as_ref(), true, "tls_termination_unavailable");
+            emit_denial(
+                &denial_tx,
+                &host_lc,
+                port,
+                &binary_str,
+                &decision,
+                DETAIL,
+                "connect-tls-termination-unavailable",
+            );
+            // No HTTP response: the tunnel is already established, so writing
+            // bytes here would corrupt the client's TLS handshake. Drop instead.
+            return Ok(());
         }
     } else if tunnel_protocol == TunnelProtocol::Http1 {
         // Plaintext HTTP detected.
@@ -1424,7 +1506,7 @@ fn resolve_owner_identity(
         })?;
 
     let bin_hash = identity_cache
-        .verify_or_cache(&bin_path)
+        .verify_or_cache_process_exe(&bin_path, owner_pid)
         .map_err(|e| IdentityError {
             reason: format!("binary integrity check failed: {e}"),
             binary: Some(bin_path.clone()),
@@ -1432,11 +1514,15 @@ fn resolve_owner_identity(
             ancestors: vec![],
         })?;
 
-    let ancestors = crate::procfs::collect_ancestor_binaries(owner_pid, entrypoint_pid);
+    let ancestor_identities = collect_ancestor_identities(owner_pid, entrypoint_pid);
+    let ancestors: Vec<PathBuf> = ancestor_identities
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect();
 
-    for ancestor in &ancestors {
+    for (ancestor_pid, ancestor) in &ancestor_identities {
         identity_cache
-            .verify_or_cache(ancestor)
+            .verify_or_cache_process_exe(ancestor, *ancestor_pid)
             .map_err(|e| IdentityError {
                 reason: format!(
                     "ancestor integrity check failed for {}: {e}",
@@ -1461,6 +1547,31 @@ fn resolve_owner_identity(
     })
 }
 
+#[cfg(target_os = "linux")]
+fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathBuf)> {
+    const MAX_DEPTH: usize = 64;
+    let mut ancestors = Vec::new();
+    let mut current = start_pid;
+
+    for _ in 0..MAX_DEPTH {
+        let parent_pid = match crate::procfs::read_ppid(current) {
+            Some(parent) if parent > 0 && parent != current => parent,
+            _ => break,
+        };
+
+        if let Ok(path) = crate::procfs::binary_path(parent_pid.cast_signed()) {
+            ancestors.push((parent_pid, path));
+        }
+
+        if parent_pid == stop_pid || parent_pid == 1 {
+            break;
+        }
+        current = parent_pid;
+    }
+
+    ancestors
+}
+
 /// Resolve the identity of the process owning a TCP peer connection.
 ///
 /// Walks `/proc/<entrypoint_pid>/net/tcp` to find the socket inode, locates
@@ -1470,10 +1581,10 @@ fn resolve_owner_identity(
 ///
 /// This is the identity-resolution block of [`evaluate_opa_tcp`] extracted
 /// into a standalone helper so it can be exercised by Linux-only regression
-/// tests without a full OPA engine. The key invariant under test is that on
-/// a hot-swap of the peer binary, the failure mode is
-/// `"Binary integrity violation"` (from the identity cache) rather than
-/// `"Failed to stat ... (deleted)"` (from the kernel-tainted path).
+/// tests without a full OPA engine. The key hot-swap invariant under test is
+/// that display paths are stripped for policy/logging, while integrity hashing
+/// reads the live executable via `/proc/<pid>/exe` instead of the replacement
+/// file that now exists at the display path.
 #[cfg(target_os = "linux")]
 fn resolve_process_identity(
     entrypoint_pid: u32,
@@ -1571,8 +1682,17 @@ fn evaluate_opa_tcp(
         }
     };
 
-    let pid = entrypoint_pid.load(Ordering::Acquire);
-    if pid == 0 {
+    if !crate::opa::network_binary_identity_required() {
+        let result = evaluate_endpoint_only_opa(engine, host, port);
+        debug!(
+            "evaluate_opa_tcp endpoint-only: host={host} port={port} action={:?}",
+            result.action
+        );
+        return result;
+    }
+
+    let entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+    let Some(proc_net_anchor_pid) = proc_net_anchor_pid(entrypoint_pid) else {
         return deny(
             "entrypoint process not yet spawned".into(),
             None,
@@ -1580,12 +1700,12 @@ fn evaluate_opa_tcp(
             vec![],
             vec![],
         );
-    }
+    };
 
     let total_start = std::time::Instant::now();
     let peer_port = peer_addr.port();
 
-    let identity = match resolve_process_identity(pid, peer_port, identity_cache) {
+    let identity = match resolve_process_identity(proc_net_anchor_pid, peer_port, identity_cache) {
         Ok(id) => id,
         Err(err) => {
             return deny(
@@ -1639,6 +1759,52 @@ fn evaluate_opa_tcp(
     result
 }
 
+#[cfg(target_os = "linux")]
+fn proc_net_anchor_pid(entrypoint_pid: u32) -> Option<u32> {
+    if entrypoint_pid != 0 {
+        return Some(entrypoint_pid);
+    }
+    sidecar_topology_enabled().then(std::process::id)
+}
+
+#[cfg(target_os = "linux")]
+fn sidecar_topology_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY)
+        .is_ok_and(|value| value == SIDECAR_SUPERVISOR_TOPOLOGY)
+}
+
+fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> ConnectDecision {
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: PathBuf::new(),
+        binary_sha256: String::new(),
+        ancestors: vec![],
+        cmdline_paths: vec![],
+    };
+
+    match engine.evaluate_network_action_with_generation(&input) {
+        Ok((action, generation)) => ConnectDecision {
+            action,
+            generation,
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        },
+        Err(e) => ConnectDecision {
+            action: NetworkAction::Deny {
+                reason: format!("policy evaluation error: {e}"),
+            },
+            generation: engine.current_generation(),
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        },
+    }
+}
+
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
 fn evaluate_opa_tcp(
@@ -1646,9 +1812,13 @@ fn evaluate_opa_tcp(
     engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
-    _host: &str,
-    _port: u16,
+    host: &str,
+    port: u16,
 ) -> ConnectDecision {
+    if !crate::opa::network_binary_identity_required() {
+        return evaluate_endpoint_only_opa(engine, host, port);
+    }
+
     ConnectDecision {
         action: NetworkAction::Deny {
             reason: "identity binding unavailable on this platform".into(),
@@ -2161,14 +2331,24 @@ fn query_l7_route_snapshot(
     };
 
     match engine.query_endpoint_configs_with_generation(&input) {
-        Ok((vals, generation)) => Some(L7RouteSnapshot {
-            configs: vals
+        Ok((vals, generation)) => {
+            let configs: Vec<_> = vals
                 .into_iter()
                 .filter_map(|val| crate::l7::parse_l7_config(&val))
                 .map(|config| L7ConfigSnapshot { config })
-                .collect(),
-            generation,
-        }),
+                .collect();
+            debug!(
+                host,
+                port,
+                generation,
+                config_count = configs.len(),
+                "Forward proxy L7 route lookup complete"
+            );
+            Some(L7RouteSnapshot {
+                configs,
+                generation,
+            })
+        }
         Err(e) => {
             let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Fail)
@@ -3346,10 +3526,29 @@ async fn handle_forward_proxy(
         }
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
+    debug!(
+        host = %host_lc,
+        port,
+        binary = %binary_str,
+        binary_pid = %pid_str,
+        matched_policy = %policy_str,
+        decision_generation = decision.generation,
+        current_generation = opa_engine.current_generation(),
+        action = ?decision.action,
+        "Forward proxy L4 policy decision"
+    );
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
     let forward_generation_guard = match opa_engine.generation_guard(decision.generation) {
         Ok(guard) => guard,
         Err(e) => {
+            warn!(
+                host = %host_lc,
+                port,
+                decision_generation = decision.generation,
+                current_generation = opa_engine.current_generation(),
+                error = %e,
+                "Forward proxy rejected request because policy generation changed after L4 decision"
+            );
             emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
             emit_activity_simple(activity_tx, true, "policy_stale");
             respond(
@@ -3410,6 +3609,15 @@ async fn handle_forward_proxy(
         && !route.configs.is_empty()
     {
         if route.generation != forward_generation_guard.captured_generation() {
+            warn!(
+                host = %host_lc,
+                port,
+                decision_generation = decision.generation,
+                guard_generation = forward_generation_guard.captured_generation(),
+                route_generation = route.generation,
+                current_generation = opa_engine.current_generation(),
+                "Forward proxy rejected request because L7 route lookup used a different policy generation"
+            );
             emit_l7_tunnel_close_after_policy_change(
                 &host_lc,
                 port,
@@ -3435,6 +3643,14 @@ async fn handle_forward_proxy(
         let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
             Ok(engine) => engine,
             Err(e) => {
+                warn!(
+                    host = %host_lc,
+                    port,
+                    route_generation = route.generation,
+                    current_generation = opa_engine.current_generation(),
+                    error = %e,
+                    "Forward proxy rejected request because L7 tunnel engine could not be cloned"
+                );
                 emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
                 emit_activity_simple(activity_tx, true, "policy_stale");
                 respond(
@@ -4114,6 +4330,14 @@ async fn handle_forward_proxy(
     };
 
     if let Err(e) = forward_generation_guard.ensure_current() {
+        warn!(
+            host = %host_lc,
+            port,
+            captured_generation = forward_generation_guard.captured_generation(),
+            current_generation = forward_generation_guard.current_generation(),
+            error = %e,
+            "Forward proxy rejected request because policy changed before upstream connect"
+        );
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         emit_activity_simple(activity_tx, true, "policy_stale");
         respond(
@@ -4252,6 +4476,14 @@ async fn handle_forward_proxy(
     };
 
     if let Err(e) = forward_generation_guard.ensure_current() {
+        warn!(
+            host = %host_lc,
+            port,
+            captured_generation = forward_generation_guard.captured_generation(),
+            current_generation = forward_generation_guard.current_generation(),
+            error = %e,
+            "Forward proxy rejected request because policy changed before relay"
+        );
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         respond(
             client,
@@ -4356,6 +4588,50 @@ fn build_json_error_response(status: u16, status_text: &str, error: &str, detail
     .into_bytes()
 }
 
+/// Detail shared by the fail-closed 503 body, the OCSF denial event, and the
+/// denial notification when a terminating CONNECT route has no TLS termination
+/// state available.
+const TLS_TERMINATION_UNAVAILABLE_DETAIL: &str = "TLS termination unavailable (CA initialization failed); \
+     refusing to tunnel — credential rewrite would be bypassed";
+
+/// Fail-closed gate evaluated BEFORE `200 Connection Established`.
+///
+/// A CONNECT route that terminates TLS (`tls: skip` is exempt) relies on the
+/// ephemeral CA to rewrite credential placeholders. When no TLS termination
+/// state exists — the CA failed to generate or write at startup (`run.rs`);
+/// `mode != Proxy` never starts this handler — the proxy cannot rewrite those
+/// placeholders, so raw-tunneling would forward the client's TLS stream
+/// straight upstream and leak any `openshell:resolve:env:*` placeholder
+/// verbatim.
+///
+/// The refusal is written here, as the first bytes on the socket, because a
+/// CONNECT client only sends its TLS `ClientHello` after reading the `200`.
+/// Refusing after the `200` would land the 503 inside the established tunnel,
+/// where the client decodes it as a TLS protocol error rather than a readable
+/// HTTP status (the flaw this replaces). Returns `true` when the connection was
+/// refused (the caller must stop) and `false` when the caller should proceed to
+/// establish the tunnel.
+async fn refuse_connect_when_tls_unavailable(
+    client: &mut TcpStream,
+    tls_state_present: bool,
+    effective_tls_skip: bool,
+) -> Result<bool> {
+    if tls_state_present || effective_tls_skip {
+        return Ok(false);
+    }
+    respond(
+        client,
+        &build_json_error_response(
+            503,
+            "Service Unavailable",
+            "tls_termination_unavailable",
+            TLS_TERMINATION_UNAVAILABLE_DETAIL,
+        ),
+    )
+    .await?;
+    Ok(true)
+}
+
 /// Check if a miette error represents a benign connection close.
 ///
 /// TLS handshake EOF, missing `close_notify`, connection resets, and broken
@@ -4396,6 +4672,46 @@ mod tests {
 
         let stream = connect_upstream(&[addr]).await.expect("connect");
         assert!(stream.nodelay().expect("query TCP_NODELAY"));
+    }
+
+    #[test]
+    fn endpoint_only_opa_allows_declared_endpoint_without_process_identity() {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let data = r#"
+version: 1
+network_policies:
+  test_l7:
+    name: test_l7
+    endpoints:
+      - host: host.k3d.internal
+        port: 56123
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: /allowed
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let engine = OpaEngine::from_strings_with_binary_identity_required(policy, data, false)
+            .expect("relaxed engine");
+
+        let decision = evaluate_endpoint_only_opa(&engine, "host.k3d.internal", 56123);
+        assert_eq!(
+            decision.action,
+            NetworkAction::Allow {
+                matched_policy: Some("test_l7".to_string()),
+            }
+        );
+        assert!(decision.binary.is_none());
+        assert!(decision.ancestors.is_empty());
+
+        let denied = evaluate_endpoint_only_opa(&engine, "api.example.com", 443);
+        assert!(
+            matches!(denied.action, NetworkAction::Deny { .. }),
+            "endpoint-only mode must still deny undeclared endpoints"
+        );
     }
 
     fn websocket_l7_config(
@@ -7994,6 +8310,367 @@ network_policies:
         assert_eq!(body["detail"], "connection to api.example.com:443 failed");
     }
 
+    /// Locks the fail-closed response the CONNECT handler sends when TLS is
+    /// detected but no termination state exists (ephemeral CA setup failed).
+    /// The proxy must refuse the connection with a 503 instead of raw-tunneling
+    /// the TLS stream, which would bypass credential rewrite and leak
+    /// placeholders verbatim.
+    #[test]
+    fn test_json_error_response_503_tls_termination_unavailable() {
+        let detail = TLS_TERMINATION_UNAVAILABLE_DETAIL;
+        let resp = build_json_error_response(
+            503,
+            "Service Unavailable",
+            "tls_termination_unavailable",
+            detail,
+        );
+        let resp_str = String::from_utf8(resp).unwrap();
+
+        assert!(resp_str.starts_with("HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(resp_str.contains("Connection: close\r\n"));
+
+        let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&resp_str[body_start..]).unwrap();
+        assert_eq!(body["error"], "tls_termination_unavailable");
+        assert_eq!(body["detail"], detail);
+    }
+
+    /// Connection-level regression for the pre-200 fail-closed gate. A real
+    /// loopback client opens a connection and the proxy-side gate runs with no
+    /// TLS termination state for a terminating (non-`tls: skip`) route. The
+    /// FIRST bytes the client reads back must be a real `HTTP/1.1 503`, not the
+    /// `HTTP/1.1 200 Connection Established` that would establish the tunnel and
+    /// bury the refusal inside it as a TLS protocol error (PR #2162 gator flaw).
+    #[tokio::test]
+    async fn connect_without_tls_termination_refused_with_503_before_200() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        // Terminating route (tls: skip = false) with no termination state.
+        let refused = refuse_connect_when_tls_unavailable(&mut server, false, false)
+            .await
+            .expect("gate write should succeed");
+        assert!(
+            refused,
+            "gate must refuse when TLS termination is unavailable"
+        );
+
+        let mut buf = vec![0u8; 512];
+        let n = client.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable\r\n"),
+            "client must read a 503 as the first bytes, not a 200; got: {response}"
+        );
+        assert!(
+            !response.contains("200 Connection Established"),
+            "no tunnel must be established before the refusal; got: {response}"
+        );
+
+        let body_start = response.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&response[body_start..]).unwrap();
+        assert_eq!(body["error"], "tls_termination_unavailable");
+        assert_eq!(body["detail"], TLS_TERMINATION_UNAVAILABLE_DETAIL);
+    }
+
+    /// The pre-200 gate must NOT touch the socket when the route can proceed:
+    /// either TLS termination state is present, or the route is `tls: skip`
+    /// (raw tunnel, no termination or credential injection). In both cases the
+    /// gate returns `false` and writes nothing, letting the caller send its
+    /// own `200 Connection Established`.
+    #[tokio::test]
+    async fn connect_with_tls_termination_or_skip_proceeds_without_writing() {
+        for (tls_present, tls_skip) in [(true, false), (false, true), (true, true)] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let (mut server, _) = listener.accept().await.unwrap();
+
+            let refused = refuse_connect_when_tls_unavailable(&mut server, tls_present, tls_skip)
+                .await
+                .expect("gate should succeed");
+            assert!(
+                !refused,
+                "gate must proceed (tls_present={tls_present}, tls_skip={tls_skip})"
+            );
+
+            // Nothing was written; after dropping the server the client sees a
+            // clean EOF (0 bytes) rather than any buffered response.
+            drop(server);
+            let mut buf = vec![0u8; 16];
+            let n = client.read(&mut buf).await.unwrap();
+            assert_eq!(
+                n, 0,
+                "gate must not write to the socket when proceeding \
+                 (tls_present={tls_present}, tls_skip={tls_skip})"
+            );
+        }
+    }
+
+    /// Drives a real `CONNECT` through the full `handle_tcp_connection` entry
+    /// point and returns `(completed, client_response_bytes, denial_stages)`.
+    /// `completed` is `false` when the handler was still running at `budget`
+    /// (e.g. a `tls: skip` route that proceeded past the fail-closed gate and
+    /// blocked on the unroutable upstream connect). `denial_stages` collects the
+    /// `denial_stage` of every `DenialEvent` the handler emitted — empty means
+    /// the connection was allowed and not blocked/refused at any stage.
+    ///
+    /// The client is an in-process `TcpStream` (no child process), so the client
+    /// socket is owned solely by this test process. Identity resolution finds
+    /// that owner in the descendant scan (which includes the entrypoint PID
+    /// itself), binds to `current_exe()`, and never falls through to the
+    /// whole-`/proc` scan — the environment-sensitive path that made a forked
+    /// child flaky under a busy CI `/proc`. Callers gate on Linux;
+    /// `evaluate_opa_tcp` denies unconditionally without `/proc`.
+    async fn drive_connect_through_handler(
+        endpoint_yaml: &str,
+        connect_target: &str,
+        budget: std::time::Duration,
+    ) -> (bool, Vec<u8>, Vec<String>) {
+        const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
+
+        // Allow the current test binary — the in-process client's
+        // `/proc/<pid>/exe` — to reach the endpoint. Matching is by path.
+        let exe = std::env::current_exe().expect("current_exe");
+        let data = format!(
+            r#"network_policies:
+  test_allow:
+    name: test_allow
+    endpoints:
+{endpoint_yaml}    binaries:
+      - {{ path: "{exe}" }}
+"#,
+            exe = exe.display(),
+        );
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = listener.local_addr().unwrap().port();
+
+        // In-process client: connect, send the CONNECT request, read the reply to
+        // EOF. The proxy closes the socket after writing a 503/403; a proceeding
+        // `tls: skip` route stalls on the upstream connect until the handler is
+        // dropped at `budget`, which closes the socket and ends the read.
+        let target = connect_target.to_string();
+        let client = tokio::spawn(async move {
+            let mut sock = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+            let req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+            sock.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            let _ = sock.read_to_end(&mut buf).await;
+            buf
+        });
+
+        let (server, _peer) = listener.accept().await.unwrap();
+        let entrypoint_pid = Arc::new(AtomicU32::new(std::process::id()));
+        let cache = Arc::new(BinaryIdentityCache::new());
+        let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
+
+        let completed = tokio::time::timeout(
+            budget,
+            Box::pin(handle_tcp_connection(
+                server,
+                engine,
+                cache,
+                entrypoint_pid,
+                None,            // tls_state — ephemeral CA unavailable
+                None,            // inference_ctx
+                None,            // policy_local_ctx
+                Arc::new(None),  // trusted_host_gateway
+                None,            // secret_resolver
+                None,            // dynamic_credentials
+                Some(denial_tx), // denial_tx — positive allow/deny signal
+                None,            // activity_tx
+            )),
+        )
+        .await
+        .is_ok();
+
+        let stdout = client.await.expect("client task");
+
+        // The handler future is now finished or dropped, so its sender half is
+        // gone; drain every denial it emitted.
+        let mut denial_stages = Vec::new();
+        while let Ok(event) = denial_rx.try_recv() {
+            denial_stages.push(event.denial_stage);
+        }
+        (completed, stdout, denial_stages)
+    }
+
+    /// End-to-end regression for the gator finding on PR #2162: with no TLS
+    /// termination state, a terminating `CONNECT` must have its 503 written as
+    /// the FIRST bytes on the socket — never after a `200 Connection
+    /// Established` that would bury the refusal inside the tunnel as a TLS error.
+    #[tokio::test]
+    async fn connect_handler_refuses_terminating_route_with_503_before_200() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+
+        // Public documentation IP (RFC 5737 TEST-NET-3): passes the SSRF check
+        // but is never actually connected — the fail-closed gate refuses first.
+        // The 30s budget is a generous belt against a slow CI runner; the refusal
+        // returns in milliseconds.
+        let (completed, stdout, _denials) = drive_connect_through_handler(
+            "      - { host: \"203.0.113.10\", port: 443 }\n",
+            "203.0.113.10:443",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(completed, "the refusal must return promptly, not hang");
+        let resp = String::from_utf8_lossy(&stdout);
+        assert!(
+            resp.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "first bytes must be a 503, not a 200; got: {resp:?}"
+        );
+        assert!(
+            !resp.contains("200 Connection Established"),
+            "no tunnel must be established before the refusal; got: {resp:?}"
+        );
+        assert!(
+            resp.contains("tls_termination_unavailable"),
+            "must be the TLS-termination-unavailable refusal; got: {resp:?}"
+        );
+    }
+
+    /// Ordering regression (gator re-check item 1): during CA-init failure, an
+    /// internal-address `CONNECT` must still receive the SSRF `403`, not the
+    /// TLS-unavailable `503` — SSRF validation runs before the fail-closed gate.
+    #[tokio::test]
+    async fn connect_handler_returns_ssrf_403_for_internal_address_not_503() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+
+        let (completed, stdout, _denials) = drive_connect_through_handler(
+            "      - { host: \"127.0.0.1\", port: 443 }\n",
+            "127.0.0.1:443",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(completed, "the SSRF denial must return promptly, not hang");
+        let resp = String::from_utf8_lossy(&stdout);
+        assert!(
+            resp.starts_with("HTTP/1.1 403 Forbidden"),
+            "internal address must get the SSRF 403; got: {resp:?}"
+        );
+        assert!(
+            resp.contains("ssrf_denied"),
+            "must be an SSRF denial; got: {resp:?}"
+        );
+        assert!(
+            !resp.contains("503"),
+            "SSRF runs before the fail-closed gate, so the 503 must not appear; got: {resp:?}"
+        );
+    }
+
+    /// A real `tls: skip` policy path through the handler is exempt from the
+    /// fail-closed gate even with no TLS termination state: the handler proceeds
+    /// past the refusal to the raw-tunnel upstream connect (which stalls on the
+    /// unroutable target), emitting no 503 and no client response before it.
+    #[tokio::test]
+    async fn connect_handler_tls_skip_route_is_not_refused() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+
+        // `_completed` is intentionally ignored: whether the unroutable connect
+        // stalls (times out) or is rejected fast by a CI egress firewall, the
+        // invariant is the same — a `tls: skip` route is exempt from the
+        // fail-closed gate, so it proceeds to the tunnel connect and writes no
+        // 503/denial to the client beforehand.
+        let (_completed, stdout, denial_stages) = drive_connect_through_handler(
+            "      - { host: \"203.0.113.10\", port: 443, tls: skip }\n",
+            "203.0.113.10:443",
+            std::time::Duration::from_millis(800),
+        )
+        .await;
+
+        let resp = String::from_utf8_lossy(&stdout);
+        assert!(
+            stdout.is_empty(),
+            "tls: skip must emit no refusal/denial before the tunnel connect; got: {resp:?}"
+        );
+        // Positive allow evidence, so this test cannot pass vacuously on a
+        // policy/identity deny (which would emit a DenialEvent): the handler
+        // must have emitted no denial at any stage.
+        assert!(
+            denial_stages.is_empty(),
+            "tls: skip must be allowed end-to-end, not denied at any stage; got: {denial_stages:?}"
+        );
+    }
+
+    /// Verifies the policy half of the Linux handler tests on every platform
+    /// (no `/proc` needed): the temp-dir binary glob yields an Allow for a
+    /// literal-IP endpoint, `tls: skip` reads back as `TlsMode::Skip`, and a
+    /// terminating endpoint reads back as `TlsMode::Auto`. Locks the OPA
+    /// preconditions so a policy-format regression is caught even where the
+    /// process-identity binding can't run.
+    #[test]
+    fn handler_test_policy_allows_glob_binary_and_reads_tls_mode() {
+        const POLICY_REGO: &str = include_str!("../data/sandbox-policy.rego");
+
+        let eval = |tls_line: &str| {
+            let data = format!(
+                r#"network_policies:
+  test_allow:
+    name: test_allow
+    endpoints:
+      - {{ host: "203.0.113.10", port: 443{tls_line} }}
+    binaries:
+      - {{ path: "/tmp/openshell-connect-test/*" }}
+"#
+            );
+            let engine = OpaEngine::from_strings(POLICY_REGO, &data).expect("load policy");
+            let input = crate::opa::NetworkInput {
+                host: "203.0.113.10".to_string(),
+                port: 443,
+                binary_path: PathBuf::from("/tmp/openshell-connect-test/connect-bash"),
+                binary_sha256: "unused".to_string(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let (action, generation) = engine
+                .evaluate_network_action_with_generation(&input)
+                .expect("evaluate");
+            match &action {
+                NetworkAction::Allow { matched_policy } => {
+                    assert!(matched_policy.is_some(), "allow must carry the policy name");
+                }
+                NetworkAction::Deny { reason } => {
+                    panic!("glob binary must be allowed, got deny: {reason}")
+                }
+            }
+            let decision = ConnectDecision {
+                action,
+                generation,
+                binary: Some(input.binary_path),
+                binary_pid: Some(1),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            query_tls_mode(&engine, &decision, "203.0.113.10", 443)
+        };
+
+        assert_eq!(
+            eval(", tls: skip"),
+            crate::l7::TlsMode::Skip,
+            "tls: skip endpoint must resolve to TlsMode::Skip"
+        );
+        assert_eq!(
+            eval(""),
+            crate::l7::TlsMode::Auto,
+            "terminating endpoint must resolve to TlsMode::Auto"
+        );
+    }
+
     #[test]
     fn test_json_error_response_content_length_matches() {
         let resp = build_json_error_response(403, "Forbidden", "test", "detail");
@@ -8011,27 +8688,23 @@ network_policies:
         assert_eq!(resp_str[body_start..].len(), cl);
     }
 
-    /// End-to-end regression for the `docker cp` hot-swap hazard that
-    /// motivated `binary_path()` stripping the kernel's `" (deleted)"`
-    /// suffix (PR #844).
+    /// End-to-end regression for the `docker cp` hot-swap hazard around
+    /// unlinked process executables.
     ///
-    /// Before the strip, the identity-resolution chain inside
-    /// `evaluate_opa_tcp` failed with `"Failed to stat
-    /// /opt/openshell/bin/openshell-sandbox (deleted)"` because
-    /// `BinaryIdentityCache::verify_or_cache()` tried to `metadata()` the
-    /// tainted path. That masked the real security signal: a live process
-    /// was now bound to a *different* binary on disk than the one that was
-    /// TOFU-cached. After the strip, `binary_path()` returns a path that
-    /// stats fine, the cache rehashes the new bytes, and the hash mismatch
-    /// surfaces as a `Binary integrity violation` error — the contract this
-    /// PR is trying to establish.
+    /// `binary_path()` strips the kernel's `" (deleted)"` suffix so policy
+    /// identity and logs use a clean display path. Integrity verification must
+    /// not hash that display path after a hot-swap, because it may now point to
+    /// unrelated replacement bytes. It hashes `/proc/<pid>/exe` instead, which
+    /// resolves to the live executable inode even after the original path was
+    /// unlinked.
     ///
     /// Test shape (from the review comment on the initial PR):
     /// 1. Start a `TcpListener` in the test process.
     /// 2. Copy `/bin/bash` to a temp path we control.
     /// 3. Prime `BinaryIdentityCache` with that temp binary's hash.
     /// 4. Spawn the temp bash as a child with a `/dev/tcp` one-liner that
-    ///    opens a real TCP connection to the listener and holds it open.
+    ///    opens a real TCP connection to the listener and holds it open
+    ///    inside the bash process.
     /// 5. Accept the connection on the listener side and capture the peer's
     ///    ephemeral port — that's what `resolve_process_identity` uses to
     ///    walk `/proc/net/tcp` back to the child PID.
@@ -8041,13 +8714,12 @@ network_policies:
     ///    now readlink to `" (deleted)"` OR the overwritten file, depending
     ///    on whether the filesystem reused the inode.
     /// 7. Call `resolve_process_identity` and assert:
-    ///    - the error reason contains `"Binary integrity violation"` (the
-    ///      cache detected the tampered on-disk bytes), and
-    ///    - the error reason does NOT contain `"Failed to stat"` or
-    ///      `"(deleted)"` (the old pre-strip failure mode).
+    ///    - identity resolution succeeds using the live executable hash, and
+    ///    - the returned display path does not contain the kernel-added
+    ///      `"(deleted)"` suffix.
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_process_identity_surfaces_binary_integrity_violation_on_hot_swap() {
+    fn resolve_process_identity_hashes_live_exe_after_hot_swap() {
         use crate::identity::BinaryIdentityCache;
         use std::io::Read;
         use std::net::TcpListener;
@@ -8079,9 +8751,12 @@ network_policies:
         assert!(!v1_hash.is_empty());
 
         // 4. Spawn the temp bash with a /dev/tcp one-liner that opens a real
-        //    connection to the listener and sleeps to keep it open. The
-        //    `read -t` blocks on stdin so the shell stays resident.
-        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; sleep 30 <&3");
+        //    connection to the listener and blocks in bash's `read` builtin
+        //    to keep it open. Do not use an external command like `sleep`:
+        //    it inherits the socket fd and intentionally trips the shared
+        //    socket ambiguity guard instead of exercising the hot-swap path.
+        let script =
+            format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; read -r -t 30 _ <&3 || true");
         let mut child = Command::new(&bash_v1)
             .arg("-c")
             .arg(&script)
@@ -8125,10 +8800,11 @@ network_policies:
         std::fs::write(&bash_v1, tampered_bytes).expect("write replacement bytes");
 
         // 7. Resolve identity through the real helper and assert the
-        //    contract: we want "Binary integrity violation", not
-        //    "Failed to stat ... (deleted)".
+        //    contract: hash the live executable via /proc/<pid>/exe while
+        //    returning a clean display path for policy/logging.
         let test_pid = std::process::id();
         let result = resolve_process_identity(test_pid, peer_port, &cache);
+        let child_pid = child.id();
 
         // Always clean up the child before asserting so a failure doesn't
         // leak a sleeping process across test runs.
@@ -8136,40 +8812,29 @@ network_policies:
         let _ = child.wait();
 
         match result {
-            Ok(_) => panic!(
-                "resolve_process_identity unexpectedly succeeded after hot-swap; \
-                 the cache should have detected the tampered on-disk bytes"
-            ),
-            Err(err) => {
-                assert!(
-                    err.reason.contains("Binary integrity violation"),
-                    "expected 'Binary integrity violation' error, got: {}",
-                    err.reason
+            Ok(identity) => {
+                assert_eq!(
+                    identity.binary_pid, child_pid,
+                    "expected the hot-swapped bash child to own the socket"
+                );
+                assert_eq!(
+                    identity.bin_path, bash_v1,
+                    "expected stripped display path to remain the original binary path"
                 );
                 assert!(
-                    !err.reason.contains("Failed to stat"),
-                    "pre-PR-#844 failure mode leaked: {}",
-                    err.reason
+                    !identity.bin_path.to_string_lossy().contains("(deleted)"),
+                    "resolved binary path still tainted: {}",
+                    identity.bin_path.display()
                 );
-                assert!(
-                    !err.reason.contains("(deleted)"),
-                    "resolved path still contains '(deleted)' suffix: {}",
-                    err.reason
+                assert_eq!(
+                    identity.bin_hash, v1_hash,
+                    "expected integrity hash from the live executable, not replacement bytes"
                 );
-                // The binary field should be populated — we did resolve a
-                // path before failing.
-                assert!(
-                    err.binary.is_some(),
-                    "expected resolved binary path on integrity failure"
-                );
-                if let Some(path) = &err.binary {
-                    assert!(
-                        !path.to_string_lossy().contains("(deleted)"),
-                        "resolved binary path still tainted: {}",
-                        path.display()
-                    );
-                }
             }
+            Err(err) => panic!(
+                "resolve_process_identity failed after hot-swap; expected live-exe identity: {}",
+                err.reason
+            ),
         }
     }
 

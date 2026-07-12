@@ -571,7 +571,11 @@ fn l7_protocol_log_summary(
     }
 
     if let Some(info) = jsonrpc_info {
-        return format!(" rule_methods={}", rule_method_names_for_log(info));
+        return format!(
+            " rule_methods={} tools={}",
+            rule_method_names_for_log(info),
+            tool_names_for_log(info)
+        );
     }
 
     String::new()
@@ -1428,8 +1432,9 @@ pub(crate) fn jsonrpc_log_message(
     reason: &str,
 ) -> String {
     let rule_methods = rule_method_names_for_log(info);
+    let tools = tool_names_for_log(info);
     format!(
-        "JSONRPC_L7_REQUEST decision={decision} http_method={http_method} endpoint={endpoint} rule_methods={rule_methods} policy_version={policy_version} reason={reason}"
+        "JSONRPC_L7_REQUEST decision={decision} rule_methods={rule_methods} tools={tools} http_method={http_method} endpoint={endpoint} policy_version={policy_version} reason={reason}"
     )
 }
 
@@ -1442,6 +1447,20 @@ pub(crate) fn rule_method_names_for_log(info: &crate::l7::jsonrpc::JsonRpcReques
         .map(|call| sanitize_log_token(&call.method))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+pub(crate) fn tool_names_for_log(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> String {
+    let tools = info
+        .calls
+        .iter()
+        .filter_map(|call| call.tool.as_deref())
+        .map(sanitize_log_token)
+        .collect::<Vec<_>>();
+    if tools.is_empty() {
+        "-".to_string()
+    } else {
+        tools.join(",")
+    }
 }
 
 fn sanitize_log_token(value: &str) -> String {
@@ -2538,7 +2557,6 @@ network_policies:
 
         let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
         assert!(allowed, "{reason}");
-
         request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"{"jsonrpc":"2.0","id":1,"method":"reports.search","params":["ignored",{"nested":true}]}"#,
             crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
@@ -2604,6 +2622,17 @@ network_policies:
 
         let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
         assert!(allowed, "{reason}");
+        let allowed_info = request.jsonrpc.as_ref().expect("parsed MCP request");
+        let allowed_message = jsonrpc_log_message(
+            "allow",
+            "POST",
+            "api.example.test:443/mcp",
+            allowed_info,
+            42,
+            &reason,
+        );
+        assert!(allowed_message.contains("rule_methods=tools/call"));
+        assert!(allowed_message.contains("tools=read_status"));
 
         request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_resource","arguments":{"scope":"workspace/main"}}}"#,
@@ -2625,6 +2654,17 @@ network_policies:
             reason.contains("deny rule"),
             "deny reason should identify policy denial: {reason}"
         );
+        let denied_message = jsonrpc_log_message(
+            "deny",
+            "POST",
+            "api.example.test:443/mcp",
+            parsed,
+            42,
+            &reason,
+        );
+        assert!(denied_message.contains("rule_methods=tools/call"));
+        assert!(denied_message.contains("tools=delete_resource"));
+        assert!(!denied_message.contains("workspace/main"));
     }
 
     #[test]
@@ -2644,6 +2684,7 @@ network_policies:
 
         assert!(message.contains("endpoint=jsonrpc.example.com:443/rpc"));
         assert!(message.contains("rule_methods=reports.archive"));
+        assert!(message.contains("tools=-"));
         assert!(message.contains("policy_version=42"));
         assert!(!message.contains("delete_resource"));
         assert!(!message.contains("secret-scope"));

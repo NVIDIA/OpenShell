@@ -53,9 +53,43 @@ pods do not need direct external ingress for SSH.
 
 ## Container Security Context
 
-The driver grants the sandbox agent container the Linux capabilities the
-supervisor needs for namespace setup and policy enforcement. It can also request
-a Kubernetes AppArmor profile through `app_armor_profile`.
+The default `combined` supervisor topology grants the sandbox agent container
+the Linux capabilities the supervisor needs for namespace setup and process,
+filesystem, and network policy enforcement.
+
+The `sidecar` supervisor topology moves pod-level network setup into a root init
+container. In the default process/binary-aware mode, the long-lived network
+sidecar runs as UID 0 with `allowPrivilegeEscalation: false`, drops default
+Linux capabilities, and adds only `SYS_PTRACE` plus `DAC_READ_SEARCH` for
+cross-UID workload `/proc` inspection. The agent container also runs as the
+resolved sandbox UID/GID with `allowPrivilegeEscalation: false` and
+`capabilities.drop: ["ALL"]`.
+Set `sidecar.process_binary_aware_network_policy = false` to run the network
+sidecar as the configured non-root `sidecar.proxy_uid`, omit the extra `/proc`
+inspection capabilities, and enforce endpoint/L7 network policy without
+matching `policy.binaries`.
+In this mode OpenShell preserves gateway session and SSH behavior, but the
+process supervisor does not perform root-to-sandbox privilege dropping or
+supervisor identity mount isolation. It still applies Landlock filesystem policy
+and child seccomp filters where the kernel/runtime supports them. Network
+endpoint and L7 policy remain enforced by the network sidecar, and
+sidecar pods use a shared process namespace so the network sidecar can resolve
+process/binary identity through `/proc/<entrypoint-pid>`.
+
+Sidecar mode keeps gateway credentials in the network sidecar. The agent
+container does not mount the projected service-account token used for sandbox
+token bootstrap, does not mount the sandbox client TLS secret, and does not get
+gateway callback environment variables. The process supervisor receives policy
+and provider environment state from the sidecar over a local control socket in
+the shared sidecar state volume. The sidecar accepts only the pre-workload
+process-supervisor connection, authenticates its UID/GID/PID with peer
+credentials, and removes the listener afterward. SSH relays use a Linux
+abstract socket whose peer PID must match that authenticated supervisor. Both
+supervisors exit if the control connection closes, coupling their container
+restart lifecycle before a new authoritative client can be established.
+
+The driver can request a Kubernetes AppArmor profile through
+`app_armor_profile`.
 
 Supported values are `Unconfined`, `RuntimeDefault`, and
 `Localhost/<profile-name>`. An empty or unset value omits
@@ -83,6 +117,13 @@ nested schema and currently accepts:
 - `pod.priority_class_name`
 - `containers.agent.resources.requests`
 - `containers.agent.resources.limits`
+- `containers.agent.volume_mounts[].name`
+- `containers.agent.volume_mounts[].mount_path`
+- `containers.agent.volume_mounts[].sub_path`
+- `containers.agent.volume_mounts[].read_only`
+- `volumes[].name`
+- `volumes[].persistent_volume_claim.claim_name`
+- `volumes[].persistent_volume_claim.read_only`
 
 Nested keys inside the `kubernetes` block use snake_case. The top-level
 `driver_config` envelope is keyed by driver names, so `kubernetes` is not part
@@ -105,3 +146,50 @@ driver's configured `default_runtime_class_name`; the typed public
 public `--gpu` flag for the default GPU request, pass a count to `--gpu` for
 counted GPU requests, and use `driver_config` only for additional driver-owned
 resource details.
+
+Use PVC volumes to mount existing Kubernetes PersistentVolumeClaims into the
+agent container. PVC volumes and mounts default to read-only unless
+`read_only: false` is set explicitly. Read-write access requires
+`read_only: false` on both the PVC volume and each writable mount. The driver
+rejects duplicate volume names, invalid DNS-1123 volume labels or PVC claim
+subdomain names, mounts that reference unknown volumes, non-normalized or
+protected mount paths, and absolute or parent-traversing `sub_path` values.
+
+Any explicit driver-config mount under `/sandbox` disables the driver's
+default `/sandbox` workspace PVC injection for that sandbox. Only the explicit
+mount paths persist through the external PVC; other `/sandbox` paths come from
+the current sandbox image.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{
+    "kubernetes": {
+      "volumes": [{
+        "name": "user-data",
+        "persistent_volume_claim": {
+          "claim_name": "pvc-user-data-123",
+          "read_only": false
+        }
+      }],
+      "containers": {
+        "agent": {
+          "volume_mounts": [
+            {
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/workspace",
+              "sub_path": "workspace",
+              "read_only": false
+            },
+            {
+              "name": "user-data",
+              "mount_path": "/sandbox/.openshell/memory",
+              "sub_path": "memory",
+              "read_only": false
+            }
+          ]
+        }
+      }
+    }
+  }' \
+  -- claude
+```

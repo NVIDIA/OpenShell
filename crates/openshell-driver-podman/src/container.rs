@@ -888,9 +888,8 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         // Side-load the supervisor binary from a standalone OCI image.
         // Podman resolves image_volumes at the libpod layer, mounting the
         // image's filesystem at the destination path without starting a
-        // container from it. The supervisor image is FROM scratch with just
-        // the binary at /openshell-sandbox, so it appears at
-        // /opt/openshell/bin/openshell-sandbox.
+        // container from it. The supervisor image exposes the binary at
+        // /openshell-sandbox, so it appears at /opt/openshell/bin/openshell-sandbox.
         image_volumes,
         hostname: format!("sandbox-{}", sandbox.name),
         // Override the image's ENTRYPOINT so the supervisor binary runs
@@ -1836,7 +1835,7 @@ mod tests {
         let vol = &image_volumes[0];
         assert_eq!(
             vol["source"].as_str(),
-            Some("ghcr.io/nvidia/openshell/supervisor:latest"),
+            Some(openshell_core::config::default_supervisor_image().as_str()),
             "image volume source should be the supervisor image"
         );
         assert_eq!(
@@ -1922,8 +1921,9 @@ mod tests {
         let image_volumes = spec["image_volumes"]
             .as_array()
             .expect("image_volumes should be an array");
+        let expected_supervisor = openshell_core::config::default_supervisor_image();
         assert!(image_volumes.iter().any(|volume| {
-            volume["source"].as_str() == Some("ghcr.io/nvidia/openshell/supervisor:latest")
+            volume["source"].as_str() == Some(expected_supervisor.as_str())
                 && volume["destination"].as_str() == Some("/opt/openshell/bin")
         }));
         assert!(image_volumes.iter().any(|volume| {
@@ -2000,6 +2000,40 @@ mod tests {
                     options.iter().any(|option| option.as_str() == Some("rw"))
                 })
         }));
+    }
+
+    #[test]
+    fn driver_config_rejects_duplicate_mount_targets() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [
+                        {
+                            "type": "volume",
+                            "source": "work-nfs",
+                            "target": "/sandbox/work"
+                        },
+                        {
+                            "type": "tmpfs",
+                            "target": "/sandbox/work"
+                        }
+                    ]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("duplicate podman driver_config mount target")
+        );
     }
 
     #[test]

@@ -121,16 +121,25 @@ jobs:
         include:
           - agent_sandbox_api: v1beta1
             agent_sandbox_version: v0.5.0
+            topology: combined
+            extra_helm_values: ""
           - agent_sandbox_api: v1alpha1
             agent_sandbox_version: v0.4.6
+            topology: combined
+            extra_helm_values: ""
+          - agent_sandbox_api: v1beta1
+            agent_sandbox_version: v0.5.0
+            topology: sidecar
+            extra_helm_values: deploy/helm/openshell/ci/values-sidecar.yaml
     permissions:
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-kubernetes-test.yml
     with:
       image-tag: ${{ github.sha }}
-      job-name: Kubernetes E2E (Rust smoke, Agent Sandbox ${{ matrix.agent_sandbox_api }})
+      job-name: Kubernetes E2E (Rust smoke, ${{ matrix.topology }}, Agent Sandbox ${{ matrix.agent_sandbox_api }})
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
+      extra-helm-values: ${{ matrix.extra_helm_values }}
 
   kubernetes-ha-e2e:
     needs: [pr_metadata, build-gateway, build-supervisor]

@@ -5,16 +5,20 @@
 
 use super::AppArmorProfile;
 use crate::config::{
-    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, SupervisorSideloadMethod,
+    DEFAULT_PROXY_UID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID,
+    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, SupervisorSideloadMethod,
+    SupervisorTopology,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::{Event as KubeEventObj, Namespace, Node};
+use k8s_openapi::api::core::v1::{
+    Event as KubeEventObj, Namespace, Node, PersistentVolumeClaimVolumeSource, Volume, VolumeMount,
+};
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
+use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, SUPERVISOR_IMAGE_BINARY_PATH,
 };
@@ -33,7 +37,8 @@ use openshell_core::proto::compute::v1::{
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,29 +111,39 @@ struct AgentSandboxApi {
 struct KubernetesSandboxDriverConfig {
     pod: KubernetesPodDriverConfig,
     containers: KubernetesDriverContainersConfig,
+    volumes: Vec<KubernetesDriverVolumeConfig>,
 }
 
 impl KubernetesSandboxDriverConfig {
-    fn from_sandbox(sandbox: &Sandbox) -> Result<Self, String> {
-        let Some(template) = sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.template.as_ref())
-        else {
-            return Ok(Self::default());
-        };
-
-        Self::from_template(template)
-    }
-
     fn from_template(template: &SandboxTemplate) -> Result<Self, String> {
         let Some(config) = template.driver_config.as_ref() else {
             return Ok(Self::default());
         };
 
         let json = serde_json::Value::Object(struct_to_json_object(config));
-        serde_json::from_value(json)
-            .map_err(|err| format!("invalid kubernetes driver_config: {err}"))
+        let config: Self = serde_json::from_value(json)
+            .map_err(|err| format!("invalid kubernetes driver_config: {err}"))?;
+        config
+            .validate()
+            .map_err(|err| format!("invalid kubernetes driver_config: {err}"))?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        validate_kubernetes_driver_volumes(&self.volumes)?;
+        validate_kubernetes_driver_volume_mounts(
+            &self.volumes,
+            &self.containers.agent.volume_mounts,
+        )
+    }
+
+    fn has_explicit_sandbox_data_mount(&self) -> bool {
+        self.containers.agent.volume_mounts.iter().any(|mount| {
+            driver_mounts::path_is_or_under(
+                Path::new(&mount.mount_path),
+                Path::new(WORKSPACE_MOUNT_PATH),
+            )
+        })
     }
 }
 
@@ -151,6 +166,7 @@ struct KubernetesDriverContainersConfig {
 #[serde(default, deny_unknown_fields)]
 struct KubernetesContainerDriverConfig {
     resources: KubernetesContainerResourceConfig,
+    volume_mounts: Vec<KubernetesDriverVolumeMountConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -158,6 +174,220 @@ struct KubernetesContainerDriverConfig {
 struct KubernetesContainerResourceConfig {
     requests: BTreeMap<String, String>,
     limits: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KubernetesDriverVolumeConfig {
+    name: String,
+    persistent_volume_claim: KubernetesPersistentVolumeClaimConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KubernetesPersistentVolumeClaimConfig {
+    claim_name: String,
+    read_only: bool,
+}
+
+impl Default for KubernetesPersistentVolumeClaimConfig {
+    fn default() -> Self {
+        Self {
+            claim_name: String::new(),
+            read_only: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct KubernetesDriverVolumeMountConfig {
+    name: String,
+    mount_path: String,
+    sub_path: Option<String>,
+    read_only: bool,
+}
+
+impl Default for KubernetesDriverVolumeMountConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mount_path: String::new(),
+            sub_path: None,
+            read_only: true,
+        }
+    }
+}
+
+impl From<&KubernetesDriverVolumeConfig> for Volume {
+    fn from(volume: &KubernetesDriverVolumeConfig) -> Self {
+        Self {
+            name: volume.name.clone(),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: volume.persistent_volume_claim.claim_name.clone(),
+                read_only: Some(volume.persistent_volume_claim.read_only),
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&KubernetesDriverVolumeMountConfig> for VolumeMount {
+    fn from(mount: &KubernetesDriverVolumeMountConfig) -> Self {
+        Self {
+            name: mount.name.clone(),
+            mount_path: mount.mount_path.clone(),
+            read_only: Some(mount.read_only),
+            sub_path: mount.sub_path.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+const CLIENT_TLS_VOLUME_NAME: &str = "openshell-client-tls";
+const SERVICE_ACCOUNT_TOKEN_VOLUME_NAME: &str = "openshell-sa-token";
+const SERVICE_ACCOUNT_TOKEN_MOUNT_PATH: &str = "/var/run/secrets/openshell";
+
+const KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES: &[&str] = &[
+    CLIENT_TLS_VOLUME_NAME,
+    SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
+    SPIFFE_WORKLOAD_API_VOLUME_NAME,
+    SUPERVISOR_VOLUME_NAME,
+    WORKSPACE_VOLUME_NAME,
+];
+
+const KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS: &[&str] = &[SERVICE_ACCOUNT_TOKEN_MOUNT_PATH];
+
+fn validate_kubernetes_driver_volumes(
+    volumes: &[KubernetesDriverVolumeConfig],
+) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for volume in volumes {
+        validate_kubernetes_dns1123_label(&volume.name, "volumes[].name")?;
+        let name = volume.name.as_str();
+        if KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES.contains(&name) {
+            return Err(format!(
+                "volume name '{name}' is reserved for OpenShell-managed volumes"
+            ));
+        }
+        if !names.insert(name) {
+            return Err(format!(
+                "duplicate kubernetes driver_config volume '{name}'"
+            ));
+        }
+        validate_kubernetes_dns1123_subdomain(
+            &volume.persistent_volume_claim.claim_name,
+            "volumes[].persistent_volume_claim.claim_name",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_driver_volume_mounts(
+    volumes: &[KubernetesDriverVolumeConfig],
+    volume_mounts: &[KubernetesDriverVolumeMountConfig],
+) -> Result<(), String> {
+    let mut volume_read_only = BTreeMap::new();
+    for volume in volumes {
+        volume_read_only.insert(
+            volume.name.as_str(),
+            volume.persistent_volume_claim.read_only,
+        );
+    }
+
+    let mut mount_paths = HashSet::new();
+    for mount in volume_mounts {
+        validate_kubernetes_dns1123_label(&mount.name, "containers.agent.volume_mounts[].name")?;
+        let volume_name = mount.name.as_str();
+        let Some(volume_is_read_only) = volume_read_only.get(volume_name) else {
+            return Err(format!(
+                "volume mount references unknown kubernetes driver_config volume '{volume_name}'"
+            ));
+        };
+        if *volume_is_read_only && !mount.read_only {
+            return Err(format!(
+                "volume mount '{volume_name}' cannot set read_only=false because the PVC volume is read_only=true"
+            ));
+        }
+
+        driver_mounts::validate_container_mount_target(&mount.mount_path)?;
+        let normalized_mount_path = driver_mounts::normalize_mount_target(&mount.mount_path);
+        if !mount_paths.insert(normalized_mount_path.clone()) {
+            return Err(format!(
+                "duplicate kubernetes driver_config mount target '{normalized_mount_path}'"
+            ));
+        }
+
+        if let Some(sub_path) = mount.sub_path.as_ref() {
+            driver_mounts::validate_mount_subpath(sub_path)?;
+        }
+    }
+    Ok(())
+}
+
+// TODO: replace with an openshell_core Kubernetes-name helper once available.
+fn is_dns_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-') {
+        return false;
+    }
+    label
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+// TODO: replace with an openshell_core Kubernetes-name helper once available.
+fn is_dns_subdomain(value: &str) -> bool {
+    value.len() <= 253 && value.split('.').all(is_dns_label)
+}
+
+fn validate_kubernetes_dns1123_label(value: &str, field: &str) -> Result<(), String> {
+    if !is_dns_label(value) {
+        return Err(format!(
+            "{field} must be a DNS-1123 label: use lowercase alphanumeric characters or '-', start and end with an alphanumeric character, and use at most 63 characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_dns1123_subdomain(value: &str, field: &str) -> Result<(), String> {
+    if !is_dns_subdomain(value) {
+        return Err(format!(
+            "{field} must be a DNS-1123 subdomain: use lowercase alphanumeric characters, '-' or '.', start and end with an alphanumeric character, and use at most 253 characters"
+        ));
+    }
+    Ok(())
+}
+
+fn mount_path_conflicts_with_protected_path(mount_path: &str, protected_path: &str) -> bool {
+    driver_mounts::path_is_or_under(Path::new(mount_path), Path::new(protected_path))
+        || driver_mounts::path_is_or_under(Path::new(protected_path), Path::new(mount_path))
+}
+
+fn validate_kubernetes_protected_path_conflicts(
+    volume_mounts: &[KubernetesDriverVolumeMountConfig],
+    protected_paths: &[&str],
+) -> Result<(), String> {
+    for mount in volume_mounts {
+        let mount_path = mount.mount_path.as_str();
+        for protected_path in protected_paths {
+            if mount_path_conflicts_with_protected_path(mount_path, protected_path) {
+                return Err(format!(
+                    "mount path '{mount_path}' conflicts with reserved OpenShell path '{protected_path}'"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn kubernetes_driver_volume_to_k8s(volume: &KubernetesDriverVolumeConfig) -> serde_json::Value {
+    serde_json::to_value(Volume::from(volume)).expect("Volume serializes to JSON")
+}
+
+fn kubernetes_driver_volume_mount_to_k8s(
+    mount: &KubernetesDriverVolumeMountConfig,
+) -> serde_json::Value {
+    serde_json::to_value(VolumeMount::from(mount)).expect("VolumeMount serializes to JSON")
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +451,9 @@ impl KubernetesComputeDriver {
         config
             .validate_sandbox_identity_config()
             .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_proxy_uid()
+            .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
@@ -268,6 +501,20 @@ impl KubernetesComputeDriver {
 
     pub fn ssh_socket_path(&self) -> &str {
         &self.config.ssh_socket_path
+    }
+
+    fn validate_driver_config_for_sandbox(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<KubernetesSandboxDriverConfig, String> {
+        kubernetes_driver_config_for_spec(
+            sandbox.spec.as_ref(),
+            self.config.provider_spiffe_enabled().then_some(
+                self.config
+                    .provider_spiffe_workload_api_socket_path
+                    .as_str(),
+            ),
+        )
     }
 
     fn agent_sandbox_api(&self, client: Client, sandbox_api_version: &str) -> AgentSandboxApi {
@@ -417,7 +664,8 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
-        let _ = KubernetesSandboxDriverConfig::from_sandbox(sandbox)
+        let _ = self
+            .validate_driver_config_for_sandbox(sandbox)
             .map_err(tonic::Status::invalid_argument)?;
         let gpu_requirements = sandbox
             .spec
@@ -526,8 +774,6 @@ impl KubernetesComputeDriver {
 
     #[allow(clippy::similar_names)]
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
-        let _ = KubernetesSandboxDriverConfig::from_sandbox(sandbox)
-            .map_err(KubernetesDriverError::InvalidArgument)?;
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -549,7 +795,8 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::Message)?;
 
         // Resolve sandbox UID/GID from config or OpenShift SCC namespace annotations.
-        let (resolved_uid, resolved_gid, ns_annotations) = self.resolve_sandbox_identity().await;
+        let (resolved_user_id, resolved_group_id, ns_annotations) =
+            self.resolve_sandbox_identity().await;
 
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
@@ -558,6 +805,12 @@ impl KubernetesComputeDriver {
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
+            topology: self.config.topology,
+            proxy_uid: self.config.sidecar.proxy_uid,
+            process_binary_aware_network_policy: self
+                .config
+                .sidecar
+                .process_binary_aware_network_policy,
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
@@ -574,10 +827,13 @@ impl KubernetesComputeDriver {
             provider_spiffe_workload_api_socket_path: &self
                 .config
                 .provider_spiffe_workload_api_socket_path,
-            sandbox_uid: resolved_uid,
-            sandbox_gid: resolved_gid,
+            sandbox_uid: resolved_user_id,
+            sandbox_gid: resolved_group_id,
         };
+        validate_sidecar_proxy_identity(&params)?;
 
+        let data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params)
+            .map_err(KubernetesDriverError::InvalidArgument)?;
         let mut obj = DynamicObject::new(name, &agent_sandbox_api.resource);
         // Copy only the SCC-related annotations onto the Sandbox CR for
         // traceability. Copying the full namespace annotation map exposes
@@ -605,7 +861,7 @@ impl KubernetesComputeDriver {
             ..Default::default()
         };
 
-        obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
+        obj.data = data;
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             agent_sandbox_api.api.create(&PostParams::default(), &obj),
@@ -1035,6 +1291,32 @@ const SUPERVISOR_VOLUME_NAME: &str = "openshell-supervisor-bin";
 /// Name of the init container that installs the supervisor binary.
 const SUPERVISOR_INIT_CONTAINER_NAME: &str = "openshell-supervisor-install";
 
+/// Name of the init container that prepares pod-level sidecar networking.
+const SUPERVISOR_NETWORK_INIT_CONTAINER_NAME: &str = "openshell-network-init";
+
+/// Container name for the network-only supervisor sidecar.
+const SUPERVISOR_NETWORK_SIDECAR_NAME: &str = "openshell-supervisor-network";
+
+/// UID used by strict process/binary-aware sidecars so Kubernetes grants the
+/// requested capability set into the effective set without privilege escalation.
+const BINARY_AWARE_SIDECAR_PROXY_UID: u32 = 0;
+
+/// Shared volume used by the network sidecar and process-only supervisor for
+/// local coordination in sidecar topology.
+const SIDECAR_STATE_VOLUME_NAME: &str = "openshell-sidecar-state";
+const SIDECAR_STATE_MOUNT_PATH: &str = "/run/openshell-sidecar";
+const SIDECAR_CONTROL_SOCKET: &str = "/run/openshell-sidecar/control.sock";
+// Linux abstract socket names are scoped to the pod's shared network namespace.
+// Unlike a filesystem socket in the shared state volume, the workload cannot
+// unlink and replace this relay endpoint after the trusted supervisor binds it.
+const SIDECAR_SSH_SOCKET_FILE: &str = "@openshell-sidecar-ssh";
+
+/// Shared TLS work directory. The network sidecar writes the proxy CA bundle
+/// here, while the agent container consumes it after sidecar bootstrap.
+const SIDECAR_TLS_VOLUME_NAME: &str = "openshell-supervisor-tls";
+const SIDECAR_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy";
+const SIDECAR_CLIENT_TLS_MOUNT_PATH: &str = "/etc/openshell-tls/proxy/client";
+
 /// Build the emptyDir volume that holds the supervisor binary.
 ///
 /// The init container writes the binary here; the agent container reads it.
@@ -1109,31 +1391,12 @@ fn supervisor_init_container(
     spec
 }
 
-/// Apply supervisor side-load transforms to an already-built pod template JSON.
-///
-/// Depending on the sideload method:
-/// - **`ImageVolume`**: mounts the supervisor OCI image directly as a read-only
-///   volume (no init container needed, requires K8s >= v1.33).
-/// - **`InitContainer`**: injects an emptyDir volume and an init container that
-///   copies the supervisor binary from the supervisor image into that volume.
-///
-/// In both cases, the agent container gets a command override to run the
-/// side-loaded binary and `runAsUser: 0` so it can create network namespaces,
-/// set up the proxy, and configure Landlock/seccomp.
-#[allow(clippy::similar_names)]
-fn apply_supervisor_sideload(
-    pod_template: &mut serde_json::Value,
+fn apply_supervisor_binary_source(
+    spec: &mut serde_json::Map<String, serde_json::Value>,
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
     method: SupervisorSideloadMethod,
-    sandbox_uid: u32,
-    sandbox_gid: u32,
 ) {
-    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
-        return;
-    };
-
-    // 1. Add the volume (image source or emptyDir depending on method)
     let volumes = spec
         .entry("volumes")
         .or_insert_with(|| serde_json::json!([]))
@@ -1152,7 +1415,6 @@ fn apply_supervisor_sideload(
         }
     }
 
-    // 2. Add the init container only for the init-container method
     if method == SupervisorSideloadMethod::InitContainer {
         let init_containers = spec
             .entry("initContainers")
@@ -1165,8 +1427,35 @@ fn apply_supervisor_sideload(
             ));
         }
     }
+}
 
-    // 3. Find the agent container and add volume mount + command override
+/// Apply supervisor side-load transforms to an already-built pod template JSON.
+///
+/// Depending on the sideload method:
+/// - **`ImageVolume`**: mounts the supervisor OCI image directly as a read-only
+///   volume (no init container needed, requires K8s >= v1.33).
+/// - **`InitContainer`**: injects an emptyDir volume and an init container that
+///   copies the supervisor binary from the supervisor image into that volume.
+///
+/// In both cases, the agent container gets a command override to run the
+/// side-loaded binary as root so it can create network namespaces, set up the
+/// proxy, and configure Landlock/seccomp.
+#[allow(clippy::similar_names)]
+fn apply_supervisor_sideload(
+    pod_template: &mut serde_json::Value,
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
+    method: SupervisorSideloadMethod,
+    sandbox_uid: u32,
+    sandbox_gid: u32,
+) {
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    apply_supervisor_binary_source(spec, supervisor_image, supervisor_image_pull_policy, method);
+
+    // Find the agent container and add volume mount + command override
     let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
         return;
     };
@@ -1227,6 +1516,398 @@ fn apply_supervisor_sideload(
     }
 }
 
+fn sidecar_state_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": SIDECAR_STATE_VOLUME_NAME,
+        "mountPath": SIDECAR_STATE_MOUNT_PATH,
+    })
+}
+
+fn sidecar_tls_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": SIDECAR_TLS_VOLUME_NAME,
+        "mountPath": SIDECAR_TLS_MOUNT_PATH,
+    })
+}
+
+fn copy_log_level_env(
+    env: &mut Vec<serde_json::Value>,
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+) {
+    if let Some(value) = spec_environment
+        .get(openshell_core::sandbox_env::LOG_LEVEL)
+        .or_else(|| template_environment.get(openshell_core::sandbox_env::LOG_LEVEL))
+    {
+        upsert_env(env, openshell_core::sandbox_env::LOG_LEVEL, value);
+    }
+}
+
+fn supervisor_sidecar_env(
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    params: &SandboxPodParams<'_>,
+) -> Vec<serde_json::Value> {
+    let mut env = Vec::new();
+    apply_required_env(
+        &mut env,
+        params.sandbox_id,
+        params.sandbox_name,
+        params.grpc_endpoint,
+        "",
+        !params.client_tls_secret_name.is_empty(),
+        provider_spiffe_socket_path(params),
+    );
+    if !params.client_tls_secret_name.is_empty() {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_CA,
+            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/ca.crt"),
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_CERT,
+            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/tls.crt"),
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::TLS_KEY,
+            &format!("{SIDECAR_CLIENT_TLS_MOUNT_PATH}/tls.key"),
+        );
+    }
+    copy_log_level_env(&mut env, template_environment, spec_environment);
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
+        "sidecar",
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
+        "sidecar-nftables",
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET,
+        SIDECAR_CONTROL_SOCKET,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SSH_SOCKET_PATH,
+        SIDECAR_SSH_SOCKET_FILE,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::PROXY_TLS_DIR,
+        SIDECAR_TLS_MOUNT_PATH,
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SANDBOX_UID,
+        &params.sandbox_uid.to_string(),
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SANDBOX_GID,
+        &params.sandbox_gid.to_string(),
+    );
+    if !params.process_binary_aware_network_policy {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY,
+            "relaxed",
+        );
+    }
+    env
+}
+
+fn supervisor_sidecar_container(
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    params: &SandboxPodParams<'_>,
+) -> serde_json::Value {
+    let proxy_uid = effective_sidecar_proxy_uid(params);
+    let capabilities = if params.process_binary_aware_network_policy {
+        serde_json::json!({
+            "drop": ["ALL"],
+            "add": ["SYS_PTRACE", "DAC_READ_SEARCH"]
+        })
+    } else {
+        serde_json::json!({
+            "drop": ["ALL"]
+        })
+    };
+    let mut container = serde_json::json!({
+        "name": SUPERVISOR_NETWORK_SIDECAR_NAME,
+        "image": params.supervisor_image,
+        "command": [
+            SUPERVISOR_IMAGE_BINARY_PATH,
+            "--mode=network",
+        ],
+        "env": supervisor_sidecar_env(template_environment, spec_environment, params),
+        "securityContext": {
+            "runAsUser": proxy_uid,
+            "runAsGroup": params.sandbox_gid,
+            "runAsNonRoot": proxy_uid != 0,
+            "allowPrivilegeEscalation": false,
+            "capabilities": capabilities
+        },
+        "volumeMounts": [
+            sidecar_state_volume_mount(),
+            sidecar_tls_volume_mount(),
+            {
+                "name": "openshell-sa-token",
+                "mountPath": "/var/run/secrets/openshell",
+                "readOnly": true
+            }
+        ]
+    });
+    if !params.supervisor_image_pull_policy.is_empty() {
+        container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
+    }
+    if params.provider_spiffe_enabled {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(serde_json::json!({
+                "name": SPIFFE_WORKLOAD_API_VOLUME_NAME,
+                "mountPath": spiffe_socket_mount_path(params.provider_spiffe_workload_api_socket_path),
+                "readOnly": true,
+            }));
+    }
+    if let Some(profile) = params.app_armor_profile {
+        container["securityContext"]["appArmorProfile"] = app_armor_profile_to_k8s(profile);
+    }
+    container
+}
+
+fn effective_sidecar_proxy_uid(params: &SandboxPodParams<'_>) -> u32 {
+    if params.process_binary_aware_network_policy {
+        BINARY_AWARE_SIDECAR_PROXY_UID
+    } else {
+        params.proxy_uid
+    }
+}
+
+fn supervisor_network_init_container(params: &SandboxPodParams<'_>) -> serde_json::Value {
+    let proxy_uid = effective_sidecar_proxy_uid(params);
+    let mut container = serde_json::json!({
+        "name": SUPERVISOR_NETWORK_INIT_CONTAINER_NAME,
+        "image": params.supervisor_image,
+        "command": [
+            SUPERVISOR_IMAGE_BINARY_PATH,
+            "--mode=network-init",
+            "--proxy-uid",
+            proxy_uid.to_string(),
+            "--proxy-gid",
+            params.sandbox_gid.to_string(),
+            "--sidecar-state-dir",
+            SIDECAR_STATE_MOUNT_PATH,
+            "--sidecar-tls-dir",
+            SIDECAR_TLS_MOUNT_PATH,
+        ],
+        "securityContext": {
+            "runAsUser": 0,
+            "allowPrivilegeEscalation": false,
+            "capabilities": {
+                "drop": ["ALL"],
+                "add": ["NET_ADMIN", "NET_RAW", "CHOWN", "FOWNER"]
+            }
+        },
+        "volumeMounts": [
+            sidecar_state_volume_mount(),
+            sidecar_tls_volume_mount(),
+        ]
+    });
+    if !params.supervisor_image_pull_policy.is_empty() {
+        container["imagePullPolicy"] = serde_json::json!(params.supervisor_image_pull_policy);
+    }
+    if !params.client_tls_secret_name.is_empty() {
+        container["volumeMounts"]
+            .as_array_mut()
+            .expect("volumeMounts is an array")
+            .push(serde_json::json!({
+                "name": "openshell-client-tls",
+                "mountPath": "/etc/openshell-tls/client",
+                "readOnly": true
+            }));
+    }
+    if let Some(profile) = params.app_armor_profile {
+        container["securityContext"]["appArmorProfile"] = app_armor_profile_to_k8s(profile);
+    }
+    container
+}
+
+fn apply_supervisor_sidecar_topology(
+    pod_template: &mut serde_json::Value,
+    template_environment: &std::collections::HashMap<String, String>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    params: &SandboxPodParams<'_>,
+) {
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    let pod_security_context = spec
+        .entry("securityContext")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(sc) = pod_security_context.as_object_mut() {
+        sc.insert("fsGroup".to_string(), serde_json::json!(params.sandbox_gid));
+    }
+
+    spec.insert("shareProcessNamespace".to_string(), serde_json::json!(true));
+
+    apply_supervisor_binary_source(
+        spec,
+        params.supervisor_image,
+        params.supervisor_image_pull_policy,
+        params.supervisor_sideload_method,
+    );
+
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        volumes.push(serde_json::json!({
+            "name": SIDECAR_STATE_VOLUME_NAME,
+            "emptyDir": {}
+        }));
+        volumes.push(serde_json::json!({
+            "name": SIDECAR_TLS_VOLUME_NAME,
+            "emptyDir": {}
+        }));
+    }
+
+    let init_containers = spec
+        .entry("initContainers")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(init_containers) = init_containers {
+        init_containers.push(supervisor_network_init_container(params));
+    }
+
+    let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+
+    let target_index = containers
+        .iter()
+        .position(|c| c.get("name").and_then(|v| v.as_str()) == Some("agent"))
+        .unwrap_or(0);
+
+    if let Some(container) = containers
+        .get_mut(target_index)
+        .and_then(|v| v.as_object_mut())
+    {
+        container.insert(
+            "command".to_string(),
+            serde_json::json!([
+                format!("{}/openshell-sandbox", SUPERVISOR_MOUNT_PATH),
+                "--mode=process"
+            ]),
+        );
+
+        let security_context = container
+            .entry("securityContext")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(sc) = security_context.as_object_mut() {
+            sc.insert(
+                "runAsUser".to_string(),
+                serde_json::json!(params.sandbox_uid),
+            );
+            sc.insert(
+                "runAsGroup".to_string(),
+                serde_json::json!(params.sandbox_gid),
+            );
+            sc.insert("runAsNonRoot".to_string(), serde_json::json!(true));
+            sc.insert(
+                "allowPrivilegeEscalation".to_string(),
+                serde_json::json!(false),
+            );
+            sc.insert(
+                "capabilities".to_string(),
+                serde_json::json!({
+                    "drop": ["ALL"]
+                }),
+            );
+        }
+
+        let volume_mounts = container
+            .entry("volumeMounts")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(volume_mounts) = volume_mounts {
+            remove_volume_mount(volume_mounts, "openshell-sa-token");
+            remove_volume_mount(volume_mounts, "openshell-client-tls");
+            remove_volume_mount(volume_mounts, SPIFFE_WORKLOAD_API_VOLUME_NAME);
+            volume_mounts.push(supervisor_volume_mount());
+            volume_mounts.push(sidecar_state_volume_mount());
+            volume_mounts.push(sidecar_tls_volume_mount());
+        }
+
+        let env = container
+            .entry("env")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(env) = env {
+            remove_env(env, openshell_core::sandbox_env::ENDPOINT);
+            remove_env(env, openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME);
+            remove_env(env, openshell_core::sandbox_env::TLS_CA);
+            remove_env(env, openshell_core::sandbox_env::TLS_CERT);
+            remove_env(env, openshell_core::sandbox_env::TLS_KEY);
+            remove_env(env, openshell_core::sandbox_env::SANDBOX_TOKEN);
+            remove_env(env, openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+            remove_env(env, openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
+            remove_env(
+                env,
+                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SUPERVISOR_TOPOLOGY,
+                "sidecar",
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
+                "sidecar-nftables",
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SSH_SOCKET_PATH,
+                SIDECAR_SSH_SOCKET_FILE,
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET,
+                SIDECAR_CONTROL_SOCKET,
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::PROXY_TLS_DIR,
+                SIDECAR_TLS_MOUNT_PATH,
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SANDBOX_UID,
+                &params.sandbox_uid.to_string(),
+            );
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::SANDBOX_GID,
+                &params.sandbox_gid.to_string(),
+            );
+        }
+    }
+
+    containers.push(supervisor_sidecar_container(
+        template_environment,
+        spec_environment,
+        params,
+    ));
+}
+
 /// Apply workspace persistence transforms to an already-built pod template.
 ///
 /// This injects:
@@ -1242,6 +1923,7 @@ fn apply_supervisor_sideload(
 /// The init container mounts the PVC at a temporary path so it can still see
 /// the image's `/sandbox` directory.  It checks for a sentinel file and skips
 /// the copy if the PVC was already initialised.
+#[allow(clippy::similar_names)]
 fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
@@ -1301,6 +1983,10 @@ fn apply_workspace_persistence(
         // self-referential symlinks under `/sandbox/.uv`, and GNU cp can
         // fail while seeding the PVC even though preserving the symlink as-is
         // is valid. `tar` copies the tree without dereferencing those links.
+        // Archive only the contents, not the `/sandbox` directory entry
+        // itself, so extraction never tries to chmod the PVC mount root.
+        // Extract without restoring owner, mode, or timestamps so the
+        // non-root init container can seed kubelet-owned PVCs.
         //
         // The inner `[ -d ... ]` guard handles custom images that don't have
         // a /sandbox directory — the copy is skipped but the sentinel is
@@ -1308,7 +1994,12 @@ fn apply_workspace_persistence(
         let copy_cmd = format!(
             "if [ ! -f {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL} ]; then \
                if [ -d {WORKSPACE_MOUNT_PATH} ]; then \
-                 tar -C {WORKSPACE_MOUNT_PATH} -cf - . | tar -C {WORKSPACE_INIT_MOUNT_PATH} -xpf -; \
+                 tmp=$(mktemp) && rm -f \"$tmp\" && \
+                   (cd {WORKSPACE_MOUNT_PATH} && find . -mindepth 1 -maxdepth 1 -exec tar -cf \"$tmp\" {{}} +) && \
+                   if [ -f \"$tmp\" ]; then \
+                     tar -C {WORKSPACE_INIT_MOUNT_PATH} --no-same-owner --no-same-permissions --touch -xf \"$tmp\" && \
+                     rm -f \"$tmp\"; \
+                   fi; \
                fi && \
                touch {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL}; \
              fi"
@@ -1366,6 +2057,9 @@ struct SandboxPodParams<'a> {
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
+    topology: SupervisorTopology,
+    proxy_uid: u32,
+    process_binary_aware_network_policy: bool,
     service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
@@ -1397,6 +2091,9 @@ impl Default for SandboxPodParams<'_> {
             supervisor_image: "",
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            topology: SupervisorTopology::default(),
+            proxy_uid: DEFAULT_PROXY_UID,
+            process_binary_aware_network_policy: true,
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
@@ -1417,6 +2114,18 @@ impl Default for SandboxPodParams<'_> {
     }
 }
 
+fn validate_sidecar_proxy_identity(
+    params: &SandboxPodParams<'_>,
+) -> Result<(), KubernetesDriverError> {
+    if params.topology == SupervisorTopology::Sidecar && params.proxy_uid == params.sandbox_uid {
+        return Err(KubernetesDriverError::Precondition(format!(
+            "proxy_uid ({}) must not match sandbox_uid ({}) in sidecar topology",
+            params.proxy_uid, params.sandbox_uid
+        )));
+    }
+    Ok(())
+}
+
 fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
     let mut env = spec.map_or_else(Default::default, |s| s.environment.clone());
     if let Some(s) = spec.filter(|s| !s.log_level.is_empty()) {
@@ -1428,27 +2137,55 @@ fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String,
     env
 }
 
-fn kubernetes_driver_config(template: &SandboxTemplate) -> KubernetesSandboxDriverConfig {
-    KubernetesSandboxDriverConfig::from_template(template)
-        .expect("validated Kubernetes driver_config")
+fn kubernetes_driver_config_for_spec(
+    spec: Option<&SandboxSpec>,
+    provider_spiffe_workload_api_socket_path: Option<&str>,
+) -> Result<KubernetesSandboxDriverConfig, String> {
+    let config = spec
+        .and_then(|spec| spec.template.as_ref())
+        .map(KubernetesSandboxDriverConfig::from_template)
+        .transpose()?
+        .unwrap_or_default();
+    let mut protected_paths = KUBERNETES_DRIVER_PROTECTED_MOUNT_PATHS.to_vec();
+    let provider_spiffe_mount_path;
+    if let Some(socket_path) = provider_spiffe_workload_api_socket_path {
+        provider_spiffe_mount_path = spiffe_socket_mount_path(socket_path);
+        protected_paths.push(&provider_spiffe_mount_path);
+    }
+    validate_kubernetes_protected_path_conflicts(
+        &config.containers.agent.volume_mounts,
+        &protected_paths,
+    )?;
+    Ok(config)
 }
 
 fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
     params: &SandboxPodParams<'_>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
+    let driver_config =
+        kubernetes_driver_config_for_spec(spec, provider_spiffe_socket_path(params))?;
     let mut root = serde_json::Map::new();
+
+    // Determine early whether OpenShell should inject its default workspace
+    // PVC. Explicit Kubernetes driver-config mounts under /sandbox/ take
+    // ownership of workspace persistence.
+    // We need this flag before building the podTemplate because the workspace
+    // persistence transforms are applied inside sandbox_template_to_k8s.
+    let user_has_explicit_workspace_mount = driver_config.has_explicit_sandbox_data_mount();
+    let inject_workspace = !user_has_explicit_workspace_mount;
 
     if let Some(spec) = spec {
         let pod_env = spec_pod_env(Some(spec));
         if let Some(template) = spec.template.as_ref() {
             root.insert(
                 "podTemplate".to_string(),
-                sandbox_template_to_k8s_with_gpu_requirements(
+                sandbox_template_to_k8s_with_validated_config(
                     template,
                     driver_gpu_requirements(spec.resource_requirements.as_ref()),
                     &pod_env,
-                    true,
+                    &driver_config,
+                    inject_workspace,
                     params,
                 ),
             );
@@ -1461,29 +2198,32 @@ fn sandbox_to_k8s_spec(
         }
     }
 
-    root.insert(
-        "volumeClaimTemplates".to_string(),
-        default_workspace_volume_claim_templates(params.workspace_default_storage_size),
-    );
+    if inject_workspace {
+        root.insert(
+            "volumeClaimTemplates".to_string(),
+            default_workspace_volume_claim_templates(params.workspace_default_storage_size),
+        );
+    }
 
     // podTemplate is required by the Kubernetes CRD - ensure it's always present
     if !root.contains_key("podTemplate") {
         let pod_env = spec_pod_env(spec);
         root.insert(
             "podTemplate".to_string(),
-            sandbox_template_to_k8s_with_gpu_requirements(
+            sandbox_template_to_k8s_with_validated_config(
                 &SandboxTemplate::default(),
                 driver_gpu_requirements(spec.and_then(|s| s.resource_requirements.as_ref())),
                 &pod_env,
-                true,
+                &driver_config,
+                inject_workspace,
                 params,
             ),
         );
     }
 
-    serde_json::Value::Object(
+    Ok(serde_json::Value::Object(
         std::iter::once(("spec".to_string(), serde_json::Value::Object(root))).collect(),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -1495,15 +2235,19 @@ fn sandbox_template_to_k8s(
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
     let gpu_requirements = gpu.then_some(GpuResourceRequirements { count: None });
-    sandbox_template_to_k8s_with_gpu_requirements(
+    let driver_config = KubernetesSandboxDriverConfig::from_template(template)
+        .expect("test Kubernetes driver_config should be valid");
+    sandbox_template_to_k8s_with_validated_config(
         template,
         gpu_requirements.as_ref(),
         spec_environment,
+        &driver_config,
         inject_workspace,
         params,
     )
 }
 
+#[cfg(test)]
 fn sandbox_template_to_k8s_with_gpu_requirements(
     template: &SandboxTemplate,
     gpu_requirements: Option<&GpuResourceRequirements>,
@@ -1511,8 +2255,26 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
-    let driver_config = kubernetes_driver_config(template);
+    let driver_config = KubernetesSandboxDriverConfig::from_template(template)
+        .expect("test Kubernetes driver_config should be valid");
+    sandbox_template_to_k8s_with_validated_config(
+        template,
+        gpu_requirements,
+        spec_environment,
+        &driver_config,
+        inject_workspace,
+        params,
+    )
+}
 
+fn sandbox_template_to_k8s_with_validated_config(
+    template: &SandboxTemplate,
+    gpu_requirements: Option<&GpuResourceRequirements>,
+    spec_environment: &std::collections::HashMap<String, String>,
+    driver_config: &KubernetesSandboxDriverConfig,
+    inject_workspace: bool,
+    params: &SandboxPodParams<'_>,
+) -> serde_json::Value {
     let mut metadata = serde_json::Map::new();
     let mut pod_labels = template
         .labels
@@ -1676,7 +2438,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     let mut volume_mounts: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
         volume_mounts.push(serde_json::json!({
-            "name": "openshell-client-tls",
+            "name": CLIENT_TLS_VOLUME_NAME,
             "mountPath": "/etc/openshell-tls/client",
             "readOnly": true
         }));
@@ -1689,10 +2451,18 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         }));
     }
     volume_mounts.push(serde_json::json!({
-        "name": "openshell-sa-token",
-        "mountPath": "/var/run/secrets/openshell",
+        "name": SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
+        "mountPath": SERVICE_ACCOUNT_TOKEN_MOUNT_PATH,
         "readOnly": true,
     }));
+    volume_mounts.extend(
+        driver_config
+            .containers
+            .agent
+            .volume_mounts
+            .iter()
+            .map(kubernetes_driver_volume_mount_to_k8s),
+    );
     container.insert(
         "volumeMounts".to_string(),
         serde_json::Value::Array(volume_mounts),
@@ -1707,13 +2477,22 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
     );
 
-    // Add TLS secret volume.  Mode 0400 (owner-read) prevents the
-    // unprivileged sandbox user from reading the mTLS private key.
+    // Add TLS secret volume. Combined mode uses mode 0400 because the
+    // supervisor starts as root and drops privileges before running workload
+    // children. Sidecar mode keeps the process supervisor non-root, so it uses
+    // pod fsGroup + 0440 to preserve gateway session and SSH control behavior.
     let mut volumes: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
+        let client_tls_default_mode = match params.topology {
+            SupervisorTopology::Combined => 0o400,
+            SupervisorTopology::Sidecar => 0o440,
+        };
         volumes.push(serde_json::json!({
-            "name": "openshell-client-tls",
-            "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
+            "name": CLIENT_TLS_VOLUME_NAME,
+            "secret": {
+                "secretName": params.client_tls_secret_name,
+                "defaultMode": client_tls_default_mode
+            }
         }));
     }
     if params.provider_spiffe_enabled {
@@ -1728,9 +2507,14 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     // Projected ServiceAccountToken volume — kubelet writes a short-lived
     // audience-bound JWT into /var/run/secrets/openshell/token and rotates
     // it automatically. The supervisor exchanges this for a gateway-minted
-    // JWT via `IssueSandboxToken` once at startup.
+    // JWT via `IssueSandboxToken` once at startup. In sidecar topology both
+    // supervisor containers run with the sandbox GID and need group-read access.
+    let sa_token_default_mode = match params.topology {
+        SupervisorTopology::Combined => 0o400,
+        SupervisorTopology::Sidecar => 0o440,
+    };
     volumes.push(serde_json::json!({
-        "name": "openshell-sa-token",
+        "name": SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
         "projected": {
             "sources": [{
                 "serviceAccountToken": {
@@ -1739,9 +2523,15 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
                     "path": "token"
                 }
             }],
-            "defaultMode": 256
+            "defaultMode": sa_token_default_mode
         }
     }));
+    volumes.extend(
+        driver_config
+            .volumes
+            .iter()
+            .map(kubernetes_driver_volume_to_k8s),
+    );
     spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     // Add hostAliases so sandbox pods can reach the Docker host.
@@ -1763,18 +2553,30 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
 
     let mut result = serde_json::Value::Object(template_value);
 
-    apply_supervisor_sideload(
-        &mut result,
-        params.supervisor_image,
-        params.supervisor_image_pull_policy,
-        params.supervisor_sideload_method,
-        params.sandbox_uid,
-        params.sandbox_gid,
-    );
+    match params.topology {
+        SupervisorTopology::Combined => {
+            apply_supervisor_sideload(
+                &mut result,
+                params.supervisor_image,
+                params.supervisor_image_pull_policy,
+                params.supervisor_sideload_method,
+                params.sandbox_uid,
+                params.sandbox_gid,
+            );
+        }
+        SupervisorTopology::Sidecar => {
+            apply_supervisor_sidecar_topology(
+                &mut result,
+                &template.environment,
+                spec_environment,
+                params,
+            );
+        }
+    }
 
     // Inject workspace persistence (init container + PVC volume mount) so
-    // that /sandbox data survives pod rescheduling.  Skipped when the user
-    // provides custom volumeClaimTemplates to avoid conflicts.
+    // that /sandbox data survives pod rescheduling. Skipped when the user
+    // provides custom storage through driver_config.
     if inject_workspace {
         apply_workspace_persistence(
             &mut result,
@@ -2068,9 +2870,9 @@ fn provider_spiffe_socket_path<'a>(params: &'a SandboxPodParams<'a>) -> Option<&
 }
 
 fn spiffe_socket_mount_path(socket_path: &str) -> String {
-    std::path::Path::new(socket_path)
+    Path::new(socket_path)
         .parent()
-        .and_then(std::path::Path::to_str)
+        .and_then(Path::to_str)
         .filter(|path| !path.is_empty() && *path != "/")
         .expect("provider SPIFFE socket path should be validated before pod rendering")
         .to_string()
@@ -2086,6 +2888,14 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     }
 
     env.push(serde_json::json!({"name": name, "value": value}));
+}
+
+fn remove_env(env: &mut Vec<serde_json::Value>, name: &str) {
+    env.retain(|item| item.get("name").and_then(|value| value.as_str()) != Some(name));
+}
+
+fn remove_volume_mount(volume_mounts: &mut Vec<serde_json::Value>, name: &str) {
+    volume_mounts.retain(|mount| mount.get("name").and_then(|value| value.as_str()) != Some(name));
 }
 
 /// Extract a string value from the template's `platform_config` Struct.
@@ -2234,6 +3044,13 @@ mod tests {
         }
     }
 
+    fn sandbox_to_k8s_spec_for_test(
+        spec: Option<&SandboxSpec>,
+        params: &SandboxPodParams<'_>,
+    ) -> serde_json::Value {
+        sandbox_to_k8s_spec(spec, params).expect("test Kubernetes driver_config should be valid")
+    }
+
     fn kube_api_error(code: u16, message: &str) -> KubeError {
         KubeError::Api(kube::core::ErrorResponse {
             status: if code == 404 {
@@ -2260,6 +3077,15 @@ mod tests {
     fn sandbox_api_version_probe_keeps_non_404_errors() {
         let err = kube_api_error(403, "sandboxes.agents.x-k8s.io is forbidden");
         assert!(!should_try_next_sandbox_api_version(&err));
+    }
+
+    fn rendered_env<'a>(container: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+        container["env"]
+            .as_array()?
+            .iter()
+            .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))?
+            .get("value")?
+            .as_str()
     }
 
     #[test]
@@ -2291,7 +3117,7 @@ mod tests {
     }
 
     #[test]
-    fn driver_config_from_sandbox_rejects_unknown_fields() {
+    fn driver_config_for_spec_rejects_unknown_fields() {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
@@ -2306,9 +3132,577 @@ mod tests {
             ..Default::default()
         };
 
-        let err = KubernetesSandboxDriverConfig::from_sandbox(&sandbox).unwrap_err();
+        let err = kubernetes_driver_config_for_spec(sandbox.spec.as_ref(), None).unwrap_err();
         assert!(err.contains("unknown field"));
         assert!(err.contains("gpu_device_ids"));
+    }
+
+    #[test]
+    fn driver_config_pvc_subpath_mounts_render_in_pod_template() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "user-data",
+                    "persistent_volume_claim": {
+                        "claim_name": "pvc-user-data-123",
+                        "read_only": false
+                    }
+                }],
+                "containers": {
+                    "agent": {
+                        "volume_mounts": [
+                            {
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/workspace",
+                                "sub_path": "workspace",
+                                "read_only": false
+                            },
+                            {
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/memory",
+                                "sub_path": "memory"
+                            }
+                        ]
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+        let spec = SandboxSpec {
+            template: Some(template),
+            ..SandboxSpec::default()
+        };
+
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+        let pod_template = &cr["spec"]["podTemplate"];
+
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        let user_volume = volumes
+            .iter()
+            .find(|volume| volume["name"] == "user-data")
+            .expect("user PVC volume should be rendered");
+        assert_eq!(
+            user_volume["persistentVolumeClaim"]["claimName"],
+            "pvc-user-data-123"
+        );
+        assert_eq!(user_volume["persistentVolumeClaim"]["readOnly"], false);
+
+        let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should exist");
+        let workspace_mount = mounts
+            .iter()
+            .find(|mount| mount["mountPath"] == "/sandbox/.openshell/workspace")
+            .expect("workspace subPath mount should be rendered");
+        assert_eq!(workspace_mount["name"], "user-data");
+        assert_eq!(workspace_mount["subPath"], "workspace");
+        assert_eq!(workspace_mount["readOnly"], false);
+
+        let memory_mount = mounts
+            .iter()
+            .find(|mount| mount["mountPath"] == "/sandbox/.openshell/memory")
+            .expect("memory subPath mount should be rendered");
+        assert_eq!(memory_mount["name"], "user-data");
+        assert_eq!(memory_mount["subPath"], "memory");
+        assert_eq!(memory_mount["readOnly"], true);
+
+        let spec_obj = cr["spec"].as_object().expect("spec should be an object");
+        assert!(
+            !spec_obj.contains_key("volumeClaimTemplates"),
+            "explicit /sandbox driver_config mounts should skip the default workspace VCT"
+        );
+        let has_workspace_init = pod_template["spec"]["initContainers"]
+            .as_array()
+            .is_some_and(|containers| {
+                containers
+                    .iter()
+                    .any(|container| container["name"] == WORKSPACE_INIT_CONTAINER_NAME)
+            });
+        assert!(
+            !has_workspace_init,
+            "explicit /sandbox driver_config mounts should skip the default workspace init container"
+        );
+    }
+
+    #[test]
+    fn driver_config_accepts_read_write_pvc_with_multiple_subpath_mounts() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "user-data",
+                    "persistent_volume_claim": {
+                        "claim_name": "pvc-user-data",
+                        "read_only": false
+                    }
+                }],
+                "containers": {
+                    "agent": {
+                        "volume_mounts": [
+                            {
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/workspace",
+                                "sub_path": "workspace",
+                                "read_only": false
+                            },
+                            {
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/memory",
+                                "sub_path": "memory",
+                                "read_only": false
+                            },
+                            {
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/sessions",
+                                "sub_path": "sessions",
+                                "read_only": false
+                            }
+                        ]
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let config = KubernetesSandboxDriverConfig::from_template(&template)
+            .expect("read-write PVC with multiple subPath mounts should validate");
+
+        assert_eq!(config.volumes.len(), 1);
+        assert_eq!(config.volumes[0].name, "user-data");
+        assert_eq!(
+            config.volumes[0].persistent_volume_claim.claim_name,
+            "pvc-user-data"
+        );
+        assert!(!config.volumes[0].persistent_volume_claim.read_only);
+        assert_eq!(config.containers.agent.volume_mounts.len(), 3);
+        assert!(
+            config
+                .containers
+                .agent
+                .volume_mounts
+                .iter()
+                .all(|mount| !mount.read_only)
+        );
+        assert!(config.has_explicit_sandbox_data_mount());
+    }
+
+    #[test]
+    fn driver_config_rejects_duplicate_pvc_volume_names() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [
+                    {
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "pvc-a"}
+                    },
+                    {
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "pvc-b"}
+                    }
+                ]
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+        assert!(err.contains("duplicate kubernetes driver_config volume"));
+    }
+
+    #[test]
+    fn driver_config_rejects_duplicate_pvc_volume_mount_targets() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "user-data",
+                    "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                }],
+                "containers": {
+                    "agent": {
+                        "volume_mounts": [
+                            {
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/workspace"
+                            },
+                            {
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/workspace"
+                            }
+                        ]
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+        assert!(err.contains("duplicate kubernetes driver_config mount target"));
+    }
+
+    #[test]
+    fn driver_config_accepts_dns1123_subdomain_pvc_claim_name() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "user-data",
+                    "persistent_volume_claim": {"claim_name": "pvc.user-data.123"}
+                }]
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let config = KubernetesSandboxDriverConfig::from_template(&template)
+            .expect("DNS-1123 subdomain PVC names should validate");
+
+        assert_eq!(
+            config.volumes[0].persistent_volume_claim.claim_name,
+            "pvc.user-data.123"
+        );
+    }
+
+    #[test]
+    fn driver_config_rejects_invalid_volume_label_and_claim_name() {
+        for (field, config) in [
+            (
+                "volumes[].name",
+                serde_json::json!({
+                    "volumes": [{
+                        "name": "User_Data",
+                        "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                    }]
+                }),
+            ),
+            (
+                "volumes[].persistent_volume_claim.claim_name",
+                serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "Pvc_User_Data"}
+                    }]
+                }),
+            ),
+        ] {
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(config)),
+                ..SandboxTemplate::default()
+            };
+
+            let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+            assert!(
+                err.contains(field) && err.contains("DNS-1123"),
+                "expected invalid {field} to fail DNS-1123 validation, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_config_rejects_mounts_referencing_unknown_volumes() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "known-data",
+                    "persistent_volume_claim": {"claim_name": "pvc-known"}
+                }],
+                "containers": {
+                    "agent": {
+                        "volume_mounts": [{
+                            "name": "missing-data",
+                            "mount_path": "/sandbox/.openshell/workspace",
+                            "sub_path": "workspace"
+                        }]
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+        assert!(err.contains("unknown kubernetes driver_config volume 'missing-data'"));
+    }
+
+    #[test]
+    fn driver_config_rejects_shared_reserved_mount_targets() {
+        for mount_path in [
+            "/",
+            "/sandbox",
+            "/etc/openshell",
+            "/etc/openshell-tls/client",
+            "/opt/openshell/bin",
+        ] {
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                    }],
+                    "containers": {
+                        "agent": {
+                            "volume_mounts": [{
+                                "name": "user-data",
+                                "mount_path": mount_path
+                            }]
+                        }
+                    }
+                }))),
+                ..SandboxTemplate::default()
+            };
+
+            let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+            assert!(
+                err.contains("mount path") || err.contains("mount target"),
+                "expected protected mount target {mount_path:?} to be rejected, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_config_rejects_kubernetes_static_protected_mount_targets() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                    }],
+                    "containers": {
+                        "agent": {
+                            "volume_mounts": [{
+                                "name": "user-data",
+                                "mount_path": "/var/run/secrets/openshell"
+                            }]
+                        }
+                    }
+                }))),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+
+        let err = kubernetes_driver_config_for_spec(Some(&spec), None).unwrap_err();
+
+        assert!(err.contains("/var/run/secrets/openshell"));
+    }
+
+    #[test]
+    fn driver_config_allows_spiffe_workload_path_without_provider_spiffe() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                    }],
+                    "containers": {
+                        "agent": {
+                            "volume_mounts": [{
+                                "name": "user-data",
+                                "mount_path": "/spiffe-workload-api"
+                            }]
+                        }
+                    }
+                }))),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+
+        kubernetes_driver_config_for_spec(Some(&spec), None)
+            .expect("SPIFFE workload path should only be protected when SPIFFE is enabled");
+    }
+
+    #[test]
+    fn driver_config_rejects_invalid_kubernetes_sub_paths() {
+        for sub_path in ["/workspace", "../workspace"] {
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                    }],
+                    "containers": {
+                        "agent": {
+                            "volume_mounts": [{
+                                "name": "user-data",
+                                "mount_path": "/sandbox/.openshell/workspace",
+                                "sub_path": sub_path
+                            }]
+                        }
+                    }
+                }))),
+                ..SandboxTemplate::default()
+            };
+
+            let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+            assert!(
+                err.contains("mount subpath must be relative"),
+                "expected invalid sub_path {sub_path:?} to be rejected, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_config_defaults_pvc_mounts_to_read_only() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "user-data",
+                    "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                }],
+                "containers": {
+                    "agent": {
+                        "volume_mounts": [{
+                            "name": "user-data",
+                            "mount_path": "/sandbox/.openshell/workspace",
+                            "sub_path": "workspace"
+                        }]
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &SandboxPodParams::default(),
+        );
+
+        let volume = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist")
+            .iter()
+            .find(|volume| volume["name"] == "user-data")
+            .expect("user volume should exist");
+        assert_eq!(volume["persistentVolumeClaim"]["readOnly"], true);
+
+        let mount = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should exist")
+            .iter()
+            .find(|mount| mount["mountPath"] == "/sandbox/.openshell/workspace")
+            .expect("user mount should exist");
+        assert_eq!(mount["readOnly"], true);
+    }
+
+    #[test]
+    fn driver_config_rejects_read_write_mount_for_read_only_pvc_volume() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "volumes": [{
+                    "name": "user-data",
+                    "persistent_volume_claim": {
+                        "claim_name": "pvc-user-data",
+                        "read_only": true
+                    }
+                }],
+                "containers": {
+                    "agent": {
+                        "volume_mounts": [{
+                            "name": "user-data",
+                            "mount_path": "/sandbox/.openshell/workspace",
+                            "read_only": false
+                        }]
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+        assert!(err.contains("cannot set read_only=false"));
+    }
+
+    #[test]
+    fn driver_config_rejects_reserved_kubernetes_volume_names() {
+        for volume_name in [
+            CLIENT_TLS_VOLUME_NAME,
+            SERVICE_ACCOUNT_TOKEN_VOLUME_NAME,
+            SPIFFE_WORKLOAD_API_VOLUME_NAME,
+            SUPERVISOR_VOLUME_NAME,
+            WORKSPACE_VOLUME_NAME,
+        ] {
+            let template = SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": volume_name,
+                        "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                    }]
+                }))),
+                ..SandboxTemplate::default()
+            };
+
+            let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+            assert!(
+                err.contains("reserved for OpenShell-managed volumes"),
+                "expected reserved volume name {volume_name:?} to be rejected, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_kubernetes_volume_names_cover_managed_pod_volumes() {
+        let params = SandboxPodParams {
+            client_tls_secret_name: "openshell-client-tls-secret",
+            provider_spiffe_enabled: true,
+            provider_spiffe_workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock",
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let volume_names = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist")
+            .iter()
+            .filter_map(|volume| volume["name"].as_str())
+            .collect::<Vec<_>>();
+
+        for volume_name in volume_names {
+            assert!(
+                KUBERNETES_DRIVER_RESERVED_VOLUME_NAMES.contains(&volume_name),
+                "managed volume {volume_name:?} should be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_config_rejects_runtime_provider_spiffe_mount_path() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "volumes": [{
+                        "name": "user-data",
+                        "persistent_volume_claim": {"claim_name": "pvc-user-data"}
+                    }],
+                    "containers": {
+                        "agent": {
+                            "volume_mounts": [{
+                                "name": "user-data",
+                                "mount_path": "/custom-spiffe"
+                            }]
+                        }
+                    }
+                }))),
+                ..SandboxTemplate::default()
+            }),
+            ..SandboxSpec::default()
+        };
+
+        let err =
+            kubernetes_driver_config_for_spec(Some(&spec), Some("/custom-spiffe/spire-agent.sock"))
+                .unwrap_err();
+
+        assert!(err.contains("/custom-spiffe"));
     }
 
     #[test]
@@ -2599,6 +3993,385 @@ mod tests {
             volume["image"].get("pullPolicy").is_none(),
             "pullPolicy should be omitted when empty"
         );
+    }
+
+    #[test]
+    fn sidecar_topology_renders_process_agent_and_network_sidecar() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            supervisor_image_pull_policy: "IfNotPresent",
+            grpc_endpoint: "https://openshell-gateway.openshell.svc:8080",
+            client_tls_secret_name: "openshell-client-tls",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        assert_eq!(pod_template["spec"]["shareProcessNamespace"], true);
+        assert_eq!(pod_template["spec"]["securityContext"]["fsGroup"], 1500);
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        assert_eq!(containers.len(), 2);
+
+        let agent = containers
+            .iter()
+            .find(|container| container["name"] == "agent")
+            .unwrap();
+        assert_eq!(
+            agent["command"],
+            serde_json::json!([
+                format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox"),
+                "--mode=process"
+            ])
+        );
+        assert_eq!(agent["securityContext"]["runAsUser"], 1500);
+        assert_eq!(agent["securityContext"]["runAsGroup"], 1500);
+        assert_eq!(agent["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(agent["securityContext"]["allowPrivilegeEscalation"], false);
+        assert_eq!(
+            agent["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"]
+            })
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::ENDPOINT),
+            None
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME),
+            None
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::TLS_CA),
+            None
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::K8S_SA_TOKEN_FILE),
+            None
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SSH_SOCKET_PATH),
+            Some(SIDECAR_SSH_SOCKET_FILE)
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET),
+            Some(SIDECAR_CONTROL_SOCKET)
+        );
+        assert_eq!(rendered_env(agent, "OPENSHELL_SUPERVISOR_READY_FILE"), None);
+        assert_eq!(rendered_env(agent, "OPENSHELL_ENTRYPOINT_PID_FILE"), None);
+        assert_eq!(
+            rendered_env(agent, "OPENSHELL_SIDECAR_POLICY_SNAPSHOT_FILE"),
+            None
+        );
+        assert_eq!(
+            rendered_env(agent, "OPENSHELL_SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE"),
+            None
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::PROXY_TLS_DIR),
+            Some(SIDECAR_TLS_MOUNT_PATH)
+        );
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::SANDBOX_UID),
+            Some("1500")
+        );
+
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(sidecar["image"], "supervisor-image:latest");
+        assert_eq!(sidecar["imagePullPolicy"], "IfNotPresent");
+        assert_eq!(
+            sidecar["command"],
+            serde_json::json!([SUPERVISOR_IMAGE_BINARY_PATH, "--mode=network"])
+        );
+        assert_eq!(sidecar["securityContext"]["runAsUser"], 0);
+        assert_eq!(sidecar["securityContext"]["runAsGroup"], 1500);
+        assert_eq!(sidecar["securityContext"]["runAsNonRoot"], false);
+        assert_eq!(
+            sidecar["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
+        assert_eq!(
+            sidecar["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"],
+                "add": ["SYS_PTRACE", "DAC_READ_SEARCH"]
+            })
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::ENDPOINT),
+            Some("https://openshell-gateway.openshell.svc:8080")
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::SSH_SOCKET_PATH),
+            Some(SIDECAR_SSH_SOCKET_FILE)
+        );
+        assert!(
+            SIDECAR_SSH_SOCKET_FILE.starts_with('@'),
+            "sidecar SSH relay must use a Linux abstract socket"
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::SANDBOX_UID),
+            Some("1500")
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::SANDBOX_GID),
+            Some("1500")
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET),
+            Some(SIDECAR_CONTROL_SOCKET)
+        );
+        assert_eq!(
+            rendered_env(sidecar, "OPENSHELL_SIDECAR_POLICY_SNAPSHOT_FILE"),
+            None
+        );
+        assert_eq!(
+            rendered_env(sidecar, "OPENSHELL_SIDECAR_PROVIDER_ENV_SNAPSHOT_FILE"),
+            None
+        );
+        assert_eq!(
+            rendered_env(
+                sidecar,
+                openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY
+            ),
+            None
+        );
+        assert_eq!(rendered_env(sidecar, "OPENSHELL_ENTRYPOINT_PID_FILE"), None);
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::PROXY_TLS_DIR),
+            Some(SIDECAR_TLS_MOUNT_PATH)
+        );
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::TLS_CA),
+            Some("/etc/openshell-tls/proxy/client/ca.crt")
+        );
+        let sidecar_mounts = sidecar["volumeMounts"].as_array().unwrap();
+        assert!(
+            !sidecar_mounts
+                .iter()
+                .any(|mount| mount["name"] == "openshell-client-tls"),
+            "runtime sidecar should use the init-copied TLS files, not the root-owned Secret mount"
+        );
+        let agent_mounts = agent["volumeMounts"].as_array().unwrap();
+        assert!(
+            !agent_mounts
+                .iter()
+                .any(|mount| mount["name"] == "openshell-sa-token"),
+            "agent container must not mount gateway bootstrap token in sidecar topology"
+        );
+        assert!(
+            !agent_mounts
+                .iter()
+                .any(|mount| mount["name"] == "openshell-client-tls"),
+            "agent container must not mount gateway client TLS secret in sidecar topology"
+        );
+        let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        let sa_token = volumes
+            .iter()
+            .find(|volume| volume["name"] == "openshell-sa-token")
+            .unwrap();
+        assert_eq!(sa_token["projected"]["defaultMode"], 0o440);
+        let client_tls = volumes
+            .iter()
+            .find(|volume| volume["name"] == "openshell-client-tls")
+            .unwrap();
+        assert_eq!(client_tls["secret"]["defaultMode"], 0o440);
+
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        let network_init = init_containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+            .unwrap();
+        assert_eq!(network_init["image"], "supervisor-image:latest");
+        assert_eq!(network_init["imagePullPolicy"], "IfNotPresent");
+        assert_eq!(
+            network_init["command"],
+            serde_json::json!([
+                SUPERVISOR_IMAGE_BINARY_PATH,
+                "--mode=network-init",
+                "--proxy-uid",
+                "0",
+                "--proxy-gid",
+                "1500",
+                "--sidecar-state-dir",
+                SIDECAR_STATE_MOUNT_PATH,
+                "--sidecar-tls-dir",
+                SIDECAR_TLS_MOUNT_PATH
+            ])
+        );
+        assert_eq!(
+            network_init["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"],
+                "add": ["NET_ADMIN", "NET_RAW", "CHOWN", "FOWNER"]
+            })
+        );
+        let network_init_mounts = network_init["volumeMounts"].as_array().unwrap();
+        assert!(network_init_mounts.iter().any(|mount| {
+            mount["name"] == "openshell-client-tls"
+                && mount["mountPath"] == "/etc/openshell-tls/client"
+        }));
+    }
+
+    #[test]
+    fn sidecar_topology_can_relax_process_binary_aware_network_policy() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            supervisor_image: "supervisor-image:latest",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1500,
+            process_binary_aware_network_policy: false,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(sidecar["securityContext"]["runAsUser"], 2200);
+        assert_eq!(sidecar["securityContext"]["runAsGroup"], 1500);
+        assert_eq!(sidecar["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            sidecar["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
+        assert_eq!(
+            sidecar["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"]
+            })
+        );
+        assert_eq!(
+            rendered_env(
+                sidecar,
+                openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY
+            ),
+            Some("relaxed")
+        );
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        let network_init = init_containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+            .unwrap();
+        assert_eq!(network_init["command"][3], "2200");
+    }
+
+    #[test]
+    fn sidecar_topology_adds_shared_state_and_tls_volumes() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            supervisor_sideload_method: SupervisorSideloadMethod::ImageVolume,
+            supervisor_image: "supervisor-image:latest",
+            grpc_endpoint: "http://openshell-gateway.openshell.svc:8080",
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+
+        let volumes = pod_template["spec"]["volumes"].as_array().unwrap();
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| volume["name"] == SIDECAR_STATE_VOLUME_NAME)
+        );
+        assert!(
+            volumes
+                .iter()
+                .any(|volume| volume["name"] == SIDECAR_TLS_VOLUME_NAME)
+        );
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == SUPERVISOR_VOLUME_NAME && volume["image"].is_object()
+        }));
+
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        let sidecar = containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_SIDECAR_NAME)
+            .unwrap();
+        assert_eq!(
+            sidecar["securityContext"]["capabilities"],
+            serde_json::json!({
+                "drop": ["ALL"],
+                "add": ["SYS_PTRACE", "DAC_READ_SEARCH"]
+            })
+        );
+        assert_eq!(sidecar["securityContext"]["runAsUser"], 0);
+        assert_eq!(sidecar["securityContext"]["runAsGroup"], 1000);
+        assert_eq!(sidecar["securityContext"]["runAsNonRoot"], false);
+        assert_eq!(
+            sidecar["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
+
+        for container_name in ["agent", SUPERVISOR_NETWORK_SIDECAR_NAME] {
+            let container = containers
+                .iter()
+                .find(|container| container["name"] == container_name)
+                .unwrap();
+            let mounts = container["volumeMounts"].as_array().unwrap();
+            assert!(mounts.iter().any(|mount| {
+                mount["name"] == SIDECAR_STATE_VOLUME_NAME
+                    && mount["mountPath"] == SIDECAR_STATE_MOUNT_PATH
+            }));
+            assert!(mounts.iter().any(|mount| {
+                mount["name"] == SIDECAR_TLS_VOLUME_NAME
+                    && mount["mountPath"] == SIDECAR_TLS_MOUNT_PATH
+            }));
+        }
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        let network_init = init_containers
+            .iter()
+            .find(|container| container["name"] == SUPERVISOR_NETWORK_INIT_CONTAINER_NAME)
+            .unwrap();
+        assert_eq!(network_init["command"][3], "0");
+    }
+
+    #[test]
+    fn sidecar_topology_rejects_proxy_uid_matching_sandbox_uid() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::Sidecar,
+            proxy_uid: 1500,
+            sandbox_uid: 1500,
+            ..SandboxPodParams::default()
+        };
+
+        let err = validate_sidecar_proxy_identity(&params).unwrap_err();
+        assert!(matches!(err, KubernetesDriverError::Precondition(_)));
+        assert!(err.to_string().contains("proxy_uid"));
     }
 
     /// Regression test: TLS mount path must match env var paths.
@@ -3055,7 +4828,7 @@ mod tests {
             .expect("volumes should exist");
         let tls_vol = volumes
             .iter()
-            .find(|v| v["name"] == "openshell-client-tls")
+            .find(|v| v["name"] == CLIENT_TLS_VOLUME_NAME)
             .expect("TLS volume should exist");
         assert_eq!(
             tls_vol["secret"]["defaultMode"],
@@ -3178,6 +4951,16 @@ mod tests {
         assert!(
             script.contains("tar -C"),
             "init script must seed image contents with a tar stream"
+        );
+        assert!(
+            script.contains("find . -mindepth 1 -maxdepth 1"),
+            "init script must archive sandbox contents without the mount root entry"
+        );
+        assert!(
+            script.contains("--no-same-owner")
+                && script.contains("--no-same-permissions")
+                && script.contains("--touch"),
+            "init script must avoid restoring metadata onto the PVC root"
         );
     }
 
@@ -3564,7 +5347,7 @@ mod tests {
                 && volume["csi"]["driver"] == "csi.spiffe.io"
         }));
         assert!(volumes.iter().any(|volume| {
-            volume["name"] == "openshell-sa-token"
+            volume["name"] == SERVICE_ACCOUNT_TOKEN_VOLUME_NAME
                 && volume["projected"]["sources"][0]["serviceAccountToken"]["path"] == "token"
         }));
 
@@ -3617,7 +5400,7 @@ mod tests {
             log_level: "debug".to_string(),
             ..SandboxSpec::default()
         };
-        let cr = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default());
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
         let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
             .as_array()
             .unwrap();
@@ -3644,7 +5427,7 @@ mod tests {
                     )]),
                     ..SandboxSpec::default()
                 };
-                let cr = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default());
+                let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
                 let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
                     .as_array()
                     .unwrap();

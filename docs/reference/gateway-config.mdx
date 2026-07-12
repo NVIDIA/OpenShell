@@ -88,7 +88,8 @@ disable_tls = false
 # Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
 # when the driver-specific table does not override them.
 default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
-supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name  = "openshell-client-tls"
 service_account_name    = "openshell-sandbox"
 host_gateway_ip         = "10.0.0.1"
@@ -172,14 +173,16 @@ service_account_name           = "openshell-sandbox"
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]
-supervisor_image               = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "IfNotPresent"
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method     = "image-volume"
-# "combined" runs networking and process supervision in the sandbox agent
-# container and preserves the existing Kubernetes sandbox behavior.
-supervisor_topology            = "combined"
+# "combined" runs the existing single supervisor container with full process,
+# filesystem, and network enforcement in the agent container. "sidecar" moves
+# pod-level network enforcement and gateway session handling into a network sidecar.
+topology                       = "combined"
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
@@ -203,6 +206,18 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # back to 1000 on non-OpenShift clusters.
 # sandbox_uid = 1500
 # sandbox_gid = 1500
+
+[openshell.drivers.kubernetes.sidecar]
+# UID used by relaxed long-running network sidecars. Strict process/binary-aware
+# sidecars run as UID 0 so Kubernetes grants the required /proc inspection
+# capabilities into the effective set. In sidecar topology the network init
+# container installs nftables rules that exempt the effective sidecar UID.
+proxy_uid                      = 1337
+# Keep process/binary-aware network policy enabled in sidecar topology. Set
+# false to run the sidecar as proxy_uid, drop the sidecar's extra /proc
+# inspection capabilities, and enforce endpoint/L7 policy without matching
+# policy.binaries.
+process_binary_aware_network_policy = true
 ```
 
 ### Docker
@@ -228,7 +243,8 @@ grpc_endpoint      = "https://host.openshell.internal:17670"
 # Skip the image-pull-and-extract step by pointing at a locally built binary.
 supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
 # When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
-supervisor_image   = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca       = "/etc/openshell/certs/ca.pem"
 guest_tls_cert     = "/etc/openshell/certs/client.pem"
 guest_tls_key      = "/etc/openshell/certs/client-key.pem"
@@ -270,7 +286,8 @@ network_name            = "openshell"
 # host_gateway_ip       = "192.168.127.254"
 sandbox_ssh_socket_path = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 10
-supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"

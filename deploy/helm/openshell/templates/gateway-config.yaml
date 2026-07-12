@@ -34,7 +34,9 @@ data:
     log_level             = {{ .Values.server.logLevel | quote }}
     sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
     default_image         = {{ .Values.server.sandboxImage | quote }}
+    {{- if include "openshell.supervisorImageOverrideEnabled" . }}
     supervisor_image      = {{ include "openshell.supervisorImage" . | quote }}
+    {{- end }}
     {{- if .Values.server.hostGatewayIP }}
     host_gateway_ip       = {{ .Values.server.hostGatewayIP | quote }}
     {{- end }}
@@ -113,7 +115,7 @@ data:
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}
     supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
-    supervisor_topology          = {{ .Values.supervisor.topology | default "combined" | quote }}
+    topology                     = {{ .Values.supervisor.topology | default "combined" | quote }}
     sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}
     {{- if .Values.server.providerTokenGrants.spiffe.enabled }}
     provider_spiffe_workload_api_socket_path = {{ .Values.server.providerTokenGrants.spiffe.workloadApiSocketPath | quote }}
@@ -142,3 +144,7 @@ data:
     {{- if .Values.supervisor.image.pullPolicy }}
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}
+
+    [openshell.drivers.kubernetes.sidecar]
+    proxy_uid                    = {{ .Values.supervisor.sidecar.proxyUid | default 1337 }}
+    process_binary_aware_network_policy = {{ .Values.supervisor.sidecar.processBinaryAwareNetworkPolicy }}

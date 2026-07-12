@@ -5,14 +5,19 @@ title: "OpenShift"
 sidebar-title: "OpenShift"
 description: "Install the OpenShell Helm chart on OpenShift, including the SCC binding and chart overrides required by OpenShift's Security Context Constraints."
 keywords: "Generative AI, Cybersecurity, Kubernetes, OpenShift, SCC, Security Context Constraints, Helm, Gateway, Installation"
-position: 5
+position: 6
 ---
 
 <Warning>
-The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC and installing the gateway with TLS and the PKI init job disabled. Use only for evaluation on a private network.
+The OpenShift install path is experimental. It currently requires running sandbox pods under the `privileged` SCC and installing the gateway with TLS disabled. Use only for evaluation on a private network.
 </Warning>
 
 OpenShift's [Security Context Constraints](https://docs.openshift.com/container-platform/latest/authentication/managing-security-context-constraints.html) reject the chart's default pod security settings. Installing on OpenShift requires precreating the namespace, granting the `privileged` SCC to the sandbox service account, and overriding a few chart values so the cluster admission controller can assign UIDs and FS groups itself.
+
+OpenShell installs sandbox nftables rules as individual commands. On OpenShift
+nodes where optional conntrack or packet log expressions are unavailable, those
+optional rules can fail without rolling back the required proxy bypass reject
+rules.
 
 ## Prerequisites
 
@@ -46,7 +51,6 @@ oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set pkiInitJob.enabled=false \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
@@ -54,13 +58,8 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 
 | Override | Reason |
 |---|---|
-| `pkiInitJob.enabled=false` | Skips the built-in TLS PKI Job. TLS must also be disabled unless you provide TLS Secrets another way. |
-| `server.disableTls=true` | The gateway has no certificates without `pkiInitJob`, so it must run plaintext. |
+| `server.disableTls=true` | Runs the gateway over plaintext HTTP for simpler evaluation. |
 | `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
-
-The gateway still needs the sandbox JWT signing Secret. When disabling
-`pkiInitJob` without enabling cert-manager, pre-create that Secret before
-installing the chart.
 
 ## Wait for the gateway to be ready
 
@@ -90,6 +89,6 @@ openshell status
 
 ## Next Steps
 
-- For TLS-enabled deployments, refer to [Managing Certificates](/kubernetes/managing-certificates) after SCC-compatible PKI is supported.
+- For TLS-enabled deployments, refer to [Managing Certificates](/kubernetes/managing-certificates).
 - To expose the gateway externally, refer to [Ingress](/kubernetes/ingress).
 - To configure OIDC authentication, refer to [Access Control](/kubernetes/access-control).

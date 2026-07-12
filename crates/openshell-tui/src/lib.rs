@@ -235,7 +235,7 @@ pub async fn run(
                     app.apply_global_settings(settings, revision);
                 }
                 Err(msg) => {
-                    tracing::warn!("failed to fetch global settings: {msg}");
+                    app.status_text = format!("failed to fetch global settings: {msg}");
                 }
             },
             Some(Event::GlobalSettingSetResult(result)) => {
@@ -284,6 +284,9 @@ pub async fn run(
                     }
                 }
                 fetch_sandbox_detail(&mut app).await;
+            }
+            Some(Event::ForwardWarnings(warnings)) => {
+                app.status_text = format!("port forward issues: {}", warnings.join("; "));
             }
             Some(Event::Mouse(mouse)) => match mouse.kind {
                 MouseEventKind::ScrollUp if app.focus == Focus::SandboxLogs => {
@@ -722,10 +725,14 @@ async fn handle_sandbox_delete(app: &mut App) {
     };
 
     // Stop any active port forwards before deleting (mirrors CLI behavior).
-    if let Ok(stopped) = openshell_core::forward::stop_forwards_for_sandbox(&sandbox_name) {
-        for port in &stopped {
-            tracing::info!("stopped forward of port {port} for sandbox {sandbox_name}");
-        }
+    if let Ok(stopped) = openshell_core::forward::stop_forwards_for_sandbox(&sandbox_name)
+        && !stopped.is_empty()
+    {
+        let ports: Vec<String> = stopped.iter().map(ToString::to_string).collect();
+        app.status_text = format!(
+            "stopped port forwards [{}] for sandbox {sandbox_name}",
+            ports.join(", ")
+        );
     }
 
     let req = openshell_core::proto::DeleteSandboxRequest { name: sandbox_name };
@@ -777,11 +784,11 @@ async fn fetch_sandbox_detail(app: &mut App) {
                 }
             }
             Ok(Err(e)) => {
-                tracing::warn!("failed to fetch sandbox detail: {}", e.message());
+                app.status_text = format!("failed to fetch sandbox detail: {}", e.message());
                 None
             }
             Err(_) => {
-                tracing::warn!("sandbox detail request timed out");
+                app.status_text = "sandbox detail request timed out".to_string();
                 None
             }
         };
@@ -812,10 +819,10 @@ async fn fetch_sandbox_detail(app: &mut App) {
                 app.apply_sandbox_settings(inner.settings);
             }
             Ok(Err(e)) => {
-                tracing::warn!("failed to fetch sandbox policy: {}", e.message());
+                app.status_text = format!("failed to fetch sandbox policy: {}", e.message());
             }
             Err(_) => {
-                tracing::warn!("sandbox policy request timed out");
+                app.status_text = "sandbox policy request timed out".to_string();
             }
         }
     }
@@ -1419,7 +1426,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
             // Start port forwards if requested.
             if !ports.is_empty() {
-                start_port_forwards(
+                let forward_warnings = start_port_forwards(
                     &mut client,
                     &endpoint,
                     &gateway_name,
@@ -1428,6 +1435,9 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                     &ports,
                 )
                 .await;
+                if !forward_warnings.is_empty() {
+                    let _ = tx.send(Event::ForwardWarnings(forward_warnings));
+                }
             }
         }
 
@@ -1448,7 +1458,9 @@ async fn start_port_forwards(
     sandbox_name: &str,
     sandbox_id: &str,
     specs: &[openshell_core::forward::ForwardSpec],
-) {
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
     // Create SSH session.
     let session = {
         let req = openshell_core::proto::CreateSshSessionRequest {
@@ -1457,18 +1469,20 @@ async fn start_port_forwards(
         match tokio::time::timeout(Duration::from_secs(10), client.create_ssh_session(req)).await {
             Ok(Ok(resp)) => resp.into_inner(),
             Ok(Err(e)) => {
-                tracing::warn!("SSH session failed for forwards: {}", e.message());
-                return;
+                warnings.push(format!("SSH session failed for forwards: {}", e.message()));
+                return warnings;
             }
             Err(_) => {
-                tracing::warn!("SSH session timed out for forwards");
-                return;
+                warnings.push("SSH session timed out for forwards".to_string());
+                return warnings;
             }
         }
     };
     if let Err(err) = validate_ssh_session_response(&session) {
-        tracing::warn!("gateway returned invalid SSH session response for forwards: {err}");
-        return;
+        warnings.push(format!(
+            "gateway returned invalid SSH session response for forwards: {err}"
+        ));
+        return warnings;
     }
 
     // Resolve gateway address.
@@ -1482,8 +1496,8 @@ async fn start_port_forwards(
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!("failed to find executable for forwards: {e}");
-            return;
+            warnings.push(format!("failed to find executable for forwards: {e}"));
+            return warnings;
         }
     };
     let proxy_command = build_proxy_command(
@@ -1563,16 +1577,18 @@ async fn start_port_forwards(
                 }
             }
             Ok(Ok(false)) => {
-                tracing::warn!("SSH forward exited with error for port {port_val}");
+                warnings.push(format!("SSH forward exited with error for port {port_val}"));
             }
             Ok(Err(e)) => {
-                tracing::warn!("forward failed for port {port_val}: {e}");
+                warnings.push(format!("forward failed for port {port_val}: {e}"));
             }
             Err(e) => {
-                tracing::warn!("forward task panicked for port {port_val}: {e}");
+                warnings.push(format!("forward task panicked for port {port_val}: {e}"));
             }
         }
     }
+
+    warnings
 }
 
 // ---------------------------------------------------------------------------
@@ -1927,11 +1943,11 @@ async fn refresh_providers(app: &mut App) {
                 .map(|profile| (profile.id.clone(), profile))
                 .collect::<HashMap<_, _>>(),
             Ok(Err(e)) => {
-                tracing::warn!("failed to list provider profiles: {}", e.message());
+                app.status_text = format!("failed to list provider profiles: {}", e.message());
                 HashMap::new()
             }
             Err(_) => {
-                tracing::warn!("list provider profiles timed out");
+                app.status_text = "list provider profiles timed out".to_string();
                 HashMap::new()
             }
         }
@@ -1946,10 +1962,10 @@ async fn refresh_providers(app: &mut App) {
     let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await;
     match result {
         Ok(Err(e)) => {
-            tracing::warn!("failed to list providers: {}", e.message());
+            app.status_text = format!("failed to list providers: {}", e.message());
         }
         Err(_) => {
-            tracing::warn!("list providers timed out");
+            app.status_text = "list providers timed out".to_string();
         }
         Ok(Ok(resp)) => {
             let providers = resp.into_inner().providers;
@@ -1994,10 +2010,10 @@ async fn refresh_global_settings(app: &mut App) {
         tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
     match result {
         Ok(Err(e)) => {
-            tracing::warn!("failed to fetch global settings: {}", e.message());
+            app.status_text = format!("failed to fetch global settings: {}", e.message());
         }
         Err(_) => {
-            tracing::warn!("get gateway settings timed out");
+            app.status_text = "get gateway settings timed out".to_string();
         }
         Ok(Ok(resp)) => {
             let inner = resp.into_inner();
@@ -2275,10 +2291,10 @@ async fn refresh_sandboxes(app: &mut App) {
     let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
     match result {
         Ok(Err(e)) => {
-            tracing::warn!("failed to list sandboxes: {}", e.message());
+            app.status_text = format!("failed to list sandboxes: {}", e.message());
         }
         Err(_) => {
-            tracing::warn!("list sandboxes timed out");
+            app.status_text = "list sandboxes timed out".to_string();
         }
         Ok(Ok(resp)) => {
             let sandboxes = resp.into_inner().sandboxes;
@@ -2387,10 +2403,10 @@ async fn refresh_sandbox_policy(app: &mut App) {
             app.apply_sandbox_settings(inner.settings);
         }
         Ok(Err(e)) => {
-            tracing::warn!("failed to refresh sandbox policy: {}", e.message());
+            app.status_text = format!("failed to refresh sandbox policy: {}", e.message());
         }
         Err(_) => {
-            tracing::warn!("sandbox policy refresh timed out");
+            app.status_text = "sandbox policy refresh timed out".to_string();
         }
     }
 }
@@ -2406,20 +2422,14 @@ async fn refresh_draft_chunks(app: &mut App) {
         status_filter: String::new(),
     };
 
-    match tokio::time::timeout(Duration::from_secs(5), app.client.get_draft_policy(req)).await {
-        Ok(Ok(resp)) => {
-            let inner = resp.into_inner();
-            app.draft_chunks = inner.chunks;
-            app.draft_version = inner.draft_version;
-            if app.draft_selected >= app.draft_chunks.len() && !app.draft_chunks.is_empty() {
-                app.draft_selected = app.draft_chunks.len() - 1;
-            }
-        }
-        Ok(Err(e)) => {
-            tracing::debug!("draft chunks refresh: {}", e.message());
-        }
-        Err(_) => {
-            tracing::debug!("draft chunks refresh timed out");
+    if let Ok(Ok(resp)) =
+        tokio::time::timeout(Duration::from_secs(5), app.client.get_draft_policy(req)).await
+    {
+        let inner = resp.into_inner();
+        app.draft_chunks = inner.chunks;
+        app.draft_version = inner.draft_version;
+        if app.draft_selected >= app.draft_chunks.len() && !app.draft_chunks.is_empty() {
+            app.draft_selected = app.draft_chunks.len() - 1;
         }
     }
 }

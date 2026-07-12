@@ -33,11 +33,16 @@ clap = { workspace = true }
 # Error handling
 miette = { workspace = true }
 
+# Unix ownership for Kubernetes sidecar init setup
+nix = { workspace = true }
+
 # TLS crypto provider install (main.rs)
 rustls = { workspace = true }
 
 # Serialization (serde_json::json! for OCSF unmapped fields)
+serde = { workspace = true }
 serde_json = { workspace = true }
+prost = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
