@@ -1181,7 +1181,7 @@ pub async fn gateway_add(
 
         let auth_skipped = is_browser_suppressed();
 
-        let auth_ok = match crate::auth::browser_auth_flow(&endpoint).await {
+        let auth_ok = match crate::auth::browser_auth_flow(&endpoint, name, false).await {
             Ok(token) => {
                 openshell_bootstrap::edge_token::store_edge_token(name, &token)?;
                 eprintln!("{} Authenticated successfully", "✓".green().bold());
@@ -1214,7 +1214,14 @@ pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
 
     match metadata.auth_mode.as_deref() {
         Some("cloudflare_jwt") => {
-            let token = crate::auth::browser_auth_flow(&metadata.gateway_endpoint).await?;
+            let remove_existing_registration =
+                gateway_metadata_source(name)? == Some(GatewayMetadataSource::User);
+            let token = crate::auth::browser_auth_flow(
+                &metadata.gateway_endpoint,
+                name,
+                remove_existing_registration,
+            )
+            .await?;
             openshell_bootstrap::edge_token::store_edge_token(name, &token)?;
             eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold());
         }

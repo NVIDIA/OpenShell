@@ -40,6 +40,34 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Length of the confirmation code (alphanumeric characters).
 const CODE_LENGTH: usize = 7;
 
+/// Format guidance for a Cloudflare Access browser login timeout.
+fn format_auth_timeout_guidance(
+    gateway_endpoint: &str,
+    gateway_name: &str,
+    remove_existing_registration: bool,
+) -> String {
+    let removal_guidance = if remove_existing_registration {
+        format!(
+            "To change the authentication mode for this existing registration, first remove it with:\n  \
+               openshell gateway remove {gateway_name}\n"
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "authentication timed out after {} seconds.\n\
+         The attempted browser login uses a Cloudflare Access edge-auth flow.\n\
+         {removal_guidance}\
+         If this gateway uses OIDC, re-register it with:\n  \
+           openshell gateway add {gateway_endpoint} --name {gateway_name} --oidc-issuer <issuer-url>\n\
+         Use --local only for a gateway provisioned with local mTLS certificates:\n  \
+           openshell gateway add {gateway_endpoint} --name {gateway_name} --local\n\
+         If this gateway uses Cloudflare Access, the timeout may be transient. Retry the browser login.",
+        AUTH_TIMEOUT.as_secs()
+    )
+}
+
 /// Generate a random alphanumeric confirmation code (e.g. "A7X-3KPX").
 ///
 /// Uses a dash separator in the middle for readability.
@@ -88,7 +116,11 @@ fn generate_confirmation_code() -> String {
 /// 3. Opens the browser to the gateway's `/auth/connect` page
 /// 4. Waits for the XHR POST callback with the CF JWT and matching code
 /// 5. Returns the token
-pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
+pub async fn browser_auth_flow(
+    gateway_endpoint: &str,
+    gateway_name: &str,
+    remove_existing_registration: bool,
+) -> Result<String> {
     // Short-circuit when the browser is suppressed (CI, e2e tests, headless
     // environments).  Without this early return the function still binds a TCP
     // listener, spawns a callback server, and waits the full AUTH_TIMEOUT
@@ -160,11 +192,11 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
             result.map_err(|_| miette::miette!("auth callback channel closed unexpectedly"))?
         }
         () = tokio::time::sleep(AUTH_TIMEOUT) => {
-            return Err(miette::miette!(
-                "authentication timed out after {} seconds.\n\
-                 Try again with: openshell gateway login",
-                AUTH_TIMEOUT.as_secs()
-            ));
+            return Err(miette::miette!(format_auth_timeout_guidance(
+                gateway_endpoint,
+                gateway_name,
+                remove_existing_registration,
+            )));
         }
     };
 
@@ -468,6 +500,83 @@ mod tests {
             unique.len() > 1,
             "codes should be random, got all identical: {codes:?}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Authentication timeout guidance
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn timeout_guidance_includes_oidc_reregistration_command() {
+        let guidance =
+            format_auth_timeout_guidance("https://gateway.example.com", "gateway", false);
+
+        assert!(guidance.contains(
+            "openshell gateway add https://gateway.example.com --name gateway --oidc-issuer <issuer-url>"
+        ));
+    }
+
+    #[test]
+    fn timeout_guidance_qualifies_local_mtls_option() {
+        let guidance =
+            format_auth_timeout_guidance("https://gateway.example.com", "gateway", false);
+
+        assert!(
+            guidance.contains(
+                "Use --local only for a gateway provisioned with local mTLS certificates"
+            )
+        );
+        assert!(
+            guidance.contains(
+                "openshell gateway add https://gateway.example.com --name gateway --local"
+            )
+        );
+        assert!(!guidance.contains("unauthenticated access"));
+    }
+
+    #[test]
+    fn timeout_guidance_preserves_cloudflare_retry_without_overclaiming() {
+        let guidance =
+            format_auth_timeout_guidance("https://gateway.example.com", "gateway", false);
+
+        assert!(guidance.contains("the timeout may be transient. Retry the browser login"));
+        assert!(!guidance.contains("Cloudflare Access is absent"));
+        assert!(!guidance.contains("Cloudflare Access is not configured"));
+    }
+
+    #[test]
+    fn timeout_guidance_removes_existing_registration_before_reregistering() {
+        let guidance = format_auth_timeout_guidance("https://gateway.example.com", "example", true);
+
+        let remove_position = guidance
+            .find("openshell gateway remove example")
+            .expect("guidance should include the existing registration removal command");
+        let add_position = guidance
+            .find("openshell gateway add https://gateway.example.com")
+            .expect("guidance should include the re-registration command");
+
+        assert!(remove_position < add_position);
+    }
+
+    #[test]
+    fn timeout_guidance_preserves_custom_gateway_name() {
+        let guidance =
+            format_auth_timeout_guidance("https://gateway.example.com", "production", false);
+
+        assert!(guidance.contains(
+            "openshell gateway add https://gateway.example.com --name production --oidc-issuer <issuer-url>"
+        ));
+        assert!(guidance.contains(
+            "openshell gateway add https://gateway.example.com --name production --local"
+        ));
+    }
+
+    #[test]
+    fn timeout_guidance_does_not_remove_read_only_registration() {
+        let guidance =
+            format_auth_timeout_guidance("https://gateway.example.com", "system-default", false);
+
+        assert!(!guidance.contains("openshell gateway remove system-default"));
     }
 
     // ---------------------------------------------------------------
