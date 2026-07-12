@@ -1513,7 +1513,11 @@ async fn stream_exec_over_relay(
     timeout_seconds: u32,
     request_tty: bool,
 ) -> Result<(), Status> {
-    let command_preview: String = command.chars().take(120).collect();
+    let command_preview: String = command
+        .chars()
+        .take(120)
+        .flat_map(char::escape_default)
+        .collect();
     info!(
         sandbox_id = %sandbox_id,
         channel_id = %channel_id,
@@ -1589,7 +1593,11 @@ async fn stream_interactive_exec_over_relay(
     cols: u32,
     rows: u32,
 ) -> Result<(), Status> {
-    let command_preview: String = command.chars().take(120).collect();
+    let command_preview: String = command
+        .chars()
+        .take(120)
+        .flat_map(char::escape_default)
+        .collect();
     info!(
         sandbox_id = %sandbox_id,
         channel_id = %channel_id,
@@ -2083,6 +2091,26 @@ mod tests {
         let cmd = build_remote_exec_command(&req).unwrap();
         assert!(cmd.starts_with("python3 -c "));
         assert!(cmd.contains("'def f():\n    return 1\nprint(f())'"));
+    }
+
+    #[test]
+    fn build_remote_exec_command_multiline_with_single_quotes() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "print('one')\r\nprint('two')".to_string(),
+            ],
+            ..Default::default()
+        };
+        let cmd = build_remote_exec_command(&req).unwrap();
+        assert!(cmd.starts_with("python3 -c "));
+        assert!(
+            cmd.contains("'print('\"'\"'one'\"'\"')\r\nprint('\"'\"'two'\"'\"')'"),
+            "CR/LF with embedded single quotes must compose correctly: {cmd}"
+        );
     }
 
     #[test]
