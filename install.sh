@@ -15,6 +15,8 @@ REPO="NVIDIA/OpenShell"
 GITHUB_URL="https://github.com/${REPO}"
 RELEASE_TAG="${OPENSHELL_VERSION:-}"
 CHECKSUMS_NAME="openshell-checksums-sha256.txt"
+GATEWAY_CHECKSUMS_NAME="openshell-gateway-checksums-sha256.txt"
+GATEWAY_UNIT_NAME="openshell-gateway.service"
 LOCAL_GATEWAY_PORT="17670"
 HOMEBREW_TAP="nvidia/openshell"
 HOMEBREW_FORMULA_NAME="openshell"
@@ -60,7 +62,9 @@ NOTES:
     from ${GITHUB_URL}/releases/latest.
 
     Linux installs the Debian package on amd64/arm64 or the RPM packages on
-    x86_64/aarch64, depending on the host package manager.
+    x86_64/aarch64, depending on the host package manager. Arch and other
+    pacman-based distributions install prebuilt release tarballs directly to
+    /usr/bin instead.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -472,8 +476,10 @@ linux_package_method() {
     echo "deb"
   elif has_cmd rpm; then
     echo "rpm"
+  elif has_cmd pacman; then
+    echo "tarball"
   else
-    error "Linux installs require either dpkg or rpm"
+    error "Linux installs require dpkg, rpm, or pacman"
   fi
 }
 
@@ -543,6 +549,47 @@ get_rpm_arch() {
       error "no RPM package is published for architecture: ${_arch}"
       ;;
   esac
+}
+
+get_tarball_arch() {
+  _arch="$(uname -m)"
+
+  case "$_arch" in
+    x86_64|amd64)
+      echo "x86_64"
+      ;;
+    aarch64|arm64)
+      echo "aarch64"
+      ;;
+    *)
+      error "no release tarball is published for architecture: ${_arch}"
+      ;;
+  esac
+}
+
+find_tarball_asset() {
+  _checksums="$1"
+  _arch="$2"
+  _package="$3"
+
+  case "$_package" in
+    openshell)
+      _filename="openshell-${_arch}-unknown-linux-musl.tar.gz"
+      ;;
+    openshell-gateway)
+      _filename="openshell-gateway-${_arch}-unknown-linux-gnu.tar.gz"
+      ;;
+    *)
+      error "unknown tarball asset selector: ${_package}"
+      ;;
+  esac
+
+  awk -v name="$_filename" '
+    ($2 == name || $2 == "*" name) {
+      print name
+      exit
+    }
+  ' "$_checksums"
 }
 
 find_deb_asset() {
@@ -953,6 +1000,85 @@ install_linux_rpm() {
   start_user_gateway
 }
 
+install_linux_tarball() {
+  require_cmd tar
+  set_linux_target_runtime_dir
+
+  _arch="$(get_tarball_arch)"
+  _tmpdir="$(mktemp -d)"
+  chmod 0755 "$_tmpdir"
+  trap 'rm -rf "$_tmpdir"' EXIT
+
+  _checksums_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${CHECKSUMS_NAME}"
+  info "downloading ${RELEASE_TAG} release checksums..."
+  download "$_checksums_url" "${_tmpdir}/${CHECKSUMS_NAME}" || {
+    error "failed to download ${_checksums_url}"
+  }
+
+  # The gateway tarball is checksummed separately from the CLI/deb/rpm assets
+  # because the release workflow generates its checksums file in a distinct
+  # step (see release-tag.yml), alongside the openshell-sandbox artifacts.
+  _gateway_checksums_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${GATEWAY_CHECKSUMS_NAME}"
+  download "$_gateway_checksums_url" "${_tmpdir}/${GATEWAY_CHECKSUMS_NAME}" || {
+    error "failed to download ${_gateway_checksums_url}"
+  }
+
+  _cli_file="$(find_tarball_asset "${_tmpdir}/${CHECKSUMS_NAME}" "$_arch" openshell)"
+  if [ -z "$_cli_file" ]; then
+    error "no openshell tarball found for architecture: ${_arch}"
+  fi
+
+  _gateway_file="$(find_tarball_asset "${_tmpdir}/${GATEWAY_CHECKSUMS_NAME}" "$_arch" openshell-gateway)"
+  if [ -z "$_gateway_file" ]; then
+    error "no openshell-gateway tarball found for architecture: ${_arch}"
+  fi
+
+  info "selected ${_cli_file} and ${_gateway_file}"
+
+  # CLI and gateway tarballs are checksummed against different manifests (see
+  # above), so each loop entry carries its own file|checksums-file pair rather
+  # than sharing one CHECKSUMS_NAME the way the RPM pair does.
+  for _asset in "${_cli_file}|${CHECKSUMS_NAME}" "${_gateway_file}|${GATEWAY_CHECKSUMS_NAME}"; do
+    _asset_file="${_asset%%|*}"
+    _asset_checksums="${_asset#*|}"
+    _asset_url="${GITHUB_URL}/releases/download/${RELEASE_TAG}/${_asset_file}"
+
+    info "downloading ${_asset_file}..."
+    download_release_asset "$RELEASE_TAG" "$_asset_file" "${_tmpdir}/${_asset_file}" || {
+      error "failed to download ${_asset_url}"
+    }
+    chmod 0644 "${_tmpdir}/${_asset_file}"
+
+    info "verifying checksum for ${_asset_file}..."
+    verify_checksum "${_tmpdir}/${_asset_file}" "${_tmpdir}/${_asset_checksums}" "$_asset_file"
+  done
+
+  info "downloading ${GATEWAY_UNIT_NAME}..."
+  _unit_url="https://raw.githubusercontent.com/${REPO}/${RELEASE_TAG}/deploy/deb/${GATEWAY_UNIT_NAME}"
+  download "$_unit_url" "${_tmpdir}/${GATEWAY_UNIT_NAME}" || {
+    error "failed to download ${_unit_url}"
+  }
+
+  info "extracting ${_cli_file} and ${_gateway_file}..."
+  mkdir -p "${_tmpdir}/bin"
+  tar -xzf "${_tmpdir}/${_cli_file}" -C "${_tmpdir}/bin" openshell
+  tar -xzf "${_tmpdir}/${_gateway_file}" -C "${_tmpdir}/bin" openshell-gateway
+
+  # Unlike install_deb_package/install_rpm_packages, there is no front-end to
+  # choose between (apt vs dpkg; dnf vs yum vs zypper vs rpm) for a plain
+  # tarball, so the install step is inlined here rather than delegated to a
+  # dedicated install_tarball_* helper.
+  info "installing ${APP_NAME} binaries to /usr/bin..."
+  as_root install -m 0755 "${_tmpdir}/bin/openshell" /usr/bin/openshell
+  as_root install -m 0755 "${_tmpdir}/bin/openshell-gateway" /usr/bin/openshell-gateway
+
+  info "installing openshell-gateway user service unit..."
+  as_root install -D -m 0644 "${_tmpdir}/${GATEWAY_UNIT_NAME}" /usr/lib/systemd/user/${GATEWAY_UNIT_NAME}
+
+  info "installed ${APP_NAME} tarballs from ${RELEASE_TAG}"
+  start_user_gateway
+}
+
 install_macos_homebrew() {
   check_macos_platform
 
@@ -1040,6 +1166,9 @@ main() {
           ;;
         rpm)
           install_linux_rpm
+          ;;
+        tarball)
+          install_linux_tarball
           ;;
         *)
           error "unsupported Linux package method"
