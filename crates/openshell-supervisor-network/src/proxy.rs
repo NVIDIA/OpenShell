@@ -1249,7 +1249,8 @@ async fn handle_tcp_connection(
         .await;
     }
 
-    let (host, port) = parse_target(target)?;
+    let (raw_host, port) = parse_target(target)?;
+    let host = normalize_host(&raw_host);
     let host_lc = host.to_ascii_lowercase();
 
     if host_lc == INFERENCE_LOCAL_HOST && port == INFERENCE_LOCAL_PORT {
@@ -1440,7 +1441,7 @@ async fn handle_tcp_connection(
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let dns_connect_start = std::time::Instant::now();
     let connector = match validate_destination(DestinationRequest {
-        host: &host,
+        host: &raw_host,
         port,
         sandbox_entrypoint_pid,
         plan: destination_plan,
@@ -2874,9 +2875,11 @@ fn implicit_allowed_ips_for_ip_host(host: &str) -> Vec<String> {
 }
 
 fn normalize_host_lookup_key(host: &str) -> &str {
-    host.strip_prefix('[')
+    let h = host
+        .strip_prefix('[')
         .and_then(|trimmed| trimmed.strip_suffix(']'))
-        .unwrap_or(host)
+        .unwrap_or(host);
+    h.strip_suffix('.').unwrap_or(h)
 }
 
 /// Returns `true` if `host` is one of the well-known driver-injected aliases
@@ -3117,15 +3120,18 @@ async fn resolve_socket_addrs(
         return Ok(addrs);
     }
 
-    let lookup_host = normalize_host_lookup_key(host);
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((lookup_host, port))
+    let dns_host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((dns_host, port))
         .await
-        .map_err(|e| format!("DNS resolution failed for {lookup_host}:{port}: {e}"))?
+        .map_err(|e| format!("DNS resolution failed for {dns_host}:{port}: {e}"))?
         .collect();
 
     if addrs.is_empty() {
         return Err(format!(
-            "DNS resolution returned no addresses for {lookup_host}:{port}"
+            "DNS resolution returned no addresses for {dns_host}:{port}"
         ));
     }
 
@@ -4107,6 +4113,9 @@ async fn handle_forward_proxy(
         respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
         return Ok(());
     };
+
+    let raw_host = host;
+    let host = normalize_host(&raw_host);
     let host_lc = host.to_ascii_lowercase();
 
     if host_lc == POLICY_LOCAL_HOST {
@@ -4860,7 +4869,7 @@ async fn handle_forward_proxy(
         .expect("destination plan hydrated");
 
     let connector = match validate_destination(DestinationRequest {
-        host: &host,
+        host: &raw_host,
         port,
         sandbox_entrypoint_pid,
         plan: destination_plan,
@@ -5402,6 +5411,10 @@ fn parse_target(target: &str) -> Result<(String, u16)> {
         .parse()
         .map_err(|_| miette::miette!("Invalid port in CONNECT target: {target}"))?;
     Ok((host.to_string(), port))
+}
+
+fn normalize_host(raw_host: &str) -> &str {
+    raw_host.strip_suffix('.').unwrap_or(raw_host)
 }
 
 async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
@@ -9664,6 +9677,16 @@ network_policies:
     }
 
     #[test]
+    fn test_normalize_host_strips_single_trailing_dot() {
+        assert_eq!(normalize_host("api.example.com."), "api.example.com");
+    }
+
+    #[test]
+    fn test_normalize_host_remains_the_same() {
+        assert_eq!(normalize_host("api.example.com"), "api.example.com");
+    }
+
+    #[test]
     fn test_parse_target_preserves_case() {
         let (host, port) = parse_target("EXAMPLE.COM:443").unwrap();
         assert_eq!(host, "EXAMPLE.COM", "parse_target should preserve case");
@@ -9821,6 +9844,14 @@ network_policies:
     }
 
     // -- parse_proxy_uri: hostname parser regression tests --
+
+    #[test]
+    fn test_parse_proxy_uri_trailing_dot_host() {
+        let (_, host, port, _) = parse_proxy_uri("http://api.example.com.:80/path").unwrap();
+        let host = normalize_host(&host);
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 80_u16);
+    }
 
     #[test]
     fn test_parse_proxy_uri_nul_byte_in_host() {
