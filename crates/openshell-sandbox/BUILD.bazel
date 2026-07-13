@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+
+WORKSPACE_DEPS = [
+    "//crates/openshell-core:openshell_core",
+    "//crates/openshell-ocsf:openshell_ocsf",
+    "//crates/openshell-policy:openshell_policy",
+    "//crates/openshell-supervisor-network:openshell_supervisor_network",
+    "//crates/openshell-supervisor-process:openshell_supervisor_process",
+]
+
+rust_library(
+    name = "openshell_sandbox",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + WORKSPACE_DEPS,
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+# The container supervisor binary, sideloaded into sandbox images.
+rust_binary(
+    name = "openshell-sandbox",
+    srcs = ["src/main.rs"],
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + WORKSPACE_DEPS + [
+        ":openshell_sandbox",
+    ],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "openshell_sandbox_test",
+    crate = ":openshell_sandbox",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+# Cargo-style integration test; CARGO_BIN_EXE_* is baked at compile time as a
+# runfiles-relative rootpath and resolved from the test's working directory.
+rust_test(
+    name = "stdout_logging_test",
+    srcs = ["tests/stdout_logging.rs"],
+    data = [":openshell-sandbox"],
+    edition = "2024",
+    rustc_env = {
+        "CARGO_BIN_EXE_openshell-sandbox": "$(rootpath :openshell-sandbox)",
+    },
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + WORKSPACE_DEPS + [
+        ":openshell_sandbox",
+    ],
+)
