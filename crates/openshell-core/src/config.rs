@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -212,9 +213,16 @@ fn is_podman_available() -> bool {
     detect_podman_socket().is_some()
 }
 
-/// Return the first responsive Podman API socket, or `None` if none respond.
+/// Return the Podman API socket, or `None` if Podman is not available.
+///
+/// Probes the well-known socket candidates first, then falls back to asking
+/// the Podman CLI where its socket lives. The symlink at a well-known path is
+/// not always present — it varies by Podman version, machine provider, and
+/// platform — so the CLI fallback is what makes detection work on hosts where
+/// Podman is functional but the socket is somewhere else.
 pub fn detect_podman_socket() -> Option<PathBuf> {
     detect_podman_socket_from_candidates(&podman_socket_candidates())
+        .or_else(discover_podman_socket)
 }
 
 fn detect_podman_socket_from_candidates(candidates: &[PathBuf]) -> Option<PathBuf> {
@@ -222,6 +230,228 @@ fn detect_podman_socket_from_candidates(candidates: &[PathBuf]) -> Option<PathBu
         .iter()
         .find(|path| podman_socket_responds(path))
         .cloned()
+}
+
+/// Query the Podman CLI to discover the host-side API socket path.
+///
+/// Strategy:
+/// 1. Run `podman info --format json` to check connectivity and whether
+///    the service is remote (macOS/Windows VM) or local (native Linux).
+/// 2. If `CONTAINER_HOST` explicitly points at a Unix socket, `podman info`
+///    just connected through it — use that path directly (a raw unix:// URL
+///    has no machine to inspect and reports the VM-internal socket).
+/// 3. If `serviceIsRemote` is true, run `podman machine inspect` to get
+///    the host-side forwarded socket (the `remoteSocket` from `podman info`
+///    is the VM-internal path, which is not reachable from the host).
+/// 4. If `serviceIsRemote` is false, use `remoteSocket.path` directly
+///    (on native Linux this IS the real local socket).
+fn discover_podman_socket() -> Option<PathBuf> {
+    let output = Command::new("podman")
+        .args(["info", "--format", "json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+
+    // podman info succeeded, so an explicit unix:// CONTAINER_HOST is the exact
+    // working host-side socket. This must be checked before the machine path,
+    // which cannot map a raw unix:// endpoint to a machine.
+    if let Some(path) = explicit_unix_container_host() {
+        return Some(path);
+    }
+
+    let info: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let is_remote = info["host"]["serviceIsRemote"].as_bool().unwrap_or(false);
+
+    if is_remote {
+        discover_podman_machine_socket()
+    } else {
+        parse_podman_info_socket(&info)
+    }
+}
+
+/// Return the socket path when `CONTAINER_HOST` is an explicit `unix://` URL.
+///
+/// Honors Podman's precedence: `CONTAINER_CONNECTION` outranks `CONTAINER_HOST`,
+/// so a set `CONTAINER_CONNECTION` means `podman info` did not use
+/// `CONTAINER_HOST` and this returns `None`.
+fn explicit_unix_container_host() -> Option<PathBuf> {
+    if env_var_nonempty("CONTAINER_CONNECTION").is_some() {
+        return None;
+    }
+    let host = env_var_nonempty("CONTAINER_HOST")?;
+    unix_url_socket_path(&host)
+}
+
+/// Parse the socket path from a `unix://` URL, or `None` for other schemes.
+fn unix_url_socket_path(url: &str) -> Option<PathBuf> {
+    let path = url.trim().strip_prefix("unix://")?;
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Extract the socket path from `podman info` JSON output.
+/// Used on native Linux where `remoteSocket.path` is the real local socket.
+fn parse_podman_info_socket(info: &serde_json::Value) -> Option<PathBuf> {
+    let path_str = info["host"]["remoteSocket"]["path"].as_str()?;
+    let path = path_str.strip_prefix("unix://").unwrap_or(path_str);
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// Which Podman machine `podman info` connected through.
+///
+/// Podman resolves its endpoint (highest precedence first) from
+/// `CONTAINER_CONNECTION` (a named connection), then `CONTAINER_HOST` (a URL),
+/// then the default connection in `containers.conf`.
+#[derive(Debug, PartialEq, Eq)]
+enum ActiveMachine {
+    /// An explicit selector (`CONTAINER_CONNECTION`, or `CONTAINER_HOST` mapped
+    /// to a connection by URL) named this connection. It must match a machine
+    /// exactly; guessing another machine would connect to the wrong socket.
+    Explicit(String),
+    /// An explicit `CONTAINER_HOST` is set but maps to no known connection
+    /// (e.g. a plain remote server, not a local machine). The active machine
+    /// cannot be determined and must not be guessed.
+    UnresolvedExplicit,
+    /// No explicit selector; the `containers.conf` default connection name, if
+    /// any. Falling back to the sole/first machine is acceptable here.
+    Default(Option<String>),
+}
+
+/// Run `podman machine inspect` to discover the host-side forwarded socket.
+/// Used on macOS/Windows where the Podman service runs inside a VM.
+///
+/// `podman machine inspect` lists every machine, so the entry backing the
+/// active Podman connection is selected rather than blindly taking the first
+/// one — otherwise a host with multiple machines could be pointed at the wrong
+/// machine's socket.
+fn discover_podman_machine_socket() -> Option<PathBuf> {
+    let output = Command::new("podman")
+        .args(["machine", "inspect"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+
+    let machines: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    parse_podman_machine_inspect(&machines, &active_podman_machine())
+}
+
+/// Determine which machine `podman info` connected through.
+fn active_podman_machine() -> ActiveMachine {
+    if let Some(name) = env_var_nonempty("CONTAINER_CONNECTION") {
+        return ActiveMachine::Explicit(name);
+    }
+    let container_host = env_var_nonempty("CONTAINER_HOST");
+    resolve_active_podman_machine(container_host.as_deref(), podman_connection_list().as_ref())
+}
+
+/// Resolve the active machine from `CONTAINER_HOST` and the connection list.
+///
+/// `CONTAINER_CONNECTION` is handled by the caller (it needs no connection
+/// list). This is split out as a pure function for testing.
+fn resolve_active_podman_machine(
+    container_host: Option<&str>,
+    connections: Option<&serde_json::Value>,
+) -> ActiveMachine {
+    if let Some(host) = container_host {
+        return connections
+            .and_then(|c| podman_connection_name_for_uri(c, host))
+            .map_or(ActiveMachine::UnresolvedExplicit, ActiveMachine::Explicit);
+    }
+    ActiveMachine::Default(connections.and_then(parse_default_podman_connection))
+}
+
+fn env_var_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Run `podman system connection list --format json`.
+fn podman_connection_list() -> Option<serde_json::Value> {
+    let output = Command::new("podman")
+        .args(["system", "connection", "list", "--format", "json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Extract the default machine connection name from
+/// `podman system connection list --format json`.
+fn parse_default_podman_connection(connections: &serde_json::Value) -> Option<String> {
+    connections
+        .as_array()?
+        .iter()
+        .find(|c| {
+            c["Default"].as_bool().unwrap_or(false) && c["IsMachine"].as_bool().unwrap_or(false)
+        })
+        .and_then(|c| c["Name"].as_str())
+        .map(str::to_string)
+}
+
+/// Find the machine connection whose URI matches `CONTAINER_HOST`.
+///
+/// Only machine connections (`IsMachine: true`) map to a local socket, so a
+/// `CONTAINER_HOST` pointing at a plain remote server yields `None`.
+fn podman_connection_name_for_uri(connections: &serde_json::Value, uri: &str) -> Option<String> {
+    connections
+        .as_array()?
+        .iter()
+        .find(|c| c["IsMachine"].as_bool().unwrap_or(false) && c["URI"].as_str() == Some(uri))
+        .and_then(|c| c["Name"].as_str())
+        .map(str::to_string)
+}
+
+/// Extract the host-side socket path from `podman machine inspect` JSON,
+/// selecting the machine backing the active connection.
+fn parse_podman_machine_inspect(
+    machines: &serde_json::Value,
+    active: &ActiveMachine,
+) -> Option<PathBuf> {
+    let machine = select_podman_machine(machines.as_array()?, active)?;
+    let path_str = machine["ConnectionInfo"]["PodmanSocket"]["Path"].as_str()?;
+    if path_str.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path_str))
+}
+
+/// Select the machine entry backing the active Podman connection.
+///
+/// An explicit selection must match a machine by name (a rootless connection
+/// shares its machine's name; a rootful connection is named `<machine>-root`,
+/// so the `-root`-stripped name is also tried). An explicit endpoint that
+/// matches no machine returns `None` rather than guessing an unrelated machine.
+/// Only the non-explicit default path falls back to the first entry, which is
+/// correct on the common single-machine host.
+fn select_podman_machine<'a>(
+    machines: &'a [serde_json::Value],
+    active: &ActiveMachine,
+) -> Option<&'a serde_json::Value> {
+    let matches_name = |name: &str| machines.iter().find(|m| m["Name"].as_str() == Some(name));
+    let match_connection = |name: &str| {
+        matches_name(name).or_else(|| name.strip_suffix("-root").and_then(matches_name))
+    };
+
+    match active {
+        ActiveMachine::Explicit(name) => match_connection(name),
+        ActiveMachine::UnresolvedExplicit => None,
+        ActiveMachine::Default(name) => name
+            .as_deref()
+            .and_then(match_connection)
+            .or_else(|| machines.first()),
+    }
 }
 
 fn podman_socket_candidates() -> Vec<PathBuf> {
@@ -1084,12 +1314,15 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
-        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
+        ActiveMachine, ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN,
+        GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+        GatewayJwtConfig, GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
         detect_docker_socket_from_candidates, detect_driver, detect_podman_socket_from_candidates,
-        docker_host_unix_socket_path, docker_socket_responds, normalize_compute_driver_name,
-        podman_socket_candidates_from_env, podman_socket_responds,
+        docker_host_unix_socket_path, docker_socket_responds, explicit_unix_container_host,
+        normalize_compute_driver_name, parse_default_podman_connection, parse_podman_info_socket,
+        parse_podman_machine_inspect, podman_connection_name_for_uri,
+        podman_socket_candidates_from_env, podman_socket_responds, resolve_active_podman_machine,
+        unix_url_socket_path,
     };
     #[cfg(unix)]
     use super::{is_reachable_unix_socket, is_unix_socket};
@@ -1592,6 +1825,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_podman_info_socket_extracts_linux_local_socket() {
+        let info: serde_json::Value = serde_json::json!({
+            "host": {
+                "serviceIsRemote": false,
+                "remoteSocket": {
+                    "path": "unix:///run/user/1000/podman/podman.sock",
+                    "exists": true
+                }
+            }
+        });
+        assert_eq!(
+            parse_podman_info_socket(&info),
+            Some(PathBuf::from("/run/user/1000/podman/podman.sock"))
+        );
+    }
+
+    #[test]
     fn supervisor_image_tag_sanitizes_build_metadata_for_oci() {
         use super::resolve_supervisor_image_tag;
         assert_eq!(
@@ -1605,11 +1855,310 @@ mod tests {
     }
 
     #[test]
+    fn parse_podman_info_socket_handles_path_without_unix_prefix() {
+        let info: serde_json::Value = serde_json::json!({
+            "host": {
+                "remoteSocket": {
+                    "path": "/run/user/1000/podman/podman.sock",
+                    "exists": true
+                }
+            }
+        });
+        assert_eq!(
+            parse_podman_info_socket(&info),
+            Some(PathBuf::from("/run/user/1000/podman/podman.sock"))
+        );
+    }
+
+    #[test]
     fn default_supervisor_image_is_version_pinned() {
         use super::default_supervisor_image;
         let image = default_supervisor_image();
         assert!(image.starts_with("ghcr.io/nvidia/openshell/supervisor:"));
         let tag = image.rsplit_once(':').unwrap().1;
         assert!(!tag.is_empty());
+    }
+
+    #[test]
+    fn parse_podman_info_socket_returns_none_for_missing_path() {
+        let info: serde_json::Value = serde_json::json!({
+            "host": {
+                "remoteSocket": {}
+            }
+        });
+        assert_eq!(parse_podman_info_socket(&info), None);
+    }
+
+    #[test]
+    fn parse_podman_info_socket_returns_none_for_empty_path() {
+        let info: serde_json::Value = serde_json::json!({
+            "host": {
+                "remoteSocket": {
+                    "path": "",
+                    "exists": false
+                }
+            }
+        });
+        assert_eq!(parse_podman_info_socket(&info), None);
+    }
+
+    #[test]
+    fn parse_podman_machine_inspect_extracts_macos_socket() {
+        let machines: serde_json::Value = serde_json::json!([
+            {
+                "ConnectionInfo": {
+                    "PodmanSocket": {
+                        "Path": "/var/folders/1q/jx7s14b928n8zvstgfk98lj00000gn/T/podman/podman-machine-default-api.sock"
+                    },
+                    "PodmanPipe": null
+                },
+                "Name": "podman-machine-default"
+            }
+        ]);
+        assert_eq!(
+            parse_podman_machine_inspect(&machines, &ActiveMachine::Default(None)),
+            Some(PathBuf::from(
+                "/var/folders/1q/jx7s14b928n8zvstgfk98lj00000gn/T/podman/podman-machine-default-api.sock"
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_podman_machine_inspect_returns_none_for_empty_array() {
+        let machines: serde_json::Value = serde_json::json!([]);
+        assert_eq!(
+            parse_podman_machine_inspect(&machines, &ActiveMachine::Default(None)),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_podman_machine_inspect_returns_none_for_missing_socket() {
+        let machines: serde_json::Value = serde_json::json!([
+            {
+                "ConnectionInfo": {},
+                "Name": "podman-machine-default"
+            }
+        ]);
+        assert_eq!(
+            parse_podman_machine_inspect(&machines, &ActiveMachine::Default(None)),
+            None
+        );
+    }
+
+    fn two_machine_inspect() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "Name": "podman-machine-default",
+                "ConnectionInfo": {
+                    "PodmanSocket": { "Path": "/tmp/podman/default-api.sock" }
+                }
+            },
+            {
+                "Name": "work",
+                "ConnectionInfo": {
+                    "PodmanSocket": { "Path": "/tmp/podman/work-api.sock" }
+                }
+            }
+        ])
+    }
+
+    #[test]
+    fn parse_podman_machine_inspect_selects_active_machine() {
+        let machines = two_machine_inspect();
+        // The active connection points at the second machine, not the first.
+        assert_eq!(
+            parse_podman_machine_inspect(&machines, &ActiveMachine::Explicit("work".to_string())),
+            Some(PathBuf::from("/tmp/podman/work-api.sock"))
+        );
+    }
+
+    #[test]
+    fn parse_podman_machine_inspect_matches_rootful_connection_to_machine() {
+        let machines = two_machine_inspect();
+        // Rootful connections are named `<machine>-root`.
+        assert_eq!(
+            parse_podman_machine_inspect(
+                &machines,
+                &ActiveMachine::Explicit("work-root".to_string())
+            ),
+            Some(PathBuf::from("/tmp/podman/work-api.sock"))
+        );
+    }
+
+    #[test]
+    fn parse_podman_machine_inspect_default_falls_back_to_first() {
+        let machines = two_machine_inspect();
+        // No selector: first entry is used (correct on single-machine hosts).
+        assert_eq!(
+            parse_podman_machine_inspect(&machines, &ActiveMachine::Default(None)),
+            Some(PathBuf::from("/tmp/podman/default-api.sock"))
+        );
+        // A default connection naming an absent machine also falls back.
+        assert_eq!(
+            parse_podman_machine_inspect(
+                &machines,
+                &ActiveMachine::Default(Some("missing".to_string()))
+            ),
+            Some(PathBuf::from("/tmp/podman/default-api.sock"))
+        );
+    }
+
+    #[test]
+    fn parse_podman_machine_inspect_does_not_guess_for_unmatched_explicit() {
+        let machines = two_machine_inspect();
+        // An explicit selection that matches no machine must NOT fall back to
+        // an unrelated machine — that would reintroduce the wrong-machine bug.
+        assert_eq!(
+            parse_podman_machine_inspect(&machines, &ActiveMachine::Explicit("other".to_string())),
+            None
+        );
+        // CONTAINER_HOST pointing at a non-machine endpoint likewise does not
+        // guess.
+        assert_eq!(
+            parse_podman_machine_inspect(&machines, &ActiveMachine::UnresolvedExplicit),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_active_podman_machine_maps_container_host_to_connection() {
+        let connections: serde_json::Value = serde_json::json!([
+            { "Name": "work", "IsMachine": true, "Default": false,
+              "URI": "ssh://core@127.0.0.1:5555/run/user/1000/podman/podman.sock" },
+            { "Name": "podman-machine-default", "IsMachine": true, "Default": true,
+              "URI": "ssh://core@127.0.0.1:4444/run/user/1000/podman/podman.sock" }
+        ]);
+        // CONTAINER_HOST pointing at the non-default machine's URI resolves to
+        // that machine, not the default.
+        assert_eq!(
+            resolve_active_podman_machine(
+                Some("ssh://core@127.0.0.1:5555/run/user/1000/podman/podman.sock"),
+                Some(&connections)
+            ),
+            ActiveMachine::Explicit("work".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_active_podman_machine_unmatched_host_is_unresolved() {
+        let connections: serde_json::Value = serde_json::json!([
+            { "Name": "podman-machine-default", "IsMachine": true, "Default": true,
+              "URI": "ssh://core@127.0.0.1:4444/run/user/1000/podman/podman.sock" }
+        ]);
+        // A CONTAINER_HOST that matches no machine connection is unresolved,
+        // never silently mapped to the default machine.
+        assert_eq!(
+            resolve_active_podman_machine(Some("tcp://192.0.2.10:2375"), Some(&connections)),
+            ActiveMachine::UnresolvedExplicit
+        );
+    }
+
+    #[test]
+    fn resolve_active_podman_machine_defaults_without_host() {
+        let connections: serde_json::Value = serde_json::json!([
+            { "Name": "podman-machine-default", "IsMachine": true, "Default": true,
+              "URI": "ssh://core@127.0.0.1:4444/run/user/1000/podman/podman.sock" }
+        ]);
+        assert_eq!(
+            resolve_active_podman_machine(None, Some(&connections)),
+            ActiveMachine::Default(Some("podman-machine-default".to_string()))
+        );
+    }
+
+    #[test]
+    fn podman_connection_name_for_uri_ignores_non_machine_matches() {
+        let connections: serde_json::Value = serde_json::json!([
+            { "Name": "remote", "IsMachine": false, "Default": false,
+              "URI": "tcp://192.0.2.10:2375" }
+        ]);
+        // A URI match against a non-machine connection does not map to a local
+        // machine socket.
+        assert_eq!(
+            podman_connection_name_for_uri(&connections, "tcp://192.0.2.10:2375"),
+            None
+        );
+    }
+
+    #[test]
+    fn unix_url_socket_path_parses_unix_urls() {
+        assert_eq!(
+            unix_url_socket_path("unix:///run/user/1000/podman/podman.sock"),
+            Some(PathBuf::from("/run/user/1000/podman/podman.sock"))
+        );
+        // Non-unix schemes and empty paths are not sockets.
+        assert_eq!(unix_url_socket_path("ssh://core@127.0.0.1:22/x"), None);
+        assert_eq!(unix_url_socket_path("tcp://127.0.0.1:2375"), None);
+        assert_eq!(unix_url_socket_path("unix://"), None);
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var/remove_var require unsafe in Rust 2024
+    fn explicit_unix_container_host_honors_scheme_and_precedence() {
+        fn set(key: &str, value: Option<&str>) {
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+
+        let original_host = std::env::var("CONTAINER_HOST").ok();
+        let original_connection = std::env::var("CONTAINER_CONNECTION").ok();
+
+        // A unix:// CONTAINER_HOST with no CONTAINER_CONNECTION is used directly.
+        set("CONTAINER_CONNECTION", None);
+        set("CONTAINER_HOST", Some("unix:///tmp/podman/custom.sock"));
+        assert_eq!(
+            explicit_unix_container_host(),
+            Some(PathBuf::from("/tmp/podman/custom.sock"))
+        );
+
+        // CONTAINER_CONNECTION outranks CONTAINER_HOST.
+        set("CONTAINER_CONNECTION", Some("work"));
+        assert_eq!(explicit_unix_container_host(), None);
+
+        // A non-unix CONTAINER_HOST is not a direct socket.
+        set("CONTAINER_CONNECTION", None);
+        set(
+            "CONTAINER_HOST",
+            Some("ssh://core@127.0.0.1:5555/run/podman.sock"),
+        );
+        assert_eq!(explicit_unix_container_host(), None);
+
+        // Nothing set.
+        set("CONTAINER_HOST", None);
+        assert_eq!(explicit_unix_container_host(), None);
+
+        set("CONTAINER_HOST", original_host.as_deref());
+        set("CONTAINER_CONNECTION", original_connection.as_deref());
+    }
+
+    #[test]
+    fn parse_default_podman_connection_picks_default_machine() {
+        let connections: serde_json::Value = serde_json::json!([
+            { "Name": "podman-machine-default", "IsMachine": true, "Default": true },
+            { "Name": "podman-machine-default-root", "IsMachine": true, "Default": false }
+        ]);
+        assert_eq!(
+            parse_default_podman_connection(&connections),
+            Some("podman-machine-default".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_default_podman_connection_ignores_non_machine_and_missing_default() {
+        // Default connection that is not a machine is ignored.
+        let non_machine: serde_json::Value = serde_json::json!([
+            { "Name": "remote-host", "IsMachine": false, "Default": true }
+        ]);
+        assert_eq!(parse_default_podman_connection(&non_machine), None);
+
+        // No default at all.
+        let no_default: serde_json::Value = serde_json::json!([
+            { "Name": "work", "IsMachine": true, "Default": false }
+        ]);
+        assert_eq!(parse_default_podman_connection(&no_default), None);
     }
 }
