@@ -246,6 +246,36 @@ pub struct InterceptedRequest {
     selector: RpcSelector,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ValidatedOperation {
+    json: Value,
+    encoded: Vec<u8>,
+}
+
+impl ValidatedOperation {
+    fn new(descriptors: &ProtoDescriptors, type_name: &str, json: Value) -> Result<Self> {
+        let encoded = descriptors.encode_json_to_message(type_name, &json)?;
+        Ok(Self { json, encoded })
+    }
+
+    fn apply_patches(
+        &self,
+        descriptors: &ProtoDescriptors,
+        type_name: &str,
+        patches: &[JsonPatch],
+    ) -> Result<Self> {
+        let json = apply_json_patches(&self.json, patches)?;
+        let encoded = descriptors
+            .encode_json_to_message(type_name, &json)
+            .map_err(|err| {
+                InterceptorError::InvalidResult(format!(
+                    "patched operation is not valid {type_name}: {err}"
+                ))
+            })?;
+        Ok(Self { json, encoded })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderProfileSourceSnapshot {
     pub revision: String,
@@ -441,25 +471,40 @@ impl GatewayInterceptorRuntime {
             .ok_or_else(|| Status::invalid_argument("unknown OpenShell method"))?
             .to_string();
         let frame = GrpcFrame::decode(body)?;
-        let mut operation = self
+        let operation = self
             .descriptors
             .decode_message_to_json(&input_type, &frame.message)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
-
-        operation = self
-            .evaluate_phase(&selector, Phase::ModifyOperation, operation, context)
-            .await?;
-        operation = self
-            .evaluate_phase(&selector, Phase::Validate, operation, context)
-            .await?;
-
-        let message = self
-            .descriptors
-            .encode_json_to_message(&input_type, &operation)
+        let mut operation = ValidatedOperation::new(&self.descriptors, &input_type, operation)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
+
+        operation = self
+            .evaluate_phase(
+                &selector,
+                Phase::ModifyOperation,
+                &input_type,
+                operation,
+                context,
+            )
+            .await?;
+        operation = self
+            .evaluate_phase(&selector, Phase::Validate, &input_type, operation, context)
+            .await?;
+
+        let final_encoding = self
+            .descriptors
+            .encode_json_to_message(&input_type, &operation.json)
+            .map_err(|err| {
+                Status::internal(format!("validated operation became invalid: {err}"))
+            })?;
+        if final_encoding != operation.encoded {
+            return Err(Status::internal(
+                "validated operation encoding changed before dispatch",
+            ));
+        }
         let body = GrpcFrame {
             compressed: false,
-            message,
+            message: operation.encoded,
         }
         .encode()
         .map_err(|err| Status::invalid_argument(err.to_string()))?;
@@ -482,9 +527,13 @@ impl GatewayInterceptorRuntime {
             .descriptors
             .decode_message_to_json(output_type, &frame.message)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        let committed_response =
+            ValidatedOperation::new(&self.descriptors, output_type, committed_response)
+                .map_err(|err| Status::invalid_argument(err.to_string()))?;
         self.evaluate_phase(
             &intercepted.selector,
             Phase::PostCommit,
+            output_type,
             committed_response,
             context,
         )
@@ -502,16 +551,17 @@ impl GatewayInterceptorRuntime {
         &self,
         selector: &RpcSelector,
         phase: Phase,
-        operation: Value,
+        operation_type: &str,
+        operation: ValidatedOperation,
         context: &EvaluationContext,
-    ) -> std::result::Result<Value, Status> {
+    ) -> std::result::Result<ValidatedOperation, Status> {
         let Some(plans) = self.bindings.get(&(selector.clone(), phase)) else {
             return Ok(operation);
         };
 
         let mut operation = operation;
         for plan in plans {
-            let result = evaluate_plan(plan, operation.clone(), context).await;
+            let result = evaluate_plan(plan, operation.json.clone(), context).await;
             let result = match result {
                 Ok(result) => result,
                 Err(err) => {
@@ -519,40 +569,57 @@ impl GatewayInterceptorRuntime {
                     continue;
                 }
             };
+            operation = apply_evaluation_result(
+                &self.descriptors,
+                operation_type,
+                plan,
+                &result,
+                operation,
+            )?;
+        }
+        Ok(operation)
+    }
+}
 
-            if let Err(err) = validate_result_contract(plan, &result) {
+fn apply_evaluation_result(
+    descriptors: &ProtoDescriptors,
+    operation_type: &str,
+    plan: &BindingPlan,
+    result: &InterceptorResult,
+    operation: ValidatedOperation,
+) -> std::result::Result<ValidatedOperation, Status> {
+    if let Err(err) = validate_result_contract(plan, result) {
+        apply_failure_policy(plan, &err)?;
+        return Ok(operation);
+    }
+
+    if !result.allowed {
+        let reason = if result.reason.trim().is_empty() {
+            "operation denied by gateway interceptor".to_string()
+        } else {
+            result.reason.clone()
+        };
+        emit_evaluation_metrics(plan, "deny", 0);
+        emit_evaluation_log(plan, result, "deny", 0);
+        return Err(status_from_result(result, reason));
+    }
+
+    if plan.phase == Phase::ModifyOperation && !result.patches.is_empty() {
+        let patch_count = result.patches.len();
+        match operation.apply_patches(descriptors, operation_type, &result.patches) {
+            Ok(candidate) => {
+                emit_evaluation_metrics(plan, "allow", patch_count);
+                emit_evaluation_log(plan, result, "allow", patch_count);
+                Ok(candidate)
+            }
+            Err(err) => {
                 apply_failure_policy(plan, &err)?;
-                continue;
-            }
-
-            if !result.allowed {
-                let reason = if result.reason.trim().is_empty() {
-                    "operation denied by gateway interceptor".to_string()
-                } else {
-                    result.reason.clone()
-                };
-                emit_evaluation_metrics(plan, "deny", 0);
-                emit_evaluation_log(plan, &result, "deny", 0);
-                return Err(status_from_result(&result, reason));
-            }
-
-            if phase == Phase::ModifyOperation && !result.patches.is_empty() {
-                let patch_count = result.patches.len();
-                match apply_json_patches(&operation, &result.patches) {
-                    Ok(patched) => {
-                        operation = patched;
-                        emit_evaluation_metrics(plan, "allow", patch_count);
-                        emit_evaluation_log(plan, &result, "allow", patch_count);
-                    }
-                    Err(err) => {
-                        apply_failure_policy(plan, &err)?;
-                    }
-                }
-            } else {
-                emit_evaluation_metrics(plan, "allow", 0);
-                emit_evaluation_log(plan, &result, "allow", 0);
+                Ok(operation)
             }
         }
+    } else {
+        emit_evaluation_metrics(plan, "allow", 0);
+        emit_evaluation_log(plan, result, "allow", 0);
         Ok(operation)
     }
 }
@@ -2260,7 +2327,10 @@ mod tests {
         UpdateConfigRequest,
     };
     use serde_json::json;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
     use tracing_subscriber::layer::SubscriberExt;
 
     #[derive(Clone)]
@@ -2274,6 +2344,126 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct AtomicCounter(Arc<AtomicU64>);
+
+    impl metrics::CounterFn for AtomicCounter {
+        fn increment(&self, value: u64) {
+            self.0.fetch_add(value, Ordering::Relaxed);
+        }
+
+        fn absolute(&self, value: u64) {
+            self.0.fetch_max(value, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct TestRecorder {
+        evaluations: Arc<AtomicU64>,
+        patches: Arc<AtomicU64>,
+        fail_open: Arc<AtomicU64>,
+        fail_closed: Arc<AtomicU64>,
+    }
+
+    impl metrics::Recorder for TestRecorder {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let counter = match key.name() {
+                "openshell_gateway_interceptor_evaluations_total" => &self.evaluations,
+                "openshell_gateway_interceptor_patches_total" => &self.patches,
+                "openshell_gateway_interceptor_fail_open_total" => &self.fail_open,
+                "openshell_gateway_interceptor_fail_closed_total" => &self.fail_closed,
+                _ => return metrics::Counter::noop(),
+            };
+            metrics::Counter::from_arc(Arc::new(AtomicCounter(counter.clone())))
+        }
+
+        fn register_gauge(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+
+        fn register_histogram(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    impl TestRecorder {
+        fn count(counter: &AtomicU64) -> u64 {
+            counter.load(Ordering::Relaxed)
+        }
+    }
+
+    fn test_modify_plan(failure_policy: FailurePolicy) -> BindingPlan {
+        BindingPlan {
+            interceptor_name: "test".to_string(),
+            binding_id: "binding".to_string(),
+            selector: RpcSelector {
+                service: "openshell.v1.OpenShell".to_string(),
+                method: "UpdateConfig".to_string(),
+            },
+            phase: Phase::ModifyOperation,
+            failure_policy,
+            timeout: DEFAULT_TIMEOUT,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_patches: DEFAULT_MAX_PATCHES,
+            client: GatewayInterceptorClient::new(
+                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+        }
+    }
+
+    fn patch(op: &str, path: &str, value: Value) -> JsonPatch {
+        JsonPatch {
+            op: op.to_string(),
+            path: path.to_string(),
+            value: Some(json_to_protobuf_value(value).unwrap()),
+            from: String::new(),
+        }
+    }
+
+    fn allowed_result(patches: Vec<JsonPatch>) -> InterceptorResult {
+        InterceptorResult {
+            allowed: true,
+            patches,
+            ..InterceptorResult::default()
         }
     }
 
@@ -2890,5 +3080,260 @@ mod tests {
         let err = apply_json_patches(&operation, &result.patches).unwrap_err();
         apply_failure_policy(&plan, &err).unwrap();
         assert_eq!(operation, json!({ "name": "demo" }));
+    }
+
+    #[test]
+    fn validated_operation_rejects_message_repeated_and_enum_type_errors() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let cases = [
+            (
+                "openshell.v1.CreateSandboxRequest",
+                json!({"name": "demo", "spec": {}}),
+                patch("replace", "/spec", json!("not-a-message")),
+            ),
+            (
+                "openshell.v1.CreateSandboxRequest",
+                json!({"name": "demo", "spec": {"providers": []}}),
+                patch("replace", "/spec/providers", json!({"provider": "github"})),
+            ),
+            (
+                "openshell.v1.ReportPolicyStatusRequest",
+                json!({
+                    "sandboxId": "sandbox-id",
+                    "version": 1,
+                    "status": "POLICY_STATUS_LOADED"
+                }),
+                patch("replace", "/status", json!("POLICY_STATUS_UNKNOWN")),
+            ),
+        ];
+
+        for (type_name, json, invalid_patch) in cases {
+            let operation = ValidatedOperation::new(&descriptors, type_name, json).unwrap();
+            let err = operation
+                .apply_patches(&descriptors, type_name, &[invalid_patch])
+                .expect_err("wrong-type patch must not produce a validated operation");
+
+            assert!(matches!(err, InterceptorError::InvalidResult(_)));
+            assert!(err.to_string().contains("patched operation is not valid"));
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_type_patch_fails_open_to_exact_prior_operation_and_metrics() {
+        tokio::task::yield_now().await;
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let operation = ValidatedOperation::new(
+            &descriptors,
+            "openshell.v1.UpdateConfigRequest",
+            json!({"name": "demo", "expectedResourceVersion": "7"}),
+        )
+        .unwrap();
+        let prior = operation.clone();
+        let plan = test_modify_plan(FailurePolicy::FailOpen);
+        let result = allowed_result(vec![patch(
+            "replace",
+            "/expectedResourceVersion",
+            json!("not-a-number"),
+        )]);
+        let recorder = TestRecorder::default();
+
+        let outcome = metrics::with_local_recorder(&recorder, || {
+            apply_evaluation_result(
+                &descriptors,
+                "openshell.v1.UpdateConfigRequest",
+                &plan,
+                &result,
+                operation,
+            )
+        })
+        .unwrap();
+
+        assert_eq!(outcome, prior);
+        assert_eq!(TestRecorder::count(&recorder.fail_open), 1);
+        assert_eq!(TestRecorder::count(&recorder.fail_closed), 0);
+        assert_eq!(TestRecorder::count(&recorder.evaluations), 0);
+        assert_eq!(TestRecorder::count(&recorder.patches), 0);
+    }
+
+    #[tokio::test]
+    async fn wrong_type_patch_fails_closed_before_dispatch_and_metrics() {
+        tokio::task::yield_now().await;
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let operation = ValidatedOperation::new(
+            &descriptors,
+            "openshell.v1.UpdateConfigRequest",
+            json!({"name": "demo", "expectedResourceVersion": "7"}),
+        )
+        .unwrap();
+        let plan = test_modify_plan(FailurePolicy::FailClosed);
+        let result = allowed_result(vec![patch(
+            "replace",
+            "/expectedResourceVersion",
+            json!("not-a-number"),
+        )]);
+        let recorder = TestRecorder::default();
+
+        let status = metrics::with_local_recorder(&recorder, || {
+            apply_evaluation_result(
+                &descriptors,
+                "openshell.v1.UpdateConfigRequest",
+                &plan,
+                &result,
+                operation,
+            )
+        })
+        .expect_err("fail-closed invalid candidate must stop dispatch");
+
+        assert_eq!(status.code(), Code::PermissionDenied);
+        assert!(status.message().contains("patched operation is not valid"));
+        assert_eq!(TestRecorder::count(&recorder.fail_open), 0);
+        assert_eq!(TestRecorder::count(&recorder.fail_closed), 1);
+        assert_eq!(TestRecorder::count(&recorder.evaluations), 0);
+        assert_eq!(TestRecorder::count(&recorder.patches), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_patch_list_is_atomic() {
+        tokio::task::yield_now().await;
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let operation = ValidatedOperation::new(
+            &descriptors,
+            "openshell.v1.UpdateConfigRequest",
+            json!({"name": "demo", "expectedResourceVersion": "7"}),
+        )
+        .unwrap();
+        let prior = operation.clone();
+        let result = allowed_result(vec![
+            patch("replace", "/name", json!("partially-mutated")),
+            patch("replace", "/expectedResourceVersion", json!("not-a-number")),
+        ]);
+
+        let outcome = apply_evaluation_result(
+            &descriptors,
+            "openshell.v1.UpdateConfigRequest",
+            &test_modify_plan(FailurePolicy::FailOpen),
+            &result,
+            operation,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, prior);
+        assert_eq!(outcome.json["name"], "demo");
+    }
+
+    #[tokio::test]
+    async fn later_binding_sees_pre_binding_value_after_invalid_candidate_fails_open() {
+        tokio::task::yield_now().await;
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let operation = ValidatedOperation::new(
+            &descriptors,
+            "openshell.v1.UpdateConfigRequest",
+            json!({"name": "demo", "expectedResourceVersion": "7"}),
+        )
+        .unwrap();
+        let plan = test_modify_plan(FailurePolicy::FailOpen);
+        let invalid_first = allowed_result(vec![
+            patch("replace", "/name", json!("rejected-candidate")),
+            patch("replace", "/expectedResourceVersion", json!("not-a-number")),
+        ]);
+        let second = allowed_result(vec![
+            patch("test", "/name", json!("demo")),
+            patch("replace", "/name", json!("accepted-candidate")),
+        ]);
+
+        let operation = apply_evaluation_result(
+            &descriptors,
+            "openshell.v1.UpdateConfigRequest",
+            &plan,
+            &invalid_first,
+            operation,
+        )
+        .unwrap();
+        let operation = apply_evaluation_result(
+            &descriptors,
+            "openshell.v1.UpdateConfigRequest",
+            &plan,
+            &second,
+            operation,
+        )
+        .unwrap();
+
+        assert_eq!(operation.json["name"], "accepted-candidate");
+        let decoded = UpdateConfigRequest::decode(operation.encoded.as_slice()).unwrap();
+        assert_eq!(decoded.name, "accepted-candidate");
+        assert_eq!(decoded.expected_resource_version, 7);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_oneof_patch_obeys_binding_failure_policy() {
+        tokio::task::yield_now().await;
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let operation = ValidatedOperation::new(
+            &descriptors,
+            "openshell.v1.PolicyMergeOperation",
+            json!({"addRule": {}}),
+        )
+        .unwrap();
+        let result = allowed_result(vec![patch("add", "/removeRule", json!({}))]);
+
+        let fail_open = apply_evaluation_result(
+            &descriptors,
+            "openshell.v1.PolicyMergeOperation",
+            &test_modify_plan(FailurePolicy::FailOpen),
+            &result,
+            operation.clone(),
+        )
+        .unwrap();
+        let fail_closed = apply_evaluation_result(
+            &descriptors,
+            "openshell.v1.PolicyMergeOperation",
+            &test_modify_plan(FailurePolicy::FailClosed),
+            &result,
+            operation.clone(),
+        )
+        .expect_err("ambiguous oneof candidate must fail closed");
+
+        assert_eq!(fail_open, operation);
+        assert_eq!(fail_closed.code(), Code::PermissionDenied);
+        assert!(fail_closed.message().contains("oneof 'operation'"));
+    }
+
+    #[tokio::test]
+    async fn accepted_candidate_updates_encoded_operation_and_patch_metrics() {
+        tokio::task::yield_now().await;
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let operation = ValidatedOperation::new(
+            &descriptors,
+            "openshell.v1.UpdateConfigRequest",
+            json!({"name": "demo", "expectedResourceVersion": "7"}),
+        )
+        .unwrap();
+        let result = allowed_result(vec![patch("replace", "/name", json!("accepted"))]);
+        let recorder = TestRecorder::default();
+
+        let operation = metrics::with_local_recorder(&recorder, || {
+            apply_evaluation_result(
+                &descriptors,
+                "openshell.v1.UpdateConfigRequest",
+                &test_modify_plan(FailurePolicy::FailClosed),
+                &result,
+                operation,
+            )
+        })
+        .unwrap();
+
+        let decoded = UpdateConfigRequest::decode(operation.encoded.as_slice()).unwrap();
+        assert_eq!(decoded.name, "accepted");
+        assert_eq!(TestRecorder::count(&recorder.evaluations), 1);
+        assert_eq!(TestRecorder::count(&recorder.patches), 1);
+        assert_eq!(TestRecorder::count(&recorder.fail_open), 0);
+        assert_eq!(TestRecorder::count(&recorder.fail_closed), 0);
     }
 }

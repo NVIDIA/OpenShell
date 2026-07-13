@@ -58,6 +58,13 @@ boundary is intentionally stricter than protobuf's last-member-wins behavior:
 ambiguous requests fail with `INVALID_ARGUMENT` before interceptor evaluation
 or handler dispatch.
 
+Modification results are atomic per binding. After applying one binding's full
+JSON Patch list, the middleware re-encodes the candidate as the request's
+protobuf type before accepting it. Invalid candidates follow that binding's
+failure policy: fail-open restores the exact pre-binding operation, while
+fail-closed rejects the request before handler dispatch. Later bindings only
+observe schema-valid operations.
+
 Each interceptor evaluation selects exactly one phase payload:
 `modify_operation`, `validate`, or `post_commit`. Modification and validation
 payloads carry the protobuf JSON operation entering that phase. Post-commit
