@@ -126,7 +126,7 @@ echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 Project requirements:
 
 - Rust 1.88+
-- Python 3.12+
+- Python 3.11+
 - Docker (running)
 - Z3 solver library (for the policy prover crate)
 
