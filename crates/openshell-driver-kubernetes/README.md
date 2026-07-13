@@ -95,7 +95,10 @@ headless Service. The driver creates an owner-referenced supervisor
 Deployment with one replica plus Service, proxy CA Secret, and NetworkPolicy
 resources so agent egress is limited to its paired supervisor pod plus DNS. If
 the supervisor pod is deleted, the Deployment recreates it. The workload pod
-does not mount gateway credentials or the supervisor binary. This topology
+does not mount gateway credentials or the supervisor binary. Its proxy CA and
+default workspace init containers run as the resolved sandbox UID/GID, disable
+privilege escalation, and drop all capabilities. The workload mounts the
+generated proxy CA bundle read-only. This topology
 intentionally omits filesystem/process/binary enforcement, SSH/exec,
 upload/download, sync, and provider environment injection.
 

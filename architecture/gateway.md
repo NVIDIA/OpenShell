@@ -71,7 +71,10 @@ minting the gateway JWT. Agent pods must be directly controlled by the
 `Pod -> ReplicaSet -> Deployment -> Sandbox` chain. The bootstrap path accepts
 both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
 controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
-deployments. Supervisors renew gateway JWTs in memory before expiry only while
+deployments. The proxy-pod gateway Role grants create/delete on its dependent
+Service, Secret, and NetworkPolicy resources, plus create/delete/get on the
+supervisor Deployment and get on its ReplicaSet for this owner-chain check.
+Supervisors renew gateway JWTs in memory before expiry only while
 the sandbox record still exists. Older tokens are not server-revoked; shared
 deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
 The config default is

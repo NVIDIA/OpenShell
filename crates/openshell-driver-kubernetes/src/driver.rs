@@ -2206,17 +2206,19 @@ fn proxy_pod_ca_source_volume_mount() -> serde_json::Value {
     })
 }
 
-fn proxy_pod_ca_tls_volume_mount() -> serde_json::Value {
+fn proxy_pod_ca_tls_volume_mount(read_only: bool) -> serde_json::Value {
     serde_json::json!({
         "name": "openshell-proxy-pod-tls",
         "mountPath": SIDECAR_TLS_MOUNT_PATH,
+        "readOnly": read_only,
     })
 }
 
 fn proxy_pod_ca_init_container(
     image: &str,
     image_pull_policy: &str,
-    sandbox_gid: u32,
+    run_as_user: u32,
+    run_as_group: u32,
 ) -> serde_json::Value {
     let copy_cmd = format!(
         "set -eu; \
@@ -2236,16 +2238,18 @@ fn proxy_pod_ca_init_container(
         "image": image,
         "command": ["sh", "-c", copy_cmd],
         "securityContext": {
-            "runAsUser": 0,
-            "runAsGroup": sandbox_gid,
+            "runAsUser": run_as_user,
+            "runAsGroup": run_as_group,
+            "runAsNonRoot": true,
             "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
             "capabilities": {
                 "drop": ["ALL"]
             }
         },
         "volumeMounts": [
             proxy_pod_ca_source_volume_mount(),
-            proxy_pod_ca_tls_volume_mount(),
+            proxy_pod_ca_tls_volume_mount(false),
         ]
     });
     if !image_pull_policy.is_empty() {
@@ -2368,6 +2372,7 @@ fn apply_supervisor_proxy_pod_topology(
         init_containers.push(proxy_pod_ca_init_container(
             params.supervisor_image,
             params.supervisor_image_pull_policy,
+            params.sandbox_uid,
             params.sandbox_gid,
         ));
     }
@@ -2417,7 +2422,7 @@ fn apply_supervisor_proxy_pod_topology(
             remove_volume_mount(volume_mounts, SERVICE_ACCOUNT_TOKEN_VOLUME_NAME);
             remove_volume_mount(volume_mounts, CLIENT_TLS_VOLUME_NAME);
             remove_volume_mount(volume_mounts, SPIFFE_WORKLOAD_API_VOLUME_NAME);
-            volume_mounts.push(proxy_pod_ca_tls_volume_mount());
+            volume_mounts.push(proxy_pod_ca_tls_volume_mount(true));
         }
 
         let env = container
@@ -2509,7 +2514,9 @@ fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
     image: &str,
     image_pull_policy: &str,
+    sandbox_uid: u32,
     sandbox_gid: u32,
+    topology: SupervisorTopology,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -2586,13 +2593,26 @@ fn apply_workspace_persistence(
              fi"
         );
 
+        let security_context = if topology == SupervisorTopology::ProxyPod {
+            serde_json::json!({
+                "runAsUser": sandbox_uid,
+                "runAsGroup": sandbox_gid,
+                "runAsNonRoot": true,
+                "allowPrivilegeEscalation": false,
+                "capabilities": {
+                    "drop": ["ALL"]
+                }
+            })
+        } else {
+            serde_json::json!({
+                "runAsUser": 0,
+            })
+        };
         let mut init_spec = serde_json::json!({
             "name": WORKSPACE_INIT_CONTAINER_NAME,
             "image": image,
             "command": ["sh", "-c", copy_cmd],
-            "securityContext": {
-                "runAsUser": 0,
-            },
+            "securityContext": security_context,
             "volumeMounts": [{
                 "name": WORKSPACE_VOLUME_NAME,
                 "mountPath": WORKSPACE_INIT_MOUNT_PATH
@@ -3172,7 +3192,9 @@ fn sandbox_template_to_k8s_with_validated_config(
             &mut result,
             image,
             params.image_pull_policy,
+            params.sandbox_uid,
             params.sandbox_gid,
+            params.topology,
         );
     }
 
@@ -3551,7 +3573,7 @@ fn proxy_pod_supervisor_deployment(
                 "mountPath": PROXY_POD_CA_SECRET_MOUNT_PATH,
                 "readOnly": true
             },
-            proxy_pod_ca_tls_volume_mount(),
+            proxy_pod_ca_tls_volume_mount(false),
         ]
     });
     if !params.supervisor_image_pull_policy.is_empty() {
@@ -5529,6 +5551,13 @@ mod tests {
             agent["securityContext"]["capabilities"]["drop"],
             serde_json::json!(["ALL"])
         );
+        let proxy_tls_mount = agent["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mount| mount["name"] == "openshell-proxy-pod-tls")
+            .unwrap();
+        assert_eq!(proxy_tls_mount["readOnly"], true);
 
         let containers = pod_template["spec"]["containers"].as_array().unwrap();
         assert_eq!(containers.len(), 1);
@@ -5553,10 +5582,23 @@ mod tests {
         }));
 
         let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
-        assert!(init_containers.iter().any(|container| {
-            container["name"] == "openshell-proxy-ca-install"
-                && container["image"] == "supervisor-image:latest"
-        }));
+        let ca_init = init_containers
+            .iter()
+            .find(|container| container["name"] == "openshell-proxy-ca-install")
+            .unwrap();
+        assert_eq!(ca_init["image"], "supervisor-image:latest");
+        assert_eq!(ca_init["securityContext"]["runAsUser"], 1500);
+        assert_eq!(ca_init["securityContext"]["runAsGroup"], 1500);
+        assert_eq!(ca_init["securityContext"]["runAsNonRoot"], true);
+        assert_eq!(
+            ca_init["securityContext"]["allowPrivilegeEscalation"],
+            false
+        );
+        assert_eq!(ca_init["securityContext"]["readOnlyRootFilesystem"], true);
+        assert_eq!(
+            ca_init["securityContext"]["capabilities"]["drop"],
+            serde_json::json!(["ALL"])
+        );
         assert!(
             !init_containers
                 .iter()
@@ -5564,6 +5606,49 @@ mod tests {
         );
 
         assert!(pod_template["spec"].get("affinity").is_none());
+    }
+
+    #[test]
+    fn proxy_pod_agent_pod_has_no_root_containers() {
+        let params = SandboxPodParams {
+            topology: SupervisorTopology::ProxyPod,
+            supervisor_image: "supervisor-image:latest",
+            namespace: "agents",
+            sandbox_id: "sandbox-123",
+            sandbox_name: "example-sandbox",
+            proxy_uid: 2200,
+            sandbox_uid: 1500,
+            sandbox_gid: 1600,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate {
+                image: "agent-image:latest".to_string(),
+                ..SandboxTemplate::default()
+            },
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        let containers = pod_template["spec"]["containers"].as_array().unwrap();
+        let init_containers = pod_template["spec"]["initContainers"].as_array().unwrap();
+        assert_eq!(init_containers.len(), 2);
+        for container in containers.iter().chain(init_containers) {
+            let security_context = &container["securityContext"];
+            assert_ne!(
+                security_context["runAsUser"], 0,
+                "{} must not run as root",
+                container["name"]
+            );
+            assert_eq!(security_context["runAsNonRoot"], true);
+            assert_eq!(security_context["allowPrivilegeEscalation"], false);
+            assert_eq!(
+                security_context["capabilities"]["drop"],
+                serde_json::json!(["ALL"])
+            );
+        }
     }
 
     #[test]
@@ -6215,7 +6300,9 @@ mod tests {
             &mut pod_template,
             "openshell/sandbox:latest",
             "IfNotPresent",
+            1000, // sandbox_uid
             1000, // sandbox_gid
+            SupervisorTopology::Combined,
         );
 
         // Init container
@@ -6275,6 +6362,8 @@ mod tests {
             "my-custom-image:v2",
             "IfNotPresent",
             1000,
+            1000,
+            SupervisorTopology::Combined,
         );
 
         let init_image = pod_template["spec"]["initContainers"][0]["image"]
@@ -6297,7 +6386,14 @@ mod tests {
             }
         });
 
-        apply_workspace_persistence(&mut pod_template, "img:latest", "Always", 1000);
+        apply_workspace_persistence(
+            &mut pod_template,
+            "img:latest",
+            "Always",
+            1000,
+            1000,
+            SupervisorTopology::Combined,
+        );
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
             .as_array()
@@ -6320,6 +6416,37 @@ mod tests {
                 && script.contains("--no-same-permissions")
                 && script.contains("--touch"),
             "init script must avoid restoring metadata onto the PVC root"
+        );
+    }
+
+    #[test]
+    fn workspace_persistence_uses_non_root_init_container_for_proxy_pod() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "img:latest"
+                }]
+            }
+        });
+
+        apply_workspace_persistence(
+            &mut pod_template,
+            "img:latest",
+            "IfNotPresent",
+            1500,
+            1600,
+            SupervisorTopology::ProxyPod,
+        );
+
+        let security_context = &pod_template["spec"]["initContainers"][0]["securityContext"];
+        assert_eq!(security_context["runAsUser"], 1500);
+        assert_eq!(security_context["runAsGroup"], 1600);
+        assert_eq!(security_context["runAsNonRoot"], true);
+        assert_eq!(security_context["allowPrivilegeEscalation"], false);
+        assert_eq!(
+            security_context["capabilities"]["drop"],
+            serde_json::json!(["ALL"])
         );
     }
 
