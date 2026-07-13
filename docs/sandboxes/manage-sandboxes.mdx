@@ -214,6 +214,8 @@ Attach labels when you create a sandbox to track ownership, environment, or work
 openshell sandbox create --label env=dev --label team=platform -- claude
 ```
 
+Labels are stored as sandbox metadata for filtering and are also applied to the underlying compute resource (the Kubernetes pod or Docker container) so you can select sandboxes with native platform tooling. The VM driver stores labels as metadata only. The `openshell.ai/` key namespace is reserved for driver-managed labels and is rejected on create.
+
 List only the sandboxes that match a label selector:
 
 ```shell
