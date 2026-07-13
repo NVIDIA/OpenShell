@@ -86,9 +86,23 @@ is_legacy_reviewer_failure_disposition() {
     [[ "$existing_body" == *"failed before producing"* ]] || return 1
 }
 
+is_draft_only_blocker_disposition() {
+    local existing_body="$1"
+    local head_sha="$2"
+    local lower_body
+
+    [[ "$existing_body" == *"$GATOR_MARKER"* ]] || return 1
+    [[ "$existing_body" == *"$head_sha"* ]] || return 1
+
+    lower_body="$(printf '%s' "$existing_body" | tr '[:upper:]' '[:lower:]')"
+    [[ "$lower_body" == *"## blocked"* ]] || return 1
+    [[ "$lower_body" == *"marked as a draft"* || "$lower_body" == *"pull request is a draft"* || "$lower_body" == *"pr is draft"* ]] || return 1
+}
+
 has_blocking_same_sha_disposition() {
     local head_sha="$1"
-    local encoded_bodies="$2"
+    local current_is_draft="$2"
+    local encoded_bodies="$3"
     local encoded_body existing_body
 
     while IFS= read -r encoded_body; do
@@ -98,6 +112,10 @@ has_blocking_same_sha_disposition() {
         [[ "$existing_body" == *"$head_sha"* ]] || continue
 
         if is_legacy_reviewer_failure_disposition "$existing_body" "$head_sha"; then
+            continue
+        fi
+
+        if [[ "$current_is_draft" != "true" ]] && is_draft_only_blocker_disposition "$existing_body" "$head_sha"; then
             continue
         fi
 
@@ -116,8 +134,10 @@ guard_duplicate_gator_disposition() {
     [[ "$body" == *"$GATOR_MARKER"* ]] || return 0
     [[ "$body" != *"## Monitoring Complete"* ]] || return 0
 
-    local head_sha
-    head_sha="$($REAL_GH api "repos/$owner/$repo/pulls/$number" --jq '.head.sha // empty' 2>/dev/null || true)"
+    local pull_json head_sha current_is_draft
+    pull_json="$($REAL_GH api "repos/$owner/$repo/pulls/$number" 2>/dev/null || true)"
+    head_sha="$(printf '%s' "$pull_json" | jq -r '.head.sha // empty' 2>/dev/null || true)"
+    current_is_draft="$(printf '%s' "$pull_json" | jq -r '.draft // false' 2>/dev/null || true)"
     [[ -n "$head_sha" ]] || return 0
 
     if is_legacy_reviewer_failure_disposition "$body" "$head_sha"; then
@@ -130,7 +150,7 @@ guard_duplicate_gator_disposition() {
     existing_comments="$($REAL_GH api "repos/$owner/$repo/issues/$number/comments" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body | @json' 2>/dev/null || true)"
     existing_reviews="$($REAL_GH api "repos/$owner/$repo/pulls/$number/reviews" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body | @json' 2>/dev/null || true)"
 
-    if has_blocking_same_sha_disposition "$head_sha" "$(printf '%s\n%s\n' "$existing_comments" "$existing_reviews")"; then
+    if has_blocking_same_sha_disposition "$head_sha" "$current_is_draft" "$(printf '%s\n%s\n' "$existing_comments" "$existing_reviews")"; then
         echo "openshell-agent: blocked duplicate gator same-SHA disposition for $owner/$repo#$number ($head_sha)" >&2
         echo "openshell-agent: push a new commit, remove the old disposition, or set OPENSHELL_GATOR_ALLOW_SAME_SHA_COMMENT=1 for an explicit maintainer-requested same-SHA action" >&2
         return 20
