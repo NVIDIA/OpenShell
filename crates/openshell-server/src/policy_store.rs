@@ -24,7 +24,7 @@ pub struct AtomicPolicyRevisionWrite {
     pub backfill_policy: Option<ProtoSandboxPolicy>,
 }
 
-pub(crate) fn policy_record_for_atomic_write(
+pub fn policy_record_for_atomic_write(
     write: &AtomicPolicyRevisionWrite,
     created_at_ms: i64,
 ) -> PolicyRecord {
@@ -42,7 +42,7 @@ pub(crate) fn policy_record_for_atomic_write(
     }
 }
 
-pub(crate) fn project_policy_revision_onto_sandbox(
+pub fn project_policy_revision_onto_sandbox(
     write: &AtomicPolicyRevisionWrite,
     payload: &[u8],
     current_resource_version: u64,

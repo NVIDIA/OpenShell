@@ -451,7 +451,7 @@ LIMIT $3 OFFSET $4
             load_error: None,
             created_at_ms: now_ms,
             loaded_at_ms: None,
-            provenance: Default::default(),
+            provenance: std::collections::HashMap::default(),
         };
         let wrapped_payload = policy_payload_from_record(&record)?;
 
