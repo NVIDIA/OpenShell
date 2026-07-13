@@ -140,6 +140,8 @@ max_payload_bytes = 262144
 timeout = "500ms"
 
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
+# client_ca_path is optional; omit it for HTTPS-only listeners that do not
+# verify client certificates.
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"

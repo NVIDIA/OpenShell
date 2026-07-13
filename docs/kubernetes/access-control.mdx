@@ -39,8 +39,11 @@ helm upgrade openshell \
   --version <version> \
   --namespace openshell \
   --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
-  --set server.oidc.audience=openshell-cli
+  --set server.oidc.audience=openshell-cli \
+  --set server.tls.clientCaSecretName=""
 ```
+
+Set `server.tls.clientCaSecretName=""` when the gateway terminates TLS directly and browsers or CLI clients connect without client certificates. The chart omits `client_ca_path` from `gateway.toml` and does not mount the client-CA volume, leaving HTTPS-only transport with OIDC for user authentication. Do not set the value to `null`; omit the key to use the chart default, or set it to `""` to disable client certificate verification.
 
 The `audience` value must match the client ID configured in your identity provider for the OpenShell resource server.
 
@@ -69,6 +72,7 @@ helm upgrade openshell \
   --namespace openshell \
   --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
   --set server.oidc.audience=openshell-cli \
+  --set server.tls.clientCaSecretName="" \
   --set server.oidc.rolesClaim=realm_access.roles \
   --set server.oidc.adminRole=openshell-admin \
   --set server.oidc.userRole=openshell-user
@@ -99,6 +103,8 @@ helm upgrade openshell \
 ```
 
 The gateway still serves TLS and sandbox supervisors still authenticate with gateway-minted sandbox JWTs. User-facing CLI/API calls without OIDC or mTLS credentials are accepted as an unauthenticated local developer principal. The proxy is responsible for authenticating callers and forwarding only authorized traffic.
+
+When the gateway terminates TLS directly and callers connect without client certificates, also set `server.tls.clientCaSecretName=""` as described in the OIDC section above.
 
 To also disable TLS entirely (when the proxy terminates TLS before the request reaches the gateway):
 

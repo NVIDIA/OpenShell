@@ -359,6 +359,7 @@ server:
     certSecretName: openshell-server-tls
     # -- K8s secret with ca.crt for client certificate verification (mTLS).
     # Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead).
+    # Do not set to null; omit the key to use the default secret name above.
     clientCaSecretName: openshell-server-client-ca
     # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls
