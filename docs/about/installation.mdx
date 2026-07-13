@@ -58,14 +58,13 @@ brew services restart openshell
 ## Linux
 
 On distributions that ship with `snapd`, the install script uses the Snap path
-described below, provided no non-snap Docker is detected. If a native Docker
-package is present, the installer silently falls back to DEB or RPM. On hosts
-without `snapd` (or with `OPENSHELL_INSTALL_METHOD=classic` set), the script
-falls back to the classic package manager.
+described below, provided no non-snap Docker is detected. On hosts without
+`snapd`, or if a native Docker package is present, the installer silently falls
+back to DEB or RPM.
 
 On Fedora and RHEL, the install script uses RPM packages. The RPMs install the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, and a systemd user service.
 
-On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
+On Debian and Ubuntu (where the snap is not applicable), the install script uses a Debian package. The Debian package installs the `openshell` CLI, `openshell-prover`, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
 
 Linux packages require glibc 2.28 or newer. The installer checks libc before downloading packages and exits with an error on older glibc versions, Alpine, musl-based distributions, or unknown libc environments.
 
@@ -190,9 +189,6 @@ terminal UI in the application menu.
 Use the `openshell` `.deb` or `.rpm` file when `snapd` is unavailable or when
 you already run Docker from a non-snap source. The installer falls back to
 these methods on hosts with native Docker.
-
-Set `OPENSHELL_INSTALL_METHOD=classic` to force the classic package on hosts
-that also have `snapd` available.
 
 ## Kubernetes
 

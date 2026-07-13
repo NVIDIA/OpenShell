@@ -488,23 +488,14 @@ local_gateway_endpoint() {
 }
 
 linux_package_method() {
-  case "${OPENSHELL_INSTALL_METHOD:-}" in
-    classic)
-      ;;
-    *)
-      if has_snapd && ! has_native_docker; then
-        echo "snap"
-        return 0
-      fi
-      ;;
-  esac
-
-  if has_cmd dpkg; then
+  if has_snapd && ! has_native_docker; then
+    echo "snap"
+  elif has_cmd dpkg; then
     echo "deb"
   elif has_cmd rpm; then
     echo "rpm"
   else
-    error "Linux installs require either dpkg or rpm"
+    error "Linux installs require either snapd, dpkg, or rpm"
   fi
 }
 
@@ -999,6 +990,7 @@ install_linux_rpm() {
 }
 
 install_linux_snap() {
+  require_cmd snap
   set_linux_target_runtime_dir
 
   # Docker snap must be installed before openshell so that the
