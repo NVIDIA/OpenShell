@@ -45,7 +45,9 @@ pod:
 |---|---|---|---|---|---|
 | `combined` | Supervisor install init container | `0` | Not set | Not set | Copies the supervisor binary into the agent container volume. |
 | `sidecar` | Network init container | `0` | `false` | Drops `ALL`; adds `NET_ADMIN`, `NET_RAW`, `CHOWN`, and `FOWNER` | Installs pod-local nftables rules and prepares shared sidecar state. |
-| `proxy-pod` | Proxy CA install init container | `0:sandbox_gid` | `false` | Drops `ALL` | Uses the supervisor utility image to copy proxy CA material into the agent pod TLS volume. |
+| `combined` / `sidecar` | Workspace persistence init container | `0` | Not set | Not set | Seeds the default workspace PVC while preserving the existing topology behavior. |
+| `proxy-pod` | Proxy CA install init container | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Copies proxy CA material into the agent pod TLS volume with a read-only root filesystem. |
+| `proxy-pod` | Workspace persistence init container | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Seeds the default workspace PVC without granting UID 0 to the agent pod. |
 
 ## Combined Topology
 
@@ -226,7 +228,9 @@ on `kubernetes.io/hostname` and preserve any affinity supplied by the workload.
 
 The agent pod does not mount or execute the OpenShell supervisor. The driver
 injects standard proxy variables and proxy CA trust directly into the workload
-container. Consequently, proxy-pod topology provides network enforcement only:
+container. The CA and default workspace init containers run as the same
+non-root UID/GID as the workload, and the workload mounts the generated CA
+bundle read-only. Consequently, proxy-pod topology provides network enforcement only:
 OpenShell filesystem policy, process controls, binary identity, SSH/connect,
 exec, upload/download, file sync, dynamic provider environment injection, and
 other process-supervisor features are unavailable. The sandbox image's own

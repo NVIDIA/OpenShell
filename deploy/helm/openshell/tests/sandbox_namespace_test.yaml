@@ -86,8 +86,6 @@ tests:
               - create
               - delete
               - get
-              - list
-              - watch
 
   - it: grants ReplicaSet get for proxy-pod supervisor token bootstrap
     template: templates/role.yaml
@@ -120,9 +118,6 @@ tests:
             verbs:
               - create
               - delete
-              - get
-              - list
-              - watch
       - contains:
           path: rules
           content:
@@ -133,9 +128,6 @@ tests:
             verbs:
               - create
               - delete
-              - get
-              - list
-              - watch
 
   - it: omits proxy-pod RBAC in the default combined topology
     template: templates/role.yaml
@@ -151,8 +143,6 @@ tests:
               - create
               - delete
               - get
-              - list
-              - watch
       - notContains:
           path: rules
           content:

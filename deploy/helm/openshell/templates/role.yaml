@@ -61,8 +61,6 @@ rules:
       - create
       - delete
       - get
-      - list
-      - watch
   - apiGroups:
       - apps
     resources:
@@ -77,9 +75,6 @@ rules:
     verbs:
       - create
       - delete
-      - get
-      - list
-      - watch
   - apiGroups:
       - networking.k8s.io
     resources:
@@ -87,8 +82,5 @@ rules:
     verbs:
       - create
       - delete
-      - get
-      - list
-      - watch
   {{- end }}
 {{- end }}
