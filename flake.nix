@@ -19,6 +19,7 @@
             # Bazel provides all build toolchains (rustc, protoc, cc) itself;
             # nix only has to supply bazel.
             pkgs.bazel_9
+            pkgs.lcov
           ];
         };
       });
