@@ -563,7 +563,7 @@ struct SequencedProviderProfileSource {
 #[cfg(test)]
 #[async_trait]
 impl ProviderProfileSource for SequencedProviderProfileSource {
-    fn source_id(&self) -> &str {
+    fn source_id(&self) -> &'static str {
         "sequenced"
     }
 
