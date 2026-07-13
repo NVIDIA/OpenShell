@@ -55,11 +55,10 @@ brew services restart openshell
 ## Linux
 
 On distributions that ship with `snapd`, the install script uses the Snap path
-described below, provided no non-snap Docker is detected. If a native Docker
-package is present, the installer silently falls back to DEB or RPM. On hosts
-without `snapd` (or with
-`OPENSHELL_INSTALL_METHOD=classic` set), the script falls back to the classic
-package manager.
+described below, unless one of the following is true:
+- a native (non-snap) Docker package is present (the `openshell` snap requires the `docker` snap, for now)
+- `snapd` is not present
+- `OPENSHELL_INSTALL_METHOD=classic` is set in the environment
 
 On Fedora and RHEL, the install script uses RPM packages. The RPM installs the `openshell` CLI, the `openshell-gateway` daemon, and a systemd user service.
 
@@ -89,7 +88,7 @@ sudo loginctl enable-linger $USER
 
 On Linux distributions that ship with `snapd`, the install script installs
 OpenShell from the Snap Store. The OpenShell snap bundles the CLI, the terminal
-UI, and a managed gateway daemon. snapd handles upgrades and rollback; the
+UI, and a managed gateway daemon. `snapd` handles upgrades and rollback; the
 gateway runs as a system service inside the snap.
 
 You can also install the snap directly:
@@ -109,9 +108,7 @@ typically `~/snap/openshell/common`. Gateway registrations live under
 `$SNAP_USER_COMMON/.config/openshell/gateways/` instead of
 `~/.config/openshell/gateways/`.
 
-The snap requires the Docker snap. `default-provider: docker` on the OpenShell
-snap installs the Docker snap automatically on first use, but you can install
-it up front with:
+The OpenShell snap requires the Docker snap, which you can install with:
 
 ```shell
 sudo snap install docker
@@ -119,24 +116,16 @@ sudo snap install docker
 
 ### Snap store installs
 
-When installing from the Snap Store, snapd automatically connects the `home`
-`network`, and `network-bind` plugs. The remaining plugs — `docker`,
-`log-observe`, and `system-observe` — still require manual connection:
+When installing from the Snap Store, snapd automatically connects the `docker`,
+`home`, `log-observe`, `network`, `network-bind`, and `system-observe plugs.
 
-```shell
-sudo snap connect openshell:docker docker:docker-daemon
-sudo snap connect openshell:log-observe
-sudo snap connect openshell:system-observe
-```
-
-The Docker slot is the Docker snap's `docker-daemon` slot; OpenShell does not
-work with a host-installed Docker Engine. The snap declares `default-provider:
-docker` on the Docker plug so snapd will offer to install the Docker snap, but
-the connection itself must be made manually. The installer runs these
-connections for you on Snap installs; run them by hand if you install the snap
-manually. The installer is best-effort: if a connect fails (for example because
-the Docker snap is not yet running), the snap still installs and the installer
-prints a warning.
+The `docker` interface is used to connect the `openshell` snap's `docker` plug
+to the `docker` snap's `docker-daemon` slot; the `openshell` snap does not yet
+work with a host-installed Docker Engine. The installer runs this and the other
+interface connections for you after installing the `openshell` snap; run them
+by hand if you install the snap manually. The installer is best-effort: if a
+connect fails (for example because the `docker` snap is not yet running), the
+snap still installs and the installer prints a warning.
 
 ### Locally built snap packages
 
@@ -190,14 +179,14 @@ sudo systemctl restart snap.openshell.gateway
 
 ### When to choose Snap
 
-Use Snap when `snapd` is available and no native Docker Engine is installed,
-and you want atomic upgrades and rollback, a single self-contained install that
-bundles the Docker provider, or a desktop launcher that surfaces the OpenShell
+Use the `openshell` snap when `snapd` is available and no native Docker Engine
+is installed, and you want atomic upgrades and rollback, a single self-contained
+and sandboxed install, or a desktop launcher that surfaces the OpenShell
 terminal UI in the application menu.
 
-Use DEB or RPM when `snapd` is unavailable or when you already run Docker Engine
-from a non-snap source. The installer falls back to DEB or RPM on hosts with
-native Docker.
+Use the `openshell` `.deb` or `.rpm` file when `snapd` is unavailable or when
+you already run Docker from a non-snap source. The installer falls back to
+these methods on hosts with native Docker.
 
 Set `OPENSHELL_INSTALL_METHOD=classic` to force the classic package on hosts
 that also have `snapd` available.

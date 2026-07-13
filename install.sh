@@ -990,15 +990,6 @@ install_linux_snap() {
   info "installing openshell snap..."
   as_root snap install openshell
 
-  # Connect required interfaces. Network and network-bind auto-connect
-  # on install; the remaining plugs need explicit connection. snap connect
-  # is idempotent — it succeeds whether the connection was just made or
-  # already existed.
-  as_root snap connect openshell:docker docker:docker-daemon
-  as_root snap connect openshell:log-observe
-  as_root snap connect openshell:system-observe
-  as_root snap connect openshell:ssh-keys
-
   info "installed openshell snap from Snap Store"
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway_snap
