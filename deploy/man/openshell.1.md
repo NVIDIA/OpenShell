@@ -94,9 +94,6 @@ development task, or behind a cloud reverse proxy.
 **policy list** *SANDBOX*
 :   Show policy revision history.
 
-**policy prove** **--policy** *FILE* \[**--credentials** *FILE*\]
-:   Verify policy properties.
-
 ## Provider Management
 
 **provider create** **--name** *NAME* **--type** *TYPE* \[**--from-existing**\] \[**--credential** *KEY=VALUE*\]

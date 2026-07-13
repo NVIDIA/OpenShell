@@ -96,6 +96,33 @@ before the child process starts.
 Gateway-global policy can override sandbox-scoped policy. Use it sparingly
 because it changes the effective access model for every sandbox on the gateway.
 
+## Managed Maximum
+
+A gateway can own one optional managed maximum policy. The maximum is a ceiling,
+not an active sandbox policy: each sandbox starts with a narrower base policy,
+and the gateway proves the fully composed base and provider-derived policy before
+creation or any authority-changing update. With no maximum configured, policy
+creation, updates, and providers keep their existing unmanaged behavior; accepted
+agent proposals remain pending for human review.
+
+The maximum extends the normal policy YAML with an ID, version, allowed/default
+`ask` or `auto` modes, and optional `review.required` annotations. The same
+admission operation protects sandbox creation, provider attachment, direct policy
+updates, and proposal merges. The initial implementation checks filesystem paths
+plus L4 and REST network authority. Explicit denies take precedence; other
+protocols and unsupported authority fields fail closed. Providers without a
+resolvable policy profile also fail closed because their credential-bearing
+reach cannot be included in the proof. Managed maximums initially require
+single-replica SQLite storage; PostgreSQL/HA needs database-backed coordination
+before it can preserve the proof-to-commit boundary across gateway replicas.
+
+The sandbox's selected permission mode is fixed at creation. `ask` holds new
+agent-proposed authority for review. `auto` applies only the requested delta that
+fits the maximum's auto-eligible region; review-marked authority remains pending.
+Authenticated direct edits are approval of that exact edit but remain bounded.
+Every merge recomputes the candidate from live policy and provider state before
+persistence, so a stored proposal or approval is evidence rather than authority.
+
 ## Policy Advisor
 
 The policy advisor pipeline turns observed denials into draft policy
@@ -107,53 +134,44 @@ through the proposal loop instead of treating the denial as terminal.
 
 1. **Submit.** Both proposers POST through the same `SubmitPolicyAnalysis`
    path. Each chunk is persisted with its `analysis_mode` for audit provenance.
-2. **Validate.** The gateway runs the prover (`openshell-prover`) on every
-   chunk regardless of mode. The prover builds a Z3 model from the merged
-   policy plus the sandbox's attached-provider credential set, then computes
-   the delta of findings between the current baseline and the merged policy.
-3. **Auto-approval gate (proposer-agnostic, opt-in).** Auto-approval fires
-   when *both* (a) the prover delta is empty (`prover: no new findings`) AND
-   (b) the `proposal_approval_mode` setting resolves to `"auto"` — gateway
-   scope wins, sandbox scope is the per-sandbox override, default is
-   `"manual"`. When both hold, the gateway internally invokes the approve
-   path with actor identity `system:auto`. The audit event uses
-   `CONFIG:APPROVED` and carries `auto=true`, `source=<mode>`,
-   `prover_delta=empty`, and `resolved_from=<gateway|sandbox>` as unmapped
-   fields, with message text `"auto-approved: no new prover findings"` —
-   never `safe`. The opt-in gate preserves OpenShell's default-deny
-   posture: with no setting at either scope, every proposal lands in
-   `pending` for human review, even when the prover sees no findings.
+2. **Validate.** The gateway rejects always-blocked targets and merges each
+   chunk into the live base policy. If a managed maximum exists, the same
+   managed-admission operation used by creation, provider attachment, and
+   direct policy updates returns `apply`, `ask`, or `reject`.
+3. **Decide.** Without a managed maximum, every accepted proposal remains
+   pending. Managed `ask` also holds all in-boundary proposals. Managed `auto`
+   applies only the requested delta inside the maximum's auto-eligible view;
+   review-marked authority remains pending and outside or unsupported authority
+   is rejected. Automatic application emits `CONFIG:APPROVED` with
+   `auto=true`, `source=<mode>`, and `approval_basis=managed_maximum`.
 4. **Implicit supersede.** On any successful submission, the gateway scans
    the sandbox's pending chunks for matches on `(host, port, binary)` and
    auto-rejects the older ones with reason `"superseded by chunk X"`. This
    gives the agent a refinement path (broad mechanistic L4 → narrow agent
    L7) without an explicit `supersedes_chunk_id` field.
-5. **Escalation.** Anything else lands in `pending` for human review.
+5. **Revalidate and merge.** Automatic and human-approved proposals are
+   checked again against live policy and provider state before persistence.
+   Stored decisions are audit evidence, not reusable authority.
 
-## What the prover decides
+## Credentialed Raw-L4 Advisory
 
-The prover answers four formal questions about each proposed policy
-change. Each "yes" answer becomes its own categorical finding — there is
-no severity grade. Any finding (of any category) blocks auto-approval.
-The categories are intended to be (mostly) mutually exclusive per
-underlying change: the gateway suppresses `capability_expansion` paths
-whose `(binary, host, port)` is also in the `credential_reach_expansion`
-delta, so a brand-new credentialed reach surfaces as one finding rather
-than one reach + N method findings.
-
-| Category | The prover detects… |
-|---|---|
-| `link_local_reach` | The proposal grants reach to a host in `169.254.0.0/16`, `fe80::/10`, or a known metadata hostname such as `metadata.google.internal`. Unconditional — cloud-metadata endpoints serve credentials regardless of sandbox state. |
-| `l7_bypass_credentialed` | The proposal lets a binary using a non-HTTP wire protocol (`git-remote-https`, `ssh`, `nc`) reach a host where a sandbox credential is in scope. The L7 proxy cannot inspect the wire protocol; the reviewer decides whether to trust the binary with the credential. |
-| `credential_reach_expansion` | A binary gained credentialed reach to a (host, port) it could not reach before. New authenticated reach is a stated intent change; the reviewer confirms the binary should authenticate to the host at all. |
-| `capability_expansion` | On a (binary, host, port) that already had credentialed reach, the policy adds a new HTTP method. The reviewer sees exactly which method was added (e.g., PUT) and decides if it's part of the agent's task. |
-
-"Credential in scope" is sandbox-coarse, not binary-fine: a credential is
-considered in scope if the sandbox has a provider attached whose
-`target_hosts` include the proposed endpoint's host, including runtime-like
+For each proposal, the gateway checks whether a raw L4 endpoint overlaps a
+host targeted by an attached provider credential. Host overlap includes
 first-label wildcard coverage such as `*.github.com` covering
-`api.github.com`. v1 does not model credential scopes (read-only vs write);
-presence is enough.
+`api.github.com`. A match adds a deterministic advisory containing the binary,
+host, and port. The warning states that raw stream authority cannot be bounded
+by an HTTP method or path.
+
+The advisory is deliberately non-gating. It does not return `apply`, `ask`, or
+`reject`, and it cannot override managed admission. This keeps the security
+contract singular: the managed maximum decides authority, while the advisory
+helps the policy author prefer L7 or consciously accept opaque L4 access.
+
+Loopback, link-local, unspecified, and known metadata targets are enforced as
+always-blocked network invariants and are rejected during proposal validation.
+Capability and credential-reach expansion are represented by the candidate
+policy and therefore bounded by managed-maximum containment rather than a
+second proposal-specific finding model.
 
 Proposals intentionally omit `allowed_ips`. If a proposed rule targets a host
 that resolves to a private IP, the proxy's runtime SSRF classification blocks
@@ -161,9 +179,8 @@ the connection. The operator must then add an explicit `allowed_ips` entry to
 permit it — a two-step flow that keeps SSRF protection on by default.
 
 The advisor proposes narrow additions and preserves explicit-deny behavior.
-Auto-approval is gated on prover determinism, not human judgment; an LLM-based
-contextual reviewer is a deliberate future addition layered on top of the
-deterministic prover gate.
+Managed containment remains deterministic; contextual review can be added as
+an advisory layer without becoming another authority boundary.
 
 ## Security Logging
 

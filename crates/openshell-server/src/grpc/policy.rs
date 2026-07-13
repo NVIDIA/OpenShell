@@ -50,21 +50,11 @@ use openshell_ocsf::{
 };
 use openshell_policy::{
     PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
-    serialize_sandbox_policy,
-};
-use openshell_prover::{
-    credentials::{Credential, CredentialSet},
-    finding::{Finding, FindingPath},
-    model::build_model,
-    policy::parse_policy_str,
-    queries::run_all_queries,
-    registry::load_embedded_binary_registry,
-    report::finding_shorthand,
 };
 use openshell_providers::{get_default_profile, normalize_provider_type};
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -87,11 +77,17 @@ const GLOBAL_SETTINGS_NAME: &str = "global";
 /// Internal object type for durable sandbox-scoped settings.
 pub const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
 /// Reserved settings key used to store global policy payload.
-const POLICY_SETTING_KEY: &str = "policy";
+pub(super) const POLICY_SETTING_KEY: &str = "policy";
 /// Sentinel `sandbox_id` used to store global policy revisions.
 const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
+
+#[derive(Clone, Copy)]
+struct ManagedMergeAdmission<'a> {
+    state: &'a ServerState,
+    source: crate::managed_policy::AdmissionSource,
+}
 
 fn emit_sandbox_policy_update_success() {
     openshell_core::telemetry::emit_lifecycle(
@@ -169,27 +165,21 @@ fn emit_gateway_policy_audit_log(
     );
 }
 
-/// Emit a `CONFIG:APPROVED` audit event for an auto-approval — same event
-/// class as a human approval, with extra unmapped fields carrying the
-/// safety reasoning so the audit is reconstructable. `source` records the
-/// proposer (`mechanistic` or `agent_authored`) for provenance.
-/// `resolved_from` records the scope that supplied the `auto` mode setting
-/// (`gateway`, `sandbox`, or `default`) so operators can see why a given
-/// approval was auto vs manual.
-fn emit_gateway_policy_auto_approve_audit_log(
+/// Emit the chunk-level approval event after managed admission authorizes an
+/// automatic apply. The separate managed-admission event carries maximum
+/// identity and proof evidence; this event records proposal provenance.
+fn emit_gateway_policy_managed_apply_audit_log(
     sandbox_id: &str,
     sandbox_name: &str,
     detail: impl Into<String>,
     version: i64,
     policy_hash: &str,
     source: &str,
-    resolved_from: &str,
 ) {
     let extra = [
         ("auto", "true".to_string()),
         ("source", source.to_string()),
-        ("prover_delta", "empty".to_string()),
-        ("resolved_from", resolved_from.to_string()),
+        ("approval_basis", "managed_maximum".to_string()),
     ];
     let message = build_gateway_policy_audit_message(
         sandbox_id,
@@ -416,265 +406,68 @@ fn summarize_draft_chunk_rule(chunk: &DraftChunkRecord) -> Result<String, Status
     Ok(summarize_add_rule(&chunk.rule_name, &rule))
 }
 
-/// Run prover queries against the merged policy and render a short
-/// human-readable verdict for the reviewer. The verdict reports only the
-/// **delta** — findings the proposal introduces on top of the current policy.
-/// Baseline gaps (pre-existing findings) are intentionally not surfaced here;
-/// they belong on a posture surface, not on the per-proposal approval moment.
-///
-/// The string is the entire output — no taxonomy, no greppable prefixes; the
-/// reviewer reads it like an OCSF shorthand line. One of:
-///
-/// - `prover: no new findings`
-/// - `prover: N new finding(s)` followed by one `  <category>: <detail>`
-///   line per finding path (categorical shorthand from `openshell-prover`)
-/// - `merge failed: <one-line error>` — proposal won't merge into the current
-///   policy
-/// - `policy invalid: <one-line error>` — merged policy fails the cheap
-///   structural safety check
-/// - `validation unavailable` — gateway-side infrastructure failure (registry
-///   load, YAML serialize/parse). Internal error detail is logged via
-///   `warn!`, never exposed to the reviewer.
-fn validation_result_for_agent_proposal(
-    current_policy: ProtoSandboxPolicy,
-    rule_name: &str,
-    proposed_rule: &NetworkPolicyRule,
-    credentials: &CredentialSet,
-) -> String {
-    let merge_op = PolicyMergeOp::AddRule {
-        rule_name: rule_name.to_string(),
-        rule: proposed_rule.clone(),
-    };
-    let merged = match merge_policy(current_policy.clone(), &[merge_op]) {
-        Ok(result) => result.policy,
-        Err(error) => return format!("merge failed: {}", one_line(&error.to_string())),
-    };
-    if let Err(error) = validate_policy_safety(&merged) {
-        return format!("policy invalid: {}", one_line(&error.to_string()));
-    }
-
-    let merged_findings = match run_prover_findings(&merged, credentials) {
-        Ok(findings) => findings,
-        Err(error) => {
-            warn!(error = %error, "prover validation unavailable for merged policy");
-            return "validation unavailable".to_string();
-        }
-    };
-    // If the baseline prover run fails (e.g. the current policy uses a shape
-    // the prover hasn't caught up to yet), fall back to an empty baseline so
-    // every merged finding surfaces as new. Safer to over-warn than miss a
-    // real regression introduced by the proposal.
-    let base_findings = match run_prover_findings(&current_policy, credentials) {
-        Ok(findings) => findings,
-        Err(error) => {
-            warn!(error = %error, "prover baseline run failed; treating baseline as empty");
-            Vec::new()
-        }
-    };
-
-    let new_findings = finding_delta(&base_findings, &merged_findings);
-    if new_findings.is_empty() {
-        return "prover: no new findings".to_string();
-    }
-    let count = new_findings.len();
-    let mut out = format!(
-        "prover: {} new finding{}",
-        count,
-        if count == 1 { "" } else { "s" }
-    );
-    for finding in &new_findings {
-        out.push_str("\n  ");
-        out.push_str(&finding_shorthand(finding));
-    }
-    out
-}
-
-/// Run the prover end-to-end against a single policy with the given
-/// credential set. Returns the raw finding list, or a short error string
-/// identifying which infrastructure step failed.
-///
-/// The credential set is passed in because it's stable across all chunks in
-/// one `SubmitPolicyAnalysis` batch — the caller builds it once and shares.
-fn run_prover_findings(
-    policy: &ProtoSandboxPolicy,
-    credentials: &CredentialSet,
-) -> Result<Vec<Finding>, String> {
-    let yaml =
-        serialize_sandbox_policy(policy).map_err(|e| format!("serialize policy failed: {e}"))?;
-    let prover_policy = parse_policy_str(&yaml).map_err(|e| format!("parse policy failed: {e}"))?;
-    let registry =
-        load_embedded_binary_registry().map_err(|e| format!("load registry failed: {e}"))?;
-    let model = build_model(prover_policy, credentials.clone(), registry);
-    Ok(run_all_queries(&model))
-}
-
-/// Build a `CredentialSet` for the sandbox by walking its attached providers.
-///
-/// v1 models "credential is present in scope for these hosts" — no scope
-/// modeling. Each attached provider produces one [`Credential`] entry whose
-/// `target_hosts` lists the hosts from the provider's profile endpoints.
-/// Missing providers or providers whose type has no profile are skipped with
-/// a `warn!` — the merged policy already excludes them at compose time, so
-/// silently treating them as absent here keeps the credential set consistent
-/// with the merged policy the prover validates against.
-async fn build_credential_set_for_sandbox(
+async fn provider_credential_target_hosts(
     store: &Store,
     provider_names: &[String],
-) -> Result<CredentialSet, Status> {
-    let mut credentials = Vec::new();
-
-    for name in provider_names {
-        let Some(provider) = store
-            .get_message_by_name::<Provider>(name)
-            .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
-        else {
-            warn!(provider_name = %name, "provider not found while building credential set; skipping");
-            continue;
-        };
-
-        let provider_type = provider.r#type.trim();
-        let profile = if let Some(canonical_type) = normalize_provider_type(provider_type) {
-            let Some(profile) = get_default_profile(canonical_type) else {
-                warn!(
-                    provider_name = %name,
-                    provider_type,
-                    "legacy provider type has no profile; skipping credential entry"
-                );
-                continue;
-            };
-            profile.clone()
-        } else {
-            let Some(profile) =
-                super::provider::get_provider_type_profile(store, provider_type).await?
-            else {
-                warn!(
-                    provider_name = %name,
-                    provider_type,
-                    "provider type has no profile; skipping credential entry"
-                );
-                continue;
-            };
-            profile
-        };
-
-        let target_hosts: Vec<String> = profile
-            .endpoints
-            .iter()
-            .map(|ep| ep.host.to_lowercase())
-            .filter(|h| !h.is_empty())
-            .collect();
-
-        if target_hosts.is_empty() {
-            continue;
-        }
-
-        credentials.push(Credential {
-            name: name.clone(),
-            cred_type: provider_type.to_string(),
-            scopes: Vec::new(),
-            injected_via: String::new(),
-            target_hosts,
-        });
-    }
-
-    Ok(CredentialSet {
-        credentials,
-        api_registries: HashMap::new(),
-    })
-}
-
-/// Stable identity key for a finding path. Deliberately excludes
-/// `policy_name`: two paths with identical (binary, endpoint, mechanism) are
-/// the same security gap whether they live in rule `foo` or rule `bar`. This
-/// keeps the delta from spuriously surfacing baseline gaps just because the
-/// proposal added a new rule name that produces the same gap shape.
-fn finding_path_key(path: &FindingPath) -> String {
-    let FindingPath::Exfil(p) = path;
-    // Include the category and (for capability_expansion) the method so
-    // adding a new method on an already-reached host surfaces as a new
-    // path; reuse of an existing method does not.
-    format!(
-        "exfil|{}|{}:{}|{}|{}",
-        p.binary, p.endpoint_host, p.endpoint_port, p.category, p.method
-    )
-}
-
-/// Return the merged-policy findings that aren't already present in the
-/// baseline. Comparison is per-(query, path) so that a single finding whose
-/// evidence grew (e.g. a new method allowed on an already-reached host)
-/// surfaces only the new evidence paths.
-///
-/// **Category suppression:** `capability_expansion` paths whose (binary,
-/// host, port) tuple appears in the `credential_reach_expansion` delta
-/// are suppressed. A brand-new credentialed reach is described by the
-/// reach-expansion finding alone; we don't double-report by also
-/// flagging every method as a separate `capability_expansion`.
-fn finding_delta(base: &[Finding], merged: &[Finding]) -> Vec<Finding> {
-    use openshell_prover::finding::category;
-
-    let base_keys: HashSet<(String, String)> = base
+) -> Result<Vec<String>, Status> {
+    let layers = profile_provider_policy_layers(store, provider_names).await?;
+    let mut hosts = layers
         .iter()
-        .flat_map(|f| {
-            let query = f.query.clone();
-            f.paths
+        .flat_map(|layer| layer.rule.endpoints.iter())
+        .map(|endpoint| {
+            endpoint
+                .host
+                .trim()
+                .trim_end_matches('.')
+                .to_ascii_lowercase()
+        })
+        .filter(|host| !host.is_empty())
+        .collect::<Vec<_>>();
+    hosts.sort();
+    hosts.dedup();
+    Ok(hosts)
+}
+
+/// Describe credential-bearing raw L4 authority without participating in
+/// admission. The managed maximum remains the sole source of apply/ask/reject
+/// decisions; operators who want this authority reviewed mark the matching
+/// maximum region `review.required`.
+fn credentialed_l4_advisory(
+    proposed_rule: &NetworkPolicyRule,
+    credential_target_hosts: &[String],
+) -> Option<String> {
+    let mut evidence = BTreeSet::new();
+    for endpoint in &proposed_rule.endpoints {
+        if !endpoint.protocol.trim().is_empty()
+            || endpoint.host.is_empty()
+            || !credential_target_hosts
                 .iter()
-                .map(move |p| (query.clone(), finding_path_key(p)))
-        })
-        .collect();
-    let mut delta: Vec<Finding> = Vec::new();
-    for finding in merged {
-        let new_paths: Vec<FindingPath> = finding
-            .paths
-            .iter()
-            .filter(|p| !base_keys.contains(&(finding.query.clone(), finding_path_key(p))))
-            .cloned()
-            .collect();
-        if new_paths.is_empty() {
+                .any(|target| super::provider::host_patterns_can_overlap(&endpoint.host, target))
+        {
             continue;
         }
-        delta.push(Finding {
-            paths: new_paths,
-            ..finding.clone()
-        });
+
+        let ports = if endpoint.ports.is_empty() {
+            vec![endpoint.port]
+        } else {
+            endpoint.ports.clone()
+        };
+        for binary in &proposed_rule.binaries {
+            for port in &ports {
+                evidence.insert(format!(
+                    "binary={} host={} port={port}",
+                    binary.path, endpoint.host
+                ));
+            }
+        }
     }
 
-    // Suppress capability_expansion paths whose (binary, host, port)
-    // appears in the credential_reach_expansion delta — a new reach is
-    // described once, by the reach-expansion category, not also by per-
-    // method capability findings.
-    let reach_tuples: HashSet<(String, String, u16)> = delta
-        .iter()
-        .filter(|f| f.query == category::CREDENTIAL_REACH_EXPANSION)
-        .flat_map(|f| {
-            f.paths.iter().map(|p| {
-                let FindingPath::Exfil(e) = p;
-                (e.binary.clone(), e.endpoint_host.clone(), e.endpoint_port)
-            })
-        })
-        .collect();
-    delta.retain_mut(|f| {
-        if f.query != category::CAPABILITY_EXPANSION {
-            return true;
-        }
-        f.paths.retain(|p| {
-            let FindingPath::Exfil(e) = p;
-            !reach_tuples.contains(&(e.binary.clone(), e.endpoint_host.clone(), e.endpoint_port))
-        });
-        !f.paths.is_empty()
-    });
-
-    delta
-}
-
-/// Collapse multi-line / multi-message error text to a single line so the
-/// `validation_result` stays a clean, scannable string.
-fn one_line(s: &str) -> String {
-    s.split('\n')
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ")
+    (!evidence.is_empty()).then(|| {
+        format!(
+            "advisory: credentialed raw L4 authority is not inspectable at L7: {}",
+            evidence.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
 }
 
 /// Auto-reject any pending chunks for the same sandbox that share the
@@ -804,7 +597,7 @@ async fn self_reject_mechanistic_if_already_covered(
     };
 
     let reason = format!(
-        "already covered by approved chunk {} (agent_authored or prior auto-approval)",
+        "already covered by approved chunk {} (agent_authored or prior automatic application)",
         covering.id
     );
     match state
@@ -838,55 +631,14 @@ async fn self_reject_mechanistic_if_already_covered(
     }
 }
 
-/// Internally approve a chunk on the auto-approval path: merge into the
-/// active policy, flip status to "approved", notify watchers, and emit a
-/// `CONFIG:APPROVED` audit event carrying `auto=true`, `source=<mode>`,
-/// `prover_delta=empty` so the audit trail records why no human approved
-/// this chunk.
-///
-/// `source` is the `analysis_mode` of the originating submission
-/// (`mechanistic` or `agent_authored`). The audit copy says "auto-approved:
-/// no new prover findings" — never "safe" — because the claim is about the
-/// prover's reasoning, not the world.
-/// Resolve the effective proposal-approval mode for a sandbox.
-///
-/// Precedence (matches the rest of the settings model): gateway scope wins
-/// over sandbox scope. A reviewer can pin manual mode fleet-wide by setting
-/// it globally; per-sandbox overrides only apply when no global is set.
-///
-/// Returns `(auto_approve_enabled, resolved_from)` where `resolved_from`
-/// is `"gateway"`, `"sandbox"`, or `"default"`. Only an exact `"auto"`
-/// value enables auto-approval; any other string (including future-
-/// reserved modes like `"auto_on_low_risk"`) is conservatively treated as
-/// manual.
-async fn resolve_proposal_approval_mode(
-    store: &Store,
-    sandbox_name: &str,
-) -> Result<(bool, &'static str), Status> {
-    let global = load_global_settings(store).await?;
-    if let Some(StoredSettingValue::String(value)) =
-        global.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY)
-    {
-        return Ok((value == "auto", "gateway"));
-    }
-
-    let sandbox = load_sandbox_settings(store, sandbox_name).await?;
-    if let Some(StoredSettingValue::String(value)) =
-        sandbox.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY)
-    {
-        return Ok((value == "auto", "sandbox"));
-    }
-
-    Ok((false, "default"))
-}
-
-async fn auto_approve_chunk(
+/// Apply a proposal after managed admission returns `Apply`, then mark the
+/// draft approved and emit proposal-level audit evidence.
+async fn apply_managed_proposal_chunk(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     sandbox_name: &str,
     chunk_id: &str,
     source: &str,
-    resolved_from: &str,
 ) -> Result<(), Status> {
     // Same gate the human-driven approve paths apply: if a global policy is
     // active, sandbox-scoped chunk approvals are meaningless because
@@ -910,7 +662,13 @@ async fn auto_approve_chunk(
         return Ok(());
     }
 
-    let (version, hash) = merge_chunk_into_policy(state.store.as_ref(), sandbox_id, &chunk).await?;
+    let (version, hash) = merge_chunk_into_policy_managed(
+        state,
+        sandbox_id,
+        &chunk,
+        crate::managed_policy::AdmissionSource::AgentProposal,
+    )
+    .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -927,16 +685,15 @@ async fn auto_approve_chunk(
     } else {
         source
     };
-    emit_gateway_policy_auto_approve_audit_log(
+    emit_gateway_policy_managed_apply_audit_log(
         sandbox_id,
         sandbox_name,
         format!(
-            "auto-approved: no new prover findings (source={source_label}) — chunk {chunk_id}: {chunk_summary}"
+            "managed maximum auto-applied proposal (source={source_label}) — chunk {chunk_id}: {chunk_summary}"
         ),
         version,
         &hash,
         source_label,
-        resolved_from,
     );
 
     info!(
@@ -946,63 +703,33 @@ async fn auto_approve_chunk(
         version = version,
         policy_hash = %hash,
         source = %source_label,
-        resolved_from = %resolved_from,
-        "Auto-approved chunk: no new prover findings"
+        approval_basis = "managed_maximum",
+        "Managed maximum auto-applied proposal chunk"
     );
 
     Ok(())
 }
 
-// TODO: share effective-policy lookup with `load_sandbox_policy` /
-// `GetSandboxConfig`. They re-implement very similar global-settings +
-// providers_v2 + compose logic; consolidating them is out of scope for the
-// agent-authored proposal validation slice.
-async fn current_effective_policy_for_sandbox(
+async fn current_base_policy_for_sandbox(
     state: &ServerState,
     sandbox: &Sandbox,
     sandbox_id: &str,
 ) -> Result<ProtoSandboxPolicy, Status> {
-    let mut policy = if let Some(record) = state
+    if let Some(record) = state
         .store
         .get_latest_policy(sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
     {
-        ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
-    } else {
-        sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.policy.clone())
-            .unwrap_or_default()
-    };
-
-    let global_settings = load_global_settings(state.store.as_ref()).await?;
-    let policy_source = decode_policy_from_global_settings(&global_settings)?.map_or(
-        PolicySource::Sandbox,
-        |global_policy| {
-            policy = global_policy;
-            PolicySource::Global
-        },
-    );
-
-    let providers_v2_enabled =
-        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
-    if providers_v2_enabled && !matches!(policy_source, PolicySource::Global) {
-        let provider_names = sandbox
-            .spec
-            .as_ref()
-            .map(|spec| spec.providers.clone())
-            .unwrap_or_default();
-        let provider_layers =
-            profile_provider_policy_layers(state.store.as_ref(), &provider_names).await?;
-        if !provider_layers.is_empty() {
-            policy = compose_effective_policy(&policy, &provider_layers);
-        }
+        let policy = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?;
+        return Ok(policy);
     }
-
-    Ok(policy)
+    Ok(sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.policy.clone())
+        .unwrap_or_default())
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -1319,9 +1046,24 @@ async fn hash_provider_profile_revision(
     Ok(())
 }
 
-async fn profile_provider_policy_layers(
+pub(super) async fn profile_provider_policy_layers(
     store: &Store,
     provider_names: &[String],
+) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    provider_policy_layers(store, provider_names, false).await
+}
+
+pub(super) async fn managed_profile_provider_policy_layers(
+    store: &Store,
+    provider_names: &[String],
+) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    provider_policy_layers(store, provider_names, true).await
+}
+
+async fn provider_policy_layers(
+    store: &Store,
+    provider_names: &[String],
+    require_resolvable_profile: bool,
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
     let mut layers = Vec::new();
 
@@ -1335,6 +1077,9 @@ async fn profile_provider_policy_layers(
         let provider_type = provider.r#type.trim();
         let profile = if let Some(canonical_type) = normalize_provider_type(provider_type) {
             let Some(profile) = get_default_profile(canonical_type) else {
+                if require_resolvable_profile {
+                    return Err(unmodeled_managed_provider(name, provider_type));
+                }
                 warn!(
                     provider_name = %name,
                     provider_type,
@@ -1347,6 +1092,9 @@ async fn profile_provider_policy_layers(
             let Some(profile) =
                 super::provider::get_provider_type_profile(store, provider_type).await?
             else {
+                if require_resolvable_profile {
+                    return Err(unmodeled_managed_provider(name, provider_type));
+                }
                 warn!(
                     provider_name = %name,
                     provider_type,
@@ -1365,6 +1113,12 @@ async fn profile_provider_policy_layers(
     }
 
     Ok(layers)
+}
+
+fn unmodeled_managed_provider(provider_name: &str, provider_type: &str) -> Status {
+    Status::failed_precondition(format!(
+        "provider '{provider_name}' type '{provider_type}' has no resolvable policy profile; managed maximum admission cannot prove its credential-bearing reach"
+    ))
 }
 
 fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
@@ -1491,6 +1245,16 @@ async fn handle_update_config_inner(
 
     if req.global {
         let _settings_guard = state.settings_mutex.lock().await;
+
+        if has_policy
+            && super::managed_policy::load_managed_policy_config(state)
+                .await?
+                .is_some()
+        {
+            return Err(Status::failed_precondition(
+                "global policy override cannot coexist with a managed maximum policy",
+            ));
+        }
 
         if has_merge_ops {
             return Err(Status::invalid_argument(
@@ -1753,6 +1517,10 @@ async fn handle_update_config_inner(
             &sandbox_id,
             spec.policy.as_ref(),
             &merge_ops,
+            Some(ManagedMergeAdmission {
+                state,
+                source: crate::managed_policy::AdmissionSource::DirectAuthenticated,
+            }),
         )
         .await?;
 
@@ -1809,6 +1577,39 @@ async fn handle_update_config_inner(
             "policy is managed globally; delete global policy before sandbox policy update",
         ));
     }
+    let requested_policy_backfill = sandbox
+        .spec
+        .as_ref()
+        .is_some_and(|spec| spec.policy.is_none());
+
+    // Provider attachment changes the composed authority evaluated below.
+    // Hold the shared guard through proof and persistence so the candidate
+    // cannot change between those steps.
+    let _sandbox_sync_guard = if super::managed_policy::load_managed_policy_config(state)
+        .await?
+        .is_some()
+    {
+        Some(state.compute.sandbox_sync_guard().await)
+    } else {
+        None
+    };
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    if requested_policy_backfill && req.expected_resource_version != 0 {
+        let current_resource_version = sandbox
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
+        if current_resource_version != req.expected_resource_version {
+            return Err(Status::aborted(format!(
+                "backfill spec.policy was modified concurrently (current resource_version: {current_resource_version})"
+            )));
+        }
+    }
 
     let spec = sandbox
         .spec
@@ -1830,9 +1631,44 @@ async fn handle_update_config_inner(
     if let Some(baseline_policy) = spec.policy.as_ref() {
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         validate_policy_safety(&new_policy)?;
+    }
+
+    let latest = state
+        .store
+        .get_latest_policy(&sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
+
+    let current_policy = if let Some(record) = latest.as_ref() {
+        ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
     } else {
-        // Backfill spec.policy using CAS (first-time policy discovery)
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+        spec.policy.clone().unwrap_or_default()
+    };
+    let source = if sandbox_caller {
+        crate::managed_policy::AdmissionSource::AgentProposal
+    } else {
+        crate::managed_policy::AdmissionSource::DirectAuthenticated
+    };
+    let decision = super::managed_policy::decide_managed_authority(
+        state,
+        super::managed_policy::ManagedAuthorityRequest {
+            mode: super::managed_policy::permission_mode_for_sandbox(&sandbox)?,
+            source,
+            sandbox_id: &sandbox_id,
+            sandbox_name: sandbox.object_name(),
+            current: Some((&current_policy, &spec.providers)),
+            candidate: (&new_policy, &spec.providers),
+            requested_delta: (&new_policy, &spec.providers),
+        },
+    )
+    .await?;
+    super::managed_policy::require_applied(decision)?;
+
+    if spec.policy.is_none() {
+        // First-time policy discovery is an authority commit point too. Do
+        // not persist the backfill until managed admission has accepted the
+        // fully composed candidate.
         let sandbox_id = sandbox.object_id().to_string();
         let new_policy_clone = new_policy.clone();
         state
@@ -1855,12 +1691,6 @@ async fn handle_update_config_inner(
             "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
         );
     }
-
-    let latest = state
-        .store
-        .get_latest_policy(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
     let payload = new_policy.encode_to_vec();
     let hash = deterministic_policy_hash(&new_policy);
@@ -2227,35 +2057,14 @@ pub(super) async fn handle_submit_policy_analysis(
         }));
     }
 
-    // `current_policy` is captured ONCE at the top of the batch and frozen
-    // for every chunk's delta computation, even if an earlier chunk in the
-    // batch auto-approves and merges. This is intentional v1 behavior:
-    // multi-chunk batches with overlapping endpoints would otherwise have
-    // chunk N+1 fail to see chunk N's contribution, which is a degenerate
-    // case for the common single-chunk submission shape. If real workloads
-    // surface a problem with batches that interact across chunks, the right
-    // fix is to recompute baseline after each successful auto-approve.
-    let current_policy = current_effective_policy_for_sandbox(state, &sandbox, &sandbox_id).await?;
-
-    // Auto-approval is an opt-in behavior, sourced from the settings model
-    // (sandbox or gateway scope) so it can be flipped on a running sandbox
-    // and managed fleet-wide. Default (no setting, or any value other than
-    // exact "auto") preserves OpenShell's default-deny posture: every
-    // proposal lands in `pending` for a human reviewer.
-    let (auto_approve_enabled, resolved_from) =
-        resolve_proposal_approval_mode(state.store.as_ref(), sandbox.object_name()).await?;
-
-    // The credential set is stable across all chunks in this batch, so build
-    // it once. v1 captures presence only — no scope modeling — so the prover
-    // can answer "is there a credential in scope for this host?" but not
-    // "what action class does that credential authorize?"
-    let provider_names_for_creds: Vec<String> = sandbox
+    let current_base_policy = current_base_policy_for_sandbox(state, &sandbox, &sandbox_id).await?;
+    let provider_names: Vec<String> = sandbox
         .spec
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
-    let credential_set =
-        build_credential_set_for_sandbox(state.store.as_ref(), &provider_names_for_creds).await?;
+    let credential_target_hosts =
+        provider_credential_target_hosts(state.store.as_ref(), &provider_names).await?;
 
     let current_version = state
         .store
@@ -2295,6 +2104,58 @@ pub(super) async fn handle_submit_policy_analysis(
             rejection_reasons.push(format!("chunk '{}' missing proposed_rule", chunk.rule_name));
             continue;
         }
+        if let Err(status) =
+            validate_rule_not_always_blocked(chunk.proposed_rule.as_ref().expect("checked above"))
+        {
+            rejected += 1;
+            rejection_reasons.push(format!("chunk '{}': {}", chunk.rule_name, status.message()));
+            continue;
+        }
+
+        let proposal_operations = [PolicyMergeOp::AddRule {
+            rule_name: chunk.rule_name.clone(),
+            rule: chunk.proposed_rule.clone().expect("checked above"),
+        }];
+        let candidate = match merge_policy(current_base_policy.clone(), &proposal_operations) {
+            Ok(merged) => merged.policy,
+            Err(error) => {
+                rejected += 1;
+                rejection_reasons.push(format!("chunk '{}': {error}", chunk.rule_name));
+                continue;
+            }
+        };
+        let (managed_auto_apply, managed_validation) = match decide_managed_merge(
+            state,
+            &sandbox,
+            &current_base_policy,
+            &candidate,
+            &proposal_operations,
+            crate::managed_policy::AdmissionSource::AgentProposal,
+        )
+        .await?
+        {
+            crate::managed_policy::AdmissionDecision::Unmanaged => (false, None),
+            crate::managed_policy::AdmissionDecision::Apply => (
+                true,
+                Some("managed: apply: requested authority is auto-eligible".to_owned()),
+            ),
+            decision @ crate::managed_policy::AdmissionDecision::Ask { .. } => {
+                let status = super::managed_policy::require_applied(decision)
+                    .expect_err("managed ask must produce an approval-required status");
+                (false, Some(format!("managed: ask: {}", status.message())))
+            }
+            decision @ crate::managed_policy::AdmissionDecision::Reject { .. } => {
+                rejected += 1;
+                let status = super::managed_policy::require_applied(decision)
+                    .expect_err("managed reject must produce an error");
+                rejection_reasons.push(format!(
+                    "chunk '{}': {}",
+                    chunk.rule_name,
+                    status.message()
+                ));
+                continue;
+            }
+        };
 
         let now_ms = current_time_ms();
         let proposed_rule_bytes = chunk
@@ -2313,16 +2174,16 @@ pub(super) async fn handle_submit_policy_analysis(
             .map(|b| b.path.clone())
             .unwrap_or_default();
 
-        // The prover runs on every proposal regardless of `analysis_mode`.
-        // Source provenance (mechanistic vs agent_authored) is preserved in
-        // OCSF audit fields, but the safety decision is grounded in the
-        // merged-policy consequence, not the author — proposer-agnostic.
-        let validation_result = validation_result_for_agent_proposal(
-            current_policy.clone(),
-            &chunk.rule_name,
+        let advisory = credentialed_l4_advisory(
             chunk.proposed_rule.as_ref().expect("checked above"),
-            &credential_set,
+            &credential_target_hosts,
         );
+        let validation_result = match (managed_validation, advisory) {
+            (Some(managed), Some(advisory)) => format!("{managed}; {advisory}"),
+            (Some(managed), None) => managed,
+            (None, Some(advisory)) => advisory,
+            (None, None) => String::new(),
+        };
 
         let record = DraftChunkRecord {
             // The handler proposes an id; the store may swap it for an
@@ -2408,24 +2269,16 @@ pub(super) async fn handle_submit_policy_analysis(
             .await;
         }
 
-        // Auto-approval gate (proposer-agnostic, opt-in): only fire when
-        // BOTH the prover found nothing new in this proposal's delta AND
-        // the reviewer opted in via the `proposal_approval_mode` setting
-        // (gateway or sandbox scope). On any failure (merge conflict,
-        // status update error), the chunk stays pending so a human can
-        // review — never silently lose a proposal. The `validation_result`
-        // literal here is the canonical empty-delta verdict; any other
-        // string means findings or infrastructure error, both of which
-        // require human attention.
-        if auto_approve_enabled
-            && validation_result == "prover: no new findings"
-            && let Err(err) = auto_approve_chunk(
+        // Only managed admission can authorize automatic application. An
+        // unmanaged proposal always remains pending, and advisories never
+        // participate in this decision.
+        if managed_auto_apply
+            && let Err(err) = apply_managed_proposal_chunk(
                 state,
                 &sandbox_id,
                 sandbox.object_name(),
                 &effective_id,
                 &req.analysis_mode,
-                resolved_from,
             )
             .await
         {
@@ -2433,7 +2286,7 @@ pub(super) async fn handle_submit_policy_analysis(
                 chunk_id = %effective_id,
                 sandbox_id = %sandbox_id,
                 error = %err,
-                "auto-approval failed; chunk remains pending for human review"
+                "managed proposal apply failed; chunk remains pending for human review"
             );
         }
 
@@ -2576,8 +2429,13 @@ async fn handle_approve_draft_chunk_inner(
         "ApproveDraftChunk: merging rule into active policy"
     );
 
-    let (version, hash) =
-        merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, &chunk).await?;
+    let (version, hash) = merge_chunk_into_policy_managed(
+        state,
+        &sandbox_id,
+        &chunk,
+        crate::managed_policy::AdmissionSource::DirectAuthenticated,
+    )
+    .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -2788,8 +2646,13 @@ async fn handle_approve_all_draft_chunks_inner(
             "ApproveAllDraftChunks: merging chunk"
         );
 
-        let (version, hash) =
-            merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, chunk).await?;
+        let (version, hash) = merge_chunk_into_policy_managed(
+            state,
+            &sandbox_id,
+            chunk,
+            crate::managed_policy::AdmissionSource::DirectAuthenticated,
+        )
+        .await?;
         last_version = version;
         last_hash = hash;
         let chunk_summary = summarize_draft_chunk_rule(chunk)?;
@@ -3502,12 +3365,72 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
     }
 }
 
+fn requested_delta_for_operations(
+    operations: &[PolicyMergeOp],
+    candidate: &ProtoSandboxPolicy,
+) -> ProtoSandboxPolicy {
+    merge_policy(ProtoSandboxPolicy::default(), operations)
+        .map_or_else(|_| candidate.clone(), |merged| merged.policy)
+}
+
+async fn decide_managed_merge(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    current_policy: &ProtoSandboxPolicy,
+    candidate: &ProtoSandboxPolicy,
+    operations: &[PolicyMergeOp],
+    source: crate::managed_policy::AdmissionSource,
+) -> Result<crate::managed_policy::AdmissionDecision, Status> {
+    let providers = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .ok_or_else(|| Status::failed_precondition("sandbox spec is missing"))?;
+    let requested_delta = if source == crate::managed_policy::AdmissionSource::AgentProposal {
+        requested_delta_for_operations(operations, candidate)
+    } else {
+        candidate.clone()
+    };
+    super::managed_policy::decide_managed_authority(
+        state,
+        super::managed_policy::ManagedAuthorityRequest {
+            mode: super::managed_policy::permission_mode_for_sandbox(sandbox)?,
+            source,
+            sandbox_id: sandbox.object_id(),
+            sandbox_name: sandbox.object_name(),
+            current: Some((current_policy, providers)),
+            candidate: (candidate, providers),
+            requested_delta: (&requested_delta, providers),
+        },
+    )
+    .await
+}
+
 async fn apply_merge_operations_with_retry(
     store: &Store,
     sandbox_id: &str,
     baseline_policy: Option<&ProtoSandboxPolicy>,
     operations: &[PolicyMergeOp],
+    managed_admission: Option<ManagedMergeAdmission<'_>>,
 ) -> Result<(i64, String), Status> {
+    let managed_admission = match managed_admission {
+        Some(admission)
+            if super::managed_policy::load_managed_policy_config(admission.state)
+                .await?
+                .is_some() =>
+        {
+            Some(admission)
+        }
+        _ => None,
+    };
+    // Provider attachment and policy persistence both change effective
+    // authority. Serialize them so the candidate proven below is the one
+    // that is committed.
+    let _sandbox_sync_guard = match managed_admission {
+        Some(admission) => Some(admission.state.compute.sandbox_sync_guard().await),
+        None => None,
+    };
+
     for attempt in 1..=MERGE_RETRY_LIMIT {
         let latest = store
             .get_latest_policy(sandbox_id)
@@ -3521,7 +3444,8 @@ async fn apply_merge_operations_with_retry(
             baseline_policy.cloned().unwrap_or_default()
         };
 
-        let merged = merge_policy(current_policy, operations).map_err(map_policy_merge_error)?;
+        let merged =
+            merge_policy(current_policy.clone(), operations).map_err(map_policy_merge_error)?;
         let new_policy = merged.policy;
         let hash = deterministic_policy_hash(&new_policy);
 
@@ -3529,6 +3453,26 @@ async fn apply_merge_operations_with_retry(
             validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         }
         validate_policy_safety(&new_policy)?;
+
+        if let Some(admission) = managed_admission {
+            let sandbox = admission
+                .state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            let decision = decide_managed_merge(
+                admission.state,
+                &sandbox,
+                &current_policy,
+                &new_policy,
+                operations,
+                admission.source,
+            )
+            .await?;
+            super::managed_policy::require_applied(decision)?;
+        }
 
         if let Some(ref current) = latest
             && current.policy_hash == hash
@@ -3589,7 +3533,31 @@ async fn apply_merge_operations_with_retry(
     )))
 }
 
-pub(super) async fn merge_chunk_into_policy(
+pub(super) async fn merge_chunk_into_policy_managed(
+    state: &ServerState,
+    sandbox_id: &str,
+    chunk: &DraftChunkRecord,
+    source: crate::managed_policy::AdmissionSource,
+) -> Result<(i64, String), Status> {
+    let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
+        .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
+    let operations = [PolicyMergeOp::AddRule {
+        rule_name: chunk.rule_name.clone(),
+        rule,
+    }];
+    validate_merge_operations_for_server(&operations)?;
+    apply_merge_operations_with_retry(
+        state.store.as_ref(),
+        sandbox_id,
+        None,
+        &operations,
+        Some(ManagedMergeAdmission { state, source }),
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn merge_chunk_into_policy(
     store: &Store,
     sandbox_id: &str,
     chunk: &DraftChunkRecord,
@@ -3601,7 +3569,7 @@ pub(super) async fn merge_chunk_into_policy(
         rule,
     }];
     validate_merge_operations_for_server(&operations)?;
-    apply_merge_operations_with_retry(store, sandbox_id, None, &operations).await
+    apply_merge_operations_with_retry(store, sandbox_id, None, &operations, None).await
 }
 
 async fn remove_chunk_from_policy(
@@ -3617,6 +3585,10 @@ async fn remove_chunk_from_policy(
             rule_name: chunk.rule_name.clone(),
             binary_path: chunk.binary.clone(),
         }],
+        Some(ManagedMergeAdmission {
+            state,
+            source: crate::managed_policy::AdmissionSource::DirectAuthenticated,
+        }),
     )
     .await
 }
@@ -3645,9 +3617,7 @@ fn proto_setting_to_stored(key: &str, value: &SettingValue) -> Result<StoredSett
         .ok_or_else(|| Status::invalid_argument("setting_value.value is required"))?;
     let stored = match (expected, inner) {
         (SettingValueKind::String, setting_value::Value::StringValue(v)) => {
-            // Enforce per-key string whitelist at configure time so typos
-            // (e.g. `proposal_approval_mode=autom`) get rejected here instead
-            // of silently falling back to the default at runtime.
+            // Enforce any per-key string whitelist at configure time.
             if let Err(allowed) = setting.validate_string_value(v) {
                 return Err(Status::invalid_argument(format!(
                     "setting '{key}' expects one of [{}]; got '{}'",
@@ -3930,6 +3900,292 @@ mod tests {
                 },
             }));
         request
+    }
+
+    async fn configure_test_managed_maximum(state: &Arc<ServerState>) {
+        crate::grpc::managed_policy::handle_set_managed_maximum_policy(
+            state,
+            Request::new(openshell_core::proto::SetManagedMaximumPolicyRequest {
+                policy_yaml: br#"version: 1
+metadata:
+  policy_id: proposal-test
+  version: 1
+  allowed_modes: [ask, auto]
+  default_mode: auto
+network_policies:
+  github:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: /repos/** }
+          - allow:
+              method: POST
+              path: /repos/**
+              review: { required: true, reason: write }
+        deny_rules:
+          - { method: DELETE, path: "**" }
+    binaries:
+      - path: /usr/bin/gh
+  credentialed_raw:
+    endpoints:
+      - host: api.credential.example
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+      - host: api.credential.example
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+"#
+                .to_vec(),
+            }),
+        )
+        .await
+        .expect("managed maximum should configure");
+    }
+
+    async fn put_managed_test_sandbox(
+        state: &Arc<ServerState>,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        providers: Vec<String>,
+    ) {
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: sandbox_id.to_owned(),
+                    name: sandbox_name.to_owned(),
+                    labels: HashMap::from([(
+                        crate::grpc::managed_policy::MANAGED_PERMISSION_MODE_LABEL.to_owned(),
+                        "auto".to_owned(),
+                    )]),
+                    ..Default::default()
+                }),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    providers,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("sandbox should persist");
+    }
+
+    fn managed_rest_chunk(method: &str) -> PolicyChunk {
+        PolicyChunk {
+            rule_name: format!("github_{}", method.to_ascii_lowercase()),
+            proposed_rule: Some(NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".to_owned(),
+                    port: 443,
+                    protocol: "rest".to_owned(),
+                    enforcement: "enforce".to_owned(),
+                    rules: vec![L7Rule {
+                        allow: Some(openshell_core::proto::L7Allow {
+                            method: method.to_owned(),
+                            path: "/repos/acme/project".to_owned(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/gh".to_owned(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            rationale: "managed proposal test".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_auto_proposals_apply_read_ask_for_reviewed_write_and_reject_delete() {
+        let state = test_server_state().await;
+        configure_test_managed_maximum(&state).await;
+        put_managed_test_sandbox(&state, "managed-auto-id", "managed-auto", Vec::new()).await;
+
+        let read = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: "managed-auto".to_owned(),
+                proposed_chunks: vec![managed_rest_chunk("GET")],
+                analysis_mode: "agent_authored".to_owned(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("read proposal should succeed")
+        .into_inner();
+        assert_eq!(read.accepted_chunks, 1);
+        assert_eq!(read.rejected_chunks, 0);
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: "managed-auto".to_owned(),
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(draft.chunks[0].status, "approved");
+
+        let write = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: "managed-auto".to_owned(),
+                proposed_chunks: vec![managed_rest_chunk("POST")],
+                analysis_mode: "agent_authored".to_owned(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("reviewed write should enter the queue")
+        .into_inner();
+        assert_eq!(write.accepted_chunks, 1);
+        let write_id = &write.accepted_chunk_ids[0];
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: "managed-auto".to_owned(),
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let reviewed_write = draft
+            .chunks
+            .iter()
+            .find(|chunk| &chunk.id == write_id)
+            .unwrap();
+        assert_eq!(reviewed_write.status, "pending");
+        assert!(reviewed_write.validation_result.contains("managed: ask"));
+
+        let denied = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: "managed-auto".to_owned(),
+                proposed_chunks: vec![managed_rest_chunk("DELETE")],
+                analysis_mode: "agent_authored".to_owned(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("denied proposal should return a structured rejection")
+        .into_inner();
+        assert_eq!(denied.accepted_chunks, 0);
+        assert_eq!(denied.rejected_chunks, 1);
+        assert!(denied.rejection_reasons[0].contains("managed maximum proposal-test@1"));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn credentialed_l4_advisory_does_not_override_managed_apply() {
+        use openshell_core::proto::{
+            ProviderProfile, ProviderProfileCategory, StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        configure_test_managed_maximum(&state).await;
+        state
+            .store
+            .put_message(&test_provider("credentialed-api", "credentialed-api"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-credentialed-api".to_owned(),
+                    name: "credentialed-api".to_owned(),
+                    ..Default::default()
+                }),
+                profile: Some(ProviderProfile {
+                    id: "credentialed-api".to_owned(),
+                    display_name: "Credentialed API".to_owned(),
+                    category: ProviderProfileCategory::Other as i32,
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.credential.example".to_owned(),
+                        port: 443,
+                        protocol: "rest".to_owned(),
+                        enforcement: "enforce".to_owned(),
+                        access: "read-only".to_owned(),
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_owned(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap();
+        put_managed_test_sandbox(
+            &state,
+            "managed-l4-id",
+            "managed-l4",
+            vec!["credentialed-api".to_owned()],
+        )
+        .await;
+
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: "managed-l4".to_owned(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "credentialed_raw".to_owned(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        endpoints: vec![NetworkEndpoint {
+                            host: "api.credential.example".to_owned(),
+                            port: 443,
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".to_owned(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    rationale: "opaque protocol requires raw transport".to_owned(),
+                    ..Default::default()
+                }],
+                analysis_mode: "agent_authored".to_owned(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("in-boundary raw L4 proposal should be admitted")
+        .into_inner();
+        assert_eq!(response.accepted_chunks, 1);
+        assert_eq!(response.rejected_chunks, 0);
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: "managed-l4".to_owned(),
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(draft.chunks[0].status, "approved");
+        assert!(draft.chunks[0].validation_result.contains("managed: apply"));
+        assert!(
+            draft.chunks[0]
+                .validation_result
+                .contains("advisory: credentialed raw L4 authority")
+        );
     }
 
     /// Wrap a request with a sandbox `Principal` bound to `sandbox_id`.
@@ -4453,6 +4709,24 @@ mod tests {
             .unwrap();
 
         assert!(layers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_provider_policy_layers_reject_unknown_provider_types() {
+        let store = test_store().await;
+        store
+            .put_message(&test_provider("custom-provider", "custom"))
+            .await
+            .unwrap();
+
+        let error =
+            managed_profile_provider_policy_layers(&store, &["custom-provider".to_string()])
+                .await
+                .expect_err("managed composition must reject unmodeled provider authority");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("no resolvable policy profile"));
+        assert!(!error.message().contains("ghp-test"));
     }
 
     #[tokio::test]
@@ -5667,33 +5941,16 @@ mod tests {
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
     }
 
-    /// Test helper: pin the proposal approval mode for a sandbox via the
-    /// settings model, mirroring what `openshell settings set <name>
-    /// proposal_approval_mode <mode>` would do at runtime.
-    async fn seed_sandbox_approval_mode(state: &Arc<ServerState>, sandbox_name: &str, mode: &str) {
-        let mut settings = load_sandbox_settings(state.store.as_ref(), sandbox_name)
-            .await
-            .unwrap();
-        settings.settings.insert(
-            settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
-            StoredSettingValue::String(mode.to_string()),
-        );
-        settings.revision = settings.revision.wrapping_add(1);
-        save_sandbox_settings(state.store.as_ref(), sandbox_name, &settings)
-            .await
-            .unwrap();
-    }
+    const LEGACY_PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
 
-    /// Test helper: pin the gateway-wide proposal approval mode, mirroring
-    /// `openshell settings set --global proposal_approval_mode <mode>`.
-    async fn seed_global_approval_mode(state: &Arc<ServerState>, mode: &str) {
-        let mut settings = load_global_settings(state.store.as_ref()).await.unwrap();
-        settings.settings.insert(
-            settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
-            StoredSettingValue::String(mode.to_string()),
+    async fn seed_legacy_global_auto_setting(state: &Arc<ServerState>) {
+        let mut stored = load_global_settings(state.store.as_ref()).await.unwrap();
+        stored.settings.insert(
+            LEGACY_PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+            StoredSettingValue::String("auto".to_string()),
         );
-        settings.revision = settings.revision.wrapping_add(1);
-        save_global_settings(state.store.as_ref(), &settings)
+        stored.revision = stored.revision.wrapping_add(1);
+        save_global_settings(state.store.as_ref(), &stored)
             .await
             .unwrap();
     }
@@ -5705,12 +5962,8 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        // Attach a github provider so the proposal below has a credential in
-        // scope for api.github.com. This causes the prover to emit a HIGH
-        // finding (L4 + credential in scope), keeping the chunk pending so
-        // the manual approve/reject lifecycle this test exercises is
-        // reachable. Without a provider, the proposal would auto-approve and
-        // the lifecycle assertions would no longer apply.
+        // Attach a GitHub provider so the raw L4 proposal records the
+        // credentialed-L4 advisory while remaining pending in unmanaged mode.
         state
             .store
             .put_message(&test_provider("github-pat", "github"))
@@ -5786,10 +6039,12 @@ mod tests {
         .into_inner();
         assert_eq!(draft_policy.draft_version, 1);
         assert_eq!(draft_policy.chunks.len(), 1);
-        // The proposal is L4 to a host with a credential in scope, so the
-        // prover emits a HIGH finding and the chunk stays pending for the
-        // manual approve path this test exercises.
         assert_eq!(draft_policy.chunks[0].status, "pending");
+        assert!(
+            draft_policy.chunks[0]
+                .validation_result
+                .starts_with("advisory: credentialed raw L4 authority")
+        );
         let chunk_id = draft_policy.chunks[0].id.clone();
 
         let approve = handle_approve_draft_chunk(
@@ -6011,15 +6266,11 @@ mod tests {
             rejected.rejection_reason, guidance,
             "reviewer's free-form reason must round-trip into the chunk for agent readback"
         );
-        // The prover now runs on every proposal regardless of analysis_mode.
-        // For this rule (L4 to api.example.com, no provider attached, no
-        // credential in scope), v1 calibration emits no finding — so the
-        // verdict is the clean "no new findings" string, not empty.
-        assert_eq!(rejected.validation_result, "prover: no new findings");
+        assert!(rejected.validation_result.is_empty());
     }
 
     #[tokio::test]
-    async fn agent_authored_exact_l7_proposal_gets_prover_pass_verdict() {
+    async fn unmanaged_l7_proposal_remains_pending_without_advisory() {
         use openshell_core::proto::{
             FilesystemPolicy, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, SandboxPhase,
             SandboxPolicy, SandboxSpec,
@@ -6050,11 +6301,6 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
-        // Opt this sandbox into auto-approval via the settings model — same
-        // path the CLI's `--approval-mode auto` exercises — to test the
-        // empty-delta → approved path.
-        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
-
         let proposed_rule = NetworkPolicyRule {
             name: "github_contents_write".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -6104,19 +6350,10 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        let verdict = &draft.chunks[0].validation_result;
+        assert!(draft.chunks[0].validation_result.is_empty());
         assert_eq!(
-            verdict, "prover: no new findings",
-            "exact L7 PUT against an inspected endpoint should not introduce \
-             any new findings over baseline; got: {verdict}"
-        );
-        // Auto-approval gate: empty delta + sandbox opted into auto mode →
-        // status flips to approved without human action. The canonical
-        // happy path for agent speed.
-        assert_eq!(
-            draft.chunks[0].status, "approved",
-            "empty-delta agent-authored proposal under auto mode must auto-approve; \
-             got status: {}",
+            draft.chunks[0].status, "pending",
+            "unmanaged proposals require human approval; got status: {}",
             draft.chunks[0].status
         );
     }
@@ -6134,8 +6371,8 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        // github provider attached so the mechanistic L4 lands a HIGH
-        // finding and stays pending.
+        // GitHub provider attached so the mechanistic L4 proposal records an
+        // advisory while remaining pending in unmanaged mode.
         state
             .store
             .put_message(&test_provider("github-pat", "github"))
@@ -6167,8 +6404,7 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
-        // Step 1: mechanistic submits a broad L4 grant; the prover flags it
-        // HIGH, so it lands in pending.
+        // Step 1: mechanistic submits a broad L4 grant.
         let mechanistic_rule = NetworkPolicyRule {
             name: "allow_api_github_com_443".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -6200,8 +6436,8 @@ mod tests {
         .into_inner();
         let mechanistic_chunk_id = mechanistic_submit.accepted_chunk_ids[0].clone();
 
-        // Sanity-check: the mechanistic chunk is pending and carries a HIGH
-        // finding.
+        // Sanity-check: the mechanistic chunk is pending and carries the
+        // non-gating credentialed-L4 advisory.
         let draft = handle_get_draft_policy(
             &state,
             with_user(Request::new(GetDraftPolicyRequest {
@@ -6218,25 +6454,16 @@ mod tests {
             .find(|c| c.id == mechanistic_chunk_id)
             .expect("mechanistic chunk present");
         assert_eq!(mech.status, "pending");
-        // Mechanistic L4 with credential in scope flags as new credentialed
-        // reach for the binary on the host.
         assert!(
             mech.validation_result
-                .contains("credential_reach_expansion"),
-            "mechanistic L4 with credential in scope should emit \
-             credential_reach_expansion; got: {}",
+                .starts_with("advisory: credentialed raw L4 authority"),
+            "mechanistic L4 with credential in scope should be advisory; got: {}",
             mech.validation_result
         );
 
-        // Step 2: the agent refines into a narrow L7 proposal for the SAME
-        // (host, port, binary). Under the v1 calibration, an L7 PUT on a
-        // host where the binary already had credentialed reach (read-only)
-        // emits a capability_expansion finding (new method on already-
-        // reached host) rather than a fresh reach expansion. The agent
-        // chunk stays pending for human review. The mechanistic chunk gets
-        // auto-rejected as superseded regardless of the agent chunk's own
-        // validation verdict — supersede is unconditional on `(host, port,
-        // binary)` overlap.
+        // Step 2: the agent refines into a narrow L7 proposal for the same
+        // (host, port, binary). The L7 proposal has no advisory and remains
+        // pending for human review; structural supersede is unchanged.
         let agent_rule = NetworkPolicyRule {
             name: "github_contents_put".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -6306,14 +6533,7 @@ mod tests {
              so the agent's chunk grants brand-new credentialed reach. got: {}",
             agent.status
         );
-        assert!(
-            agent
-                .validation_result
-                .contains("credential_reach_expansion"),
-            "agent chunk should carry credential_reach_expansion (new credentialed reach \
-             on api.github.com); got: {}",
-            agent.validation_result
-        );
+        assert!(agent.validation_result.is_empty());
         assert_eq!(
             mech_after.status, "rejected",
             "older mechanistic chunk for same (host, port, binary) should be superseded; \
@@ -6332,12 +6552,9 @@ mod tests {
         );
     }
 
-    /// Auto-approval is **proposer-agnostic**: a mechanistic proposal whose
-    /// prover delta is empty auto-approves the same way an agent-authored one
-    /// does. Source provenance is preserved in the audit trail (OCSF event
-    /// `source=mechanistic`) but does not change the safety decision.
+    /// Unmanaged proposals remain pending regardless of proposer provenance.
     #[tokio::test]
-    async fn mechanistic_proposal_with_empty_delta_also_auto_approves() {
+    async fn unmanaged_mechanistic_proposal_remains_pending() {
         use openshell_core::proto::{
             FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
             SandboxSpec,
@@ -6369,10 +6586,6 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
-        // Opt into auto mode via the settings model to test the
-        // proposer-agnostic gate.
-        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
-
         let proposed_rule = NetworkPolicyRule {
             name: "anon_l4".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -6413,23 +6626,18 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        let verdict = &draft.chunks[0].validation_result;
-        assert_eq!(verdict, "prover: no new findings");
+        assert!(draft.chunks[0].validation_result.is_empty());
         assert_eq!(
-            draft.chunks[0].status, "approved",
-            "empty-delta mechanistic proposal under auto mode must auto-approve \
-             (proposer-agnostic); got status: {}",
+            draft.chunks[0].status, "pending",
+            "unmanaged mechanistic proposal must wait for human review; got status: {}",
             draft.chunks[0].status
         );
     }
 
-    /// `protocol: rest, access: full` on a host where the binary had no
-    /// prior credentialed reach: the prover emits
-    /// `credential_reach_expansion`. (The per-method `capability_expansion`
-    /// paths are suppressed by the gateway delta because the reach is
-    /// new; one finding describes the change, not eight.)
+    /// Credential presence does not turn inspected L7 authority into a raw
+    /// L4 advisory.
     #[tokio::test]
-    async fn agent_authored_l7_full_with_credential_emits_reach_expansion() {
+    async fn credentialed_l7_proposal_has_no_l4_advisory() {
         use openshell_core::proto::{
             FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
             SandboxSpec,
@@ -6466,8 +6674,6 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
-        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
-
         // L7-annotated (protocol: rest, enforce) but access: full — no
         // method/path bound. Credential in scope.
         let proposed_rule = NetworkPolicyRule {
@@ -6513,33 +6719,17 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        let verdict = &draft.chunks[0].validation_result;
-        assert!(
-            verdict.contains("credential_reach_expansion"),
-            "L7 `access: full` on a host the binary did not previously reach must emit \
-             credential_reach_expansion; got: {verdict}"
-        );
-        // Capability_expansion paths for the same (binary, host:port) are
-        // suppressed when the reach itself is new — one finding, not many.
-        assert!(
-            !verdict.contains("capability_expansion"),
-            "capability_expansion must be suppressed when reach itself is new; got: {verdict}"
-        );
+        assert!(draft.chunks[0].validation_result.is_empty());
         assert_eq!(
             draft.chunks[0].status, "pending",
-            "any prover finding must keep the chunk in pending despite auto mode; got: {}",
+            "unmanaged proposals require human approval; got: {}",
             draft.chunks[0].status
         );
     }
 
-    /// Acceptance criterion #7: default approval mode is manual. A sandbox
-    /// with no `proposal_approval_mode` setting at either scope must NOT
-    /// auto-approve empty-delta proposals; the chunk lands in `pending` for
-    /// human review. This is the default-deny safeguard: auto-approval is
-    /// an explicit opt-in, not a global behavior change shipped under a
-    /// feature.
+    /// Unmanaged authority expansion always requires human approval.
     #[tokio::test]
-    async fn empty_delta_does_not_auto_approve_when_mode_unset() {
+    async fn unmanaged_proposal_remains_pending() {
         use openshell_core::proto::{
             FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
             SandboxSpec,
@@ -6564,8 +6754,6 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
-                // No approval-mode setting seeded at sandbox or gateway
-                // scope — the resolver must treat absence as "manual".
                 ..Default::default()
             }),
             ..Default::default()
@@ -6594,7 +6782,7 @@ mod tests {
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "anon_l4".to_string(),
                     proposed_rule: Some(proposed_rule),
-                    rationale: "un-credentialed L4 — prover sees no finding".to_string(),
+                    rationale: "uncredentialed L4".to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -6613,198 +6801,18 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        let verdict = &draft.chunks[0].validation_result;
-        assert_eq!(
-            verdict, "prover: no new findings",
-            "prover should still emit no findings; gate is downstream",
-        );
+        assert!(draft.chunks[0].validation_result.is_empty());
         assert_eq!(
             draft.chunks[0].status, "pending",
-            "default (unset) proposal_approval_mode must not auto-approve; \
-             chunk should wait for human review. got status: {}",
+            "unmanaged proposal must wait for human review; got status: {}",
             draft.chunks[0].status
         );
     }
 
-    /// Unknown `proposal_approval_mode` strings (typos, future-mode values
-    /// the gateway doesn't yet know about) fall back to manual. This locks
-    /// in forward-compat: a future CLI that learns about `"auto_on_low_risk"`
-    /// can never accidentally bypass an older gateway's review gate just by
-    /// virtue of an unrecognized value defaulting to "auto."
+    /// A stale persisted legacy auto setting cannot restore unmanaged
+    /// automatic approval after the setting is removed from the product.
     #[tokio::test]
-    async fn empty_delta_does_not_auto_approve_when_mode_unknown_string() {
-        use openshell_core::proto::{
-            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
-            SandboxSpec,
-        };
-
-        let state = test_server_state().await;
-        let sandbox_name = "unknown-mode".to_string();
-        let mut sandbox = Sandbox {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: "sb-unknown-mode".to_string(),
-                name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
-                resource_version: 0,
-            }),
-            spec: Some(SandboxSpec {
-                policy: Some(SandboxPolicy {
-                    version: 1,
-                    filesystem: Some(FilesystemPolicy {
-                        read_write: vec!["/sandbox".to_string()],
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        sandbox.set_phase(SandboxPhase::Ready as i32);
-        state.store.put_message(&sandbox).await.unwrap();
-        // A future-CLI value the current gateway doesn't recognize.
-        seed_sandbox_approval_mode(&state, &sandbox_name, "auto_on_low_risk").await;
-
-        let proposed_rule = NetworkPolicyRule {
-            name: "anon_l4".to_string(),
-            endpoints: vec![NetworkEndpoint {
-                host: "example.com".to_string(),
-                port: 443,
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        handle_submit_policy_analysis(
-            &state,
-            with_user(Request::new(SubmitPolicyAnalysisRequest {
-                name: sandbox_name.clone(),
-                analysis_mode: "agent_authored".to_string(),
-                proposed_chunks: vec![PolicyChunk {
-                    rule_name: "anon_l4".to_string(),
-                    proposed_rule: Some(proposed_rule),
-                    rationale: "un-credentialed L4".to_string(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })),
-        )
-        .await
-        .unwrap();
-
-        let draft = handle_get_draft_policy(
-            &state,
-            with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
-                status_filter: String::new(),
-            })),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert_eq!(
-            draft.chunks[0].status, "pending",
-            "unknown approval-mode strings must fall back to manual; \
-             only the literal \"auto\" opts in. got: {}",
-            draft.chunks[0].status
-        );
-    }
-
-    /// Explicit `"manual"` is equivalent to the unset default — chunk lands
-    /// in pending even with empty delta.
-    #[tokio::test]
-    async fn empty_delta_does_not_auto_approve_when_mode_explicit_manual() {
-        use openshell_core::proto::{
-            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
-            SandboxSpec,
-        };
-
-        let state = test_server_state().await;
-        let sandbox_name = "explicit-manual-mode".to_string();
-        let mut sandbox = Sandbox {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: "sb-explicit-manual-mode".to_string(),
-                name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
-                resource_version: 0,
-            }),
-            spec: Some(SandboxSpec {
-                policy: Some(SandboxPolicy {
-                    version: 1,
-                    filesystem: Some(FilesystemPolicy {
-                        read_write: vec!["/sandbox".to_string()],
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        sandbox.set_phase(SandboxPhase::Ready as i32);
-        state.store.put_message(&sandbox).await.unwrap();
-        seed_sandbox_approval_mode(&state, &sandbox_name, "manual").await;
-
-        let proposed_rule = NetworkPolicyRule {
-            name: "anon_l4".to_string(),
-            endpoints: vec![NetworkEndpoint {
-                host: "example.com".to_string(),
-                port: 443,
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        handle_submit_policy_analysis(
-            &state,
-            with_user(Request::new(SubmitPolicyAnalysisRequest {
-                name: sandbox_name.clone(),
-                analysis_mode: "agent_authored".to_string(),
-                proposed_chunks: vec![PolicyChunk {
-                    rule_name: "anon_l4".to_string(),
-                    proposed_rule: Some(proposed_rule),
-                    rationale: "un-credentialed L4 — prover sees no finding".to_string(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })),
-        )
-        .await
-        .unwrap();
-
-        let draft = handle_get_draft_policy(
-            &state,
-            with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
-                status_filter: String::new(),
-            })),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert_eq!(
-            draft.chunks[0].status, "pending",
-            "explicit manual mode must equal default mode — no auto-approval; \
-             got: {}",
-            draft.chunks[0].status
-        );
-    }
-
-    /// Gateway-scope `proposal_approval_mode = "auto"` enables auto-approval
-    /// for any sandbox under that gateway, with no per-sandbox setting
-    /// required. This is the fleet-wide opt-in path — a reviewer flips the
-    /// gateway setting once and every sandbox without an explicit override
-    /// gets prover-gated auto-approval.
-    #[tokio::test]
-    async fn empty_delta_auto_approves_from_gateway_scope_setting() {
+    async fn stale_legacy_auto_setting_is_inert() {
         use openshell_core::proto::{
             FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
             SandboxSpec,
@@ -6835,8 +6843,7 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
-        // Fleet-wide opt-in — no sandbox-scope setting.
-        seed_global_approval_mode(&state, "auto").await;
+        seed_legacy_global_auto_setting(&state).await;
 
         let proposed_rule = NetworkPolicyRule {
             name: "anon_l4".to_string(),
@@ -6859,98 +6866,7 @@ mod tests {
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "anon_l4".to_string(),
                     proposed_rule: Some(proposed_rule),
-                    rationale: "un-credentialed L4 — empty delta".to_string(),
-                    ..Default::default()
-                }],
-                ..Default::default()
-            })),
-        )
-        .await
-        .unwrap();
-
-        let draft = handle_get_draft_policy(
-            &state,
-            with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
-                status_filter: String::new(),
-            })),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert_eq!(
-            draft.chunks[0].status, "approved",
-            "empty-delta proposal must auto-approve when the gateway-scope \
-             setting is \"auto\" and no sandbox-scope override exists. got: {}",
-            draft.chunks[0].status
-        );
-    }
-
-    /// Gateway scope wins over sandbox scope. A reviewer can pin manual mode
-    /// fleet-wide; a per-sandbox `"auto"` value is silently ignored. Matches
-    /// the existing settings precedence convention (global wins, sandbox is
-    /// the per-sandbox override only when no global is set).
-    #[tokio::test]
-    async fn gateway_manual_overrides_sandbox_auto() {
-        use openshell_core::proto::{
-            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
-            SandboxSpec,
-        };
-
-        let state = test_server_state().await;
-        let sandbox_name = "gateway-pinned-manual".to_string();
-        let mut sandbox = Sandbox {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: "sb-gateway-pinned-manual".to_string(),
-                name: sandbox_name.clone(),
-                created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
-                resource_version: 0,
-            }),
-            spec: Some(SandboxSpec {
-                policy: Some(SandboxPolicy {
-                    version: 1,
-                    filesystem: Some(FilesystemPolicy {
-                        read_write: vec!["/sandbox".to_string()],
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        sandbox.set_phase(SandboxPhase::Ready as i32);
-        state.store.put_message(&sandbox).await.unwrap();
-        // Gateway pins manual; the sandbox-scope override is supplied (test
-        // helper bypasses the UpdateConfig precondition, simulating the
-        // before-pin state) to prove the resolver still picks the gateway
-        // value.
-        seed_global_approval_mode(&state, "manual").await;
-        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
-
-        let proposed_rule = NetworkPolicyRule {
-            name: "anon_l4".to_string(),
-            endpoints: vec![NetworkEndpoint {
-                host: "example.com".to_string(),
-                port: 443,
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        handle_submit_policy_analysis(
-            &state,
-            with_user(Request::new(SubmitPolicyAnalysisRequest {
-                name: sandbox_name.clone(),
-                analysis_mode: "agent_authored".to_string(),
-                proposed_chunks: vec![PolicyChunk {
-                    rule_name: "anon_l4".to_string(),
-                    proposed_rule: Some(proposed_rule),
-                    rationale: "un-credentialed L4 — empty delta".to_string(),
+                    rationale: "uncredentialed unmanaged L4".to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -6971,8 +6887,7 @@ mod tests {
         .into_inner();
         assert_eq!(
             draft.chunks[0].status, "pending",
-            "gateway-scope \"manual\" must win over sandbox-scope \"auto\"; \
-             got: {}",
+            "legacy gateway auto setting must not authorize unmanaged expansion; got: {}",
             draft.chunks[0].status
         );
     }
@@ -6981,7 +6896,7 @@ mod tests {
     /// the submit boundary. Provider-synthesized rules are a reserved
     /// namespace; an agent that addresses one by name could otherwise
     /// circumvent the merge guard that splits agent contributions into their
-    /// own rule (so the prover sees them honestly).
+    /// own rule and blur the user/provider ownership boundary.
     #[tokio::test]
     async fn submit_rejects_reserved_provider_rule_name_prefix() {
         use openshell_core::proto::{
@@ -7146,12 +7061,10 @@ mod tests {
         );
     }
 
-    /// v1 calibration row: **L4 with a credential in scope → HIGH finding.**
-    /// The sandbox has a github provider attached, so a credential is in
-    /// scope for api.github.com. A broad L4 proposal therefore lands in
-    /// pending with a HIGH finding.
+    /// Raw L4 authority to an attached provider's credential target records
+    /// a non-gating advisory.
     #[tokio::test]
-    async fn agent_authored_l4_proposal_with_credential_records_high_finding() {
+    async fn credentialed_l4_proposal_records_advisory() {
         use openshell_core::proto::{
             FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
             SandboxSpec,
@@ -7231,29 +7144,20 @@ mod tests {
         .unwrap()
         .into_inner();
         let verdict = &draft.chunks[0].validation_result;
-        let first_line = verdict.lines().next().unwrap_or("");
         assert!(
-            first_line.starts_with("prover: ") && first_line.contains("new finding"),
-            "expected first line like `prover: N new finding(s)`, got: {verdict}"
+            verdict.starts_with("advisory: credentialed raw L4 authority"),
+            "expected credentialed L4 advisory, got: {verdict}"
         );
         assert!(
-            verdict.contains("credential_reach_expansion"),
-            "L4 + credential in scope emits credential_reach_expansion (the binary gains \
-             credentialed reach to a new host:port); got: {verdict}"
-        );
-        assert!(
-            verdict.contains("api.github.com:443"),
+            verdict.contains("host=api.github.com port=443"),
             "expected the finding line to cite the proposed endpoint, got: {verdict}"
         );
     }
 
-    /// v1 calibration row: **L4 with NO credential in scope → no finding.**
-    /// Without an attached provider, no credential targets api.github.com,
-    /// so the prover treats the L4 grant as bounded (no privileged action
-    /// available) and emits nothing. The proposal verdict reads
-    /// `prover: no new findings`, eligible for auto-approval.
+    /// Raw L4 authority without a matching provider credential target has no
+    /// credentialed-L4 advisory.
     #[tokio::test]
-    async fn agent_authored_l4_proposal_without_credential_emits_no_finding() {
+    async fn l4_proposal_without_credential_has_no_advisory() {
         use openshell_core::proto::{
             FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
             SandboxSpec,
@@ -7327,18 +7231,12 @@ mod tests {
         .unwrap()
         .into_inner();
         let verdict = &draft.chunks[0].validation_result;
-        assert_eq!(
-            verdict, "prover: no new findings",
-            "L4 grant with no credential in scope is bounded in v1; got: {verdict}"
-        );
+        assert!(verdict.is_empty(), "unexpected advisory: {verdict}");
     }
 
-    /// v1 calibration row: **link-local host → HIGH finding regardless of
-    /// credentials.** Even with no provider attached, a proposal targeting
-    /// `169.254.169.254` (AWS IMDS / cloud metadata) emits a HIGH finding.
-    /// This is the one categorical safety floor v1 ships.
+    /// Link-local authority is a gateway/runtime invariant, not an advisory.
     #[tokio::test]
-    async fn agent_authored_link_local_proposal_records_high_finding() {
+    async fn agent_authored_link_local_proposal_is_rejected() {
         use openshell_core::proto::{
             FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
             SandboxSpec,
@@ -7384,7 +7282,7 @@ mod tests {
             }],
         };
 
-        handle_submit_policy_analysis(
+        let response = handle_submit_policy_analysis(
             &state,
             with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
@@ -7399,32 +7297,16 @@ mod tests {
             })),
         )
         .await
-        .unwrap();
-
-        let draft = handle_get_draft_policy(
-            &state,
-            with_user(Request::new(GetDraftPolicyRequest {
-                name: sandbox_name,
-                status_filter: String::new(),
-            })),
-        )
-        .await
         .unwrap()
         .into_inner();
-        let verdict = &draft.chunks[0].validation_result;
-        assert!(
-            verdict.contains("link_local_reach"),
-            "link-local proposal must emit link_local_reach regardless of credentials; \
-             got: {verdict}"
-        );
-        assert!(
-            verdict.contains("169.254.169.254"),
-            "finding line must cite the link-local host; got: {verdict}"
-        );
+        assert_eq!(response.accepted_chunks, 0);
+        assert_eq!(response.rejected_chunks, 1);
+        assert!(response.rejection_reasons[0].contains("169.254.169.254"));
+        assert!(response.rejection_reasons[0].contains("always-blocked"));
     }
 
     #[tokio::test]
-    async fn agent_authored_validation_uses_providers_v2_effective_policy() {
+    async fn provider_composition_does_not_create_l4_advisory_for_l7_proposal() {
         use openshell_core::proto::{
             FilesystemPolicy, L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint,
             ProviderProfile, ProviderProfileCategory, SandboxPhase, SandboxPolicy, SandboxSpec,
@@ -7552,35 +7434,13 @@ mod tests {
         .await
         .unwrap()
         .into_inner();
-        let verdict = &draft.chunks[0].validation_result;
-        let first_line = verdict.lines().next().unwrap_or("");
-        assert!(
-            first_line.starts_with("prover: "),
-            "validation should run end-to-end against the providers-v2 composed \
-             effective policy and produce a prover verdict; got: {verdict}"
-        );
-        assert!(
-            !verdict.contains("validation unavailable"),
-            "providers-v2 composition must not break the prover pipeline; \
-             got: {verdict}"
-        );
+        assert!(draft.chunks[0].validation_result.is_empty());
+        assert_eq!(draft.chunks[0].status, "pending");
     }
 
-    /// End-to-end loop test against the v1 calibration and the auto-approval
-    /// gate. Mirrors the two-path flow in `examples/agent-driven-policy-management`:
-    ///
-    /// 1. Un-credentialed L7 proposal (raw.githubusercontent.com GET) →
-    ///    prover sees no findings → sandbox in `auto` mode → chunk
-    ///    auto-approves without human action.
-    ///
-    /// 2. Credentialed L7 proposal (api.github.com PUT) → prover sees
-    ///    `github_token` in scope, emits MEDIUM → chunk lands in pending
-    ///    for human review even under `auto` mode.
-    ///
-    /// This is the deterministic counterpart of the demo's product UX
-    /// claim: "narrow safe = free, narrow credentialed = one approval."
+    /// Unmanaged L7 proposals remain pending regardless of credential reach.
     #[tokio::test]
-    async fn full_loop_under_v2_auto_mode_splits_credentialed_and_uncredentialed() {
+    async fn unmanaged_l7_proposals_remain_pending() {
         use openshell_core::proto::{
             FilesystemPolicy, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, SandboxPhase,
             SandboxPolicy, SandboxSpec,
@@ -7589,10 +7449,8 @@ mod tests {
         let state = test_server_state().await;
         enable_providers_v2(&state).await;
 
-        // Github provider attached: a credential ends up in scope for
-        // api.github.com (PUT proposal flags MEDIUM). raw.githubusercontent.com
-        // is not declared by any provider, so the bootstrap fetch is
-        // un-credentialed and auto-approves.
+        // GitHub provider attached: only raw L4 authority would produce the
+        // credentialed-L4 advisory.
         state
             .store
             .put_message(&test_provider("github-pat", "github"))
@@ -7624,9 +7482,7 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
-        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
-
-        // ── Step 1: un-credentialed GET → expected auto-approve ──
+        // ── Step 1: uncredentialed GET ──
         let uncredentialed_rule = NetworkPolicyRule {
             name: "github_raw_openapi_get".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -7668,7 +7524,7 @@ mod tests {
         .into_inner();
         let step1_chunk_id = step1.accepted_chunk_ids[0].clone();
 
-        // ── Step 2: credentialed PUT → expected MEDIUM, pending ──
+        // ── Step 2: credentialed PUT ──
         let credentialed_rule = NetworkPolicyRule {
             name: "github_contents_put".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -7732,44 +7588,18 @@ mod tests {
             .expect("step2 chunk present");
 
         assert_eq!(
-            step1_chunk.status, "approved",
-            "un-credentialed L7 proposal under v2 + auto mode must auto-approve; got: {}",
+            step1_chunk.status, "pending",
+            "unmanaged L7 proposal must remain pending; got: {}",
             step1_chunk.status
         );
-        assert_eq!(
-            step1_chunk.validation_result, "prover: no new findings",
-            "un-credentialed L7 verdict should be `no new findings`; got: {}",
-            step1_chunk.validation_result
-        );
+        assert!(step1_chunk.validation_result.is_empty());
 
         assert_eq!(
             step2_chunk.status, "pending",
-            "credentialed L7 PUT under v2 + auto mode must stay pending; got: {}",
+            "unmanaged credentialed L7 proposal must remain pending; got: {}",
             step2_chunk.status
         );
-        // This test's spec policy has no pre-existing rule for curl on
-        // api.github.com, so the agent's chunk grants brand-new
-        // credentialed reach: the finding is credential_reach_expansion,
-        // not capability_expansion. (The capability_expansion path is
-        // suppressed by the delta because the reach is new — one finding
-        // per change, not two.) The demo's policy.template.yaml has
-        // github_api_readonly which exercises the capability_expansion
-        // path; that's covered by the supersede test above.
-        assert!(
-            step2_chunk
-                .validation_result
-                .contains("credential_reach_expansion"),
-            "credentialed PUT on a host the binary did not previously reach must carry \
-             credential_reach_expansion; got: {}",
-            step2_chunk.validation_result
-        );
-        assert!(
-            !step2_chunk
-                .validation_result
-                .contains("capability_expansion"),
-            "capability_expansion must be suppressed when reach itself is new; got: {}",
-            step2_chunk.validation_result
-        );
+        assert!(step2_chunk.validation_result.is_empty());
     }
 
     /// Two agent-authored proposals targeting the same host/port/binary must
@@ -8270,35 +8100,31 @@ mod tests {
         );
     }
 
-    /// Auto-approval audit messages carry `auto=true`, `source=<mode>`, and
-    /// `prover_delta=empty` as extra unmapped fields so a reviewer can
-    /// reconstruct the safety reasoning without needing to grep the chunk
-    /// table. The message text itself says "auto-approved: no new prover
-    /// findings" — never "safe" — because the claim is about the prover's
-    /// reasoning, not the world.
+    /// Managed automatic application records proposal provenance without
+    /// reviving the legacy empty-finding approval basis.
     #[test]
-    fn build_gateway_policy_audit_message_carries_auto_approve_provenance() {
+    fn build_gateway_policy_audit_message_carries_managed_apply_provenance() {
         let extra = [
             ("auto", "true".to_string()),
             ("source", "agent_authored".to_string()),
-            ("prover_delta", "empty".to_string()),
+            ("approval_basis", "managed_maximum".to_string()),
         ];
         let message = build_gateway_policy_audit_message(
             "sb-123",
             "demo-sandbox",
             "approved",
-            "auto-approved: no new prover findings (source=agent_authored) — chunk abc: add-rule x",
+            "managed maximum auto-applied proposal (source=agent_authored) — chunk abc: add-rule x",
             12,
             "sha256:autohash",
             &extra,
         );
         assert!(
             message.contains("CONFIG:APPROVED"),
-            "auto-approval reuses CONFIG:APPROVED; got: {message}"
+            "managed automatic application uses CONFIG:APPROVED; got: {message}"
         );
         assert!(
-            message.contains("auto-approved: no new prover findings"),
-            "audit copy must say `no new prover findings`, not `safe`; got: {message}"
+            message.contains("managed maximum auto-applied proposal"),
+            "audit copy must identify the managed approval basis; got: {message}"
         );
         assert!(
             message.contains("auto:true"),
@@ -8309,8 +8135,8 @@ mod tests {
             "missing source field: {message}"
         );
         assert!(
-            message.contains("prover_delta:empty"),
-            "missing prover_delta field: {message}"
+            message.contains("approval_basis:managed_maximum"),
+            "missing managed approval basis: {message}"
         );
     }
 
@@ -8740,8 +8566,8 @@ mod tests {
         }];
 
         let (left, right) = tokio::join!(
-            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_allow),
-            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_deny),
+            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_allow, None),
+            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_deny, None),
         );
 
         let mut versions = vec![left.unwrap().0, right.unwrap().0];
@@ -9031,78 +8857,6 @@ mod tests {
         };
         let stored = proto_setting_to_stored("ocsf_json_enabled", &value).unwrap();
         assert_eq!(stored, StoredSettingValue::Bool(true));
-    }
-
-    #[test]
-    fn proto_setting_to_stored_accepts_allowed_proposal_approval_mode_values() {
-        for raw in ["manual", "auto"] {
-            let value = SettingValue {
-                value: Some(setting_value::Value::StringValue(raw.to_string())),
-            };
-            let stored = proto_setting_to_stored(settings::PROPOSAL_APPROVAL_MODE_KEY, &value)
-                .unwrap_or_else(|e| panic!("expected '{raw}' to be accepted, got: {e}"));
-            assert_eq!(stored, StoredSettingValue::String(raw.to_string()));
-        }
-    }
-
-    #[test]
-    fn proto_setting_to_stored_rejects_invalid_proposal_approval_mode_value() {
-        // Typos and future-reserved modes must be rejected at configure time
-        // — without this, the value silently resolves to manual at runtime
-        // (fail-closed) and the operator never finds out they fat-fingered
-        // the setting.
-        for raw in ["autom", "AUTO", "Manual", "auto_on_low_risk", "", " auto"] {
-            let value = SettingValue {
-                value: Some(setting_value::Value::StringValue(raw.to_string())),
-            };
-            let res = proto_setting_to_stored(settings::PROPOSAL_APPROVAL_MODE_KEY, &value);
-            assert!(
-                res.is_err(),
-                "expected '{raw}' to be rejected, got: {res:?}"
-            );
-            let err = res.unwrap_err();
-            assert_eq!(err.code(), Code::InvalidArgument);
-        }
-    }
-
-    #[test]
-    fn proto_setting_to_stored_rejection_message_lists_allowed_proposal_approval_mode_values() {
-        let value = SettingValue {
-            value: Some(setting_value::Value::StringValue("autom".to_string())),
-        };
-        let err =
-            proto_setting_to_stored(settings::PROPOSAL_APPROVAL_MODE_KEY, &value).unwrap_err();
-        assert_eq!(err.code(), Code::InvalidArgument);
-        let msg = err.message();
-        assert!(msg.contains("manual"), "missing 'manual' in {msg}");
-        assert!(msg.contains("auto"), "missing 'auto' in {msg}");
-        assert!(msg.contains("autom"), "missing offending value in {msg}");
-    }
-
-    /// Locks in that invalid `proposal_approval_mode` is rejected at the
-    /// `UpdateConfig` RPC boundary — not just in the `proto_setting_to_stored`
-    /// helper. Prevents a future refactor from accidentally routing setting
-    /// writes around the validation chokepoint.
-    #[tokio::test]
-    async fn update_config_global_rejects_invalid_proposal_approval_mode() {
-        let state = test_server_state().await;
-        let req = with_user(Request::new(UpdateConfigRequest {
-            global: true,
-            setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
-            setting_value: Some(SettingValue {
-                value: Some(setting_value::Value::StringValue("autom".to_string())),
-            }),
-            ..Default::default()
-        }));
-        let err = handle_update_config(&state, req)
-            .await
-            .expect_err("invalid proposal_approval_mode must be rejected at UpdateConfig");
-        assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(
-            err.message().contains("autom") && err.message().contains("manual"),
-            "expected rejection message to echo the bad value and list allowed values; got: {}",
-            err.message()
-        );
     }
 
     #[tokio::test]
@@ -9451,8 +9205,8 @@ mod tests {
         let sandbox_name = "my-sandbox";
         let mut settings = StoredSettings::default();
         settings.settings.insert(
-            settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
-            StoredSettingValue::String("auto".to_string()),
+            "ocsf_json_enabled".to_string(),
+            StoredSettingValue::Bool(true),
         );
         settings.revision = 3;
         save_sandbox_settings(&store, sandbox_name, &settings)
@@ -9462,8 +9216,8 @@ mod tests {
         let loaded = load_sandbox_settings(&store, sandbox_name).await.unwrap();
         assert_eq!(loaded.revision, 3);
         assert_eq!(
-            loaded.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY),
-            Some(&StoredSettingValue::String("auto".to_string()))
+            loaded.settings.get("ocsf_json_enabled"),
+            Some(&StoredSettingValue::Bool(true))
         );
     }
 

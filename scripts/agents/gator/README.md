@@ -34,7 +34,7 @@ The launcher:
 - Selects the requested harness and bakes the common runtime into the immutable sandbox payload.
 - For `--harness codex`, imports `providers/codex-gator.yaml`, creates or updates the `codex-gator` provider from `$HOME/.codex/auth.json`, and stores the refresh token as gateway-only refresh material.
 - For `--harness codex`, configures gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN` and rotates it before launching the sandbox.
-- Enables `providers_v2_enabled`, `agent_policy_proposals_enabled`, and `proposal_approval_mode=auto` at gateway scope.
+- Enables `providers_v2_enabled` and `agent_policy_proposals_enabled` at gateway scope. Any accepted proposal waits for human review unless the gateway is configured with a managed maximum and the sandbox uses managed `auto` mode.
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
 - Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to prevent duplicate same-head-SHA gator dispositions.
 - Bakes `scripts/agents/gator/skills/gator-gate/SKILL.md` into `/etc/openshell/agent-payload`.

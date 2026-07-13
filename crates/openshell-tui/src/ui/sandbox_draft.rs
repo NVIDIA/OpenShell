@@ -479,57 +479,27 @@ fn approval_annotation(chunk: &PolicyChunk) -> Option<ApprovalAnnotation> {
         return None;
     }
 
-    if validation == "prover: no new findings" {
-        if chunk.status == "approved" {
-            return Some(ApprovalAnnotation {
-                kind: ApprovalAnnotationKind::AutoApproved,
-                short_label: "auto-approved".to_string(),
-                detail_label: "proposal was auto-approved; no additional risk detected".to_string(),
-            });
-        }
-
+    if validation.starts_with("managed: apply:") && chunk.status == "approved" {
         return Some(ApprovalAnnotation {
-            kind: ApprovalAnnotationKind::RequiresReview,
-            short_label: "review required".to_string(),
-            detail_label: "rule requires review; no additional risk detected".to_string(),
+            kind: ApprovalAnnotationKind::AutoApproved,
+            short_label: "auto-applied".to_string(),
+            detail_label: validation.to_string(),
         });
     }
 
-    let issues = validation_issue_summary(validation);
     if chunk.status == "approved" {
         return Some(ApprovalAnnotation {
             kind: ApprovalAnnotationKind::Reviewed,
             short_label: "reviewed".to_string(),
-            detail_label: format!("rule was approved after review; possible issues: {issues}"),
+            detail_label: validation.to_string(),
         });
     }
 
     Some(ApprovalAnnotation {
         kind: ApprovalAnnotationKind::RequiresReview,
         short_label: "review required".to_string(),
-        detail_label: format!(
-            "rule was not auto-approved and requires review; possible issues: {issues}"
-        ),
+        detail_label: validation.to_string(),
     })
-}
-
-fn validation_issue_summary(validation: &str) -> String {
-    let mut issues = Vec::new();
-    for line in validation.lines().skip(1) {
-        let Some((category, _)) = line.trim().split_once(':') else {
-            continue;
-        };
-        let label = category.trim().replace('_', " ");
-        if !label.is_empty() && !issues.contains(&label) {
-            issues.push(label);
-        }
-    }
-
-    if issues.is_empty() {
-        validation.lines().next().unwrap_or(validation).to_string()
-    } else {
-        issues.join(", ")
-    }
 }
 
 fn format_endpoint_summary(endpoint: &NetworkEndpoint) -> String {

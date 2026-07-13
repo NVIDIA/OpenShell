@@ -74,7 +74,7 @@ The following Providers v2 design items are not part of the current behavior:
 | Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
 | Inference mounting from attached providers | `inference_capable` is profile metadata. Attaching an inference-capable provider does not yet create `inference.local` routes. |
 | Multi-provider inference routing | Path-based routing such as `inference.local/openai/...` and `inference.local/anthropic/...` is not yet wired to provider profiles. |
-| Policy prover integration | OpenShell does not yet run the policy prover automatically on sandbox startup or block startup based on prover findings. |
+| Multiple managed policy inputs | Managed admission composes attached provider policy into each candidate and checks it against one gateway-managed maximum. Selecting and intersecting multiple maximums for agents and subagents is future work. |
 | Refresh telemetry as OCSF events | Credential refresh logs are secret-safe gateway logs. OCSF refresh events and metrics are future work. |
 
 Use [Inference Routing](/sandboxes/inference-routing) for the current `inference.local` model.

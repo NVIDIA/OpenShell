@@ -12,15 +12,14 @@ Run the full agent-driven policy loop end-to-end:
 3. The agent reads `/etc/openshell/skills/policy_advisor.md`, drafts the
    narrowest rule needed, and submits it to `http://policy.local/v1/proposals`.
    It saves the returned `chunk_id`.
-4. The gateway merges the proposed rule with the current sandbox policy, runs
-   the policy prover, and stores a concise `validation_result` on the pending
-   chunk. This is deterministic control-plane evidence, not agent prose.
+4. The gateway validates the proposed rule. This demo does not install a
+   managed maximum, so every accepted proposal remains pending for review.
 5. The agent calls `GET /v1/proposals/{chunk_id}/wait?timeout=300` — a single
    HTTP request that the supervisor holds open until the developer decides.
    This is the load-bearing UX point: the agent burns zero LLM tokens while
    it waits; it's literally sleeping on a socket.
 6. You approve the proposal from the host with one keystroke after seeing the
-   exact rule and the prover verdict in `openshell rule get`.
+   exact rule in `openshell rule get`.
 7. The agent's `/wait` returns within ~1 second of the approval. The sandbox
    has hot-reloaded the merged policy; the agent retries the original PUT
    once and exits.
@@ -60,7 +59,7 @@ under `openshell-policy-advisor-demo/` per run.
 DEMO_MANUAL_APPROVE=1 bash examples/agent-driven-policy-management/demo.sh
 ```
 
-Same flow, but the script no longer auto-approves. When the agent submits a
+Same flow, but the script no longer issues approvals on your behalf. When the agent submits a
 proposal, the demo prints the exact `approve` and `reject --reason` commands
 and pauses until you run one from another terminal. This is how you'd review
 a coding agent's privilege ask in a real session — read the structured grant,
@@ -81,7 +80,7 @@ reject with `--reason "scope to docs/ paths only"` and the agent reads
 | `DEMO_GITHUB_TOKEN` | falls back to `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token` |
 | `DEMO_KEEP_SANDBOX` | `0` (set `1` to inspect the sandbox after the demo) |
 | `DEMO_MANUAL_APPROVE` | `0` (set `1` to pause for host-side `rule approve` / `rule reject --reason`) |
-| `DEMO_APPROVAL_TIMEOUT_SECS` | `240` (auto), `1800` (manual mode) |
+| `DEMO_APPROVAL_TIMEOUT_SECS` | `240` (scripted approval), `1800` (manual approval) |
 | `DEMO_CODEX_MODEL` | `gpt-5.4-mini` (pinned for ChatGPT-account compatibility; override if your account supports a different model) |
 | `DEMO_CODEX_REASONING` | `low` (the demo task is mechanical; `medium`/`high` slow it down without changing outcomes) |
 | `OPENSHELL_BIN` | `target/debug/openshell` if present, else `openshell` on `PATH` |
@@ -102,32 +101,24 @@ with three parts, each with a different trust level:
 |---|---|---|
 | `proposed_rule` (host, port, method, path, binary) | agent, schema-validated by the gateway | structured contract — *this* is what you're approving |
 | `rationale` (free-form prose) | agent | hint only — a compromised agent can lie here |
-| `validation_result` (prover output) | gateway-side prover | trust signal — but this surface is in progress (see [RFC 0002](../../rfc/0002-agent-driven-policy-management/README.md)) |
+| `validation_result` | gateway managed admission and advisory logic | deterministic context; empty for ordinary unmanaged L7 proposals |
 
-The MVP today shows the structured rule plus the agent's rationale in
-`openshell rule get` and the TUI inbox panel. With prover validation wired
-into the gateway, `openshell rule get` also shows a `Validation:` line for
-agent-authored chunks. The value is the prover's verdict in OCSF-shorthand
-style — one short, scannable string per chunk:
-
-```text
-Validation: prover: no new findings
-```
+The CLI and TUI show the structured rule plus the agent's rationale. When a
+gateway-managed maximum is configured, `validation_result` records whether the
+proposal was auto-eligible or required review. A raw L4 proposal to a provider
+credential target also carries a non-gating advisory such as:
 
 ```text
-Validation: prover: 1 new finding
-              capability_expansion: PUT on api.github.com:443 via /usr/bin/curl
+Validation: advisory: credentialed raw L4 authority is not inspectable at L7: binary=/usr/bin/curl host=api.github.com port=443
 ```
 
-Other possible verdicts: `validation unavailable` (gateway-side prover infra
-issue — surfaces in the gateway log, not as proposal failure), `merge failed:
-…` (proposal won't merge into the current policy), and `policy invalid: …`
-(merged policy fails the structural safety check).
+That advisory does not approve or reject the proposal. The managed maximum is
+the only automatic admission boundary. Loopback, link-local, unspecified, and
+known metadata targets are rejected as always-blocked authority.
 
-Read the structured rule (Endpoints + Binary). Read the Validation line.
-Approve if both look right. The demo's `openshell rule approve-all`
-auto-approves to keep the loop short; in a real session a developer makes
-that judgment per chunk before pressing `a`.
+Read the structured rule (Endpoints + Binary), rationale, and any validation
+context. The demo driver runs `openshell rule approve-all` to keep the loop
+short; in a real unmanaged session a developer makes that judgment per chunk.
 
 ## Going further
 

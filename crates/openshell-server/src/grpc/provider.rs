@@ -232,6 +232,32 @@ pub(super) async fn update_provider_record(
     validate_provider_mutable_fields(&candidate)?;
     validate_provider_update_against_attached_sandboxes(store, &candidate).await?;
 
+    let managed_maximum_configured = super::policy::load_global_settings(store)
+        .await?
+        .settings
+        .contains_key(super::managed_policy::MANAGED_MAXIMUM_SETTING_KEY);
+    if managed_maximum_configured {
+        let attached_sandboxes = sandboxes_using_provider(store, candidate.object_name()).await?;
+        let existing_credential_keys = existing
+            .credentials
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>();
+        let candidate_credential_keys = candidate
+            .credentials
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>();
+        if !attached_sandboxes.is_empty()
+            && (existing.config != candidate.config
+                || existing_credential_keys != candidate_credential_keys)
+        {
+            return Err(Status::failed_precondition(format!(
+                "provider '{}' is attached to managed sandbox(es) {}; only credential-value rotation with unchanged keys and config is allowed",
+                candidate.object_name(),
+                attached_sandboxes.join(", ")
+            )));
+        }
+    }
+
     // Serialize labels for storage
     let labels_map = candidate.object_labels();
     let labels_json = if labels_map
@@ -734,7 +760,7 @@ fn count_as_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
-fn host_patterns_can_overlap(first: &str, second: &str) -> bool {
+pub(super) fn host_patterns_can_overlap(first: &str, second: &str) -> bool {
     let first = first.to_ascii_lowercase();
     let second = second.to_ascii_lowercase();
     if !first.contains('*') {
@@ -1728,6 +1754,10 @@ async fn profile_attached_sandbox_diagnostics(
     profiles: &[(String, ProviderTypeProfile)],
     operation: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
+    let managed_maximum_configured = super::policy::load_global_settings(store)
+        .await?
+        .settings
+        .contains_key(super::managed_policy::MANAGED_MAXIMUM_SETTING_KEY);
     let mut candidate_profiles =
         std::collections::HashMap::<String, (String, ProviderProfile)>::new();
     for (source, profile) in profiles {
@@ -1780,6 +1810,20 @@ async fn profile_attached_sandbox_diagnostics(
         }
 
         if imported_profiles_used.is_empty() {
+            continue;
+        }
+        if managed_maximum_configured {
+            diagnostics.extend(imported_profiles_used.iter().map(|(source, profile_id)| {
+                ProfileValidationDiagnostic {
+                    source: source.clone(),
+                    profile_id: profile_id.clone(),
+                    field: "id".to_string(),
+                    message: format!(
+                        "provider profile '{profile_id}' is attached to managed sandbox '{sandbox_name}' and cannot be changed while that sandbox exists"
+                    ),
+                    severity: "error".to_string(),
+                }
+            }));
             continue;
         }
         if let Err(err) = validate_dynamic_token_grant_bindings_unambiguous(&bindings) {
@@ -1904,6 +1948,7 @@ pub(super) async fn handle_update_provider(
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let result = update_provider_record(state.store.as_ref(), provider).await;
     match result {
         Ok(provider) => {

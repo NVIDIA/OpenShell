@@ -1379,6 +1379,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 ..Default::default()
             }),
             labels: HashMap::new(),
+            permission_mode: String::new(),
         };
 
         let sandbox_name =

@@ -85,28 +85,6 @@ pub const PROVIDERS_V2_ENABLED_KEY: &str = "providers_v2_enabled";
 /// still applies when this flag is on.
 pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_enabled";
 
-/// Approval mode for agent-authored policy proposals.
-///
-/// `"manual"` (the default when unset): every proposal lands in the draft
-/// inbox for human review, regardless of the prover verdict. `"auto"`:
-/// proposals whose prover delta is empty are approved automatically;
-/// proposals with findings still require human approval. Any other value
-/// (typos, future-reserved modes like `"auto_on_low_risk"`) falls back to
-/// manual — auto mode is an explicit, exact opt-in.
-///
-/// Resolution precedence (matches the rest of the settings model): gateway
-/// scope wins over sandbox scope. A reviewer can pin manual mode for a
-/// fleet by setting it globally; per-sandbox overrides only apply when no
-/// global is set.
-pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
-
-/// Allowed values for [`PROPOSAL_APPROVAL_MODE_KEY`].
-///
-/// Any other string is rejected at configure time (so operators get immediate
-/// feedback on typos like `"autom"`) while the runtime resolver still
-/// fail-closes on unknown persisted values for defense in depth.
-pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
-
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // Gateway-level opt-in for provider profile policy composition. Defaults
     // to false when unset.
@@ -129,13 +107,6 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         key: AGENT_POLICY_PROPOSALS_ENABLED_KEY,
         kind: SettingValueKind::Bool,
         allowed_string_values: None,
-    },
-    // Approval mode for agent-authored proposals. See
-    // PROPOSAL_APPROVAL_MODE_KEY for details. Defaults to manual.
-    RegisteredSetting {
-        key: PROPOSAL_APPROVAL_MODE_KEY,
-        kind: SettingValueKind::String,
-        allowed_string_values: Some(PROPOSAL_APPROVAL_MODE_VALUES),
     },
 ];
 
@@ -168,9 +139,8 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES, PROVIDERS_V2_ENABLED_KEY,
-        REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
-        registered_keys_csv, setting_for_key,
+        PROVIDERS_V2_ENABLED_KEY, REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind,
+        parse_bool_like, registered_keys_csv, setting_for_key,
     };
 
     #[test]
@@ -201,40 +171,6 @@ mod tests {
         // the helper still returns Ok for arbitrary strings.
         assert!(setting.validate_string_value("anything").is_ok());
         assert!(setting.validate_string_value("").is_ok());
-    }
-
-    #[test]
-    fn proposal_approval_mode_accepts_manual_and_auto() {
-        let setting = setting_for_key(PROPOSAL_APPROVAL_MODE_KEY)
-            .expect("proposal_approval_mode should be registered");
-        assert_eq!(setting.kind, SettingValueKind::String);
-        assert_eq!(
-            setting.allowed_string_values,
-            Some(PROPOSAL_APPROVAL_MODE_VALUES)
-        );
-        assert!(setting.validate_string_value("manual").is_ok());
-        assert!(setting.validate_string_value("auto").is_ok());
-    }
-
-    #[test]
-    fn proposal_approval_mode_rejects_typos_and_future_modes() {
-        let setting = setting_for_key(PROPOSAL_APPROVAL_MODE_KEY)
-            .expect("proposal_approval_mode should be registered");
-        for bad in [
-            "autom",
-            "AUTO",
-            "Manual",
-            "",
-            " auto",
-            "auto_on_low_risk",
-            "yes",
-        ] {
-            let err = setting
-                .validate_string_value(bad)
-                .expect_err(&format!("expected '{bad}' to be rejected"));
-            // Caller gets the allowed slice back for diagnostics.
-            assert_eq!(err, PROPOSAL_APPROVAL_MODE_VALUES);
-        }
     }
 
     // ---- parse_bool_like ----

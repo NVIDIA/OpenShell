@@ -7,9 +7,8 @@
 #
 # Shows the approval loop in one run:
 #   deny → agent proposes narrow access → gateway validates → approve → retry.
-# A public raw.githubusercontent.com GET auto-approves; the GitHub PUT waits
-# for review because a GitHub credential is in scope. See README.md for the
-# full walkthrough.
+# This demo runs unmanaged, so every accepted proposal waits for host review.
+# See README.md for the full walkthrough.
 
 set -euo pipefail
 
@@ -40,7 +39,7 @@ DEMO_GITHUB_PROVIDER_NAME="${DEMO_GITHUB_PROVIDER_NAME:-github-policy-demo-${DEM
 DEMO_CODEX_MODEL="${DEMO_CODEX_MODEL:-gpt-5.4-mini}"
 DEMO_CODEX_LOCAL_BIN="${DEMO_CODEX_LOCAL_BIN:-}"
 DEMO_MANUAL_APPROVE="${DEMO_MANUAL_APPROVE:-0}"
-# Manual approvals need more headroom than the auto-approve loop — a human
+# Manual approvals need more headroom than the scripted approval loop — a human
 # reads the proposal, thinks, and decides. Bump the default to 30 min when
 # the developer is in the loop. Explicit overrides still win.
 if [[ "$DEMO_MANUAL_APPROVE" == "1" ]]; then
@@ -365,7 +364,7 @@ start_agent_sandbox() {
     "$OPENSHELL_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
 
     info "policy:   raw GitHub schema path denied; GitHub writes denied"
-    info "approval: auto for no new findings; review for credential risk"
+    info "approval: unmanaged; every proposal waits for host review"
     info "target:   PUT /repos/${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}/contents/${DEMO_FILE_PATH}"
     info "log:      ${AGENT_LOG}"
 
@@ -380,7 +379,6 @@ start_agent_sandbox() {
             --provider "$DEMO_CODEX_PROVIDER_NAME" \
             --provider "$DEMO_GITHUB_PROVIDER_NAME" \
             --policy "$POLICY_FILE" \
-            --approval-mode auto \
             --upload "${PAYLOAD_DIR}:/sandbox" \
             --no-git-ignore \
             --no-auto-providers \
@@ -391,20 +389,16 @@ start_agent_sandbox() {
 }
 
 # Strip `rule get` down to the approval contract: chunk, binary, access,
-# and the prover's categorical findings (no severity grade — the prover
-# emits category names like `credential_reach_expansion` and
-# `capability_expansion`).
+# gateway admission context, and any advisory.
 summarize_pending() {
     local pending="$1"
     sed 's/\x1b\[[0-9;]*m//g' "$pending" \
         | awk '
             BEGIN {
-                in_validation = 0
                 chunk_count = 0
                 validation_printed = 0
             }
             /^[[:space:]]*Chunk:/ {
-                in_validation = 0
                 chunk_count++
                 validation_printed = 0
                 if (chunk_count > 1) print ""
@@ -415,17 +409,15 @@ summarize_pending() {
                 next
             }
             /Binary:/ {
-                in_validation = 0
                 sub(/^[[:space:]]*/, "")
                 sub(/^Binary:/, "Binary:    ")
                 print "    " $0
                 next
             }
             /Endpoints:/ {
-                in_validation = 0
                 sub(/^[[:space:]]*/, "")
                 if (!validation_printed) {
-                    print "    Prover:    no verdict shown"
+                    print "    Admission: unmanaged; review required"
                     validation_printed = 1
                 }
                 sub(/^Endpoints:/, "Access:    ")
@@ -433,52 +425,24 @@ summarize_pending() {
                 next
             }
             /Validation:/ {
-                in_validation = 1
                 validation_printed = 1
                 sub(/^[[:space:]]*/, "")
-                sub(/^Validation:[[:space:]]*(prover:[[:space:]]*)?/, "Prover:    ")
+                sub(/^Validation:[[:space:]]*/, "Admission: ")
                 print "    " $0
                 next
             }
             /Rationale:/ {
-                in_validation = 0
                 sub(/^[[:space:]]*/, "")
                 sub(/^Rationale:/, "Reason:    ")
                 print "    " $0
                 next
             }
-            # Indented continuation lines of the validation block are
-            # category-named finding rows (e.g.,
-            # `capability_expansion: PUT on api.github.com:443 via /usr/bin/curl`).
-            in_validation && /^[[:space:]]+(credential_reach_expansion|capability_expansion|l7_bypass_credentialed|link_local_reach):/ {
-                sub(/^[[:space:]]*/, "")
-                print "    Finding:   " $0
-                next
-            }
-            { in_validation = 0 }
         '
 }
 
-pending_requires_review() {
-    local pending="$1"
-    local clean
-    # Empty-delta chunks can appear in the pending view for a moment before the
-    # gateway records auto-approval. Keep the demo focused on actual review
-    # work: findings, merge failures, or policy validation failures.
-    clean="$(sed 's/\x1b\[[0-9;]*m//g' "$pending")"
-    if grep -Eq 'Validation: (prover: [1-9][0-9]* new finding|merge failed|policy invalid)|^[[:space:]]+(credential_reach_expansion|capability_expansion|l7_bypass_credentialed|link_local_reach):' <<<"$clean"; then
-        return 0
-    fi
-    if grep -q 'Validation:' <<<"$clean"; then
-        return 1
-    fi
-    return 0
-}
-
 narrate_sandbox_workflow() {
-    info "Loop: deny → propose → validate → decide → retry"
-    info "  auto:   scoped requests with no new findings continue"
-    info "  review: credentialed or risky requests pause here"
+    info "Loop: deny → propose → admit → review → retry"
+    info "  review: every accepted unmanaged proposal pauses here"
     info ""
     info "${DIM}Watching for review requests...${RESET}"
 }
@@ -530,10 +494,7 @@ approve_pending_until_agent_exits() {
     approval_count=0
 
     while true; do
-        # Agent finished? Drain its exit status and we're done. Under v1
-        # auto-approval, the agent's narrow L7 proposals auto-approve at the
-        # gateway and the agent can exit without any escalation surfacing
-        # here. That's the success case — no human action required.
+        # Agent finished? Drain its exit status and we're done.
         if ! kill -0 "$AGENT_PID" >/dev/null 2>&1; then
             spin_clear
             if ! wait "$AGENT_PID"; then
@@ -542,21 +503,16 @@ approve_pending_until_agent_exits() {
             fi
             AGENT_PID=""
             if (( approval_count == 0 )); then
-                info "agent exited with zero review approvals (all proposals auto-approved)"
+                info "agent exited without requesting additional authority"
             else
                 info "agent exited after ${approval_count} review approval(s)"
             fi
             return
         fi
 
-        # Anything pending needs an explicit host-side decision. Auto mode only
-        # bypasses this when the gateway validation finds no new risk.
+        # Anything pending needs an explicit host-side decision.
         if "$OPENSHELL_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending >"$pending" 2>/dev/null \
             && grep -q "Chunk:" "$pending" && grep -q "pending" "$pending"; then
-            if ! pending_requires_review "$pending"; then
-                spin_wait "waiting for auto-approvals to settle" 2
-                continue
-            fi
             spin_clear
             info ""
             info "${YELLOW}approval requested${RESET}"
@@ -612,7 +568,7 @@ verify_github_write() {
 show_logs() {
     step "Decision trace"
     "$OPENSHELL_BIN" logs "$DEMO_SANDBOX_NAME" --since 10m -n 200 2>&1 \
-        | grep -E 'HTTP:PUT.*(DENIED|ALLOWED)|agent_authored proposal|auto-approved: no new prover findings \(source=agent_authored\)|gateway approved draft chunk .*PUT|Policy reloaded successfully' \
+        | grep -E 'HTTP:PUT.*(DENIED|ALLOWED)|agent_authored proposal|gateway approved draft chunk .*PUT|Policy reloaded successfully' \
         | grep -v 'source=mechanistic' \
         | sed 's/^/  /' || true
 }

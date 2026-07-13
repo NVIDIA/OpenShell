@@ -439,7 +439,7 @@ e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 HOST_PORT=$(e2e_pick_port)
 STATE_DIR="${XDG_STATE_HOME}"
 mkdir -p "${STATE_DIR}"
-JWT_DIR="${STATE_DIR}/jwt"
+JWT_DIR="${PKI_DIR}/jwt"
 
 GATEWAY_ENDPOINT="https://host.openshell.internal:${HOST_PORT}"
 E2E_NAMESPACE="e2e-docker-$$-${HOST_PORT}"
@@ -459,8 +459,6 @@ fi
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 echo "Using sandbox image: ${SANDBOX_IMAGE} (pull policy: ${SANDBOX_IMAGE_PULL_POLICY})"
-e2e_generate_gateway_jwt "${JWT_DIR}"
-
 # Driver-specific options moved from CLI flags into a TOML config table
 # (commit 560550d2). Synthesize a minimal config here and pass --config.
 # Quote a value as a TOML basic string: wrap in double quotes and escape

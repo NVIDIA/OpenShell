@@ -78,7 +78,7 @@ For the initial implementation of this RFC, dynamic policy management should be 
 
 - L4 network policy for all outbound traffic
 - L7 REST enforcement for HTTP APIs where `protocol: rest` is configured
-- policy prover checks that can distinguish L4-only access from L7-enforced access
+- explicit policy representation that distinguishes L4-only access from L7-enforced access
 
 This matters because "allow GitHub" is not a single thing:
 

@@ -48,6 +48,27 @@ struct RelayGateway {
 
 #[tonic::async_trait]
 impl OpenShell for RelayGateway {
+    async fn set_managed_maximum_policy(
+        &self,
+        _: tonic::Request<openshell_core::proto::SetManagedMaximumPolicyRequest>,
+    ) -> Result<Response<openshell_core::proto::ManagedMaximumPolicyResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_managed_maximum_policy(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetManagedMaximumPolicyRequest>,
+    ) -> Result<Response<openshell_core::proto::ManagedMaximumPolicyResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_managed_maximum_policy(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteManagedMaximumPolicyRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteManagedMaximumPolicyResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     type RelayStreamStream = std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>,
     >;

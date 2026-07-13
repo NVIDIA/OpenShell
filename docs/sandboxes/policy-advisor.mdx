@@ -3,14 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Use Policy Advisor"
 sidebar-title: "Policy Advisor"
-description: "Let sandboxed agents propose narrow policy changes through policy.local while keeping developer approval in the loop."
+description: "Let sandboxed agents propose narrow policy changes through policy.local under human or managed-maximum admission."
 keywords: "Generative AI, Cybersecurity, Policy Advisor, Policy, Sandbox, policy.local, Agent Policy"
 position: 6
 ---
 
-Policy advisor lets a running sandboxed agent ask for a narrow network policy change after OpenShell denies a request. The agent submits a draft through `policy.local`, a developer approves or rejects it from outside the sandbox, and approved network policy hot-reloads into the same sandbox.
+Policy advisor lets a running sandboxed agent ask for a narrow network policy change after OpenShell denies a request. The agent submits a draft through `policy.local`; unmanaged changes wait for a developer, while a managed maximum can apply eligible changes automatically. Approved network policy hot-reloads into the same sandbox.
 
-Policy advisor preserves OpenShell's default-deny posture. The structured rule is the approval contract, and the agent's rationale is supporting context. By default every proposal lands in the draft inbox for human review. Opt-in [auto mode](#approval-modes) lets the gateway approve provably safe proposals — those whose [prover delta](#what-auto-approval-checks) is empty — without a reviewer in the loop; proposals with any prover finding still require human approval.
+Policy advisor preserves OpenShell's default-deny posture. The structured rule is the approval contract, and the agent's rationale is supporting context. Without a managed maximum policy, every accepted proposal lands in the draft inbox for human review. A gateway-managed maximum can bound proposals and allow eligible changes to apply automatically without creating a second security decision surface.
 
 ## Enable Policy Advisor
 
@@ -47,45 +47,27 @@ openshell settings delete --global \
 
 Set the value before creating a sandbox when you want the first denied request to include policy advisor guidance. Running sandboxes poll settings and can enable the surface after startup, but startup enablement gives the agent the clearest first-denial path.
 
-## Approval Modes
+## Admission Modes
 
-Every proposal — mechanistic or agent-authored — is routed through the [policy prover](#what-auto-approval-checks). The `proposal_approval_mode` setting decides what happens when the prover finds nothing to flag.
+The gateway has one automatic enforcement surface: the [managed maximum policy](/sandboxes/policies#managed-maximum-policies). The sandbox's immutable managed permission mode determines what happens to a proposal inside that boundary:
 
-| Mode | When unset / `manual` | `auto` |
+| Gateway state | Sandbox mode | Proposal behavior |
 |---|---|---|
-| Empty prover delta | Lands in the draft inbox for human review. | Approved automatically; the sandbox hot-reloads the new rule and the agent retries. |
-| Any prover finding | Lands in the draft inbox. | Lands in the draft inbox — auto-approval is gated on an empty delta. |
+| No managed maximum | Unmanaged | Every accepted proposal waits for human review. |
+| Managed maximum | `ask` | Every proposal inside the maximum waits for human review. |
+| Managed maximum | `auto` | Auto-eligible authority applies immediately; `review.required` authority waits for human review. |
 
-`manual` is the default. Auto mode is an explicit opt-in; OpenShell's default-deny posture is preserved unless you choose otherwise.
-
-Enable auto mode at gateway scope when you want every sandbox on this gateway to auto-approve safe proposals:
-
-```shell
-openshell settings set --global \
-  --key proposal_approval_mode \
-  --value auto \
-  --yes
-```
-
-Enable it for one sandbox when no global value is set:
+In managed mode, authority outside the maximum, explicitly denied authority, always-blocked network targets, and authority the containment model does not support are rejected before entering the draft queue. Select a managed mode at sandbox creation:
 
 ```shell
-openshell settings set <sandbox-name> \
-  --key proposal_approval_mode \
-  --value auto
+openshell sandbox create --policy ./base.yaml --permission-mode auto <name>
 ```
 
-The shorthand at create time writes the sandbox-scoped setting for you:
+Omit `--permission-mode` to use the maximum's default. If a local developer wants a hands-off workflow, they can install an explicit broad maximum and use `auto`; OpenShell does not provide a separate unmanaged auto-approval path.
 
-```shell
-openshell sandbox create --approval-mode auto <name>
-```
+OpenShell reruns containment against the live sandbox policy and provider state immediately before an automatically or manually approved proposal is merged. The stored proposal and earlier decision explain what happened; they do not authorize a stale candidate.
 
-Only `manual` and `auto` are accepted; typos like `autom` are rejected at configure time. Stale or unknown values found in storage are still treated as `manual` at runtime as a defense-in-depth measure.
-
-**Precedence.** Gateway scope wins over sandbox scope. A reviewer can pin `manual` for a fleet by setting it globally; per-sandbox overrides only apply when no global value is set.
-
-**Audit trail.** Every auto-approval emits a `CONFIG:APPROVED` event with `auto=true`, `source=<mechanistic|agent_authored>`, `prover_delta=empty`, and `resolved_from=<gateway|sandbox|default>` so operators can reconstruct why a given approval ran without human review.
+Every managed automatic application emits a `CONFIG:APPROVED` event with `auto=true`, `source=<mechanistic|agent_authored>`, and `approval_basis=managed_maximum`.
 
 ## How It Works
 
@@ -102,11 +84,11 @@ The loop has seven steps:
 2. For inspected REST traffic, OpenShell returns a structured `403` body with fields such as `layer`, `host`, `port`, `binary`, `method`, `path`, `rule_missing`, `agent_guidance`, and `next_steps`.
 3. The agent reads the policy advisor skill, inspects the current policy, and optionally reads recent denial log lines.
 4. The agent submits one or more `addRule` proposals to `http://policy.local/v1/proposals`.
-5. The gateway stores accepted proposals as pending draft chunks for the sandbox and runs the [policy prover](#what-auto-approval-checks) against the proposed delta.
-6. Under `auto` mode, proposals with an empty prover delta are approved immediately and skipped past human review. Under `manual` mode (the default), every proposal — and under `auto` mode, every proposal with a prover finding — lands in the draft inbox for a developer to approve or reject.
+5. The gateway rejects always-blocked targets and runs managed-maximum admission when a maximum is configured. It may attach the [credentialed raw-L4 advisory](#credentialed-raw-l4-advisory), but that warning never decides admission.
+6. Unmanaged and managed `ask` proposals land in the draft inbox. Managed `auto` applies auto-eligible proposals, keeps review-required proposals pending, and rejects proposals outside the maximum.
 7. The agent waits on `/v1/proposals/{chunk_id}/wait` until a decision is available. Approved proposals hot-reload into the sandbox; rejected proposals return `rejection_reason` and `validation_result` so the agent can revise.
 
-When a proposal is approved, `/wait` reports `policy_reloaded: true` only after the local sandbox policy covers the approved rule. At that point the agent can retry the original denied action once. If a proposal is rejected, `/wait` returns `rejection_reason` and `validation_result` so the agent can revise or stop. `validation_result` carries the categorical prover findings — `link_local_reach`, `l7_bypass_credentialed`, `credential_reach_expansion`, `capability_expansion` — so the agent can narrow the next attempt to the specific concern the prover flagged.
+When a proposal is approved, `/wait` reports `policy_reloaded: true` only after the local sandbox policy covers the approved rule. At that point the agent can retry the original denied action once. If a proposal is rejected, `/wait` returns `rejection_reason` and `validation_result` so the agent can revise or stop. `validation_result` records managed-admission context and any advisory attached to the proposal.
 
 ## What Gets Proposed
 
@@ -160,20 +142,13 @@ The current `policy.local` JSON shape covers L4 endpoints and REST method or pat
 
 Policy advisor proposals do not add `allowed_ips` automatically. If an advisor-proposed hostname resolves to an internal or private address, OpenShell's SSRF protections still block the connection until a developer explicitly adds the required `allowed_ips` entry. Exact hostname trust for user-declared policy endpoints does not apply to advisor-generated proposal binaries.
 
-## What Auto-Approval Checks
+## Credentialed Raw-L4 Advisory
 
-The policy prover runs against every proposal — mechanistic and agent-authored alike — and asks four formal questions about the proposed change. Each "yes" is one categorical finding. Any finding blocks auto-approval; only an empty delta is eligible.
+A proposal for a raw L4 endpoint has no HTTP method or path boundary. When that endpoint overlaps a host targeted by an attached provider credential, OpenShell adds a deterministic advisory to `validation_result`, including the binary, host, and port.
 
-| Category | Triggered when |
-|---|---|
-| `link_local_reach` | The proposal reaches a host in `169.254.0.0/16`, `fe80::/10`, or a known metadata hostname such as `metadata.google.internal` (cloud-metadata territory, which serves credentials regardless of sandbox state). Unconditional. |
-| `l7_bypass_credentialed` | A binary using a wire protocol the L7 proxy cannot inspect (`git-remote-https`, `ssh`, `nc`) gains reach to a host where a credential is in scope. |
-| `credential_reach_expansion` | A binary gains credentialed reach to a `(host, port)` it could not reach before. |
-| `capability_expansion` | On a `(binary, host, port)` that already had credentialed reach, the proposal adds a new HTTP method. The finding cites the specific method. |
+The advisory is evidence for the policy author, not an enforcement primitive. It never approves, rejects, or overrides managed-maximum admission. Prefer an enforced L7 rule when the protocol supports one. If opaque protocol access is intentional, review the raw L4 authority as granting the named binary the full host and port.
 
-Findings are categorical — there is no severity tier. The reviewer reads the category and the structured evidence to decide. When the prover delta is empty, the proposal is provably safe under the model and auto-approval (if enabled) can fire.
-
-The full reasoning model lives in [`crates/openshell-prover/README.md`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-prover/README.md). Provider profiles composed in via [Providers v2](/sandboxes/providers-v2) are part of the effective policy the prover reasons over.
+Loopback, link-local, unspecified, and known metadata targets are different: OpenShell rejects them as always-blocked authority rather than reporting an advisory. Managed maximum containment decides capability expansion and credential-bearing reach through the same maximum-policy boundary used for every other authority change.
 
 ## Review Proposals
 
@@ -183,7 +158,7 @@ Review pending chunks from the host:
 openshell rule get <sandbox-name> --status pending
 ```
 
-Under `auto` mode, only proposals the prover flagged appear here; empty-delta proposals are already approved and visible under `--status approved` with the auto-approval audit fields described in [Approval Modes](#approval-modes). Under `manual` mode, every proposal — regardless of prover verdict — shows up as pending.
+Unmanaged and managed `ask` proposals appear here. In managed `auto`, review-required proposals appear here while auto-eligible proposals are already visible under `--status approved`.
 
 The output shows the chunk ID, status, rationale, binary, and endpoint summary. For L7 proposals, the endpoint summary includes the protocol, method, and path:
 
@@ -231,7 +206,7 @@ Policy advisor emits audit events into the sandbox log. Use these lines to trace
 openshell logs <sandbox-name> --since 10m
 ```
 
-Look for `HTTP:* DENIED`, `CONFIG:PROPOSED`, `CONFIG:APPROVED` or `CONFIG:REJECTED`, `CONFIG:LOADED`, and the final allowed request if the agent retries successfully. Auto-approved chunks emit `CONFIG:APPROVED` with `auto=true`, `source=<mechanistic|agent_authored>`, `prover_delta=empty`, and `resolved_from=<gateway|sandbox|default>`.
+Look for `HTTP:* DENIED`, `CONFIG:PROPOSED`, `CONFIG:APPROVED` or `CONFIG:REJECTED`, `CONFIG:LOADED`, and the final allowed request if the agent retries successfully. Managed automatic applications emit `CONFIG:APPROVED` with `auto=true`, `source=<mechanistic|agent_authored>`, and `approval_basis=managed_maximum`.
 
 ## Next Steps
 

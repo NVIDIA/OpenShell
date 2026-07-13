@@ -27,6 +27,9 @@ pub const LABEL_SANDBOX_NAME: &str = "openshell.ai/sandbox-name";
 /// Container/pod label carrying the sandbox namespace.
 pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
 
+/// Sandbox metadata label carrying its immutable managed permission mode.
+pub const LABEL_PERMISSION_MODE: &str = "openshell.ai/permission-mode";
+
 // ---------------------------------------------------------------------------
 
 /// Path to the sandbox supervisor binary inside the container image.

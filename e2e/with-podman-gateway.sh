@@ -372,7 +372,7 @@ HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 export XDG_STATE_HOME="${STATE_DIR}"
-JWT_DIR="${STATE_DIR}/jwt"
+JWT_DIR="${PKI_DIR}/jwt"
 
 E2E_NAMESPACE="e2e-podman-$$-${HOST_PORT}"
 PODMAN_NETWORK_NAME="${E2E_NAMESPACE}"
@@ -383,8 +383,6 @@ export OPENSHELL_E2E_NETWORK_NAME="${PODMAN_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
-e2e_generate_gateway_jwt "${JWT_DIR}"
-
 # Driver-specific options moved from CLI flags into a TOML config table
 # (commit 560550d2). Synthesize a minimal config here and pass --config.
 # Quote a value as a TOML basic string: see with-docker-gateway.sh for

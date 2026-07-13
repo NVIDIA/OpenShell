@@ -136,18 +136,6 @@ e2e_toml_string() {
   printf '"%s"' "${value}"
 }
 
-e2e_generate_gateway_jwt() {
-  local jwt_dir=$1
-
-  mkdir -p "${jwt_dir}"
-  (
-    umask 077
-    openssl genpkey -algorithm Ed25519 -out "${jwt_dir}/signing.pem" >/dev/null 2>&1
-  )
-  openssl pkey -in "${jwt_dir}/signing.pem" -pubout -out "${jwt_dir}/public.pem" >/dev/null 2>&1
-  openssl rand -hex 16 >"${jwt_dir}/kid"
-}
-
 e2e_write_gateway_jwt_config() {
   local jwt_dir=$1
   local gateway_id=$2

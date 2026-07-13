@@ -4,6 +4,7 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+mod managed_policy;
 pub mod policy;
 pub mod provider;
 mod sandbox;
@@ -15,16 +16,17 @@ use openshell_core::proto::{
     ApproveDraftChunkResponse, AttachSandboxProviderRequest, AttachSandboxProviderResponse,
     ClearDraftChunksRequest, ClearDraftChunksResponse, ConfigureProviderRefreshRequest,
     ConfigureProviderRefreshResponse, CreateProviderRequest, CreateSandboxRequest,
-    CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderProfileRequest,
+    CreateSshSessionRequest, CreateSshSessionResponse, DeleteManagedMaximumPolicyRequest,
+    DeleteManagedMaximumPolicyResponse, DeleteProviderProfileRequest,
     DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DeleteServiceRequest, DeleteServiceResponse, DetachSandboxProviderRequest,
     DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, GatewayMessage,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetManagedMaximumPolicyRequest,
+    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     GetServiceRequest, HealthRequest, HealthResponse, ImportProviderProfilesRequest,
@@ -33,16 +35,17 @@ use openshell_core::proto::{
     ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest,
-    ListServicesResponse, ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest,
-    PushSandboxLogsResponse, RefreshSandboxTokenRequest, RefreshSandboxTokenResponse,
-    RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
-    UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
-    WatchSandboxRequest, open_shell_server::OpenShell,
+    ListServicesResponse, ManagedMaximumPolicyResponse, ProviderProfileResponse, ProviderResponse,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    SandboxResponse, SandboxStreamEvent, ServiceEndpointResponse, ServiceStatus,
+    SetManagedMaximumPolicyRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
+    UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
+    open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -493,6 +496,30 @@ impl OpenShell for OpenShellService {
         request: Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
         policy::handle_get_gateway_config(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "config:write", role = "admin")]
+    async fn set_managed_maximum_policy(
+        &self,
+        request: Request<SetManagedMaximumPolicyRequest>,
+    ) -> Result<Response<ManagedMaximumPolicyResponse>, Status> {
+        managed_policy::handle_set_managed_maximum_policy(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "config:read", role = "admin")]
+    async fn get_managed_maximum_policy(
+        &self,
+        request: Request<GetManagedMaximumPolicyRequest>,
+    ) -> Result<Response<ManagedMaximumPolicyResponse>, Status> {
+        managed_policy::handle_get_managed_maximum_policy(&self.state, request).await
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "config:write", role = "admin")]
+    async fn delete_managed_maximum_policy(
+        &self,
+        request: Request<DeleteManagedMaximumPolicyRequest>,
+    ) -> Result<Response<DeleteManagedMaximumPolicyResponse>, Status> {
+        managed_policy::handle_delete_managed_maximum_policy(&self.state, request).await
     }
 
     #[rpc_auth(auth = "sandbox")]

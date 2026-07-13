@@ -3,21 +3,20 @@
 
 # Initial sandbox policy for the agent-driven policy demo.
 #
-# The demo exercises two flavors of denial-→-propose-→-decision:
+# The demo exercises two denial → proposal → review loops:
 #
 #  - Step 1 hits raw.githubusercontent.com (no credential in scope). The
 #    host is pre-listed at L7 with no allowed paths, so the agent's GET
-#    structured-403's. The agent proposes the exact path; the prover
-#    sees no credential exposure and the gateway auto-approves.
+#    structured-403's. The agent proposes the exact path and the host-side
+#    demo driver approves the pending unmanaged proposal.
 #
 #  - Step 2 hits api.github.com PUT (github credential in scope). The
 #    host is pre-allowed for read-only access, so the PUT
-#    structured-403's. The agent proposes the narrow PUT path; the
-#    prover sees github_token in scope and emits MEDIUM. The chunk
+#    structured-403's. The agent proposes the narrow PUT path. The chunk
 #    lands in pending for human review; demo.sh approves on behalf.
 #
-# This shows both halves of the loop in one run: free path for safe
-# changes, single human approval for credentialed ones.
+# Every proposal waits because the sandbox has no managed maximum. Set
+# DEMO_MANUAL_APPROVE=1 to make the developer issue each decision directly.
 
 version: 1
 
@@ -50,7 +49,7 @@ network_policies:
   github_api_readonly:
     # api.github.com pre-allowed for read-only access. Writes (PUT/POST/PATCH/DELETE)
     # structured-403 at L7 — the agent proposes the specific method/path,
-    # and the prover gates on credential-in-scope (github provider attached).
+    # and the reviewer sees the exact requested method and path.
     name: github-api-readonly
     endpoints:
       - host: api.github.com
@@ -64,11 +63,7 @@ network_policies:
   github_raw_scoped:
     # raw.githubusercontent.com — pre-listed at L7 with one bootstrap
     # path so the L7 validator accepts the rule. The agent must propose
-    # any additional GET paths it actually needs. Each new proposal is
-    # un-credentialed (no provider declares this host), so the prover
-    # sees no findings and the gateway auto-approves narrow scoped reads
-    # when `proposal_approval_mode = auto` (set via `--approval-mode auto`
-    # at create or via `openshell settings set` at runtime).
+    # any additional GET paths it actually needs.
     name: github-raw-scoped
     endpoints:
       - host: raw.githubusercontent.com

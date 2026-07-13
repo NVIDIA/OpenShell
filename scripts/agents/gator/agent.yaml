@@ -31,8 +31,6 @@ settings:
     value: true
   - key: agent_policy_proposals_enabled
     value: true
-  - key: proposal_approval_mode
-    value: auto
 
 providers:
   - id: github

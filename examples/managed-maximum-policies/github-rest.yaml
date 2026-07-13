@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+metadata:
+  policy_id: github-read-auto-write-review
+  version: 1
+  allowed_modes: [ask, auto]
+  default_mode: auto
+  audit_label: github-engineering
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  github:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        path: /repos/**
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: /repos/** }
+          - allow:
+              method: POST
+              path: /repos/**
+              review: { required: true, reason: "GitHub write" }
+        deny_rules:
+          - { method: DELETE, path: "**" }
+    binaries:
+      - { path: /usr/bin/gh }
+      - { path: /usr/bin/curl }

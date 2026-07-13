@@ -32,6 +32,36 @@ network_policies: { ... }
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
+## Managed Maximum Extensions
+
+`openshell policy maximum set` accepts the same policy shape with one additional top-level
+`metadata` block. These fields identify a gateway-owned ceiling and are not valid in ordinary
+sandbox policy files.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `metadata.policy_id` | string | Yes | Stable administrator-chosen identity for the maximum. |
+| `metadata.version` | integer | Yes | Positive version. Replacing the same policy ID requires a larger version. |
+| `metadata.allowed_modes` | list | Yes | Non-empty set containing `ask`, `auto`, or both. |
+| `metadata.default_mode` | string | Yes | Mode used when sandbox creation omits `--permission-mode`; must appear in `allowed_modes`. |
+| `metadata.audit_label` | string | No | Operator label copied into managed admission audit events. |
+
+An endpoint or an allow payload can include a managed-only review annotation:
+
+```yaml showLineNumbers={false}
+review:
+  required: true
+  reason: "write changes external state"
+```
+
+Endpoint-level review applies to all authority on that endpoint. Allow-level review applies only to
+the matching REST method/path region. Review metadata changes managed automatic-application
+eligibility; it does not remove the authority from the maximum.
+
+The initial managed containment surface models filesystem paths, L4 host/port/binary access, and
+REST method/path access. `deny_rules` remove REST authority before containment. GraphQL, MCP, and
+other endpoint controls fail closed in managed mode instead of being silently ignored.
+
 ## Version
 
 The version field identifies which schema the policy uses:

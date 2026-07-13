@@ -10,7 +10,9 @@
 #![allow(clippy::cast_possible_wrap)] // Intentional u32->i32 conversions for proto compat
 
 use crate::ServerState;
+use crate::managed_policy::AdmissionSource;
 use crate::persistence::{ObjectType, WriteCondition, generate_name};
+use crate::policy_store::PolicyStoreExt;
 use futures::future;
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
@@ -129,10 +131,27 @@ async fn handle_create_sandbox_inner(
     validate_sandbox_spec(&request.name, &spec)?;
 
     // Validate labels (keys and values must meet Kubernetes requirements).
+    if request
+        .labels
+        .contains_key(super::managed_policy::MANAGED_PERMISSION_MODE_LABEL)
+    {
+        return Err(Status::invalid_argument(format!(
+            "label '{}' is reserved by OpenShell",
+            super::managed_policy::MANAGED_PERMISSION_MODE_LABEL
+        )));
+    }
     for (key, value) in &request.labels {
         crate::grpc::validation::validate_label_key(key)?;
         crate::grpc::validation::validate_label_value(value)?;
     }
+
+    // Serialize sandbox creation against managed-boundary mutations. The
+    // maximum can only change while no sandbox exists, so this guard closes
+    // the race between that check and sandbox persistence.
+    let _managed_settings_guard = state.settings_mutex.lock().await;
+    let permission_mode =
+        super::managed_policy::resolve_create_permission_mode(state, &request.permission_mode)
+            .await?;
 
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
@@ -173,14 +192,37 @@ async fn handle_create_sandbox_inner(
         request.name.clone()
     };
 
+    let base_policy = spec.policy.clone().unwrap_or_default();
+    let decision = super::managed_policy::decide_managed_authority(
+        state,
+        super::managed_policy::ManagedAuthorityRequest {
+            mode: permission_mode,
+            source: AdmissionSource::SandboxCreate,
+            sandbox_id: &id,
+            sandbox_name: &name,
+            current: None,
+            candidate: (&base_policy, &spec.providers),
+            requested_delta: (&base_policy, &spec.providers),
+        },
+    )
+    .await?;
+    super::managed_policy::require_applied(decision)?;
+
     let now_ms = current_time_ms();
+    let mut labels = request.labels.clone();
+    if let Some(mode) = permission_mode {
+        labels.insert(
+            super::managed_policy::MANAGED_PERMISSION_MODE_LABEL.to_owned(),
+            mode.as_str().to_owned(),
+        );
+    }
 
     let mut sandbox = Sandbox {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: id.clone(),
             name: name.clone(),
             created_at_ms: now_ms,
-            labels: request.labels.clone(),
+            labels,
             resource_version: 0,
         }),
         spec: Some(spec),
@@ -358,6 +400,32 @@ pub(super) async fn handle_attach_sandbox_provider(
     validate_sandbox_spec(&request.sandbox_name, &candidate_spec)?;
     validate_provider_environment_keys_unique(state.store.as_ref(), &candidate_spec.providers)
         .await?;
+
+    let current_policy = if let Some(record) = state
+        .store
+        .get_latest_policy(&sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch latest policy failed: {error}")))?
+    {
+        openshell_core::proto::SandboxPolicy::decode(record.policy_payload.as_slice())
+            .map_err(|error| Status::internal(format!("decode current policy failed: {error}")))?
+    } else {
+        spec.policy.clone().unwrap_or_default()
+    };
+    let decision = super::managed_policy::decide_managed_authority(
+        state,
+        super::managed_policy::ManagedAuthorityRequest {
+            mode: super::managed_policy::permission_mode_for_sandbox(&sandbox)?,
+            source: AdmissionSource::DirectAuthenticated,
+            sandbox_id: &sandbox_id,
+            sandbox_name: sandbox.object_name(),
+            current: Some((&current_policy, &spec.providers)),
+            candidate: (&current_policy, &candidate_spec.providers),
+            requested_delta: (&current_policy, &candidate_spec.providers),
+        },
+    )
+    .await?;
+    super::managed_policy::require_applied(decision)?;
 
     let provider_name = request.provider_name.clone();
     let attached = Arc::new(AtomicBool::new(false));
@@ -2693,6 +2761,7 @@ mod tests {
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
+                permission_mode: String::new(),
             }),
         )
         .await
@@ -2725,6 +2794,7 @@ mod tests {
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
+                permission_mode: String::new(),
             }),
         )
         .await
@@ -2756,6 +2826,7 @@ mod tests {
                         ..Default::default()
                     }),
                     labels: HashMap::new(),
+                    permission_mode: String::new(),
                 }),
             )
             .await

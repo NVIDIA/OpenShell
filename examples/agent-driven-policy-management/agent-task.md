@@ -85,12 +85,9 @@ proposal, submit it to `http://policy.local/v1/proposals`, wait on
 4. Block on the developer's decision by calling
    `GET http://policy.local/v1/proposals/{chunk_id}/wait?timeout=300`.
 
-   - This time the prover emits a `capability_expansion` finding: PUT
-     is a new method on a host the binary already had credentialed
-     reach to (read-only). That's a stated intent change, so the
-     gateway holds the chunk in `pending` for human review instead of
-     auto-approving. The `/wait` call still parks on a socket — zero
-     LLM tokens burn while the human decides.
+   - This sandbox is unmanaged, so the gateway holds every accepted
+     proposal in `pending` for human review. The `/wait` call parks on
+     a socket, so no LLM tokens burn while the human decides.
    - `status: "approved"` — retry the PUT once. Policy has hot-reloaded.
    - `status: "rejected"` — read `rejection_reason`. If it has text,
      address the specific feedback and submit a revised proposal (back

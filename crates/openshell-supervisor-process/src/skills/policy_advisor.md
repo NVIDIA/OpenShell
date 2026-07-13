@@ -27,8 +27,8 @@ The sandbox-local policy API is reachable at `http://policy.local`:
 - `GET /v1/proposals/{chunk_id}` — immediate state of one proposal.
   Returns `status` (`pending` / `approved` / `rejected`),
   `rejection_reason` (the reviewer's free-form note, only set on reject),
-  and `validation_result` (the gateway prover's verdict on this chunk;
-  may be empty).
+  and `validation_result` (the gateway's managed-admission decision or a
+  non-blocking advisory; may be empty).
 - `GET /v1/proposals/{chunk_id}/wait?timeout=<seconds>` — block on this
   proposal until the developer decides or the timeout expires. Default
   60s, clamped [1, 300]. On timeout you get `status: "pending"` plus
@@ -46,12 +46,9 @@ operations. Each `addRule` carries a complete narrow `NetworkPolicyRule`.
    `port`, `binary`, `rule_missing`, and `detail` as evidence.
 2. Fetch the current policy from `/v1/policy/current`.
 3. Fetch recent denials from `/v1/denials` if the response body is incomplete.
-4. Prefer L7 REST rules for REST APIs. **Proposals against hosts where no
-   credential is in scope auto-approve** (see Auto-approval below). Any
-   credentialed reach or capability change goes to human review — that is
-   the design. L7 is still the agent-speed path because the prover can
-   precisely describe the change (which method was added on which path);
-   L4 to a credentialed host loses that precision. Use L4 only when the
+4. Prefer L7 REST rules for REST APIs. L7 lets the gateway bound authority by
+   method and path. Raw L4 access to a credential target gives the binary the
+   whole host/port authority and produces an advisory. Use L4 only when the
    binary's wire protocol is opaque to L7 inspection (`ssh`, `nc`,
    `git-remote-http`) or the host has no documented REST surface.
 5. Draft the narrowest rule: exact host, exact port, exact binary when known,
@@ -76,10 +73,10 @@ operations. Each `addRule` carries a complete narrow `NetworkPolicyRule`.
      blind; do not loop tightly.
    - `status: "rejected"` — read `rejection_reason` and
      `validation_result`. `rejection_reason` is what the reviewer typed;
-     `validation_result` is the prover's verdict, which often explains
-     a reject driven by automated checks. If either has content, address
-     the specific feedback and submit a revised proposal. If both are
-     empty, draft something materially different or ask the user.
+     `validation_result` records gateway admission context or an advisory.
+     If either has content, address the specific feedback and submit a
+     revised proposal. If both are empty, draft something materially
+     different or ask the user.
    - `status: "pending"` with `timed_out: true` — call `/wait` again.
    - Any non-2xx response — surface to the user; do not retry the denied
      action without approval.
@@ -125,65 +122,32 @@ A complete narrow REST-inspected rule looks like this:
 }
 ```
 
-## Auto-approval
+## Admission and review
 
-Auto-approval is opt-in via the `proposal_approval_mode` setting,
-managed through the standard settings model. Reviewers set it at the
-gateway scope (fleet-wide) with `openshell settings set --global
-proposal_approval_mode auto` or at the sandbox scope with `openshell
-settings set <name> proposal_approval_mode auto`. The CLI's `openshell
-sandbox create --approval-mode auto` is a shorthand that writes the
-sandbox-scoped setting at create time. Gateway scope wins when both are
-set; the default (no setting) is `"manual"`.
+The gateway has one enforcement decision surface: an optional managed maximum
+policy. The sandbox's immutable managed permission mode controls proposals
+inside that boundary:
 
-When auto-approval is enabled and the prover finds nothing new, the
-gateway approves the chunk with actor `system:auto` and the
-`CONFIG:APPROVED` audit event carries `auto=true`, `source=<mode>`,
-`prover_delta=empty`, and `resolved_from=<gateway|sandbox>`. The
-agent's `/wait` returns approved in ~1 second. When the prover does
-find something — or the setting is `"manual"`/unset — the chunk lands
-in `pending` for human review.
+- Without a managed maximum, every accepted proposal remains `pending` for a
+  developer.
+- In managed `ask` mode, every proposal inside the maximum remains `pending`.
+- In managed `auto` mode, auto-eligible authority inside the maximum is
+  applied; authority marked `review.required` remains `pending`.
+- Authority outside the maximum, explicitly denied, always blocked, or not
+  supported by managed containment is rejected at submission.
 
-The prover answers four formal questions about each proposed change.
-Each "yes" answer is its own categorical finding — there is no
-severity grade. Any finding blocks auto-approval.
+The gateway rechecks the live policy and provider state before applying an
+approved proposal. A stored decision never authorizes a stale candidate.
+Managed automatic application emits `CONFIG:APPROVED` with `auto=true`, the
+proposal source, and `approval_basis=managed_maximum`.
 
-- **`link_local_reach`** — the proposal grants reach to a link-local IP
-  range (`169.254.0.0/16`, `fe80::/10`) or a known metadata hostname
-  such as `metadata.google.internal`. Cloud metadata endpoints like
-  `169.254.169.254` live here. **Never** propose access to these —
-  these endpoints serve credentials regardless of what the sandbox
-  itself holds.
-- **`l7_bypass_credentialed`** — the proposal lets a binary using a
-  wire protocol the L7 proxy cannot inspect (`/usr/bin/git`,
-  `/usr/lib/git-core/git-remote-http`, `/usr/bin/ssh`, `/usr/bin/nc`)
-  reach a host where a sandbox credential is in scope. Wire protocols
-  opaque to L7 are unbounded by L7 scoping; the reviewer must decide
-  whether to trust the binary with the credential.
-- **`credential_reach_expansion`** — the proposal grants a binary
-  credentialed reach to a (host, port) it could not reach before. New
-  authenticated reach is a stated intent change — the reviewer
-  confirms whether the binary should be able to authenticate to the
-  host at all.
-- **`capability_expansion`** — the proposal adds a new HTTP method on
-  a (binary, host, port) that already had credentialed reach. The
-  reviewer sees exactly which method was added and decides if it's
-  part of the agent's task. Mutating methods (PUT, POST, PATCH,
-  DELETE) are typical sources of this finding.
-
-What auto-approves (under `auto` mode):
-
-- Proposals where the prover finds zero of the four categories — for
-  example, L7 rules against hosts with no credential in scope
-  (public-content fetches from CDNs, schema URLs, public API
-  discovery).
-
-If your proposal escalates and you'd like it to auto-approve, look
-first at whether the host actually needs a credentialed binary. A
-public-content GET often doesn't, and switching to a different host
-(or removing the credential dependency) makes the finding go away.
-Credentialed mutations are *supposed* to escalate — propose the
-narrow rule and wait for review.
+Raw L4 authority to a host targeted by an attached provider credential adds a
+non-blocking `advisory: credentialed raw L4 authority ...` message. The
+advisory explains that OpenShell cannot constrain the connection by HTTP
+method or path. It does not approve, reject, or override the managed maximum;
+use the narrowest L7 rule available. Never propose loopback, link-local,
+unspecified, or known metadata endpoints: the gateway rejects those as
+always-blocked network authority.
 
 ## Refining an earlier auto-suggested rule
 

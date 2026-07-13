@@ -32,6 +32,7 @@ mod defaults;
 mod grpc;
 mod http;
 mod inference;
+mod managed_policy;
 mod multiplex;
 mod persistence;
 pub(crate) mod policy_store;

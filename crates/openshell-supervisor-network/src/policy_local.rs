@@ -782,7 +782,7 @@ async fn fetch_chunk_or_404(
 /// next on the redraft loop — identity (`chunk_id`, `status`), the proposal
 /// it submitted (`rule_name`, `binary`), the two feedback signals
 /// (`rejection_reason` from the reviewer, `validation_result` from the
-/// gateway prover), and (on /wait) `policy_reloaded` so the agent can tell
+/// gateway admission or advisory context), and (on /wait) `policy_reloaded` so the agent can tell
 /// "approved AND the new rule is loaded — safe to retry" from "approved
 /// but the supervisor hasn't reloaded yet — re-issue /wait or surface to
 /// user". Display-only proto fields (`hit_count`, `confidence`, `stage`,

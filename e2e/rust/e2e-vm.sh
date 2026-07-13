@@ -124,8 +124,8 @@ GATEWAY_PID_FILE="${RUN_STATE_DIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${RUN_STATE_DIR}/gateway.args"
 GATEWAY_CONFIG="${RUN_STATE_DIR}/gateway.toml"
 GATEWAY_DB="${RUN_STATE_DIR}/gateway.db"
-JWT_DIR="${RUN_STATE_DIR}/jwt"
 PKI_DIR="${RUN_STATE_DIR}/pki"
+JWT_DIR="${PKI_DIR}/jwt"
 GATEWAY_NAME="openshell-e2e-vm-${HOST_PORT}"
 
 # ── Cleanup (trap) ───────────────────────────────────────────────────
@@ -194,7 +194,6 @@ echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STA
 # host-loopback proxy carries the connection while keeping the endpoint aligned
 # with package-managed gateway certificates. gvproxy's bare gateway IP
 # (192.168.127.1) does NOT forward arbitrary host ports.
-e2e_generate_gateway_jwt "${JWT_DIR}"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 
 cat >"${GATEWAY_CONFIG}" <<EOF

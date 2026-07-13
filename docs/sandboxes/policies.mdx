@@ -73,6 +73,54 @@ User-specified paths in your policy YAML are not pre-filtered. If you list a pat
 
 This distinction means baseline system paths degrade gracefully while user-specified paths surface configuration errors.
 
+## Managed Maximum Policies
+
+A gateway administrator can configure one managed maximum policy that bounds every sandbox on
+the gateway. The maximum is a ceiling: it does not become the sandbox's active policy and does not
+grant runtime access by itself. OpenShell proves the sandbox policy plus attached provider policy
+against the maximum before creation and before any authority-changing update.
+
+Configure the maximum before creating sandboxes:
+
+```shell
+openshell policy maximum set --policy ./maximum.yaml --yes
+openshell policy maximum get --full
+openshell sandbox create --policy ./base.yaml --permission-mode auto
+```
+
+The maximum uses normal policy YAML plus a top-level `metadata` block. It can also mark an endpoint
+or individual allow rule with `review.required: true`. Its `allowed_modes` and `default_mode` select
+how agent proposals inside the boundary behave:
+
+| Mode | Auto-eligible proposal | Review-required proposal | Outside or unsupported proposal |
+|---|---|---|---|
+| `ask` | Keep pending for a reviewer. | Keep pending for a reviewer. | Reject before persistence. |
+| `auto` | Apply after live-state revalidation. | Keep pending for a reviewer. | Reject before persistence. |
+
+An authenticated direct policy edit is approval of that exact change, but it must still fit inside
+the maximum. Sandbox creation rejects review-required starting authority. Provider attachment and
+provider-derived policy are part of the same composed candidate. Credential values are never
+included in decision logs.
+
+The initial managed containment surface supports filesystem paths plus L4 and REST network
+authority. Explicit deny rules take precedence. GraphQL, MCP, and endpoint behavior that the
+containment prover does not model fail closed in managed mode. On an unmanaged gateway, accepted
+agent proposals always wait for human review; there is no separate unmanaged automatic mode. An
+attached provider must have a resolvable policy profile so the gateway can include its
+credential-bearing reach in the proof.
+
+The maximum can be replaced or deleted only when no sandboxes exist, and it cannot coexist with a
+gateway-global policy override. This initial implementation requires single-replica SQLite storage;
+the gateway rejects managed maximum configuration with PostgreSQL/HA storage until admission uses
+database-backed coordination:
+
+```shell
+openshell policy maximum delete --yes
+```
+
+See the runnable [managed maximum examples](https://github.com/NVIDIA/OpenShell/tree/main/examples/managed-maximum-policies)
+for REST read-auto/write-review behavior.
+
 ## Apply a Custom Policy
 
 Pass a policy YAML file when creating the sandbox:

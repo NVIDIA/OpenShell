@@ -137,6 +137,18 @@ service OpenShell {
   rpc GetGatewayConfig(openshell.sandbox.v1.GetGatewayConfigRequest)
       returns (openshell.sandbox.v1.GetGatewayConfigResponse);
 
+  // Configure the gateway-owned maximum authority boundary.
+  rpc SetManagedMaximumPolicy(SetManagedMaximumPolicyRequest)
+      returns (ManagedMaximumPolicyResponse);
+
+  // Get the configured maximum authority boundary.
+  rpc GetManagedMaximumPolicy(GetManagedMaximumPolicyRequest)
+      returns (ManagedMaximumPolicyResponse);
+
+  // Delete the configured maximum authority boundary.
+  rpc DeleteManagedMaximumPolicy(DeleteManagedMaximumPolicyRequest)
+      returns (DeleteManagedMaximumPolicyResponse);
+
   // Update settings or policy at sandbox or global scope.
   rpc UpdateConfig(UpdateConfigRequest)
       returns (UpdateConfigResponse);
@@ -326,10 +338,9 @@ message SandboxSpec {
   ResourceRequirements resource_requirements = 9;
   reserved 10;
   reserved "gpu_device";
-  // Field 11 was `proposal_approval_mode`. The approval mode is now a
-  // runtime setting (gateway or sandbox scope) read via UpdateConfig /
-  // GetSandboxConfig, so it can be flipped on a running sandbox and
-  // managed fleet-wide.
+  // Field 11 was the legacy unmanaged proposal approval mode. Automatic
+  // proposal application now requires a gateway-managed maximum policy and
+  // the sandbox's immutable managed permission mode.
   reserved 11;
   reserved "proposal_approval_mode";
 }
@@ -447,6 +458,10 @@ message CreateSandboxRequest {
   string name = 2;
   // Optional labels for the sandbox (key-value metadata).
   map<string, string> labels = 3;
+  // Managed permission mode for this sandbox (`ask` or `auto`). When omitted,
+  // a configured managed maximum supplies its default. Rejected when no
+  // managed maximum is configured.
+  string permission_mode = 4;
 }
 
 // Get sandbox request.
@@ -1283,6 +1298,34 @@ message UpdateConfigResponse {
   bool deleted = 4;
 }
 
+// Set one gateway-owned managed maximum policy document.
+message SetManagedMaximumPolicyRequest {
+  // OpenShell policy YAML plus a top-level managed `metadata` block.
+  bytes policy_yaml = 1;
+}
+
+message GetManagedMaximumPolicyRequest {}
+
+message DeleteManagedMaximumPolicyRequest {}
+
+// Current managed maximum policy and its validated metadata.
+message ManagedMaximumPolicyResponse {
+  bool configured = 1;
+  bytes policy_yaml = 2;
+  string policy_id = 3;
+  uint64 version = 4;
+  repeated string allowed_modes = 5;
+  string default_mode = 6;
+  string audit_label = 7;
+  string policy_hash = 8;
+  uint64 settings_revision = 9;
+}
+
+message DeleteManagedMaximumPolicyResponse {
+  bool deleted = 1;
+  uint64 settings_revision = 2;
+}
+
 // Get sandbox policy status request.
 message GetSandboxPolicyStatusRequest {
   // Sandbox name (canonical lookup key). Ignored when global is true.
@@ -1852,8 +1895,8 @@ message DraftChunkPayload {
   string binary = 9;
   // Current draft version for the owning sandbox.
   int64 draft_version = 10;
-  // Gateway prover verdict for this chunk; empty until prover runs.
-  // Mirrors PolicyChunk.validation_result.
+  // Managed-admission context or a non-gating gateway advisory. Empty when
+  // neither applies. Mirrors PolicyChunk.validation_result.
   string validation_result = 11;
   // Operator-supplied free-form rejection text; empty for non-rejected
   // chunks. Mirrors PolicyChunk.rejection_reason.
@@ -1892,7 +1935,7 @@ message StoredDraftChunk {
   int32 hit_count = 15;
   int64 first_seen_ms = 16;
   int64 last_seen_ms = 17;
-  // Gateway prover verdict; empty until the prover runs. See PolicyChunk.
+  // Managed-admission context or a non-gating gateway advisory. See PolicyChunk.
   string validation_result = 18;
   // Operator-supplied free-form rejection text. See PolicyChunk.
   string rejection_reason = 19;

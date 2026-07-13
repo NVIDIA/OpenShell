@@ -328,10 +328,10 @@ impl OcsfEvent {
                 );
                 let what = e.base.message.as_deref().unwrap_or("config");
                 // Bracketed suffix carries the structured provenance fields a
-                // reviewer needs to scan a CONFIG audit line. Auto-approval
-                // emits `auto`/`source`/`prover_delta`; every config change
-                // also carries `policy_version` and `policy_hash`. Order is
-                // stable so logs are greppable.
+                // reviewer needs to scan a CONFIG audit line. Managed
+                // automatic application emits `auto`/`source`/`approval_basis`;
+                // every config change also carries `policy_version` and
+                // `policy_hash`. Order is stable so logs are greppable.
                 let suffix = e
                     .base
                     .unmapped
@@ -345,6 +345,7 @@ impl OcsfEvent {
                         };
                         push("auto");
                         push("source");
+                        push("approval_basis");
                         push("prover_delta");
                         push("resolved_from");
                         if let Some(ver) = u.get("policy_version").and_then(|v| v.as_str()) {
@@ -984,17 +985,15 @@ mod tests {
         );
     }
 
-    /// Auto-approval audit events carry `auto`, `source`, `prover_delta`, and
-    /// `resolved_from` as unmapped fields. Lock the suffix order so operators
-    /// (and the demo's grep) can rely on it.
+    /// Managed automatic application audit events carry the approval basis as
+    /// an unmapped field. Lock the suffix order so operators can rely on it.
     #[test]
-    fn test_config_state_change_shorthand_includes_auto_approve_fields() {
+    fn test_config_state_change_shorthand_includes_managed_apply_fields() {
         let mut b = base(5019, "Device Config State Change", 5, "Discovery", 1, "Log");
-        b.set_message("auto-approved: no new prover findings (source=agent_authored)");
+        b.set_message("managed maximum auto-applied proposal (source=agent_authored)");
         b.add_unmapped("auto", serde_json::json!("true"));
         b.add_unmapped("source", serde_json::json!("agent_authored"));
-        b.add_unmapped("prover_delta", serde_json::json!("empty"));
-        b.add_unmapped("resolved_from", serde_json::json!("sandbox"));
+        b.add_unmapped("approval_basis", serde_json::json!("managed_maximum"));
         b.add_unmapped("policy_version", serde_json::json!("v4"));
         b.add_unmapped("policy_hash", serde_json::json!("sha256:cafe"));
 
@@ -1009,8 +1008,8 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "CONFIG:APPROVED [INFO] auto-approved: no new prover findings (source=agent_authored) \
-             [auto:true source:agent_authored prover_delta:empty resolved_from:sandbox \
+            "CONFIG:APPROVED [INFO] managed maximum auto-applied proposal (source=agent_authored) \
+             [auto:true source:agent_authored approval_basis:managed_maximum \
              version:v4 hash:sha256:cafe]"
         );
     }
