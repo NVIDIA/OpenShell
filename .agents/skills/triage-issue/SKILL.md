@@ -45,13 +45,29 @@ Assess one specific issue. Proceed to Step 1 with the given issue number.
 triage issues
 ```
 
-Query all open issues with the `state:triage-needed` label and process them in sequence:
+Batch mode requires a confirmation gate before processing. This prevents accidental mass-commenting on a public repository.
+
+**Step 1: Preview.** Query all matching issues and display a summary:
 
 ```bash
-gh issue list --label "state:triage-needed" --state open --json number,title --jq '.[].number'
+gh issue list --label "state:triage-needed" --state open --json number,title --jq '.[] | "#\(.number) \(.title)"'
 ```
 
-For each issue returned, run the full triage workflow (Steps 1-7). Report a summary at the end listing each issue and its classification.
+Present the results to the user:
+
+```
+Found N issues with state:triage-needed:
+
+  #250  Bug: sandbox fails to start with VM driver
+  #312  Feature: add --output yaml to sandbox list
+  ... (show up to 10, then "and N more")
+
+This will post a triage comment on each issue.
+```
+
+**Step 2: Confirm.** Ask the user for explicit confirmation before proceeding. Use `AskUserQuestion` with options "Proceed with all N issues", "Let me pick specific issues", and let them provide custom input. Do **not** proceed without confirmation.
+
+**Step 3: Process.** Only after confirmation, run the full triage workflow (Steps 1-7 below) for each issue. Report a summary at the end listing each issue and its classification.
 
 ## Step 1: Fetch the Issue
 
