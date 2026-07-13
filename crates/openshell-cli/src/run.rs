@@ -7329,6 +7329,9 @@ fn policy_revision_to_json(
     if !rev.load_error.is_empty() {
         obj.insert("load_error".to_string(), serde_json::json!(rev.load_error));
     }
+    if !rev.provenance.is_empty() {
+        obj.insert("provenance".to_string(), serde_json::json!(rev.provenance));
+    }
     if view.includes_policy() {
         let policy = match rev.policy.as_ref() {
             Some(policy) => {
@@ -7884,7 +7887,7 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
+        PolicyGetView, ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_to_json,
@@ -7892,7 +7895,7 @@ mod tests {
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
-        plaintext_gateway_is_remote, progress_step_from_metadata,
+        plaintext_gateway_is_remote, policy_revision_to_json, progress_step_from_metadata,
         provider_profile_allows_empty_credentials, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
         sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
@@ -7917,11 +7920,40 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GpuResourceRequirements, Provider, ProviderCredentialRefresh,
+        GpuResourceRequirements, PolicyStatus, Provider, ProviderCredentialRefresh,
         ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
         ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        ResourceRequirements, SandboxCondition, SandboxPolicyRevision, SandboxStatus,
+        datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn policy_revision_json_includes_revision_provenance() {
+        let revision = SandboxPolicyRevision {
+            version: 2,
+            policy_hash: "hash".to_string(),
+            provenance: std::collections::HashMap::from([(
+                "openshell.nvidia.com/policy-signature".to_string(),
+                "signed".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let json = policy_revision_to_json(
+            "sandbox",
+            Some("example"),
+            Some(2),
+            &revision,
+            PolicyStatus::Pending,
+            PolicyGetView::Metadata,
+        )
+        .unwrap();
+
+        assert_eq!(
+            json["provenance"]["openshell.nvidia.com/policy-signature"],
+            "signed"
+        );
+    }
 
     struct EnvVarGuard {
         key: &'static str,

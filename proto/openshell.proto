@@ -1230,8 +1230,10 @@ message UpdateConfigRequest {
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   // Ignored for global-scoped updates.
   uint64 expected_resource_version = 8;
-  // Optional annotations to merge into sandbox metadata after a successful
-  // sandbox-scoped update. Intended for non-secret provenance metadata.
+  // Complete, non-secret provenance for a sandbox policy revision. The gateway
+  // stores this map immutably with the revision and also merges it into sandbox
+  // metadata as a convenience projection. For setting-only updates, the map is
+  // only merged into sandbox metadata.
   map<string, string> annotations = 9;
 }
 
@@ -1356,6 +1358,8 @@ message SandboxPolicyRevision {
   int64 loaded_at_ms = 6;
   // The full policy (only populated when explicitly requested).
   openshell.sandbox.v1.SandboxPolicy policy = 7;
+  // Immutable provenance supplied with this policy revision.
+  map<string, string> provenance = 8;
 }
 
 // Policy load status.
@@ -1837,6 +1841,8 @@ message PolicyRevisionPayload {
   string load_error = 3;
   // When the policy version was reported as loaded (ms since epoch). 0 if unset.
   int64 loaded_at_ms = 4;
+  // Immutable provenance supplied when this revision was created.
+  map<string, string> provenance = 5;
 }
 
 // Stored payload for a draft policy chunk row in the generic objects table.
@@ -1880,6 +1886,7 @@ message StoredPolicyRevision {
   optional string load_error = 7;
   int64 created_at_ms = 8;
   optional int64 loaded_at_ms = 9;
+  map<string, string> provenance = 10;
 }
 
 // Internal stored draft chunk row materialized from the generic objects table.

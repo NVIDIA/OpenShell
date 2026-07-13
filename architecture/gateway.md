@@ -198,6 +198,15 @@ populate `scope`, `version`, `status`, `dedup_key`, and `hit_count` so the
 gateway can efficiently fetch the latest policy, track load status, and manage
 advisor drafts without creating resource-specific tables.
 
+Each sandbox policy revision stores the complete provenance annotation map
+supplied with that update. The revision payload is the authoritative immutable
+record; sandbox metadata receives the same annotations only as a convenience
+projection and can retain keys from earlier revisions. Policy revision creation,
+optional first-policy backfill, metadata projection, and superseding older
+revisions commit in one database transaction. SQLite serializes this operation
+with an immediate transaction, while Postgres locks the sandbox row. A failed
+resource-version check or revision insert rolls back the entire operation.
+
 SQLite is the default local store; Postgres is supported for deployments that
 need an external database or multi-replica coordination. Both backends expose
 the same `Store` API and the same logical schema. Backend differences stay

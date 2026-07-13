@@ -13,7 +13,7 @@
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
-use crate::policy_store::PolicyStoreExt;
+use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::ProviderProfileSources;
 use openshell_core::net::is_internal_ip;
 use openshell_core::proto::policy_merge_operation;
@@ -1127,6 +1127,42 @@ async fn persist_update_config_annotations(
     Ok(sandbox_metadata_annotations(&updated))
 }
 
+async fn persist_existing_policy_projection(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    expected_resource_version: u64,
+    annotations: &HashMap<String, String>,
+    current_annotations: &HashMap<String, String>,
+    backfill_policy: Option<&ProtoSandboxPolicy>,
+) -> Result<HashMap<String, String>, Status> {
+    let annotations_match = annotations
+        .iter()
+        .all(|(key, value)| current_annotations.get(key) == Some(value));
+    if backfill_policy.is_none() && annotations_match {
+        return Ok(current_annotations.clone());
+    }
+
+    let annotations = annotations.clone();
+    let backfill_policy = backfill_policy.cloned();
+    let updated = state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
+            if let Some(policy) = backfill_policy.as_ref()
+                && let Some(spec) = sandbox.spec.as_mut()
+                && spec.policy.is_none()
+            {
+                spec.policy = Some(policy.clone());
+            }
+            if let Some(metadata) = sandbox.metadata.as_mut() {
+                metadata.annotations.extend(annotations.clone());
+            }
+        })
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "store policy projection"))?;
+
+    Ok(sandbox_metadata_annotations(&updated))
+}
+
 async fn resolve_sandbox_by_name_for_principal(
     store: &Store,
     principal: &Principal,
@@ -1866,21 +1902,32 @@ async fn handle_update_config_inner(
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
         let merge_ops = parse_merge_operations(&req.merge_operations)?;
         validate_merge_operations_for_server(&merge_ops)?;
-        let (version, hash) = apply_merge_operations_with_retry(
+        let atomic_context = AtomicPolicyWriteContext {
+            expected_resource_version: req.expected_resource_version,
+            provenance: &req.annotations,
+            annotations: &req.annotations,
+        };
+        let (version, hash, updated_sandbox) = apply_merge_operations_with_retry(
             state.store.as_ref(),
             &sandbox_id,
             spec.policy.as_ref(),
             &merge_ops,
+            Some(&atomic_context),
         )
         .await?;
-        response_annotations = persist_update_config_annotations(
-            state,
-            &sandbox_id,
-            req.expected_resource_version,
-            &req.annotations,
-            &response_annotations,
-        )
-        .await?;
+        response_annotations = if let Some(updated_sandbox) = updated_sandbox {
+            sandbox_metadata_annotations(&updated_sandbox)
+        } else {
+            persist_existing_policy_projection(
+                state,
+                &sandbox_id,
+                req.expected_resource_version,
+                &req.annotations,
+                &response_annotations,
+                None,
+            )
+            .await?
+        };
 
         state.sandbox_watch_bus.notify(&sandbox_id);
         emit_gateway_policy_audit_log(
@@ -1954,94 +2001,108 @@ async fn handle_update_config_inner(
         validate_no_reserved_provider_policy_keys(&new_policy)?;
     }
 
-    if let Some(baseline_policy) = spec.policy.as_ref() {
+    let backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         validate_policy_safety(&new_policy)?;
+        None
     } else {
-        // Backfill spec.policy using CAS (first-time policy discovery)
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-        let sandbox_id = sandbox.object_id().to_string();
-        let new_policy_clone = new_policy.clone();
-        let annotations = req.annotations.clone();
-        let updated_sandbox = state
-            .store
-            .update_message_cas::<Sandbox, _>(
-                &sandbox_id,
-                req.expected_resource_version,
-                |sandbox| {
-                    if let Some(ref mut spec) = sandbox.spec
-                        && spec.policy.is_none()
-                    {
-                        spec.policy = Some(new_policy_clone.clone());
-                    }
-                    if !annotations.is_empty()
-                        && let Some(metadata) = sandbox.metadata.as_mut()
-                    {
-                        metadata.annotations.extend(annotations.clone());
-                    }
-                },
-            )
-            .await
-            .map_err(|e| super::persistence_error_to_status(e, "backfill spec.policy"))?;
-        response_annotations = sandbox_metadata_annotations(&updated_sandbox);
+        Some(new_policy.clone())
+    };
+    let _sandbox_sync_guard = if backfill_policy.is_some() {
+        Some(state.compute.sandbox_sync_guard().await)
+    } else {
+        None
+    };
+
+    let payload = new_policy.encode_to_vec();
+    let hash = deterministic_policy_hash(&new_policy);
+    let (next_version, committed_annotations) = {
+        let mut committed = None;
+        for attempt in 1..=MERGE_RETRY_LIMIT {
+            let latest = state
+                .store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
+
+            if let Some(ref current) = latest
+                && current.policy_hash == hash
+                && current.provenance == req.annotations
+            {
+                response_annotations = persist_existing_policy_projection(
+                    state,
+                    &sandbox_id,
+                    req.expected_resource_version,
+                    &req.annotations,
+                    &response_annotations,
+                    backfill_policy.as_ref(),
+                )
+                .await?;
+                if backfill_policy.is_some() {
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
+                    );
+                }
+                return Ok(update_config_response(
+                    u32::try_from(current.version).unwrap_or(0),
+                    hash,
+                    0,
+                    false,
+                    response_annotations,
+                ));
+            }
+
+            let next_version = latest.as_ref().map_or(1, |record| record.version + 1);
+            let write = AtomicPolicyRevisionWrite {
+                id: uuid::Uuid::new_v4().to_string(),
+                sandbox_id: sandbox_id.clone(),
+                version: next_version,
+                policy_payload: payload.clone(),
+                policy_hash: hash.clone(),
+                provenance: req.annotations.clone(),
+                expected_resource_version: req.expected_resource_version,
+                annotations: req.annotations.clone(),
+                backfill_policy: backfill_policy.clone(),
+            };
+
+            match state.store.put_policy_revision_atomic(&write).await {
+                Ok(updated_sandbox) => {
+                    committed =
+                        Some((next_version, sandbox_metadata_annotations(&updated_sandbox)));
+                    break;
+                }
+                Err(error) if error.is_unique_violation_on("objects_version_uq") => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        attempt,
+                        conflicting_version = next_version,
+                        "UpdateConfig: policy version conflict, retrying"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    return Err(super::persistence_error_to_status(
+                        error,
+                        "persist policy revision",
+                    ));
+                }
+            }
+        }
+        committed.ok_or_else(|| {
+            Status::aborted(format!(
+                "UpdateConfig: gave up after {MERGE_RETRY_LIMIT} policy version conflict retries"
+            ))
+        })?
+    };
+    response_annotations = committed_annotations;
+
+    if backfill_policy.is_some() {
         info!(
             sandbox_id = %sandbox_id,
             "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
         );
     }
-
-    let latest = state
-        .store
-        .get_latest_policy(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
-
-    let payload = new_policy.encode_to_vec();
-    let hash = deterministic_policy_hash(&new_policy);
-
-    if let Some(ref current) = latest
-        && current.policy_hash == hash
-    {
-        response_annotations = persist_update_config_annotations(
-            state,
-            &sandbox_id,
-            req.expected_resource_version,
-            &req.annotations,
-            &response_annotations,
-        )
-        .await?;
-
-        return Ok(update_config_response(
-            u32::try_from(current.version).unwrap_or(0),
-            hash,
-            0,
-            false,
-            response_annotations,
-        ));
-    }
-
-    let next_version = latest.map_or(1, |r| r.version + 1);
-    let policy_id = uuid::Uuid::new_v4().to_string();
-
-    state
-        .store
-        .put_policy_revision(&policy_id, &sandbox_id, next_version, &payload, &hash)
-        .await
-        .map_err(|e| Status::internal(format!("persist policy revision failed: {e}")))?;
-
-    let _ = state
-        .store
-        .supersede_older_policies(&sandbox_id, next_version)
-        .await;
-
-    response_annotations = persist_update_config_annotations(
-        state,
-        &sandbox_id,
-        req.expected_resource_version,
-        &req.annotations,
-        &response_annotations,
-    )
-    .await?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
 
@@ -3372,6 +3433,7 @@ fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> San
         created_at_ms: record.created_at_ms,
         loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
         policy,
+        provenance: record.provenance.clone(),
     }
 }
 
@@ -3660,12 +3722,19 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
     }
 }
 
+struct AtomicPolicyWriteContext<'a> {
+    expected_resource_version: u64,
+    provenance: &'a HashMap<String, String>,
+    annotations: &'a HashMap<String, String>,
+}
+
 async fn apply_merge_operations_with_retry(
     store: &Store,
     sandbox_id: &str,
     baseline_policy: Option<&ProtoSandboxPolicy>,
     operations: &[PolicyMergeOp],
-) -> Result<(i64, String), Status> {
+    atomic_context: Option<&AtomicPolicyWriteContext<'_>>,
+) -> Result<(i64, String, Option<Sandbox>), Status> {
     for attempt in 1..=MERGE_RETRY_LIMIT {
         let latest = store
             .get_latest_policy(sandbox_id)
@@ -3690,26 +3759,48 @@ async fn apply_merge_operations_with_retry(
 
         if let Some(ref current) = latest
             && current.policy_hash == hash
+            && atomic_context.is_none_or(|context| current.provenance == *context.provenance)
         {
-            return Ok((current.version, hash));
+            return Ok((current.version, hash, None));
         }
 
         if latest.is_none() && !merged.changed {
-            return Ok((0, hash));
+            return Ok((0, hash, None));
         }
 
         let payload = new_policy.encode_to_vec();
         let next_version = latest.as_ref().map_or(1, |record| record.version + 1);
         let policy_id = uuid::Uuid::new_v4().to_string();
 
-        match store
-            .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
-            .await
-        {
-            Ok(()) => {
-                let _ = store
-                    .supersede_older_policies(sandbox_id, next_version)
-                    .await;
+        let write_result = if let Some(context) = atomic_context {
+            store
+                .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+                    id: policy_id,
+                    sandbox_id: sandbox_id.to_string(),
+                    version: next_version,
+                    policy_payload: payload,
+                    policy_hash: hash.clone(),
+                    provenance: context.provenance.clone(),
+                    expected_resource_version: context.expected_resource_version,
+                    annotations: context.annotations.clone(),
+                    backfill_policy: None,
+                })
+                .await
+                .map(Some)
+        } else {
+            store
+                .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
+                .await
+                .map(|()| None)
+        };
+
+        match write_result {
+            Ok(updated_sandbox) => {
+                if atomic_context.is_none() {
+                    let _ = store
+                        .supersede_older_policies(sandbox_id, next_version)
+                        .await;
+                }
 
                 if attempt > 1 {
                     info!(
@@ -3721,7 +3812,7 @@ async fn apply_merge_operations_with_retry(
                     );
                 }
 
-                return Ok((next_version, hash));
+                return Ok((next_version, hash, updated_sandbox));
             }
             Err(e) => {
                 if e.is_unique_violation_on("objects_version_uq") {
@@ -3759,7 +3850,9 @@ pub(super) async fn merge_chunk_into_policy(
         rule,
     }];
     validate_merge_operations_for_server(&operations)?;
-    apply_merge_operations_with_retry(store, sandbox_id, None, &operations).await
+    apply_merge_operations_with_retry(store, sandbox_id, None, &operations, None)
+        .await
+        .map(|(version, hash, _)| (version, hash))
 }
 
 async fn remove_chunk_from_policy(
@@ -3775,8 +3868,10 @@ async fn remove_chunk_from_policy(
             rule_name: chunk.rule_name.clone(),
             binary_path: chunk.binary.clone(),
         }],
+        None,
     )
     .await
+    .map(|(version, hash, _)| (version, hash))
 }
 
 // ---------------------------------------------------------------------------
@@ -9207,8 +9302,8 @@ mod tests {
         }];
 
         let (left, right) = tokio::join!(
-            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_allow),
-            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_deny),
+            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_allow, None),
+            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_deny, None),
         );
 
         let mut versions = vec![left.unwrap().0, right.unwrap().0];
@@ -10366,10 +10461,17 @@ mod tests {
             stored.spec.as_ref().unwrap().policy.is_some(),
             "policy should still be backfilled"
         );
+        let revision = state
+            .store
+            .get_latest_policy("sb-annotated-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision.provenance, annotations);
     }
 
     #[tokio::test]
-    async fn update_config_same_policy_hash_persists_and_returns_annotations() {
+    async fn update_config_same_policy_hash_with_new_provenance_creates_revision() {
         let state = test_server_state().await;
         let mut policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
         openshell_policy::ensure_sandbox_process_identity(&mut policy);
@@ -10404,7 +10506,7 @@ mod tests {
         .unwrap()
         .into_inner();
 
-        assert_eq!(response.version, 1);
+        assert_eq!(response.version, 2);
         assert_eq!(
             response
                 .annotations
@@ -10429,6 +10531,77 @@ mod tests {
                 .map(String::as_str),
             Some("same-hash-signature")
         );
+        let latest = state
+            .store
+            .get_latest_policy("sb-same-hash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.version, 2);
+        assert_eq!(
+            latest.provenance,
+            HashMap::from([(
+                "openshell.nvidia.com/policy-signature".to_string(),
+                "same-hash-signature".to_string(),
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_same_policy_and_provenance_is_idempotent() {
+        let state = test_server_state().await;
+        let mut policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut policy);
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-idempotent-provenance",
+                "idempotent-provenance",
+                policy.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let annotations = HashMap::from([(
+            "openshell.nvidia.com/policy-signature".to_string(),
+            "same-signature".to_string(),
+        )]);
+
+        let first = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "idempotent-provenance".to_string(),
+                policy: Some(policy.clone()),
+                annotations: annotations.clone(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let second = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "idempotent-provenance".to_string(),
+                policy: Some(policy),
+                annotations: annotations.clone(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 1);
+        assert_eq!(second.annotations, annotations);
+        let revisions = state
+            .store
+            .list_policies("sb-idempotent-provenance", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].provenance, annotations);
     }
 
     #[tokio::test]
@@ -10560,6 +10733,65 @@ mod tests {
                 .map(String::as_str),
             Some("keep")
         );
+    }
+
+    #[tokio::test]
+    async fn update_config_merge_stores_revision_provenance_atomically() {
+        let state = test_server_state().await;
+        let mut baseline = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut baseline);
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-merge-provenance",
+                "merge-provenance",
+                baseline,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let provenance = HashMap::from([(
+            "openshell.nvidia.com/policy-signature".to_string(),
+            "merge-signature".to_string(),
+        )]);
+
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "merge-provenance".to_string(),
+                merge_operations: vec![PolicyMergeOperation {
+                    operation: Some(policy_merge_operation::Operation::AddRule(
+                        openshell_core::proto::AddNetworkRule {
+                            rule_name: "allow_api_example".to_string(),
+                            rule: Some(NetworkPolicyRule {
+                                name: "allow_api_example".to_string(),
+                                endpoints: vec![NetworkEndpoint {
+                                    host: "api.example.com".to_string(),
+                                    port: 443,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }),
+                        },
+                    )),
+                }],
+                annotations: provenance.clone(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.version, 1);
+        assert_eq!(response.annotations, provenance);
+        let revision = state
+            .store
+            .get_latest_policy("sb-merge-provenance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision.provenance, provenance);
     }
 
     #[tokio::test]
@@ -10909,6 +11141,15 @@ mod tests {
             unchanged.spec.as_ref().unwrap().policy.is_none(),
             "policy should still be None after failed backfill"
         );
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "failed backfill must not leave an orphan revision"
+        );
     }
 
     #[tokio::test]
@@ -11009,6 +11250,16 @@ mod tests {
         assert!(
             final_sandbox.spec.as_ref().unwrap().policy.is_some(),
             "policy should be backfilled after one success"
+        );
+        assert_eq!(
+            state
+                .store
+                .list_policies("sb-1", 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "concurrent backfills must create exactly one revision"
         );
     }
 }
