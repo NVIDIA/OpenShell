@@ -610,7 +610,8 @@ async fn handle_tcp_connection(
         .await;
     }
 
-    let (host, port) = parse_target(target)?;
+    let (raw_host, port) = parse_target(target)?;
+    let host = normalize_connect_host(&raw_host);
     let host_lc = host.to_ascii_lowercase();
 
     if host_lc == INFERENCE_LOCAL_HOST && port == INFERENCE_LOCAL_PORT {
@@ -763,7 +764,7 @@ async fn handle_tcp_connection(
     // while keeping loopback/link-local/unspecified addresses denied.
     let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
     if raw_allowed_ips.is_empty() {
-        raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
+        raw_allowed_ips = implicit_allowed_ips_for_ip_host(host);
     }
     let exact_declared_endpoint_host =
         query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port);
@@ -781,7 +782,7 @@ async fn handle_tcp_connection(
         // user code runs). Bypass the normal SSRF tiers so link-local gateway
         // addresses (used by rootless Podman with pasta) are not hard-blocked.
         // Cloud metadata IPs and control-plane ports are still rejected.
-        match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
+        match resolve_and_check_trusted_gateway(&raw_host, port, gw, sandbox_entrypoint_pid).await {
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
@@ -833,7 +834,7 @@ async fn handle_tcp_connection(
         // Loopback and link-local are still always blocked.
         match parse_allowed_ips(&raw_allowed_ips) {
             Ok(nets) => {
-                match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
+                match resolve_and_check_allowed_ips(&raw_host, port, &nets, sandbox_entrypoint_pid)
                     .await
                 {
                     Ok(addrs) => addrs,
@@ -935,7 +936,7 @@ async fn handle_tcp_connection(
         // host:port, so private IP resolution is permitted without duplicating
         // the resolved IP in allowed_ips. Always-blocked addresses and
         // control-plane ports remain denied.
-        match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
+        match resolve_and_check_declared_endpoint(&raw_host, port, sandbox_entrypoint_pid).await {
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
@@ -985,7 +986,7 @@ async fn handle_tcp_connection(
         }
     } else {
         // Default: reject all internal IPs (loopback, RFC 1918, link-local).
-        match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
+        match resolve_and_reject_internal(&raw_host, port, sandbox_entrypoint_pid).await {
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
@@ -4542,6 +4543,10 @@ fn parse_target(target: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
+fn normalize_connect_host(raw_host: &str) -> &str {
+    raw_host.strip_suffix('.').unwrap_or(raw_host)
+}
+
 async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     client.write_all(bytes).await.into_diagnostic()?;
     Ok(())
@@ -7452,6 +7457,19 @@ network_policies:
             host, "evil.com\0.safe.com",
             "NUL byte not stripped or rejected"
         );
+    }
+
+    #[test]
+    fn test_normalize_connect_host_strips_single_trailing_dot() {
+        assert_eq!(
+            normalize_connect_host("api.example.com."),
+            "api.example.com"
+        );
+    }
+
+    #[test]
+    fn test_normalize_connect_host_remains_the_same() {
+        assert_eq!(normalize_connect_host("api.example.com"), "api.example.com");
     }
 
     #[test]
