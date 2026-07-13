@@ -592,6 +592,15 @@ mod tests {
         assert!(path.exists());
     }
 
+    /// Make the spawned shell block until the test kills it: `read` is a
+    /// builtin, so the copied /bin/sh needs no other binaries, and it blocks
+    /// for as long as the test holds the write end of the stdin pipe.
+    #[cfg(target_os = "linux")]
+    fn block_until_killed(cmd: &mut std::process::Command) -> &mut std::process::Command {
+        cmd.args(["-c", "read _x"])
+            .stdin(std::process::Stdio::piped())
+    }
+
     /// Verify that an unlinked binary's path is returned without the
     /// kernel's " (deleted)" suffix. This is the common case during a
     /// `docker cp` hot-swap of the supervisor binary — before this strip,
@@ -602,10 +611,11 @@ mod tests {
     fn binary_path_strips_deleted_suffix() {
         use std::os::unix::fs::PermissionsExt;
 
-        // Copy /bin/sleep to a temp path we control so we can unlink it.
+        // Copy /bin/sh (the only universally present binary) to a temp path
+        // we control so we can unlink it.
         let tmp = tempfile::TempDir::new().unwrap();
         let exe_path = tmp.path().join("deleted-sleep");
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy("/bin/sh", &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         // Spawn a child from the temp binary, then unlink it while the
@@ -613,7 +623,7 @@ mod tests {
         // `/proc/<pid>/exe`, but readlink will now return the tainted
         // "<path> (deleted)" string.
         let mut cmd = std::process::Command::new(&exe_path);
-        cmd.arg("5");
+        block_until_killed(&mut cmd);
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
         wait_for_child_exec(pid, &exe_path);
@@ -659,11 +669,11 @@ mod tests {
         // Basename literally ends with " (deleted)" while the file is still
         // on disk — a pathological but legal filename.
         let exe_path = tmp.path().join("sleepy (deleted)");
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy("/bin/sh", &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(&exe_path);
-        cmd.arg("5");
+        block_until_killed(&mut cmd);
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
         wait_for_child_exec(pid, &exe_path);
@@ -702,11 +712,11 @@ mod tests {
         raw_name.extend_from_slice(b".bin");
         let exe_path = tmp.path().join(OsString::from_vec(raw_name));
 
-        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::copy("/bin/sh", &exe_path).unwrap();
         std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cmd = std::process::Command::new(&exe_path);
-        cmd.arg("5");
+        block_until_killed(&mut cmd);
         let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
         let pid: i32 = child.id().cast_signed();
         wait_for_child_exec(pid, &exe_path);
