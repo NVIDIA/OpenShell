@@ -5,8 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use prost::Message as _;
-use prost_types::FileDescriptorSet;
+use prost_reflect::DescriptorPool;
 
 use crate::{InterceptorError, Result};
 
@@ -59,46 +58,31 @@ pub struct OpenShellRouteIndex {
 
 impl OpenShellRouteIndex {
     pub fn from_descriptor_set(bytes: &[u8]) -> Result<Self> {
-        let set = FileDescriptorSet::decode(bytes)
+        let pool = DescriptorPool::decode(bytes)
             .map_err(|e| InterceptorError::Config(format!("decode descriptor set: {e}")))?;
+        Self::from_descriptor_pool(&pool)
+    }
+
+    pub(crate) fn from_descriptor_pool(pool: &DescriptorPool) -> Result<Self> {
+        let service = pool
+            .get_service_by_name(SERVICE_OPEN_SHELL)
+            .ok_or_else(|| {
+                InterceptorError::Config(format!(
+                    "descriptor set does not contain service '{SERVICE_OPEN_SHELL}'"
+                ))
+            })?;
         let mut all_methods = BTreeSet::new();
         let mut unary_methods = BTreeSet::new();
         let mut input_types = BTreeMap::new();
         let mut output_types = BTreeMap::new();
 
-        for file in &set.file {
-            if file.package.as_deref() != Some("openshell.v1") {
-                continue;
-            }
-            for service in &file.service {
-                if service.name.as_deref() != Some("OpenShell") {
-                    continue;
-                }
-                for method in &service.method {
-                    let name = method.name.clone().unwrap_or_default();
-                    all_methods.insert(name.clone());
-                    if !method.client_streaming.unwrap_or(false)
-                        && !method.server_streaming.unwrap_or(false)
-                    {
-                        let input_type = method
-                            .input_type
-                            .as_deref()
-                            .unwrap_or_default()
-                            .strip_prefix('.')
-                            .unwrap_or_else(|| method.input_type.as_deref().unwrap_or_default())
-                            .to_string();
-                        let output_type = method
-                            .output_type
-                            .as_deref()
-                            .unwrap_or_default()
-                            .strip_prefix('.')
-                            .unwrap_or_else(|| method.output_type.as_deref().unwrap_or_default())
-                            .to_string();
-                        unary_methods.insert(name.clone());
-                        input_types.insert(name.clone(), input_type);
-                        output_types.insert(name, output_type);
-                    }
-                }
+        for method in service.methods() {
+            let name = method.name().to_string();
+            all_methods.insert(name.clone());
+            if !method.is_client_streaming() && !method.is_server_streaming() {
+                unary_methods.insert(name.clone());
+                input_types.insert(name.clone(), method.input().full_name().to_string());
+                output_types.insert(name, method.output().full_name().to_string());
             }
         }
 

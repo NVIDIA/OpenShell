@@ -52,11 +52,12 @@ phases, and re-encoded before the handler sees the request. This keeps
 interception centralized: adding an interceptable unary RPC does not require
 method-specific gateway instrumentation.
 
-The descriptor codec preserves protobuf `oneof` metadata and rejects wire or
-JSON input that selects multiple alternatives in one group. This interceptor
-boundary is intentionally stricter than protobuf's last-member-wins behavior:
-ambiguous requests fail with `INVALID_ARGUMENT` before interceptor evaluation
-or handler dispatch.
+The descriptor codec uses protobuf's standard `oneof` semantics. If binary
+input contains multiple alternatives from one group, the last member on the
+wire wins. The middleware converts that selected value to ProtoJSON and
+re-encodes it before dispatch, so the interceptor and handler observe the same
+canonical request. ProtoJSON input that names multiple alternatives remains
+invalid.
 
 Modification results are atomic per binding. After applying one binding's full
 JSON Patch list, the middleware re-encodes the candidate as the request's
