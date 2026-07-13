@@ -44,16 +44,8 @@ pub use config::{
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, SetResourceVersion};
 
-/// Build version string derived from git metadata.
-///
-/// For local builds this is computed by `build.rs` via `git describe` using
-/// the guess-next-dev scheme (e.g. `0.0.4-dev.6+g2bf9969`). In Docker/CI
-/// builds where `.git` is absent, falls back to `CARGO_PKG_VERSION` which
-/// is already set correctly by the build pipeline's sed patch.
-pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
-    Some(v) => v,
-    None => env!("CARGO_PKG_VERSION"),
-};
+/// Build version string, from the crate version set by the release pipeline.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Encoded protobuf `FileDescriptorSet` for every proto in `proto/`.
 ///

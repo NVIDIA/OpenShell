@@ -28,7 +28,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 reqwest = { workspace = true, features = ["blocking", "rustls-tls-webpki-roots"], optional = true }
 
 [features]
-default = ["telemetry"]
+default = ["telemetry", "vendored-protoc"]
 ## Compile in anonymous telemetry emission support. On by default; disable with
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.
@@ -37,10 +37,14 @@ telemetry = ["dep:reqwest", "dep:chrono"]
 ## code in other crates. Enabled by openshell-sandbox and
 ## openshell-supervisor-network dev builds.
 test-helpers = []
+## Compile protoc from source in build.rs so plain cargo builds are
+## self-contained. Bazel builds disable this and inject a prebuilt hermetic
+## protoc via $PROTOC.
+vendored-protoc = ["dep:protobuf-src"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
-protobuf-src = { workspace = true }
+protobuf-src = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

@@ -6,3 +6,7 @@
 # the header lives in /usr/include/z3/ rather than /usr/include/. The extra -I
 # is harmless on systems where the path doesn't exist.
 BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/include/z3"
+
+# Location of the shared protobuf tree, consumed by openshell-core's build.rs.
+# Bazel builds inject this via build_script_env instead.
+OPENSHELL_PROTO_DIR = { value = "proto", relative = true }
