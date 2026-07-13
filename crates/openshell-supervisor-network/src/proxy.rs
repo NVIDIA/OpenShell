@@ -468,8 +468,8 @@ fn forward_l7_hard_deny_reason(
         .or_else(|| {
             request_info.jsonrpc.as_ref().and_then(|info| {
                 info.error
-                    .as_deref()
-                    .map(|error| format!("JSON-RPC request rejected: {error}"))
+                    .as_ref()
+                    .map(crate::l7::jsonrpc::JsonRpcInspectionError::rejection_reason)
                     .or_else(|| {
                         crate::l7::relay::jsonrpc_response_frame_hard_deny_reason(protocol, info)
                     })
@@ -4862,27 +4862,31 @@ network_policies:
 
     #[test]
     fn forward_l7_hard_deny_reason_includes_jsonrpc_errors() {
-        let request_info = crate::l7::L7RequestInfo {
-            action: "POST".to_string(),
-            target: "/rpc".to_string(),
-            query_params: std::collections::HashMap::new(),
-            graphql: None,
-            jsonrpc: Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
-                calls: Vec::new(),
-                is_batch: false,
-                receive_stream: false,
-                has_response: false,
-                error: Some("missing or non-string 'jsonrpc' field".to_string()),
-            }),
-        };
+        let cases: &[(&[u8], &str)] = &[
+            (b"{", "JSON-RPC request rejected: invalid JSON"),
+            (
+                br#"{"id":1,"method":"reports.list"}"#,
+                "JSON-RPC request rejected: missing or non-string 'jsonrpc' field",
+            ),
+        ];
 
-        let reason = forward_l7_hard_deny_reason(crate::l7::L7Protocol::JsonRpc, &request_info)
-            .expect("JSON-RPC parse error");
+        for &(body, expected_reason) in cases {
+            let request_info = crate::l7::L7RequestInfo {
+                action: "POST".to_string(),
+                target: "/rpc".to_string(),
+                query_params: std::collections::HashMap::new(),
+                graphql: None,
+                jsonrpc: Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+                    body,
+                    crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
+                )),
+            };
 
-        assert_eq!(
-            reason,
-            "JSON-RPC request rejected: missing or non-string 'jsonrpc' field"
-        );
+            let reason = forward_l7_hard_deny_reason(crate::l7::L7Protocol::JsonRpc, &request_info)
+                .expect("JSON-RPC parse error");
+
+            assert_eq!(reason, expected_reason);
+        }
     }
 
     #[test]

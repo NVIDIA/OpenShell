@@ -408,8 +408,8 @@ where
             .or_else(|| {
                 jsonrpc_info
                     .as_ref()
-                    .and_then(|info| info.error.as_deref())
-                    .map(|error| format!("JSON-RPC request rejected: {error}"))
+                    .and_then(|info| info.error.as_ref())
+                    .map(crate::l7::jsonrpc::JsonRpcInspectionError::rejection_reason)
             });
         let force_deny = parse_error_reason.is_some();
         let (allowed, reason) = if let Some(reason) = parse_error_reason {
@@ -1085,8 +1085,8 @@ where
 
         let parse_error_reason = jsonrpc_info
             .error
-            .as_deref()
-            .map(|e| format!("JSON-RPC request rejected: {e}"));
+            .as_ref()
+            .map(crate::l7::jsonrpc::JsonRpcInspectionError::rejection_reason);
         let response_frame_reason =
             jsonrpc_response_frame_hard_deny_reason(config.protocol, &jsonrpc_info);
         let force_deny = parse_error_reason.is_some() || response_frame_reason.is_some();
@@ -1611,6 +1611,27 @@ fn jsonrpc_request_for_call(
     item_request
 }
 
+fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_json::Value {
+    let call = if info.is_batch {
+        None
+    } else {
+        info.calls.first()
+    };
+    serde_json::json!({
+        "method": call.map(|call| call.method.as_str()),
+        "params": call.map(|call| &call.params),
+        "tool": call.and_then(|call| call.tool.as_deref()),
+        "receive_stream": info.receive_stream,
+        "has_response": info.has_response,
+        // Rust keeps the inspection failure kind typed. Rego's stable boundary is
+        // still the original diagnostic string or null.
+        "error": info
+            .error
+            .as_ref()
+            .map(crate::l7::jsonrpc::JsonRpcInspectionError::detail),
+    })
+}
+
 fn evaluate_l7_request_once(
     engine: &TunnelPolicyEngine,
     ctx: &L7EvalContext,
@@ -1639,17 +1660,7 @@ fn evaluate_l7_request_once(
             "path": request.target,
             "query_params": request.query_params.clone(),
             "graphql": request.graphql.clone(),
-            "jsonrpc": request.jsonrpc.as_ref().map(|j| {
-                let call = if j.is_batch { None } else { j.calls.first() };
-                serde_json::json!({
-                    "method": call.map(|call| call.method.as_str()),
-                    "params": call.map(|call| &call.params),
-                    "tool": call.and_then(|call| call.tool.as_deref()),
-                    "receive_stream": j.receive_stream,
-                    "has_response": j.has_response,
-                    "error": j.error,
-                })
-            }),
+            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
         }
     });
 
@@ -2382,6 +2393,32 @@ network_policies:
 
         assert!(!allowed);
         assert!(reason.contains("WEBSOCKET_TEXT /ws not permitted"));
+    }
+
+    #[test]
+    fn jsonrpc_inspection_error_opa_projection_remains_string_or_null() {
+        let invalid_json = crate::l7::jsonrpc::parse_jsonrpc_body(
+            b"{",
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
+        );
+        let invalid_message = crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"{"id":1,"method":"reports.list"}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
+        );
+        let accepted = crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"{"jsonrpc":"2.0","id":1,"method":"reports.list"}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
+        );
+
+        assert_eq!(
+            jsonrpc_policy_input(&invalid_json)["error"],
+            serde_json::json!("invalid JSON")
+        );
+        assert_eq!(
+            jsonrpc_policy_input(&invalid_message)["error"],
+            serde_json::json!("missing or non-string 'jsonrpc' field")
+        );
+        assert!(jsonrpc_policy_input(&accepted)["error"].is_null());
     }
 
     #[test]
