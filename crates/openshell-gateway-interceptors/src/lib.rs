@@ -67,6 +67,12 @@ pub enum InterceptorError {
 
 pub type Result<T> = std::result::Result<T, InterceptorError>;
 
+/// Descriptor-backed protobuf/JSON codec used at the interceptor boundary.
+///
+/// The codec rejects wire or JSON inputs that select multiple alternatives in
+/// the same protobuf `oneof`. This is stricter than protobuf's usual
+/// last-member-wins behavior so an interceptor never authorizes an ambiguous
+/// representation.
 #[derive(Debug, Clone)]
 pub struct ProtoJsonCodec {
     descriptors: Arc<ProtoDescriptors>,
@@ -1184,10 +1190,42 @@ impl ProtoDescriptors {
             .options
             .as_ref()
             .is_some_and(prost_types::MessageOptions::map_entry);
+        let mut oneofs = message
+            .oneof_decl
+            .iter()
+            .enumerate()
+            .map(|(index, oneof)| {
+                let name = oneof.name.clone().unwrap_or_default();
+                if name.is_empty() {
+                    return Err(InterceptorError::Config(format!(
+                        "oneof {index} on message '{full_name}' has no name"
+                    )));
+                }
+                Ok(OneofDesc {
+                    name,
+                    field_numbers: BTreeSet::new(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut fields = BTreeMap::new();
         let mut fields_by_json = HashMap::new();
         for field in &message.field {
             let field_desc = FieldDesc::from_proto(field)?;
+            if let Some(oneof_index) = field_desc.oneof_index {
+                let oneof = oneofs.get_mut(oneof_index as usize).ok_or_else(|| {
+                    InterceptorError::Config(format!(
+                        "field '{}' on message '{full_name}' references invalid oneof index {oneof_index}",
+                        field_desc.name
+                    ))
+                })?;
+                if field_desc.repeated {
+                    return Err(InterceptorError::Config(format!(
+                        "repeated field '{}' on message '{full_name}' cannot belong to oneof '{}'",
+                        field_desc.name, oneof.name
+                    )));
+                }
+                oneof.field_numbers.insert(field_desc.number);
+            }
             fields_by_json.insert(field_desc.json_name.clone(), field_desc.number);
             fields_by_json.insert(field_desc.name.clone(), field_desc.number);
             fields.insert(field_desc.number, field_desc);
@@ -1197,6 +1235,7 @@ impl ProtoDescriptors {
             MessageDesc {
                 fields,
                 fields_by_json,
+                oneofs,
                 map_entry,
             },
         );
@@ -1249,11 +1288,13 @@ impl ProtoDescriptors {
 
     fn decode_message_to_json(&self, type_name: &str, bytes: &[u8]) -> Result<Value> {
         if let Some(value) = decode_well_known_json(type_name, bytes) {
+            self.validate_message_oneofs(type_name, bytes)?;
             return value;
         }
 
         let message = self.message(type_name)?;
         let mut values: HashMap<u32, Vec<Value>> = HashMap::new();
+        let mut selected_oneofs = HashMap::new();
         let mut input = bytes;
         while !input.is_empty() {
             let key = decode_varint(&mut input)?;
@@ -1265,6 +1306,7 @@ impl ProtoDescriptors {
                 skip_unknown(wire_type, &mut input)?;
                 continue;
             };
+            message.select_oneof(type_name, field, &mut selected_oneofs)?;
             let decoded = self.decode_field_value(field, wire_type, &mut input)?;
             values.entry(field_number).or_default().extend(decoded);
         }
@@ -1285,6 +1327,37 @@ impl ProtoDescriptors {
             out.insert(field.json_name.clone(), value);
         }
         Ok(Value::Object(out))
+    }
+
+    fn validate_message_oneofs(&self, type_name: &str, bytes: &[u8]) -> Result<()> {
+        let message = self.message(type_name)?;
+        let mut selected_oneofs = HashMap::new();
+        let mut input = bytes;
+        while !input.is_empty() {
+            let key = decode_varint(&mut input)?;
+            let field_number = u32::try_from(key >> 3)
+                .map_err(|_| InterceptorError::Transcode("field number overflow".to_string()))?;
+            let wire_type = u8::try_from(key & 0x07)
+                .map_err(|_| InterceptorError::Transcode("wire type overflow".to_string()))?;
+            let Some(field) = message.fields.get(&field_number) else {
+                skip_unknown(wire_type, &mut input)?;
+                continue;
+            };
+            message.select_oneof(type_name, field, &mut selected_oneofs)?;
+            if field.kind == FieldKind::Message && wire_type == 2 {
+                let bytes = decode_length_delimited(&mut input)?;
+                let nested_type = field.type_name.as_deref().ok_or_else(|| {
+                    InterceptorError::Transcode(format!(
+                        "message field {} lacks type_name",
+                        field.name
+                    ))
+                })?;
+                self.validate_message_oneofs(nested_type, &bytes)?;
+            } else {
+                skip_unknown(wire_type, &mut input)?;
+            }
+        }
+        Ok(())
     }
 
     fn decode_field_value(
@@ -1464,7 +1537,8 @@ impl ProtoDescriptors {
                 "{type_name} JSON must be an object"
             )));
         };
-        let mut out = Vec::new();
+        let mut fields = Vec::with_capacity(map.len());
+        let mut selected_oneofs = HashMap::new();
         for (json_name, value) in map {
             if value.is_null() {
                 continue;
@@ -1475,6 +1549,12 @@ impl ProtoDescriptors {
                 )));
             };
             let field = message.fields.get(number).expect("field index is valid");
+            message.select_oneof(type_name, field, &mut selected_oneofs)?;
+            fields.push((field, value));
+        }
+
+        let mut out = Vec::new();
+        for (field, value) in fields {
             if self.field_is_map(field) {
                 self.encode_map_field(field, value, &mut out)?;
             } else if field.repeated {
@@ -1648,7 +1728,45 @@ impl ProtoDescriptors {
 struct MessageDesc {
     fields: BTreeMap<u32, FieldDesc>,
     fields_by_json: HashMap<String, u32>,
+    oneofs: Vec<OneofDesc>,
     map_entry: bool,
+}
+
+impl MessageDesc {
+    fn select_oneof(
+        &self,
+        type_name: &str,
+        field: &FieldDesc,
+        selected: &mut HashMap<u32, u32>,
+    ) -> Result<()> {
+        let Some(oneof_index) = field.oneof_index else {
+            return Ok(());
+        };
+        let oneof = self
+            .oneofs
+            .get(oneof_index as usize)
+            .expect("oneof indexes are validated when descriptors are loaded");
+        debug_assert!(oneof.field_numbers.contains(&field.number));
+        if let Some(previous_number) = selected.insert(oneof_index, field.number)
+            && previous_number != field.number
+        {
+            let previous = self
+                .fields
+                .get(&previous_number)
+                .expect("oneof member field is indexed");
+            return Err(InterceptorError::Transcode(format!(
+                "message '{type_name}' sets multiple fields in oneof '{}': '{}' and '{}'",
+                oneof.name, previous.name, field.name
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OneofDesc {
+    name: String,
+    field_numbers: BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -1659,6 +1777,7 @@ struct FieldDesc {
     repeated: bool,
     kind: FieldKind,
     type_name: Option<String>,
+    oneof_index: Option<u32>,
 }
 
 impl FieldDesc {
@@ -1677,6 +1796,16 @@ impl FieldDesc {
             .type_name
             .as_ref()
             .map(|name| trim_type_name(name).to_string());
+        let oneof_index = field
+            .oneof_index
+            .map(|index| {
+                u32::try_from(index).map_err(|_| {
+                    InterceptorError::Config(format!(
+                        "field '{name}' has invalid oneof index {index}"
+                    ))
+                })
+            })
+            .transpose()?;
         Ok(Self {
             name,
             json_name,
@@ -1684,6 +1813,7 @@ impl FieldDesc {
             repeated,
             kind,
             type_name,
+            oneof_index,
         })
     }
 
@@ -2126,7 +2256,8 @@ fn json_u32(value: &Value, field: &str) -> Result<u32> {
 mod tests {
     use super::*;
     use openshell_core::proto::{
-        CreateSandboxRequest, SandboxSpec, SandboxTemplate, UpdateConfigRequest,
+        CreateSandboxRequest, GpuResourceRequirements, SandboxSpec, SandboxTemplate,
+        UpdateConfigRequest,
     };
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -2402,6 +2533,270 @@ mod tests {
             .unwrap();
         let decoded = UpdateConfigRequest::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn descriptor_loading_rejects_invalid_oneof_indexes() {
+        let descriptor_set = FileDescriptorSet {
+            file: vec![FileDescriptorProto {
+                package: Some("test".to_string()),
+                message_type: vec![DescriptorProto {
+                    name: Some("Broken".to_string()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("value".to_string()),
+                        number: Some(1),
+                        label: Some(Label::Optional as i32),
+                        r#type: Some(Type::String as i32),
+                        oneof_index: Some(0),
+                        ..FieldDescriptorProto::default()
+                    }],
+                    ..DescriptorProto::default()
+                }],
+                ..FileDescriptorProto::default()
+            }],
+        };
+
+        let err = ProtoDescriptors::from_descriptor_set(&descriptor_set.encode_to_vec())
+            .expect_err("out-of-range oneof index must be rejected");
+
+        assert!(err.to_string().contains("test.Broken"));
+        assert!(err.to_string().contains("invalid oneof index 0"));
+    }
+
+    #[test]
+    fn dynamic_codec_rejects_ambiguous_policy_merge_oneof_wire_input() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let add_then_remove = vec![0x0a, 0x00, 0x1a, 0x00];
+        let remove_then_add = vec![0x1a, 0x00, 0x0a, 0x00];
+
+        for bytes in [add_then_remove, remove_then_add] {
+            let err = descriptors
+                .decode_message_to_json("openshell.v1.PolicyMergeOperation", &bytes)
+                .expect_err("multiple operation alternatives must be rejected");
+            let message = err.to_string();
+            assert!(message.contains("openshell.v1.PolicyMergeOperation"));
+            assert!(message.contains("oneof 'operation'"));
+            assert!(message.contains("add_rule"));
+            assert!(message.contains("remove_rule"));
+        }
+    }
+
+    #[test]
+    fn dynamic_codec_rejects_ambiguous_interceptor_phase_wire_input() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let modify_then_validate = vec![0x32, 0x00, 0x3a, 0x00];
+
+        let err = descriptors
+            .decode_message_to_json(
+                "openshell.gateway_interceptor.v1.InterceptorEvaluation",
+                &modify_then_validate,
+            )
+            .expect_err("multiple phase alternatives must be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("oneof 'phase'"));
+        assert!(message.contains("modify_operation"));
+        assert!(message.contains("validate"));
+    }
+
+    #[test]
+    fn dynamic_codec_rejects_ambiguous_well_known_value_wire_input() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let mut string_then_bool = Vec::new();
+        encode_key(3, 2, &mut string_then_bool);
+        encode_length_delimited(b"text", &mut string_then_bool).unwrap();
+        encode_key(4, 0, &mut string_then_bool);
+        encode_varint(1, &mut string_then_bool);
+
+        let err = descriptors
+            .decode_message_to_json("google.protobuf.Value", &string_then_bool)
+            .expect_err("well-known Value alternatives must be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("google.protobuf.Value"));
+        assert!(message.contains("oneof 'kind'"));
+        assert!(message.contains("string_value"));
+        assert!(message.contains("bool_value"));
+    }
+
+    #[test]
+    fn dynamic_codec_rejects_ambiguous_value_nested_in_well_known_struct() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let mut ambiguous_value = Vec::new();
+        encode_key(3, 2, &mut ambiguous_value);
+        encode_length_delimited(b"text", &mut ambiguous_value).unwrap();
+        encode_key(4, 0, &mut ambiguous_value);
+        encode_varint(1, &mut ambiguous_value);
+
+        let mut map_entry = Vec::new();
+        encode_key(1, 2, &mut map_entry);
+        encode_length_delimited(b"key", &mut map_entry).unwrap();
+        encode_key(2, 2, &mut map_entry);
+        encode_length_delimited(&ambiguous_value, &mut map_entry).unwrap();
+
+        let mut struct_bytes = Vec::new();
+        encode_key(1, 2, &mut struct_bytes);
+        encode_length_delimited(&map_entry, &mut struct_bytes).unwrap();
+
+        let err = descriptors
+            .decode_message_to_json("google.protobuf.Struct", &struct_bytes)
+            .expect_err("nested well-known Value alternatives must be rejected");
+
+        assert!(err.to_string().contains("google.protobuf.Value"));
+        assert!(err.to_string().contains("oneof 'kind'"));
+    }
+
+    #[test]
+    fn dynamic_codec_rejects_ambiguous_oneof_json_before_encoding() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+
+        let err = descriptors
+            .encode_json_to_message(
+                "openshell.v1.PolicyMergeOperation",
+                &json!({
+                    "addRule": {},
+                    "removeRule": {}
+                }),
+            )
+            .expect_err("multiple JSON alternatives must be rejected");
+
+        assert!(err.to_string().contains("oneof 'operation'"));
+    }
+
+    #[test]
+    fn dynamic_codec_round_trips_each_policy_merge_oneof_alternative() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+
+        for field in [
+            "addRule",
+            "removeEndpoint",
+            "removeRule",
+            "addDenyRules",
+            "addAllowRules",
+            "removeBinary",
+        ] {
+            let json = json!({ (field): {} });
+            let encoded = descriptors
+                .encode_json_to_message("openshell.v1.PolicyMergeOperation", &json)
+                .unwrap();
+            let decoded = descriptors
+                .decode_message_to_json("openshell.v1.PolicyMergeOperation", &encoded)
+                .unwrap();
+            let decoded = decoded
+                .as_object()
+                .expect("decoded oneof must be an object");
+            assert_eq!(decoded.len(), 1);
+            assert!(decoded.contains_key(field));
+        }
+    }
+
+    #[test]
+    fn dynamic_codec_preserves_proto3_optional_presence() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+
+        for request in [
+            GpuResourceRequirements { count: None },
+            GpuResourceRequirements { count: Some(0) },
+            GpuResourceRequirements { count: Some(2) },
+        ] {
+            let json = descriptors
+                .decode_message_to_json(
+                    "openshell.v1.GpuResourceRequirements",
+                    &request.encode_to_vec(),
+                )
+                .unwrap();
+            let encoded = descriptors
+                .encode_json_to_message("openshell.v1.GpuResourceRequirements", &json)
+                .unwrap();
+            let decoded = GpuResourceRequirements::decode(encoded.as_slice()).unwrap();
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn dynamic_codec_rejects_nested_oneof_violations() {
+        let descriptors =
+            ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let ambiguous_merge = vec![0x0a, 0x00, 0x1a, 0x00];
+        let mut update_config = Vec::new();
+        encode_key(7, 2, &mut update_config);
+        encode_length_delimited(&ambiguous_merge, &mut update_config).unwrap();
+
+        let err = descriptors
+            .decode_message_to_json("openshell.v1.UpdateConfigRequest", &update_config)
+            .expect_err("nested oneof violation must be rejected");
+
+        assert!(err.to_string().contains("PolicyMergeOperation"));
+        assert!(err.to_string().contains("oneof 'operation'"));
+    }
+
+    #[tokio::test]
+    async fn request_middleware_rejects_ambiguous_oneof_before_evaluation() {
+        let selector = RpcSelector {
+            service: "openshell.v1.OpenShell".to_string(),
+            method: "UpdateConfig".to_string(),
+        };
+        let plan = BindingPlan {
+            interceptor_name: "must-not-run".to_string(),
+            binding_id: "must-not-run".to_string(),
+            selector: selector.clone(),
+            phase: Phase::ModifyOperation,
+            failure_policy: FailurePolicy::FailClosed,
+            timeout: DEFAULT_TIMEOUT,
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
+            max_patches: DEFAULT_MAX_PATCHES,
+            client: GatewayInterceptorClient::new(
+                Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+        };
+        let runtime = GatewayInterceptorRuntime {
+            bindings: Arc::new(BTreeMap::from([(
+                (selector, Phase::ModifyOperation),
+                vec![plan],
+            )])),
+            profile_sources: Arc::new(BTreeMap::new()),
+            routes: Arc::new(
+                routes::OpenShellRouteIndex::from_descriptor_set(
+                    openshell_core::FILE_DESCRIPTOR_SET,
+                )
+                .unwrap(),
+            ),
+            descriptors: Arc::new(
+                ProtoDescriptors::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap(),
+            ),
+        };
+        let ambiguous_merge = vec![0x0a, 0x00, 0x1a, 0x00];
+        let mut request = Vec::new();
+        encode_key(7, 2, &mut request);
+        encode_length_delimited(&ambiguous_merge, &mut request).unwrap();
+        let body = GrpcFrame {
+            compressed: false,
+            message: request,
+        }
+        .encode()
+        .unwrap();
+
+        let err = runtime
+            .evaluate_request(
+                "/openshell.v1.OpenShell/UpdateConfig",
+                &body,
+                &EvaluationContext {
+                    principal: BTreeMap::new(),
+                    validate_current_state: None,
+                },
+            )
+            .await
+            .expect_err("ambiguous request must fail before interceptor evaluation");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("oneof 'operation'"));
     }
 
     #[test]

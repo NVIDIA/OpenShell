@@ -52,6 +52,12 @@ phases, and re-encoded before the handler sees the request. This keeps
 interception centralized: adding an interceptable unary RPC does not require
 method-specific gateway instrumentation.
 
+The descriptor codec preserves protobuf `oneof` metadata and rejects wire or
+JSON input that selects multiple alternatives in one group. This interceptor
+boundary is intentionally stricter than protobuf's last-member-wins behavior:
+ambiguous requests fail with `INVALID_ARGUMENT` before interceptor evaluation
+or handler dispatch.
+
 Each interceptor evaluation selects exactly one phase payload:
 `modify_operation`, `validate`, or `post_commit`. Modification and validation
 payloads carry the protobuf JSON operation entering that phase. Post-commit
