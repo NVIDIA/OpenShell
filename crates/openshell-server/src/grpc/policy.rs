@@ -14,6 +14,8 @@ use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
+use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
+#[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
 use openshell_core::net::is_internal_ip;
 use openshell_core::proto::policy_merge_operation;
@@ -520,7 +522,7 @@ fn run_prover_findings(
 /// with the merged policy the prover validates against.
 async fn build_credential_set_for_sandbox_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileSources,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<CredentialSet, Status> {
     let mut credentials = Vec::new();
@@ -538,8 +540,7 @@ async fn build_credential_set_for_sandbox_with_catalog(
         let provider_type = provider.r#type.trim();
         let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
         let Some(profile) =
-            super::provider::get_provider_type_profile_with_catalog(store, catalog, profile_id)
-                .await?
+            super::provider::get_provider_type_profile_with_catalog(catalog, profile_id)
         else {
             warn!(
                 provider_name = %name,
@@ -978,6 +979,7 @@ async fn auto_approve_chunk(
 // agent-authored proposal validation slice.
 async fn current_effective_policy_for_sandbox(
     state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
     sandbox: &Sandbox,
     sandbox_id: &str,
 ) -> Result<ProtoSandboxPolicy, Status> {
@@ -1016,7 +1018,7 @@ async fn current_effective_policy_for_sandbox(
             .unwrap_or_default();
         let provider_layers = profile_provider_policy_layers_with_catalog(
             state.store.as_ref(),
-            &state.provider_profile_sources,
+            catalog,
             &provider_names,
         )
         .await?;
@@ -1221,6 +1223,10 @@ pub(super) async fn handle_get_sandbox_config(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
 
     // Try to get the latest policy from the policy history table.
     let latest = state
@@ -1325,7 +1331,7 @@ pub(super) async fn handle_get_sandbox_config(
     {
         let provider_layers = profile_provider_policy_layers_with_catalog(
             state.store.as_ref(),
-            &state.provider_profile_sources,
+            &provider_profile_catalog,
             &sandbox_provider_names,
         )
         .await?;
@@ -1340,7 +1346,7 @@ pub(super) async fn handle_get_sandbox_config(
     let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
     let provider_env_revision = compute_provider_env_revision_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_sources,
+        &provider_profile_catalog,
         &sandbox_provider_names,
     )
     .await?;
@@ -1362,17 +1368,15 @@ async fn compute_provider_env_revision(
     store: &Store,
     provider_names: &[String],
 ) -> Result<u64, Status> {
-    compute_provider_env_revision_with_catalog(
-        store,
-        &ProviderProfileSources::with_default_sources(),
-        provider_names,
-    )
-    .await
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    compute_provider_env_revision_with_catalog(store, &catalog, provider_names).await
 }
 
 pub(super) async fn compute_provider_env_revision_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileSources,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
@@ -1394,8 +1398,7 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
                 hasher.update(provider.r#type.as_bytes());
-                hash_provider_profile_revision(store, catalog, &provider.r#type, &mut hasher)
-                    .await?;
+                hash_provider_profile_revision(catalog, &provider.r#type, &mut hasher);
 
                 let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
                 credential_keys.sort();
@@ -1421,16 +1424,13 @@ pub(super) async fn compute_provider_env_revision_with_catalog(
     )?))
 }
 
-async fn hash_provider_profile_revision(
-    store: &Store,
-    catalog: &ProviderProfileSources,
+fn hash_provider_profile_revision(
+    catalog: &EffectiveProviderProfileCatalog,
     provider_type: &str,
     hasher: &mut Sha256,
-) -> Result<(), Status> {
+) {
     let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
-    catalog
-        .hash_profile_revision(store, profile_id, hasher)
-        .await
+    catalog.hash_profile_revision(profile_id, hasher);
 }
 
 #[cfg(test)]
@@ -1438,17 +1438,15 @@ async fn profile_provider_policy_layers(
     store: &Store,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
-    profile_provider_policy_layers_with_catalog(
-        store,
-        &ProviderProfileSources::with_default_sources(),
-        provider_names,
-    )
-    .await
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    profile_provider_policy_layers_with_catalog(store, &catalog, provider_names).await
 }
 
 async fn profile_provider_policy_layers_with_catalog(
     store: &Store,
-    catalog: &ProviderProfileSources,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
     let mut layers = Vec::new();
@@ -1463,8 +1461,7 @@ async fn profile_provider_policy_layers_with_catalog(
         let provider_type = provider.r#type.trim();
         let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
         let Some(profile) =
-            super::provider::get_provider_type_profile_with_catalog(store, catalog, profile_id)
-                .await?
+            super::provider::get_provider_type_profile_with_catalog(catalog, profile_id)
         else {
             warn!(
                 provider_name = %name,
@@ -1526,15 +1523,19 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
     let provider_names = spec.providers;
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
     let provider_env_revision = compute_provider_env_revision_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_sources,
+        &provider_profile_catalog,
         &provider_names,
     )
     .await?;
     let provider_environment = super::provider::resolve_provider_environment_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_sources,
+        &provider_profile_catalog,
         &provider_names,
     )
     .await?;
@@ -2450,7 +2451,17 @@ pub(super) async fn handle_submit_policy_analysis(
     // case for the common single-chunk submission shape. If real workloads
     // surface a problem with batches that interact across chunks, the right
     // fix is to recompute baseline after each successful auto-approve.
-    let current_policy = current_effective_policy_for_sandbox(state, &sandbox, &sandbox_id).await?;
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let current_policy = current_effective_policy_for_sandbox(
+        state,
+        &provider_profile_catalog,
+        &sandbox,
+        &sandbox_id,
+    )
+    .await?;
 
     // Auto-approval is an opt-in behavior, sourced from the settings model
     // (sandbox or gateway scope) so it can be flipped on a running sandbox
@@ -2471,7 +2482,7 @@ pub(super) async fn handle_submit_policy_analysis(
         .unwrap_or_default();
     let credential_set = build_credential_set_for_sandbox_with_catalog(
         state.store.as_ref(),
-        &state.provider_profile_sources,
+        &provider_profile_catalog,
         &provider_names_for_creds,
     )
     .await?;
@@ -4165,6 +4176,7 @@ mod tests {
     use crate::persistence::test_store;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::Code;
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
@@ -4699,6 +4711,202 @@ mod tests {
         .into_inner()
         .policy
         .expect("sandbox config should include policy")
+    }
+
+    #[tokio::test]
+    async fn request_paths_use_one_provider_profile_snapshot() {
+        use openshell_core::proto::{
+            ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
+            ProviderProfileCredential,
+        };
+
+        fn snapshot_profile(
+            id: &str,
+            host: &str,
+            credential_env: &str,
+            token_endpoint: &str,
+        ) -> ProviderProfile {
+            ProviderProfile {
+                id: id.to_string(),
+                display_name: id.to_string(),
+                category: ProviderProfileCategory::Other as i32,
+                credentials: vec![ProviderProfileCredential {
+                    name: "access_token".to_string(),
+                    env_vars: vec![credential_env.to_string()],
+                    auth_style: "bearer".to_string(),
+                    header_name: "authorization".to_string(),
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        token_endpoint: token_endpoint.to_string(),
+                        audience: "api://snapshot-test".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                endpoints: vec![NetworkEndpoint {
+                    host: host.to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let state = test_server_state().await;
+        let mut state = Arc::into_inner(state).expect("test state should be uniquely owned");
+        state.provider_profile_sources = ProviderProfileSources::from_test_snapshot_sequence(
+            vec![
+                (
+                    "revision-a".to_string(),
+                    vec![
+                        snapshot_profile(
+                            "moving-a",
+                            "one.revision-a.example",
+                            "TOKEN_A",
+                            "https://auth.revision-a.example/token-a",
+                        ),
+                        snapshot_profile(
+                            "moving-b",
+                            "two.revision-a.example",
+                            "TOKEN_B",
+                            "https://auth.revision-a.example/token-b",
+                        ),
+                    ],
+                ),
+                (
+                    "revision-b".to_string(),
+                    vec![
+                        snapshot_profile(
+                            "moving-a",
+                            "one.revision-b.example",
+                            "TOKEN_A",
+                            "https://auth.revision-b.example/token-a",
+                        ),
+                        snapshot_profile(
+                            "moving-b",
+                            "two.revision-b.example",
+                            "TOKEN_B",
+                            "https://auth.revision-b.example/token-b",
+                        ),
+                    ],
+                ),
+            ],
+            Arc::clone(&fetch_count),
+        );
+        let state = Arc::new(state);
+        enable_providers_v2(&state).await;
+
+        let mut provider_a = test_provider("provider-a", "moving-a");
+        provider_a.credentials = HashMap::from([("TOKEN_A".to_string(), "a".to_string())]);
+        let mut provider_b = test_provider("provider-b", "moving-b");
+        provider_b.credentials = HashMap::from([("TOKEN_B".to_string(), "b".to_string())]);
+        state.store.put_message(&provider_a).await.unwrap();
+        state.store.put_message(&provider_b).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-snapshot-consistency",
+                "snapshot-consistency",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["provider-a".to_string(), "provider-b".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let first = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-snapshot-consistency".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        let first_policy = first.policy.unwrap();
+        assert!(first_policy.network_policies.values().any(|rule| {
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "one.revision-a.example")
+        }));
+        assert!(first_policy.network_policies.values().any(|rule| {
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "two.revision-a.example")
+        }));
+
+        let second = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-snapshot-consistency".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
+        assert_ne!(first.provider_env_revision, second.provider_env_revision);
+        let second_policy = second.policy.unwrap();
+        assert!(second_policy.network_policies.values().any(|rule| {
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "one.revision-b.example")
+        }));
+        assert!(!second_policy.network_policies.values().any(|rule| {
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "one.revision-a.example")
+        }));
+
+        let environment = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-snapshot-consistency".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            environment.provider_env_revision,
+            second.provider_env_revision
+        );
+        assert_eq!(environment.dynamic_credentials.len(), 2);
+        assert!(environment.dynamic_credentials.values().all(|credential| {
+            credential
+                .token_grant
+                .as_ref()
+                .is_some_and(|grant| grant.token_endpoint.contains("revision-b"))
+        }));
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: "snapshot-consistency".to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "snapshot_consistency_test".to_string(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        name: "snapshot_consistency_test".to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "proposal.example.com".to_string(),
+                            port: 443,
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                            ..Default::default()
+                        }],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

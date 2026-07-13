@@ -20,6 +20,7 @@ use openshell_providers::{
 use prost::Message as _;
 use sha2::{Digest, Sha256};
 use tonic::Status;
+use tracing::debug;
 
 use crate::persistence::{ObjectType, Store};
 
@@ -163,8 +164,10 @@ struct EffectiveProfileEntry {
 }
 
 #[derive(Debug, Clone)]
-struct EffectiveProviderProfiles {
+pub struct EffectiveProviderProfileCatalog {
     profiles: BTreeMap<String, EffectiveProfileEntry>,
+    revision: String,
+    source_count: usize,
 }
 
 impl ProviderProfileSources {
@@ -238,97 +241,39 @@ impl ProviderProfileSources {
         }
     }
 
-    pub async fn list_profiles(&self, store: &Store) -> Result<Vec<ProviderProfile>, Status> {
-        let catalog = self.effective_profiles(store).await?;
-        Ok(catalog
-            .profiles
-            .values()
-            .map(|entry| entry.response.clone())
-            .collect())
+    #[cfg(test)]
+    pub(crate) fn from_test_snapshot_sequence(
+        snapshots: Vec<(String, Vec<ProviderProfile>)>,
+        fetch_count: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        assert!(
+            !snapshots.is_empty(),
+            "test snapshot sequence must not be empty"
+        );
+        Self {
+            sources: vec![Arc::new(SequencedProviderProfileSource {
+                snapshots: snapshots
+                    .into_iter()
+                    .map(|(revision, profiles)| ProviderProfileSnapshot { revision, profiles })
+                    .collect(),
+                fetch_count,
+            })],
+        }
     }
 
-    pub async fn get_profile(
+    pub(crate) async fn snapshot_catalog(
         &self,
         store: &Store,
-        id: &str,
-    ) -> Result<Option<ProviderProfile>, Status> {
-        let Some(id) = normalize_profile_id(id) else {
-            return Ok(None);
-        };
-        Ok(self
-            .effective_profiles(store)
-            .await?
-            .profiles
-            .get(&id)
-            .map(|entry| entry.response.clone()))
-    }
-
-    pub async fn get_type_profile(
-        &self,
-        store: &Store,
-        id: &str,
-    ) -> Result<Option<ProviderTypeProfile>, Status> {
-        let Some(id) = normalize_profile_id(id) else {
-            return Ok(None);
-        };
-        Ok(self
-            .effective_profiles(store)
-            .await?
-            .profiles
-            .get(&id)
-            .map(|entry| entry.profile.clone()))
-    }
-
-    pub async fn static_source_for_profile(
-        &self,
-        store: &Store,
-        id: &str,
-    ) -> Result<Option<String>, Status> {
-        let Some(id) = normalize_profile_id(id) else {
-            return Ok(None);
-        };
-        Ok(self
-            .effective_profiles(store)
-            .await?
-            .profiles
-            .get(&id)
-            .filter(|entry| !entry.user_managed)
-            .map(|entry| entry.source_id.clone()))
-    }
-
-    pub async fn hash_profile_revision(
-        &self,
-        store: &Store,
-        profile_id: &str,
-        hasher: &mut Sha256,
-    ) -> Result<(), Status> {
-        let Some(profile_id) = normalize_profile_id(profile_id) else {
-            hasher.update(b"invalid-profile-id");
-            return Ok(());
-        };
-
-        let catalog = self.effective_profiles(store).await?;
-        let Some(entry) = catalog.profiles.get(&profile_id) else {
-            hasher.update(b"missing");
-            return Ok(());
-        };
-
-        hasher.update(b"provider-profile-source-entry");
-        hasher.update(entry.source_id.as_bytes());
-        hasher.update(entry.source_revision.as_bytes());
-        let ownership_tag: &[u8] = if entry.user_managed {
-            b"user-managed"
-        } else {
-            b"source-managed"
-        };
-        hasher.update(ownership_tag);
-        hasher.update(entry.response.encode_to_vec());
-        Ok(())
-    }
-
-    async fn effective_profiles(&self, store: &Store) -> Result<EffectiveProviderProfiles, Status> {
+    ) -> Result<EffectiveProviderProfileCatalog, Status> {
         let snapshots = self.snapshots(store).await?;
-        build_effective_profiles(snapshots)
+        let catalog = build_effective_profiles(snapshots)?;
+        debug!(
+            catalog_revision = %catalog.revision(),
+            source_fetch_count = catalog.source_count(),
+            profile_count = catalog.profiles.len(),
+            "captured provider profile catalog snapshot"
+        );
+        Ok(catalog)
     }
 
     async fn snapshots(
@@ -350,11 +295,72 @@ impl ProviderProfileSources {
     }
 }
 
+impl EffectiveProviderProfileCatalog {
+    pub(crate) fn revision(&self) -> &str {
+        &self.revision
+    }
+
+    pub(crate) fn source_count(&self) -> usize {
+        self.source_count
+    }
+
+    pub(crate) fn list_profiles(&self) -> Vec<ProviderProfile> {
+        self.profiles
+            .values()
+            .map(|entry| entry.response.clone())
+            .collect()
+    }
+
+    pub(crate) fn get_profile(&self, id: &str) -> Option<ProviderProfile> {
+        let id = normalize_profile_id(id)?;
+        self.profiles.get(&id).map(|entry| entry.response.clone())
+    }
+
+    pub(crate) fn get_type_profile(&self, id: &str) -> Option<ProviderTypeProfile> {
+        let id = normalize_profile_id(id)?;
+        self.profiles.get(&id).map(|entry| entry.profile.clone())
+    }
+
+    pub(crate) fn static_source_for_profile(&self, id: &str) -> Option<String> {
+        let id = normalize_profile_id(id)?;
+        self.profiles
+            .get(&id)
+            .filter(|entry| !entry.user_managed)
+            .map(|entry| entry.source_id.clone())
+    }
+
+    pub(crate) fn hash_profile_revision(&self, profile_id: &str, hasher: &mut Sha256) {
+        let Some(profile_id) = normalize_profile_id(profile_id) else {
+            hasher.update(b"invalid-profile-id");
+            return;
+        };
+
+        let Some(entry) = self.profiles.get(&profile_id) else {
+            hasher.update(b"missing");
+            return;
+        };
+
+        hasher.update(b"provider-profile-source-entry");
+        hasher.update(entry.source_id.as_bytes());
+        hasher.update(entry.source_revision.as_bytes());
+        let ownership_tag: &[u8] = if entry.user_managed {
+            b"user-managed"
+        } else {
+            b"source-managed"
+        };
+        hasher.update(ownership_tag);
+        hasher.update(entry.response.encode_to_vec());
+    }
+}
+
 fn build_effective_profiles(
     snapshots: Vec<CollectedProviderProfileSnapshot>,
-) -> Result<EffectiveProviderProfiles, Status> {
+) -> Result<EffectiveProviderProfileCatalog, Status> {
     let mut source_ids = BTreeSet::new();
     let mut profiles: BTreeMap<String, EffectiveProfileEntry> = BTreeMap::new();
+    let source_count = snapshots.len();
+    let mut catalog_hasher = Sha256::new();
+    catalog_hasher.update(b"openshell-effective-provider-profile-catalog-v1");
 
     for snapshot in snapshots {
         let source_id = snapshot.source_id.trim();
@@ -368,11 +374,22 @@ fn build_effective_profiles(
                 "duplicate provider profile source id '{source_id}'"
             )));
         }
+        let source_revision = snapshot.revision.trim();
+        if source_revision.is_empty() {
+            return Err(Status::failed_precondition(format!(
+                "provider profile source '{source_id}' returned an empty revision"
+            )));
+        }
         if snapshot.profiles.is_empty() && !snapshot.allow_empty {
             return Err(Status::failed_precondition(format!(
                 "provider profile source '{source_id}' returned no profiles"
             )));
         }
+
+        catalog_hasher.update((source_id.len() as u64).to_le_bytes());
+        catalog_hasher.update(source_id.as_bytes());
+        catalog_hasher.update((source_revision.len() as u64).to_le_bytes());
+        catalog_hasher.update(source_revision.as_bytes());
 
         let source_profiles = snapshot
             .profiles
@@ -410,7 +427,7 @@ fn build_effective_profiles(
                 id,
                 EffectiveProfileEntry {
                     source_id: source_id.to_string(),
-                    source_revision: snapshot.revision.clone(),
+                    source_revision: source_revision.to_string(),
                     user_managed: snapshot.user_managed,
                     profile: ProviderTypeProfile::from_proto(&profile),
                     response: profile,
@@ -419,7 +436,11 @@ fn build_effective_profiles(
         }
     }
 
-    Ok(EffectiveProviderProfiles { profiles })
+    Ok(EffectiveProviderProfileCatalog {
+        profiles,
+        revision: format!("sha256:{:x}", catalog_hasher.finalize()),
+        source_count,
+    })
 }
 
 fn validate_source_profiles(
@@ -533,6 +554,36 @@ impl ProviderProfileSource for StaticProviderProfileSource {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+struct SequencedProviderProfileSource {
+    snapshots: Vec<ProviderProfileSnapshot>,
+    fetch_count: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ProviderProfileSource for SequencedProviderProfileSource {
+    fn source_id(&self) -> &str {
+        "sequenced"
+    }
+
+    fn user_managed(&self) -> bool {
+        false
+    }
+
+    fn allow_empty(&self) -> bool {
+        false
+    }
+
+    async fn snapshot(&self, _store: &Store) -> Result<ProviderProfileSnapshot, Status> {
+        let index = self
+            .fetch_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.snapshots[index.min(self.snapshots.len() - 1)].clone())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use openshell_core::GatewayInterceptorConfig;
@@ -541,6 +592,7 @@ mod tests {
         ProviderProfileSnapshot as ProtoProviderProfileSnapshot, ProviderProfileSnapshotRequest,
         gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
     use tokio_stream::wrappers::TcpListenerStream;
@@ -622,6 +674,61 @@ mod tests {
         profile.id = id.to_string();
         profile.display_name = id.to_string();
         profile.to_proto()
+    }
+
+    #[tokio::test]
+    async fn captured_catalog_is_immutable_and_each_source_is_fetched_once() {
+        let mut revision_a = profile("moving-profile");
+        revision_a.display_name = "revision-a".to_string();
+        let mut revision_b = revision_a.clone();
+        revision_b.display_name = "revision-b".to_string();
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let sources = ProviderProfileSources::from_test_snapshot_sequence(
+            vec![
+                ("revision-a".to_string(), vec![revision_a]),
+                ("revision-b".to_string(), vec![revision_b]),
+            ],
+            Arc::clone(&fetch_count),
+        );
+        let store = crate::persistence::test_store().await;
+
+        let first = sources.snapshot_catalog(&store).await.unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        assert_eq!(first.source_count(), 1);
+        assert_eq!(
+            first.get_profile("moving-profile").unwrap().display_name,
+            "revision-a"
+        );
+        assert!(first.get_type_profile("moving-profile").is_some());
+        let mut first_profile_hash = Sha256::new();
+        first.hash_profile_revision("moving-profile", &mut first_profile_hash);
+        let first_profile_hash = first_profile_hash.finalize();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+
+        let second = sources.snapshot_catalog(&store).await.unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            second.get_profile("moving-profile").unwrap().display_name,
+            "revision-b"
+        );
+        let mut second_profile_hash = Sha256::new();
+        second.hash_profile_revision("moving-profile", &mut second_profile_hash);
+        assert_ne!(first_profile_hash, second_profile_hash.finalize());
+        assert_ne!(first.revision(), second.revision());
+    }
+
+    #[test]
+    fn empty_source_revision_is_invalid() {
+        let err = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "source-a".to_string(),
+            revision: "  ".to_string(),
+            profiles: vec![profile("github")],
+            user_managed: false,
+            allow_empty: false,
+        }])
+        .unwrap_err();
+
+        assert!(err.message().contains("returned an empty revision"));
     }
 
     #[test]
@@ -756,7 +863,11 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let profiles = sources.list_profiles(&store).await.unwrap();
+        let profiles = sources
+            .snapshot_catalog(&store)
+            .await
+            .unwrap()
+            .list_profiles();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].id, "github");
         let snapshot = runtime
@@ -788,7 +899,7 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let err = sources.list_profiles(&store).await.unwrap_err();
+        let err = sources.snapshot_catalog(&store).await.unwrap_err();
         assert!(err.message().contains("returned no profiles"));
         task.abort();
     }
@@ -812,7 +923,7 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let err = sources.list_profiles(&store).await.unwrap_err();
+        let err = sources.snapshot_catalog(&store).await.unwrap_err();
         assert!(err.message().contains("is invalid"));
         task.abort();
     }
@@ -839,7 +950,11 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let profiles = sources.list_profiles(&store).await.unwrap();
+        let profiles = sources
+            .snapshot_catalog(&store)
+            .await
+            .unwrap()
+            .list_profiles();
         assert!(profiles.iter().any(|profile| profile.id == "github"));
         assert!(
             profiles
@@ -871,7 +986,7 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let err = sources.list_profiles(&store).await.unwrap_err();
+        let err = sources.snapshot_catalog(&store).await.unwrap_err();
         assert!(
             err.message()
                 .contains("duplicate provider profile id 'github'")
@@ -898,7 +1013,7 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let err = sources.list_profiles(&store).await.unwrap_err();
+        let err = sources.snapshot_catalog(&store).await.unwrap_err();
         assert!(err.message().contains("duplicate provider profile id"));
         task.abort();
     }
@@ -925,7 +1040,7 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let err = sources.list_profiles(&store).await.unwrap_err();
+        let err = sources.snapshot_catalog(&store).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
         task.abort();
     }

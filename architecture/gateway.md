@@ -117,6 +117,15 @@ IDs fail instead of creating source precedence. The gateway treats configured
 interceptors as trusted sources and does not verify signature annotations in
 their profile payloads.
 
+Each logical gateway request captures the selected sources into one validated,
+immutable effective catalog before deriving provider behavior. Policy layers,
+credential scope, injected environment material, dynamic token grants, and
+provider-environment revisions use that same catalog. Each configured source is
+therefore fetched at most once per request, and a source revision change becomes
+visible on the next request instead of partway through the current request. The
+capture emits debug diagnostics with the combined catalog revision, source fetch
+count, and profile count; it never logs provider credentials or profile material.
+
 Supported auth modes:
 
 | Mode | Use |
