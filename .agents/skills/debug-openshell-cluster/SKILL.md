@@ -262,6 +262,13 @@ kubectl -n openshell get secret \
   openshell-jwt-keys
 ```
 
+When `server.tls.clientCaSecretName=""`, the chart intentionally omits
+`client_ca_path` and the `tls-client-ca` mount, even with built-in PKI or
+cert-manager. That is expected; do not treat a missing `tls-client-ca` pod
+mount as a defect (`openshell-server-client-ca` may still exist from PKI).
+User auth is OIDC or trusted proxy (`server.auth.allowUnauthenticatedUsers=true`);
+supervisor transport still uses `openshell-client-tls`.
+
 In cert-manager installs, `certManager.enabled=true` makes cert-manager own TLS
 generation. The Helm chart should still render the `openshell-certgen`
 pre-install/pre-upgrade hook in JWT-only mode to create `openshell-jwt-keys`,
@@ -461,6 +468,7 @@ openshell logs <sandbox-name>
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
+| Browser `ERR_BAD_SSL_CLIENT_AUTH_CERT` or gateway logs show client cert verification when OIDC or direct HTTPS is expected | Listener client-CA verification still enabled (`clientCaSecretName` unset or `client_ca_path` in ConfigMap) | Set `server.tls.clientCaSecretName=""`, upgrade chart, confirm ConfigMap omits `client_ca_path` |
 
 ## Reporting
 
