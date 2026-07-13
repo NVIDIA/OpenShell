@@ -17,7 +17,11 @@ authoritative profile source.
   annotation that is used to verify the policy
 - sandbox creation evaluations add a `correlation_id` log annotation for gateway
   audit logs, plus non-secret policy hash/signing key metadata
-- users cannot replace or merge sandbox policy after sandbox creation
+- sandbox policy synchronization must carry the current signed governance
+  policy; unsigned, stale, or modified policies are denied for every caller
+- sandbox policy analysis may report telemetry, but sandbox-authored policy
+  proposals are denied before they reach the gateway handler
+- `proposal_approval_mode=auto` is blocked at both sandbox and global scope
 - users cannot import or update provider profiles outside the vended set
 - provider profile deletion is blocked by the interceptor
 
@@ -57,6 +61,13 @@ sandboxes receive the updated signed policy through `CreateSandbox`. If
 propagate through the normal sandbox config polling path. Static baseline
 changes that the gateway rejects for existing sandboxes are logged and still
 apply to newly created sandboxes.
+
+The example also validates `SubmitPolicyAnalysis`. Requests without proposed
+policy chunks remain available for denial and network-activity telemetry.
+Requests containing proposed chunks are denied, so a sandbox cannot use the
+gateway's optional auto-approval path to widen its governed policy. This rule
+belongs to the example: gateways without this binding retain the standard
+proposal workflow.
 
 Provider profile YAML files are loaded by the interceptor from `--profiles`
 (default: this example's `profiles/` directory). The interceptor names each
@@ -109,3 +120,8 @@ To run the governance smoke test suite and stop the gateway when it completes:
 ```shell
 ./smoke.sh --test-suite
 ```
+
+The suite uses a gateway-signed JWT for the created sandbox identity to attempt
+an unsigned policy widening and a policy proposal. It verifies that both are
+denied, telemetry is accepted, and the active policy version and hash remain
+unchanged.

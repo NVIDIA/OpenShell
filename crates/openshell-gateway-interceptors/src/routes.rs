@@ -26,7 +26,6 @@ pub const NON_INTERCEPTABLE_METHODS: &[&str] = &[
     "GetSandboxConfig",
     "GetSandboxProviderEnvironment",
     "ReportPolicyStatus",
-    "SubmitPolicyAnalysis",
     "IssueSandboxToken",
     "RefreshSandboxToken",
     "GetSandbox",
@@ -152,6 +151,7 @@ mod tests {
             OpenShellRouteIndex::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         assert!(index.is_interceptable("openshell.v1.OpenShell", "CreateSandbox"));
         assert!(index.is_interceptable("openshell.v1.OpenShell", "UpdateConfig"));
+        assert!(index.is_interceptable("openshell.v1.OpenShell", "SubmitPolicyAnalysis"));
         assert!(!index.is_interceptable("openshell.v1.OpenShell", "GetSandbox"));
         assert!(!index.is_interceptable("openshell.v1.OpenShell", "WatchSandbox"));
         assert_eq!(

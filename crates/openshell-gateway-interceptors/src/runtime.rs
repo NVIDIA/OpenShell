@@ -53,6 +53,7 @@ struct ValidatedOperation {
 impl ValidatedOperation {
     fn new(codec: &ProtoJsonCodec, type_name: &str, json: Value) -> Result<Self> {
         let encoded = codec.encode_json_to_message(type_name, &json)?;
+        let json = codec.decode_bytes_to_json(type_name, &encoded)?;
         Ok(Self { json, encoded })
     }
 
@@ -62,15 +63,16 @@ impl ValidatedOperation {
         type_name: &str,
         patches: &[JsonPatch],
     ) -> Result<Self> {
-        let json = apply_json_patches(&self.json, patches)?;
-        let encoded = codec
-            .encode_json_to_message(type_name, &json)
-            .map_err(|err| {
-                InterceptorError::InvalidResult(format!(
-                    "patched operation is not valid {type_name}: {err}"
-                ))
-            })?;
-        Ok(Self { json, encoded })
+        let json = apply_json_patches(&self.json, patches).map_err(|err| {
+            InterceptorError::InvalidResult(format!(
+                "patched operation is not valid {type_name}: {err}"
+            ))
+        })?;
+        Self::new(codec, type_name, json).map_err(|err| {
+            InterceptorError::InvalidResult(format!(
+                "patched operation is not valid {type_name}: {err}"
+            ))
+        })
     }
 }
 
@@ -140,15 +142,17 @@ impl GatewayInterceptorRuntime {
             .evaluate_phase(&selector, Phase::Validate, &input_type, operation, context)
             .await?;
 
-        let final_encoding = self
+        let encoded_operation = self
             .codec
-            .encode_json_to_message(&input_type, &operation.json)
+            .decode_bytes_to_json(&input_type, &operation.encoded)
             .map_err(|err| {
-                Status::internal(format!("validated operation became invalid: {err}"))
+                Status::internal(format!(
+                    "validated operation encoding became invalid: {err}"
+                ))
             })?;
-        if final_encoding != operation.encoded {
+        if encoded_operation != operation.json {
             return Err(Status::internal(
-                "validated operation encoding changed before dispatch",
+                "validated operation diverged from its encoding before dispatch",
             ));
         }
         let body = GrpcFrame {
@@ -847,6 +851,51 @@ mod tests {
             .unwrap();
 
         assert_eq!(json["mergeOperations"][0], json!({"removeRule": {}}));
+    }
+
+    #[tokio::test]
+    async fn request_middleware_accepts_semantically_equal_map_encodings() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let routes =
+            routes::OpenShellRouteIndex::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET)
+                .unwrap();
+        let runtime = GatewayInterceptorRuntime {
+            plan: Arc::new(ExecutionPlan::empty(routes)),
+            codec: codec.clone(),
+        };
+        let request = UpdateConfigRequest {
+            name: "demo".to_string(),
+            expected_resource_version: u64::MAX - 1,
+            annotations: HashMap::from([
+                ("policy-hash".to_string(), "sha256:v2:abc".to_string()),
+                ("policy-signature".to_string(), "signature".to_string()),
+                ("policy-signature-kid".to_string(), "kid".to_string()),
+                ("correlation-id".to_string(), "reload-1".to_string()),
+            ]),
+            ..UpdateConfigRequest::default()
+        };
+        let body = GrpcFrame {
+            compressed: false,
+            message: request.encode_to_vec(),
+        }
+        .encode()
+        .unwrap();
+
+        let intercepted = runtime
+            .evaluate_request(
+                "/openshell.v1.OpenShell/UpdateConfig",
+                &body,
+                &EvaluationContext {
+                    principal: BTreeMap::new(),
+                    validate_current_state: None,
+                },
+            )
+            .await
+            .unwrap();
+        let frame = GrpcFrame::decode(&intercepted.body).unwrap();
+        let decoded = UpdateConfigRequest::decode(frame.message.as_slice()).unwrap();
+
+        assert_eq!(decoded, request);
     }
 
     #[test]

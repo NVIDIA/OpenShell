@@ -52,6 +52,11 @@ phases, and re-encoded before the handler sees the request. This keeps
 interception centralized: adding an interceptable unary RPC does not require
 method-specific gateway instrumentation.
 
+`SubmitPolicyAnalysis` is interceptable because proposed chunks can eventually
+change active policy through the gateway's approval workflow. An interceptor
+may therefore reject policy proposals while permitting telemetry-only requests.
+Gateways without a matching binding retain the standard proposal behavior.
+
 The descriptor codec uses protobuf's standard `oneof` semantics. If binary
 input contains multiple alternatives from one group, the last member on the
 wire wins. The middleware converts that selected value to ProtoJSON and
@@ -61,10 +66,12 @@ invalid.
 
 Modification results are atomic per binding. After applying one binding's full
 JSON Patch list, the middleware re-encodes the candidate as the request's
-protobuf type before accepting it. Invalid candidates follow that binding's
-failure policy: fail-open restores the exact pre-binding operation, while
-fail-closed rejects the request before handler dispatch. Later bindings only
-observe schema-valid operations.
+protobuf type and decodes those accepted bytes back to canonical ProtoJSON.
+Invalid candidates follow that binding's failure policy: fail-open restores the
+exact pre-binding operation, while fail-closed rejects the request before
+handler dispatch. Later bindings only observe the same schema-valid operation
+that the handler will receive; protobuf map entry ordering is not treated as a
+semantic difference.
 
 Each interceptor evaluation selects exactly one phase payload:
 `modify_operation`, `validate`, or `post_commit`. Modification and validation

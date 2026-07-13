@@ -29,3 +29,7 @@ tonic = { version = "0.14", features = ["transport"] }
 [[bin]]
 name = "governance-interceptor"
 path = "src/main.rs"
+
+[[bin]]
+name = "governance-smoke-client"
+path = "src/smoke_client.rs"

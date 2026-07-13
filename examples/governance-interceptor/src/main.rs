@@ -316,6 +316,11 @@ impl GovernanceInterceptorService {
                     &[GatewayInterceptorPhase::Validate],
                 ),
                 binding(
+                    "govern-submit-policy-analysis",
+                    "SubmitPolicyAnalysis",
+                    &[GatewayInterceptorPhase::Validate],
+                ),
+                binding(
                     "govern-import-provider-profiles",
                     "ImportProviderProfiles",
                     &[GatewayInterceptorPhase::Validate],
@@ -371,14 +376,12 @@ impl GovernanceInterceptorService {
             ("CreateProvider", interceptor_evaluation::Phase::Validate(_)) => {
                 Ok(self.validate_create_provider(&operation, &profile_state.ids))
             }
-            ("UpdateConfig", interceptor_evaluation::Phase::Validate(_)) => {
-                Ok(validate_update_config(
-                    &operation,
-                    &evaluation.principal,
-                    &policy_state,
-                    &self.policy_signer,
-                ))
-            }
+            ("UpdateConfig", interceptor_evaluation::Phase::Validate(_)) => Ok(
+                validate_update_config(&operation, &policy_state, &self.policy_signer),
+            ),
+            ("SubmitPolicyAnalysis", interceptor_evaluation::Phase::Validate(_)) => Ok(
+                validate_submit_policy_analysis(&operation, &evaluation.principal),
+            ),
             ("ImportProviderProfiles", interceptor_evaluation::Phase::Validate(_)) => {
                 Ok(self.validate_import_provider_profiles(&operation, &profile_state.ids))
             }
@@ -665,12 +668,13 @@ fn validate_signed_policy_payload(
 
 fn validate_update_config(
     operation: &Value,
-    principal: &HashMap<String, String>,
     policy_state: &PolicyState,
     policy_signer: &PolicySigner,
 ) -> InterceptorResult {
-    if principal.get("kind").is_some_and(|kind| kind == "sandbox") {
-        return allow();
+    if requests_auto_proposal_approval(operation) {
+        return deny(
+            "automatic policy proposal approval is blocked by provider profile governance",
+        );
     }
     let is_global = operation
         .get("global")
@@ -691,6 +695,47 @@ fn validate_update_config(
         deny("sandbox policy updates are blocked by provider profile governance")
     } else {
         allow()
+    }
+}
+
+fn requests_auto_proposal_approval(operation: &Value) -> bool {
+    let setting_key = operation
+        .get("settingKey")
+        .or_else(|| operation.get("setting_key"))
+        .and_then(Value::as_str);
+    if setting_key != Some("proposal_approval_mode") {
+        return false;
+    }
+
+    operation
+        .get("settingValue")
+        .or_else(|| operation.get("setting_value"))
+        .and_then(|value| {
+            value
+                .get("stringValue")
+                .or_else(|| value.get("string_value"))
+        })
+        .and_then(Value::as_str)
+        == Some("auto")
+}
+
+fn validate_submit_policy_analysis(
+    operation: &Value,
+    principal: &HashMap<String, String>,
+) -> InterceptorResult {
+    if principal.get("kind").map(String::as_str) != Some("sandbox") {
+        return deny("policy analysis requires an authenticated sandbox principal");
+    }
+
+    match operation
+        .get("proposedChunks")
+        .or_else(|| operation.get("proposed_chunks"))
+    {
+        Some(Value::Array(chunks)) if !chunks.is_empty() => {
+            deny("sandbox-authored policy proposals are blocked by provider profile governance")
+        }
+        Some(Value::Array(_)) | None => allow(),
+        Some(_) => deny("policy analysis proposed chunks must be an array"),
     }
 }
 

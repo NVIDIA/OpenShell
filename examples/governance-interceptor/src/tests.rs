@@ -47,6 +47,21 @@ fn evaluation(
     }
 }
 
+fn sandbox_evaluation(
+    method: &str,
+    phase: GatewayInterceptorPhase,
+    operation: Value,
+) -> InterceptorEvaluation {
+    let mut evaluation = evaluation(method, phase, operation);
+    evaluation
+        .principal
+        .insert("kind".to_string(), "sandbox".to_string());
+    evaluation
+        .principal
+        .insert("sandbox_id".to_string(), "demo-id".to_string());
+    evaluation
+}
+
 fn managed_profile_ids(service: &GovernanceInterceptorService) -> Vec<String> {
     service.current_profile_state().ids
 }
@@ -211,6 +226,7 @@ fn manifest_declares_governance_bindings() {
     assert!(ids.contains(&"govern-update-provider-profiles"));
     assert!(ids.contains(&"govern-delete-provider-profile"));
     assert!(ids.contains(&"govern-update-config"));
+    assert!(ids.contains(&"govern-submit-policy-analysis"));
     assert!(ids.contains(&"govern-create-sandbox"));
     assert!(!ids.contains(&"govern-attach-provider"));
     assert!(!ids.contains(&"govern-detach-provider"));
@@ -572,6 +588,60 @@ fn signed_governance_policy_update_is_allowed() {
 }
 
 #[test]
+fn sandbox_policy_sync_requires_current_signed_governance_policy() {
+    let service = service();
+    let state = policy_state(&service);
+
+    let unsigned = service
+        .evaluate_inner(&sandbox_evaluation(
+            "UpdateConfig",
+            GatewayInterceptorPhase::Validate,
+            json!({"name": "demo", "policy": state.policy.clone()}),
+        ))
+        .unwrap();
+    assert!(!unsigned.allowed);
+    assert!(unsigned.reason.contains("governance annotations"));
+
+    let signed = service
+        .evaluate_inner(&sandbox_evaluation(
+            "UpdateConfig",
+            GatewayInterceptorPhase::Validate,
+            json!({
+                "name": "demo",
+                "policy": state.policy.clone(),
+                "annotations": policy_update_annotations(
+                    &state,
+                    "governance:sandbox-sync:test",
+                ),
+            }),
+        ))
+        .unwrap();
+    assert!(signed.allowed);
+
+    let mut widened = state.policy.clone();
+    widened["networkPolicies"]["sandbox_added"] = json!({
+        "name": "sandbox-added",
+        "endpoints": [{"host": "sandbox-added.example", "port": 443}],
+    });
+    let copied_annotations = service
+        .evaluate_inner(&sandbox_evaluation(
+            "UpdateConfig",
+            GatewayInterceptorPhase::Validate,
+            json!({
+                "name": "demo",
+                "policy": widened,
+                "annotations": policy_update_annotations(
+                    &state,
+                    "governance:sandbox-sync:copied",
+                ),
+            }),
+        ))
+        .unwrap();
+    assert!(!copied_annotations.allowed);
+    assert!(copied_annotations.reason.contains("invalid"));
+}
+
+#[test]
 fn stale_governance_policy_update_is_denied_after_reload() {
     let service = service();
     let stale = policy_state(&service);
@@ -771,17 +841,129 @@ fn policy_update_and_merge_are_denied() {
         .unwrap();
     assert!(global_policy_update.allowed);
 
-    let mut sandbox_policy_sync = evaluation(
-        "UpdateConfig",
-        GatewayInterceptorPhase::Validate,
-        json!({"name": "demo", "policy": {"version": 1}}),
+    let sandbox_policy_sync = service
+        .evaluate_inner(&sandbox_evaluation(
+            "UpdateConfig",
+            GatewayInterceptorPhase::Validate,
+            json!({"name": "demo", "policy": {"version": 1}}),
+        ))
+        .unwrap();
+    assert!(!sandbox_policy_sync.allowed);
+}
+
+#[test]
+fn automatic_proposal_approval_settings_are_denied() {
+    let service = service();
+
+    for operation in [
+        json!({
+            "global": true,
+            "settingKey": "proposal_approval_mode",
+            "settingValue": {"stringValue": "auto"},
+        }),
+        json!({
+            "name": "demo",
+            "settingKey": "proposal_approval_mode",
+            "settingValue": {"stringValue": "auto"},
+        }),
+    ] {
+        let result = service
+            .evaluate_inner(&evaluation(
+                "UpdateConfig",
+                GatewayInterceptorPhase::Validate,
+                operation,
+            ))
+            .unwrap();
+        assert!(!result.allowed);
+        assert!(result.reason.contains("automatic policy proposal approval"));
+    }
+
+    for operation in [
+        json!({
+            "global": true,
+            "settingKey": "proposal_approval_mode",
+            "settingValue": {"stringValue": "manual"},
+        }),
+        json!({
+            "global": true,
+            "settingKey": "proposal_approval_mode",
+            "deleteSetting": true,
+        }),
+    ] {
+        let result = service
+            .evaluate_inner(&evaluation(
+                "UpdateConfig",
+                GatewayInterceptorPhase::Validate,
+                operation,
+            ))
+            .unwrap();
+        assert!(result.allowed);
+    }
+}
+
+#[test]
+fn sandbox_policy_analysis_allows_telemetry_but_denies_proposals() {
+    let service = service();
+
+    for operation in [
+        json!({
+            "name": "demo",
+            "networkActivitySummaries": [{"networkActivityCount": 1}],
+        }),
+        json!({
+            "name": "demo",
+            "summaries": [{"host": "denied.example", "port": 443}],
+        }),
+        json!({"name": "demo", "proposedChunks": []}),
+    ] {
+        let result = service
+            .evaluate_inner(&sandbox_evaluation(
+                "SubmitPolicyAnalysis",
+                GatewayInterceptorPhase::Validate,
+                operation,
+            ))
+            .unwrap();
+        assert!(result.allowed);
+    }
+
+    let proposal = service
+        .evaluate_inner(&sandbox_evaluation(
+            "SubmitPolicyAnalysis",
+            GatewayInterceptorPhase::Validate,
+            json!({
+                "name": "demo",
+                "proposedChunks": [{"ruleName": "sandbox-added"}],
+            }),
+        ))
+        .unwrap();
+    assert!(!proposal.allowed);
+    assert!(
+        proposal
+            .reason
+            .contains("sandbox-authored policy proposals")
     );
-    sandbox_policy_sync
-        .principal
-        .insert("kind".to_string(), "sandbox".to_string());
-    sandbox_policy_sync
-        .principal
-        .insert("sandbox_id".to_string(), "demo-id".to_string());
-    let sandbox_policy_sync = service.evaluate_inner(&sandbox_policy_sync).unwrap();
-    assert!(sandbox_policy_sync.allowed);
+}
+
+#[test]
+fn policy_analysis_fails_closed_without_a_sandbox_principal() {
+    let service = service();
+
+    let missing = service
+        .evaluate_inner(&evaluation(
+            "SubmitPolicyAnalysis",
+            GatewayInterceptorPhase::Validate,
+            json!({"name": "demo"}),
+        ))
+        .unwrap();
+    assert!(!missing.allowed);
+
+    let mut user = evaluation(
+        "SubmitPolicyAnalysis",
+        GatewayInterceptorPhase::Validate,
+        json!({"name": "demo"}),
+    );
+    user.principal
+        .insert("kind".to_string(), "user".to_string());
+    let user = service.evaluate_inner(&user).unwrap();
+    assert!(!user.allowed);
 }

@@ -433,6 +433,7 @@ EOF
   run_step "allows slack provider create" "${CLI[@]}" provider create --name slack --type slack --credential SLACK_BOT_TOKEN=dummy
 
   expect_failure "denies disallowed provider create" "${CLI[@]}" provider create --name bitbucket --type bitbucket --credential BITBUCKET_TOKEN=dummy
+  expect_failure "denies automatic proposal approval" "${CLI[@]}" settings set --global --key proposal_approval_mode --value auto --yes
 
   run_step "creates sandbox with selected github provider" "${CLI[@]}" sandbox create --name "$SANDBOX_NAME" --provider github --no-auto-providers --keep --no-tty -- /bin/sh -lc true
   expect_log_contains "gateway logs interceptor log annotations" "log_annotations" "$GATEWAY_LOG"
@@ -441,6 +442,19 @@ EOF
   expect_output_not_contains "sandbox does not auto-add slack provider" "slack" "${CLI[@]}" sandbox provider list "$SANDBOX_NAME"
   expect_output_contains "effective policy has github provider layer" "_provider_github" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
   expect_output_not_contains "effective policy omits unselected slack layer" "_provider_slack" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
+
+  local sandbox_id
+  sandbox_id="$("${CLI[@]}" sandbox get "$SANDBOX_NAME" | awk '/Id:/ && !found { print $2; found=1 }')"
+  if [[ -z "$sandbox_id" ]]; then
+    fail "reads governed sandbox id"
+  fi
+  pass "reads governed sandbox id"
+
+  run_step \
+    "denies authenticated governance bypasses without changing policy" \
+    "$EXAMPLE_DIR/target/debug/governance-smoke-client" \
+    "$GATEWAY_ENDPOINT" "$SANDBOX_NAME" "$sandbox_id" \
+    "$JWT_DIR/signing.pem" "$RUN_ID" "$RUN_ID"
 
   local initial_policy_signature
   initial_policy_signature="$(policy_signature_for_sandbox "$SANDBOX_NAME")"
