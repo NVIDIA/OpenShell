@@ -482,7 +482,7 @@
           "FILE:@@//Cargo.lock ad976bdf1c6a3cd027180643c6ac2507b7fefc58dbaf3b2d857aace97932c912",
           "FILE:@@//Cargo.toml 7571bc7f6b66b26b31f4db5c87a788f7d931a547b4a72ab9f493c86756920567",
           "FILE:@@//crates/openshell-bootstrap/Cargo.toml 9a2d047e91d50c43fc845e85f78f0347e647dddb4cf4316061ac255d12f27c03",
-          "FILE:@@//crates/openshell-core/Cargo.toml d9913ec2a4a1219c5b46f2f728f84cb9cb13c66442fdcc17548714835a6b3d45",
+          "FILE:@@//crates/openshell-core/Cargo.toml be11ca76a5e30f5d689a312dbb93b54a1b96e9481d25af33077aa26d388750ee",
           "FILE:@@//crates/openshell-cli/Cargo.toml 481db1a19a6c01373b76fa7368c3530b39111286a37af05ac51e3b43058b9d54",
           "FILE:@@//crates/openshell-policy/Cargo.toml d1aa0f50a181e931aa8ee5761415166e226b9e712971723666b6728155e115ee",
           "FILE:@@//crates/openshell-prover/Cargo.toml 3a7481cd54c4f0906aa175fe863904978501485b10d3b9972e043ad587c0752e",

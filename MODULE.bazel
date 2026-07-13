@@ -77,3 +77,8 @@ register_toolchains(
     "@zig_sdk//libc_aware/toolchain:linux_amd64_musl",
     "@zig_sdk//libc_aware/toolchain:linux_arm64_musl",
 )
+
+# Hermetic protoc for openshell-core's build script, injected via $PROTOC
+# instead of the autotools build that protobuf-src does under cargo. Built
+# from source in the exec configuration (one-time cost, then cached).
+bazel_dep(name = "protobuf", version = "33.4")

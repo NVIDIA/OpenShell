@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+# Runs build.rs: tonic/prost codegen for //proto plus the FileDescriptorSet.
+# protoc is Bazel-built from the protobuf module and injected via $PROTOC, so
+# the vendored-protoc (protobuf-src) feature stays off here.
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    build_script_env = {
+        "OPENSHELL_PROTO_DIR": "$${pwd}/proto",
+        "PROTOC": "$(execpath @protobuf//:protoc)",
+        # Resolves google/protobuf/*.proto imports against the protobuf source
+        # tree; the well_known_type_protos entry in data stages those files.
+        "PROTOC_INCLUDE": "$${pwd}/external/protobuf+/src",
+    },
+    data = [
+        "//proto:protos",
+        "@protobuf//:well_known_type_protos",
+    ],
+    edition = "2024",
+    tools = ["@protobuf//:protoc"],
+    deps = ["@crates//:tonic-prost-build"],
+)
+
+rust_library(
+    name = "openshell_core",
+    srcs = glob(["src/**/*.rs"]),
+    crate_features = ["telemetry"],
+    edition = "2024",
+    version = "0.0.0",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True) + [":build_script"],
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "openshell_core_test",
+    crate = ":openshell_core",
+    crate_features = ["telemetry"],
+    deps = all_crate_deps(normal_dev = True),
+)
