@@ -345,9 +345,38 @@ name = "provider-governance"
 grpc_endpoint = "http://$INTERCEPTOR_ADDR"
 order = 10
 failure_policy = "fail_closed"
+binding_policy = "allowlist"
 timeout = "500ms"
 max_response_bytes = 1048576
 max_patches = 32
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/CreateSandbox"
+phases = ["modify_operation", "validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/CreateProvider"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/UpdateConfig"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/SubmitPolicyAnalysis"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/ImportProviderProfiles"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/UpdateProviderProfiles"
+phases = ["validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc = "openshell.v1.OpenShell/DeleteProviderProfile"
+phases = ["validate"]
 EOF
 }
 

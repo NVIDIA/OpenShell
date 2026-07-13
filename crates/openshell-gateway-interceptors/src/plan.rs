@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
 use openshell_core::config::{
-    GatewayInterceptorBindingOverride, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
-    GatewayInterceptorPhaseConfig,
+    GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
+    GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig,
 };
 use openshell_core::proto::gateway_interceptor::v1::{
     DescribeRequest, GatewayInterceptorPhase, InterceptorBinding, InterceptorSelector,
@@ -21,7 +21,7 @@ use tonic::Request;
 use tonic::codegen::http::Uri;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::profile_source::GatewayInterceptorProfileSource;
 use crate::routes::OpenShellRouteIndex;
@@ -210,28 +210,48 @@ impl ExecutionPlan {
                         ))
                     })?
                     .into_inner();
-            let manifest_default = parse_optional_failure_policy(&manifest.failure_policy)?;
-            let service_default = config
-                .failure_policy
-                .map(FailurePolicy::from)
-                .or(manifest_default)
-                .unwrap_or(FailurePolicy::FailClosed);
+            let service_default = match config.binding_policy {
+                GatewayInterceptorBindingPolicy::Dynamic => {
+                    let manifest_default = parse_optional_failure_policy(&manifest.failure_policy)?;
+                    config
+                        .failure_policy
+                        .map(FailurePolicy::from)
+                        .or(manifest_default)
+                        .unwrap_or(FailurePolicy::FailClosed)
+                }
+                GatewayInterceptorBindingPolicy::Allowlist
+                | GatewayInterceptorBindingPolicy::Exact => config
+                    .failure_policy
+                    .map_or(FailurePolicy::FailClosed, FailurePolicy::from),
+            };
             let max_response_bytes = config
                 .max_response_bytes
                 .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES);
             let max_patches = config.max_patches.unwrap_or(DEFAULT_MAX_PATCHES);
 
-            let override_index = OverrideIndex::new(&config.bindings)?;
-            for manifest_binding in &manifest.bindings {
-                let normalized = normalize_binding(
+            let normalized_bindings = match config.binding_policy {
+                GatewayInterceptorBindingPolicy::Dynamic => {
+                    warn!(
+                        interceptor = %config.name,
+                        "interceptor uses dynamic binding policy; valid manifest bindings are operator-authorized"
+                    );
+                    normalize_dynamic_bindings(
+                        &config.name,
+                        &manifest.bindings,
+                        service_default,
+                        &config.bindings,
+                    )?
+                }
+                GatewayInterceptorBindingPolicy::Allowlist
+                | GatewayInterceptorBindingPolicy::Exact => normalize_strict_bindings(
                     &config.name,
-                    manifest_binding,
+                    &manifest.bindings,
                     service_default,
-                    &override_index,
-                )?;
-                let Some(normalized) = normalized else {
-                    continue;
-                };
+                    &config.bindings,
+                    config.binding_policy,
+                )?,
+            };
+            for normalized in normalized_bindings {
                 if !routes
                     .is_interceptable(&normalized.selector.service, &normalized.selector.method)
                 {
@@ -334,6 +354,263 @@ struct NormalizedBinding {
     selector: RpcSelector,
     phases: Vec<Phase>,
     failure_policy: FailurePolicy,
+}
+
+#[derive(Debug)]
+struct StrictBindingConfig<'a> {
+    selector: RpcSelector,
+    phases: Vec<Phase>,
+    source: &'a GatewayInterceptorBindingOverride,
+}
+
+fn normalize_dynamic_bindings(
+    interceptor_name: &str,
+    manifest_bindings: &[InterceptorBinding],
+    service_default: FailurePolicy,
+    overrides: &[GatewayInterceptorBindingOverride],
+) -> Result<Vec<NormalizedBinding>> {
+    let override_index = OverrideIndex::new(overrides)?;
+    let mut normalized = Vec::new();
+    for binding in manifest_bindings {
+        if let Some(binding) =
+            normalize_binding(interceptor_name, binding, service_default, &override_index)?
+        {
+            normalized.push(binding);
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_strict_bindings(
+    interceptor_name: &str,
+    manifest_bindings: &[InterceptorBinding],
+    service_default: FailurePolicy,
+    configured_bindings: &[GatewayInterceptorBindingOverride],
+    policy: GatewayInterceptorBindingPolicy,
+) -> Result<Vec<NormalizedBinding>> {
+    debug_assert!(matches!(
+        policy,
+        GatewayInterceptorBindingPolicy::Allowlist | GatewayInterceptorBindingPolicy::Exact
+    ));
+
+    let configured = normalize_strict_config(interceptor_name, configured_bindings)?;
+    let configured_selectors = configured
+        .iter()
+        .map(|binding| binding.selector.clone())
+        .collect::<BTreeSet<_>>();
+    let mut normalized = Vec::with_capacity(configured.len());
+
+    for binding_config in configured {
+        let matches = manifest_bindings
+            .iter()
+            .filter(|binding| {
+                selector_from_proto(binding.selector.as_ref())
+                    .is_ok_and(|selector| selector == binding_config.selector)
+            })
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => {
+                return Err(InterceptorError::Config(format!(
+                    "interceptor '{interceptor_name}' did not declare configured binding '{}'",
+                    binding_config.selector.rpc()
+                )));
+            }
+            [manifest_binding] => normalized.push(normalize_strict_binding(
+                interceptor_name,
+                manifest_binding,
+                &binding_config,
+                service_default,
+                policy,
+            )?),
+            _ => {
+                return Err(InterceptorError::Config(format!(
+                    "interceptor '{interceptor_name}' declared multiple bindings for configured RPC '{}'",
+                    binding_config.selector.rpc()
+                )));
+            }
+        }
+    }
+
+    for manifest_binding in manifest_bindings {
+        let selector = match selector_from_proto(manifest_binding.selector.as_ref()) {
+            Ok(selector) => selector,
+            Err(err) if policy == GatewayInterceptorBindingPolicy::Allowlist => {
+                warn!(
+                    interceptor = %interceptor_name,
+                    binding_id = %manifest_binding.id,
+                    error = %err,
+                    "ignoring malformed manifest binding outside the operator allowlist"
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        if configured_selectors.contains(&selector) {
+            continue;
+        }
+        if policy == GatewayInterceptorBindingPolicy::Exact {
+            return Err(InterceptorError::Config(format!(
+                "interceptor '{interceptor_name}' declared unconfigured binding '{}'",
+                selector.rpc()
+            )));
+        }
+        warn!(
+            interceptor = %interceptor_name,
+            binding_id = %manifest_binding.id,
+            rpc = %selector.rpc(),
+            "ignoring manifest binding outside the operator allowlist"
+        );
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_strict_config<'a>(
+    interceptor_name: &str,
+    bindings: &'a [GatewayInterceptorBindingOverride],
+) -> Result<Vec<StrictBindingConfig<'a>>> {
+    let mut selectors = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        if binding.id.is_some() {
+            return Err(InterceptorError::Config(format!(
+                "interceptor '{interceptor_name}' strict binding configuration must select by RPC, not id"
+            )));
+        }
+        if binding.disabled {
+            return Err(InterceptorError::Config(format!(
+                "interceptor '{interceptor_name}' strict binding configuration cannot use disabled=true; omit the binding instead"
+            )));
+        }
+        let selector = strict_config_selector(binding)?;
+        if !selectors.insert(selector.clone()) {
+            return Err(InterceptorError::Config(format!(
+                "interceptor '{interceptor_name}' has duplicate configured binding '{}'",
+                selector.rpc()
+            )));
+        }
+        let configured_phases = binding.phases.as_ref().ok_or_else(|| {
+            InterceptorError::Config(format!(
+                "interceptor '{interceptor_name}' configured binding '{}' requires phases",
+                selector.rpc()
+            ))
+        })?;
+        if configured_phases.is_empty() {
+            return Err(InterceptorError::Config(format!(
+                "interceptor '{interceptor_name}' configured binding '{}' requires at least one phase",
+                selector.rpc()
+            )));
+        }
+        let phases = configured_phases
+            .iter()
+            .copied()
+            .map(Phase::from)
+            .collect::<Vec<_>>();
+        if phases.iter().copied().collect::<BTreeSet<_>>().len() != phases.len() {
+            return Err(InterceptorError::Config(format!(
+                "interceptor '{interceptor_name}' configured binding '{}' contains duplicate phases",
+                selector.rpc()
+            )));
+        }
+        normalized.push(StrictBindingConfig {
+            selector,
+            phases,
+            source: binding,
+        });
+    }
+    Ok(normalized)
+}
+
+fn strict_config_selector(binding: &GatewayInterceptorBindingOverride) -> Result<RpcSelector> {
+    let rpc = binding
+        .rpc
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let service = binding
+        .service
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let method = binding
+        .method
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    match (rpc, service, method) {
+        (Some(rpc), None, None) => parse_rpc_selector(rpc),
+        (None, Some(service), Some(method)) => {
+            Ok(RpcSelector::new(service.trim(), method.trim()))
+        }
+        (None, None, None) => Err(InterceptorError::Config(
+            "strict binding configuration requires rpc or service+method".to_string(),
+        )),
+        _ => Err(InterceptorError::Config(
+            "strict binding configuration requires exactly one selector form: rpc or service+method"
+                .to_string(),
+        )),
+    }
+}
+
+fn normalize_strict_binding(
+    interceptor_name: &str,
+    manifest_binding: &InterceptorBinding,
+    config: &StrictBindingConfig<'_>,
+    service_default: FailurePolicy,
+    policy: GatewayInterceptorBindingPolicy,
+) -> Result<NormalizedBinding> {
+    let binding_id = manifest_binding.id.trim();
+    if binding_id.is_empty() {
+        return Err(InterceptorError::Config(format!(
+            "interceptor '{interceptor_name}' declared a binding without id"
+        )));
+    }
+    let manifest_phases = manifest_binding
+        .phases
+        .iter()
+        .map(|phase| {
+            GatewayInterceptorPhase::try_from(*phase)
+                .map_err(|_| InterceptorError::Config("unknown binding phase".to_string()))
+                .and_then(Phase::try_from)
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    if manifest_phases.is_empty() {
+        return Err(InterceptorError::Config(format!(
+            "interceptor '{interceptor_name}' binding '{binding_id}' declares no phases"
+        )));
+    }
+    let configured_phases = config.phases.iter().copied().collect::<BTreeSet<_>>();
+    let phases_match = match policy {
+        GatewayInterceptorBindingPolicy::Allowlist => configured_phases.is_subset(&manifest_phases),
+        GatewayInterceptorBindingPolicy::Exact => configured_phases == manifest_phases,
+        GatewayInterceptorBindingPolicy::Dynamic => unreachable!("strict policy required"),
+    };
+    if !phases_match {
+        return Err(InterceptorError::Config(format!(
+            "interceptor '{interceptor_name}' binding '{}' phases do not satisfy {} policy",
+            config.selector.rpc(),
+            match policy {
+                GatewayInterceptorBindingPolicy::Allowlist => "allowlist",
+                GatewayInterceptorBindingPolicy::Exact => "exact",
+                GatewayInterceptorBindingPolicy::Dynamic => unreachable!(),
+            }
+        )));
+    }
+
+    let failure_policy = config
+        .source
+        .failure_policy
+        .map_or(service_default, FailurePolicy::from);
+    if config.phases.contains(&Phase::PostCommit) && failure_policy != FailurePolicy::FailOpen {
+        return Err(InterceptorError::Config(format!(
+            "interceptor '{interceptor_name}' binding '{binding_id}' uses failure_policy={} for post_commit; post_commit must use fail_open",
+            failure_policy.as_str()
+        )));
+    }
+
+    Ok(NormalizedBinding {
+        binding_id: binding_id.to_string(),
+        selector: config.selector.clone(),
+        phases: config.phases.clone(),
+        failure_policy,
+    })
 }
 
 #[derive(Debug)]
@@ -616,12 +893,43 @@ async fn connect_unix_endpoint(path: PathBuf) -> Result<Channel> {
 
 #[cfg(test)]
 mod tests {
-    use openshell_core::config::GatewayInterceptorConfig;
+    use openshell_core::config::{
+        GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy,
+        GatewayInterceptorConfig, GatewayInterceptorPhaseConfig,
+    };
     use openshell_core::proto::gateway_interceptor::v1::{
         GatewayInterceptorPhase, InterceptorBinding, InterceptorSelector,
     };
 
     use super::*;
+
+    fn manifest_binding(
+        id: &str,
+        rpc: &str,
+        phases: &[GatewayInterceptorPhase],
+    ) -> InterceptorBinding {
+        InterceptorBinding {
+            id: id.to_string(),
+            selector: Some(InterceptorSelector {
+                rpc: rpc.to_string(),
+                service: String::new(),
+                method: String::new(),
+            }),
+            phases: phases.iter().map(|phase| *phase as i32).collect(),
+            failure_policy: "fail_open".to_string(),
+        }
+    }
+
+    fn strict_binding(
+        rpc: &str,
+        phases: Vec<GatewayInterceptorPhaseConfig>,
+    ) -> GatewayInterceptorBindingOverride {
+        GatewayInterceptorBindingOverride {
+            rpc: Some(rpc.to_string()),
+            phases: Some(phases),
+            ..GatewayInterceptorBindingOverride::default()
+        }
+    }
 
     #[test]
     fn parses_timeout_suffixes() {
@@ -653,6 +961,167 @@ mod tests {
             err.to_string(),
             "invalid interceptor config: duplicate interceptor instance name 'governance'"
         );
+    }
+
+    #[test]
+    fn interceptor_binding_policy_defaults_to_dynamic() {
+        assert_eq!(
+            GatewayInterceptorConfig::default().binding_policy,
+            GatewayInterceptorBindingPolicy::Dynamic
+        );
+    }
+
+    #[test]
+    fn allowlist_enables_only_configured_phases_and_ignores_manifest_policy() {
+        let rpc = "openshell.v1.OpenShell/CreateSandbox";
+        let manifest = vec![
+            manifest_binding(
+                "create",
+                rpc,
+                &[
+                    GatewayInterceptorPhase::ModifyOperation,
+                    GatewayInterceptorPhase::Validate,
+                ],
+            ),
+            manifest_binding(
+                "update",
+                "openshell.v1.OpenShell/UpdateConfig",
+                &[GatewayInterceptorPhase::Validate],
+            ),
+        ];
+        let configured = vec![strict_binding(
+            rpc,
+            vec![GatewayInterceptorPhaseConfig::Validate],
+        )];
+
+        let normalized = normalize_strict_bindings(
+            "governance",
+            &manifest,
+            FailurePolicy::FailClosed,
+            &configured,
+            GatewayInterceptorBindingPolicy::Allowlist,
+        )
+        .unwrap();
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].binding_id, "create");
+        assert_eq!(normalized[0].phases, vec![Phase::Validate]);
+        assert_eq!(normalized[0].failure_policy, FailurePolicy::FailClosed);
+    }
+
+    #[test]
+    fn allowlist_requires_every_configured_binding_and_phase() {
+        let rpc = "openshell.v1.OpenShell/CreateSandbox";
+        let manifest = vec![manifest_binding(
+            "create",
+            rpc,
+            &[GatewayInterceptorPhase::Validate],
+        )];
+        let missing_phase = vec![strict_binding(
+            rpc,
+            vec![GatewayInterceptorPhaseConfig::ModifyOperation],
+        )];
+        let missing_rpc = vec![strict_binding(
+            "openshell.v1.OpenShell/UpdateConfig",
+            vec![GatewayInterceptorPhaseConfig::Validate],
+        )];
+
+        let phase_err = normalize_strict_bindings(
+            "governance",
+            &manifest,
+            FailurePolicy::FailClosed,
+            &missing_phase,
+            GatewayInterceptorBindingPolicy::Allowlist,
+        )
+        .unwrap_err();
+        let rpc_err = normalize_strict_bindings(
+            "governance",
+            &manifest,
+            FailurePolicy::FailClosed,
+            &missing_rpc,
+            GatewayInterceptorBindingPolicy::Allowlist,
+        )
+        .unwrap_err();
+
+        assert!(phase_err.to_string().contains("do not satisfy allowlist"));
+        assert!(
+            rpc_err
+                .to_string()
+                .contains("did not declare configured binding")
+        );
+    }
+
+    #[test]
+    fn exact_rejects_extra_bindings_and_phases() {
+        let rpc = "openshell.v1.OpenShell/CreateSandbox";
+        let configured = vec![strict_binding(
+            rpc,
+            vec![GatewayInterceptorPhaseConfig::Validate],
+        )];
+        let extra_binding = vec![
+            manifest_binding("create", rpc, &[GatewayInterceptorPhase::Validate]),
+            manifest_binding(
+                "update",
+                "openshell.v1.OpenShell/UpdateConfig",
+                &[GatewayInterceptorPhase::Validate],
+            ),
+        ];
+        let extra_phase = vec![manifest_binding(
+            "create",
+            rpc,
+            &[
+                GatewayInterceptorPhase::ModifyOperation,
+                GatewayInterceptorPhase::Validate,
+            ],
+        )];
+
+        let binding_err = normalize_strict_bindings(
+            "governance",
+            &extra_binding,
+            FailurePolicy::FailClosed,
+            &configured,
+            GatewayInterceptorBindingPolicy::Exact,
+        )
+        .unwrap_err();
+        let phase_err = normalize_strict_bindings(
+            "governance",
+            &extra_phase,
+            FailurePolicy::FailClosed,
+            &configured,
+            GatewayInterceptorBindingPolicy::Exact,
+        )
+        .unwrap_err();
+
+        assert!(binding_err.to_string().contains("unconfigured binding"));
+        assert!(phase_err.to_string().contains("do not satisfy exact"));
+    }
+
+    #[test]
+    fn strict_policies_match_by_rpc_and_reject_id_or_ambiguous_manifest_entries() {
+        let rpc = "openshell.v1.OpenShell/CreateSandbox";
+        let mut configured_with_id =
+            strict_binding(rpc, vec![GatewayInterceptorPhaseConfig::Validate]);
+        configured_with_id.id = Some("create".to_string());
+        let id_err = normalize_strict_config("governance", &[configured_with_id]).unwrap_err();
+        assert!(id_err.to_string().contains("select by RPC, not id"));
+
+        let configured = vec![strict_binding(
+            rpc,
+            vec![GatewayInterceptorPhaseConfig::Validate],
+        )];
+        let duplicated = vec![
+            manifest_binding("create-a", rpc, &[GatewayInterceptorPhase::Validate]),
+            manifest_binding("create-b", rpc, &[GatewayInterceptorPhase::Validate]),
+        ];
+        let duplicate_err = normalize_strict_bindings(
+            "governance",
+            &duplicated,
+            FailurePolicy::FailClosed,
+            &configured,
+            GatewayInterceptorBindingPolicy::Allowlist,
+        )
+        .unwrap_err();
+        assert!(duplicate_err.to_string().contains("multiple bindings"));
     }
 
     #[test]

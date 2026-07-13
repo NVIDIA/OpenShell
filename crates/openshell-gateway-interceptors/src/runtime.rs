@@ -214,7 +214,11 @@ impl GatewayInterceptorRuntime {
 
         let mut operation = operation;
         for plan in plans {
-            let result = evaluate_plan(plan, operation.json.clone(), context).await;
+            let interceptor_view = self
+                .codec
+                .decode_bytes_to_interceptor_json(operation_type, &operation.encoded)
+                .map_err(|err| Status::internal(err.to_string()))?;
+            let result = evaluate_plan(plan, interceptor_view, context).await;
             let result = match result {
                 Ok(result) => result,
                 Err(err) => {
@@ -254,6 +258,10 @@ fn apply_evaluation_result(
 
     if plan.phase == Phase::ModifyOperation && !result.patches.is_empty() {
         let patch_count = result.patches.len();
+        if let Err(err) = validate_patch_visibility(codec, operation_type, &result.patches) {
+            apply_failure_policy(plan, &err)?;
+            return Ok(operation);
+        }
         match operation.apply_patches(codec, operation_type, &result.patches) {
             Ok(candidate) => {
                 emit_evaluation_metrics(plan, "allow", patch_count);
@@ -270,6 +278,20 @@ fn apply_evaluation_result(
         emit_evaluation_log(plan, result, "allow", 0);
         Ok(operation)
     }
+}
+
+fn validate_patch_visibility(
+    codec: &ProtoJsonCodec,
+    operation_type: &str,
+    patches: &[JsonPatch],
+) -> Result<()> {
+    for patch in patches {
+        codec.ensure_interceptor_patch_path_visible(operation_type, &patch.path)?;
+        if !patch.from.is_empty() {
+            codec.ensure_interceptor_patch_path_visible(operation_type, &patch.from)?;
+        }
+    }
+    Ok(())
 }
 
 async fn evaluate_plan(
@@ -577,7 +599,8 @@ mod tests {
     use super::*;
     use openshell_core::proto::gateway_interceptor::v1::gateway_interceptor_client::GatewayInterceptorClient;
     use openshell_core::proto::{
-        CreateSandboxRequest, SandboxSpec, SandboxTemplate, UpdateConfigRequest,
+        CreateProviderRequest, CreateSandboxRequest, Provider, SandboxSpec, SandboxTemplate,
+        UpdateConfigRequest,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -722,6 +745,117 @@ mod tests {
             patches,
             ..InterceptorResult::default()
         }
+    }
+
+    fn create_provider_operation(codec: &ProtoJsonCodec) -> ValidatedOperation {
+        let request = CreateProviderRequest {
+            provider: Some(Provider {
+                r#type: "github".to_string(),
+                credentials: HashMap::from([(
+                    "GITHUB_TOKEN".to_string(),
+                    "secret-value".to_string(),
+                )]),
+                config: HashMap::from([("region".to_string(), "old".to_string())]),
+                ..Provider::default()
+            }),
+        };
+        let json = codec
+            .decode_message_to_json("openshell.v1.CreateProviderRequest", &request)
+            .unwrap();
+        ValidatedOperation::new(codec, "openshell.v1.CreateProviderRequest", json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn secret_patch_path_fails_closed() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let operation = create_provider_operation(&codec);
+        let result = allowed_result(vec![patch(
+            "replace",
+            "/provider/credentials/GITHUB_TOKEN",
+            json!("replacement"),
+        )]);
+
+        let status = apply_evaluation_result(
+            &codec,
+            "openshell.v1.CreateProviderRequest",
+            &test_modify_plan(FailurePolicy::FailClosed),
+            &result,
+            operation,
+        )
+        .expect_err("secret patch must fail closed");
+
+        assert!(status.message().contains("omitted secret field"));
+    }
+
+    #[tokio::test]
+    async fn secret_patch_path_fails_open_to_the_unchanged_operation() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let operation = create_provider_operation(&codec);
+        let prior = operation.clone();
+        let result = allowed_result(vec![patch(
+            "remove",
+            "/provider/credentials/GITHUB_TOKEN",
+            Value::Null,
+        )]);
+
+        let outcome = apply_evaluation_result(
+            &codec,
+            "openshell.v1.CreateProviderRequest",
+            &test_modify_plan(FailurePolicy::FailOpen),
+            &result,
+            operation,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, prior);
+    }
+
+    #[tokio::test]
+    async fn secret_patch_from_path_is_rejected() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let operation = create_provider_operation(&codec);
+        let result = allowed_result(vec![JsonPatch {
+            op: "copy".to_string(),
+            path: "/provider/config/copied".to_string(),
+            value: None,
+            from: "/provider/credentials/GITHUB_TOKEN".to_string(),
+        }]);
+
+        let status = apply_evaluation_result(
+            &codec,
+            "openshell.v1.CreateProviderRequest",
+            &test_modify_plan(FailurePolicy::FailClosed),
+            &result,
+            operation,
+        )
+        .expect_err("secret patch source must fail closed");
+
+        assert!(status.message().contains("omitted secret field"));
+    }
+
+    #[tokio::test]
+    async fn non_secret_patch_preserves_authoritative_credentials() {
+        let codec = ProtoJsonCodec::openshell().unwrap();
+        let operation = create_provider_operation(&codec);
+        let result = allowed_result(vec![patch(
+            "replace",
+            "/provider/config/region",
+            json!("new"),
+        )]);
+
+        let outcome = apply_evaluation_result(
+            &codec,
+            "openshell.v1.CreateProviderRequest",
+            &test_modify_plan(FailurePolicy::FailClosed),
+            &result,
+            operation,
+        )
+        .unwrap();
+        let decoded = CreateProviderRequest::decode(outcome.encoded.as_slice()).unwrap();
+        let provider = decoded.provider.unwrap();
+
+        assert_eq!(provider.config["region"], "new");
+        assert_eq!(provider.credentials["GITHUB_TOKEN"], "secret-value");
     }
 
     #[test]

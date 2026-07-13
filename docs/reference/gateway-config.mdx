@@ -146,18 +146,19 @@ name               = "quota"
 grpc_endpoint      = "unix:///run/openshell/interceptors/quota.sock"
 order              = 10
 failure_policy     = "fail_closed"
+binding_policy     = "allowlist"
 timeout            = "500ms"
 max_response_bytes = 1048576
 max_patches        = 32
 
 [[openshell.gateway.interceptors.bindings]]
-id             = "quota-create-sandbox"
+rpc            = "openshell.v1.OpenShell/CreateSandbox"
 phases         = ["modify_operation", "validate"]
 failure_policy = "fail_closed"
 
 [[openshell.gateway.interceptors.bindings]]
-rpc      = "openshell.v1.OpenShell/UpdateConfig"
-disabled = true
+rpc    = "openshell.v1.OpenShell/UpdateConfig"
+phases = ["validate"]
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
@@ -166,7 +167,15 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
-`[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target unary OpenShell methods that are not on the built-in supervisor, streaming, read-only, or introspection allowlist. Request bodies are exposed as protobuf JSON objects, so adding a new unary RPC does not require handler-specific interceptor code.
+`[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target unary OpenShell methods that are not on the built-in supervisor, streaming, read-only, or introspection allowlist. Request bodies are exposed as protobuf JSON objects, so adding a new unary RPC does not require handler-specific interceptor code. Fields marked secret in the protobuf schema are recursively omitted from requests and post-commit responses. Interceptors cannot patch an omitted field or a containing object.
+
+`binding_policy` controls how the manifest and operator binding configuration combine:
+
+- `dynamic` enables valid manifest bindings and treats configured entries as optional narrowing overrides. This is the compatibility default. The gateway logs a startup warning because the interceptor controls its non-secret RPC authority.
+- `allowlist` enables only configured RPC selectors and phases. The gateway ignores and logs extra manifest declarations, but fails startup when the manifest omits a configured RPC or phase.
+- `exact` requires the configured and manifest RPC selectors and phases to match exactly.
+
+Bindings under `allowlist` and `exact` require `rpc` or `service` plus `method`, and a nonempty `phases` list. They match by RPC rather than manifest binding ID. Duplicate selectors, `id`, and `disabled` are invalid in these modes; omit a binding to disable it. Binding failure policy comes from the binding, then the configured service, then defaults to `fail_closed`. Manifest failure policies do not override strict-mode operator configuration.
 
 Bindings that include `post_commit` must resolve to `failure_policy = "fail_open"`; the gateway rejects fail-closed post-commit configuration at startup. Post-commit evaluation is observational. If response observation or interceptor evaluation fails after a handler succeeds, the gateway logs and counts the failure but returns the committed response unchanged.
 
@@ -183,7 +192,7 @@ provider_profile_sources = [
 
 The gateway validates snapshot structure and provider-profile semantics. It treats a configured interceptor as the source trust boundary and does not verify signature, hash, or key annotations in profile payloads.
 
-`failure_policy` accepts `fail_closed` or `fail_open`. `timeout` accepts `ms` and `s` suffixes. Binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
+`failure_policy` accepts `fail_closed` or `fail_open`. `timeout` accepts `ms` and `s` suffixes. In `dynamic` mode, binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
 

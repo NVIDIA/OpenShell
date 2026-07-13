@@ -52,6 +52,20 @@ phases, and re-encoded before the handler sees the request. This keeps
 interception centralized: adding an interceptable unary RPC does not require
 method-specific gateway instrumentation.
 
+Each configured interceptor selects a binding policy. `dynamic` accepts valid
+manifest declarations and preserves the compatibility behavior. `allowlist`
+enables only operator-configured RPCs and phases, while `exact` requires the
+configured and declared sets to match. Strict policies match by RPC rather than
+manifest binding ID, so renaming a binding does not change authority. Provider
+profile sources remain a separate operator-controlled capability.
+
+The protobuf schema marks dedicated credential, token, and refresh-material
+fields with a custom secret option. The middleware recursively omits those
+fields from every request and post-commit response sent to an interceptor while
+retaining the complete protobuf operation for handler dispatch. JSON Patch
+paths and source paths cannot select an omitted field or replace a containing
+object. There is no configuration that exposes annotated fields.
+
 `SubmitPolicyAnalysis` is interceptable because proposed chunks can eventually
 change active policy through the gateway's approval workflow. An interceptor
 may therefore reject policy proposals while permitting telemetry-only requests.

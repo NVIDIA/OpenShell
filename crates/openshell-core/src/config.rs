@@ -577,10 +577,29 @@ pub struct GatewayInterceptorConfig {
     /// Maximum JSON patches accepted from one evaluation result.
     #[serde(default)]
     pub max_patches: Option<usize>,
-    /// Optional binding overrides. Overrides may disable bindings or narrow
-    /// phases/selectors declared by the interceptor service.
+    /// Controls whether manifest bindings are dynamic, allowlisted, or must
+    /// exactly match operator configuration.
+    #[serde(default)]
+    pub binding_policy: GatewayInterceptorBindingPolicy,
+    /// Binding configuration. Its validation and authorization semantics are
+    /// selected by `binding_policy`.
     #[serde(default)]
     pub bindings: Vec<GatewayInterceptorBindingOverride>,
+}
+
+/// Operator policy for authorizing interceptor manifest bindings.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorBindingPolicy {
+    /// Preserve manifest-controlled binding discovery. Configured bindings
+    /// may narrow or disable manifest declarations.
+    #[default]
+    Dynamic,
+    /// Enable only configured RPC selectors and phases. Extra manifest
+    /// declarations are ignored.
+    Allowlist,
+    /// Require configured and manifest RPC selectors and phases to match.
+    Exact,
 }
 
 /// One configured source in the gateway's effective provider-profile catalog.
@@ -604,7 +623,7 @@ pub enum GatewayInterceptorFailurePolicy {
     FailOpen,
 }
 
-/// Configured override for a manifest binding.
+/// Configured binding authorization or dynamic-manifest override.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayInterceptorBindingOverride {
@@ -939,10 +958,11 @@ mod tests {
     #[cfg(unix)]
     use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorFailurePolicy,
-        GatewayJwtConfig, GatewayProviderProfileSourceConfig, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket, normalize_compute_driver_name,
-        podman_socket_candidates_from_env, podman_socket_responds,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
+        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
+        GatewayProviderProfileSourceConfig, detect_driver, docker_host_unix_socket_path,
+        is_unix_socket, normalize_compute_driver_name, podman_socket_candidates_from_env,
+        podman_socket_responds,
     };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
@@ -1039,6 +1059,26 @@ mod tests {
                 .unwrap_err();
 
         assert!(err.to_string().contains("unknown variant `ignore`"));
+    }
+
+    #[test]
+    fn gateway_interceptor_binding_policy_defaults_and_parses_strict_modes() {
+        let defaulted: GatewayInterceptorConfig = serde_json::from_value(serde_json::json!({
+            "name": "governance",
+            "grpc_endpoint": "unix:///tmp/governance.sock"
+        }))
+        .unwrap();
+        let allowlist: GatewayInterceptorBindingPolicy =
+            serde_json::from_value(serde_json::json!("allowlist")).unwrap();
+        let exact: GatewayInterceptorBindingPolicy =
+            serde_json::from_value(serde_json::json!("exact")).unwrap();
+
+        assert_eq!(
+            defaulted.binding_policy,
+            GatewayInterceptorBindingPolicy::Dynamic
+        );
+        assert_eq!(allowlist, GatewayInterceptorBindingPolicy::Allowlist);
+        assert_eq!(exact, GatewayInterceptorBindingPolicy::Exact);
     }
 
     #[test]
