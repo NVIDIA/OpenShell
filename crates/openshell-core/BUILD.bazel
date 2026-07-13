@@ -30,7 +30,13 @@ cargo_build_script(
 rust_library(
     name = "openshell_core",
     srcs = glob(["src/**/*.rs"]),
-    crate_features = ["telemetry"],
+    crate_features = [
+        "telemetry",
+        # Test-only flag-guard helpers wanted by supervisor/sandbox dev
+        # builds; cargo's workspace feature unification enables this in dev
+        # graphs the same way.
+        "test-helpers",
+    ],
     edition = "2024",
     version = "0.0.0",
     visibility = ["//visibility:public"],
