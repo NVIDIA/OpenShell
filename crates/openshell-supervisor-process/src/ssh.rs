@@ -11,6 +11,7 @@ use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
@@ -652,7 +653,7 @@ pub async fn connect_in_netns(
             .map_err(|_| std::io::Error::other("netns connect thread panicked"))??;
         std_stream.set_nonblocking(true)?;
         let stream = tokio::net::TcpStream::from_std(std_stream)?;
-        crate::net::set_nodelay_best_effort(&stream);
+        set_tcp_nodelay_best_effort(&stream);
         return Ok(stream);
     }
 
@@ -660,7 +661,7 @@ pub async fn connect_in_netns(
     let _ = netns_fd;
 
     let stream = tokio::net::TcpStream::connect(addr).await?;
-    crate::net::set_nodelay_best_effort(&stream);
+    set_tcp_nodelay_best_effort(&stream);
     Ok(stream)
 }
 

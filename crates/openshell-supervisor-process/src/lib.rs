@@ -12,7 +12,6 @@ pub mod child_env;
 pub mod debug_rpc;
 pub mod log_push;
 pub mod managed_children;
-mod net;
 pub mod process;
 pub mod run;
 pub mod sandbox;

@@ -26,6 +26,7 @@
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use miette::{IntoDiagnostic, Result};
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -101,11 +102,7 @@ async fn accept_loop(listener: TcpListener, config: Arc<TunnelConfig>) {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 debug!(peer = %peer, "accepted local tunnel connection");
-                // set TCP_NODELAY so small gRPC frames are not delayed. Okay if it fails;
-                // things just go a bit slower in some cases, so we log and continue.
-                if let Err(e) = stream.set_nodelay(true) {
-                    debug!(peer = %peer, error = %e, "failed to set TCP_NODELAY");
-                }
+                set_tcp_nodelay_best_effort(&stream);
                 let config = Arc::clone(&config);
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(stream, &config).await {
@@ -179,20 +176,13 @@ async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream
         .await
         .map_err(|e| miette::miette!("WebSocket connect failed: {e}"))?;
 
-    // set TCP_NODELAY on the WebSocket's TCP stream so small gRPC frames are
-    // not delayed. Okay if it fails; things just go a bit slower in some
-    // cases, so we log and continue.
     let tcp = match ws_stream.get_ref() {
         MaybeTlsStream::Plain(tcp) => Some(tcp),
         MaybeTlsStream::Rustls(tls) => Some(tls.get_ref().0),
         _ => None,
     };
     if let Some(tcp) = tcp {
-        if let Err(e) = tcp.set_nodelay(true) {
-            debug!(error = %e, "failed to set TCP_NODELAY on WebSocket stream");
-        }
-    } else {
-        debug!("unknown WebSocket stream variant; skipping TCP_NODELAY");
+        set_tcp_nodelay_best_effort(tcp);
     }
 
     debug!(

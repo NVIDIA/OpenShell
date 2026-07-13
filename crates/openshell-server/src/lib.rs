@@ -52,6 +52,7 @@ pub mod tracing_bus;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -549,11 +550,7 @@ async fn serve_gateway_listener(
             }
         };
 
-        // set TCP_NODELAY so small gRPC frames are not delayed. Okay if it fails;
-        // things just go a bit slower in some cases, so we log and continue.
-        if let Err(e) = stream.set_nodelay(true) {
-            debug!(error = %e, client = %addr, "Failed to set TCP_NODELAY on accepted connection");
-        }
+        set_tcp_nodelay_best_effort(&stream);
 
         spawn_gateway_connection(
             stream,

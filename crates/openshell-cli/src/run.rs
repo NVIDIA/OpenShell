@@ -27,6 +27,7 @@ use openshell_bootstrap::{
 use openshell_bootstrap::{
     GatewayMetadataSource, ListedGateway, gateway_metadata_source, list_gateways_with_source,
 };
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
     PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
@@ -2891,11 +2892,7 @@ pub async fn service_forward_tcp(
                 let (socket, peer) = accepted
                     .into_diagnostic()
                     .wrap_err("failed to accept local forward connection")?;
-                // set TCP_NODELAY so small forwarded writes are not delayed. Okay if it
-                // fails; things just go a bit slower in some cases, so we log and continue.
-                if let Err(err) = socket.set_nodelay(true) {
-                    tracing::debug!(peer = %peer, error = %err, "failed to set TCP_NODELAY");
-                }
+                set_tcp_nodelay_best_effort(&socket);
                 let mut client = client.clone();
                 let sandbox_id = sandbox_id.clone();
                 let target_host = target_host.to_string();

@@ -10,7 +10,10 @@ use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::denial::DenialEvent;
-use openshell_core::net::{is_always_blocked_ip, is_internal_ip, is_link_local_ip};
+use openshell_core::net::{
+    connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip, is_link_local_ip,
+    set_tcp_nodelay_best_effort,
+};
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
@@ -268,12 +271,7 @@ impl ProxyHandle {
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
-                        // set TCP_NODELAY so small relayed writes are not delayed. Okay
-                        // if it fails; things just go a bit slower in some cases, so we
-                        // log and continue.
-                        if let Err(e) = stream.set_nodelay(true) {
-                            tracing::debug!(error = %e, "failed to set TCP_NODELAY on accepted proxy connection");
-                        }
+                        set_tcp_nodelay_best_effort(&stream);
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
@@ -1082,7 +1080,7 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    let mut upstream = connect_upstream(validated_addrs.as_slice())
+    let mut upstream = connect_tcp_nodelay_best_effort(validated_addrs.as_slice())
         .await
         .into_diagnostic()?;
 
@@ -2263,17 +2261,6 @@ async fn write_all(writer: &mut (impl tokio::io::AsyncWrite + Unpin), data: &[u8
     writer.write_all(data).await.into_diagnostic()?;
     writer.flush().await.into_diagnostic()?;
     Ok(())
-}
-
-/// Connect to `addrs` with `TCP_NODELAY` set so small relayed writes are not
-/// delayed. Best-effort: okay if it fails, things just go a bit slower, so we
-/// log and continue.
-async fn connect_upstream(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
-    let stream = TcpStream::connect(addrs).await?;
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::debug!(error = %e, "failed to set TCP_NODELAY on upstream connection");
-    }
-    Ok(stream)
 }
 
 #[derive(Debug, Clone)]
@@ -4354,7 +4341,7 @@ async fn handle_forward_proxy(
     }
 
     // 6. Connect upstream
-    let mut upstream = match connect_upstream(addrs.as_slice()).await {
+    let mut upstream = match connect_tcp_nodelay_best_effort(addrs.as_slice()).await {
         Ok(s) => s,
         Err(e) => {
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -4663,16 +4650,6 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-
-    /// Regression test: the upstream connect path sets `TCP_NODELAY`.
-    #[tokio::test]
-    async fn connect_upstream_sets_tcp_nodelay() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let addr = listener.local_addr().expect("local addr");
-
-        let stream = connect_upstream(&[addr]).await.expect("connect");
-        assert!(stream.nodelay().expect("query TCP_NODELAY"));
-    }
 
     #[test]
     fn endpoint_only_opa_allows_declared_endpoint_without_process_identity() {

@@ -31,6 +31,7 @@ use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
 use openshell_core::grpc_client;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -664,12 +665,12 @@ async fn connect_tcp_target(
             .map_err(|_| "netns tcp connect thread panicked")??;
         stream.set_nonblocking(true)?;
         let stream = tokio::net::TcpStream::from_std(stream)?;
-        crate::net::set_nodelay_best_effort(&stream);
+        set_tcp_nodelay_best_effort(&stream);
         return Ok(stream);
     }
 
     let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
-    crate::net::set_nodelay_best_effort(&stream);
+    set_tcp_nodelay_best_effort(&stream);
     Ok(stream)
 }
 
@@ -680,7 +681,7 @@ async fn connect_tcp_target(
     _netns_fd: Option<i32>,
 ) -> Result<tokio::net::TcpStream, Box<dyn std::error::Error + Send + Sync>> {
     let stream = tokio::net::TcpStream::connect((host.as_str(), port)).await?;
-    crate::net::set_nodelay_best_effort(&stream);
+    set_tcp_nodelay_best_effort(&stream);
     Ok(stream)
 }
 
