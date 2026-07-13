@@ -34,6 +34,18 @@ tests:
           path: spec.template.spec.containers[0].args
           content: "--jwt-only"
         documentIndex: 3
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--server-san=openshell.my-namespace.svc"
+        documentIndex: 3
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--server-san=openshell.my-namespace.svc.cluster.local"
+        documentIndex: 3
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--server-san=openshell.openshell.svc.cluster.local"
+        documentIndex: 3
 
   - it: renders JWT-only certgen hook when cert-manager owns TLS
     template: templates/certgen.yaml

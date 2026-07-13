@@ -28,7 +28,9 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
 use kube::api::{Api, ObjectMeta, PostParams};
 use miette::{IntoDiagnostic, Result, WrapErr};
-use openshell_bootstrap::pki::{DEFAULT_SERVER_SANS, PkiBundle, generate_pki};
+use openshell_bootstrap::pki::{
+    DEFAULT_SERVER_SANS, PkiBundle, generate_pki, generate_pki_with_server_sans,
+};
 use openshell_core::paths::{create_dir_restricted, set_file_owner_only};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -69,8 +71,11 @@ pub struct CertgenArgs {
     #[arg(long, conflicts_with = "output_dir")]
     jwt_only: bool,
 
-    /// Extra Subject Alternative Name for the server certificate. Repeatable.
-    /// Auto-detected as an IP address or DNS name.
+    /// Subject Alternative Name for the server certificate. Repeatable.
+    ///
+    /// Kubernetes mode treats this as the complete SAN list. Local
+    /// `--output-dir` mode appends these values to the built-in local defaults.
+    /// Values are auto-detected as IP addresses or DNS names.
     #[arg(long = "server-san", value_name = "SAN")]
     server_sans: Vec<String>,
 
@@ -88,7 +93,7 @@ pub async fn run(args: CertgenArgs) -> Result<()> {
         .init();
 
     if args.dry_run {
-        let bundle = generate_pki(&args.server_sans)?;
+        let bundle = generate_bundle(args.output_dir.as_deref(), &args.server_sans)?;
         print_bundle(&bundle);
         return Ok(());
     }
@@ -96,8 +101,16 @@ pub async fn run(args: CertgenArgs) -> Result<()> {
     if let Some(dir) = args.output_dir.as_deref() {
         run_local(dir, &args.server_sans)
     } else {
-        let bundle = generate_pki(&args.server_sans)?;
+        let bundle = generate_bundle(None, &args.server_sans)?;
         run_kubernetes(&args, &bundle).await
+    }
+}
+
+fn generate_bundle(output_dir: Option<&Path>, server_sans: &[String]) -> Result<PkiBundle> {
+    if output_dir.is_some() {
+        generate_pki(server_sans)
+    } else {
+        generate_pki_with_server_sans(server_sans)
     }
 }
 
@@ -789,9 +802,10 @@ fn print_bundle(bundle: &PkiBundle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        CertSan, K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, jwt_signing_secret,
-        missing_required_server_sans, read_local_bundle, sibling_temp_dir, tls_secret,
-        write_local_bundle, write_local_jwt_bundle, write_local_tls_bundle,
+        CertSan, K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, generate_bundle,
+        jwt_signing_secret, missing_required_server_sans, read_local_bundle, server_cert_sans,
+        sibling_temp_dir, tls_secret, write_local_bundle, write_local_jwt_bundle,
+        write_local_tls_bundle,
     };
     use openshell_bootstrap::pki::generate_pki;
     use std::path::Path;
@@ -829,6 +843,36 @@ mod tests {
                 "({s},{c},{j})"
             );
         }
+    }
+
+    #[test]
+    fn generate_bundle_uses_authoritative_sans_for_kubernetes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("server.crt");
+        let requested = vec!["openshell.my-namespace.svc.cluster.local".to_string()];
+        let bundle = generate_bundle(None, &requested).expect("generate bundle");
+        std::fs::write(&cert, bundle.server_cert_pem).expect("write certificate");
+
+        let sans = server_cert_sans(&cert).expect("read certificate SANs");
+        assert_eq!(
+            sans,
+            std::iter::once(CertSan::Dns(requested[0].clone())).collect()
+        );
+    }
+
+    #[test]
+    fn generate_bundle_preserves_additive_defaults_for_local_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("server.crt");
+        let requested = vec!["local-extra.example.test".to_string()];
+        let bundle = generate_bundle(Some(dir.path()), &requested).expect("generate bundle");
+        std::fs::write(&cert, bundle.server_cert_pem).expect("write certificate");
+
+        let sans = server_cert_sans(&cert).expect("read certificate SANs");
+        assert!(sans.contains(&CertSan::Dns("localhost".to_string())));
+        assert!(sans.contains(&CertSan::Dns("host.docker.internal".to_string())));
+        assert!(sans.contains(&CertSan::Dns("host.containers.internal".to_string())));
+        assert!(sans.contains(&CertSan::Dns(requested[0].clone())));
     }
 
     #[test]

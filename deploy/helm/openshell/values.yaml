@@ -319,12 +319,10 @@ networkPolicy:
 # left untouched on upgrade. Reuses the gateway image - no extra image to
 # mirror in air-gapped environments.
 #
-# The server certificate already includes the built-in cluster SANs
-# (`openshell`, `openshell.openshell.svc`, the cluster.local FQDN, `localhost`,
-# `openshell.localhost`, `*.openshell.localhost`, `host.docker.internal`, and
-# `127.0.0.1`) baked into the gateway binary. The lists below are additional
-# SANs appended on top. Wildcard DNS SANs also enable sandbox service URLs under
-# that domain, for example `*.apps.example.com` enables
+# The server certificate already includes the release-aware service name and
+# cluster FQDN plus local loopback and container-host SANs. The lists below are
+# additional SANs appended on top. Wildcard DNS SANs also enable sandbox service
+# URLs under that domain, for example `*.apps.example.com` enables
 # `<sandbox>--<service>.apps.example.com`.
 pkiInitJob:
   # -- Run a pre-install/pre-upgrade Job that creates gateway and client mTLS
@@ -353,15 +351,8 @@ certManager:
   certificateDuration: 8760h
   # -- Renewal window for cert-manager-issued certificates.
   certificateRenewBefore: 720h
-  # -- DNS SANs on the cert-manager-issued server certificate.
-  serverDnsNames:
-    - openshell
-    - openshell.openshell.svc
-    - openshell.openshell.svc.cluster.local
-    - localhost
-    - openshell.localhost
-    - "*.openshell.localhost"
-    - host.docker.internal
+  # -- Extra DNS SANs to append to the release-aware server certificate defaults.
+  serverDnsNames: []
   # -- IP SANs on the cert-manager-issued server certificate.
   serverIpAddresses:
     - 127.0.0.1

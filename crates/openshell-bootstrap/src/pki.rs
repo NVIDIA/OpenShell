@@ -50,6 +50,20 @@ pub const DEFAULT_SERVER_SANS: &[&str] = &[
 /// never expire. This is appropriate for an internal dev-cluster PKI where certs
 /// are ephemeral to the cluster's lifetime.
 pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
+    let server_sans = DEFAULT_SERVER_SANS
+        .iter()
+        .map(|san| (*san).to_string())
+        .chain(extra_sans.iter().cloned())
+        .collect::<Vec<_>>();
+    generate_pki_with_server_sans(&server_sans)
+}
+
+/// Generate a complete PKI bundle using exactly the supplied server SANs.
+///
+/// This is intended for callers, such as the Helm certgen hook, that own the
+/// complete deployment-specific SAN list. Local callers should use
+/// [`generate_pki`] so the runtime host aliases remain present.
+pub fn generate_pki_with_server_sans(server_sans: &[String]) -> Result<PkiBundle> {
     // --- CA ---
     let ca_key = KeyPair::generate()
         .into_diagnostic()
@@ -74,7 +88,7 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
     let server_key = KeyPair::generate()
         .into_diagnostic()
         .wrap_err("failed to generate server key")?;
-    let server_sans = build_server_sans(extra_sans);
+    let server_sans = build_server_sans(server_sans);
     let mut server_params = CertificateParams::new(Vec::<String>::new())
         .into_diagnostic()
         .wrap_err("failed to create server cert params")?;
@@ -127,14 +141,11 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
     })
 }
 
-/// Build the SAN list for the server certificate from defaults + extras.
-fn build_server_sans(extra_sans: &[String]) -> Vec<SanType> {
+/// Build the SAN list for the server certificate from caller-provided values.
+fn build_server_sans(server_sans: &[String]) -> Vec<SanType> {
     let mut sans = Vec::new();
 
-    for s in DEFAULT_SERVER_SANS {
-        add_san(&mut sans, s);
-    }
-    for s in extra_sans {
+    for s in server_sans {
         add_san(&mut sans, s);
     }
 
@@ -178,12 +189,35 @@ mod tests {
     }
 
     #[test]
-    fn build_server_sans_includes_defaults_and_extras() {
-        let extras = vec!["192.168.1.100".to_string(), "remote.host".to_string()];
-        let sans = build_server_sans(&extras);
+    fn generate_pki_adds_defaults_to_extras() {
+        let extras = ["192.168.1.100".to_string(), "remote.host".to_string()];
+        let server_sans = DEFAULT_SERVER_SANS
+            .iter()
+            .map(|san| (*san).to_string())
+            .chain(extras.iter().cloned())
+            .collect::<Vec<_>>();
+        let sans = build_server_sans(&server_sans);
 
-        // Should have all default SANs + 2 extras
         assert_eq!(sans.len(), DEFAULT_SERVER_SANS.len() + 2);
+    }
+
+    #[test]
+    fn authoritative_server_sans_exclude_unspecified_defaults() {
+        let server_sans = vec![
+            "openshell.release-namespace.svc.cluster.local".to_string(),
+            "192.0.2.10".to_string(),
+        ];
+        let sans = build_server_sans(&server_sans);
+
+        assert_eq!(sans.len(), server_sans.len());
+        assert!(!sans.iter().any(|san| {
+            matches!(san, SanType::DnsName(name) if name.as_str() == "openshell.openshell.svc.cluster.local")
+        }));
+        assert!(
+            !sans.iter().any(|san| {
+                matches!(san, SanType::DnsName(name) if name.as_str() == "localhost")
+            })
+        );
     }
 
     #[test]
