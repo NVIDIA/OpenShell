@@ -106,6 +106,9 @@ supervisor opens a new control stream, usually after the previous owner pod is
 terminated or the stream breaks. A reconnect from the same supervisor instance
 with a newer epoch can supersede the previous owner before the TTL expires, and
 heartbeats from the active connection renew that current owner record.
+Cleanup from an older connection checks the shared owner record before and
+after changing sandbox readiness. It cannot demote a sandbox after a newer
+replica has published replacement ownership.
 
 Session-bound operations such as exec, TCP forwarding, file sync, and sandbox
 service routing first check the local session registry. If the supervisor is
@@ -127,7 +130,15 @@ Gateway peer RPCs authenticate with Kubernetes ServiceAccount identity rather
 than a shared secret. Helm mounts a projected, pod-bound token with audience
 `openshell-gateway-peer`; the receiving gateway validates it through
 TokenReview, checks the live pod UID and chart selector labels, and authorizes
-only the internal peer relay method.
+only the internal peer relay method. When gateway TLS is enabled, peer clients
+also trust the chart CA, present the chart-generated client certificate for
+mTLS, and verify the stable gateway Service DNS name even when connecting to a
+Deployment pod IP.
+
+`WatchSandbox` uses the local update bus for same-replica writes. One shared
+poller per gateway observes resource-version changes made by other replicas and
+feeds that bus for all local watchers, avoiding a database poll per client
+stream.
 
 ## API Surface
 

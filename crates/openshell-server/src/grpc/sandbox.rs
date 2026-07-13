@@ -715,9 +715,6 @@ pub(super) async fn handle_watch_sandbox(
             }
         }
 
-        let mut store_poll = tokio::time::interval(std::time::Duration::from_secs(1));
-        store_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
         loop {
             tokio::select! {
                 res = async {
@@ -730,10 +727,14 @@ pub(super) async fn handle_watch_sandbox(
                         Ok(()) => {
                             match state.store.get_message::<Sandbox>(&sandbox_id).await {
                                 Ok(Some(sandbox)) => {
-                                    last_sandbox_resource_version = Some(sandbox
+                                    let resource_version = sandbox
                                         .metadata
                                         .as_ref()
-                                        .map_or(0, |metadata| metadata.resource_version));
+                                        .map_or(0, |metadata| metadata.resource_version);
+                                    if last_sandbox_resource_version == Some(resource_version) {
+                                        continue;
+                                    }
+                                    last_sandbox_resource_version = Some(resource_version);
                                     state.sandbox_index.update_from_sandbox(&sandbox);
                                     if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
                                         return;
@@ -756,39 +757,6 @@ pub(super) async fn handle_watch_sandbox(
                         }
                         Err(err) => {
                             let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
-                            return;
-                        }
-                    }
-                }
-                _ = store_poll.tick(), if follow_status => {
-                    match state.store.get_message::<Sandbox>(&sandbox_id).await {
-                        Ok(Some(sandbox)) => {
-                            let resource_version = sandbox
-                                .metadata
-                                .as_ref()
-                                .map_or(0, |metadata| metadata.resource_version);
-                            if last_sandbox_resource_version == Some(resource_version) {
-                                continue;
-                            }
-                            last_sandbox_resource_version = Some(resource_version);
-                            state.sandbox_index.update_from_sandbox(&sandbox);
-                            if tx.send(Ok(SandboxStreamEvent {
-                                payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone())),
-                            })).await.is_err() {
-                                return;
-                            }
-                            if stop_on_terminal {
-                                let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
-                                if phase == SandboxPhase::Ready {
-                                    return;
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(Status::internal(format!("fetch sandbox failed: {e}")))).await;
                             return;
                         }
                     }
@@ -2394,8 +2362,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_sandbox_polls_store_updates_without_local_bus_notification() {
+    async fn watch_sandbox_observes_shared_store_poller_notification() {
         let state = test_server_state().await;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        crate::sandbox_watch::spawn_store_poller(
+            state.store.clone(),
+            state.sandbox_watch_bus.clone(),
+            std::time::Duration::from_millis(10),
+            shutdown_rx,
+        );
         let mut sandbox = test_sandbox("watch-poll", Vec::new());
         sandbox.set_phase(SandboxPhase::Provisioning as i32);
         let sandbox_id = sandbox.object_id().to_string();

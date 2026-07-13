@@ -161,7 +161,7 @@ projected peer ServiceAccount token volume, and TokenReview RBAC:
 kubectl -n openshell get svc openshell-peer -o wide
 kubectl -n openshell get endpoints openshell-peer
 kubectl -n openshell get pod -l app.kubernetes.io/instance=openshell \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{.spec.volumes[?(@.name=="gateway-peer-token")]}{"\n"}{.spec.containers[0].env[?(@.name=="OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE")]}{"\n"}{.spec.containers[0].env[?(@.name=="OPENSHELL_PEER_ENDPOINT")]}{"\n"}{end}'
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{.spec.volumes[?(@.name=="gateway-peer-token")]}{"\n"}{.spec.volumes[?(@.name=="peer-client-tls")]}{"\n"}{.spec.containers[0].env[?(@.name=="OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE")]}{"\n"}{.spec.containers[0].env[?(@.name=="OPENSHELL_PEER_ENDPOINT")]}{"\n"}{.spec.containers[0].env[?(@.name=="OPENSHELL_PEER_TLS_SERVER_NAME")]}{"\n"}{end}'
 kubectl auth can-i create tokenreviews.authentication.k8s.io \
   --as=system:serviceaccount:openshell:openshell
 kubectl auth can-i get pods -n openshell \
@@ -180,6 +180,13 @@ the live gateway pods. Deployment-backed gateway pods should also publish
 `OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE` name follows the existing
 token-file convention used by `OPENSHELL_SANDBOX_TOKEN_FILE` and
 `OPENSHELL_K8S_SA_TOKEN_FILE`.
+
+For TLS-enabled gateways, peer clients verify the stable gateway Service DNS
+name and load the chart CA plus client identity from
+`OPENSHELL_PEER_TLS_CA_FILE`, `OPENSHELL_PEER_TLS_CERT_FILE`, and
+`OPENSHELL_PEER_TLS_KEY_FILE`. If peer calls fail during TLS negotiation, verify
+the `peer-client-tls` volume exists, those files are readable, and the server
+certificate includes the name in `OPENSHELL_PEER_TLS_SERVER_NAME`.
 
 Check required Helm deployment secrets:
 

@@ -80,6 +80,20 @@ spec:
           value: /var/run/secrets/openshell-peer/token
         - name: OPENSHELL_PEER_POD_LABELS
           value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s" (include "openshell.name" .) .Release.Name | quote }}
+        {{- if not .Values.server.disableTls }}
+        - name: OPENSHELL_PEER_TLS_SERVER_NAME
+          value: {{ printf "%s.%s.svc.cluster.local" (include "openshell.fullname" .) .Release.Namespace | quote }}
+        {{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled }}
+        - name: OPENSHELL_PEER_TLS_CA_FILE
+          value: /etc/openshell-tls/server/ca.crt
+        {{- end }}
+        {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+        - name: OPENSHELL_PEER_TLS_CERT_FILE
+          value: /etc/openshell-tls/peer-client/tls.crt
+        - name: OPENSHELL_PEER_TLS_KEY_FILE
+          value: /etc/openshell-tls/peer-client/tls.key
+        {{- end }}
+        {{- end }}
         {{- if .Values.server.externalDbSecret }}
         - name: OPENSHELL_DB_URL
           valueFrom:
@@ -117,6 +131,11 @@ spec:
         - name: tls-cert
           mountPath: /etc/openshell-tls/server
           readOnly: true
+        {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+        - name: peer-client-tls
+          mountPath: /etc/openshell-tls/peer-client
+          readOnly: true
+        {{- end }}
         {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
         - name: tls-client-ca
           mountPath: /etc/openshell-tls/client-ca
@@ -185,6 +204,11 @@ spec:
     - name: tls-cert
       secret:
         secretName: {{ .Values.server.tls.certSecretName }}
+    {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+    - name: peer-client-tls
+      secret:
+        secretName: {{ .Values.server.tls.clientTlsSecretName }}
+    {{- end }}
     {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
     - name: tls-client-ca
       secret:

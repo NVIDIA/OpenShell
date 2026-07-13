@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::{Ascii, MetadataValue};
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -40,6 +40,79 @@ const MAX_PENDING_RELAYS: usize = 256;
 /// consume the entire global budget. Sits above the SSH-tunnel per-sandbox
 /// cap (20) so tunnel-specific limits still fire first for that caller.
 const MAX_PENDING_RELAYS_PER_SANDBOX: usize = 32;
+const PEER_TLS_CA_FILE_ENV: &str = "OPENSHELL_PEER_TLS_CA_FILE";
+const PEER_TLS_CERT_FILE_ENV: &str = "OPENSHELL_PEER_TLS_CERT_FILE";
+const PEER_TLS_KEY_FILE_ENV: &str = "OPENSHELL_PEER_TLS_KEY_FILE";
+const PEER_TLS_SERVER_NAME_ENV: &str = "OPENSHELL_PEER_TLS_SERVER_NAME";
+
+#[derive(Debug, Default)]
+struct PeerTlsClientConfig {
+    ca_file: Option<std::path::PathBuf>,
+    cert_file: Option<std::path::PathBuf>,
+    key_file: Option<std::path::PathBuf>,
+    server_name: Option<String>,
+}
+
+impl PeerTlsClientConfig {
+    fn from_env() -> Self {
+        Self {
+            ca_file: nonempty_env(PEER_TLS_CA_FILE_ENV).map(Into::into),
+            cert_file: nonempty_env(PEER_TLS_CERT_FILE_ENV).map(Into::into),
+            key_file: nonempty_env(PEER_TLS_KEY_FILE_ENV).map(Into::into),
+            server_name: nonempty_env(PEER_TLS_SERVER_NAME_ENV),
+        }
+    }
+
+    fn load(&self) -> Result<ClientTlsConfig, Status> {
+        let mut tls = if let Some(path) = self.ca_file.as_deref() {
+            let pem = std::fs::read(path).map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to read gateway peer TLS CA {}: {err}",
+                    path.display()
+                ))
+            })?;
+            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(pem))
+        } else {
+            ClientTlsConfig::new().with_native_roots()
+        };
+
+        match (self.cert_file.as_deref(), self.key_file.as_deref()) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert = std::fs::read(cert_path).map_err(|err| {
+                    Status::failed_precondition(format!(
+                        "failed to read gateway peer TLS certificate {}: {err}",
+                        cert_path.display()
+                    ))
+                })?;
+                let key = std::fs::read(key_path).map_err(|err| {
+                    Status::failed_precondition(format!(
+                        "failed to read gateway peer TLS key {}: {err}",
+                        key_path.display()
+                    ))
+                })?;
+                tls = tls.identity(Identity::from_pem(cert, key));
+            }
+            (None, None) => {}
+            _ => {
+                return Err(Status::failed_precondition(format!(
+                    "{PEER_TLS_CERT_FILE_ENV} and {PEER_TLS_KEY_FILE_ENV} must be configured together"
+                )));
+            }
+        }
+
+        if let Some(server_name) = self.server_name.as_deref() {
+            tls = tls.domain_name(server_name);
+        }
+        Ok(tls)
+    }
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
 // ---------------------------------------------------------------------------
 // Session registry
@@ -642,8 +715,9 @@ async fn build_peer_channel(endpoint: &str) -> Result<Channel, Status> {
         .http2_adaptive_window(true);
 
     if endpoint.starts_with("https://") {
+        let peer_tls = PeerTlsClientConfig::from_env().load()?;
         ep = ep
-            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .tls_config(peer_tls)
             .map_err(|err| Status::internal(format!("failed to configure peer TLS: {err}")))?;
     }
 
@@ -1323,6 +1397,42 @@ mod tests {
     /// `register` signature without the receiver noise.
     fn make_shutdown() -> oneshot::Sender<()> {
         oneshot::channel::<()>().0
+    }
+
+    #[test]
+    fn peer_tls_client_config_requires_certificate_and_key_together() {
+        let config = PeerTlsClientConfig {
+            cert_file: Some("client.crt".into()),
+            ..Default::default()
+        };
+
+        let err = config
+            .load()
+            .expect_err("an incomplete peer mTLS identity must fail closed");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains(PEER_TLS_KEY_FILE_ENV));
+    }
+
+    #[test]
+    fn peer_tls_client_config_loads_chart_ca_identity_and_server_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = dir.path().join("ca.crt");
+        let cert = dir.path().join("tls.crt");
+        let key = dir.path().join("tls.key");
+        std::fs::write(&ca, b"test-ca").unwrap();
+        std::fs::write(&cert, b"test-cert").unwrap();
+        std::fs::write(&key, b"test-key").unwrap();
+
+        let config = PeerTlsClientConfig {
+            ca_file: Some(ca),
+            cert_file: Some(cert),
+            key_file: Some(key),
+            server_name: Some("openshell.openshell.svc.cluster.local".to_string()),
+        };
+
+        config
+            .load()
+            .expect("complete chart peer TLS materials should configure tonic");
     }
 
     fn sandbox_record(id: &str, name: &str) -> Sandbox {

@@ -127,6 +127,12 @@ Kubernetes TokenReview API, verify the live pod UID and Helm selector labels,
 and authorize only the internal `PeerRelay` RPC. The chart does not create or
 accept a shared gateway peer Secret.
 
+With gateway TLS enabled, peer calls use the chart CA and client TLS Secret for
+server verification and mTLS. The client verifies the stable gateway Service
+DNS name while connecting directly to the owning pod. Custom TLS Secrets must
+include that Service DNS name in the server certificate and provide the CA and
+client credentials configured by `server.tls`.
+
 ## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`

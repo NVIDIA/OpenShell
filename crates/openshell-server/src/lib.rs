@@ -462,6 +462,12 @@ pub(crate) async fn run_server(
     }
 
     state.compute.spawn_watchers(shutdown_rx.clone());
+    sandbox_watch::spawn_store_poller(
+        store.clone(),
+        state.sandbox_watch_bus.clone(),
+        Duration::from_secs(1),
+        shutdown_rx.clone(),
+    );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));

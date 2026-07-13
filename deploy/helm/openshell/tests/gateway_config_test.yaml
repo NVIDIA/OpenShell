@@ -347,10 +347,36 @@ tests:
             name: OPENSHELL_PEER_TOKEN_AUDIENCE
             value: openshell-gateway-peer
       - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_SERVER_NAME
+            value: openshell.my-namespace.svc.cluster.local
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CA_FILE
+            value: /etc/openshell-tls/server/ca.crt
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_CERT_FILE
+            value: /etc/openshell-tls/peer-client/tls.crt
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_PEER_TLS_KEY_FILE
+            value: /etc/openshell-tls/peer-client/tls.key
+      - contains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
             name: gateway-peer-token
             mountPath: /var/run/secrets/openshell-peer
+            readOnly: true
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: peer-client-tls
+            mountPath: /etc/openshell-tls/peer-client
             readOnly: true
       - equal:
           path: spec.template.spec.volumes[2].projected.sources[0].serviceAccountToken.audience

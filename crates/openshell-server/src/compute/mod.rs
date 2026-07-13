@@ -1278,11 +1278,38 @@ impl ComputeRuntime {
     }
 
     pub async fn supervisor_session_connected(&self, sandbox_id: &str) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, true).await
+        let _guard = self.sync_lock.lock().await;
+        let sandbox = self
+            .update_supervisor_session_state(sandbox_id, true)
+            .await?;
+        self.publish_supervisor_session_state(sandbox_id, sandbox);
+        Ok(())
     }
 
     pub async fn supervisor_session_disconnected(&self, sandbox_id: &str) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, false).await
+        let _guard = self.sync_lock.lock().await;
+
+        // A replacement session may already be owned by another replica. Do
+        // not let cleanup from this replica overwrite the new owner's Ready
+        // state. Recheck after the demotion as well: if ownership changed
+        // between the first read and the CAS, restore Ready before releasing
+        // the synchronization lock. A new owner published after the second
+        // read will run supervisor_session_connected and promote the sandbox.
+        if self.supervisor_session_ready(sandbox_id).await? {
+            return Ok(());
+        }
+
+        let demoted = self
+            .update_supervisor_session_state(sandbox_id, false)
+            .await?;
+        let sandbox = if self.supervisor_session_ready(sandbox_id).await? {
+            self.update_supervisor_session_state(sandbox_id, true)
+                .await?
+        } else {
+            demoted
+        };
+        self.publish_supervisor_session_state(sandbox_id, sandbox);
+        Ok(())
     }
 
     async fn supervisor_session_ready(&self, sandbox_id: &str) -> Result<bool, String> {
@@ -1304,13 +1331,11 @@ impl ComputeRuntime {
         Ok(age_ms < ttl_ms)
     }
 
-    async fn set_supervisor_session_state(
+    async fn update_supervisor_session_state(
         &self,
         sandbox_id: &str,
         connected: bool,
-    ) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
-
+    ) -> Result<Option<Sandbox>, String> {
         // Use CAS to update sandbox phase based on supervisor session state
         let result = self
             .store
@@ -1340,7 +1365,7 @@ impl ComputeRuntime {
             Err(crate::persistence::PersistenceError::Database(ref msg))
                 if msg.contains("not found") =>
             {
-                return Ok(());
+                return Ok(None);
             }
             Err(crate::persistence::PersistenceError::Conflict {
                 current_resource_version,
@@ -1354,9 +1379,14 @@ impl ComputeRuntime {
             Err(e) => return Err(e.to_string()),
         };
 
-        self.sandbox_index.update_from_sandbox(&sandbox);
-        self.sandbox_watch_bus.notify(sandbox_id);
-        Ok(())
+        Ok(Some(sandbox))
+    }
+
+    fn publish_supervisor_session_state(&self, sandbox_id: &str, sandbox: Option<Sandbox>) {
+        if let Some(sandbox) = sandbox {
+            self.sandbox_index.update_from_sandbox(&sandbox);
+            self.sandbox_watch_bus.notify(sandbox_id);
+        }
     }
 
     async fn apply_deleted(&self, sandbox_id: &str) -> Result<(), String> {
@@ -3150,6 +3180,42 @@ mod tests {
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "DependenciesNotReady");
         assert_eq!(ready.message, "Supervisor session not connected");
+    }
+
+    #[tokio::test]
+    async fn stale_session_disconnect_preserves_new_remote_owner_ready_state() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        SupervisorOwnerIndex::new(runtime.store.clone(), OWNER_TTL)
+            .publish(
+                "sb-1",
+                "replacement-session",
+                "supervisor-instance",
+                2,
+                "gateway-b",
+                "http://gateway-b:8080",
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .supervisor_session_disconnected("sb-1")
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
     }
 
     #[tokio::test]
