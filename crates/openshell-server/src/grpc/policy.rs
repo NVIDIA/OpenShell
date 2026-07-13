@@ -8515,6 +8515,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
