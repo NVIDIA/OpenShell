@@ -55,6 +55,12 @@ fn policy_state(service: &GovernanceInterceptorService) -> PolicyState {
     service.current_policy_state()
 }
 
+fn jwt_header(service: &GovernanceInterceptorService) -> Header {
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.kid = Some(service.policy_signer.kid().to_string());
+    header
+}
+
 #[test]
 fn evaluation_requires_a_phase_payload() {
     let service = service();
@@ -93,7 +99,10 @@ fn assert_signed_profile(service: &GovernanceInterceptorService, profile: &Provi
         .annotations
         .get(PROFILE_HASH_ANNOTATION)
         .expect("profile hash annotation");
-    assert_eq!(profile_hash, &deterministic_profile_hash(profile));
+    assert_eq!(
+        profile_hash,
+        &deterministic_profile_hash(profile).expect("profile hash")
+    );
     assert_eq!(
         profile
             .annotations
@@ -448,6 +457,72 @@ fn create_sandbox_validate_denies_signed_policy_mismatch() {
         .unwrap();
     assert!(!result.allowed);
     assert!(result.reason.contains("signature"));
+}
+
+#[test]
+fn policy_signature_rejects_legacy_hash_algorithm() {
+    let service = service();
+    let state = policy_state(&service);
+    let claims = PolicySignatureClaims {
+        sub: POLICY_JWT_SUBJECT.to_string(),
+        iss: POLICY_JWT_ISSUER.to_string(),
+        aud: POLICY_JWT_AUDIENCE.to_string(),
+        iat: now_secs(),
+        exp: 0,
+        hash_algorithm: "openshell-governance-protobuf-sha256-v1".to_string(),
+        policy_sha256: state.policy_hash.clone(),
+    };
+    let token = encode(
+        &jwt_header(&service),
+        &claims,
+        &service.policy_signer.encoding_key,
+    )
+    .unwrap();
+
+    let error = service
+        .policy_signer
+        .verify_policy_signature(&token, &state.policy_hash)
+        .unwrap_err();
+    assert_eq!(error, "unexpected policy hash algorithm");
+}
+
+#[test]
+fn profile_signature_rejects_missing_hash_algorithm() {
+    #[derive(serde::Serialize)]
+    struct LegacyProfileSignatureClaims {
+        sub: String,
+        iss: String,
+        aud: String,
+        iat: i64,
+        exp: i64,
+        profile_id: String,
+        profile_sha256: String,
+    }
+
+    let service = service();
+    let profile = &service.current_profile_state().profiles[0];
+    let profile_hash = profile.annotations.get(PROFILE_HASH_ANNOTATION).unwrap();
+    let claims = LegacyProfileSignatureClaims {
+        sub: format!("{PROFILE_JWT_SUBJECT_PREFIX}{}", profile.id),
+        iss: POLICY_JWT_ISSUER.to_string(),
+        aud: PROFILE_JWT_AUDIENCE.to_string(),
+        iat: 0,
+        exp: 0,
+        profile_id: profile.id.clone(),
+        profile_sha256: profile_hash.clone(),
+    };
+    let token = encode(
+        &jwt_header(&service),
+        &claims,
+        &service.policy_signer.encoding_key,
+    )
+    .unwrap();
+
+    let error = service
+        .policy_signer
+        .verify_profile_signature(&token, &profile.id, profile_hash)
+        .unwrap_err();
+    assert!(error.contains("missing field `hash_algorithm`"));
 }
 
 #[test]

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod policy_hash;
+mod proto_json;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -23,13 +24,16 @@ use openshell_core::proto::{
     ListSandboxesRequest, ProviderProfile, Sandbox, SandboxPhase, SandboxPolicy,
     UpdateConfigRequest, open_shell_client::OpenShellClient,
 };
-use openshell_gateway_interceptors::ProtoJsonCodec;
 use openshell_policy::parse_sandbox_policy;
 use openshell_providers::{ProviderTypeProfile, normalize_profile_id};
-use policy_hash::deterministic_policy_hash;
+use policy_hash::{
+    HASH_ALGORITHM, canonical_policy_hash, canonical_profile_hash,
+    canonical_profile_snapshot_revision, is_v2_digest,
+};
 use prost::Message as _;
 use prost_types::ListValue;
 use prost_types::{Struct, Value as ProtoValue, value::Kind};
+use proto_json::{decode_message_to_json, encode_json_to_message};
 use rcgen::{KeyPair, PKCS_ED25519};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value, json};
@@ -79,6 +83,7 @@ struct PolicySignatureClaims {
     aud: String,
     iat: i64,
     exp: i64,
+    hash_algorithm: String,
     policy_sha256: String,
 }
 
@@ -89,6 +94,7 @@ struct ProfileSignatureClaims {
     aud: String,
     iat: i64,
     exp: i64,
+    hash_algorithm: String,
     profile_id: String,
     profile_sha256: String,
 }
@@ -122,6 +128,7 @@ impl PolicySigner {
             aud: POLICY_JWT_AUDIENCE.to_string(),
             iat: now_secs(),
             exp: 0,
+            hash_algorithm: HASH_ALGORITHM.to_string(),
             policy_sha256: policy_hash.to_string(),
         };
         let mut header = Header::new(Algorithm::EdDSA);
@@ -137,6 +144,7 @@ impl PolicySigner {
             aud: PROFILE_JWT_AUDIENCE.to_string(),
             iat: 0,
             exp: 0,
+            hash_algorithm: HASH_ALGORITHM.to_string(),
             profile_id: profile_id.to_string(),
             profile_sha256: profile_hash.to_string(),
         };
@@ -167,6 +175,12 @@ impl PolicySigner {
             .map_err(|err| format!("failed to verify policy JWT: {err}"))?;
         if data.claims.sub != POLICY_JWT_SUBJECT {
             return Err("unexpected policy JWT subject".to_string());
+        }
+        if data.claims.hash_algorithm != HASH_ALGORITHM {
+            return Err("unexpected policy hash algorithm".to_string());
+        }
+        if !is_v2_digest(&data.claims.policy_sha256) {
+            return Err("unexpected policy hash format".to_string());
         }
         if data.claims.policy_sha256 != policy_hash {
             return Err("signed policy hash does not match sandbox policy".to_string());
@@ -204,6 +218,12 @@ impl PolicySigner {
         }
         if data.claims.profile_id != profile_id {
             return Err("unexpected provider profile id".to_string());
+        }
+        if data.claims.hash_algorithm != HASH_ALGORITHM {
+            return Err("unexpected provider profile hash algorithm".to_string());
+        }
+        if !is_v2_digest(&data.claims.profile_sha256) {
+            return Err("unexpected provider profile hash format".to_string());
         }
         if data.claims.profile_sha256 != profile_hash {
             return Err("signed provider profile hash does not match profile".to_string());
@@ -631,7 +651,7 @@ fn validate_signed_policy_payload(
     policy_signer: &PolicySigner,
 ) -> Result<(), String> {
     let sandbox_policy = sandbox_policy_from_interceptor_json(policy)?;
-    let sandbox_policy_hash = deterministic_policy_hash(&sandbox_policy);
+    let sandbox_policy_hash = canonical_policy_hash(&sandbox_policy)?;
     policy_signer
         .verify_policy_signature(signature, &sandbox_policy_hash)
         .map_err(|err| format!("sandbox policy signature is invalid: {err}"))?;
@@ -726,7 +746,7 @@ fn load_policy_state(
         .map_err(|err| format!("failed to parse policy YAML: {err}"))?;
     let policy = sandbox_policy_to_proto_json(&policy_proto)?;
     let policy = normalize_for_struct(policy)?;
-    let policy_hash = deterministic_policy_hash(&policy_proto);
+    let policy_hash = canonical_policy_hash(&policy_proto)?;
     let policy_signature = policy_signer.sign_policy(&policy_hash)?;
     Ok(PolicyState {
         policy,
@@ -876,7 +896,7 @@ fn profile_state_from_loaded(
         .map(|loaded| sign_provider_profile(loaded.profile, policy_signer))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ProviderProfileState {
-        revision: provider_profile_revision(&profiles),
+        revision: canonical_profile_snapshot_revision(&profiles)?,
         ids,
         profiles,
     })
@@ -890,7 +910,7 @@ fn sign_provider_profile(
     profile.annotations.remove(PROFILE_HASH_ANNOTATION);
     profile.annotations.remove(PROFILE_SIGNATURE_KID_ANNOTATION);
 
-    let profile_hash = deterministic_profile_hash(&profile);
+    let profile_hash = deterministic_profile_hash(&profile)?;
     let profile_signature = policy_signer.sign_profile(&profile.id, &profile_hash)?;
     profile
         .annotations
@@ -905,26 +925,12 @@ fn sign_provider_profile(
     Ok(profile)
 }
 
-fn provider_profile_revision(profiles: &[ProviderProfile]) -> String {
-    let mut profiles = profiles.to_vec();
-    profiles.sort_by(|left, right| left.id.cmp(&right.id));
-    let mut hasher = Sha256::new();
-    hasher.update(b"openshell-governance-provider-profiles-v1");
-    for profile in profiles {
-        hasher.update(profile.encode_to_vec());
-    }
-    format!("sha256:{:x}", hasher.finalize())
-}
-
-fn deterministic_profile_hash(profile: &ProviderProfile) -> String {
+fn deterministic_profile_hash(profile: &ProviderProfile) -> Result<String, String> {
     let mut profile = profile.clone();
     profile.annotations.remove(PROFILE_SIGNATURE_ANNOTATION);
     profile.annotations.remove(PROFILE_HASH_ANNOTATION);
     profile.annotations.remove(PROFILE_SIGNATURE_KID_ANNOTATION);
-    let mut hasher = Sha256::new();
-    hasher.update(b"openshell-governance-provider-profile-v1");
-    hasher.update(profile.encode_to_vec());
-    format!("sha256:{:x}", hasher.finalize())
+    canonical_profile_hash(&profile)
 }
 
 fn is_managed_profile_id(managed_profile_ids: &[String], id: &str) -> bool {
@@ -1021,14 +1027,12 @@ fn now_secs() -> i64 {
 }
 
 fn sandbox_policy_to_proto_json(policy: &SandboxPolicy) -> Result<Value, String> {
-    ProtoJsonCodec::openshell()
-        .and_then(|codec| codec.decode_message_to_json(SANDBOX_POLICY_TYPE, policy))
+    decode_message_to_json(SANDBOX_POLICY_TYPE, policy)
         .map_err(|err| format!("failed to render policy protobuf JSON: {err}"))
 }
 
 fn sandbox_policy_from_interceptor_json(policy: &Value) -> Result<SandboxPolicy, String> {
-    let bytes = ProtoJsonCodec::openshell()
-        .and_then(|codec| codec.encode_json_to_message(SANDBOX_POLICY_TYPE, policy))
+    let bytes = encode_json_to_message(SANDBOX_POLICY_TYPE, policy)
         .map_err(|err| format!("sandbox policy cannot be decoded as protobuf JSON: {err}"))?;
     SandboxPolicy::decode(bytes.as_slice())
         .map_err(|err| format!("sandbox policy protobuf payload is invalid: {err}"))

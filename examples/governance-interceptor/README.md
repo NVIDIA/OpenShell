@@ -41,6 +41,14 @@ start. This keeps the example self-contained. Production governance services
 should load managed signing keys, publish verifier keys, and define a rotation
 process.
 
+The example owns this digest contract independently of the gateway. It uses a
+local reflected protobuf codec, recursively sorts ProtoJSON object keys, and
+preserves repeated-field order. Policy and profile hashes use the
+`sha256:v2:<hex>` format, and their JWTs require
+`hash_algorithm=openshell-governance-protojson-sha256-v2`. The gateway's policy
+hash is a separate operational revision identifier and is not expected to
+match the signed governance hash.
+
 The interceptor polls the policy file every second by default. When `policy.yaml`
 changes and parses successfully, the interceptor re-signs it immediately. New
 sandboxes receive the updated signed policy through `CreateSandbox`. If
