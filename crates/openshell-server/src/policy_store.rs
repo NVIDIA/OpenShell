@@ -94,6 +94,13 @@ pub trait PolicyStoreExt {
         rejection_reason: Option<&str>,
     ) -> PersistenceResult<bool>;
 
+    async fn conditionally_reject_draft_chunk(
+        &self,
+        id: &str,
+        decided_at_ms: i64,
+        rejection_reason: &str,
+    ) -> PersistenceResult<bool>;
+
     async fn update_draft_chunk_rule(
         &self,
         id: &str,
@@ -254,6 +261,26 @@ impl PolicyStoreExt for Store {
             Self::Sqlite(store) => {
                 store
                     .update_draft_chunk_status(id, status, decided_at_ms, rejection_reason)
+                    .await
+            }
+        }
+    }
+
+    async fn conditionally_reject_draft_chunk(
+        &self,
+        id: &str,
+        decided_at_ms: i64,
+        rejection_reason: &str,
+    ) -> PersistenceResult<bool> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .conditionally_reject_draft_chunk(id, decided_at_ms, rejection_reason)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .conditionally_reject_draft_chunk(id, decided_at_ms, rejection_reason)
                     .await
             }
         }

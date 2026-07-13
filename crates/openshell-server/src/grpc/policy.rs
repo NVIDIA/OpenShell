@@ -835,15 +835,10 @@ async fn self_reject_mechanistic_if_already_covered(
     );
     match state
         .store
-        .update_draft_chunk_status(
-            new_chunk_id,
-            "rejected",
-            Some(current_time_ms()),
-            Some(&reason),
-        )
+        .conditionally_reject_draft_chunk(new_chunk_id, current_time_ms(), &reason)
         .await
     {
-        Ok(_) => {
+        Ok(true) => {
             info!(
                 sandbox_id = %sandbox_id,
                 chunk_id = %new_chunk_id,
@@ -852,6 +847,13 @@ async fn self_reject_mechanistic_if_already_covered(
                 port = port,
                 binary = %binary,
                 "Auto-rejected incoming mechanistic chunk: endpoint already covered by an approved chunk"
+            );
+        }
+        Ok(false) => {
+            info!(
+                sandbox_id = %sandbox_id,
+                chunk_id = %new_chunk_id,
+                "mechanistic self-reject skipped: chunk no longer pending (decided concurrently)"
             );
         }
         Err(err) => {
@@ -8160,6 +8162,120 @@ mod tests {
             policy.network_policies.contains_key("allow_10_0_0_5_8080"),
             "approved rule must stay merged after resubmit; keys: {:?}",
             policy.network_policies.keys().collect::<Vec<_>>()
+        );
+    }
+
+    fn pending_draft_chunk(id: &str, sandbox_id: &str) -> DraftChunkRecord {
+        DraftChunkRecord {
+            id: id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            draft_version: 1,
+            status: "pending".to_string(),
+            rule_name: "allow_endpoint".to_string(),
+            proposed_rule: Vec::new(),
+            rationale: String::new(),
+            security_notes: String::new(),
+            confidence: 0.5,
+            created_at_ms: 1_000,
+            decided_at_ms: None,
+            host: "10.0.0.5".to_string(),
+            port: 8080,
+            binary: "/usr/bin/curl".to_string(),
+            hit_count: 1,
+            first_seen_ms: 1_000,
+            last_seen_ms: 1_000,
+            validation_result: String::new(),
+            rejection_reason: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn conditionally_reject_transitions_pending_chunk() {
+        let store = test_store().await;
+        store
+            .put_draft_chunk(&pending_draft_chunk("cas-pending", "sb-cas-pending"), None)
+            .await
+            .unwrap();
+
+        let changed = store
+            .conditionally_reject_draft_chunk("cas-pending", 5, "covered by approved chunk cover-1")
+            .await
+            .unwrap();
+        assert!(changed, "a pending chunk must transition to rejected");
+
+        let stored = store.get_draft_chunk("cas-pending").await.unwrap().unwrap();
+        assert_eq!(stored.status, "rejected");
+        assert_eq!(stored.decided_at_ms, Some(5));
+        assert_eq!(stored.rejection_reason, "covered by approved chunk cover-1");
+    }
+
+    #[tokio::test]
+    async fn conditionally_reject_leaves_approved_chunk_untouched() {
+        let store = test_store().await;
+        store
+            .put_draft_chunk(
+                &pending_draft_chunk("cas-approved", "sb-cas-approved"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .update_draft_chunk_status("cas-approved", "approved", Some(1), None)
+                .await
+                .unwrap()
+        );
+
+        let changed = store
+            .conditionally_reject_draft_chunk("cas-approved", 2, "covered")
+            .await
+            .unwrap();
+        assert!(
+            !changed,
+            "an approved chunk must not be conditionally rejected"
+        );
+
+        let stored = store
+            .get_draft_chunk("cas-approved")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.status, "approved",
+            "the approved status must survive a losing conditional reject"
+        );
+        assert!(stored.rejection_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conditionally_reject_loses_race_to_approval() {
+        let store = test_store().await;
+        store
+            .put_draft_chunk(&pending_draft_chunk("cas-race", "sb-cas-race"), None)
+            .await
+            .unwrap();
+
+        let observed = store.get_draft_chunk("cas-race").await.unwrap().unwrap();
+        assert_eq!(observed.status, "pending");
+
+        assert!(
+            store
+                .update_draft_chunk_status("cas-race", "approved", Some(10), None)
+                .await
+                .unwrap()
+        );
+
+        let changed = store
+            .conditionally_reject_draft_chunk("cas-race", 11, "covered")
+            .await
+            .unwrap();
+        assert!(!changed);
+
+        let stored = store.get_draft_chunk("cas-race").await.unwrap().unwrap();
+        assert_eq!(
+            stored.status, "approved",
+            "an approval that commits before the conditional reject must win; the ledger must \
+             never read rejected while the merged rule stays enforced"
         );
     }
 
