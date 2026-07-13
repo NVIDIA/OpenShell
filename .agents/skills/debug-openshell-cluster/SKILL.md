@@ -316,6 +316,13 @@ kubectl -n openshell get secret \
   openshell-jwt-keys
 ```
 
+When `server.tls.clientCaSecretName=""`, the chart intentionally omits
+`client_ca_path` and the `tls-client-ca` mount, even with built-in PKI or
+cert-manager. That is expected; do not treat a missing `tls-client-ca` pod
+mount as a defect (`openshell-server-client-ca` may still exist from PKI).
+User auth is OIDC or trusted proxy (`server.auth.allowUnauthenticatedUsers=true`);
+supervisor transport still uses `openshell-client-tls`.
+
 In cert-manager installs, `certManager.enabled=true` makes cert-manager own TLS
 generation. The Helm chart should still render the `openshell-certgen`
 pre-install/pre-upgrade hook in JWT-only mode to create `openshell-jwt-keys`,
@@ -638,6 +645,7 @@ openshell logs <sandbox-name>
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
 | External server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server-external`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |
 | Sandbox supervisors fail TLS handshake with `UnknownCA` after configuring `certManager.serverIssuerRef` | `server.grpcEndpoint` is set to the external hostname, forcing supervisors to receive the ACME cert (via SNI) which they can't verify against chart CA | Remove `server.grpcEndpoint` or set it to the internal service name; supervisors should connect via internal service name to receive the internal cert |
+| Browser `ERR_BAD_SSL_CLIENT_AUTH_CERT` or gateway logs show client cert verification when OIDC or direct HTTPS is expected | Listener client-CA verification still enabled (`clientCaSecretName` unset or `client_ca_path` in ConfigMap) | Set `server.tls.clientCaSecretName=""`, upgrade chart, confirm ConfigMap omits `client_ca_path` |
 
 ## Reporting
 
