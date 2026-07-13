@@ -12,3 +12,11 @@ platform(
     name = "linux_arm64_musl",
     parents = ["@zig_sdk//libc_aware/platform:linux_arm64_musl"],
 )
+
+# Experimental: cross-compiling library crates to macOS. zig provides the
+# darwin libc headers and libSystem stubs; targets needing Apple framework
+# link stubs (Security, CoreFoundation) cannot link without an Apple SDK.
+platform(
+    name = "darwin_arm64",
+    parents = ["@zig_sdk//platform:darwin_arm64"],
+)

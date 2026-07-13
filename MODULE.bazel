@@ -46,6 +46,19 @@ rust.repository_set(
     ],
 )
 
+# Experimental macOS cross-compilation (library crates only; linking needs
+# Apple framework stubs that zig does not ship).
+rust.repository_set(
+    name = "rust_darwin_arm64",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_triple = "aarch64-apple-darwin",
+    versions = ["1.95.0"],
+    target_compatible_with = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
 use_repo(rust, "rust_toolchains")
 
 # The musl hub entries must be registered before //:all — the gnu entries in
@@ -76,6 +89,7 @@ use_repo(hermetic_toolchain, "zig_sdk")
 register_toolchains(
     "@zig_sdk//libc_aware/toolchain:linux_amd64_musl",
     "@zig_sdk//libc_aware/toolchain:linux_arm64_musl",
+    "@zig_sdk//toolchain:darwin_arm64",
 )
 
 # Hermetic protoc for openshell-core's build script, injected via $PROTOC
