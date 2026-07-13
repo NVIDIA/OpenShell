@@ -15,6 +15,17 @@ use crate::l7::provider::{L7Provider, L7Request};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
 
+/// Stable classification reason for a top-level array on an MCP endpoint.
+pub(crate) const UNSUPPORTED_MCP_BATCH_REASON: &str = "unsupported_mcp_batch";
+
+/// Preserve stable classifier reasons while contextualizing ordinary JSON-RPC parse failures.
+pub(crate) fn jsonrpc_parse_rejection_reason(error: &str) -> String {
+    if error == UNSUPPORTED_MCP_BATCH_REASON {
+        return error.to_string();
+    }
+    format!("JSON-RPC request rejected: {error}")
+}
+
 /// Selects whether the parser should treat a JSON-RPC message as generic
 /// JSON-RPC 2.0 or as an MCP message with MCP method/params validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +188,17 @@ pub fn parse_jsonrpc_body_with_options(
     };
 
     if let serde_json::Value::Array(items) = value {
+        // Streamable HTTP carries one MCP message per POST. Reject the array
+        // itself before parsing members so every batch shape fails uniformly.
+        if inspection_options.mode == JsonRpcInspectionMode::Mcp {
+            return JsonRpcRequestInfo {
+                calls: Vec::new(),
+                is_batch: true,
+                receive_stream: false,
+                has_response: false,
+                error: Some(UNSUPPORTED_MCP_BATCH_REASON.to_string()),
+            };
+        }
         if items.is_empty() {
             return JsonRpcRequestInfo {
                 calls: Vec::new(),
@@ -489,6 +511,64 @@ mod tests {
             Some("search_web")
         );
         assert_eq!(call.params.len(), 1);
+    }
+
+    #[test]
+    fn mcp_batch_rejects_every_top_level_array_shape() {
+        let batches: &[&[u8]] = &[
+            br"[]",
+            br#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+            br#"[{"jsonrpc":"2.0","method":"notifications/initialized"}]"#,
+            br#"[{"jsonrpc":"2.0","id":1,"result":{}}]"#,
+            br#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":1,"result":{}}]"#,
+        ];
+
+        for body in batches {
+            let info = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+            assert!(info.calls.is_empty(), "batch calls escaped: {info:?}");
+            assert!(
+                info.is_batch,
+                "array was not classified as a batch: {info:?}"
+            );
+            assert!(!info.has_response, "batch members were inspected: {info:?}");
+            assert_eq!(info.error.as_deref(), Some(UNSUPPORTED_MCP_BATCH_REASON));
+        }
+    }
+
+    #[test]
+    fn mcp_batch_rejection_preserves_single_mcp_and_generic_batch_controls() {
+        let singles: &[(&[u8], Option<&str>, bool)] = &[
+            (
+                br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+                Some("ping"),
+                false,
+            ),
+            (
+                br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                Some("notifications/initialized"),
+                false,
+            ),
+            (br#"{"jsonrpc":"2.0","id":1,"result":{}}"#, None, true),
+        ];
+
+        for (body, expected_method, expected_response) in singles {
+            let mcp = parse_jsonrpc_body(body, JsonRpcInspectionMode::Mcp);
+            assert!(mcp.error.is_none(), "single MCP message failed: {mcp:?}");
+            assert!(!mcp.is_batch);
+            assert_eq!(
+                mcp.calls.first().map(|call| call.method.as_str()),
+                *expected_method
+            );
+            assert_eq!(mcp.has_response, *expected_response);
+        }
+
+        let generic = parse_jsonrpc_body(
+            br#"[{"jsonrpc":"2.0","id":1,"method":"reports.list"},{"jsonrpc":"2.0","method":"reports.observed"}]"#,
+            JsonRpcInspectionMode::JsonRpc,
+        );
+        assert!(generic.error.is_none(), "generic batch failed: {generic:?}");
+        assert!(generic.is_batch);
+        assert_eq!(generic.calls.len(), 2);
     }
 
     #[test]

@@ -628,7 +628,9 @@ Use `protocol: json-rpc` and `method` when you need generic JSON-RPC 2.0 matchin
 
 Generic JSON-RPC policy `params` matchers are not supported. Generic JSON-RPC policy rules match only the JSON-RPC method. For batch requests, OpenShell evaluates each JSON-RPC call independently and denies the whole batch if any call is denied.
 
-For MCP, `tool` accepts a string glob or `{ any: [...] }` matcher for `tools/call` `params.name`. Rules that use `tool` or lower-level `params.name` must set `method: tools/call` unless `mcp.allow_all_known_mcp_methods: true` enables the endpoint method profile. MCP method globs are accepted only for the `tools/` method family, such as `tools/*`; omit `method` instead of writing `method: "*"` only when the endpoint method profile should allow all MCP methods. Omit `tool` to allow all tools for a `tools/call` method rule. OpenShell does not support MCP tool argument matching yet; allowed tools accept all argument payloads by default. Other MCP `params` keys are rejected. For batch requests, OpenShell evaluates each JSON-RPC call independently and denies the whole batch if any call is denied.
+For MCP, `tool` accepts a string glob or `{ any: [...] }` matcher for `tools/call` `params.name`. Rules that use `tool` or lower-level `params.name` must set `method: tools/call` unless `mcp.allow_all_known_mcp_methods: true` enables the endpoint method profile. MCP method globs are accepted only for the `tools/` method family, such as `tools/*`; omit `method` instead of writing `method: "*"` only when the endpoint method profile should allow all MCP methods. Omit `tool` to allow all tools for a `tools/call` method rule. OpenShell does not support MCP tool argument matching yet; allowed tools accept all argument payloads by default. Other MCP `params` keys are rejected.
+
+Each MCP Streamable HTTP POST body must contain one JSON-RPC request, notification, or response. OpenShell rejects every top-level JSON array, including an empty array, before method policy evaluation. The proxy returns HTTP 403 with `detail` set to `unsupported_mcp_batch` and forwards no bytes upstream.
 
 ### GraphQL matching
 
