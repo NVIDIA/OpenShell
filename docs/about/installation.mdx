@@ -58,7 +58,7 @@ On distributions that ship with `snapd`, the install script uses the Snap path
 described below, unless one of the following is true:
 - a native (non-snap) Docker package is present (the `openshell` snap requires the `docker` snap, for now)
 - `snapd` is not present
-- `OPENSHELL_INSTALL_METHOD=classic` is set in the environment
+- `OPENSHELL_INSTALL_METHOD` is set in the environment to some value other than `snap` (e.g. `OPENSHELL_INSTALL_METHOD=deb`)
 
 On Fedora and RHEL, the install script uses RPM packages. The RPM installs the `openshell` CLI, the `openshell-gateway` daemon, and a systemd user service.
 
@@ -188,8 +188,25 @@ Use the `openshell` `.deb` or `.rpm` file when `snapd` is unavailable or when
 you already run Docker from a non-snap source. The installer falls back to
 these methods on hosts with native Docker.
 
-Set `OPENSHELL_INSTALL_METHOD=classic` to force the classic package on hosts
-that also have `snapd` available.
+### Force an install method
+
+Set `OPENSHELL_INSTALL_METHOD` to force a specific install method instead of
+relying on auto-detection. Supported values:
+
+| Value | Install path |
+|---|---|
+| `deb` | Debian package via `apt`/`dpkg` |
+| `rpm` | RPM package via `dnf`/`yum`/`zypper`/`rpm` |
+| `snap` | Snap package via `snapd` |
+| `homebrew` | Homebrew formula via `brew` (macOS only; not yet supported on Linux) |
+
+When the variable is unset, the script auto-detects the host package manager
+as described above. If the requested method's package manager is not
+installed, the installer aborts with an error.
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_INSTALL_METHOD=deb sh
+```
 
 ## Kubernetes
 
