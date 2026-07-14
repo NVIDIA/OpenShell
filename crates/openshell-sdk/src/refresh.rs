@@ -35,7 +35,7 @@ use tokio::sync::{Mutex, RwLock};
 /// Domain-specific, deliberately not coupled to `tonic`, `napi`, or any
 /// FFI-facing error type. The SDK maps these into [`SdkError::Auth`] before
 /// surfacing to callers.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum RefreshError {
     /// Refresh failed but a retry might succeed (network blip, transient
@@ -60,7 +60,8 @@ impl std::error::Error for RefreshError {}
 
 impl From<RefreshError> for SdkError {
     fn from(value: RefreshError) -> Self {
-        Self::auth(value.to_string())
+        let retryable = matches!(value, RefreshError::Transient(_));
+        Self::auth_retryable(value.to_string(), retryable)
     }
 }
 
@@ -127,9 +128,10 @@ struct TokenState {
 }
 
 /// Cloneable outcome of a single refresh attempt, shared across all waiters
-/// that joined it. `Err` carries the rendered message (so the type stays
-/// `Clone` for [`Shared`]); the SDK remaps it to [`SdkError::Auth`].
-type RefreshOutcome = std::result::Result<String, String>;
+/// that joined it. `Err` carries the [`RefreshError`] itself (kept `Clone`
+/// for [`Shared`]) so its Transient/Terminal kind survives to the await site,
+/// where it maps to [`SdkError::Auth`] with `retryable` set accordingly.
+type RefreshOutcome = std::result::Result<String, RefreshError>;
 type RefreshFuture = Shared<Pin<Box<dyn Future<Output = RefreshOutcome> + Send>>>;
 
 /// In-flight refresh attempt, if any. `epoch` lets the leader that started an
@@ -257,10 +259,10 @@ impl TokenSource {
                                 Ok(state.token.clone())
                             }
                         }
-                        // Store the bare refresh-error text; the single
-                        // `SdkError::auth` wrap happens where the shared
-                        // result is awaited below, so it isn't double-wrapped.
-                        Err(err) => Err(err.to_string()),
+                        // Carry the `RefreshError` itself so its
+                        // Transient/Terminal kind survives; the single
+                        // `SdkError` wrap happens at the await site below.
+                        Err(err) => Err(err),
                     };
                     // Clear this attempt's slot so the next caller starts a
                     // fresh refresh. Epoch-guarded so a newer attempt is never
@@ -283,7 +285,7 @@ impl TokenSource {
             }
         };
 
-        shared.await.map_err(SdkError::auth)
+        shared.await.map_err(SdkError::from)
     }
 
     /// Replace the current token without invoking the refresher.
@@ -634,5 +636,46 @@ mod tests {
         for outcome in &outcomes {
             assert!(outcome.is_err(), "every waiter should observe the failure");
         }
+    }
+
+    #[test]
+    fn refresh_error_maps_to_classified_auth() {
+        // The Transient/Terminal split must survive conversion into `SdkError`
+        // so consumers can tell a retryable blip from a dead session, and the
+        // message must be wrapped exactly once.
+        let transient = SdkError::from(RefreshError::Transient("blip".into()));
+        assert!(transient.retryable(), "transient refresh is retryable");
+        assert_eq!(
+            transient.to_string(),
+            "auth error: transient refresh error: blip",
+            "single wrap, no doubled `auth error:` prefix"
+        );
+
+        let terminal = SdkError::from(RefreshError::Terminal("revoked".into()));
+        assert!(!terminal.retryable(), "terminal refresh needs re-auth");
+        assert_eq!(terminal.code(), "auth");
+    }
+
+    #[tokio::test]
+    async fn terminal_refresh_surfaces_non_retryable() {
+        // End-to-end: a Terminal error from the refresher reaches the caller as
+        // a non-retryable auth error through the shared single-flight path.
+        struct TerminalRefresher;
+        #[async_trait::async_trait]
+        impl Refresh for TerminalRefresher {
+            async fn refresh(&self) -> std::result::Result<RefreshedToken, RefreshError> {
+                Err(RefreshError::Terminal("session revoked".into()))
+            }
+        }
+        let source = TokenSource::new(
+            RefreshedToken::new("initial").with_expires_at(0),
+            Arc::new(TerminalRefresher),
+        );
+        let err = source.refresh_now().await.expect_err("refresh must fail");
+        assert!(!err.retryable(), "terminal failure is not retryable");
+        assert!(
+            err.to_string()
+                .contains("terminal refresh error: session revoked")
+        );
     }
 }

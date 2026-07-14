@@ -45,11 +45,18 @@ pub enum SdkError {
 
     /// Auth-related failure: OIDC discovery / refresh, token format invalid
     /// for header injection.
+    ///
+    /// `retryable` mirrors the refresh contract's transient/terminal split: a
+    /// transient failure (network or `IdP` blip) may succeed on retry, while a
+    /// terminal one (session revoked, refresh token expired) requires
+    /// re-authentication. All non-refresh auth failures are non-retryable.
     #[error("auth error: {message}")]
     #[diagnostic(code(openshell::sdk::auth))]
     Auth {
         /// Error message.
         message: String,
+        /// Whether retrying the same operation may succeed.
+        retryable: bool,
     },
 
     /// Local IO failure (file read, listener bind, socket).
@@ -110,10 +117,19 @@ impl SdkError {
         }
     }
 
-    /// Create an `Auth` error.
+    /// Create a non-retryable `Auth` error.
     pub fn auth(message: impl Into<String>) -> Self {
         Self::Auth {
             message: message.into(),
+            retryable: false,
+        }
+    }
+
+    /// Create an `Auth` error, tagging whether retrying may succeed.
+    pub fn auth_retryable(message: impl Into<String>, retryable: bool) -> Self {
+        Self::Auth {
+            message: message.into(),
+            retryable,
         }
     }
 
@@ -123,6 +139,22 @@ impl SdkError {
     /// `not_found`, `already_exists`, `rpc`. Phase 3 (napi binding) will
     /// surface this as the JS error's `code` field for discriminated-union
     /// ergonomics.
+    /// Whether retrying the same operation may succeed.
+    ///
+    /// Only a transient [`SdkError::Auth`] failure reports `true`; every other
+    /// error is non-retryable and the caller should surface it rather than
+    /// loop. Consumers use this to distinguish a retryable refresh blip from a
+    /// dead session that needs re-authentication.
+    pub const fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Auth {
+                retryable: true,
+                ..
+            }
+        )
+    }
+
     pub const fn code(&self) -> &'static str {
         match self {
             Self::InvalidConfig { .. } => "invalid_config",
