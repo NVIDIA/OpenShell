@@ -152,6 +152,7 @@ fn apply_podman_runtime_defaults(
     context: DriverStartupContext<'_>,
 ) {
     podman.gateway_port = context.gateway_port;
+    apply_podman_socket_path(podman, context.file);
     apply_podman_env_overrides(podman);
     apply_guest_tls_defaults_to_split_fields(
         &mut podman.guest_tls_ca,
@@ -200,6 +201,45 @@ fn apply_podman_env_overrides(podman: &mut PodmanComputeConfig) {
     if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
         podman.host_gateway_ip = ip;
     }
+}
+
+/// Auto-detect the Podman API socket path when it is not otherwise pinned.
+///
+/// `socket_path` precedence, highest to lowest:
+///   1. `OPENSHELL_PODMAN_SOCKET` environment variable
+///   2. explicit `[openshell.drivers.podman].socket_path` in the config file
+///   3. auto-detected socket via the podman CLI (with well-known fallbacks)
+///   4. the `PodmanComputeConfig` default
+///
+/// The env var (1) is applied by [`apply_podman_env_overrides`], so this skips
+/// detection when it is set. `podman.socket_path` already holds the config-file
+/// value (2) or the serde default (4) from deserialization, so detection (3)
+/// only runs when the operator did not pin the socket explicitly — avoiding an
+/// unnecessary `podman` subprocess in the common configured case.
+fn apply_podman_socket_path(
+    podman: &mut PodmanComputeConfig,
+    file: Option<&config_file::ConfigFile>,
+) {
+    if std::env::var_os("OPENSHELL_PODMAN_SOCKET").is_some() || podman_socket_path_set_in_file(file)
+    {
+        return;
+    }
+    if let Some(detected) = openshell_core::config::detect_podman() {
+        podman.socket_path = detected;
+    }
+}
+
+/// Returns `true` when the config file's `[openshell.drivers.podman]` table
+/// explicitly sets `socket_path`.
+///
+/// `socket_path` is not inheritable from `[openshell.gateway]`, so only the
+/// driver-specific table is consulted. This distinguishes an operator-provided
+/// socket path from the `PodmanComputeConfig` default that `#[serde(default)]`
+/// fills in when the key is absent.
+fn podman_socket_path_set_in_file(file: Option<&config_file::ConfigFile>) -> bool {
+    file.and_then(|f| f.openshell.drivers.get("podman"))
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("socket_path"))
 }
 
 fn apply_remote_driver_overrides(
@@ -304,6 +344,61 @@ enable_bind_mounts = true
         let cfg = podman_config_from_context(test_context(Some(&file))).expect("podman config");
 
         assert!(cfg.enable_bind_mounts);
+    }
+
+    #[test]
+    fn podman_socket_path_set_in_file_detects_explicit_value() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.podman]
+socket_path = "/run/user/1000/podman/podman.sock"
+"#,
+        )
+        .expect("valid config");
+        assert!(podman_socket_path_set_in_file(Some(&file)));
+    }
+
+    #[test]
+    fn podman_socket_path_set_in_file_false_without_explicit_value() {
+        // Podman table present but no socket_path key.
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.podman]
+default_image = "example/image:latest"
+"#,
+        )
+        .expect("valid config");
+        assert!(!podman_socket_path_set_in_file(Some(&file)));
+
+        // No podman table at all.
+        let empty: config_file::ConfigFile =
+            toml::from_str("[openshell.gateway]\n").expect("valid config");
+        assert!(!podman_socket_path_set_in_file(Some(&empty)));
+
+        // No config file at all.
+        assert!(!podman_socket_path_set_in_file(None));
+    }
+
+    #[test]
+    fn podman_config_honors_explicit_socket_path_over_auto_detection() {
+        // An explicit socket_path must survive config construction: because it
+        // is set in the file, auto-detection is skipped and the value is kept.
+        // (Assumes OPENSHELL_PODMAN_SOCKET is unset in the test environment,
+        // matching the other driver-config tests.)
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.podman]
+socket_path = "/run/openshell/custom-podman.sock"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = podman_config_from_context(test_context(Some(&file))).expect("podman config");
+
+        assert_eq!(
+            cfg.socket_path,
+            PathBuf::from("/run/openshell/custom-podman.sock")
+        );
     }
 
     #[test]

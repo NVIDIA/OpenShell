@@ -274,6 +274,8 @@ compute_drivers = ["podman"]
 
 [openshell.drivers.podman]
 # Rootless socket path. For root Podman use /run/podman/podman.sock.
+# Precedence: OPENSHELL_PODMAN_SOCKET env var > this value > auto-detection.
+# Set this to pin a specific Podman machine instead of the auto-detected one.
 socket_path             = "/run/user/1000/podman/podman.sock"
 default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy       = "missing"   # always | missing | never | newer
