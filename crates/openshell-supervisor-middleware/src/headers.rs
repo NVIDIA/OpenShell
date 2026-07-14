@@ -3,11 +3,103 @@
 
 //! Validation and logical application of middleware request-header mutations.
 
-use miette::{Result, miette};
 use openshell_core::proto::{ExistingHeaderAction, HeaderMutation, header_mutation};
 
-const MAX_HEADER_MUTATIONS: usize = 64;
-const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
+pub const MAX_HEADER_MUTATIONS: usize = 64;
+pub const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderMutationError {
+    TooMany { count: usize },
+    InvalidName { name: String },
+    Protected { name: String },
+    HopByHop { name: String },
+    WriteNamespace { name: String },
+    UnsafeValue { name: String },
+    TooLarge,
+    InvalidExistingAction,
+    MissingExistingAction { name: String },
+    UnsupportedExistingAction,
+    Empty,
+}
+
+impl HeaderMutationError {
+    /// Stable platform-owned reason suitable for untrusted middleware failures.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::TooMany { .. } => "header_mutation_count_over_capacity",
+            Self::InvalidName { .. } => "header_mutation_invalid_name",
+            Self::Protected { .. } => "header_mutation_protected_header",
+            Self::HopByHop { .. } => "header_mutation_hop_by_hop_header",
+            Self::WriteNamespace { .. } => "header_mutation_write_namespace",
+            Self::UnsafeValue { .. } => "header_mutation_unsafe_value",
+            Self::TooLarge => "header_mutation_bytes_over_capacity",
+            Self::InvalidExistingAction => "header_mutation_invalid_existing_action",
+            Self::MissingExistingAction { .. } => "header_mutation_missing_existing_action",
+            Self::UnsupportedExistingAction => "header_mutation_unsupported_existing_action",
+            Self::Empty => "header_mutation_empty",
+        }
+    }
+}
+
+impl std::fmt::Display for HeaderMutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooMany { count } => write!(
+                formatter,
+                "middleware returned too many header mutations: {count} exceeds {MAX_HEADER_MUTATIONS}"
+            ),
+            Self::InvalidName { name } => {
+                write!(
+                    formatter,
+                    "middleware returned invalid header name '{name}'"
+                )
+            }
+            Self::Protected { name } => {
+                write!(
+                    formatter,
+                    "middleware cannot mutate protected header '{name}'"
+                )
+            }
+            Self::HopByHop { name } => {
+                write!(
+                    formatter,
+                    "middleware cannot mutate hop-by-hop header '{name}'"
+                )
+            }
+            Self::WriteNamespace { name } => write!(
+                formatter,
+                "middleware can only write request headers prefixed with x-openshell-middleware- and cannot write '{name}'"
+            ),
+            Self::UnsafeValue { name } => {
+                write!(
+                    formatter,
+                    "middleware cannot write header '{name}' with an unsafe value"
+                )
+            }
+            Self::TooLarge => write!(
+                formatter,
+                "middleware header mutations exceed {MAX_HEADER_MUTATION_BYTES} bytes"
+            ),
+            Self::InvalidExistingAction => {
+                write!(formatter, "middleware returned invalid on_existing action")
+            }
+            Self::MissingExistingAction { name } => write!(
+                formatter,
+                "middleware must specify on_existing for header '{name}'"
+            ),
+            Self::UnsupportedExistingAction => {
+                write!(
+                    formatter,
+                    "middleware returned unsupported on_existing action"
+                )
+            }
+            Self::Empty => write!(formatter, "middleware returned an empty header mutation"),
+        }
+    }
+}
+
+impl std::error::Error for HeaderMutationError {}
 
 /// Validate and atomically apply one middleware response to the logical header
 /// state observed by the next middleware. Repeated values and wire order are
@@ -15,12 +107,11 @@ const MAX_HEADER_MUTATION_BYTES: usize = 32 * 1024;
 pub fn apply(
     existing_headers: &[(String, String)],
     mutations: &[HeaderMutation],
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(String, String)>, HeaderMutationError> {
     if mutations.len() > MAX_HEADER_MUTATIONS {
-        return Err(miette!(
-            "middleware returned too many header mutations: {} exceeds {MAX_HEADER_MUTATIONS}",
-            mutations.len()
-        ));
+        return Err(HeaderMutationError::TooMany {
+            count: mutations.len(),
+        });
     }
 
     let mut headers = existing_headers.to_vec();
@@ -30,23 +121,19 @@ pub fn apply(
             Some(header_mutation::Operation::Write(write)) => {
                 let name = validate_name(&write.name)?;
                 if is_connection_nominated(&headers, &name) {
-                    return Err(miette!(
-                        "middleware cannot mutate hop-by-hop header '{}'",
-                        write.name
-                    ));
+                    return Err(HeaderMutationError::HopByHop {
+                        name: write.name.clone(),
+                    });
                 }
                 if !name.starts_with("x-openshell-middleware-") {
-                    return Err(miette!(
-                        "middleware can only write request headers prefixed with \
-                         x-openshell-middleware- and cannot write '{}'",
-                        write.name
-                    ));
+                    return Err(HeaderMutationError::WriteNamespace {
+                        name: write.name.clone(),
+                    });
                 }
                 if !is_safe_value(&write.value) {
-                    return Err(miette!(
-                        "middleware cannot write header '{}' with an unsafe value",
-                        write.name
-                    ));
+                    return Err(HeaderMutationError::UnsafeValue {
+                        name: write.name.clone(),
+                    });
                 }
                 mutation_bytes = mutation_bytes
                     .saturating_add(name.len())
@@ -54,12 +141,11 @@ pub fn apply(
                 enforce_size_limit(mutation_bytes)?;
 
                 let action = ExistingHeaderAction::try_from(write.on_existing)
-                    .map_err(|_| miette!("middleware returned invalid on_existing action"))?;
+                    .map_err(|_| HeaderMutationError::InvalidExistingAction)?;
                 if action == ExistingHeaderAction::Unspecified {
-                    return Err(miette!(
-                        "middleware must specify on_existing for header '{}'",
-                        write.name
-                    ));
+                    return Err(HeaderMutationError::MissingExistingAction {
+                        name: write.name.clone(),
+                    });
                 }
                 let exists = headers.iter().any(|(existing, _)| *existing == name);
                 if !exists || action == ExistingHeaderAction::Append {
@@ -68,47 +154,44 @@ pub fn apply(
                     headers.retain(|(existing, _)| *existing != name);
                     headers.push((name, write.value.clone()));
                 } else if action != ExistingHeaderAction::Skip {
-                    return Err(miette!(
-                        "middleware returned unsupported on_existing action"
-                    ));
+                    return Err(HeaderMutationError::UnsupportedExistingAction);
                 }
             }
             Some(header_mutation::Operation::Remove(remove)) => {
                 let name = validate_name(&remove.name)?;
                 if is_connection_nominated(&headers, &name) {
-                    return Err(miette!(
-                        "middleware cannot mutate hop-by-hop header '{}'",
-                        remove.name
-                    ));
+                    return Err(HeaderMutationError::HopByHop {
+                        name: remove.name.clone(),
+                    });
                 }
                 mutation_bytes = mutation_bytes.saturating_add(name.len());
                 enforce_size_limit(mutation_bytes)?;
                 headers.retain(|(existing, _)| *existing != name);
             }
-            None => return Err(miette!("middleware returned an empty header mutation")),
+            None => return Err(HeaderMutationError::Empty),
         }
     }
     Ok(headers)
 }
 
-fn enforce_size_limit(mutation_bytes: usize) -> Result<()> {
+fn enforce_size_limit(mutation_bytes: usize) -> Result<(), HeaderMutationError> {
     if mutation_bytes > MAX_HEADER_MUTATION_BYTES {
-        return Err(miette!(
-            "middleware header mutations exceed {MAX_HEADER_MUTATION_BYTES} bytes"
-        ));
+        return Err(HeaderMutationError::TooLarge);
     }
     Ok(())
 }
 
-fn validate_name(name: &str) -> Result<String> {
+fn validate_name(name: &str) -> Result<String, HeaderMutationError> {
     let lower = name.to_ascii_lowercase();
     if lower.is_empty() || !lower.bytes().all(is_name_token_byte) {
-        return Err(miette!("middleware returned invalid header name '{name}'"));
+        return Err(HeaderMutationError::InvalidName {
+            name: name.to_string(),
+        });
     }
     if is_protected(&lower) {
-        return Err(miette!(
-            "middleware cannot mutate protected header '{name}'"
-        ));
+        return Err(HeaderMutationError::Protected {
+            name: name.to_string(),
+        });
     }
     Ok(lower)
 }

@@ -4844,6 +4844,22 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     #[test]
+    fn middleware_denial_response_contains_only_platform_mutation_reason() {
+        const RAW_SECRET: &str = "sk-secret-request-value";
+        let reason = "middleware_failed: header_mutation_invalid_name";
+        let response = build_json_error_response(
+            403,
+            "Forbidden",
+            "middleware_denied",
+            &format!("POST api.example.test:443/v1 denied by middleware: {reason}"),
+        );
+        let response = String::from_utf8(response).expect("UTF-8 error response");
+
+        assert!(response.contains(reason));
+        assert!(!response.contains(RAW_SECRET));
+    }
+
+    #[test]
     fn endpoint_only_opa_allows_declared_endpoint_without_process_identity() {
         let policy = include_str!("../data/sandbox-policy.rego");
         let data = r#"

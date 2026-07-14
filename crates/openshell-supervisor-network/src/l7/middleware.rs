@@ -10,6 +10,7 @@ use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -275,30 +276,47 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
 fn safe_middleware_headers(headers: &[u8]) -> Result<Vec<(String, String)>> {
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    let mut out = Vec::new();
-    for line in header_str.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim().to_ascii_lowercase();
-        if name.is_empty()
-            || matches!(
-                name.as_str(),
-                "authorization"
-                    | "proxy-authorization"
-                    | "cookie"
-                    | "host"
-                    | "content-length"
-                    | "transfer-encoding"
-            )
-            || name.starts_with("x-amz-")
-            || name.starts_with("x-openshell-credential")
-        {
-            continue;
-        }
-        out.push((name, value.trim().to_string()));
-    }
-    Ok(out)
+    let parsed: Vec<(String, String)> = header_str
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect();
+    let connection_nominated: HashSet<String> = parsed
+        .iter()
+        .filter(|(name, _)| name == "connection")
+        .flat_map(|(_, value)| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    Ok(parsed
+        .into_iter()
+        .filter(|(name, _)| {
+            !name.is_empty()
+                && !matches!(
+                    name.as_str(),
+                    "authorization"
+                        | "proxy-authorization"
+                        | "proxy-authenticate"
+                        | "cookie"
+                        | "host"
+                        | "content-length"
+                        | "transfer-encoding"
+                        | "connection"
+                        | "proxy-connection"
+                        | "keep-alive"
+                        | "te"
+                        | "trailer"
+                        | "upgrade"
+                )
+                && !name.starts_with("x-amz-")
+                && !name.starts_with("x-openshell-credential")
+                && !connection_nominated.contains(name)
+        })
+        .collect())
 }
 
 pub fn middleware_network_input(ctx: &L7EvalContext) -> crate::opa::NetworkInput {
@@ -416,7 +434,14 @@ pub(super) fn middleware_events(
             .build();
         events.push(event);
     }
-    for finding in &outcome.findings {
+    // The runner rejects stages above this cap through `on_error`. Keep the
+    // emission-side bound as defense in depth for manually constructed or
+    // future outcome producers.
+    for finding in outcome
+        .findings
+        .iter()
+        .take(openshell_supervisor_middleware::MAX_MIDDLEWARE_FINDINGS)
+    {
         let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(match finding.finding.severity.as_str() {
                 "high" => SeverityId::High,
@@ -496,6 +521,26 @@ mod tests {
                 ("accept".to_string(), "application/json".to_string()),
                 ("x-api-key".to_string(), "second-value".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn middleware_headers_omit_standard_and_connection_nominated_hop_by_hop_fields() {
+        let headers = safe_middleware_headers(
+            b"GET /v1 HTTP/1.1\r\n\
+              X-Hop: secret-hop-value\r\n\
+              Connection: keep-alive, x-hop\r\n\
+              Keep-Alive: timeout=5\r\n\
+              TE: trailers\r\n\
+              Trailer: X-Checksum\r\n\
+              Upgrade: websocket\r\n\
+              X-Visible: visible-value\r\n\r\n",
+        )
+        .expect("headers should parse");
+
+        assert_eq!(
+            headers,
+            vec![("x-visible".to_string(), "visible-value".to_string())]
         );
     }
 }

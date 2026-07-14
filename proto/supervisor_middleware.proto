@@ -70,16 +70,20 @@ message HttpRequestEvaluation {
   // Evaluation phase selected for this request.
   SupervisorMiddlewarePhase phase = 2;
   // Sandbox and request identity available to the supervisor.
+  // The encoded context is limited to 4 KiB.
   RequestContext context = 3;
   // Validated service-specific policy configuration.
+  // The encoded configuration is limited to 64 KiB.
   google.protobuf.Struct config = 4;
   // Destination and HTTP request target.
+  // The encoded target is limited to 32 KiB.
   HttpRequestTarget target = 5;
   // HTTP request headers before OpenShell injects credentials, in wire
   // order. Repeated header names are preserved as separate entries. Protected
   // credential, routing, framing, and hop-by-hop headers are omitted.
+  // At most 128 lines and 64 KiB of encoded headers are included.
   repeated HttpHeader headers = 6;
-  // Buffered request body. Empty for a bodyless request.
+  // Buffered request body, limited to 4 MiB. Empty for a bodyless request.
   bytes body = 7;
 }
 
@@ -201,9 +205,10 @@ message HttpRequestResult {
   // Allow or deny decision for this request.
   Decision decision = 1;
   // Audit-safe human-readable reason. OpenShell does not relay text from an
-  // operator-run service into denied responses or security logs.
+  // operator-run service into denied responses or security logs. Limited to
+  // 4 KiB before normalization.
   string reason = 2;
-  // Replacement request body when has_body is true.
+  // Replacement request body when has_body is true. Limited to 4 MiB.
   bytes body = 3;
   // True when body should replace the request body, including with an empty body.
   bool has_body = 4;
@@ -212,12 +217,15 @@ message HttpRequestResult {
   // "x-openshell-middleware-" namespace. Removes may target other visible
   // request headers, but credential, routing, framing, and hop-by-hop headers
   // are always protected. A violating result is a middleware failure handled
-  // according to the policy failure mode.
+  // according to the policy failure mode. At most 64 operations, 32 KiB of
+  // validated name/value data, and 64 KiB encoded are accepted.
   repeated HeaderMutation header_mutations = 5;
   // Audit-safe findings produced during evaluation. For operator-run services,
   // OpenShell logs platform-owned fields derived from the validated binding id
   // rather than service-provided type, label, confidence, or metadata text.
+  // At most 64 findings of at most 4 KiB encoded each are accepted.
   repeated Finding findings = 6;
-  // Non-secret service-defined metadata included in diagnostics.
+  // Non-secret service-defined metadata included in diagnostics. At most 64
+  // entries and 32 KiB of combined key/value data are accepted.
   map<string, string> metadata = 7;
 }

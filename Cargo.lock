@@ -3943,6 +3943,7 @@ dependencies = [
  "miette",
  "openshell-core",
  "openshell-supervisor-middleware-builtins",
+ "prost",
  "prost-types",
  "tokio",
  "tokio-stream",

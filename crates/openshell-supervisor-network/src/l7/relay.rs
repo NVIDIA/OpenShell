@@ -4046,6 +4046,31 @@ network_policies:
         // Safe finding metadata is still present.
         assert!(serialized.contains("secret.common"));
 
+        let mut bounded_outcome = outcome;
+        bounded_outcome.findings = vec![
+            NamespacedFinding {
+                middleware: "external-guard".into(),
+                finding: openshell_core::proto::Finding {
+                    r#type: "example/content-guard.finding".into(),
+                    label: "External middleware finding".into(),
+                    count: 1,
+                    confidence: String::new(),
+                    severity: "medium".into(),
+                },
+            };
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_FINDINGS
+                + 10
+        ];
+        let bounded_events = middleware_events(&ctx, &req, &bounded_outcome);
+        assert_eq!(
+            bounded_events
+                .iter()
+                .filter(|event| event.class_uid() == 2004)
+                .count(),
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_FINDINGS,
+            "finding emission must remain bounded even if an invalid outcome bypasses the runner"
+        );
+
         let denied_outcome = ChainOutcome {
             allowed: false,
             reason: "request matched configured policy".into(),
@@ -4079,6 +4104,19 @@ network_policies:
              [policy:rest_api engine:middleware] \
              [failed:false transformed:false reason:request matched configured policy]"
         );
+
+        let external_failure_outcome = ChainOutcome {
+            reason: "middleware_failed: header_mutation_invalid_name".into(),
+            applied: vec![MiddlewareInvocation {
+                failed: true,
+                ..denied_outcome.applied[0].clone()
+            }],
+            ..denied_outcome
+        };
+        let failure_events = middleware_events(&ctx, &req, &external_failure_outcome);
+        let serialized = serde_json::to_string(&failure_events).expect("serialize failure events");
+        assert!(serialized.contains("header_mutation_invalid_name"));
+        assert!(!serialized.contains(RAW_SECRET));
     }
 
     #[tokio::test]

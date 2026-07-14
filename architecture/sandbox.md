@@ -74,11 +74,14 @@ and phases as enums. Built-ins run in-process;
 operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
 service capabilities and implementation-owned config before delivery.
-The platform caps middleware bodies at 4 MiB and configures the gRPC client
-with 64 KiB of protobuf envelope headroom. Registration and manifest limits
-above that boundary fail before request-body allocation. External per-request
-reason, finding text, and diagnostic metadata are untrusted: the supervisor
-maps logged findings to the validated binding ID and platform-owned text.
+The platform caps middleware bodies at 4 MiB and derives the gRPC transport
+limit from bounded request and response components, reserving 420 KiB for the
+largest valid protobuf envelope. Config, context, target, headers, mutations,
+reasons, findings, and metadata each have explicit size or cardinality limits.
+Registration and manifest body limits above the platform boundary fail before
+request-body allocation. External per-request reason, finding text, mutation
+errors, and diagnostic metadata are untrusted: the supervisor maps logged
+findings to the validated binding ID and uses platform-owned failure codes.
 At startup, the supervisor installs the in-process registry before connecting
 to external services, so an external outage cannot remove built-in bindings.
 For a gateway policy snapshot, the supervisor prepares replacements off to the

@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use miette::{Result, miette};
+use prost::Message;
 
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
@@ -25,8 +26,48 @@ use tonic::Request;
 
 /// Largest request or replacement body accepted by the middleware platform.
 pub const MAX_MIDDLEWARE_BODY_BYTES: usize = 4 * 1024 * 1024;
-/// gRPC message limit for middleware calls, including protobuf envelope fields.
-pub const MIDDLEWARE_GRPC_MESSAGE_BYTES: usize = MAX_MIDDLEWARE_BODY_BYTES + 64 * 1024;
+/// Largest encoded service-specific configuration attached to one evaluation.
+pub const MAX_MIDDLEWARE_CONFIG_BYTES: usize = 64 * 1024;
+/// Largest encoded request identity context attached to one evaluation.
+pub const MAX_MIDDLEWARE_CONTEXT_BYTES: usize = 4 * 1024;
+/// Largest encoded destination and request target attached to one evaluation.
+pub const MAX_MIDDLEWARE_TARGET_BYTES: usize = 32 * 1024;
+/// Largest number of request header lines exposed to one middleware.
+pub const MAX_MIDDLEWARE_HEADERS: usize = 128;
+/// Largest encoded request header collection exposed to one middleware.
+pub const MAX_MIDDLEWARE_HEADER_BYTES: usize = 64 * 1024;
+/// Largest operator-provided reason accepted in one middleware result.
+pub const MAX_MIDDLEWARE_REASON_BYTES: usize = 4 * 1024;
+/// Largest number of findings accepted from one middleware stage.
+pub const MAX_MIDDLEWARE_FINDINGS: usize = 64;
+/// Largest encoded individual finding accepted from one middleware stage.
+pub const MAX_MIDDLEWARE_FINDING_BYTES: usize = 4 * 1024;
+/// Largest number of metadata entries accepted from one middleware stage.
+pub const MAX_MIDDLEWARE_METADATA_ENTRIES: usize = 64;
+/// Largest combined metadata key/value payload accepted from one middleware stage.
+pub const MAX_MIDDLEWARE_METADATA_BYTES: usize = 32 * 1024;
+
+const MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES: usize = 64 * 1024;
+const MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES: usize = 64 * 1024;
+const MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES: usize = MAX_MIDDLEWARE_CONFIG_BYTES
+    + MAX_MIDDLEWARE_CONTEXT_BYTES
+    + MAX_MIDDLEWARE_TARGET_BYTES
+    + MAX_MIDDLEWARE_HEADER_BYTES
+    + MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES;
+const MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES: usize = MAX_MIDDLEWARE_REASON_BYTES
+    + MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES
+    + MAX_MIDDLEWARE_FINDINGS * MAX_MIDDLEWARE_FINDING_BYTES
+    + MAX_MIDDLEWARE_METADATA_BYTES
+    + MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES;
+const MAX_MIDDLEWARE_ENVELOPE_BYTES: usize =
+    if MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES > MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES {
+        MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES
+    } else {
+        MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES
+    };
+/// gRPC message limit derived from the body and bounded protobuf components.
+pub const MIDDLEWARE_GRPC_MESSAGE_BYTES: usize =
+    MAX_MIDDLEWARE_BODY_BYTES + MAX_MIDDLEWARE_ENVELOPE_BYTES;
 
 const HTTP_REQUEST_OPERATION: SupervisorMiddlewareOperation =
     SupervisorMiddlewareOperation::HttpRequest;
@@ -254,6 +295,13 @@ impl MiddlewareDiagnosticPolicy {
             normalize_untrusted_diagnostics(binding, result);
         }
     }
+
+    fn header_mutation_error_reason(self, error: &headers::HeaderMutationError) -> String {
+        match self {
+            Self::Preserve => safe_reason(&error.to_string()),
+            Self::Normalize => error.code().to_string(),
+        }
+    }
 }
 
 /// Validated middleware services available to a gateway or one supervisor.
@@ -451,6 +499,94 @@ fn normalize_untrusted_diagnostics(
         }
         .to_string();
     }
+}
+
+fn validate_request_envelope(
+    evaluation: &HttpRequestEvaluation,
+) -> std::result::Result<(), &'static str> {
+    if evaluation.body.len() > MAX_MIDDLEWARE_BODY_BYTES {
+        return Err("request_body_over_capacity");
+    }
+    if evaluation
+        .config
+        .as_ref()
+        .is_some_and(|config| config.encoded_len() > MAX_MIDDLEWARE_CONFIG_BYTES)
+    {
+        return Err("request_config_over_capacity");
+    }
+    if evaluation
+        .context
+        .as_ref()
+        .is_some_and(|context| context.encoded_len() > MAX_MIDDLEWARE_CONTEXT_BYTES)
+    {
+        return Err("request_context_over_capacity");
+    }
+    if evaluation
+        .target
+        .as_ref()
+        .is_some_and(|target| target.encoded_len() > MAX_MIDDLEWARE_TARGET_BYTES)
+    {
+        return Err("request_target_over_capacity");
+    }
+    if evaluation.headers.len() > MAX_MIDDLEWARE_HEADERS {
+        return Err("request_header_count_over_capacity");
+    }
+    let header_bytes = evaluation.headers.iter().fold(0usize, |total, header| {
+        total.saturating_add(header.encoded_len())
+    });
+    if header_bytes > MAX_MIDDLEWARE_HEADER_BYTES {
+        return Err("request_header_bytes_over_capacity");
+    }
+    if evaluation.encoded_len() > MIDDLEWARE_GRPC_MESSAGE_BYTES {
+        return Err("request_envelope_over_capacity");
+    }
+    Ok(())
+}
+
+fn validate_response_envelope(
+    result: &openshell_core::proto::HttpRequestResult,
+) -> std::result::Result<(), &'static str> {
+    if result.body.len() > MAX_MIDDLEWARE_BODY_BYTES {
+        return Err("response_body_over_capacity");
+    }
+    if result.reason.len() > MAX_MIDDLEWARE_REASON_BYTES {
+        return Err("response_reason_over_capacity");
+    }
+    if result.header_mutations.len() > headers::MAX_HEADER_MUTATIONS {
+        return Err("header_mutation_count_over_capacity");
+    }
+    let mutation_bytes = result
+        .header_mutations
+        .iter()
+        .fold(0usize, |total, mutation| {
+            total.saturating_add(mutation.encoded_len())
+        });
+    if mutation_bytes > MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES {
+        return Err("header_mutation_bytes_over_capacity");
+    }
+    if result.findings.len() > MAX_MIDDLEWARE_FINDINGS {
+        return Err("response_findings_over_capacity");
+    }
+    if result
+        .findings
+        .iter()
+        .any(|finding| finding.encoded_len() > MAX_MIDDLEWARE_FINDING_BYTES)
+    {
+        return Err("response_finding_over_capacity");
+    }
+    if result.metadata.len() > MAX_MIDDLEWARE_METADATA_ENTRIES {
+        return Err("response_metadata_count_over_capacity");
+    }
+    let metadata_bytes = result.metadata.iter().fold(0usize, |total, (key, value)| {
+        total.saturating_add(key.len()).saturating_add(value.len())
+    });
+    if metadata_bytes > MAX_MIDDLEWARE_METADATA_BYTES {
+        return Err("response_metadata_bytes_over_capacity");
+    }
+    if result.encoded_len() > MIDDLEWARE_GRPC_MESSAGE_BYTES {
+        return Err("response_envelope_over_capacity");
+    }
+    Ok(())
 }
 
 impl MiddlewareRegistry {
@@ -717,6 +853,11 @@ impl ChainRunner {
         implementation: &str,
         config: prost_types::Struct,
     ) -> Result<()> {
+        if config.encoded_len() > MAX_MIDDLEWARE_CONFIG_BYTES {
+            return Err(miette!(
+                "middleware config exceeds the platform maximum of {MAX_MIDDLEWARE_CONFIG_BYTES} encoded bytes"
+            ));
+        }
         let manifests = self.manifests().await?;
         let Some((state, _)) = manifests.iter().find(|(_, manifest)| {
             manifest
@@ -825,6 +966,22 @@ impl ChainRunner {
                 }
             }
             let evaluation = build_evaluation(entry, binding, &input, &headers, &body);
+            if let Err(reason) = validate_request_envelope(&evaluation) {
+                match apply_on_error(entry, reason, &mut applied) {
+                    OnErrorAction::FailOpen => continue,
+                    OnErrorAction::FailClosed(reason) => {
+                        return Ok(ChainOutcome {
+                            allowed: false,
+                            reason,
+                            body,
+                            header_mutations,
+                            findings,
+                            metadata,
+                            applied,
+                        });
+                    }
+                }
+            }
             let Some(service) = entry.service.as_ref() else {
                 unreachable!("described binding always has a service")
             };
@@ -852,6 +1009,23 @@ impl ChainRunner {
                     }
                 }
             };
+
+            if let Err(reason) = validate_response_envelope(&result) {
+                match apply_on_error(entry, reason, &mut applied) {
+                    OnErrorAction::FailOpen => continue,
+                    OnErrorAction::FailClosed(reason) => {
+                        return Ok(ChainOutcome {
+                            allowed: false,
+                            reason,
+                            body,
+                            header_mutations,
+                            findings,
+                            metadata,
+                            applied,
+                        });
+                    }
+                }
+            }
 
             service
                 .diagnostic_policy
@@ -931,7 +1105,10 @@ impl ChainRunner {
             let updated_headers = match headers::apply(&headers, &result.header_mutations) {
                 Ok(updated) => updated,
                 Err(error) => {
-                    match apply_on_error(entry, &safe_reason(&error.to_string()), &mut applied) {
+                    let reason = service
+                        .diagnostic_policy
+                        .header_mutation_error_reason(&error);
+                    match apply_on_error(entry, &reason, &mut applied) {
                         OnErrorAction::FailOpen => continue,
                         OnErrorAction::FailClosed(reason) => {
                             return Ok(ChainOutcome {
@@ -2222,20 +2399,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_transport_accepts_platform_maximum_response_body() {
+    async fn remote_transport_accepts_maximum_bounded_request_and_response_envelopes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test middleware");
         let address = listener.local_addr().expect("test middleware address");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let response_findings = (0..MAX_MIDDLEWARE_FINDINGS)
+            .map(|_| Finding {
+                r#type: "f".repeat(1024),
+                label: "finding".into(),
+                count: 1,
+                confidence: "medium".into(),
+                severity: "medium".into(),
+            })
+            .collect();
         let server = tonic::transport::Server::builder()
             .add_service(
                 SupervisorMiddlewareServer::new(ScriptedService {
                     binding_id: "example/content-guard".into(),
                     max_body_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
                     result: openshell_core::proto::HttpRequestResult {
+                        reason: "r".repeat(MAX_MIDDLEWARE_REASON_BYTES - 128),
                         body: vec![b'x'; MAX_MIDDLEWARE_BODY_BYTES],
                         has_body: true,
+                        header_mutations: vec![write_header(
+                            "x-openshell-middleware-envelope",
+                            &"h".repeat(headers::MAX_HEADER_MUTATION_BYTES - 128),
+                            ExistingHeaderAction::Append,
+                        )],
+                        findings: response_findings,
+                        metadata: std::iter::once((
+                            "diagnostic".into(),
+                            "m".repeat(MAX_MIDDLEWARE_METADATA_BYTES - 128),
+                        ))
+                        .collect(),
                         ..allow_result()
                     },
                 })
@@ -2252,22 +2450,44 @@ mod tests {
         let registry = MiddlewareRegistry::connect_services(Vec::new(), vec![registration])
             .await
             .expect("connect external middleware");
+        let config = prost_types::Struct {
+            fields: std::iter::once((
+                "payload".into(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(
+                        "c".repeat(MAX_MIDDLEWARE_CONFIG_BYTES - 256),
+                    )),
+                },
+            ))
+            .collect(),
+        };
+        assert!(config.encoded_len() <= MAX_MIDDLEWARE_CONFIG_BYTES);
+        let mut request = input("");
+        request.request_id = "r".repeat(MAX_MIDDLEWARE_CONTEXT_BYTES - 256);
+        request.path = format!("/{}", "p".repeat(MAX_MIDDLEWARE_TARGET_BYTES - 512));
+        request.headers = vec![(
+            "x-large-envelope".into(),
+            "v".repeat(MAX_MIDDLEWARE_HEADER_BYTES - 256),
+        )];
+        request.body = vec![b'b'; MAX_MIDDLEWARE_BODY_BYTES];
         let outcome = ChainRunner::from_registry(registry)
             .evaluate(
                 &[ChainEntry {
                     name: "guard".into(),
                     implementation: "example/content-guard".into(),
                     order: 0,
-                    config: prost_types::Struct::default(),
+                    config,
                     on_error: OnError::FailClosed,
                 }],
-                input("hello"),
+                request,
             )
             .await
-            .expect("maximum-size response should fit configured transport limit");
+            .expect("maximum bounded envelopes should fit configured transport limit");
 
         assert!(outcome.allowed);
         assert_eq!(outcome.body.len(), MAX_MIDDLEWARE_BODY_BYTES);
+        assert_eq!(outcome.header_mutations.len(), 1);
+        assert_eq!(outcome.findings.len(), MAX_MIDDLEWARE_FINDINGS);
         let _ = shutdown_tx.send(());
         server_task
             .await
@@ -2321,6 +2541,88 @@ mod tests {
         assert!(outcome.metadata.is_empty());
         assert!(!format!("{outcome:?}").contains(secret));
         assert!(!format!("{outcome:?}").contains("FINDING:FORGED"));
+    }
+
+    #[tokio::test]
+    async fn external_header_mutation_failure_uses_platform_reason() {
+        let secret = "sk-secret-request-value";
+        let registration = external_registration(4096);
+        let service = Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                header_mutations: vec![write_header(
+                    &format!("x-openshell-middleware-invalid\n{secret}"),
+                    "value",
+                    ExistingHeaderAction::Append,
+                )],
+                ..allow_result()
+            },
+        });
+        let registry = registry_with_external(service, registration).await;
+        let outcome = ChainRunner::from_registry(registry)
+            .evaluate(
+                &[ChainEntry {
+                    name: "guard".into(),
+                    implementation: "example/content-guard".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                input("hello"),
+            )
+            .await
+            .expect("evaluate external middleware");
+
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.reason,
+            "middleware_failed: header_mutation_invalid_name"
+        );
+        assert!(outcome.findings.is_empty());
+        assert!(!format!("{outcome:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn finding_overflow_is_an_invalid_response_governed_by_on_error() {
+        let registration = external_registration(4096);
+        let service = Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                findings: vec![Finding::default(); MAX_MIDDLEWARE_FINDINGS + 1],
+                ..allow_result()
+            },
+        });
+        let registry = registry_with_external(service, registration).await;
+        let runner = ChainRunner::from_registry(registry);
+
+        for (on_error, allowed) in [(OnError::FailClosed, false), (OnError::FailOpen, true)] {
+            let outcome = runner
+                .evaluate(
+                    &[ChainEntry {
+                        name: "guard".into(),
+                        implementation: "example/content-guard".into(),
+                        order: 0,
+                        config: prost_types::Struct::default(),
+                        on_error,
+                    }],
+                    input("hello"),
+                )
+                .await
+                .expect("evaluate finding overflow");
+
+            assert_eq!(outcome.allowed, allowed);
+            assert!(outcome.findings.is_empty());
+            assert_eq!(outcome.applied.len(), 1);
+            assert!(outcome.applied[0].failed);
+            if !allowed {
+                assert_eq!(
+                    outcome.reason,
+                    "middleware_failed: response_findings_over_capacity"
+                );
+            }
+        }
     }
 
     #[tokio::test]
