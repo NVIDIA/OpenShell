@@ -1,0 +1,242 @@
+[tools]
+go = "1.25"
+protoc = "29.6"
+"go:github.com/golangci/golangci-lint/v2/cmd/golangci-lint" = "2.12"
+"go:google.golang.org/protobuf/cmd/protoc-gen-go" = "1.36.11"
+"go:google.golang.org/grpc/cmd/protoc-gen-go-grpc" = "1.6.2"
+
+[tasks.test]
+description = "Run unit tests with coverage"
+run = "go test -coverprofile=coverage.out -coverpkg=./openshell/... -race ./..."
+
+[tasks."test:integration"]
+description = "Run integration tests"
+run = "go test -tags=integration -race ./..."
+
+[tasks.lint]
+description = "Run linter"
+run = "golangci-lint run ./..."
+
+[tasks.fmt]
+description = "Format code"
+run = "goimports -w . && go fmt ./..."
+
+[tasks.build]
+description = "Build all packages"
+run = "go build ./..."
+
+[tasks.ci]
+description = "Run full CI pipeline"
+depends = ["lint", "build", "test", "proto:check", "docs:check"]
+
+[tasks."docs:check"]
+description = "Verify every public package has a docs page"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOCS_DIR="docs/src/api"
+SUMMARY="docs/src/SUMMARY.md"
+MISSING=0
+
+# Find all public packages with a doc.go (excluding internal, proto, types)
+for docfile in openshell/v1/*/doc.go; do
+  pkg=$(basename "$(dirname "$docfile")")
+
+  # Skip internal packages and types (no user-facing docs needed)
+  case "$pkg" in
+    internal|types) continue ;;
+  esac
+
+  # Check for matching docs page
+  if [ ! -f "$DOCS_DIR/$pkg.md" ]; then
+    echo "MISSING: $DOCS_DIR/$pkg.md (package openshell/v1/$pkg has doc.go but no docs page)"
+    MISSING=$((MISSING + 1))
+  fi
+
+  # Check for SUMMARY.md entry
+  if ! grep -q "api/$pkg.md" "$SUMMARY" 2>/dev/null; then
+    echo "MISSING: SUMMARY.md entry for api/$pkg.md"
+    MISSING=$((MISSING + 1))
+  fi
+done
+
+if [ "$MISSING" -gt 0 ]; then
+  echo ""
+  echo "ERROR: $MISSING documentation gaps found."
+  echo "Every public package with doc.go needs a docs/src/api/<pkg>.md page"
+  echo "and a SUMMARY.md entry. See Constitution XIII."
+  exit 1
+fi
+
+echo "Docs check passed: all public packages have documentation."
+"""
+
+[tasks."proto:gen"]
+description = "Generate Go bindings from proto files"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Check required tools
+for tool in protoc protoc-gen-go protoc-gen-go-grpc; do
+  if ! command -v "$tool" &>/dev/null; then
+    echo "ERROR: $tool not found. Run 'mise install' to install it."
+    exit 1
+  fi
+done
+
+MODULE="github.com/NVIDIA/OpenShell/sdk/go"
+PROTO_DIR="proto"
+
+# Create output directories
+mkdir -p "$PROTO_DIR/openshellv1" "$PROTO_DIR/datamodelv1" "$PROTO_DIR/sandboxv1"
+
+# M flag mappings for Go package paths
+M_FLAGS=""
+M_FLAGS="$M_FLAGS --go_opt=Mopenshell.proto=$MODULE/proto/openshellv1"
+M_FLAGS="$M_FLAGS --go_opt=Mdatamodel.proto=$MODULE/proto/datamodelv1"
+M_FLAGS="$M_FLAGS --go_opt=Msandbox.proto=$MODULE/proto/sandboxv1"
+M_FLAGS="$M_FLAGS --go-grpc_opt=Mopenshell.proto=$MODULE/proto/openshellv1"
+M_FLAGS="$M_FLAGS --go-grpc_opt=Mdatamodel.proto=$MODULE/proto/datamodelv1"
+M_FLAGS="$M_FLAGS --go-grpc_opt=Msandbox.proto=$MODULE/proto/sandboxv1"
+
+# Generate Go code for all proto files
+# Use module= option to strip the module prefix from the output path,
+# so files land in proto/openshellv1/ etc. instead of the full module path
+protoc \
+  --proto_path="$PROTO_DIR" \
+  --go_out=. \
+  --go_opt=module=$MODULE \
+  --go-grpc_out=. \
+  --go-grpc_opt=module=$MODULE \
+  $M_FLAGS \
+  "$PROTO_DIR/openshell.proto" \
+  "$PROTO_DIR/datamodel.proto" \
+  "$PROTO_DIR/sandbox.proto"
+
+echo "Proto generation complete."
+echo "Generated packages:"
+for pkg in openshellv1 datamodelv1 sandboxv1; do
+  echo "  $PROTO_DIR/$pkg/: $(ls "$PROTO_DIR/$pkg/"*.go 2>/dev/null | wc -l | tr -d ' ') files"
+done
+"""
+
+[tasks."proto:check"]
+description = "Verify generated proto files are up to date"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Check required tools
+for tool in protoc protoc-gen-go protoc-gen-go-grpc; do
+  if ! command -v "$tool" &>/dev/null; then
+    echo "ERROR: $tool not found. Run 'mise install' to install it."
+    exit 1
+  fi
+done
+
+MODULE="github.com/NVIDIA/OpenShell/sdk/go"
+PROTO_DIR="proto"
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+# Create output directories in temp
+mkdir -p "$WORK_DIR/proto/openshellv1" "$WORK_DIR/proto/datamodelv1" "$WORK_DIR/proto/sandboxv1"
+
+# M flag mappings (same as proto:gen)
+M_FLAGS=""
+M_FLAGS="$M_FLAGS --go_opt=Mopenshell.proto=$MODULE/proto/openshellv1"
+M_FLAGS="$M_FLAGS --go_opt=Mdatamodel.proto=$MODULE/proto/datamodelv1"
+M_FLAGS="$M_FLAGS --go_opt=Msandbox.proto=$MODULE/proto/sandboxv1"
+M_FLAGS="$M_FLAGS --go-grpc_opt=Mopenshell.proto=$MODULE/proto/openshellv1"
+M_FLAGS="$M_FLAGS --go-grpc_opt=Mdatamodel.proto=$MODULE/proto/datamodelv1"
+M_FLAGS="$M_FLAGS --go-grpc_opt=Msandbox.proto=$MODULE/proto/sandboxv1"
+
+# Generate to temp directory
+protoc \
+  --proto_path="$PROTO_DIR" \
+  --go_out="$WORK_DIR" \
+  --go_opt=module=$MODULE \
+  --go-grpc_out="$WORK_DIR" \
+  --go-grpc_opt=module=$MODULE \
+  $M_FLAGS \
+  "$PROTO_DIR/openshell.proto" \
+  "$PROTO_DIR/datamodel.proto" \
+  "$PROTO_DIR/sandbox.proto"
+
+# Diff against committed files
+DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "$PROTO_DIR" \
+  --exclude="*.proto" \
+  --exclude="UPSTREAM_VERSION" \
+  2>&1) || true
+
+if [ -n "$DIFF_OUTPUT" ]; then
+  echo "ERROR: Generated proto files are out of date."
+  echo "Run 'mise run proto:gen' to regenerate."
+  echo ""
+  echo "$DIFF_OUTPUT"
+  exit 1
+fi
+
+echo "Proto check passed: generated files are up to date."
+"""
+
+[tasks."proto:clean"]
+description = "Remove all generated proto files"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROTO_DIR="proto"
+
+# Remove all generated .pb.go files
+find "$PROTO_DIR" -name "*.pb.go" -delete 2>/dev/null || true
+
+# Remove empty generated subdirectories
+for dir in "$PROTO_DIR"/*/; do
+  [ -d "$dir" ] && rmdir "$dir" 2>/dev/null || true
+done
+
+echo "Proto clean complete."
+"""
+
+[tasks."proto:sync"]
+description = "Sync proto files from upstream OpenShell repo"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+UPSTREAM_PATH="${UPSTREAM_PATH:-../OpenShell/proto}"
+
+if [ ! -d "$UPSTREAM_PATH" ]; then
+  echo "ERROR: Upstream proto directory not found: $UPSTREAM_PATH"
+  echo "Set UPSTREAM_PATH env var to the correct location."
+  exit 1
+fi
+
+PROTO_DIR="proto"
+mkdir -p "$PROTO_DIR"
+
+PROTO_FILES="openshell.proto datamodel.proto sandbox.proto"
+for f in $PROTO_FILES; do
+  src="$UPSTREAM_PATH/$f"
+  if [ ! -f "$src" ]; then
+    echo "ERROR: Proto file not found: $src"
+    exit 1
+  fi
+  cp "$src" "$PROTO_DIR/$f"
+  echo "Copied $f"
+done
+
+# Record upstream commit SHA
+UPSTREAM_REPO_DIR="$(cd "$UPSTREAM_PATH/.." && pwd)"
+if [ -d "$UPSTREAM_REPO_DIR/.git" ]; then
+  SHA=$(git -C "$UPSTREAM_REPO_DIR" rev-parse HEAD)
+else
+  SHA="unknown"
+fi
+echo "$SHA" > "$PROTO_DIR/UPSTREAM_VERSION"
+echo "Upstream version: $SHA"
+echo "Proto sync complete."
+"""
