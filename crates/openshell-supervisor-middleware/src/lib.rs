@@ -24,6 +24,11 @@ use openshell_core::proto::{
 use tokio::sync::OnceCell;
 use tonic::Request;
 
+pub use openshell_core::middleware::{
+    MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CONFIGS,
+    MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_SELECTOR_PATTERNS,
+};
+
 /// Largest request or replacement body accepted by the middleware platform.
 pub const MAX_MIDDLEWARE_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Largest encoded service-specific configuration attached to one evaluation.
@@ -38,8 +43,6 @@ pub const MAX_MIDDLEWARE_HEADERS: usize = 128;
 pub const MAX_MIDDLEWARE_HEADER_BYTES: usize = 64 * 1024;
 /// Largest operator-provided reason accepted in one middleware result.
 pub const MAX_MIDDLEWARE_REASON_BYTES: usize = 4 * 1024;
-/// Largest number of findings accepted from one middleware stage.
-pub const MAX_MIDDLEWARE_FINDINGS: usize = 64;
 /// Largest encoded individual finding accepted from one middleware stage.
 pub const MAX_MIDDLEWARE_FINDING_BYTES: usize = 4 * 1024;
 /// Largest number of metadata entries accepted from one middleware stage.
@@ -56,10 +59,11 @@ const MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES: usize = MAX_MIDDLEWARE_CONFIG_BYTES
     + MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES;
 const MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES: usize = MAX_MIDDLEWARE_REASON_BYTES
     + MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES
-    + MAX_MIDDLEWARE_FINDINGS * MAX_MIDDLEWARE_FINDING_BYTES
+    + MAX_MIDDLEWARE_FINDINGS_PER_STAGE * MAX_MIDDLEWARE_FINDING_BYTES
     + MAX_MIDDLEWARE_METADATA_BYTES
     + MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES;
-const MAX_MIDDLEWARE_ENVELOPE_BYTES: usize =
+/// gRPC envelope headroom derived from every bounded non-body component.
+pub const MIDDLEWARE_GRPC_ENVELOPE_BYTES: usize =
     if MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES > MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES {
         MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES
     } else {
@@ -67,7 +71,7 @@ const MAX_MIDDLEWARE_ENVELOPE_BYTES: usize =
     };
 /// gRPC message limit derived from the body and bounded protobuf components.
 pub const MIDDLEWARE_GRPC_MESSAGE_BYTES: usize =
-    MAX_MIDDLEWARE_BODY_BYTES + MAX_MIDDLEWARE_ENVELOPE_BYTES;
+    MAX_MIDDLEWARE_BODY_BYTES + MIDDLEWARE_GRPC_ENVELOPE_BYTES;
 
 const HTTP_REQUEST_OPERATION: SupervisorMiddlewareOperation =
     SupervisorMiddlewareOperation::HttpRequest;
@@ -189,6 +193,10 @@ pub struct HttpRequestInput {
     /// preserved as separate entries so middleware inspects every value the
     /// upstream will receive.
     pub headers: Vec<(String, String)>,
+    /// Lowercased names nominated by the original request's `Connection`
+    /// headers. Their values are not exposed to middleware, but mutations must
+    /// still treat these dynamically hop-by-hop fields as protected.
+    pub connection_nominated_headers: Vec<String>,
     pub body: Vec<u8>,
 }
 
@@ -564,7 +572,7 @@ fn validate_response_envelope(
     if mutation_bytes > MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES {
         return Err("header_mutation_bytes_over_capacity");
     }
-    if result.findings.len() > MAX_MIDDLEWARE_FINDINGS {
+    if result.findings.len() > MAX_MIDDLEWARE_FINDINGS_PER_STAGE {
         return Err("response_findings_over_capacity");
     }
     if result
@@ -695,6 +703,7 @@ impl MiddlewareRegistry {
 
     /// Validate implementation-owned configuration for every middleware entry.
     pub async fn validate_policy_configs(&self, policy: &SandboxPolicy) -> Result<()> {
+        ensure_config_capacity(policy.network_middlewares.len())?;
         let runner = ChainRunner::from_registry(self.clone());
         for config in &policy.network_middlewares {
             runner
@@ -808,6 +817,7 @@ impl ChainRunner {
     }
 
     pub async fn describe_chain(&self, entries: &[ChainEntry]) -> Result<Vec<DescribedChainEntry>> {
+        ensure_chain_capacity(entries.len())?;
         let manifests = self.manifests().await?;
         let mut entries = entries.to_vec();
         sort_chain_entries(&mut entries);
@@ -925,6 +935,7 @@ impl ChainRunner {
         input: HttpRequestInput,
         transformed_body_policy: TransformedBodyPolicy<'_>,
     ) -> Result<ChainOutcome> {
+        ensure_chain_capacity(entries.len())?;
         let mut headers = input.headers.clone();
         let mut body = input.body.clone();
         let mut header_mutations = Vec::new();
@@ -1102,7 +1113,11 @@ impl ChainRunner {
             // Validate and apply the entire stage atomically. Under fail-open,
             // one malformed mutation must not leave earlier mutations from the
             // same response visible to later middleware.
-            let updated_headers = match headers::apply(&headers, &result.header_mutations) {
+            let updated_headers = match headers::apply(
+                &headers,
+                &input.connection_nominated_headers,
+                &result.header_mutations,
+            ) {
                 Ok(updated) => updated,
                 Err(error) => {
                     let reason = service
@@ -1201,6 +1216,24 @@ pub fn sort_chain_entries(entries: &mut [ChainEntry]) {
     });
 }
 
+fn ensure_config_capacity(count: usize) -> Result<()> {
+    if count > MAX_MIDDLEWARE_CONFIGS {
+        return Err(miette!(
+            "middleware config count {count} exceeds platform maximum {MAX_MIDDLEWARE_CONFIGS}"
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_chain_capacity(count: usize) -> Result<()> {
+    if count > MAX_MIDDLEWARE_CHAIN_STAGES {
+        return Err(miette!(
+            "selected middleware stage count {count} exceeds platform maximum {MAX_MIDDLEWARE_CHAIN_STAGES}"
+        ));
+    }
+    Ok(())
+}
+
 fn build_evaluation(
     entry: &DescribedChainEntry,
     binding: &MiddlewareBinding,
@@ -1292,6 +1325,7 @@ mod tests {
             path: "/v1".into(),
             query: String::new(),
             headers: Vec::new(),
+            connection_nominated_headers: Vec::new(),
             body: body.as_bytes().to_vec(),
         }
     }
@@ -1385,6 +1419,37 @@ mod tests {
             .map(|entry| entry.entry.name.as_str())
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "later"]);
+    }
+
+    #[tokio::test]
+    async fn describe_chain_accepts_maximum_selected_stages() {
+        let entries: Vec<_> = (0..MAX_MIDDLEWARE_CHAIN_STAGES)
+            .map(|index| entry(&format!("stage-{index}"), OnError::FailClosed))
+            .collect();
+
+        let described = builtin_runner()
+            .describe_chain(&entries)
+            .await
+            .expect("maximum selected stage count");
+        assert_eq!(described.len(), MAX_MIDDLEWARE_CHAIN_STAGES);
+    }
+
+    #[tokio::test]
+    async fn describe_chain_rejects_selected_stages_over_capacity() {
+        let entries: Vec<_> = (0..=MAX_MIDDLEWARE_CHAIN_STAGES)
+            .map(|index| entry(&format!("stage-{index}"), OnError::FailClosed))
+            .collect();
+
+        let error = builtin_runner()
+            .describe_chain(&entries)
+            .await
+            .err()
+            .expect("selected stage count over capacity");
+        assert!(
+            error
+                .to_string()
+                .contains("selected middleware stage count 11 exceeds platform maximum 10")
+        );
     }
 
     #[tokio::test]
@@ -2405,7 +2470,7 @@ mod tests {
             .expect("bind test middleware");
         let address = listener.local_addr().expect("test middleware address");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let response_findings = (0..MAX_MIDDLEWARE_FINDINGS)
+        let response_findings = (0..MAX_MIDDLEWARE_FINDINGS_PER_STAGE)
             .map(|_| Finding {
                 r#type: "f".repeat(1024),
                 label: "finding".into(),
@@ -2487,12 +2552,21 @@ mod tests {
         assert!(outcome.allowed);
         assert_eq!(outcome.body.len(), MAX_MIDDLEWARE_BODY_BYTES);
         assert_eq!(outcome.header_mutations.len(), 1);
-        assert_eq!(outcome.findings.len(), MAX_MIDDLEWARE_FINDINGS);
+        assert_eq!(outcome.findings.len(), MAX_MIDDLEWARE_FINDINGS_PER_STAGE);
         let _ = shutdown_tx.send(());
         server_task
             .await
             .expect("join test middleware")
             .expect("serve");
+    }
+
+    #[test]
+    fn grpc_envelope_headroom_matches_bounded_components() {
+        assert_eq!(MIDDLEWARE_GRPC_ENVELOPE_BYTES, 292 * 1024);
+        assert_eq!(
+            MIDDLEWARE_GRPC_MESSAGE_BYTES,
+            MAX_MIDDLEWARE_BODY_BYTES + 292 * 1024
+        );
     }
 
     #[tokio::test]
@@ -2584,13 +2658,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_nominated_write_and_remove_are_rejected_after_filtering() {
+        let mutations = [
+            write_header(
+                "x-openshell-middleware-tag",
+                "value",
+                ExistingHeaderAction::Append,
+            ),
+            HeaderMutation {
+                operation: Some(header_mutation::Operation::Remove(
+                    openshell_core::proto::RemoveHeader {
+                        name: "x-openshell-middleware-tag".into(),
+                    },
+                )),
+            },
+        ];
+
+        for mutation in mutations {
+            let service = Arc::new(ScriptedService {
+                binding_id: "example/content-guard".into(),
+                max_body_bytes: 4096,
+                result: openshell_core::proto::HttpRequestResult {
+                    header_mutations: vec![mutation],
+                    ..allow_result()
+                },
+            });
+            let registry = registry_with_external(service, external_registration(4096)).await;
+            let mut request = input("hello");
+            request.connection_nominated_headers = vec!["x-openshell-middleware-tag".into()];
+
+            let outcome = ChainRunner::from_registry(registry)
+                .evaluate(
+                    &[ChainEntry {
+                        name: "guard".into(),
+                        implementation: "example/content-guard".into(),
+                        order: 0,
+                        config: prost_types::Struct::default(),
+                        on_error: OnError::FailClosed,
+                    }],
+                    request,
+                )
+                .await
+                .expect("evaluate external middleware");
+
+            assert!(!outcome.allowed);
+            assert_eq!(
+                outcome.reason,
+                "middleware_failed: header_mutation_hop_by_hop_header"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn finding_overflow_is_an_invalid_response_governed_by_on_error() {
         let registration = external_registration(4096);
         let service = Arc::new(ScriptedService {
             binding_id: "example/content-guard".into(),
             max_body_bytes: 4096,
             result: openshell_core::proto::HttpRequestResult {
-                findings: vec![Finding::default(); MAX_MIDDLEWARE_FINDINGS + 1],
+                findings: vec![Finding::default(); MAX_MIDDLEWARE_FINDINGS_PER_STAGE + 1],
                 ..allow_result()
             },
         });
@@ -2622,6 +2748,56 @@ mod tests {
                     "middleware_failed: response_findings_over_capacity"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn maximum_chain_retains_findings_from_every_stage() {
+        let runner = ChainRunner::new(Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                findings: vec![
+                    Finding {
+                        r#type: "example.finding".into(),
+                        label: "Example finding".into(),
+                        count: 1,
+                        confidence: String::new(),
+                        severity: "medium".into(),
+                    };
+                    MAX_MIDDLEWARE_FINDINGS_PER_STAGE
+                ],
+                ..allow_result()
+            },
+        }));
+        let entries: Vec<_> = (0..MAX_MIDDLEWARE_CHAIN_STAGES)
+            .map(|index| ChainEntry {
+                name: format!("guard-{index}"),
+                implementation: "example/content-guard".into(),
+                order: i32::try_from(index).expect("bounded stage index"),
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            })
+            .collect();
+
+        let outcome = runner
+            .evaluate(&entries, input("hello"))
+            .await
+            .expect("evaluate maximum chain");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.applied.len(), MAX_MIDDLEWARE_CHAIN_STAGES);
+        assert_eq!(outcome.findings.len(), MAX_MIDDLEWARE_CHAIN_FINDINGS);
+        for (stage, findings) in outcome
+            .findings
+            .chunks_exact(MAX_MIDDLEWARE_FINDINGS_PER_STAGE)
+            .enumerate()
+        {
+            assert!(
+                findings
+                    .iter()
+                    .all(|finding| finding.middleware == format!("guard-{stage}"))
+            );
         }
     }
 

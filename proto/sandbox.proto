@@ -27,7 +27,8 @@ message SandboxPolicy {
   ProcessPolicy process = 4;
   // Network access policies keyed by name (e.g. "claude_code", "gitlab").
   map<string, NetworkPolicyRule> network_policies = 5;
-  // Reusable supervisor middleware configs for network egress.
+  // Reusable supervisor middleware configs for network egress. At most 10
+  // configs are accepted, and at most 10 stages can be selected per request.
   repeated NetworkMiddlewareConfig network_middlewares = 6;
 }
 
@@ -83,7 +84,8 @@ message NetworkMiddlewareConfig {
 
 // Host selector controlling which admitted destinations use a middleware config.
 message MiddlewareEndpointSelector {
-  // Exact host or DNS glob patterns included in the selection.
+  // Exact host or DNS glob patterns included in the selection. Include and
+  // exclude accept at most 32 combined patterns.
   repeated string include = 1;
   // Exact host or DNS glob patterns removed from the selection.
   // Exclusions take precedence over inclusions.

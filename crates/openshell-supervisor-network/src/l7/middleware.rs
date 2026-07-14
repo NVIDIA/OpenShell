@@ -143,8 +143,15 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
         // body. Apply each entry's `on_error` policy without buffering (an
         // unresolved binding is handled before the body is read) and forward
         // the original request unchanged if the chain allows.
-        let input =
-            middleware_request_input(scheme, &req, ctx, Vec::new(), String::new(), Vec::new());
+        let input = middleware_request_input(
+            scheme,
+            &req,
+            ctx,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
         let outcome = runner.evaluate_described(&chain, input).await?;
         emit_middleware_events(ctx, &req, &outcome);
         return Ok(if outcome.allowed {
@@ -168,7 +175,15 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     };
     let headers = safe_middleware_headers(&buffered.headers)?;
     let query = raw_query_from_request_headers(&buffered.headers)?;
-    let input = middleware_request_input(scheme, &req, ctx, headers, query, buffered.body);
+    let input = middleware_request_input(
+        scheme,
+        &req,
+        ctx,
+        headers.visible,
+        headers.connection_nominated,
+        query,
+        buffered.body,
+    );
     // The explicitly selected transformation policy either re-checks every
     // replacement or documents that this protocol's policy is body-independent.
     // An ALLOW outcome therefore means the final body is policy-compliant.
@@ -193,6 +208,7 @@ pub(super) fn middleware_request_input(
     req: &crate::l7::provider::L7Request,
     ctx: &L7EvalContext,
     headers: Vec<(String, String)>,
+    connection_nominated_headers: Vec<String>,
     query: String,
     body: Vec<u8>,
 ) -> openshell_supervisor_middleware::HttpRequestInput {
@@ -206,6 +222,7 @@ pub(super) fn middleware_request_input(
         path: req.target.clone(),
         query,
         headers,
+        connection_nominated_headers,
         body,
     }
 }
@@ -272,8 +289,15 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
 
 /// Parse the raw header block into middleware-visible headers, preserving
 /// wire order and repeated names so middleware inspects every value the
-/// upstream will receive. Credential-bearing headers are omitted.
-fn safe_middleware_headers(headers: &[u8]) -> Result<Vec<(String, String)>> {
+/// upstream will receive. Credential-bearing and hop-by-hop headers are
+/// omitted, while dynamically nominated names are retained separately for
+/// mutation validation.
+struct SafeMiddlewareHeaders {
+    visible: Vec<(String, String)>,
+    connection_nominated: Vec<String>,
+}
+
+fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let parsed: Vec<(String, String)> = header_str
@@ -292,7 +316,7 @@ fn safe_middleware_headers(headers: &[u8]) -> Result<Vec<(String, String)>> {
         .filter(|token| !token.is_empty())
         .collect();
 
-    Ok(parsed
+    let visible = parsed
         .into_iter()
         .filter(|(name, _)| {
             !name.is_empty()
@@ -316,7 +340,13 @@ fn safe_middleware_headers(headers: &[u8]) -> Result<Vec<(String, String)>> {
                 && !name.starts_with("x-openshell-credential")
                 && !connection_nominated.contains(name)
         })
-        .collect())
+        .collect();
+    let mut connection_nominated: Vec<_> = connection_nominated.into_iter().collect();
+    connection_nominated.sort();
+    Ok(SafeMiddlewareHeaders {
+        visible,
+        connection_nominated,
+    })
 }
 
 pub fn middleware_network_input(ctx: &L7EvalContext) -> crate::opa::NetworkInput {
@@ -434,13 +464,13 @@ pub(super) fn middleware_events(
             .build();
         events.push(event);
     }
-    // The runner rejects stages above this cap through `on_error`. Keep the
-    // emission-side bound as defense in depth for manually constructed or
-    // future outcome producers.
+    // Each stage and the selected chain are independently bounded by the
+    // runner. Keep the derived chain-wide emission bound as defense in depth
+    // for manually constructed or future outcome producers.
     for finding in outcome
         .findings
         .iter()
-        .take(openshell_supervisor_middleware::MAX_MIDDLEWARE_FINDINGS)
+        .take(openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_FINDINGS)
     {
         let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(match finding.finding.severity.as_str() {
@@ -495,7 +525,7 @@ mod tests {
         .expect("headers should parse");
 
         assert_eq!(
-            headers,
+            headers.visible,
             vec![("x-request-id".to_string(), "request-123".to_string())]
         );
     }
@@ -515,7 +545,7 @@ mod tests {
         .expect("headers should parse");
 
         assert_eq!(
-            headers,
+            headers.visible,
             vec![
                 ("x-api-key".to_string(), "first-value".to_string()),
                 ("accept".to_string(), "application/json".to_string()),
@@ -539,8 +569,9 @@ mod tests {
         .expect("headers should parse");
 
         assert_eq!(
-            headers,
+            headers.visible,
             vec![("x-visible".to_string(), "visible-value".to_string())]
         );
+        assert_eq!(headers.connection_nominated, vec!["keep-alive", "x-hop"]);
     }
 }

@@ -77,11 +77,11 @@ network_middlewares:
       exclude: ["trusted.example.com"]
 ```
 
-Each config has a policy-local `name`, a built-in or operator-provided binding ID in `middleware`, an integer `order`, implementation-owned `config`, failure behavior, and host selectors.
+Each config has a policy-local `name`, a built-in or operator-provided binding ID in `middleware`, an integer `order`, implementation-owned `config`, failure behavior, and host selectors. A policy accepts at most 10 middleware configs.
 
-`include` selects destination hosts. `exclude` takes precedence and removes hosts from that selection. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints: `*` matches exactly one DNS label, `**` matches one or more labels, and intra-label patterns like `*-api.example.com` work. Brace alternates such as `{prod,staging}` are rejected at validation; list each host pattern separately.
+`include` selects destination hosts. `exclude` takes precedence and removes hosts from that selection. Each config accepts at most 32 combined include and exclude patterns. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints: `*` matches exactly one DNS label, `**` matches one or more labels, and intra-label patterns like `*-api.example.com` work. Brace alternates such as `{prod,staging}` are rejected at validation; list each host pattern separately.
 
-Matching configs run once each by ascending `order`; lower values run first and policy-local names break ties. The default order is `0`. Different config names may reference the same binding and run as separate stages. Config names must be unique.
+Matching configs run once each by ascending `order`; lower values run first and policy-local names break ties. The default order is `0`. Different config names may reference the same binding and run as separate stages. Config names must be unique. Runtime selection defensively rejects chains with more than 10 stages.
 
 See [Policy Schema](/reference/policy-schema#network-middleware) for the complete field reference.
 
@@ -109,7 +109,7 @@ Every middleware binding declares the largest request or replacement body it sup
 - A selected chain buffers using its largest stage limit, so every stage that can process the body receives it.
 - The same per-stage limit applies to request bodies and replacement bodies.
 
-The gateway rejects a registration whose operator limit exceeds the service capability or the 4 MiB platform maximum instead of silently clamping it. OpenShell also bounds the non-body protobuf components: 64 KiB for service config, 4 KiB for request context, 32 KiB for the target, and 128 request header lines totaling at most 64 KiB encoded. Results allow a 4 KiB reason, 64 header mutations totaling at most 64 KiB encoded, 64 findings of at most 4 KiB encoded each, and 64 metadata entries totaling at most 32 KiB. Middleware gRPC servers should configure request and response message limits to at least 4 MiB plus 420 KiB so every platform-valid envelope fits.
+The gateway rejects a registration whose operator limit exceeds the service capability or the 4 MiB platform maximum instead of silently clamping it. OpenShell also bounds the non-body protobuf components: 64 KiB for service config, 4 KiB for request context, 32 KiB for the target, and 128 request header lines totaling at most 64 KiB encoded. Results allow a 4 KiB reason, 64 header mutations totaling at most 64 KiB encoded, 32 findings of at most 4 KiB encoded each, and 64 metadata entries totaling at most 32 KiB. Middleware gRPC servers should configure request and response message limits to at least 4 MiB plus 292 KiB so every platform-valid envelope fits.
 
 At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. OpenShell can apply `fail_open` to an oversized `Content-Length` before consuming body bytes. A chunked body can cross the limit only after bytes have been consumed, so OpenShell denies that request because it cannot safely resume the original stream.
 
@@ -147,7 +147,7 @@ Middleware activity is emitted through OpenShell's OCSF logging:
 - A denied built-in invocation records its audit-safe reason. For operator-run services, OpenShell records a stable reason derived from the validated binding ID instead of service-provided per-request text.
 - A bypass under `fail_open` emits a detection finding.
 - A required stage that fails closed emits a high-severity detection finding.
-- Built-in findings include their type, label, and aggregate count. Operator-run findings use the validated binding ID and a platform label plus the aggregate count; OpenShell does not log service-provided finding text or diagnostic metadata. A stage can return at most 64 findings. Exceeding the cap is an invalid response handled through `on_error`.
+- Built-in findings include their type, label, and aggregate count. Operator-run findings use the validated binding ID and a platform label plus the aggregate count; OpenShell does not log service-provided finding text or diagnostic metadata. A stage can return at most 32 findings. Exceeding the per-stage cap is an invalid response handled through `on_error`. A maximum 10-stage chain retains and emits up to 320 findings without silently dropping findings from later stages.
 - Registry reload success and failure are emitted as configuration state changes.
 
 See [Logging](/observability/logging) for log access and [OCSF JSON Export](/observability/ocsf-json-export) for structured export.

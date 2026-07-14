@@ -223,7 +223,8 @@ message HttpRequestResult {
   // Audit-safe findings produced during evaluation. For operator-run services,
   // OpenShell logs platform-owned fields derived from the validated binding id
   // rather than service-provided type, label, confidence, or metadata text.
-  // At most 64 findings of at most 4 KiB encoded each are accepted.
+  // At most 32 findings of at most 4 KiB encoded each are accepted per stage.
+  // A policy selects at most 10 stages, so one chain retains at most 320.
   repeated Finding findings = 6;
   // Non-secret service-defined metadata included in diagnostics. At most 64
   // entries and 32 KiB of combined key/value data are accepted.

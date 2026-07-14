@@ -3959,8 +3959,15 @@ network_policies:
             token_grant_resolver: None,
         };
 
-        let input =
-            middleware_request_input("http", &req, &ctx, Vec::new(), String::new(), Vec::new());
+        let input = middleware_request_input(
+            "http",
+            &req,
+            &ctx,
+            Vec::new(),
+            Vec::new(),
+            String::new(),
+            Vec::new(),
+        );
 
         assert_eq!(input.scheme, "http");
     }
@@ -4047,9 +4054,24 @@ network_policies:
         assert!(serialized.contains("secret.common"));
 
         let mut bounded_outcome = outcome;
-        bounded_outcome.findings = vec![
-            NamespacedFinding {
-                middleware: "external-guard".into(),
+        bounded_outcome.findings = (0
+            ..openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES)
+            .flat_map(|stage| {
+                (0..openshell_supervisor_middleware::MAX_MIDDLEWARE_FINDINGS_PER_STAGE).map(
+                    move |_| NamespacedFinding {
+                        middleware: format!("external-guard-{stage}"),
+                        finding: openshell_core::proto::Finding {
+                            r#type: "example/content-guard.finding".into(),
+                            label: "External middleware finding".into(),
+                            count: 1,
+                            confidence: String::new(),
+                            severity: "medium".into(),
+                        },
+                    },
+                )
+            })
+            .chain(std::iter::once(NamespacedFinding {
+                middleware: "over-capacity".into(),
                 finding: openshell_core::proto::Finding {
                     r#type: "example/content-guard.finding".into(),
                     label: "External middleware finding".into(),
@@ -4057,17 +4079,15 @@ network_policies:
                     confidence: String::new(),
                     severity: "medium".into(),
                 },
-            };
-            openshell_supervisor_middleware::MAX_MIDDLEWARE_FINDINGS
-                + 10
-        ];
+            }))
+            .collect();
         let bounded_events = middleware_events(&ctx, &req, &bounded_outcome);
         assert_eq!(
             bounded_events
                 .iter()
                 .filter(|event| event.class_uid() == 2004)
                 .count(),
-            openshell_supervisor_middleware::MAX_MIDDLEWARE_FINDINGS,
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_FINDINGS,
             "finding emission must remain bounded even if an invalid outcome bypasses the runner"
         );
 

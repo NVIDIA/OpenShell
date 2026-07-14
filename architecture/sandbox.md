@@ -75,9 +75,12 @@ operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
 service capabilities and implementation-owned config before delivery.
 The platform caps middleware bodies at 4 MiB and derives the gRPC transport
-limit from bounded request and response components, reserving 420 KiB for the
+limit from bounded request and response components, reserving 292 KiB for the
 largest valid protobuf envelope. Config, context, target, headers, mutations,
 reasons, findings, and metadata each have explicit size or cardinality limits.
+Policies contain at most 10 middleware configs with 32 combined host selector
+patterns each. Runtime selection defensively allows at most 10 stages, each of
+which can return 32 findings, for a derived chain maximum of 320 findings.
 Registration and manifest body limits above the platform boundary fail before
 request-body allocation. External per-request reason, finding text, mutation
 errors, and diagnostic metadata are untrusted: the supervisor maps logged
@@ -120,6 +123,9 @@ operations. Rust validates and applies a stage atomically to the logical header
 state before the next stage runs, then replays the validated operations against
 the raw request before credential injection. Credential, routing, framing, and
 hop-by-hop headers remain supervisor-owned and cannot be mutated.
+Names dynamically nominated by the original request's `Connection` header are
+carried separately after header filtering so write and remove mutations cannot
+reintroduce them.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:

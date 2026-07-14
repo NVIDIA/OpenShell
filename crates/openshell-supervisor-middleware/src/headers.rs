@@ -106,6 +106,7 @@ impl std::error::Error for HeaderMutationError {}
 /// preserved; comparisons are case-insensitive.
 pub fn apply(
     existing_headers: &[(String, String)],
+    connection_nominated_headers: &[String],
     mutations: &[HeaderMutation],
 ) -> Result<Vec<(String, String)>, HeaderMutationError> {
     if mutations.len() > MAX_HEADER_MUTATIONS {
@@ -120,7 +121,7 @@ pub fn apply(
         match mutation.operation.as_ref() {
             Some(header_mutation::Operation::Write(write)) => {
                 let name = validate_name(&write.name)?;
-                if is_connection_nominated(&headers, &name) {
+                if is_connection_nominated(connection_nominated_headers, &name) {
                     return Err(HeaderMutationError::HopByHop {
                         name: write.name.clone(),
                     });
@@ -159,7 +160,7 @@ pub fn apply(
             }
             Some(header_mutation::Operation::Remove(remove)) => {
                 let name = validate_name(&remove.name)?;
-                if is_connection_nominated(&headers, &name) {
+                if is_connection_nominated(connection_nominated_headers, &name) {
                     return Err(HeaderMutationError::HopByHop {
                         name: remove.name.clone(),
                     });
@@ -246,12 +247,10 @@ fn is_protected(name: &str) -> bool {
         || name.starts_with("x-openshell-credential")
 }
 
-fn is_connection_nominated(headers: &[(String, String)], name: &str) -> bool {
-    headers
+fn is_connection_nominated(connection_nominated_headers: &[String], name: &str) -> bool {
+    connection_nominated_headers
         .iter()
-        .filter(|(header, _)| header == "connection")
-        .flat_map(|(_, value)| value.split(','))
-        .any(|token| token.trim().eq_ignore_ascii_case(name))
+        .any(|nominated| nominated.eq_ignore_ascii_case(name))
 }
 
 #[cfg(test)]
@@ -281,6 +280,7 @@ mod tests {
     fn protected_header_write_is_rejected() {
         let error = apply(
             &[],
+            &[],
             &[write(
                 "Authorization",
                 "Bearer nope",
@@ -298,6 +298,7 @@ mod tests {
     #[test]
     fn unsafe_header_value_is_rejected() {
         let error = apply(
+            &[],
             &[],
             &[write(
                 "x-openshell-middleware-inject",
@@ -317,6 +318,7 @@ mod tests {
         ];
         let appended = apply(
             &existing,
+            &[],
             &[write(
                 "X-OpenShell-Middleware-Tag",
                 "two",
@@ -335,6 +337,7 @@ mod tests {
 
         let overwritten = apply(
             &existing,
+            &[],
             &[write(
                 "X-OpenShell-Middleware-Tag",
                 "two",
@@ -352,6 +355,7 @@ mod tests {
 
         let skipped = apply(
             &existing,
+            &[],
             &[write(
                 "X-OpenShell-Middleware-Tag",
                 "two",
@@ -369,13 +373,13 @@ mod tests {
             ("accept".to_string(), "application/json".to_string()),
             ("x-trace".to_string(), "two".to_string()),
         ];
-        let updated = apply(&existing, &[remove("X-Trace")]).expect("remove visible header");
+        let updated = apply(&existing, &[], &[remove("X-Trace")]).expect("remove visible header");
         assert_eq!(updated, vec![("accept".into(), "application/json".into())]);
     }
 
     #[test]
     fn protected_header_remove_is_rejected_even_when_not_visible() {
-        let error = apply(&[], &[remove("Authorization")]).expect_err("protected removal");
+        let error = apply(&[], &[], &[remove("Authorization")]).expect_err("protected removal");
         assert!(
             error
                 .to_string()
@@ -385,11 +389,29 @@ mod tests {
 
     #[test]
     fn connection_nominated_header_is_protected() {
-        let existing = [
-            ("connection".to_string(), "keep-alive, x-hop".to_string()),
-            ("x-hop".to_string(), "value".to_string()),
-        ];
-        let error = apply(&existing, &[remove("X-Hop")]).expect_err("hop-by-hop removal");
-        assert!(error.to_string().contains("hop-by-hop header 'X-Hop'"));
+        let nominated = vec!["x-openshell-middleware-tag".to_string()];
+        let write_error = apply(
+            &[],
+            &nominated,
+            &[write(
+                "X-OpenShell-Middleware-Tag",
+                "value",
+                ExistingHeaderAction::Append,
+            )],
+        )
+        .expect_err("hop-by-hop write");
+        assert!(
+            write_error
+                .to_string()
+                .contains("hop-by-hop header 'X-OpenShell-Middleware-Tag'")
+        );
+
+        let remove_error = apply(&[], &nominated, &[remove("X-OpenShell-Middleware-Tag")])
+            .expect_err("hop-by-hop removal");
+        assert!(
+            remove_error
+                .to_string()
+                .contains("hop-by-hop header 'X-OpenShell-Middleware-Tag'")
+        );
     }
 }

@@ -1042,9 +1042,14 @@ async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
             Ok(PreparedRequestBody { headers, body })
         }
         BodyLength::Chunked => {
-            let body = collect_chunked_body(client, already_read, generation_guard, None)
-                .await
-                .map_err(CollectChunkedError::into_report)?;
+            let body = collect_chunked_body(
+                client,
+                already_read,
+                generation_guard,
+                Some(MAX_REWRITE_BODY_BYTES),
+            )
+            .await
+            .map_err(CollectChunkedError::into_report)?;
             let (mut headers, body) =
                 rewrite_buffered_body(rewritten_headers, original_header_str, body, resolver)?;
             headers = set_content_length(&headers, body.len())?;
@@ -1234,7 +1239,7 @@ impl CollectChunkedError {
     fn into_report(self) -> miette::Error {
         match self {
             Self::OverCapacity => {
-                miette!("chunked body wire representation exceeds middleware buffer limit")
+                miette!("chunked body wire representation exceeds configured buffer limit")
             }
             Self::Failed(error) => error,
         }
@@ -3603,6 +3608,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_rewrite_rejects_aggregate_chunk_extension_overflow() {
+        let mut wire = Vec::new();
+        let chunk = format!("1;pad={}\r\nx\r\n", "a".repeat(64));
+        while wire.len() <= MAX_REWRITE_BODY_BYTES {
+            wire.extend_from_slice(chunk.as_bytes());
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+
+        let req = L7Request {
+            action: "POST".into(),
+            target: "/api".into(),
+            query_params: HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: BodyLength::Chunked,
+        };
+        let headers =
+            b"POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let result = collect_and_rewrite_request_body(
+            &req,
+            &mut tokio::io::empty(),
+            headers,
+            std::str::from_utf8(headers).expect("headers"),
+            &wire,
+            None,
+            None,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("aggregate chunk extensions must be bounded")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("chunked body wire representation exceeds configured buffer limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_rewrite_rejects_aggregate_chunk_trailer_overflow() {
+        let mut wire = b"1\r\nx\r\n0\r\n".to_vec();
+        let trailer = format!("x-pad: {}\r\n", "a".repeat(64));
+        while wire.len() <= MAX_REWRITE_BODY_BYTES {
+            wire.extend_from_slice(trailer.as_bytes());
+        }
+        wire.extend_from_slice(b"\r\n");
+
+        let req = L7Request {
+            action: "POST".into(),
+            target: "/api".into(),
+            query_params: HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: BodyLength::Chunked,
+        };
+        let headers =
+            b"POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let result = collect_and_rewrite_request_body(
+            &req,
+            &mut tokio::io::empty(),
+            headers,
+            std::str::from_utf8(headers).expect("headers"),
+            &wire,
+            None,
+            None,
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("aggregate chunk trailers must be bounded")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("chunked body wire representation exceeds configured buffer limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
     async fn collect_chunked_body_reads_payload_in_blocks() {
         let payload_len = 64 * 1024;
         let mut wire = format!("{payload_len:x}\r\n").into_bytes();
@@ -3730,7 +3813,7 @@ mod tests {
         );
         assert!(
             !err.to_string().contains("over_capacity")
-                && !err.to_string().contains("exceeds middleware buffer limit"),
+                && !err.to_string().contains("exceeds configured buffer limit"),
             "protocol errors must not be reported as over-capacity: {err}"
         );
     }

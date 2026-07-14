@@ -883,6 +883,12 @@ fn global_middleware_entries(configs: &[regorus::Value], host: &str) -> Result<V
     let mut entries = Vec::new();
     for config in configs {
         if middleware_selector_matches(config, host)? {
+            if entries.len() >= openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES {
+                return Err(miette::miette!(
+                    "selected middleware stage count exceeds platform maximum {}",
+                    openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES
+                ));
+            }
             entries.push(chain_entry_from_value(config)?);
         }
     }
@@ -7149,6 +7155,47 @@ network_policies:
         assert_eq!(
             names,
             vec!["endpoint-redactor", "policy-redactor", "global-redactor"]
+        );
+    }
+
+    fn matching_middleware_configs(count: usize) -> Vec<regorus::Value> {
+        (0..count)
+            .map(|index| {
+                regorus::Value::from(serde_json::json!({
+                    "name": format!("stage-{index}"),
+                    "middleware": "openshell/secrets",
+                    "endpoints": {"include": ["api.example.com"]}
+                }))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn middleware_chain_accepts_maximum_selected_stages() {
+        let configs = matching_middleware_configs(
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES,
+        );
+
+        let chain =
+            global_middleware_entries(&configs, "api.example.com").expect("maximum selected chain");
+        assert_eq!(
+            chain.len(),
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES
+        );
+    }
+
+    #[test]
+    fn middleware_chain_rejects_selected_stages_over_capacity() {
+        let configs = matching_middleware_configs(
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES + 1,
+        );
+
+        let error = global_middleware_entries(&configs, "api.example.com")
+            .expect_err("selected chain over capacity");
+        assert!(
+            error
+                .to_string()
+                .contains("selected middleware stage count exceeds platform maximum 10")
         );
     }
 
