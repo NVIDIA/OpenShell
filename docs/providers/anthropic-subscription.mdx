@@ -23,7 +23,7 @@ Create the provider with `--from-claude-login`:
 
 ```shell
 openshell provider create \
-  --name claude-plan \
+  --name claude-subscription \
   --type anthropic-oauth \
   --from-claude-login
 ```
@@ -58,7 +58,7 @@ Then point `inference.local` at the provider:
 
 ```shell
 openshell inference set \
-  --provider claude-plan \
+  --provider claude-subscription \
   --model claude-sonnet-4-6
 ```
 
@@ -76,13 +76,13 @@ openshell settings set --global --key providers_v2_enabled --value true --yes
 
 # 2. Authenticate on the host, then create the provider
 claude login
-openshell provider create --name claude-plan --type anthropic-oauth --from-claude-login
+openshell provider create --name claude-subscription --type anthropic-oauth --from-claude-login
 
 # 3. Configure inference routing
-openshell inference set --provider claude-plan --model claude-sonnet-4-6
+openshell inference set --provider claude-subscription --model claude-sonnet-4-6
 
 # 4. Create a sandbox with the provider attached
-openshell sandbox create --name my-sandbox --provider claude-plan
+openshell sandbox create --name my-sandbox --provider claude-subscription
 ```
 
 Then inside the sandbox, launch Claude Code against the local endpoint:

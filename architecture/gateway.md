@@ -450,7 +450,7 @@ back the provider record. Service-account JSON and private keys are gateway-side
 refresh bootstrap material only; sandbox runtime inference receives minted
 access tokens, not raw service-account material.
 
-The `anthropic-oauth` provider type (alias `claude-plan`) routes the direct
+The `anthropic-oauth` provider type (alias `claude-subscription`) routes the direct
 Anthropic API with a subscription OAuth token instead of an API key. Its
 inference profile uses `Authorization: Bearer` plus a mandatory
 `anthropic-beta: oauth-2025-04-20` default header; the sandbox router merges that

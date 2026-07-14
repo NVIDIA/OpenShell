@@ -254,7 +254,7 @@ pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
     match input.trim().to_ascii_lowercase().as_str() {
         "openai" => Some("openai"),
         "anthropic" => Some("anthropic"),
-        "anthropic-oauth" | "claude-plan" => Some("anthropic-oauth"),
+            "anthropic-oauth" | "claude-subscription" => Some("anthropic-oauth"),
         "nvidia" => Some("nvidia"),
         "deepinfra" => Some("deepinfra"),
         "aws-bedrock" => Some("aws-bedrock"),
@@ -514,16 +514,16 @@ mod tests {
 
     #[test]
     fn profile_for_anthropic_oauth_types() {
-        for key in &["anthropic-oauth", "claude-plan", "Anthropic-OAuth"] {
+        for key in &["anthropic-oauth", "claude-subscription", "Anthropic-OAuth"] {
             let profile = profile_for(key).expect("anthropic-oauth profile should be Some");
             assert_eq!(profile.provider_type, "anthropic-oauth");
         }
     }
 
     #[test]
-    fn normalize_aliases_claude_plan_to_anthropic_oauth() {
+    fn normalize_aliases_claude_subscription_to_anthropic_oauth() {
         assert_eq!(
-            normalize_inference_provider_type("claude-plan"),
+            normalize_inference_provider_type("claude-subscription"),
             Some("anthropic-oauth")
         );
         assert_eq!(

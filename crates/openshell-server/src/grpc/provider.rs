@@ -5933,7 +5933,7 @@ mod tests {
         ));
         // The alias resolves to the same provider type and stays non-injectable.
         let aliased = Provider {
-            r#type: "claude-plan".to_string(),
+            r#type: "claude-subscription".to_string(),
             ..Default::default()
         };
         assert!(is_non_injectable_provider_credential(
