@@ -9,6 +9,8 @@ use openshell_core::proto::{
 
 use crate::is_provider_rule_name;
 
+const DEFAULT_JSON_RPC_MAX_BODY_BYTES: u32 = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PolicyMergeOp {
     AddRule {
@@ -135,6 +137,40 @@ impl std::fmt::Display for PolicyMergeWarning {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyMergeError {
     MissingRuleNameForAddRule,
+    /// An `AddRule` operation has no endpoint authorization to merge.
+    EmptyAddRuleEndpoints {
+        operation_index: usize,
+        rule_name: String,
+    },
+    /// Overlapping endpoints have different effective MCP inspection contracts.
+    McpContractConflict {
+        operation_index: usize,
+        host: String,
+        port: u32,
+        /// Rendered effective contract already established at this endpoint.
+        existing: String,
+        /// Rendered effective contract the operation asked for.
+        incoming: String,
+    },
+    /// A newly added binary would inherit an existing endpoint authorization
+    /// that the incoming rule did not declare.
+    NewBinaryWouldInheritAuthorization {
+        operation_index: usize,
+        rule_name: String,
+        binary_path: String,
+        host: String,
+        ports: Vec<u32>,
+    },
+    /// Existing binaries would inherit a new or changed endpoint authorization,
+    /// but the incoming rule did not declare the existing binary scope.
+    ExistingBinariesWouldInheritAuthorization {
+        operation_index: usize,
+        rule_name: String,
+        host: String,
+        ports: Vec<u32>,
+        /// Existing binary scope the operation must also declare to proceed.
+        undeclared_binaries: Vec<String>,
+    },
     InvalidEndpointReference {
         host: String,
         port: u32,
@@ -167,6 +203,44 @@ impl std::fmt::Display for PolicyMergeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MissingRuleNameForAddRule => write!(f, "add-rule operation requires a rule name"),
+            Self::EmptyAddRuleEndpoints {
+                operation_index,
+                rule_name,
+            } => write!(
+                f,
+                "merge operation {operation_index} add-rule '{rule_name}' must contain at least one endpoint"
+            ),
+            Self::McpContractConflict {
+                operation_index,
+                host,
+                port,
+                existing,
+                incoming,
+            } => write!(
+                f,
+                "merge operation {operation_index} cannot combine MCP contracts at {host}:{port}: existing {existing}, incoming {incoming}"
+            ),
+            Self::NewBinaryWouldInheritAuthorization {
+                operation_index,
+                rule_name,
+                binary_path,
+                host,
+                ports,
+            } => write!(
+                f,
+                "merge operation {operation_index} add-rule '{rule_name}' would grant new binary '{binary_path}' undeclared authorization for {host} on ports {ports:?}"
+            ),
+            Self::ExistingBinariesWouldInheritAuthorization {
+                operation_index,
+                rule_name,
+                host,
+                ports,
+                undeclared_binaries,
+            } => write!(
+                f,
+                "merge operation {operation_index} add-rule '{rule_name}' would grant existing binaries new or changed authorization for {host} on ports {ports:?}; also declare {}",
+                undeclared_binaries.join(", ")
+            ),
             Self::InvalidEndpointReference { host, port } => {
                 write!(f, "invalid endpoint reference '{host}:{port}'")
             }
@@ -213,10 +287,8 @@ pub struct PolicyMergeResult {
 /// merge of `proposed` would produce.
 ///
 /// "Contains" means: for every endpoint in `proposed`, some rule in
-/// `policy.network_policies` has an endpoint with overlapping
-/// host/path/port set AND containing every L7 allow (method/path) the
-/// proposed endpoint requested, and that rule's binaries cover every
-/// binary in `proposed`.
+/// `policy.network_policies` has an endpoint whose authorization covers the
+/// full proposed endpoint and whose binaries cover every proposed binary.
 ///
 /// The sandbox's `policy.local /wait` long-poll uses this to decide when
 /// the local supervisor has actually loaded a policy that includes the
@@ -226,59 +298,191 @@ pub struct PolicyMergeResult {
 /// `/wait` calls (false sleep). This check is the property the agent
 /// actually cares about — "is my rule in effect right now?".
 ///
-/// L4-vs-L7 split: endpoint overlap reuses `endpoints_overlap` so the
-/// L4 surface (host/path/port) lines up with the `add_rule` merge — if
-/// the gateway folded the chunk into an existing rule under a different
-/// key, this check still returns true. The L7 layer is checked
-/// separately because `endpoints_overlap` is intentionally L4-only:
-/// without the L7 check, coverage would return true the instant the
-/// supervisor reloaded *any* change to an overlapping endpoint, even
-/// before the new method/path actually landed — exactly the false-wakeup
-/// mode this fix exists to prevent, just one layer down.
+/// Coverage is intentionally stricter than endpoint overlap used during
+/// merging. Every proposed port and every complete protobuf allow/deny matcher
+/// must be loaded. Runtime-defaulted scalars are compared by effective value so
+/// omitted defaults do not cause false negatives while explicit policy changes
+/// do not become wildcards. Different loaded rules may jointly cover the
+/// proposal, but every binary-by-endpoint pair must be present in that union.
+///
+/// Coverage asks whether the loaded policy contains the proposal, not whether
+/// the two are identical. The loaded endpoint is a superset of any proposal
+/// that merged into an endpoint carrying earlier authorizations, so
+/// `endpoint_authorization_covers` compares merge-widened fields by containment
+/// and only exact-matches the fields the merge never widens.
 pub fn policy_covers_rule(policy: &SandboxPolicy, proposed: &NetworkPolicyRule) -> bool {
     if proposed.endpoints.is_empty() {
         return false;
     }
     proposed.endpoints.iter().all(|target_endpoint| {
-        policy.network_policies.values().any(|rule| {
-            rule.endpoints.iter().any(|endpoint| {
-                endpoints_overlap(endpoint, target_endpoint)
-                    && endpoint_l7_covers(endpoint, target_endpoint)
-            }) && proposed.binaries.iter().all(|target_binary| {
-                rule.binaries
-                    .iter()
-                    .any(|binary| binary.path == target_binary.path)
+        if proposed.binaries.is_empty() {
+            return policy.network_policies.values().any(|rule| {
+                rule.binaries.is_empty()
+                    && rule
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint_authorization_covers(endpoint, target_endpoint))
+            });
+        }
+
+        proposed.binaries.iter().all(|target_binary| {
+            policy.network_policies.values().any(|rule| {
+                binary_scope_covers(rule, target_binary)
+                    && rule
+                        .endpoints
+                        .iter()
+                        .any(|endpoint| endpoint_authorization_covers(endpoint, target_endpoint))
             })
         })
     })
 }
 
-/// L7 coverage for a single endpoint match. If the proposed endpoint
-/// declared explicit L7 allow rules (method+path), every one of them must
-/// be present in the merged endpoint's `rules`. An empty `proposed.rules`
-/// is treated as "L4-only" and returns true (the endpoint match alone is
-/// sufficient).
-///
-/// Conservative on access presets: if a merged endpoint uses
-/// `access: read-write` instead of explicit rules, this returns false
-/// even though the preset would permit the method at runtime. That
-/// produces a one-cycle re-issue on the agent's side — preferable to a
-/// false-positive coverage signal that lets the agent retry too early.
-fn endpoint_l7_covers(merged: &NetworkEndpoint, proposed: &NetworkEndpoint) -> bool {
-    if proposed.rules.is_empty() {
-        return true;
+fn binary_scope_covers(rule: &NetworkPolicyRule, proposed: &NetworkBinary) -> bool {
+    rule.binaries.is_empty()
+        || rule
+            .binaries
+            .iter()
+            .any(|binary| binary.path == proposed.path)
+}
+
+fn endpoint_authorization_covers(loaded: &NetworkEndpoint, proposed: &NetworkEndpoint) -> bool {
+    if !loaded.host.eq_ignore_ascii_case(&proposed.host)
+        || loaded.path != proposed.path
+        || !ports_cover(loaded, proposed)
+        || !protocols_match(&loaded.protocol, &proposed.protocol)
+        || effective_tls(&loaded.tls) != effective_tls(&proposed.tls)
+        || effective_enforcement(&loaded.enforcement)
+            != effective_enforcement(&proposed.enforcement)
+        || !mcp_contracts_match(loaded, proposed)
+    {
+        return false;
     }
-    proposed.rules.iter().all(|proposed_rule| {
-        let Some(proposed_allow) = proposed_rule.allow.as_ref() else {
-            return true;
-        };
-        merged.rules.iter().any(|existing| {
-            existing.allow.as_ref().is_some_and(|existing_allow| {
-                existing_allow.method == proposed_allow.method
-                    && existing_allow.path == proposed_allow.path
-            })
+
+    if !proposed.access.is_empty() && loaded.access != proposed.access {
+        return false;
+    }
+
+    // Split by how `merge_endpoint` treats each field.
+    //
+    // Widened fields (list appends and `|=` flags) use containment: merging
+    // into an endpoint that already carries them leaves the loaded copy a
+    // superset of the proposal, so equality would report "not covered" for a
+    // proposal that did land and leave the `/wait` long-poll spinning until
+    // its deadline.
+    //
+    // Retained fields keep exact comparison: the merge never widens them, so a
+    // difference means the incoming value was dropped in favor of the existing
+    // one and the proposal genuinely is not loaded.
+    contains_all(&loaded.rules, &proposed.rules)
+        && contains_all(&loaded.deny_rules, &proposed.deny_rules)
+        && contains_all(&loaded.allowed_ips, &proposed.allowed_ips)
+        && flag_covers(loaded.allow_encoded_slash, proposed.allow_encoded_slash)
+        && flag_covers(
+            loaded.websocket_credential_rewrite,
+            proposed.websocket_credential_rewrite,
+        )
+        && flag_covers(
+            loaded.request_body_credential_rewrite,
+            proposed.request_body_credential_rewrite,
+        )
+        && flag_covers(loaded.advisor_proposed, proposed.advisor_proposed)
+        && loaded.persisted_queries == proposed.persisted_queries
+        && loaded.graphql_persisted_queries == proposed.graphql_persisted_queries
+        && loaded.graphql_max_body_bytes == proposed.graphql_max_body_bytes
+        && loaded.credential_signing == proposed.credential_signing
+        && loaded.signing_service == proposed.signing_service
+        && loaded.signing_region == proposed.signing_region
+        && (endpoint_uses_mcp(loaded)
+            || loaded.json_rpc_max_body_bytes == proposed.json_rpc_max_body_bytes)
+}
+
+/// Containment for a field the merge appends to: every proposed entry must be
+/// loaded, but the loaded endpoint may carry entries from earlier merges.
+fn contains_all<T: PartialEq>(loaded: &[T], proposed: &[T]) -> bool {
+    proposed.iter().all(|item| loaded.contains(item))
+}
+
+/// Containment for a field the merge combines with `|=`: the loaded flag only
+/// ever gains bits, so coverage holds unless the proposal set a bit that is
+/// missing from the loaded endpoint.
+fn flag_covers(loaded: bool, proposed: bool) -> bool {
+    loaded || !proposed
+}
+
+fn endpoint_authorizations_equivalent(left: &NetworkEndpoint, right: &NetworkEndpoint) -> bool {
+    endpoint_authorization_covers(left, right) && endpoint_authorization_covers(right, left)
+}
+
+fn ports_cover(loaded: &NetworkEndpoint, proposed: &NetworkEndpoint) -> bool {
+    let loaded_ports = canonical_ports(loaded);
+    canonical_ports(proposed)
+        .iter()
+        .all(|port| loaded_ports.contains(port))
+}
+
+fn protocols_match(left: &str, right: &str) -> bool {
+    if left.eq_ignore_ascii_case("mcp") || right.eq_ignore_ascii_case("mcp") {
+        left.eq_ignore_ascii_case("mcp") && right.eq_ignore_ascii_case("mcp")
+    } else {
+        left == right
+    }
+}
+
+fn effective_tls(value: &str) -> &str {
+    match value {
+        "" | "terminate" | "passthrough" => "auto",
+        value => value,
+    }
+}
+
+fn effective_enforcement(value: &str) -> &str {
+    if value.is_empty() { "audit" } else { value }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EffectiveMcpContract {
+    strict_tool_names: bool,
+    allow_all_known_mcp_methods: bool,
+    max_body_bytes: u32,
+}
+
+fn effective_mcp_contract(endpoint: &NetworkEndpoint) -> Option<EffectiveMcpContract> {
+    endpoint
+        .protocol
+        .eq_ignore_ascii_case("mcp")
+        .then(|| EffectiveMcpContract {
+            strict_tool_names: endpoint
+                .mcp
+                .as_ref()
+                .and_then(|options| options.strict_tool_names)
+                .unwrap_or(true),
+            allow_all_known_mcp_methods: endpoint
+                .mcp
+                .as_ref()
+                .and_then(|options| options.allow_all_known_mcp_methods)
+                .unwrap_or(false),
+            max_body_bytes: effective_json_rpc_max_body_bytes(endpoint.json_rpc_max_body_bytes),
         })
-    })
+}
+
+fn effective_json_rpc_max_body_bytes(value: u32) -> u32 {
+    if value == 0 {
+        DEFAULT_JSON_RPC_MAX_BODY_BYTES
+    } else {
+        value
+    }
+}
+
+fn endpoint_uses_mcp(endpoint: &NetworkEndpoint) -> bool {
+    endpoint.protocol.eq_ignore_ascii_case("mcp") || endpoint.mcp.is_some()
+}
+
+fn mcp_contracts_match(left: &NetworkEndpoint, right: &NetworkEndpoint) -> bool {
+    match (effective_mcp_contract(left), effective_mcp_contract(right)) {
+        (None, None) => !endpoint_uses_mcp(left) && !endpoint_uses_mcp(right),
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 pub fn merge_policy(
@@ -288,8 +492,12 @@ pub fn merge_policy(
     let mut merged = policy.clone();
     let mut warnings = Vec::new();
 
-    for operation in operations {
-        apply_operation(&mut merged, operation, &mut warnings)?;
+    // Validate and apply in request order. `merged` is private until every
+    // operation succeeds, so failures remain atomic without allowing a later
+    // malformed operation to replace the error from an earlier operation.
+    for (operation_index, operation) in operations.iter().enumerate() {
+        validate_operation(operation_index, operation)?;
+        apply_operation(&mut merged, operation_index, operation, &mut warnings)?;
     }
 
     let changed = merged != policy;
@@ -298,6 +506,24 @@ pub fn merge_policy(
         warnings,
         changed,
     })
+}
+
+fn validate_operation(
+    operation_index: usize,
+    operation: &PolicyMergeOp,
+) -> Result<(), PolicyMergeError> {
+    if let PolicyMergeOp::AddRule { rule_name, rule } = operation {
+        if rule_name.trim().is_empty() {
+            return Err(PolicyMergeError::MissingRuleNameForAddRule);
+        }
+        if rule.endpoints.is_empty() {
+            return Err(PolicyMergeError::EmptyAddRuleEndpoints {
+                operation_index,
+                rule_name: rule_name.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn generated_rule_name(host: &str, port: u32) -> String {
@@ -311,12 +537,13 @@ pub fn generated_rule_name(host: &str, port: u32) -> String {
 
 fn apply_operation(
     policy: &mut SandboxPolicy,
+    operation_index: usize,
     operation: &PolicyMergeOp,
     warnings: &mut Vec<PolicyMergeWarning>,
 ) -> Result<(), PolicyMergeError> {
     match operation {
         PolicyMergeOp::AddRule { rule_name, rule } => {
-            add_rule(policy, rule_name, rule, warnings)?;
+            add_rule(policy, operation_index, rule_name, rule, warnings)?;
         }
         PolicyMergeOp::RemoveEndpoint {
             rule_name,
@@ -380,14 +607,11 @@ fn apply_operation(
 
 fn add_rule(
     policy: &mut SandboxPolicy,
+    operation_index: usize,
     rule_name: &str,
     incoming_rule: &NetworkPolicyRule,
     warnings: &mut Vec<PolicyMergeWarning>,
 ) -> Result<(), PolicyMergeError> {
-    if rule_name.trim().is_empty() {
-        return Err(PolicyMergeError::MissingRuleNameForAddRule);
-    }
-
     let mut incoming_rule = incoming_rule.clone();
     normalize_rule(&mut incoming_rule);
     if incoming_rule.name.is_empty() {
@@ -431,7 +655,13 @@ fn add_rule(
             .network_policies
             .get_mut(&key)
             .expect("existing rule must be present");
-        merge_rules(existing_rule, &incoming_rule, warnings)?;
+        merge_rules(
+            existing_rule,
+            &incoming_rule,
+            operation_index,
+            rule_name,
+            warnings,
+        )?;
     } else {
         policy
             .network_policies
@@ -444,28 +674,50 @@ fn add_rule(
 fn merge_rules(
     existing_rule: &mut NetworkPolicyRule,
     incoming_rule: &NetworkPolicyRule,
+    operation_index: usize,
+    rule_name: &str,
     warnings: &mut Vec<PolicyMergeWarning>,
 ) -> Result<(), PolicyMergeError> {
-    append_unique_binaries(&mut existing_rule.binaries, &incoming_rule.binaries);
-
+    // A rule authorizes the Cartesian product of its binaries and endpoints.
+    // Build the final endpoint set off to the side, then reject any implicit
+    // grants before publishing either half of that product.
+    let mut merged_endpoints = existing_rule.endpoints.clone();
+    let mut endpoint_warnings = Vec::new();
     for incoming_endpoint in &incoming_rule.endpoints {
         let mut incoming_endpoint = incoming_endpoint.clone();
         normalize_endpoint(&mut incoming_endpoint);
         if let Some(existing_endpoint) =
-            find_matching_endpoint_mut(&mut existing_rule.endpoints, &incoming_endpoint)
+            find_matching_endpoint_mut(&mut merged_endpoints, &incoming_endpoint)
         {
-            merge_endpoint(existing_endpoint, &incoming_endpoint, warnings)?;
+            merge_endpoint(
+                existing_endpoint,
+                &incoming_endpoint,
+                operation_index,
+                &mut endpoint_warnings,
+            )?;
         } else {
-            existing_rule.endpoints.push(incoming_endpoint);
+            merged_endpoints.push(incoming_endpoint);
         }
     }
 
+    ensure_authorization_inheritance_is_declared(
+        existing_rule,
+        incoming_rule,
+        &merged_endpoints,
+        operation_index,
+        rule_name,
+    )?;
+
+    existing_rule.endpoints = merged_endpoints;
+    append_unique_binaries(&mut existing_rule.binaries, &incoming_rule.binaries);
+    warnings.extend(endpoint_warnings);
     Ok(())
 }
 
 fn merge_endpoint(
     existing: &mut NetworkEndpoint,
     incoming: &NetworkEndpoint,
+    operation_index: usize,
     warnings: &mut Vec<PolicyMergeWarning>,
 ) -> Result<(), PolicyMergeError> {
     let host = if existing.host.is_empty() {
@@ -473,11 +725,16 @@ fn merge_endpoint(
     } else {
         existing.host.clone()
     };
-    let port = canonical_ports(existing)
+    let existing_ports = canonical_ports(existing);
+    let incoming_ports = canonical_ports(incoming);
+    let port = existing_ports
         .into_iter()
-        .next()
-        .or_else(|| canonical_ports(incoming).into_iter().next())
+        .find(|port| incoming_ports.contains(port))
+        .or_else(|| incoming_ports.first().copied())
         .unwrap_or(0);
+
+    let promotes_l4_to_mcp = promotes_l4_endpoint_to_mcp(existing, incoming);
+    ensure_mcp_contract_compatible(existing, incoming, operation_index, &host, port)?;
 
     if existing.host.is_empty() {
         existing.host.clone_from(&incoming.host);
@@ -499,6 +756,10 @@ fn merge_endpoint(
         },
         warnings,
     );
+    if promotes_l4_to_mcp {
+        existing.mcp.clone_from(&incoming.mcp);
+        existing.json_rpc_max_body_bytes = incoming.json_rpc_max_body_bytes;
+    }
     let existing_enforcement = existing.enforcement.clone();
     merge_string_field(
         &mut existing.enforcement,
@@ -561,6 +822,144 @@ fn merge_endpoint(
     existing.advisor_proposed |= incoming.advisor_proposed;
     normalize_endpoint(existing);
     Ok(())
+}
+
+fn ensure_mcp_contract_compatible(
+    existing: &NetworkEndpoint,
+    incoming: &NetworkEndpoint,
+    operation_index: usize,
+    host: &str,
+    port: u32,
+) -> Result<(), PolicyMergeError> {
+    if promotes_l4_endpoint_to_mcp(existing, incoming) || mcp_contracts_match(existing, incoming) {
+        return Ok(());
+    }
+
+    Err(PolicyMergeError::McpContractConflict {
+        operation_index,
+        host: host.to_string(),
+        port,
+        existing: describe_mcp_contract(existing),
+        incoming: describe_mcp_contract(incoming),
+    })
+}
+
+/// Renders the values `mcp_contracts_match` compares, so the reported conflict
+/// names the fields that have to agree. The effective contract is rendered
+/// rather than the raw options because an omitted option and its default are
+/// the same contract.
+fn describe_mcp_contract(endpoint: &NetworkEndpoint) -> String {
+    effective_mcp_contract(endpoint).map_or_else(
+        || format!("non-mcp(protocol='{}')", endpoint.protocol),
+        |contract| {
+            format!(
+                "mcp(strict_tool_names={}, allow_all_known_mcp_methods={}, max_body_bytes={})",
+                contract.strict_tool_names,
+                contract.allow_all_known_mcp_methods,
+                contract.max_body_bytes
+            )
+        },
+    )
+}
+
+fn promotes_l4_endpoint_to_mcp(existing: &NetworkEndpoint, incoming: &NetworkEndpoint) -> bool {
+    // Only an endpoint without an established inspection contract can adopt
+    // the complete incoming MCP contract instead of combining two contracts.
+    existing.protocol.is_empty()
+        && existing.mcp.is_none()
+        && existing.json_rpc_max_body_bytes == 0
+        && effective_mcp_contract(incoming).is_some()
+}
+
+fn ensure_authorization_inheritance_is_declared(
+    existing_rule: &NetworkPolicyRule,
+    incoming_rule: &NetworkPolicyRule,
+    merged_endpoints: &[NetworkEndpoint],
+    operation_index: usize,
+    rule_name: &str,
+) -> Result<(), PolicyMergeError> {
+    let existing_binary_paths: HashSet<&str> = existing_rule
+        .binaries
+        .iter()
+        .map(|binary| binary.path.as_str())
+        .collect();
+    // An existing empty list already authorizes any binary, so no incoming
+    // concrete path can expand that side of the Cartesian product.
+    let new_binary = if existing_rule.binaries.is_empty() {
+        None
+    } else {
+        incoming_rule
+            .binaries
+            .iter()
+            .find(|binary| !existing_binary_paths.contains(binary.path.as_str()))
+    };
+    let undeclared_binaries = undeclared_existing_binaries(existing_rule, incoming_rule);
+
+    for endpoint in merged_endpoints {
+        if let Some(binary) = new_binary
+            && !incoming_rule
+                .endpoints
+                .iter()
+                .any(|declared| endpoint_authorization_covers(declared, endpoint))
+        {
+            return Err(PolicyMergeError::NewBinaryWouldInheritAuthorization {
+                operation_index,
+                rule_name: rule_name.to_string(),
+                binary_path: binary.path.clone(),
+                host: endpoint.host.clone(),
+                ports: canonical_ports(endpoint),
+            });
+        }
+
+        let endpoint_is_new_or_changed = !existing_rule
+            .endpoints
+            .iter()
+            .any(|existing| endpoint_authorizations_equivalent(existing, endpoint));
+        if endpoint_is_new_or_changed && !undeclared_binaries.is_empty() {
+            return Err(
+                PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+                    operation_index,
+                    rule_name: rule_name.to_string(),
+                    host: endpoint.host.clone(),
+                    ports: canonical_ports(endpoint),
+                    undeclared_binaries,
+                },
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Existing binary scope the incoming rule failed to declare. Empty means the
+/// operation covers the whole existing scope and no binary can inherit a new
+/// endpoint implicitly.
+///
+/// An empty binary list means any binary: an incoming any-binary scope covers
+/// every existing binary, while a specific incoming list can never claim an
+/// existing any-binary scope.
+fn undeclared_existing_binaries(
+    existing_rule: &NetworkPolicyRule,
+    incoming_rule: &NetworkPolicyRule,
+) -> Vec<String> {
+    if incoming_rule.binaries.is_empty() {
+        return Vec::new();
+    }
+    if existing_rule.binaries.is_empty() {
+        return vec!["the existing any-binary scope".to_string()];
+    }
+
+    existing_rule
+        .binaries
+        .iter()
+        .filter(|existing| {
+            !incoming_rule
+                .binaries
+                .iter()
+                .any(|incoming| incoming.path == existing.path)
+        })
+        .map(|existing| existing.path.clone())
+        .collect()
 }
 
 fn merge_string_field(
@@ -917,12 +1316,13 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{
-        PolicyMergeError, PolicyMergeOp, PolicyMergeWarning, generated_rule_name, merge_policy,
-        policy_covers_rule,
+        DEFAULT_JSON_RPC_MAX_BODY_BYTES, PolicyMergeError, PolicyMergeOp, PolicyMergeWarning,
+        generated_rule_name, merge_policy, policy_covers_rule,
     };
     use crate::restrictive_default_policy;
     use openshell_core::proto::{
-        L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule,
+        L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary, NetworkEndpoint,
+        NetworkPolicyRule, SandboxPolicy,
     };
 
     fn endpoint(host: &str, port: u32) -> NetworkEndpoint {
@@ -969,11 +1369,797 @@ mod tests {
         }
     }
 
+    fn binary(path: &str) -> NetworkBinary {
+        NetworkBinary {
+            path: path.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn mcp_tool_rule(tool: &str) -> L7Rule {
+        L7Rule {
+            allow: Some(L7Allow {
+                method: "tools/call".to_string(),
+                params: HashMap::from([(
+                    "name".to_string(),
+                    L7QueryMatcher {
+                        glob: tool.to_string(),
+                        any: Vec::new(),
+                    },
+                )]),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn mcp_endpoint(
+        host: &str,
+        ports: &[u32],
+        strict_tool_names: Option<bool>,
+        allow_all_known_mcp_methods: Option<bool>,
+        max_body_bytes: u32,
+        rules: Vec<L7Rule>,
+    ) -> NetworkEndpoint {
+        NetworkEndpoint {
+            host: host.to_string(),
+            port: ports.first().copied().unwrap_or_default(),
+            ports: ports.to_vec(),
+            protocol: "mcp".to_string(),
+            rules,
+            json_rpc_max_body_bytes: max_body_bytes,
+            mcp: Some(McpOptions {
+                strict_tool_names,
+                allow_all_known_mcp_methods,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn rule_with_authorizations(
+        name: &str,
+        endpoints: Vec<NetworkEndpoint>,
+        binaries: &[&str],
+    ) -> NetworkPolicyRule {
+        NetworkPolicyRule {
+            name: name.to_string(),
+            endpoints,
+            binaries: binaries.iter().map(|path| binary(path)).collect(),
+        }
+    }
+
+    fn policy_with_rule(rule_name: &str, rule: NetworkPolicyRule) -> SandboxPolicy {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(rule_name.to_string(), rule);
+        policy
+    }
+
     #[test]
     fn generated_rule_name_sanitizes_host() {
         assert_eq!(
             generated_rule_name("api.github.com", 443),
             "allow_api_github_com_443"
+        );
+    }
+
+    #[test]
+    fn add_rule_rejects_empty_endpoints_at_the_library_boundary() {
+        let error = merge_policy(
+            restrictive_default_policy(),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "empty".to_string(),
+                rule: rule_with_authorizations("empty", Vec::new(), &["/usr/bin/client"]),
+            }],
+        )
+        .expect_err("an AddRule without authorization endpoints must fail");
+
+        assert_eq!(
+            error,
+            PolicyMergeError::EmptyAddRuleEndpoints {
+                operation_index: 0,
+                rule_name: "empty".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn merge_reports_the_first_failing_operation_in_request_order() {
+        let operations = [
+            PolicyMergeOp::AddAllowRules {
+                host: "missing.example.com".to_string(),
+                port: 443,
+                rules: vec![rest_rule("GET", "/")],
+            },
+            PolicyMergeOp::AddRule {
+                rule_name: "empty".to_string(),
+                rule: NetworkPolicyRule::default(),
+            },
+        ];
+
+        assert_eq!(
+            merge_policy(restrictive_default_policy(), &operations),
+            Err(PolicyMergeError::EndpointNotFound {
+                host: "missing.example.com".to_string(),
+                port: 443,
+            })
+        );
+    }
+
+    #[test]
+    fn new_binary_cannot_inherit_an_undeclared_existing_rest_endpoint() {
+        let existing_endpoint = NetworkEndpoint {
+            protocol: "rest".to_string(),
+            rules: vec![rest_rule("GET", "/admin")],
+            ..endpoint("admin.example.com", 443)
+        };
+        let existing =
+            rule_with_authorizations("existing", vec![existing_endpoint], &["/usr/bin/trusted"]);
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![endpoint("public.example.com", 443)],
+            &["/usr/bin/untrusted"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("the new binary did not declare the existing REST endpoint");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::NewBinaryWouldInheritAuthorization {
+                operation_index: 0,
+                binary_path,
+                host,
+                ports,
+                ..
+            } if binary_path == "/usr/bin/untrusted"
+                && host == "admin.example.com"
+                && ports == vec![443]
+        ));
+    }
+
+    #[test]
+    fn new_binary_cannot_inherit_an_undeclared_existing_mcp_endpoint() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint(
+                "mcp.example.com",
+                &[443],
+                None,
+                None,
+                0,
+                vec![mcp_tool_rule("existing-tool")],
+            )],
+            &["/usr/bin/trusted"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![endpoint("unrelated.example.com", 443)],
+            &["/usr/bin/untrusted"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("the new binary did not declare the existing MCP endpoint");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::NewBinaryWouldInheritAuthorization {
+                operation_index: 0,
+                binary_path,
+                host,
+                ..
+            } if binary_path == "/usr/bin/untrusted" && host == "mcp.example.com"
+        ));
+    }
+
+    #[test]
+    fn new_binary_must_declare_every_existing_mcp_endpoint() {
+        let endpoint_a = mcp_endpoint(
+            "a.example.com",
+            &[443],
+            None,
+            None,
+            0,
+            vec![mcp_tool_rule("a")],
+        );
+        let endpoint_b = mcp_endpoint(
+            "b.example.com",
+            &[443],
+            None,
+            None,
+            0,
+            vec![mcp_tool_rule("b")],
+        );
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![endpoint_a.clone(), endpoint_b],
+            &["/usr/bin/trusted"],
+        );
+        let incoming =
+            rule_with_authorizations("existing", vec![endpoint_a], &["/usr/bin/untrusted"]);
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("declaring only one endpoint must not grant the second endpoint");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::NewBinaryWouldInheritAuthorization { host, .. }
+                if host == "b.example.com"
+        ));
+    }
+
+    #[test]
+    fn existing_binary_scope_must_be_declared_for_a_new_mcp_endpoint() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![endpoint("rest.example.com", 443)],
+            &["/usr/bin/first", "/usr/bin/second"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint(
+                "mcp.example.com",
+                &[443],
+                None,
+                None,
+                0,
+                vec![mcp_tool_rule("new-tool")],
+            )],
+            &["/usr/bin/first"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("the undeclared second binary would inherit the new MCP endpoint");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::ExistingBinariesWouldInheritAuthorization { host, .. }
+                if host == "mcp.example.com"
+        ));
+    }
+
+    #[test]
+    fn existing_any_binary_scope_requires_an_incoming_any_binary_declaration() {
+        let existing =
+            rule_with_authorizations("existing", vec![endpoint("rest.example.com", 443)], &[]);
+        let incoming_endpoint = mcp_endpoint(
+            "mcp.example.com",
+            &[443],
+            None,
+            None,
+            0,
+            vec![mcp_tool_rule("new-tool")],
+        );
+        let specific_incoming = rule_with_authorizations(
+            "existing",
+            vec![incoming_endpoint.clone()],
+            &["/usr/bin/client"],
+        );
+
+        assert!(matches!(
+            merge_policy(
+                policy_with_rule("existing", existing.clone()),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "existing".to_string(),
+                    rule: specific_incoming,
+                }]
+            ),
+            Err(PolicyMergeError::ExistingBinariesWouldInheritAuthorization { .. })
+        ));
+
+        let any_binary_incoming =
+            rule_with_authorizations("existing", vec![incoming_endpoint], &[]);
+        assert!(
+            merge_policy(
+                policy_with_rule("existing", existing),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "existing".to_string(),
+                    rule: any_binary_incoming,
+                }]
+            )
+            .is_ok(),
+            "an explicit any-binary proposal covers the existing any-binary scope"
+        );
+    }
+
+    #[test]
+    fn l4_endpoint_promotion_to_mcp_requires_the_complete_existing_binary_scope() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![endpoint("mcp.example.com", 443)],
+            &["/usr/bin/first", "/usr/bin/second"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint(
+                "mcp.example.com",
+                &[443],
+                None,
+                None,
+                0,
+                vec![mcp_tool_rule("new-tool")],
+            )],
+            &["/usr/bin/first"],
+        );
+
+        let error = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect_err("the second binary did not declare the MCP promotion");
+
+        assert!(matches!(
+            error,
+            PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+                operation_index: 0,
+                host,
+                ports,
+                ..
+            } if host == "mcp.example.com" && ports == vec![443]
+        ));
+    }
+
+    #[test]
+    fn l4_endpoint_promotion_to_mcp_preserves_the_declared_contract() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![endpoint("mcp.example.com", 443)],
+            &["/usr/bin/first", "/usr/bin/second"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint(
+                "mcp.example.com",
+                &[443],
+                Some(false),
+                Some(true),
+                128 * 1024,
+                vec![mcp_tool_rule("new-tool")],
+            )],
+            &["/usr/bin/first", "/usr/bin/second"],
+        );
+
+        let result = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("the complete binary scope explicitly accepts the MCP promotion");
+
+        let promoted = &result.policy.network_policies["existing"].endpoints[0];
+        assert_eq!(promoted.protocol, "mcp");
+        assert_eq!(promoted.json_rpc_max_body_bytes, 128 * 1024);
+        assert_eq!(
+            promoted.mcp,
+            Some(McpOptions {
+                strict_tool_names: Some(false),
+                allow_all_known_mcp_methods: Some(true),
+            })
+        );
+        assert_eq!(promoted.rules, vec![mcp_tool_rule("new-tool")]);
+    }
+
+    #[test]
+    fn established_rest_endpoint_cannot_be_reinterpreted_as_mcp() {
+        let existing_endpoint = NetworkEndpoint {
+            protocol: "rest".to_string(),
+            rules: vec![rest_rule("GET", "/")],
+            ..endpoint("api.example.com", 443)
+        };
+        let existing =
+            rule_with_authorizations("existing", vec![existing_endpoint], &["/usr/bin/client"]);
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint(
+                "api.example.com",
+                &[443],
+                None,
+                None,
+                0,
+                vec![mcp_tool_rule("tool")],
+            )],
+            &["/usr/bin/client"],
+        );
+
+        assert!(matches!(
+            merge_policy(
+                policy_with_rule("existing", existing),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "existing".to_string(),
+                    rule: incoming,
+                }]
+            ),
+            Err(PolicyMergeError::McpContractConflict {
+                existing, incoming, ..
+            }) if existing == "non-mcp(protocol='rest')" && incoming.starts_with("mcp(")
+        ));
+    }
+
+    #[test]
+    fn mcp_overlap_uses_effective_defaults_and_rejects_body_limit_changes() {
+        let existing_endpoint = mcp_endpoint(
+            "mcp.example.com",
+            &[443, 8443],
+            None,
+            None,
+            0,
+            vec![mcp_tool_rule("tool")],
+        );
+        let explicit_defaults = mcp_endpoint(
+            "mcp.example.com",
+            &[8443],
+            Some(true),
+            Some(false),
+            DEFAULT_JSON_RPC_MAX_BODY_BYTES,
+            vec![mcp_tool_rule("tool")],
+        );
+        let existing =
+            rule_with_authorizations("existing", vec![existing_endpoint], &["/usr/bin/client"]);
+        let equivalent = rule_with_authorizations(
+            "incoming",
+            vec![explicit_defaults.clone()],
+            &["/usr/bin/client"],
+        );
+        assert!(
+            merge_policy(
+                policy_with_rule("existing", existing.clone()),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "incoming".to_string(),
+                    rule: equivalent,
+                }]
+            )
+            .is_ok(),
+            "omitted MCP booleans and body limit must equal their runtime defaults"
+        );
+
+        let mut different_body_limit = explicit_defaults;
+        different_body_limit.json_rpc_max_body_bytes = 128 * 1024;
+        let conflicting =
+            rule_with_authorizations("incoming", vec![different_body_limit], &["/usr/bin/client"]);
+        assert!(matches!(
+            merge_policy(
+                policy_with_rule("existing", existing),
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "incoming".to_string(),
+                    rule: conflicting,
+                }]
+            ),
+            // The existing endpoint omitted the limit, so the conflict reports
+            // its effective default rather than the raw zero.
+            Err(PolicyMergeError::McpContractConflict {
+                port: 8443,
+                existing,
+                incoming,
+                ..
+            }) if existing.contains("max_body_bytes=65536")
+                && incoming.contains("max_body_bytes=131072")
+        ));
+    }
+
+    #[test]
+    fn non_overlapping_mcp_endpoints_may_use_different_contracts() {
+        let existing = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint(
+                "first.example.com",
+                &[443, 8443],
+                None,
+                None,
+                0,
+                vec![mcp_tool_rule("first-tool")],
+            )],
+            &["/usr/bin/client"],
+        );
+        let incoming = rule_with_authorizations(
+            "existing",
+            vec![mcp_endpoint(
+                "second.example.com",
+                &[443],
+                Some(false),
+                Some(true),
+                128 * 1024,
+                vec![mcp_tool_rule("second-tool")],
+            )],
+            &["/usr/bin/client"],
+        );
+
+        let result = merge_policy(
+            policy_with_rule("existing", existing),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("contract differences on disjoint endpoints are independent");
+
+        assert_eq!(
+            result.policy.network_policies["existing"].endpoints.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn policy_coverage_checks_full_mcp_matchers_ports_contract_and_defaults() {
+        let loaded_endpoint = mcp_endpoint(
+            "mcp.example.com",
+            &[443],
+            None,
+            None,
+            0,
+            vec![mcp_tool_rule("loaded-tool")],
+        );
+        let loaded = policy_with_rule(
+            "loaded",
+            rule_with_authorizations(
+                "loaded",
+                vec![loaded_endpoint.clone()],
+                &["/usr/bin/client"],
+            ),
+        );
+
+        let wrong_tool = rule_with_authorizations(
+            "proposed",
+            vec![mcp_endpoint(
+                "mcp.example.com",
+                &[443],
+                Some(true),
+                Some(false),
+                DEFAULT_JSON_RPC_MAX_BODY_BYTES,
+                vec![mcp_tool_rule("different-tool")],
+            )],
+            &["/usr/bin/client"],
+        );
+        assert!(!policy_covers_rule(&loaded, &wrong_tool));
+
+        let extra_port = rule_with_authorizations(
+            "proposed",
+            vec![mcp_endpoint(
+                "mcp.example.com",
+                &[443, 8443],
+                None,
+                None,
+                0,
+                vec![mcp_tool_rule("loaded-tool")],
+            )],
+            &["/usr/bin/client"],
+        );
+        assert!(!policy_covers_rule(&loaded, &extra_port));
+
+        let equivalent_defaults = rule_with_authorizations(
+            "proposed",
+            vec![mcp_endpoint(
+                "mcp.example.com",
+                &[443],
+                Some(true),
+                Some(false),
+                DEFAULT_JSON_RPC_MAX_BODY_BYTES,
+                vec![mcp_tool_rule("loaded-tool")],
+            )],
+            &["/usr/bin/client"],
+        );
+        assert!(policy_covers_rule(&loaded, &equivalent_defaults));
+
+        let different_body = rule_with_authorizations(
+            "proposed",
+            vec![mcp_endpoint(
+                "mcp.example.com",
+                &[443],
+                None,
+                None,
+                128 * 1024,
+                vec![mcp_tool_rule("loaded-tool")],
+            )],
+            &["/usr/bin/client"],
+        );
+        assert!(!policy_covers_rule(&loaded, &different_body));
+
+        let mut explicit_defaults = loaded_endpoint;
+        explicit_defaults.tls = "passthrough".to_string();
+        explicit_defaults.enforcement = "audit".to_string();
+        let runtime_defaults = rule_with_authorizations(
+            "proposed",
+            vec![explicit_defaults.clone()],
+            &["/usr/bin/client"],
+        );
+        assert!(policy_covers_rule(&loaded, &runtime_defaults));
+
+        explicit_defaults.tls = "terminate".to_string();
+        let legacy_terminate = rule_with_authorizations(
+            "proposed",
+            vec![explicit_defaults.clone()],
+            &["/usr/bin/client"],
+        );
+        assert!(policy_covers_rule(&loaded, &legacy_terminate));
+
+        explicit_defaults.tls = "skip".to_string();
+        let skip_tls = rule_with_authorizations(
+            "proposed",
+            vec![explicit_defaults.clone()],
+            &["/usr/bin/client"],
+        );
+        assert!(!policy_covers_rule(&loaded, &skip_tls));
+
+        explicit_defaults.tls.clear();
+        explicit_defaults.enforcement = "enforce".to_string();
+        let different_runtime_scalars =
+            rule_with_authorizations("proposed", vec![explicit_defaults], &["/usr/bin/client"]);
+        assert!(!policy_covers_rule(&loaded, &different_runtime_scalars));
+    }
+
+    /// `policy_covers_rule` answers "is my rule in effect?" for the sandbox's
+    /// `/wait` long-poll, so anything `merge_policy` accepts must read back as
+    /// covered once loaded. Otherwise the poll spins to its deadline and the
+    /// agent is told its approved rule never landed.
+    #[test]
+    fn merged_policy_covers_the_rule_it_merged() {
+        // Every field `merge_endpoint` widens rather than replaces, set on the
+        // existing endpoint and absent from the proposal.
+        let existing_endpoint = NetworkEndpoint {
+            protocol: "rest".to_string(),
+            rules: vec![rest_rule("GET", "/health")],
+            deny_rules: vec![L7DenyRule {
+                method: "DELETE".to_string(),
+                path: "/*".to_string(),
+                ..Default::default()
+            }],
+            allowed_ips: vec!["10.0.0.1".to_string()],
+            allow_encoded_slash: true,
+            websocket_credential_rewrite: true,
+            request_body_credential_rewrite: true,
+            advisor_proposed: true,
+            ..endpoint("api.example.com", 443)
+        };
+        let proposed = rule_with_authorizations(
+            "api",
+            vec![NetworkEndpoint {
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("GET", "/users")],
+                ..endpoint("api.example.com", 443)
+            }],
+            &["/usr/bin/client"],
+        );
+
+        let merged = merge_policy(
+            policy_with_rule(
+                "api",
+                rule_with_authorizations("api", vec![existing_endpoint], &["/usr/bin/client"]),
+            ),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "api".to_string(),
+                rule: proposed.clone(),
+            }],
+        )
+        .expect("merge must accept a proposal that declares the full binary scope");
+
+        assert!(policy_covers_rule(&merged.policy, &proposed));
+    }
+
+    #[test]
+    fn policy_coverage_requires_proposed_denies_but_allows_loaded_only_denies() {
+        let deny = |path: &str| L7DenyRule {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            ..Default::default()
+        };
+        let proposed_endpoint = NetworkEndpoint {
+            protocol: "rest".to_string(),
+            rules: vec![rest_rule("GET", "/users")],
+            deny_rules: vec![deny("/users/secret")],
+            ..endpoint("api.example.com", 443)
+        };
+        let proposed = rule_with_authorizations(
+            "proposed",
+            vec![proposed_endpoint.clone()],
+            &["/usr/bin/client"],
+        );
+        let cover_with = |deny_rules: Vec<L7DenyRule>| {
+            let loaded_endpoint = NetworkEndpoint {
+                deny_rules,
+                ..proposed_endpoint.clone()
+            };
+            policy_covers_rule(
+                &policy_with_rule(
+                    "loaded",
+                    rule_with_authorizations("loaded", vec![loaded_endpoint], &["/usr/bin/client"]),
+                ),
+                &proposed,
+            )
+        };
+
+        assert!(
+            !cover_with(Vec::new()),
+            "a proposed deny that is not loaded means the proposal is not in effect"
+        );
+        assert!(
+            cover_with(vec![deny("/users/secret")]),
+            "the proposed deny alone is coverage"
+        );
+        assert!(
+            cover_with(vec![deny("/users/secret"), deny("/admin")]),
+            "a deny carried by the loaded endpoint from an earlier merge must not block coverage"
+        );
+    }
+
+    #[test]
+    fn policy_coverage_requires_endpoint_advisor_provenance_to_be_loaded() {
+        let loaded_endpoint = endpoint("api.example.com", 443);
+        let mut proposed_endpoint = loaded_endpoint.clone();
+        proposed_endpoint.advisor_proposed = true;
+        let loaded = policy_with_rule(
+            "loaded",
+            rule_with_authorizations("loaded", vec![loaded_endpoint], &["/usr/bin/client"]),
+        );
+        let proposed =
+            rule_with_authorizations("proposed", vec![proposed_endpoint], &["/usr/bin/client"]);
+
+        assert!(!policy_covers_rule(&loaded, &proposed));
+    }
+
+    #[test]
+    fn policy_coverage_checks_every_binary_endpoint_pair_across_rule_union() {
+        let proposed = rule_with_authorizations(
+            "proposed",
+            vec![
+                endpoint("a.example.com", 443),
+                endpoint("b.example.com", 443),
+            ],
+            &["/usr/bin/first", "/usr/bin/second"],
+        );
+        let mut loaded = restrictive_default_policy();
+        for (name, host, binary_path) in [
+            ("a-first", "a.example.com", "/usr/bin/first"),
+            ("a-second", "a.example.com", "/usr/bin/second"),
+            ("b-first", "b.example.com", "/usr/bin/first"),
+        ] {
+            loaded.network_policies.insert(
+                name.to_string(),
+                rule_with_authorizations(name, vec![endpoint(host, 443)], &[binary_path]),
+            );
+        }
+
+        assert!(
+            !policy_covers_rule(&loaded, &proposed),
+            "the missing b.example.com × /usr/bin/second pair must fail coverage"
+        );
+
+        loaded.network_policies.insert(
+            "b-second".to_string(),
+            rule_with_authorizations(
+                "b-second",
+                vec![endpoint("b.example.com", 443)],
+                &["/usr/bin/second"],
+            ),
+        );
+        assert!(
+            policy_covers_rule(&loaded, &proposed),
+            "separate loaded rules may jointly cover the complete Cartesian product"
         );
     }
 
@@ -1003,10 +2189,7 @@ mod tests {
                 rules: vec![rest_rule("GET", "/repos/**")],
                 ..Default::default()
             }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/gh".to_string(),
-                ..Default::default()
-            }],
+            binaries: vec![binary("/usr/bin/curl"), binary("/usr/bin/gh")],
         };
 
         let result = merge_policy(
@@ -1724,11 +2907,9 @@ mod tests {
     }
 
     #[test]
-    fn policy_covers_rule_treats_empty_proposed_binaries_as_any_binary() {
+    fn policy_covers_rule_requires_loaded_any_binary_scope_for_any_binary_proposal() {
         // A proposed rule with no binaries is the "any binary" shape.
-        // The merged rule keeps its own binaries; coverage holds iff
-        // endpoint and (vacuously satisfied) binary set match. Document
-        // the semantics so a future reader doesn't flip it accidentally.
+        // A specific loaded binary list cannot cover that Cartesian scope.
         let proposed = NetworkPolicyRule {
             name: "any_binary_rule".to_string(),
             endpoints: vec![endpoint("api.github.com", 443)],
@@ -1749,9 +2930,17 @@ mod tests {
         );
 
         assert!(
-            policy_covers_rule(&policy, &proposed),
-            "empty proposed binaries should match any merged binary set"
+            !policy_covers_rule(&policy, &proposed),
+            "a specific loaded binary list must not cover an any-binary proposal"
         );
+
+        policy
+            .network_policies
+            .get_mut("existing")
+            .expect("existing rule")
+            .binaries
+            .clear();
+        assert!(policy_covers_rule(&policy, &proposed));
     }
 
     #[test]

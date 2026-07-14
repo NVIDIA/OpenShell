@@ -502,6 +502,11 @@ The CLI validates the argument shapes before it sends the request. The gateway t
 - `--add-allow` or `--add-deny` points at an endpoint that does not exist.
 - `--add-allow` or `--add-deny` targets an endpoint that is neither REST nor WebSocket.
 - `--add-deny` targets an endpoint that has no base allow set.
+- an update adds a binary to a rule without declaring every endpoint that rule already authorizes.
+- an update adds or changes an endpoint on a rule without declaring every binary that rule already authorizes.
+- an update gives one host and port two different MCP inspection contracts.
+
+A rule authorizes every listed binary to reach every listed endpoint, so merging a binary and an endpoint into the same rule authorizes that pair too. The gateway rejects the whole batch rather than granting a pair the update did not ask for. The error names the binaries you need to add. Declare the rule's full binary and endpoint scope in the update, or put the new authorization in a separate rule.
 
 ## Global Policy Override
 

@@ -4396,11 +4396,17 @@ fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<
 fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
     match error {
         openshell_policy::PolicyMergeError::MissingRuleNameForAddRule
+        | openshell_policy::PolicyMergeError::EmptyAddRuleEndpoints { .. }
         | openshell_policy::PolicyMergeError::InvalidEndpointReference { .. }
         | openshell_policy::PolicyMergeError::UnsupportedAccessPreset { .. } => {
             Status::invalid_argument(error.to_string())
         }
-        openshell_policy::PolicyMergeError::EndpointNotFound { .. }
+        openshell_policy::PolicyMergeError::McpContractConflict { .. }
+        | openshell_policy::PolicyMergeError::NewBinaryWouldInheritAuthorization { .. }
+        | openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+            ..
+        }
+        | openshell_policy::PolicyMergeError::EndpointNotFound { .. }
         | openshell_policy::PolicyMergeError::EndpointHasNoL7Inspection { .. }
         | openshell_policy::PolicyMergeError::UnsupportedEndpointProtocol { .. }
         | openshell_policy::PolicyMergeError::EndpointHasNoAllowBase { .. } => {
@@ -5323,6 +5329,51 @@ mod tests {
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("_provider_work_github"));
         assert!(err.message().contains("reserved '_provider_' prefix"));
+    }
+
+    #[test]
+    fn policy_merge_error_mapping_distinguishes_request_shape_from_state_conflicts() {
+        let empty =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::EmptyAddRuleEndpoints {
+                operation_index: 0,
+                rule_name: "empty".to_string(),
+            });
+        assert_eq!(empty.code(), Code::InvalidArgument);
+
+        let contract =
+            map_policy_merge_error(openshell_policy::PolicyMergeError::McpContractConflict {
+                operation_index: 1,
+                host: "mcp.example.com".to_string(),
+                port: 443,
+                existing: "mcp(max_body_bytes=65536)".to_string(),
+                incoming: "mcp(max_body_bytes=131072)".to_string(),
+            });
+        assert_eq!(contract.code(), Code::FailedPrecondition);
+
+        let inheritance = map_policy_merge_error(
+            openshell_policy::PolicyMergeError::NewBinaryWouldInheritAuthorization {
+                operation_index: 2,
+                rule_name: "existing".to_string(),
+                binary_path: "/usr/bin/client".to_string(),
+                host: "mcp.example.com".to_string(),
+                ports: vec![443],
+            },
+        );
+        assert_eq!(inheritance.code(), Code::FailedPrecondition);
+
+        let existing_scope = map_policy_merge_error(
+            openshell_policy::PolicyMergeError::ExistingBinariesWouldInheritAuthorization {
+                operation_index: 3,
+                rule_name: "existing".to_string(),
+                host: "api.example.com".to_string(),
+                ports: vec![443],
+                undeclared_binaries: vec!["/usr/bin/other".to_string()],
+            },
+        );
+        assert_eq!(existing_scope.code(), Code::FailedPrecondition);
+        // The proposer has to know which binaries to add, so the remediation
+        // detail must survive into the status message.
+        assert!(existing_scope.message().contains("/usr/bin/other"));
     }
 
     // ---- Sandbox IDOR guard (issue #1354) ----
