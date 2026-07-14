@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# libclang plumbing for z3-sys's bindgen run: the prebuilt LLVM libclang, the
+# libz.so.1 it expects from the host (which NixOS does not serve), and clang's
+# builtin headers. Kept together because the prebuilt binary's runtime
+# expectations are the whole problem this package exists to solve.
+
+load("@rules_cc//cc:cc_shared_library.bzl", "cc_shared_library")
+
+# A libz.so.1 whose exports carry the ZLIB_1.2.0 symbol version that the
+# prebuilt libclang references; the BCR zlib's cc_library omits it (see
+# zlib.map).
+cc_shared_library(
+    name = "z_shared",
+    additional_linker_inputs = ["zlib.map"],
+    user_link_flags = ["-Wl,--version-script=$(location zlib.map)"],
+    deps = ["@zlib//:z"],
+)
+
+# libclang next to that libz.so.1. libclang's RUNPATH is $ORIGIN/../lib, so a
+# sibling libz in the same lib/ dir resolves without patching the binary.
+genrule(
+    name = "libclang_bundle",
+    srcs = [
+        ":z_shared",
+        "@llvm_toolchain_llvm//:libclang",
+    ],
+    outs = [
+        "libclang/lib/libclang.so",
+        "libclang/lib/libz.so.1",
+    ],
+    cmd = "cp $(execpath @llvm_toolchain_llvm//:libclang) $(RULEDIR)/libclang/lib/libclang.so && " +
+          "cp $(execpath :z_shared) $(RULEDIR)/libclang/lib/libz.so.1",
+    visibility = ["//visibility:public"],
+)
+
+# Clang's builtin headers (stdbool.h etc.), which libclang would normally find
+# relative to its binary but cannot in the stripped bundle above.
+alias(
+    name = "clang_builtin_include",
+    actual = "@llvm_toolchain_llvm//:lib/clang/20/include",
+    visibility = ["//visibility:public"],
+)

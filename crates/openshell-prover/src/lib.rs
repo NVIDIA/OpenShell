@@ -84,7 +84,11 @@ mod tests {
     use std::path::PathBuf;
 
     fn testdata_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata")
+        // Bazel runs the test from its runfiles root and points this at the
+        // package dir; cargo bakes the manifest dir at compile time.
+        let base = std::env::var("OPENSHELL_MANIFEST_DIR")
+            .unwrap_or_else(|_| env!("CARGO_MANIFEST_DIR").to_owned());
+        PathBuf::from(base).join("testdata")
     }
 
     // 1. Parse testdata/policy.yaml, verify structure.

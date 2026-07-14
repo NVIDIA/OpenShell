@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+load("@crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+rust_library(
+    name = "openshell_prover",
+    srcs = glob(["src/**/*.rs"]),
+    compile_data = glob(["registry/**"]),
+    edition = "2024",
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+rust_test(
+    name = "openshell_prover_test",
+    crate = ":openshell_prover",
+    data = glob(["testdata/**"]),
+    env = {"OPENSHELL_MANIFEST_DIR": "crates/openshell-prover"},
+    deps = all_crate_deps(normal_dev = True),
+)

@@ -7,92 +7,11 @@ module(
 )
 
 bazel_dep(name = "platforms", version = "1.1.0")
-bazel_dep(name = "rules_rust", version = "0.71.3")
-bazel_dep(name = "hermetic_cc_toolchain", version = "4.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
 
-rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+# The rest of the build config lives in bazel/, split by concern.
+include("//bazel:rust.MODULE.bazel")
 
-rust.toolchain(
-    edition = "2024",
-    versions = ["1.95.0"],
-)
+include("//bazel:cc_toolchains.MODULE.bazel")
 
-# Musl toolchains for static release builds. Their @zig_sdk//libc:musl
-# constraint keeps them dormant on the (constraint-less) host platform, so
-# dev builds are unaffected.
-rust.repository_set(
-    name = "rust_linux_amd64_musl",
-    exec_triple = "x86_64-unknown-linux-gnu",
-    target_triple = "x86_64-unknown-linux-musl",
-    versions = ["1.95.0"],
-    extra_rustc_flags = ["-Clink-self-contained=no"],
-    target_compatible_with = [
-        "@platforms//os:linux",
-        "@platforms//cpu:x86_64",
-        "@zig_sdk//libc:musl",
-    ],
-)
-
-rust.repository_set(
-    name = "rust_linux_arm64_musl",
-    exec_triple = "x86_64-unknown-linux-gnu",
-    target_triple = "aarch64-unknown-linux-musl",
-    versions = ["1.95.0"],
-    extra_rustc_flags = ["-Clink-self-contained=no"],
-    target_compatible_with = [
-        "@platforms//os:linux",
-        "@platforms//cpu:aarch64",
-        "@zig_sdk//libc:musl",
-    ],
-)
-
-# Experimental macOS cross-compilation (library crates only; linking needs
-# Apple framework stubs that zig does not ship).
-rust.repository_set(
-    name = "rust_darwin_arm64",
-    exec_triple = "x86_64-unknown-linux-gnu",
-    target_triple = "aarch64-apple-darwin",
-    versions = ["1.95.0"],
-    target_compatible_with = [
-        "@platforms//os:macos",
-        "@platforms//cpu:aarch64",
-    ],
-)
-
-use_repo(rust, "rust_toolchains")
-
-# The musl hub entries must be registered before //:all — the gnu entries in
-# the hub also match musl platforms (they declare no libc constraint), and
-# Bazel picks the first compatible registration.
-register_toolchains(
-    "@rust_toolchains//:rust_linux_amd64_musl__x86_64-unknown-linux-musl__stable",
-    "@rust_toolchains//:rust_linux_arm64_musl__aarch64-unknown-linux-musl__stable",
-)
-
-register_toolchains("@rust_toolchains//:all")
-
-crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
-crate.from_cargo(
-    name = "crates",
-    cargo_lockfile = "//:Cargo.lock",
-    manifests = [
-        "//:Cargo.toml",
-    ],
-)
-use_repo(crate, "crates")
-
-hermetic_toolchain = use_extension("@hermetic_cc_toolchain//toolchain:ext.bzl", "toolchains")
-use_repo(hermetic_toolchain, "zig_sdk")
-
-# Only match platforms carrying @zig_sdk//libc:musl — dormant for dev builds,
-# which keep the autodetected host toolchain.
-register_toolchains(
-    "@zig_sdk//libc_aware/toolchain:linux_amd64_musl",
-    "@zig_sdk//libc_aware/toolchain:linux_arm64_musl",
-    "@zig_sdk//toolchain:darwin_arm64",
-)
-
-# Hermetic protoc for openshell-core's build script, injected via $PROTOC
-# instead of the autotools build that protobuf-src does under cargo. Built
-# from source in the exec configuration (one-time cost, then cached).
-bazel_dep(name = "protobuf", version = "33.4")
+include("//bazel:z3.MODULE.bazel")

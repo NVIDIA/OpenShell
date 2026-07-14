@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# C/C++ toolchain providers: zig (cross-compilation), protoc, and libclang.
+
+bazel_dep(name = "hermetic_cc_toolchain", version = "4.1.0")
+
+hermetic_toolchain = use_extension("@hermetic_cc_toolchain//toolchain:ext.bzl", "toolchains")
+use_repo(hermetic_toolchain, "zig_sdk")
+
+# Only match platforms carrying @zig_sdk//libc:musl — dormant for dev builds,
+# which keep the autodetected host toolchain.
+register_toolchains(
+    "@zig_sdk//libc_aware/toolchain:linux_amd64_musl",
+    "@zig_sdk//libc_aware/toolchain:linux_arm64_musl",
+    "@zig_sdk//toolchain:darwin_arm64",
+)
+
+# Hermetic protoc for openshell-core's build script, injected via $PROTOC
+# instead of the autotools build that protobuf-src does under cargo. Built
+# from source in the exec configuration (one-time cost, then cached).
+bazel_dep(name = "protobuf", version = "33.4")
+
+# Prebuilt LLVM distribution as the source of libclang for z3-sys's bindgen
+# run (the same route rules_rust's bindgen_toolchain example takes; building
+# LLVM from source needs an older C++ toolchain than ours). Deliberately not
+# registered as a cc toolchain — zig and the host autodetect own that space.
+bazel_dep(name = "toolchains_llvm", version = "1.8.0")
+
+llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
+llvm.toolchain(
+    name = "llvm_toolchain",
+    llvm_version = "20.1.4",
+)
+use_repo(llvm, "llvm_toolchain_llvm")
+
+# The prebuilt libclang.so dynamically links libz.so.1 and expects it from
+# the host, which NixOS does not serve; a Bazel-built one is bundled next to
+# it instead (see //bazel/clang:libclang_bundle).
+bazel_dep(name = "zlib", version = "1.3.1.bcr.5")

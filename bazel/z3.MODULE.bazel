@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Bazel-built libz3 for openshell-prover, injected into z3-sys instead of the
+# system library that plain cargo links. The BCR module is a year stale, so
+# override with the upstream release, which carries its own MODULE.bazel.
+bazel_dep(name = "z3", version = "4.16.0")
+
+archive_override(
+    module_name = "z3",
+    # z3's BUILD.bazel collects install outputs from lib/, but CMake's
+    # GNUInstallDirs host-sniffs the layout and picks lib64/ on non-Debian
+    # Linux. Pin the libdir right after each generator declaration.
+    patch_cmds = [
+        """sed -i '/-G Ninja/a\\        "-D CMAKE_INSTALL_LIBDIR=lib",' BUILD.bazel""",
+    ],
+    integrity = "sha256-xow+XkgQsWEmuMtMR+7oXBrD4kqBkUyONxtA3p3TOsc=",
+    strip_prefix = "z3-z3-4.16.0",
+    urls = ["https://github.com/Z3Prover/z3/archive/refs/tags/z3-4.16.0.tar.gz"],
+)

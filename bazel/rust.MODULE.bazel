@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Rust toolchains and the crate_universe dependency graph.
+
+bazel_dep(name = "rules_rust", version = "0.71.3")
+
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+
+rust.toolchain(
+    edition = "2024",
+    versions = ["1.95.0"],
+)
+
+# Musl toolchains for static release builds. Their @zig_sdk//libc:musl
+# constraint keeps them dormant on the (constraint-less) host platform, so
+# dev builds are unaffected.
+rust.repository_set(
+    name = "rust_linux_amd64_musl",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_triple = "x86_64-unknown-linux-musl",
+    versions = ["1.95.0"],
+    extra_rustc_flags = ["-Clink-self-contained=no"],
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+        "@zig_sdk//libc:musl",
+    ],
+)
+
+rust.repository_set(
+    name = "rust_linux_arm64_musl",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_triple = "aarch64-unknown-linux-musl",
+    versions = ["1.95.0"],
+    extra_rustc_flags = ["-Clink-self-contained=no"],
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+        "@zig_sdk//libc:musl",
+    ],
+)
+
+# Experimental macOS cross-compilation (library crates only; linking needs
+# Apple framework stubs that zig does not ship).
+rust.repository_set(
+    name = "rust_darwin_arm64",
+    exec_triple = "x86_64-unknown-linux-gnu",
+    target_triple = "aarch64-apple-darwin",
+    versions = ["1.95.0"],
+    target_compatible_with = [
+        "@platforms//os:macos",
+        "@platforms//cpu:aarch64",
+    ],
+)
+
+use_repo(rust, "rust_toolchains")
+
+# The musl hub entries must be registered before //:all — the gnu entries in
+# the hub also match musl platforms (they declare no libc constraint), and
+# Bazel picks the first compatible registration.
+register_toolchains(
+    "@rust_toolchains//:rust_linux_amd64_musl__x86_64-unknown-linux-musl__stable",
+    "@rust_toolchains//:rust_linux_arm64_musl__aarch64-unknown-linux-musl__stable",
+)
+
+register_toolchains("@rust_toolchains//:all")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = [
+        "//:Cargo.toml",
+    ],
+)
+
+# Under cargo, z3-sys links the system libz3; here it gets the Bazel-built
+# one: the header for its bindgen run and the lib directory for linking.
+crate.annotation(
+    crate = "z3-sys",
+    build_script_data = [
+        "@@//:z3_install",
+        "@@//bazel/clang:clang_builtin_include",
+        "@@//bazel/clang:libclang/lib/libclang.so",
+        "@@//bazel/clang:libclang/lib/libz.so.1",
+    ],
+    build_script_env = {
+        "BINDGEN_EXTRA_CLANG_ARGS": "-isystem $(execpath @@//bazel/clang:clang_builtin_include)",
+        "LIBCLANG_PATH": "$(execpath @@//bazel/clang:libclang/lib/libclang.so)",
+        "Z3_LIBRARY_PATH_OVERRIDE": "$(execpath @@//:z3_install)/lib",
+        "Z3_SYS_Z3_HEADER": "$(execpath @@//:z3_install)/include/z3.h",
+    },
+)
+use_repo(crate, "crates")

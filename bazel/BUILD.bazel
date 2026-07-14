@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Package marker so the MODULE.bazel include() segments in this directory
+# resolve as labels. Build targets live in the sibling packages.

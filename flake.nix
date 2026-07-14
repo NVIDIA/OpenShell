@@ -20,6 +20,7 @@
             # nix only has to supply bazel.
             pkgs.bazel_9
             pkgs.lcov
+            pkgs.graphviz
           ];
         };
       });

@@ -1,0 +1,7 @@
+/* The prebuilt libclang references zlib symbols tagged ZLIB_1.2.0, but the
+ * BCR zlib's cc_library build exports them untagged. Re-apply the symbol
+ * version upstream zlib's own Makefile would (see :libclang_bundle). */
+ZLIB_1.2.0 {
+    global:
+        *;
+};

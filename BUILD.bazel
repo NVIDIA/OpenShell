@@ -20,3 +20,12 @@ platform(
     name = "darwin_arm64",
     parents = ["@zig_sdk//platform:darwin_arm64"],
 )
+
+# The Bazel-built z3 install tree (include/ + lib/) as one directory
+# artifact, consumed by the z3-sys crate annotation in bazel/rust.MODULE.bazel.
+filegroup(
+    name = "z3_install",
+    srcs = ["@z3//:z3_static"],
+    output_group = "gen_dir",
+    visibility = ["//visibility:public"],
+)
