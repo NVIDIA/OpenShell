@@ -11,40 +11,35 @@ use crate::{InterceptorError, Result};
 
 const SERVICE_OPEN_SHELL: &str = "openshell.v1.OpenShell";
 
-/// Unary `openshell.v1.OpenShell` methods that are deliberately excluded from
-/// gateway interception. New unary methods are interceptable by default unless
-/// added here in the same change.
-pub const NON_INTERCEPTABLE_METHODS: &[&str] = &[
-    "Health",
-    "WatchSandbox",
-    "ExecSandbox",
-    "ForwardTcp",
-    "ExecSandboxInteractive",
-    "PushSandboxLogs",
-    "ConnectSupervisor",
-    "RelayStream",
-    "GetSandboxConfig",
-    "GetSandboxProviderEnvironment",
-    "ReportPolicyStatus",
-    "IssueSandboxToken",
-    "RefreshSandboxToken",
-    "GetSandbox",
-    "ListSandboxes",
-    "ListSandboxProviders",
-    "GetProvider",
-    "ListProviders",
-    "ListProviderProfiles",
-    "GetProviderProfile",
-    "LintProviderProfiles",
-    "GetProviderRefreshStatus",
-    "GetGatewayConfig",
-    "GetSandboxPolicyStatus",
-    "ListSandboxPolicies",
-    "GetSandboxLogs",
-    "GetDraftPolicy",
-    "GetDraftHistory",
-    "GetService",
-    "ListServices",
+/// Unary `openshell.v1.OpenShell` methods that may be targeted by gateway
+/// interceptors. New methods are non-interceptable until deliberately added
+/// here.
+pub const INTERCEPTABLE_METHODS: &[&str] = &[
+    "CreateSandbox",
+    "AttachSandboxProvider",
+    "DetachSandboxProvider",
+    "DeleteSandbox",
+    "CreateSshSession",
+    "ExposeService",
+    "DeleteService",
+    "RevokeSshSession",
+    "CreateProvider",
+    "ImportProviderProfiles",
+    "UpdateProviderProfiles",
+    "UpdateProvider",
+    "ConfigureProviderRefresh",
+    "RotateProviderCredential",
+    "DeleteProviderRefresh",
+    "DeleteProvider",
+    "DeleteProviderProfile",
+    "UpdateConfig",
+    "SubmitPolicyAnalysis",
+    "ApproveDraftChunk",
+    "RejectDraftChunk",
+    "ApproveAllDraftChunks",
+    "EditDraftChunk",
+    "UndoDraftChunk",
+    "ClearDraftChunks",
 ];
 
 #[derive(Debug, Clone)]
@@ -91,7 +86,7 @@ impl OpenShellRouteIndex {
             input_types,
             output_types,
         };
-        index.validate_non_interceptable_list()?;
+        index.validate_interceptable_list()?;
         Ok(index)
     }
 
@@ -99,7 +94,7 @@ impl OpenShellRouteIndex {
     pub fn is_interceptable(&self, service: &str, method: &str) -> bool {
         service == SERVICE_OPEN_SHELL
             && self.unary_methods.contains(method)
-            && !NON_INTERCEPTABLE_METHODS.contains(&method)
+            && INTERCEPTABLE_METHODS.contains(&method)
     }
 
     #[must_use]
@@ -120,16 +115,24 @@ impl OpenShellRouteIndex {
         }
     }
 
-    fn validate_non_interceptable_list(&self) -> Result<()> {
+    fn validate_interceptable_list(&self) -> Result<()> {
         let mut stale = Vec::new();
-        for method in NON_INTERCEPTABLE_METHODS {
+        let mut streaming = Vec::new();
+        for method in INTERCEPTABLE_METHODS {
             if !self.all_methods.contains(*method) {
                 stale.push((*method).to_string());
+            } else if !self.unary_methods.contains(*method) {
+                streaming.push((*method).to_string());
             }
         }
         if !stale.is_empty() {
             return Err(InterceptorError::Config(format!(
-                "non-interceptable route list has stale methods: {stale:?}"
+                "interceptable route list has stale methods: {stale:?}"
+            )));
+        }
+        if !streaming.is_empty() {
+            return Err(InterceptorError::Config(format!(
+                "interceptable route list has streaming methods: {streaming:?}"
             )));
         }
         Ok(())
@@ -141,19 +144,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_interceptable_entries_match_real_methods() {
+    fn interceptable_entries_match_real_unary_methods() {
         OpenShellRouteIndex::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
     }
 
     #[test]
-    fn write_methods_are_interceptable_by_default() {
+    fn only_explicitly_allowed_write_methods_are_interceptable() {
         let index =
             OpenShellRouteIndex::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         assert!(index.is_interceptable("openshell.v1.OpenShell", "CreateSandbox"));
         assert!(index.is_interceptable("openshell.v1.OpenShell", "UpdateConfig"));
         assert!(index.is_interceptable("openshell.v1.OpenShell", "SubmitPolicyAnalysis"));
+        assert!(!index.is_interceptable("openshell.v1.OpenShell", "Health"));
         assert!(!index.is_interceptable("openshell.v1.OpenShell", "GetSandbox"));
         assert!(!index.is_interceptable("openshell.v1.OpenShell", "WatchSandbox"));
+        assert!(!index.is_interceptable("openshell.v1.OpenShell", "FutureUnaryMethod"));
         assert_eq!(
             index.output_type("openshell.v1.OpenShell", "CreateSandbox"),
             Some("openshell.v1.SandboxResponse")

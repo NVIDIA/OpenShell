@@ -45,12 +45,13 @@ Gateway interceptors run in one middleware layer on the `openshell.v1.OpenShell`
 gRPC service after authentication and before tonic dispatches to individual
 handlers. At startup the gateway calls each configured interceptor's `Describe`
 RPC, validates declared bindings against the compiled OpenShell descriptor set,
-and builds an immutable execution plan. Unary OpenShell requests that are not
-streaming, supervisor-facing, read-only, or introspection methods are decoded
-through the descriptor set into protobuf JSON, evaluated through configured
-phases, and re-encoded before the handler sees the request. This keeps
-interception centralized: adding an interceptable unary RPC does not require
-method-specific gateway instrumentation.
+and builds an immutable execution plan. Only unary OpenShell methods in the
+gateway's explicit interceptable-method allowlist are decoded through the
+descriptor set into protobuf JSON, evaluated through configured phases, and
+re-encoded before the handler sees the request. New RPCs are non-interceptable
+until deliberately added to this allowlist. Interception remains centralized:
+allowlisting a unary RPC does not require method-specific gateway
+instrumentation.
 
 Each configured interceptor selects a binding policy. `dynamic` accepts valid
 manifest declarations and preserves the compatibility behavior. `allowlist`
