@@ -37,6 +37,7 @@ mod persistence;
 pub(crate) mod policy_store;
 mod provider_refresh;
 mod readiness;
+mod runtime_config;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
@@ -119,6 +120,9 @@ pub struct ServerState {
     /// mutations that reads global state.
     pub settings_mutex: tokio::sync::Mutex<()>,
 
+    /// Runtime settings managed by the optional gateway runtime config file.
+    pub(crate) runtime_settings: runtime_config::RuntimeSettingsState,
+
     /// Registry of active supervisor sessions and pending relay channels.
     ///
     /// Stored as `Arc` so compute drivers (e.g. the Docker driver)
@@ -191,6 +195,7 @@ impl ServerState {
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
+            runtime_settings: runtime_config::RuntimeSettingsState::default(),
             supervisor_sessions,
             oidc_cache,
             sandbox_jwt_issuer: None,
@@ -273,6 +278,27 @@ pub(crate) async fn run_server(
         supervisor_sessions,
         oidc_cache,
     );
+
+    let runtime_config_path = config_file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.runtime_config_path.clone());
+    if let Some(path) = runtime_config_path.as_ref() {
+        let outcome = runtime_config::apply_file(
+            path,
+            store.as_ref(),
+            &state.settings_mutex,
+            &state.runtime_settings,
+        )
+        .await
+        .map_err(|e| Error::config(e.to_string()))?;
+        info!(
+            path = %path.display(),
+            changed = outcome.changed,
+            settings_revision = outcome.revision,
+            managed_key_count = outcome.managed_key_count,
+            "runtime config file applied"
+        );
+    }
 
     // Load the gateway-minted sandbox JWT signing key when configured.
     // Optional so single-driver dev deployments without certgen continue
@@ -374,6 +400,9 @@ pub(crate) async fn run_server(
     }
 
     state.compute.spawn_watchers(shutdown_rx.clone());
+    if let Some(path) = runtime_config_path {
+        runtime_config::spawn_watcher(state.clone(), path, shutdown_rx.clone());
+    }
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));

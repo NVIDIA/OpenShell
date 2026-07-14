@@ -270,6 +270,10 @@ Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
 sandbox supervisor polls for config revisions and hot-reloads dynamic policy
 when the policy engine accepts the update.
+When configured, a gateway runtime settings file reconciles selected
+gateway-global settings into the same settings row. Keys present in that file
+are file-managed; omitted keys stay available through the normal global
+settings API.
 
 Provider credential expiry is enforced during gateway-to-sandbox credential
 resolution and again by the sandbox placeholder resolver. This keeps expired
@@ -447,6 +451,12 @@ The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
 Driver implementation settings live in the TOML driver tables. See
 `docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
 0003 for the full schema.
+
+Startup configuration can reference a separate runtime settings file with
+`runtime_config_path`. That file is watched after startup and is intentionally
+limited to registered runtime settings such as provider/profile and logging
+feature flags. It does not configure drivers, listeners, providers,
+credentials, or global policy payloads.
 
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).

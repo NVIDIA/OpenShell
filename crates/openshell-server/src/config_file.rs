@@ -84,6 +84,11 @@ pub struct GatewayFileSection {
     // ── Logging ──────────────────────────────────────────────────────────
     #[serde(default)]
     pub log_level: Option<String>,
+    /// Path to an optional gateway runtime settings file. When set, the
+    /// gateway loads registered runtime settings from this file at startup and
+    /// watches it for changes.
+    #[serde(default)]
+    pub runtime_config_path: Option<PathBuf>,
 
     // ── Drivers ──────────────────────────────────────────────────────────
     #[serde(default)]
@@ -352,6 +357,7 @@ version = 1
 bind_address = "0.0.0.0:8080"
 health_bind_address = "0.0.0.0:8081"
 log_level = "info"
+runtime_config_path = "/etc/openshell/runtime.toml"
 compute_drivers = ["kubernetes"]
 sandbox_namespace = "agents"
 grpc_rate_limit_requests = 120
@@ -378,6 +384,10 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
         let file = load(tmp.path()).expect("valid file parses");
         let gw = &file.openshell.gateway;
         assert_eq!(gw.log_level.as_deref(), Some("info"));
+        assert_eq!(
+            gw.runtime_config_path.as_deref(),
+            Some(Path::new("/etc/openshell/runtime.toml"))
+        );
         assert_eq!(
             gw.default_image.as_deref(),
             Some("ghcr.io/nvidia/openshell/sandbox:latest")

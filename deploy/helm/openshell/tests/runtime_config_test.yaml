@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway runtime config
+templates:
+  - templates/runtime-config.yaml
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: does not render a runtime config map by default
+    template: templates/runtime-config.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: omits runtime_config_path by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'runtime_config_path\s*='
+
+  - it: renders a runtime config map from values
+    template: templates/runtime-config.yaml
+    set:
+      server.runtimeConfig.enabled: true
+      server.runtimeConfig.settings.providers_v2_enabled: true
+      server.runtimeConfig.settings.proposal_approval_mode: auto
+    asserts:
+      - hasDocuments:
+          count: 1
+      - equal:
+          path: metadata.name
+          value: openshell-runtime-config
+      - matchRegex:
+          path: data["runtime.toml"]
+          pattern: 'providers_v2_enabled\s*=\s*true'
+      - matchRegex:
+          path: data["runtime.toml"]
+          pattern: 'proposal_approval_mode\s*=\s*"auto"'
+
+  - it: renders runtime_config_path when runtime config is enabled
+    template: templates/gateway-config.yaml
+    set:
+      server.runtimeConfig.enabled: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'runtime_config_path\s*=\s*"/etc/openshell-runtime/runtime.toml"'
+
+  - it: mounts the rendered runtime config map
+    template: templates/statefulset.yaml
+    set:
+      server.runtimeConfig.enabled: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: runtime-config
+            mountPath: /etc/openshell-runtime
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: runtime-config
+            configMap:
+              name: openshell-runtime-config
+
+  - it: uses an existing runtime config map without rendering one
+    template: templates/runtime-config.yaml
+    set:
+      server.runtimeConfig.enabled: true
+      server.runtimeConfig.existingConfigMap: precreated-runtime
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: mounts an existing runtime config map
+    template: templates/statefulset.yaml
+    set:
+      server.runtimeConfig.enabled: true
+      server.runtimeConfig.existingConfigMap: precreated-runtime
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: runtime-config
+            configMap:
+              name: precreated-runtime
+
+  - it: rejects runtime config filenames that include paths
+    template: templates/statefulset.yaml
+    set:
+      server.runtimeConfig.enabled: true
+      server.runtimeConfig.filename: nested/runtime.toml
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.runtimeConfig.filename must be a non-empty filename, not a path."

@@ -77,6 +77,11 @@ spec:
         - name: gateway-config
           mountPath: /etc/openshell
           readOnly: true
+        {{- if eq (include "openshell.runtimeConfigEnabled" .) "true" }}
+        - name: runtime-config
+          mountPath: /etc/openshell-runtime
+          readOnly: true
+        {{- end }}
         - name: sandbox-jwt
           mountPath: /etc/openshell-jwt
           readOnly: true
@@ -136,6 +141,11 @@ spec:
     - name: gateway-config
       configMap:
         name: {{ include "openshell.fullname" . }}-config
+    {{- if eq (include "openshell.runtimeConfigEnabled" .) "true" }}
+    - name: runtime-config
+      configMap:
+        name: {{ include "openshell.runtimeConfigMapName" . }}
+    {{- end }}
     - name: sandbox-jwt
       secret:
         secretName: {{ include "openshell.sandboxJwtSecretName" . }}
