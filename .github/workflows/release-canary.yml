@@ -185,7 +185,6 @@ jobs:
           sudo snap connect openshell:docker docker:docker-daemon
           sudo snap connect openshell:log-observe
           sudo snap connect openshell:system-observe
-          sudo snap connect openshell:ssh-keys
 
       - name: Register snap gateway and check status
         run: |
