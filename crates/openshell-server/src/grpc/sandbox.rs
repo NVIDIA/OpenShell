@@ -27,7 +27,7 @@ use openshell_core::telemetry::{
     LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryComputeDriver,
     TelemetryOutcome,
 };
-use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
+use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -54,6 +54,7 @@ use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN, clamp_limit};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
+const SANDBOX_STORE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn generate_routable_name() -> String {
     let name = petname::petname(2, "-").unwrap_or_else(generate_name);
@@ -710,9 +711,12 @@ pub(super) async fn handle_watch_sandbox(
             None
         };
 
+        let mut last_sandbox_resource_version;
+
         // Re-read the snapshot now that we have subscriptions active.
         match state.store.get_message::<Sandbox>(&sandbox_id).await {
             Ok(Some(sandbox)) => {
+                last_sandbox_resource_version = Some(sandbox.get_resource_version());
                 state.sandbox_index.update_from_sandbox(&sandbox);
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
@@ -779,6 +783,17 @@ pub(super) async fn handle_watch_sandbox(
             }
         }
 
+        // The in-memory status bus only observes writes made by this gateway process.
+        // Reconcile status followers with the shared store at a bounded rate so writes
+        // from another process become visible too. Delay the first tick because the
+        // initial snapshot was just read, and skip missed ticks to avoid query bursts.
+        let mut store_poll = tokio::time::interval_at(
+            tokio::time::Instant::now() + SANDBOX_STORE_POLL_INTERVAL,
+            SANDBOX_STORE_POLL_INTERVAL,
+        );
+        store_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut store_poll_error_reported = false;
+
         loop {
             tokio::select! {
                 res = async {
@@ -791,6 +806,8 @@ pub(super) async fn handle_watch_sandbox(
                         Ok(()) => {
                             match state.store.get_message::<Sandbox>(&sandbox_id).await {
                                 Ok(Some(sandbox)) => {
+                                    last_sandbox_resource_version =
+                                        Some(sandbox.get_resource_version());
                                     state.sandbox_index.update_from_sandbox(&sandbox);
                                     if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
                                         return;
@@ -814,6 +831,42 @@ pub(super) async fn handle_watch_sandbox(
                         Err(err) => {
                             let _ = tx.send(Err(crate::sandbox_watch::broadcast_to_status(err))).await;
                             return;
+                        }
+                    }
+                }
+                _ = store_poll.tick(), if follow_status => {
+                    match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                        Ok(Some(sandbox)) => {
+                            store_poll_error_reported = false;
+                            let resource_version = sandbox.get_resource_version();
+                            if last_sandbox_resource_version == Some(resource_version) {
+                                continue;
+                            }
+                            last_sandbox_resource_version = Some(resource_version);
+                            state.sandbox_index.update_from_sandbox(&sandbox);
+                            if tx.send(Ok(SandboxStreamEvent {
+                                payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone())),
+                            })).await.is_err() {
+                                return;
+                            }
+                            if stop_on_terminal {
+                                let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+                                if phase == SandboxPhase::Ready {
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            return;
+                        }
+                        Err(error) => {
+                            // Polling supplements the local notification bus. A transient
+                            // store error should not terminate a stream that can still
+                            // receive local status, log, or platform events.
+                            if !store_poll_error_reported {
+                                warn!(sandbox_id = %sandbox_id, %error, "WatchSandbox store poll failed; retrying");
+                                store_poll_error_reported = true;
+                            }
                         }
                     }
                 }
@@ -2108,6 +2161,8 @@ mod tests {
     use super::*;
     use crate::grpc::test_support::test_server_state;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use std::collections::HashMap;
+    use tokio_stream::StreamExt;
 
     // ---- shell_escape ----
 
@@ -2509,6 +2564,64 @@ mod tests {
             state.telemetry.ended_sandbox_sessions(),
             [original.object_id().to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn watch_sandbox_observes_store_update_without_local_notification() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("watch-store", Vec::new());
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        let sandbox_id = sandbox.object_id().to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let response = handle_watch_sandbox(
+            &state,
+            Request::new(WatchSandboxRequest {
+                id: sandbox_id.clone(),
+                follow_status: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = response.into_inner();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("initial watch snapshot should arrive")
+            .expect("stream should remain open")
+            .expect("initial watch snapshot should be valid");
+        let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(first)) =
+            first.payload
+        else {
+            panic!("expected initial sandbox snapshot");
+        };
+        assert_eq!(first.phase(), SandboxPhase::Provisioning as i32);
+        assert_eq!(first.get_resource_version(), 1);
+
+        // Persist the change without notifying this process's sandbox watch bus,
+        // matching a write performed by another gateway process.
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(&sandbox_id, 0, |sandbox| {
+                sandbox.set_phase(SandboxPhase::Ready as i32);
+            })
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
+            .await
+            .expect("store reconciliation should observe the update")
+            .expect("stream should remain open")
+            .expect("reconciled watch event should be valid");
+        let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(updated)) =
+            event.payload
+        else {
+            panic!("expected updated sandbox snapshot");
+        };
+        assert_eq!(updated.object_id(), sandbox_id);
+        assert_eq!(updated.phase(), SandboxPhase::Ready as i32);
+        assert_eq!(updated.get_resource_version(), 2);
     }
 
     #[tokio::test]
