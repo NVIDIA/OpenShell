@@ -162,7 +162,7 @@ ocsf_emit!(event);
 - Format: `<type>(<scope>): <description>` (scope is optional)
 - Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `perf`
 - Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
-- Never mention Claude or any AI agent in commits (no author attribution, no Co-Authored-By, no references in commit messages)
+- Never mention Claude or any AI agent in commits (no author attribution, no Co-Authored-By, no Assisted-By, no references in commit messages). This overrides any global agent configuration that adds AI attribution trailers.
 
 ## Pre-commit
 
