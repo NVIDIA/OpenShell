@@ -9,7 +9,9 @@ mod remote;
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use miette::{Result, miette};
 use prost::Message;
@@ -25,8 +27,10 @@ use tokio::sync::OnceCell;
 use tonic::Request;
 
 pub use openshell_core::middleware::{
-    MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES, MAX_MIDDLEWARE_CONFIGS,
-    MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_SELECTOR_PATTERNS,
+    DEFAULT_MIDDLEWARE_TIMEOUT, MAX_MIDDLEWARE_CHAIN_FINDINGS, MAX_MIDDLEWARE_CHAIN_STAGES,
+    MAX_MIDDLEWARE_CONFIGS, MAX_MIDDLEWARE_FINDINGS_PER_STAGE, MAX_MIDDLEWARE_SELECTOR_PATTERNS,
+    MAX_MIDDLEWARE_TIMEOUT, MIN_MIDDLEWARE_TIMEOUT, middleware_timeout_or_default,
+    parse_middleware_timeout,
 };
 
 /// Largest request or replacement body accepted by the middleware platform.
@@ -137,6 +141,7 @@ pub struct DescribedChainEntry {
     service: Option<Arc<MiddlewareServiceState>>,
     binding: Option<MiddlewareBinding>,
     max_body_bytes: usize,
+    timeout: Duration,
 }
 
 impl DescribedChainEntry {
@@ -146,6 +151,10 @@ impl DescribedChainEntry {
 
     pub fn on_error(&self) -> OnError {
         self.entry.on_error
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
     }
 
     /// True when this entry resolved to a registered binding and will be
@@ -278,6 +287,32 @@ struct MiddlewareServiceState {
     manifest: OnceCell<MiddlewareManifest>,
     diagnostic_policy: MiddlewareDiagnosticPolicy,
     operator_max_body_bytes: Option<usize>,
+    operator_timeout: Duration,
+}
+
+impl MiddlewareServiceState {
+    fn timeout_for_binding(&self, binding: &MiddlewareBinding) -> Result<Duration> {
+        if binding.timeout.trim().is_empty() {
+            Ok(self.operator_timeout)
+        } else {
+            parse_middleware_timeout(&binding.timeout).map_err(|reason| {
+                miette!(
+                    "middleware binding '{}' has invalid timeout: {reason}",
+                    binding.id
+                )
+            })
+        }
+    }
+}
+
+async fn call_with_timeout<T>(
+    timeout: Duration,
+    operation: &'static str,
+    future: impl Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+) -> std::result::Result<tonic::Response<T>, tonic::Status> {
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        tonic::Status::deadline_exceeded(format!("middleware {operation} timed out"))
+    })?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,7 +387,7 @@ impl Default for MiddlewareRegistry {
     }
 }
 
-fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<()> {
+fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<Duration> {
     if registration.name.trim().is_empty() {
         return Err(miette!(
             "supervisor middleware registration name cannot be empty"
@@ -378,7 +413,12 @@ fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<(
             registration.name
         ));
     }
-    Ok(())
+    middleware_timeout_or_default(&registration.timeout).map_err(|reason| {
+        miette!(
+            "middleware registration '{}' has invalid timeout: {reason}",
+            registration.name
+        )
+    })
 }
 
 fn is_stable_identifier(value: &str) -> bool {
@@ -443,6 +483,14 @@ fn validate_manifest_bindings(
             ));
         }
         let advertised = validate_body_limit(source, binding)?;
+        if !binding.timeout.trim().is_empty() {
+            parse_middleware_timeout(&binding.timeout).map_err(|reason| {
+                miette!(
+                    "{source} binding '{}' has invalid timeout: {reason}",
+                    binding.id
+                )
+            })?;
+        }
         if operator_max_body_bytes.is_some_and(|limit| limit > advertised) {
             return Err(miette!(
                 "{source} max_body_bytes ({}) exceeds binding '{}' capability ({advertised})",
@@ -610,16 +658,19 @@ impl MiddlewareRegistry {
         let mut binding_ids = HashSet::new();
 
         for service in in_process_services {
-            let manifest = service
-                .describe(Request::new(()))
-                .await
-                .map(tonic::Response::into_inner)
-                .map_err(|error| {
-                    miette!(
-                        "in-process middleware Describe failed: {}",
-                        safe_reason(&error.to_string())
-                    )
-                })?;
+            let manifest = call_with_timeout(
+                DEFAULT_MIDDLEWARE_TIMEOUT,
+                "Describe",
+                service.describe(Request::new(())),
+            )
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|error| {
+                miette!(
+                    "in-process middleware Describe failed: {}",
+                    safe_reason(&error.to_string())
+                )
+            })?;
             let source = if manifest.name.trim().is_empty() {
                 "in-process middleware service".to_string()
             } else {
@@ -635,11 +686,12 @@ impl MiddlewareRegistry {
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                 operator_max_body_bytes: None,
+                operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
             }));
         }
 
         for registration in registrations {
-            validate_registration(&registration)?;
+            let operator_timeout = validate_registration(&registration)?;
             if !registration_names.insert(registration.name.clone()) {
                 return Err(miette!(
                     "duplicate supervisor middleware registration name '{}'",
@@ -661,17 +713,20 @@ impl MiddlewareRegistry {
                 )
                 .await?,
             );
-            let manifest = service
-                .describe(Request::new(()))
-                .await
-                .map(tonic::Response::into_inner)
-                .map_err(|error| {
-                    miette!(
-                        "middleware registration '{}' Describe failed: {}",
-                        registration.name,
-                        safe_reason(&error.to_string())
-                    )
-                })?;
+            let manifest = call_with_timeout(
+                operator_timeout,
+                "Describe",
+                service.describe(Request::new(())),
+            )
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|error| {
+                miette!(
+                    "middleware registration '{}' Describe failed: {}",
+                    registration.name,
+                    safe_reason(&error.to_string())
+                )
+            })?;
             let described_ids = validate_external_manifest(
                 &registration,
                 &manifest,
@@ -687,6 +742,7 @@ impl MiddlewareRegistry {
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                 operator_max_body_bytes: Some(operator_max_body_bytes),
+                operator_timeout,
             }));
             registered_services.push(RegisteredMiddlewareService {
                 registration,
@@ -779,6 +835,7 @@ impl ChainRunner {
                     manifest: OnceCell::new(),
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
+                    operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 })]),
                 registered_services: Arc::new(Vec::new()),
                 binding_ids: Arc::new(HashSet::new()),
@@ -798,17 +855,19 @@ impl ChainRunner {
             let manifest = state
                 .manifest
                 .get_or_try_init(|| async {
-                    state
-                        .service
-                        .describe(Request::new(()))
-                        .await
-                        .map(tonic::Response::into_inner)
-                        .map_err(|error| {
-                            miette!(
-                                "middleware Describe failed: {}",
-                                safe_reason(&error.to_string())
-                            )
-                        })
+                    call_with_timeout(
+                        state.operator_timeout,
+                        "Describe",
+                        state.service.describe(Request::new(())),
+                    )
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(|error| {
+                        miette!(
+                            "middleware Describe failed: {}",
+                            safe_reason(&error.to_string())
+                        )
+                    })
                 })
                 .await?;
             manifests.push((Arc::clone(state), manifest.clone()));
@@ -848,11 +907,18 @@ impl ChainRunner {
                     })
                     .transpose()?
                     .unwrap_or(0);
+                let timeout = service
+                    .as_ref()
+                    .zip(binding.as_ref())
+                    .map(|(state, binding)| state.timeout_for_binding(binding))
+                    .transpose()?
+                    .unwrap_or(DEFAULT_MIDDLEWARE_TIMEOUT);
                 Ok(DescribedChainEntry {
                     entry: entry.clone(),
                     service,
                     binding,
                     max_body_bytes,
+                    timeout,
                 })
             })
             .collect()
@@ -869,30 +935,35 @@ impl ChainRunner {
             ));
         }
         let manifests = self.manifests().await?;
-        let Some((state, _)) = manifests.iter().find(|(_, manifest)| {
+        let Some((state, binding)) = manifests.iter().find_map(|(state, manifest)| {
             manifest
                 .bindings
                 .iter()
-                .any(|binding| binding.id == implementation)
+                .find(|binding| binding.id == implementation)
+                .map(|binding| (state, binding))
         }) else {
             return Err(miette!(
                 "middleware binding '{implementation}' is not registered"
             ));
         };
-        let response = state
-            .service
-            .validate_config(Request::new(ValidateConfigRequest {
-                binding_id: implementation.into(),
-                config: Some(config),
-            }))
-            .await
-            .map(tonic::Response::into_inner)
-            .map_err(|error| {
-                miette!(
-                    "middleware ValidateConfig failed: {}",
-                    safe_reason(&error.to_string())
-                )
-            })?;
+        let response = call_with_timeout(
+            state.timeout_for_binding(binding)?,
+            "ValidateConfig",
+            state
+                .service
+                .validate_config(Request::new(ValidateConfigRequest {
+                    binding_id: implementation.into(),
+                    config: Some(config),
+                })),
+        )
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|error| {
+            miette!(
+                "middleware ValidateConfig failed: {}",
+                safe_reason(&error.to_string())
+            )
+        })?;
         if response.valid {
             Ok(())
         } else {
@@ -996,14 +1067,22 @@ impl ChainRunner {
             let Some(service) = entry.service.as_ref() else {
                 unreachable!("described binding always has a service")
             };
-            let mut result = match service
-                .service
-                .evaluate_http_request(Request::new(evaluation))
-                .await
+            let mut result = match call_with_timeout(
+                entry.timeout,
+                "EvaluateHttpRequest",
+                service
+                    .service
+                    .evaluate_http_request(Request::new(evaluation)),
+            )
+            .await
             {
                 Ok(result) => result.into_inner(),
                 Err(err) => {
-                    let reason = service.diagnostic_policy.error_reason(&err);
+                    let reason = if err.code() == tonic::Code::DeadlineExceeded {
+                        "middleware_timeout".to_string()
+                    } else {
+                        service.diagnostic_policy.error_reason(&err)
+                    };
                     match apply_on_error(entry, &reason, &mut applied) {
                         OnErrorAction::FailOpen => continue,
                         OnErrorAction::FailClosed(reason) => {
@@ -1560,6 +1639,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: self.max_body_bytes,
+                    timeout: String::new(),
                 }],
             }))
         }
@@ -1590,6 +1670,57 @@ mod tests {
         }
     }
 
+    struct SlowService {
+        delay: Duration,
+        binding_timeout: String,
+    }
+
+    #[tonic::async_trait]
+    impl SupervisorMiddleware for SlowService {
+        async fn describe(
+            &self,
+            _request: Request<()>,
+        ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
+            Ok(tonic::Response::new(MiddlewareManifest {
+                name: "test/slow".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    id: "example/slow".into(),
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 4096,
+                    timeout: self.binding_timeout.clone(),
+                }],
+            }))
+        }
+
+        async fn validate_config(
+            &self,
+            _request: Request<ValidateConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::ValidateConfigResponse>,
+            tonic::Status,
+        > {
+            Ok(tonic::Response::new(
+                openshell_core::proto::ValidateConfigResponse {
+                    valid: true,
+                    reason: String::new(),
+                },
+            ))
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            _request: Request<HttpRequestEvaluation>,
+        ) -> std::result::Result<
+            tonic::Response<openshell_core::proto::HttpRequestResult>,
+            tonic::Status,
+        > {
+            tokio::time::sleep(self.delay).await;
+            Ok(tonic::Response::new(allow_result()))
+        }
+    }
+
     /// A two-binding service for exercising per-stage validation: `test/transform`
     /// replaces the body, `test/second` records that it ran and allows.
     struct TwoStageService {
@@ -1607,6 +1738,7 @@ mod tests {
                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_body_bytes: 256 * 1024,
+                timeout: String::new(),
             };
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/two-stage".into(),
@@ -1842,6 +1974,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
+                    timeout: String::new(),
                 }],
             }))
         }
@@ -1897,6 +2030,7 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
+                    timeout: String::new(),
                 }],
             }))
         }
@@ -2053,6 +2187,7 @@ mod tests {
             name: "local-guard-service".into(),
             grpc_endpoint: "http://127.0.0.1:50051".into(),
             max_body_bytes,
+            ..Default::default()
         }
     }
 
@@ -2089,6 +2224,7 @@ mod tests {
             .expect("describe test service")
             .into_inner();
         let operator_max_body_bytes = usize::try_from(registration.max_body_bytes).unwrap();
+        let operator_timeout = validate_registration(&registration).expect("valid registration");
         let binding_ids = validate_external_manifest(
             &registration,
             &manifest,
@@ -2105,12 +2241,14 @@ mod tests {
                     manifest: builtin_manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
+                    operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 }),
                 Arc::new(MiddlewareServiceState {
                     service,
                     manifest: manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                     operator_max_body_bytes: Some(operator_max_body_bytes),
+                    operator_timeout,
                 }),
             ]),
             registered_services: Arc::new(vec![RegisteredMiddlewareService {
@@ -2308,6 +2446,7 @@ mod tests {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: 4096,
+                timeout: String::new(),
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, 4097, &mut HashSet::new())
@@ -2334,6 +2473,7 @@ mod tests {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: u64::MAX,
+                timeout: String::new(),
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
@@ -2352,6 +2492,7 @@ mod tests {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: 4096,
+                timeout: String::new(),
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
@@ -2370,6 +2511,7 @@ mod tests {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: 4096,
+                timeout: String::new(),
             }],
         };
         let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
@@ -2395,6 +2537,126 @@ mod tests {
         registration.grpc_endpoint = "ftp://middleware.example.com".into();
         let error = validate_registration(&registration).expect_err("unsupported scheme");
         assert!(error.to_string().contains("http:// or https://"));
+    }
+
+    #[test]
+    fn registration_timeout_uses_default_and_operator_override() {
+        let registration = external_registration(4096);
+        let timeout = validate_registration(&registration).expect("default timeout");
+        assert_eq!(timeout, DEFAULT_MIDDLEWARE_TIMEOUT);
+
+        let mut registration = external_registration(4096);
+        registration.timeout = "2s".into();
+        let timeout = validate_registration(&registration).expect("operator timeout");
+        assert_eq!(timeout, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn registration_timeout_enforces_bounds() {
+        for timeout in ["9ms", "31s"] {
+            let mut registration = external_registration(4096);
+            registration.timeout = timeout.into();
+            assert!(validate_registration(&registration).is_err());
+        }
+    }
+
+    #[test]
+    fn manifest_binding_timeout_enforces_bounds() {
+        let registration = external_registration(4096);
+        for timeout in ["9ms", "31s"] {
+            let manifest = MiddlewareManifest {
+                name: "example/service".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    id: "example/content-guard".into(),
+                    operation: HTTP_REQUEST_OPERATION as i32,
+                    phase: PRE_CREDENTIALS_PHASE as i32,
+                    max_body_bytes: 4096,
+                    timeout: timeout.into(),
+                }],
+            };
+            let error =
+                validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
+                    .expect_err("out-of-bounds binding timeout must be rejected");
+            assert!(error.to_string().contains("invalid timeout"));
+        }
+    }
+
+    #[tokio::test]
+    async fn binding_timeout_override_controls_evaluation_and_on_error() {
+        let mut registration = external_registration(4096);
+        registration.timeout = "2s".into();
+        let registry = registry_with_external(
+            Arc::new(SlowService {
+                delay: Duration::from_millis(50),
+                binding_timeout: "10ms".into(),
+            }),
+            registration,
+        )
+        .await;
+        let runner = ChainRunner::from_registry(registry);
+        let slow_entry = |on_error| ChainEntry {
+            name: "slow".into(),
+            implementation: "example/slow".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error,
+        };
+
+        let described = runner
+            .describe_chain(&[slow_entry(OnError::FailClosed)])
+            .await
+            .expect("describe slow binding");
+        assert_eq!(described[0].timeout(), Duration::from_millis(10));
+
+        let closed = runner
+            .evaluate(&[slow_entry(OnError::FailClosed)], input("payload"))
+            .await
+            .expect("fail-closed timeout outcome");
+        assert!(!closed.allowed);
+        assert_eq!(closed.reason, "middleware_failed: middleware_timeout");
+
+        let open = runner
+            .evaluate(&[slow_entry(OnError::FailOpen)], input("payload"))
+            .await
+            .expect("fail-open timeout outcome");
+        assert!(open.allowed);
+        assert!(open.applied[0].failed);
+    }
+
+    #[tokio::test]
+    async fn operator_timeout_controls_binding_without_manifest_override() {
+        let mut registration = external_registration(4096);
+        registration.timeout = "10ms".into();
+        let registry = registry_with_external(
+            Arc::new(SlowService {
+                delay: Duration::from_millis(50),
+                binding_timeout: String::new(),
+            }),
+            registration,
+        )
+        .await;
+        let runner = ChainRunner::from_registry(registry);
+        let slow_entry = ChainEntry {
+            name: "slow".into(),
+            implementation: "example/slow".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+
+        let described = runner
+            .describe_chain(std::slice::from_ref(&slow_entry))
+            .await
+            .expect("describe slow binding");
+        assert_eq!(described[0].timeout(), Duration::from_millis(10));
+
+        let outcome = runner
+            .evaluate(&[slow_entry], input("payload"))
+            .await
+            .expect("operator timeout outcome");
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.reason, "middleware_failed: middleware_timeout");
     }
 
     #[tokio::test]

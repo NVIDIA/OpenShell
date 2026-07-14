@@ -177,6 +177,9 @@ pub struct MiddlewareServiceFileConfig {
     pub grpc_endpoint: String,
     /// Operator-owned body limit for every binding exposed by this service.
     pub max_body_bytes: u64,
+    /// Default RPC timeout using an integer with an `ms` or `s` suffix.
+    #[serde(default)]
+    pub timeout: Option<String>,
 }
 
 impl From<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
@@ -185,6 +188,7 @@ impl From<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
             name: config.name.clone(),
             grpc_endpoint: config.grpc_endpoint.clone(),
             max_body_bytes: config.max_body_bytes,
+            timeout: config.timeout.clone().unwrap_or_default(),
         }
     }
 }
@@ -437,6 +441,7 @@ allow_unauthenticated_users = true
 name = "local-guard"
 grpc_endpoint = "http://127.0.0.1:50051"
 max_body_bytes = 262144
+timeout = "2s"
 "#;
         let tmp = write_tmp(toml);
         let file = load(tmp.path()).expect("valid middleware registration parses");
@@ -446,8 +451,11 @@ max_body_bytes = 262144
                 name: "local-guard".into(),
                 grpc_endpoint: "http://127.0.0.1:50051".into(),
                 max_body_bytes: 262_144,
+                timeout: Some("2s".into()),
             }]
         );
+        let registration = SupervisorMiddlewareService::from(&file.openshell.gateway.middleware[0]);
+        assert_eq!(registration.timeout, "2s");
     }
 
     #[test]

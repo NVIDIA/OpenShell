@@ -45,6 +45,11 @@ message MiddlewareBinding {
   SupervisorMiddlewarePhase phase = 3;
   // Maximum request or replacement body this binding can process.
   uint64 max_body_bytes = 4;
+  // Optional binding-specific RPC timeout. Empty uses the operator-configured
+  // service timeout, or the 500ms platform default when that is also omitted.
+  // Values use an integer with an `ms` or `s` suffix and must be between 10ms
+  // and 30s.
+  string timeout = 5;
 }
 
 // ValidateConfigRequest contains one policy configuration to validate.

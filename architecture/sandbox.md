@@ -81,6 +81,12 @@ reasons, findings, and metadata each have explicit size or cardinality limits.
 Policies contain at most 10 middleware configs with 32 combined host selector
 patterns each. Runtime selection defensively allows at most 10 stages, each of
 which can return 32 findings, for a derived chain maximum of 320 findings.
+Middleware RPCs default to a 500 ms deadline. Operators can set a service-wide
+`timeout` in gateway configuration, and a service can advertise a more specific
+timeout for each binding in its `Describe` manifest. Both use integer `ms` or
+`s` values bounded from 10 ms through 30 s. Binding values take precedence over
+the service value; `Describe` uses the service value because bindings have not
+been discovered yet.
 Registration and manifest body limits above the platform boundary fail before
 request-body allocation. External per-request reason, finding text, mutation
 errors, and diagnostic metadata are untrusted: the supervisor maps logged

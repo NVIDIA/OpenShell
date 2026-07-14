@@ -16,11 +16,9 @@ use tonic::{Request, Response, Status};
 use crate::MIDDLEWARE_GRPC_MESSAGE_BYTES;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct RemoteMiddlewareService {
-    registration_name: String,
     client: SupervisorMiddlewareClient<Channel>,
 }
 
@@ -52,26 +50,10 @@ impl RemoteMiddlewareService {
                 )
             })?;
         Ok(Self {
-            registration_name: registration_name.to_string(),
             client: SupervisorMiddlewareClient::new(channel)
                 .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
         })
-    }
-
-    async fn with_timeout<T>(
-        &self,
-        operation: &'static str,
-        future: impl Future<Output = std::result::Result<Response<T>, Status>>,
-    ) -> std::result::Result<Response<T>, Status> {
-        tokio::time::timeout(RPC_TIMEOUT, future)
-            .await
-            .map_err(|_| {
-                Status::deadline_exceeded(format!(
-                    "middleware '{}' {operation} timed out",
-                    self.registration_name
-                ))
-            })?
     }
 }
 
@@ -82,8 +64,7 @@ impl SupervisorMiddleware for RemoteMiddlewareService {
         request: Request<()>,
     ) -> std::result::Result<Response<MiddlewareManifest>, Status> {
         let mut client = self.client.clone();
-        self.with_timeout("Describe", client.describe(request))
-            .await
+        client.describe(request).await
     }
 
     async fn validate_config(
@@ -91,8 +72,7 @@ impl SupervisorMiddleware for RemoteMiddlewareService {
         request: Request<ValidateConfigRequest>,
     ) -> std::result::Result<Response<ValidateConfigResponse>, Status> {
         let mut client = self.client.clone();
-        self.with_timeout("ValidateConfig", client.validate_config(request))
-            .await
+        client.validate_config(request).await
     }
 
     async fn evaluate_http_request(
@@ -100,7 +80,6 @@ impl SupervisorMiddleware for RemoteMiddlewareService {
         request: Request<HttpRequestEvaluation>,
     ) -> std::result::Result<Response<HttpRequestResult>, Status> {
         let mut client = self.client.clone();
-        self.with_timeout("EvaluateHttpRequest", client.evaluate_http_request(request))
-            .await
+        client.evaluate_http_request(request).await
     }
 }

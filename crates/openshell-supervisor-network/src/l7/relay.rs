@@ -3250,6 +3250,7 @@ network_policies:
                         phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
                             as i32,
                         max_body_bytes: 8192,
+                        timeout: String::new(),
                     }],
                 },
             ))
@@ -3750,6 +3751,7 @@ network_policies:
                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_body_bytes,
+                timeout: String::new(),
             };
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/two-limits".into(),

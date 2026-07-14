@@ -47,6 +47,7 @@ pub fn describe() -> MiddlewareBinding {
         operation: SupervisorMiddlewareOperation::HttpRequest as i32,
         phase: SupervisorMiddlewarePhase::PreCredentials as i32,
         max_body_bytes: MAX_BODY_BYTES,
+        timeout: String::new(),
     }
 }
 

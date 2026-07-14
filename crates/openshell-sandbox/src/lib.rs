@@ -3289,6 +3289,7 @@ filesystem_policy:
             name: "unavailable-guard".into(),
             grpc_endpoint: "http://127.0.0.1:1".into(),
             max_body_bytes: 1024,
+            ..Default::default()
         };
         connect_middleware_registry(&[invalid_external])
             .await

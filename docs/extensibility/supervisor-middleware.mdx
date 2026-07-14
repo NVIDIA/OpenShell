@@ -48,6 +48,7 @@ Start an operator-run service before starting the gateway, then add a registrati
 name = "local-content-guard"
 grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
+timeout = "500ms"
 ```
 
 | Field | Description |
@@ -55,6 +56,9 @@ max_body_bytes = 262144
 | `name` | Operator-facing registration name used in diagnostics. Policies do not reference this value. |
 | `grpc_endpoint` | Service address reachable from both the gateway and sandbox supervisors. Supports plaintext `http://` and TLS `https://` with platform trust roots. |
 | `max_body_bytes` | Operator limit applied to every binding exposed by the service, up to the 4 MiB platform maximum. |
+| `timeout` | Optional service-wide RPC timeout using an integer with an `ms` or `s` suffix. Defaults to `500ms`; valid values range from `10ms` through `30s`. |
+
+Each binding returned by `Describe` may advertise its own `timeout` using the same syntax and bounds. A binding timeout takes precedence over the gateway service setting; an omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The service timeout applies to `Describe`, while the effective binding timeout applies to `ValidateConfig` and `EvaluateHttpRequest`.
 
 The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes a binding ID already owned by another service. Operator-run services cannot claim the reserved `openshell/` namespace.
 

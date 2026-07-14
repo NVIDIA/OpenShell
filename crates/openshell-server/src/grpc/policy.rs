@@ -9658,6 +9658,7 @@ mod tests {
             name: "local-guard".into(),
             grpc_endpoint: "http://127.0.0.1:50051".into(),
             max_body_bytes: 1024,
+            ..Default::default()
         };
 
         let without = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);

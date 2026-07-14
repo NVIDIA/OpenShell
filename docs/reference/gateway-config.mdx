@@ -110,6 +110,7 @@ grpc_rate_limit_window_seconds = 60
 name = "local-content-guard"
 grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
+timeout = "500ms"
 
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
@@ -157,6 +158,7 @@ Register operator-run supervisor middleware services with one or more `[[openshe
 name = "local-content-guard"
 grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
+timeout = "500ms"
 ```
 
 Each service implements the supervisor middleware gRPC contract and may expose multiple binding IDs through `Describe`. Policies reference those binding IDs, not the registration `name`. The gateway rejects duplicate binding IDs across services and prevents operator-run services from claiming the reserved `openshell/` namespace.
@@ -164,6 +166,8 @@ Each service implements the supervisor middleware gRPC contract and may expose m
 The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
 
 `max_body_bytes` is the operator limit for every binding exposed by the service. It must be greater than zero, no larger than each binding's advertised limit, and no larger than the 4 MiB platform maximum. OpenShell rejects an oversized value instead of silently clamping it. Middleware gRPC servers should allow messages of at least 4 MiB plus 292 KiB so a maximum-size body and its protobuf envelope fit on the transport.
+
+`timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise its own `timeout` in the `Describe` manifest; that binding-specific value takes precedence over the service setting. OpenShell validates both levels before accepting the service. The effective timeout covers `ValidateConfig` and `EvaluateHttpRequest`; `Describe` uses the service timeout because binding metadata is not available yet.
 
 The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
 
