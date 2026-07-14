@@ -1231,10 +1231,12 @@ message UpdateConfigRequest {
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   // Ignored for global-scoped updates.
   uint64 expected_resource_version = 8;
-  // Complete, non-secret provenance for a sandbox policy revision. The gateway
-  // stores this map immutably with the revision and also merges it into sandbox
-  // metadata as a convenience projection. For setting-only updates, the map is
-  // only merged into sandbox metadata.
+  // Caller-provided annotations associated with a sandbox-scoped update. Values
+  // must not contain secrets; the gateway treats them as opaque metadata and does
+  // not interpret or verify their semantics. For policy updates, the gateway
+  // stores the annotations immutably with the revision and merges them into
+  // sandbox metadata as a convenience projection. For setting-only updates, it
+  // only merges them into sandbox metadata.
   map<string, string> annotations = 9;
 }
 
