@@ -16,15 +16,15 @@ tests:
       pkiInitJob.enabled: true
       certManager.enabled: false
     asserts:
-      - equal:
-          path: spec.template.spec.volumes[3].name
-          value: tls-client-ca
-      - equal:
-          path: spec.template.spec.volumes[3].secret.secretName
-          value: openshell-server-tls
-      - equal:
-          path: spec.template.spec.volumes[3].secret.items[0].key
-          value: ca.crt
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls-client-ca
+            secret:
+              secretName: openshell-server-tls
+              items:
+                - key: ca.crt
+                  path: ca.crt
 
   - it: shares the cert-manager server TLS ca.crt when clientCaFromServerTlsSecret is true
     template: templates/statefulset.yaml
@@ -32,15 +32,15 @@ tests:
       certManager.enabled: true
       certManager.clientCaFromServerTlsSecret: true
     asserts:
-      - equal:
-          path: spec.template.spec.volumes[3].name
-          value: tls-client-ca
-      - equal:
-          path: spec.template.spec.volumes[3].secret.secretName
-          value: openshell-server-tls
-      - equal:
-          path: spec.template.spec.volumes[3].secret.items[0].key
-          value: ca.crt
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls-client-ca
+            secret:
+              secretName: openshell-server-tls
+              items:
+                - key: ca.crt
+                  path: ca.crt
 
   # Regression: with cert-manager enabled and pkiInitJob left at its default
   # `true`, the client CA condition must honor certManager precedence and NOT
@@ -54,14 +54,13 @@ tests:
       certManager.clientCaFromServerTlsSecret: false
       pkiInitJob.enabled: true
     asserts:
-      - equal:
-          path: spec.template.spec.volumes[3].name
-          value: tls-client-ca
-      - equal:
-          path: spec.template.spec.volumes[3].secret.secretName
-          value: openshell-server-client-ca
-      - notExists:
-          path: spec.template.spec.volumes[3].secret.items
+      # Exact matching (without any: true) also verifies that secret.items is absent.
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tls-client-ca
+            secret:
+              secretName: openshell-server-client-ca
 
   # When cert-manager owns TLS, does not share its CA, and no separate client CA
   # secret is configured, there is no client CA to mount: the volume must not
@@ -74,12 +73,14 @@ tests:
       pkiInitJob.enabled: true
       server.tls.clientCaSecretName: ""
     asserts:
-      - lengthEqual:
+      - notContains:
           path: spec.template.spec.volumes
-          count: 3
+          content:
+            name: tls-client-ca
+          any: true
       - notContains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
             name: tls-client-ca
             mountPath: /etc/openshell-tls/client-ca
-            readOnly: true
+          any: true
