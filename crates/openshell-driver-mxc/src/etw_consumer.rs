@@ -1254,6 +1254,20 @@ fn map_config_state(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
 }
 
 /// `CreateProcessInSandbox` (populated) → Process Activity [1007] "Launch".
+///
+/// PRIVACY NOTE (review item #3): `cmd_line` is copied **verbatim** from MXC's
+/// ETW event into the OCSF `process.cmd_line` field. This consumer performs **no
+/// privacy/secret filtering** — if a caller passes credentials, tokens, or PII on
+/// the command line, they will appear **unredacted** in the durable audit trail.
+/// This is deliberate (audit fidelity), so the OCSF log must be treated as
+/// sensitive at rest and in transit.
+///
+/// Redaction is intentionally **not** done here and is owned by an upstream
+/// privacy layer, not the ETW→OCSF path. Note that no general PII/secret scrubber
+/// covers this field today: the only redaction that exists
+/// (`openshell_core::secrets`, `${…}` → `[CREDENTIAL]`) is scoped to the network
+/// proxy's HTTP-target logging, a separate egress path. If/when a general
+/// audit-output PII filter lands, this field is where it must apply.
 fn map_process_launch(ctx: &SandboxContext, ev: &DecodedEtwEvent, cmd_line: &str) -> OcsfEvent {
     // The created process's own pid isn't in this event (it appears later in
     // `ProcessLaunched`); the emitting pid is the sandbox host (wxc-exec).
