@@ -1,0 +1,108 @@
+name: Build CI Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/docker/Dockerfile.ci'
+      - 'mise.toml'
+      - 'mise.lock'
+      - 'tasks/**'
+      - '.github/workflows/ci-image.yml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  CI_IMAGE: ghcr.io/nvidia/openshell/ci
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-ci-image:
+    name: Build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: linux-amd64-cpu8
+          - arch: arm64
+            platform: linux/arm64
+            runner: linux-arm64-cpu8
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve BuildKit config
+        id: buildkit
+        run: |
+          if [[ -r /etc/buildkit/buildkitd.toml ]]; then
+            echo "config=/etc/buildkit/buildkitd.toml" >> "$GITHUB_OUTPUT"
+          else
+            echo "config=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+        with:
+          buildkitd-config: ${{ steps.buildkit.outputs.config }}
+
+      - name: Build and push CI image
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARCH_IMAGE: ${{ env.CI_IMAGE }}:${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --builder openshell \
+            --platform "${{ matrix.platform }}" \
+            --secret id=MISE_GITHUB_TOKEN,env=MISE_GITHUB_TOKEN \
+            --cache-from "type=gha,scope=ci-image-${{ matrix.arch }}" \
+            --cache-to "type=gha,mode=max,scope=ci-image-${{ matrix.arch }}" \
+            --push \
+            -t "$ARCH_IMAGE" \
+            -f deploy/docker/Dockerfile.ci \
+            .
+
+      - name: Smoke check CI image
+        env:
+          ARCH_IMAGE: ${{ env.CI_IMAGE }}:${{ github.sha }}-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          docker run --rm --platform "${{ matrix.platform }}" "$ARCH_IMAGE" mise --version
+          docker run --rm --platform "${{ matrix.platform }}" "$ARCH_IMAGE" gh --version
+          docker run --rm --platform "${{ matrix.platform }}" "$ARCH_IMAGE" docker buildx version
+
+  merge-ci-image:
+    name: Merge manifest
+    needs: build-ci-image
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 10
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --prefer-index=false \
+            -t "${CI_IMAGE}:${GITHUB_SHA}" \
+            -t "${CI_IMAGE}:latest" \
+            "${CI_IMAGE}:${GITHUB_SHA}-amd64" \
+            "${CI_IMAGE}:${GITHUB_SHA}-arm64"
