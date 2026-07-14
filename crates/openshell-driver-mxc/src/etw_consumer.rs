@@ -52,6 +52,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -215,17 +216,39 @@ impl DecodedEtwEvent {
 // Session handle (RAII)
 // ---------------------------------------------------------------------------
 
+/// Health of the blocking `ProcessTrace` pump, shared between the pump thread and
+/// the owning [`EtwSession`] (review #4). Previously `ProcessTrace`'s result was
+/// discarded, so if capture died mid-run (e.g. the session was stopped out from
+/// under us) the backend had no way to know. The pump records its outcome here so
+/// an *unexpected* termination is logged at ERROR and can be queried via
+/// [`EtwSession::is_capture_alive`].
+#[derive(Default)]
+struct CaptureHealth {
+    /// Set once the pump's `ProcessTrace` has returned (capture is no longer running).
+    stopped: AtomicBool,
+    /// Set by [`EtwSession::stop`] *before* stopping the session, so a deliberate
+    /// shutdown isn't misreported as a capture failure.
+    stopping: AtomicBool,
+    /// The `WIN32_ERROR` code `ProcessTrace` returned (0 == `ERROR_SUCCESS`).
+    /// Only meaningful once `stopped` is set.
+    exit_code: AtomicU32,
+}
+
 /// A running real-time ETW session plus its worker threads. Dropping (or calling
 /// [`EtwSession::stop`]) stops the session and joins the threads.
 pub(crate) struct EtwSession {
     handle: u64,
     pump_thread: Option<JoinHandle<()>>,
     consumer_thread: Option<JoinHandle<()>>,
+    health: Arc<CaptureHealth>,
 }
 
 impl EtwSession {
     /// Stop the session and join worker threads. Idempotent.
     pub fn stop(&mut self) {
+        // Mark the stop as expected *before* triggering it so the pump thread's
+        // `ProcessTrace` return isn't logged as an unexpected capture death.
+        self.health.stopping.store(true, Ordering::SeqCst);
         if self.handle != 0 {
             stop_session(self.handle);
             self.handle = 0;
@@ -239,6 +262,14 @@ impl EtwSession {
         if let Some(t) = self.consumer_thread.take() {
             let _ = t.join();
         }
+    }
+
+    /// Whether the `ProcessTrace` pump is still running. Returns `false` once the
+    /// pump has returned — whether from a deliberate [`stop`](Self::stop) or an
+    /// unexpected termination. Exposed so the backend can surface capture health
+    /// in status/diagnostics (review #4).
+    pub fn is_capture_alive(&self) -> bool {
+        !self.health.stopped.load(Ordering::SeqCst)
     }
 }
 
@@ -336,9 +367,11 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
         }
     };
 
+    let health = Arc::new(CaptureHealth::default());
+    let pump_health = health.clone();
     let pump_thread = match std::thread::Builder::new()
         .name("etw-ocsf-pump".into())
-        .spawn(move || run_trace(opened))
+        .spawn(move || run_trace(opened, pump_health))
     {
         Ok(t) => t,
         Err(e) => {
@@ -360,6 +393,7 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
         handle,
         pump_thread: Some(pump_thread),
         consumer_thread: Some(consumer_thread),
+        health,
     })
 }
 
@@ -542,14 +576,38 @@ fn open_trace(tx_ptr: *mut mpsc::Sender<RawEtwEvent>) -> Result<OpenedTrace, Str
 /// Run the blocking `ProcessTrace` pump for an already-opened trace, then clean
 /// up. Owns [`OpenedTrace`] for its whole lifetime so the `LoggerName` buffer and
 /// boxed `Sender` stay valid until `ProcessTrace` returns.
-fn run_trace(opened: OpenedTrace) {
+///
+/// `ProcessTrace` blocks until the session stops. A deliberate stop (via
+/// [`EtwSession::stop`], which sets `health.stopping`) is normal; any *other*
+/// return means capture died and is recorded + logged at ERROR (review #4) so it
+/// isn't silently discarded.
+fn run_trace(opened: OpenedTrace, health: Arc<CaptureHealth>) {
     let OpenedTrace {
         handle,
         name,
         tx_ptr,
     } = opened;
 
-    let _ = unsafe { ProcessTrace(&[handle], None, None) };
+    let status = unsafe { ProcessTrace(&[handle], None, None) };
+
+    // Record the outcome before any cleanup so a health query never races a
+    // still-"alive" state after the pump has actually returned.
+    health.exit_code.store(status.0, Ordering::SeqCst);
+    health.stopped.store(true, Ordering::SeqCst);
+
+    let expected = health.stopping.load(Ordering::SeqCst);
+    if !expected {
+        // The session went away without anyone asking it to (e.g. an external
+        // `logman stop`, a provider error, or a dropped trace). Surface it — the
+        // OCSF audit trail is now blind until the driver is restarted.
+        tracing::error!(
+            target: "mxc_etw",
+            code = status.0,
+            "ETW ProcessTrace terminated unexpectedly; MXC OCSF capture is no longer running"
+        );
+    } else {
+        tracing::debug!(target: "mxc_etw", code = status.0, "ETW ProcessTrace returned after stop");
+    }
 
     unsafe {
         let _ = CloseTrace(handle);
