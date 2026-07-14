@@ -55,7 +55,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
@@ -67,7 +67,7 @@ use tracing::{debug, error, info, warn};
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use compute::ComputeRuntime;
+use compute::{ComputeRuntime, GatewayListenerRequirement};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
@@ -381,8 +381,10 @@ pub(crate) async fn run_server(
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
 
-    let gateway_listener_addresses =
-        gateway_listener_addresses(config.bind_address, state.compute.gateway_bind_addresses());
+    let gateway_listener_addresses = gateway_listener_addresses(
+        config.bind_address,
+        state.compute.gateway_listener_requirements(),
+    )?;
     let mut gateway_listeners = Vec::with_capacity(gateway_listener_addresses.len());
     for address in gateway_listener_addresses {
         let listener = TcpListener::bind(address)
@@ -493,10 +495,48 @@ pub(crate) async fn run_server(
 
 fn gateway_listener_addresses(
     bind_address: SocketAddr,
-    extra_addresses: &[SocketAddr],
-) -> Vec<SocketAddr> {
+    requirements: &[GatewayListenerRequirement],
+) -> Result<Vec<SocketAddr>> {
+    let needs_local_interface_resolution = requirements.iter().any(|requirement| {
+        matches!(
+            requirement,
+            GatewayListenerRequirement::LocalInterface { .. }
+        )
+    }) && !std::iter::once(bind_address)
+        .chain(
+            requirements
+                .iter()
+                .filter_map(|requirement| match requirement {
+                    GatewayListenerRequirement::Exact { address, .. } => Some(*address),
+                    GatewayListenerRequirement::LocalInterface { .. } => None,
+                }),
+        )
+        .any(listener_satisfies_local_interface);
+    let local_interface_ips = if needs_local_interface_resolution {
+        gateway_local_interface_ips()?
+    } else {
+        Vec::new()
+    };
+    gateway_listener_addresses_with_local_ips(bind_address, requirements, &local_interface_ips)
+}
+
+fn gateway_listener_addresses_with_local_ips(
+    bind_address: SocketAddr,
+    requirements: &[GatewayListenerRequirement],
+    local_interface_ips: &[IpAddr],
+) -> Result<Vec<SocketAddr>> {
     let mut addresses = vec![bind_address];
-    for address in extra_addresses {
+
+    // Resolve exact requirements first so semantic requirements can be
+    // satisfied by an exact listener regardless of response ordering.
+    for requirement in requirements {
+        let GatewayListenerRequirement::Exact { address, .. } = requirement else {
+            continue;
+        };
+        // These are protocol invariants, not authorization. A production
+        // listener policy must still decide which drivers and addresses are
+        // allowed before the gateway binds them.
+        validate_driver_gateway_listener(bind_address, *address)?;
         if !addresses
             .iter()
             .any(|existing| listener_covers(*existing, *address))
@@ -504,7 +544,129 @@ fn gateway_listener_addresses(
             addresses.push(*address);
         }
     }
-    addresses
+
+    for requirement in requirements {
+        let GatewayListenerRequirement::LocalInterface { reason } = requirement else {
+            continue;
+        };
+        if addresses
+            .iter()
+            .any(|address| listener_satisfies_local_interface(*address))
+        {
+            continue;
+        }
+
+        let Some(ip) = preferred_gateway_local_interface_ip(local_interface_ips) else {
+            return Err(Error::config(format!(
+                "compute driver requested a gateway-local interface listener but the gateway found no usable non-loopback, non-link-local address (reason: {reason})"
+            )));
+        };
+        let address = SocketAddr::new(ip, bind_address.port());
+        info!(
+            %address,
+            %reason,
+            "Resolved compute driver gateway-local interface requirement"
+        );
+        validate_driver_gateway_listener(bind_address, address)?;
+        if !addresses
+            .iter()
+            .any(|existing| listener_covers(*existing, address))
+        {
+            addresses.push(address);
+        }
+    }
+    Ok(addresses)
+}
+
+fn validate_driver_gateway_listener(
+    primary_listener: SocketAddr,
+    requested_listener: SocketAddr,
+) -> Result<()> {
+    if requested_listener.ip().is_unspecified() {
+        return Err(Error::config(format!(
+            "compute driver requested wildcard gateway listener {requested_listener}"
+        )));
+    }
+    if requested_listener.ip().is_multicast() {
+        return Err(Error::config(format!(
+            "compute driver requested multicast gateway listener {requested_listener}"
+        )));
+    }
+    if requested_listener.port() == 0 || requested_listener.port() != primary_listener.port() {
+        return Err(Error::config(format!(
+            "compute driver requested gateway listener {requested_listener} with a port that does not match the primary gateway listener {primary_listener}"
+        )));
+    }
+    Ok(())
+}
+
+fn listener_satisfies_local_interface(address: SocketAddr) -> bool {
+    address.ip().is_unspecified() || gateway_local_interface_ip_is_usable(address.ip())
+}
+
+fn preferred_gateway_local_interface_ip(addresses: &[IpAddr]) -> Option<IpAddr> {
+    let mut candidates = addresses
+        .iter()
+        .copied()
+        .filter(|ip| gateway_local_interface_ip_is_usable(*ip))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        gateway_local_interface_family_rank(*left)
+            .cmp(&gateway_local_interface_family_rank(*right))
+            .then_with(|| left.cmp(right))
+    });
+    candidates.dedup();
+    candidates.into_iter().next()
+}
+
+const fn gateway_local_interface_family_rank(address: IpAddr) -> u8 {
+    match address {
+        IpAddr::V4(_) => 0,
+        IpAddr::V6(_) => 1,
+    }
+}
+
+fn gateway_local_interface_ip_is_usable(address: IpAddr) -> bool {
+    !address.is_loopback()
+        && !address.is_unspecified()
+        && !address.is_multicast()
+        && !openshell_core::net::is_link_local_ip(address)
+}
+
+#[cfg(unix)]
+fn gateway_local_interface_ips() -> Result<Vec<IpAddr>> {
+    let interfaces = nix::ifaddrs::getifaddrs().map_err(|err| {
+        Error::config(format!(
+            "failed to enumerate gateway-local interface addresses: {err}"
+        ))
+    })?;
+    let mut addresses = Vec::new();
+    for interface in interfaces {
+        let Some(address) = interface.address else {
+            continue;
+        };
+        let address = address
+            .as_sockaddr_in()
+            .map(|address| IpAddr::V4(address.ip()))
+            .or_else(|| {
+                address
+                    .as_sockaddr_in6()
+                    .map(|address| IpAddr::V6(address.ip()))
+            });
+        if let Some(address) = address
+            && !addresses.contains(&address)
+        {
+            addresses.push(address);
+        }
+    }
+    Ok(addresses)
+}
+
+#[cfg(not(unix))]
+fn gateway_local_interface_ips() -> Result<Vec<IpAddr>> {
+    Err(Error::config(
+        "gateway-local interface listener requirements are not supported on this platform",
+    ))
 }
 
 fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
@@ -516,8 +678,8 @@ fn listener_covers(existing: SocketAddr, requested: SocketAddr) -> bool {
     }
 
     match (existing.ip(), requested.ip()) {
-        (std::net::IpAddr::V4(existing), std::net::IpAddr::V4(_)) => existing.is_unspecified(),
-        (std::net::IpAddr::V6(existing), std::net::IpAddr::V6(_)) => existing.is_unspecified(),
+        (IpAddr::V4(existing), IpAddr::V4(_)) => existing.is_unspecified(),
+        (IpAddr::V6(existing), IpAddr::V6(_)) => existing.is_unspecified(),
         _ => false,
     }
 }
@@ -898,9 +1060,10 @@ fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfiguredComputeDriver, ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
-        allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_addresses, is_benign_tls_handshake_failure,
+        ConfiguredComputeDriver, ConnectionProtocol, GatewayListenerRequirement, MultiplexService,
+        ServerState, TlsAcceptor, allow_plaintext_service_http, classify_initial_bytes,
+        configured_compute_driver, gateway_listener_addresses,
+        gateway_listener_addresses_with_local_ips, is_benign_tls_handshake_failure,
         kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
     };
     use openshell_core::{
@@ -908,7 +1071,7 @@ mod tests {
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
     use std::io::{Error, ErrorKind};
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::{TempDir, tempdir};
@@ -1375,9 +1538,13 @@ mod tests {
     fn gateway_listener_addresses_skip_driver_address_covered_by_wildcard() {
         let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
+        let requirements = [
+            exact_listener_requirement(docker),
+            exact_listener_requirement(docker),
+        ];
 
         assert_eq!(
-            gateway_listener_addresses(primary, &[docker, docker]),
+            gateway_listener_addresses(primary, &requirements).unwrap(),
             vec![primary]
         );
     }
@@ -1386,10 +1553,119 @@ mod tests {
     fn gateway_listener_addresses_include_driver_address_on_distinct_ip() {
         let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();
+        let requirements = [
+            exact_listener_requirement(docker),
+            exact_listener_requirement(docker),
+        ];
 
         assert_eq!(
-            gateway_listener_addresses(primary, &[docker, docker]),
+            gateway_listener_addresses(primary, &requirements).unwrap(),
             vec![primary, docker]
         );
+    }
+
+    #[test]
+    fn gateway_listener_addresses_reject_driver_wildcard() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let requested: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+
+        let err = gateway_listener_addresses(primary, &[exact_listener_requirement(requested)])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("wildcard gateway listener"));
+    }
+
+    #[test]
+    fn gateway_listener_addresses_reject_driver_port_mismatch() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let requested: SocketAddr = "172.18.0.1:9090".parse().unwrap();
+
+        let err = gateway_listener_addresses(primary, &[exact_listener_requirement(requested)])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn gateway_listener_addresses_resolve_local_interface_in_gateway_namespace() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let local_interface_ips = [
+            "127.0.0.1".parse::<IpAddr>().unwrap(),
+            "169.254.20.1".parse().unwrap(),
+            "2001:db8::20".parse().unwrap(),
+            "192.0.2.20".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            gateway_listener_addresses_with_local_ips(
+                primary,
+                &[local_interface_requirement()],
+                &local_interface_ips,
+            )
+            .unwrap(),
+            vec![primary, "192.0.2.20:8080".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_addresses_skip_local_resolution_when_primary_covers_it() {
+        let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+
+        assert_eq!(
+            gateway_listener_addresses_with_local_ips(
+                primary,
+                &[local_interface_requirement()],
+                &[],
+            )
+            .unwrap(),
+            vec![primary]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_addresses_exact_requirement_can_satisfy_earlier_local_requirement() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let exact: SocketAddr = "192.0.2.20:8080".parse().unwrap();
+        let requirements = [
+            local_interface_requirement(),
+            exact_listener_requirement(exact),
+        ];
+
+        assert_eq!(
+            gateway_listener_addresses_with_local_ips(primary, &requirements, &[]).unwrap(),
+            vec![primary, exact]
+        );
+    }
+
+    #[test]
+    fn gateway_listener_addresses_reject_unresolvable_local_interface() {
+        let primary: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let unusable_ips = [
+            "127.0.0.1".parse::<IpAddr>().unwrap(),
+            "169.254.20.1".parse().unwrap(),
+            "fe80::1".parse().unwrap(),
+        ];
+
+        let err = gateway_listener_addresses_with_local_ips(
+            primary,
+            &[local_interface_requirement()],
+            &unusable_ips,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("no usable non-loopback"));
+    }
+
+    fn exact_listener_requirement(address: SocketAddr) -> GatewayListenerRequirement {
+        GatewayListenerRequirement::Exact {
+            address,
+            reason: "test exact listener".to_string(),
+        }
+    }
+
+    fn local_interface_requirement() -> GatewayListenerRequirement {
+        GatewayListenerRequirement::LocalInterface {
+            reason: "test gateway-local listener".to_string(),
+        }
     }
 }

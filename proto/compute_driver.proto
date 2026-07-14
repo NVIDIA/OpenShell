@@ -19,6 +19,11 @@ service ComputeDriver {
   // Report driver capabilities and defaults.
   rpc GetCapabilities(GetCapabilitiesRequest) returns (GetCapabilitiesResponse);
 
+  // Report additional gateway listeners required to make sandbox callbacks
+  // reachable through this driver's compute network.
+  rpc GetGatewayListenerRequirements(GetGatewayListenerRequirementsRequest)
+      returns (GetGatewayListenerRequirementsResponse);
+
   // Validate a sandbox before create-time provisioning.
   rpc ValidateSandboxCreate(ValidateSandboxCreateRequest)
       returns (ValidateSandboxCreateResponse);
@@ -54,6 +59,34 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
+}
+
+message GetGatewayListenerRequirementsRequest {}
+
+// A listener requirement is not authorization to expose the gateway. The
+// gateway owns requirement validation, authorization, resolution, and the
+// authoritative bind.
+message GatewayListenerRequirement {
+  // Untrusted human-readable driver rationale for diagnostics.
+  string reason = 1;
+
+  oneof selector {
+    // Concrete IP:port address requested by the driver. The port must match
+    // the gateway's primary listener.
+    string exact_bind_address = 2;
+    // Ask the gateway to select a non-loopback, non-link-local address from
+    // its own network namespace, using the primary listener's port.
+    GatewayLocalInterfaceRequirement local_interface = 3;
+  }
+}
+
+// Semantic requirement used when the driver cannot safely inspect the
+// gateway's network namespace. Fields can be added as new selection
+// constraints are demonstrated by drivers.
+message GatewayLocalInterfaceRequirement {}
+
+message GetGatewayListenerRequirementsResponse {
+  repeated GatewayListenerRequirement requirements = 1;
 }
 
 // Driver-owned sandbox model used for create requests and platform observations.

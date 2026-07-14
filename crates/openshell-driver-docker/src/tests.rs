@@ -223,6 +223,44 @@ fn container_visible_endpoint_rewrites_loopback_hosts() {
     );
 }
 
+#[tokio::test]
+async fn gateway_listener_requirements_report_managed_bridge_address() {
+    let driver = test_driver_with_config(runtime_config());
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.requirements.len(), 1);
+    assert_eq!(
+        response.requirements[0].selector,
+        Some(Selector::ExactBindAddress(format!(
+            "172.18.0.1:{DEFAULT_SERVER_PORT}"
+        )))
+    );
+    assert_eq!(
+        response.requirements[0].reason,
+        "docker managed bridge gateway"
+    );
+}
+
+#[tokio::test]
+async fn gateway_listener_requirements_are_empty_for_host_gateway_route() {
+    let mut config = runtime_config();
+    config.gateway_route = DockerGatewayRoute::HostGateway;
+    let driver = test_driver_with_config(config);
+
+    let response = driver
+        .get_gateway_listener_requirements(Request::new(GetGatewayListenerRequirementsRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(response.requirements.is_empty());
+}
+
 #[test]
 fn docker_bridge_gateway_ip_requires_ipv4_gateway() {
     let network = bollard::models::NetworkInspect {

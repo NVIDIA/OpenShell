@@ -97,6 +97,7 @@ rustix = { workspace = true }
 x509-parser = "0.16"
 arc-swap = "1"
 notify = "8"
+nix = { workspace = true, features = ["net"] }
 
 [features]
 default = ["telemetry"]
