@@ -49,6 +49,8 @@ assert_contains \
 assert_contains \
   "$service" \
   'ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal'
+assert_contains "$service" 'Restart=on-failure'
+assert_contains "$service" 'RestartSec=5s'
 assert_not_contains "$service" '%S/openshell/tls'
 
 assert_contains \
@@ -57,6 +59,8 @@ assert_contains \
 assert_contains \
   "$spec" \
   'ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal'
+assert_contains "$spec" 'Restart=on-failure'
+assert_contains "$spec" 'RestartSec=5'
 assert_not_contains "$spec" '%%S/openshell/tls'
 
 echo "packaging asset tests passed"

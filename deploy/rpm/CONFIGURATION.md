@@ -13,29 +13,56 @@ The RPM ships a default TOML configuration template at
 `openshell-gateway.service`, the systemd unit copies this template to
 `~/.config/openshell/gateway.toml` if no config file exists there yet.
 
-The defaults are tuned for rootless Podman use:
+The default keeps the listener on loopback while leaving compute driver
+selection automatic:
 
 ```toml
 [openshell]
 version = 1
 
 [openshell.gateway]
-bind_address = "0.0.0.0:17670"
-compute_drivers = ["podman"]
+bind_address = "127.0.0.1:17670"
 ```
 
-`bind_address = "0.0.0.0:17670"` is required because Podman sandbox
-containers reach the gateway over the host network bridge and cannot
-connect to `127.0.0.1` inside the gateway's network namespace. mTLS is
-enabled by default and protects all connections.
+The loopback default avoids exposing the gateway on host network interfaces.
+Rootless Podman sandbox containers cannot reach host loopback from their
+network namespace. Configure `bind_address = "0.0.0.0:17670"` before creating
+Podman-backed sandboxes.
 
-`compute_drivers = ["podman"]` pins the compute driver to Podman. Without
-this, the gateway auto-detects in order: Kubernetes, Podman, Docker. Pinning
-prevents unexpected driver selection if Docker is also installed on the host.
+When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then a
+reachable Podman socket, then Docker. Set `compute_drivers = ["docker"]` or
+`compute_drivers = ["podman"]` to require a specific container runtime.
+
+The RPM does not include the VM driver. To use VM-backed sandboxes, download
+the matching `openshell-driver-vm` release artifact, install the binary in a
+conventional libexec directory (or set `driver_dir` to its location), and
+select it explicitly:
+
+```toml
+[openshell.gateway]
+compute_drivers = ["vm"]
+
+[openshell.drivers.vm]
+grpc_endpoint = "https://host.containers.internal:17670"
+```
+
+The gateway never auto-detects VM support. If it cannot find the binary, the
+startup error lists every directory it searched.
 
 ### Customizing the configuration
 
-Edit `~/.config/openshell/gateway.toml` directly. The template at
+Use the gateway config command to select a driver or update the listener. For
+example, pin Docker:
+
+```shell
+openshell-gateway config set 'openshell.gateway.compute_drivers=["docker"]'
+systemctl --user restart openshell-gateway
+```
+
+Pass another dotted `KEY=VALUE` argument to update more fields atomically. Set
+`openshell.gateway.compute_drivers=[]` to restore automatic driver selection.
+The command preserves comments and unrelated settings. You can also edit
+`~/.config/openshell/gateway.toml` directly. The template at
 `/usr/share/openshell-gateway/gateway.toml.default` is not read at runtime
 and is not overwritten by RPM upgrades.
 
@@ -64,7 +91,7 @@ systemctl --user edit openshell-gateway
 
 The RPM enables mutual TLS by default. The gateway requires a valid
 client certificate for all API connections and listens on
-`0.0.0.0:17670` by default (see "Default configuration" above).
+`127.0.0.1:17670` by default (see "Default configuration" above).
 
 ### Auto-generated certificates
 
@@ -214,8 +241,8 @@ overrides that persist across package upgrades.
 
 | TOML option | Default | Description |
 |-------------|---------|-------------|
-| `bind_address` | `0.0.0.0:17670` (RPM default) | Address for the gRPC/HTTP API. |
-| `compute_drivers` | `["podman"]` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman. |
+| `bind_address` | `127.0.0.1:17670` | Address for the gRPC/HTTP API. Rootless Podman requires `0.0.0.0:17670`. |
+| `compute_drivers` | unset | The gateway auto-detects Kubernetes, then a reachable Podman socket, then Docker. VM requires explicit selection. |
 | `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
 | `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
 | `guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Client TLS material bind-mounted into sandbox containers. |
@@ -228,7 +255,7 @@ the gateway uses `sqlite:$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 ### Driver TOML settings
 
 Create `~/.config/openshell/gateway.toml` when you need to customize driver
-settings:
+settings. For example, pin Podman explicitly:
 
 ```toml
 [openshell]

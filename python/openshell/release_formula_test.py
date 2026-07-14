@@ -57,6 +57,7 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
     assert 'bind_address = "127.0.0.1:17670"' not in formula
     assert '# compute_drivers = ["vm"]' not in formula
     assert 'run opt_libexec/"openshell-gateway-homebrew-service"' in formula
+    assert "keep_alive successful_exit: false" in formula
     assert 'xdg_config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"' in formula
     assert 'xdg_gateway_config="${xdg_config_home}/openshell/gateway.toml"' in formula
     assert 'prefix_gateway_config="#{var}/openshell/gateway.toml"' in formula
@@ -130,6 +131,8 @@ def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
     assert "Environment=OPENSHELL_BIND_ADDRESS" not in spec
     assert "Environment=OPENSHELL_PODMAN_TLS_CA" not in spec
     assert "ExecStart=/usr/bin/openshell-gateway" in spec
+    assert "Restart=on-failure" in spec
+    assert "RestartSec=5" in spec
     assert "--config" not in spec
     assert "--db-url" not in spec
 
@@ -149,5 +152,7 @@ def test_deb_user_service_uses_gateway_defaults_without_config_helper() -> None:
     assert "%S/openshell/tls" not in unit
     assert "init-gateway-config.sh" not in unit
     assert "ExecStart=/usr/bin/openshell-gateway" in unit
+    assert "Restart=on-failure" in unit
+    assert "RestartSec=5s" in unit
     assert "--config" not in unit
     assert "--db-url" not in unit

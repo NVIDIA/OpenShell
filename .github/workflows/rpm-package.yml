@@ -113,6 +113,44 @@ jobs:
           echo "=== Built RPMs ==="
           ls -lah artifacts/
 
+      - name: Verify runtime-neutral RPM installation
+        run: |
+          set -euo pipefail
+
+          cli_rpm=""
+          gateway_rpm=""
+          for rpm_file in artifacts/*.rpm; do
+            case "$(rpm -qp --queryformat '%{NAME}' "$rpm_file")" in
+              openshell) cli_rpm="$rpm_file" ;;
+              openshell-gateway) gateway_rpm="$rpm_file" ;;
+            esac
+          done
+          test -n "$cli_rpm"
+          test -n "$gateway_rpm"
+
+          if rpm -qp --recommends "$cli_rpm" | grep -Eq '^podman([[:space:]]|$)'; then
+            echo "::error::The openshell RPM still recommends Podman"
+            exit 1
+          fi
+          if rpm -qp --requires "$gateway_rpm" | grep -Eq '^podman([[:space:]]|$)'; then
+            echo "::error::The openshell-gateway RPM still requires Podman"
+            exit 1
+          fi
+
+          if rpm -q podman >/dev/null 2>&1; then
+            dnf remove -y podman
+          fi
+          if rpm -q podman >/dev/null 2>&1; then
+            echo "::error::Podman must be absent before the package install test"
+            exit 1
+          fi
+
+          dnf install -y "$cli_rpm" "$gateway_rpm"
+          if rpm -q podman >/dev/null 2>&1; then
+            echo "::error::Installing OpenShell unexpectedly installed Podman"
+            exit 1
+          fi
+
       - name: Upload RPM artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

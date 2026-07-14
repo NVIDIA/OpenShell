@@ -27,6 +27,7 @@ mod auth;
 pub mod certgen;
 pub mod cli;
 mod compute;
+mod config_command;
 pub mod config_file;
 mod defaults;
 mod grpc;
@@ -838,22 +839,78 @@ fn configured_compute_driver(
     driver_startup: compute::driver_config::DriverStartupContext<'_>,
 ) -> Result<ConfiguredComputeDriver> {
     match config.compute_drivers.as_slice() {
-        [] => match openshell_core::config::detect_driver() {
-            Some(ComputeDriverKind::Vm) => Err(Error::config(
-                "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
-            )),
-            Some(driver) => Ok(ConfiguredComputeDriver::Builtin(driver)),
-            None => Err(Error::config(
-                "no compute driver configured and auto-detection found no suitable driver; \
-                set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
-            )),
-        },
+        [] => {
+            let detection = openshell_core::config::detect_drivers();
+            let Some(driver) = detection.selected else {
+                return Err(Error::config(
+                    "no compute driver configured and auto-detection found no suitable driver; \
+                    install and start Docker or Podman, or install the VM driver and select it \
+                    with `openshell-gateway config set 'openshell.gateway.compute_drivers=[\"vm\"]'`",
+                ));
+            };
+
+            if driver == ComputeDriverKind::Vm {
+                return Err(Error::config(
+                    "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
+                ));
+            }
+
+            log_auto_detected_driver(config, driver, &detection.available);
+            Ok(ConfiguredComputeDriver::Builtin(driver))
+        }
         [driver] => resolve_configured_compute_driver(driver, driver_startup),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers.join(",")
         ))),
     }
+}
+
+fn log_auto_detected_driver(
+    config: &Config,
+    selected: ComputeDriverKind,
+    detected: &[ComputeDriverKind],
+) {
+    let available = detected
+        .iter()
+        .map(|driver| driver.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    info!(
+        driver = %selected,
+        available_drivers = %available,
+        "Auto-selected compute driver"
+    );
+
+    for guidance in auto_detection_guidance(config, selected, detected.len()) {
+        warn!(
+            driver = %selected,
+            available_drivers = %available,
+            bind_address = %config.bind_address,
+            "{guidance}"
+        );
+    }
+}
+
+fn auto_detection_guidance(
+    config: &Config,
+    selected: ComputeDriverKind,
+    detected_count: usize,
+) -> Vec<String> {
+    let mut guidance = Vec::new();
+    if detected_count > 1 {
+        guidance.push(
+            "Multiple compute drivers are available. Auto-detection is evaluated at every gateway start; pin the intended driver with `openshell-gateway config set 'openshell.gateway.compute_drivers=[\"<driver>\"]'`, then restart the gateway service"
+                .to_string(),
+        );
+    }
+    if selected == ComputeDriverKind::Podman && config.bind_address.ip().is_loopback() {
+        guidance.push(format!(
+            "Podman was auto-selected while the gateway is bound to loopback. If you use rootless Podman, run `openshell-gateway config set openshell.gateway.bind_address=0.0.0.0:{}`, then restart the gateway service",
+            config.bind_address.port()
+        ));
+    }
+    guidance
 }
 
 fn resolve_configured_compute_driver(
@@ -899,8 +956,8 @@ fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
 mod tests {
     use super::{
         ConfiguredComputeDriver, ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
-        allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_addresses, is_benign_tls_handshake_failure,
+        allow_plaintext_service_http, auto_detection_guidance, classify_initial_bytes,
+        configured_compute_driver, gateway_listener_addresses, is_benign_tls_handshake_failure,
         kubernetes_sandbox_jwt_expiry_disabled, serve_gateway_listener,
     };
     use openshell_core::{
@@ -1251,6 +1308,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn auto_detection_warns_how_to_pin_when_multiple_drivers_are_available() {
+        let config = Config::new(None);
+
+        let guidance = auto_detection_guidance(&config, ComputeDriverKind::Docker, 2).join("\n");
+
+        assert!(guidance.contains("Auto-detection is evaluated at every gateway start"));
+        assert!(guidance.contains(
+            "openshell-gateway config set 'openshell.gateway.compute_drivers=[\"<driver>\"]'"
+        ));
+        assert!(guidance.contains("restart the gateway service"));
+    }
+
+    #[test]
+    fn auto_detected_podman_on_loopback_warns_with_bind_command() {
+        let config = Config::new(None).with_bind_address("127.0.0.1:17670".parse().unwrap());
+
+        let guidance = auto_detection_guidance(&config, ComputeDriverKind::Podman, 1).join("\n");
+
+        assert!(
+            guidance.contains(
+                "openshell-gateway config set openshell.gateway.bind_address=0.0.0.0:17670"
+            )
+        );
+        assert!(guidance.contains("If you use rootless Podman"));
+    }
+
+    #[test]
+    fn auto_detected_podman_on_non_loopback_needs_no_bind_guidance() {
+        let config = Config::new(None).with_bind_address("0.0.0.0:17670".parse().unwrap());
+
+        assert!(auto_detection_guidance(&config, ComputeDriverKind::Podman, 1).is_empty());
     }
 
     #[test]

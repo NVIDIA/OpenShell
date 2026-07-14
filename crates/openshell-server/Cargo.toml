@@ -77,6 +77,8 @@ pin-project-lite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
+tempfile = "3"
 tokio-stream = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true }
@@ -92,7 +94,6 @@ russh = "0.57"
 rand = { workspace = true }
 petname = "2"
 ipnet = "2"
-tempfile = "3"
 rustix = { workspace = true }
 x509-parser = "0.16"
 arc-swap = "1"

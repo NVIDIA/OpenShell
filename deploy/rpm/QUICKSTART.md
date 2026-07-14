@@ -4,10 +4,19 @@ Get from `dnf install` to a running sandbox in five minutes.
 
 ## Prerequisites
 
-### Podman (rootless)
+### Container runtime
 
-The gateway uses rootless Podman for sandbox containers. Verify
-Podman is installed and the cgroup version is v2:
+Install and start either Docker or Podman before starting the gateway. The RPM
+does not install a container runtime. When `compute_drivers` is unset, the
+gateway auto-detects Kubernetes, then a reachable Podman socket, then Docker.
+
+For Docker, verify that the daemon is running:
+
+```shell
+docker info
+```
+
+For rootless Podman, verify Podman is installed and the cgroup version is v2:
 
 ```shell
 podman --version
@@ -22,7 +31,9 @@ sudo grubby --update-kernel=ALL --args="systemd.unified_cgroup_hierarchy=1"
 sudo reboot
 ```
 
-### Subordinate UID/GID ranges
+The following subordinate ID and socket steps apply only to rootless Podman.
+
+### Subordinate UID/GID ranges (Podman)
 
 Rootless containers require subordinate UID/GID mappings:
 
@@ -45,13 +56,20 @@ socket activation:
 systemctl --user enable --now podman.socket
 ```
 
+Make the gateway reachable from rootless Podman containers before creating a
+sandbox:
+
+```shell
+openshell-gateway config set openshell.gateway.bind_address=0.0.0.0:17670
+```
+
 ### Network access
 
 The gateway pulls container images from ghcr.io on first sandbox
 creation. Ensure the host can reach ghcr.io over HTTPS (port 443).
 
-For air-gapped environments, pre-load images with `podman pull` and
-set `image_pull_policy = "never"` in
+For air-gapped environments, pre-load images with `docker pull` or
+`podman pull` and set the selected driver's `image_pull_policy = "never"` in
 `~/.config/openshell/gateway.toml`. See CONFIGURATION.md for
 details.
 
@@ -65,11 +83,11 @@ On first start, the gateway automatically generates:
 
 - A self-signed PKI bundle (CA, server cert, client cert) for mTLS
 
-> **Note:** The RPM default configuration binds to `0.0.0.0:17670` so
-> Podman sandbox containers can reach the gateway over the host network
-> bridge. Mutual TLS (mTLS) is enabled automatically on first start,
-> requiring a valid client certificate for every connection. See
-> CONFIGURATION.md for details.
+> **Note:** The RPM default configuration binds to `127.0.0.1:17670` to avoid
+> exposing the gateway on host network interfaces. Driver auto-detection does
+> not widen the listener. Configure Podman as shown above before creating
+> Podman-backed sandboxes. Mutual TLS (mTLS) is enabled automatically on first
+> start. See CONFIGURATION.md for details.
 
 Verify the service is running:
 

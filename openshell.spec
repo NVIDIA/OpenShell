@@ -53,10 +53,6 @@ BuildRequires:  pandoc
 # Python sub-package build dependencies
 BuildRequires:  python3-devel
 
-# Runtime: container runtime for package-managed gateway sandboxes.
-# The gateway auto-detects Podman when the package-managed service starts.
-Recommends:     podman
-
 %description
 OpenShell provides safe, sandboxed runtimes for autonomous AI agents.
 It offers a CLI for managing gateway registrations, sandboxes, and providers with
@@ -65,16 +61,14 @@ LLM inference routing.
 
 # --- Gateway sub-package ---
 %package gateway
-Summary:        OpenShell gateway server with Podman sandbox driver
-Requires:       podman
+Summary:        OpenShell gateway server
 Requires:       openssl
 Requires:       %{name} = %{version}-%{release}
 
 %description gateway
 OpenShell gateway server providing the control-plane API for sandbox
-lifecycle management. This package installs Podman-oriented defaults in
-gateway TOML while leaving compute driver selection to gateway auto-detection
-or explicit operator configuration.
+lifecycle management. Compute driver selection uses gateway auto-detection or
+explicit operator configuration.
 
 # --- Python SDK sub-package ---
 %package -n python3-%{name}
@@ -155,8 +149,6 @@ cat > %{buildroot}%{_userunitdir}/%{name}-gateway.service << 'EOF'
 [Unit]
 Description=OpenShell Gateway (user)
 Documentation=https://github.com/NVIDIA/OpenShell
-After=podman.socket
-Wants=podman.socket
 
 [Service]
 Type=exec

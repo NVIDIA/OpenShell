@@ -46,7 +46,7 @@ USAGE:
     curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 
 OPTIONS:
-    --help       Print this help message
+    --help       Print this help message.
 
 ENVIRONMENT VARIABLES:
     OPENSHELL_VERSION   Release tag to install (default: latest tagged release).
@@ -54,7 +54,6 @@ ENVIRONMENT VARIABLES:
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
                         pre-v0.0.37 installation.
-
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
@@ -682,24 +681,58 @@ patch_homebrew_formula() {
 
 }
 
+report_detected_compute_driver() {
+  _gateway_bin="${OPENSHELL_GATEWAY_BIN:-openshell-gateway}"
+  if ! _detected_driver="$(as_target_user "$_gateway_bin" config detect-driver)"; then
+    warn "could not detect an available compute driver; the gateway will report runtime errors when it starts"
+    return 0
+  fi
+
+  case "$_detected_driver" in
+    podman)
+      warn "Podman was auto-detected. If you use rootless Podman, configure the gateway to listen on the host bridge:"
+      info "openshell-gateway config set openshell.gateway.bind_address=0.0.0.0:${LOCAL_GATEWAY_PORT}"
+      info "Restart the gateway service for changes to take effect."
+      ;;
+    kubernetes | docker | none)
+      ;;
+    *)
+      warn "gateway returned an unexpected detected compute driver: ${_detected_driver}"
+      ;;
+  esac
+}
+
 start_user_gateway() {
   info "restarting openshell-gateway user service as ${TARGET_USER}..."
 
   if ! as_target_user systemctl --user daemon-reload; then
-    info "could not reach the user systemd manager for ${TARGET_USER}"
-    info "restart the gateway later with: systemctl --user enable openshell-gateway && systemctl --user restart openshell-gateway"
-    info "then register it with: openshell gateway add https://127.0.0.1:17670 --local --name openshell"
-    return 0
+    dump_local_gateway_diagnostics
+    gateway_startup_error "could not reload the user systemd manager for ${TARGET_USER}"
   fi
 
-  as_target_user systemctl --user enable openshell-gateway
-  as_target_user systemctl --user restart openshell-gateway
-  as_target_user systemctl --user is-active --quiet openshell-gateway
+  if ! as_target_user systemctl --user enable openshell-gateway; then
+    dump_local_gateway_diagnostics
+    gateway_startup_error "could not enable the openshell-gateway user service"
+  fi
+  if ! as_target_user systemctl --user restart openshell-gateway; then
+    dump_local_gateway_diagnostics
+    gateway_startup_error "could not restart the openshell-gateway user service"
+  fi
+  if ! as_target_user systemctl --user is-active --quiet openshell-gateway; then
+    dump_local_gateway_diagnostics
+    gateway_startup_error "the openshell-gateway user service is not active"
+  fi
 
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
   wait_for_local_gateway_listener
   wait_for_local_gateway_status
+  info "gateway service is healthy"
+}
+
+gateway_startup_error() {
+  _reason="$1"
+  error "${_reason}. OpenShell package installation succeeded, but the gateway service is not healthy. Review the diagnostics above. If no compute driver is available, install and start Docker or Podman, or install openshell-driver-vm and explicitly select VM. The supervised service will normally retry automatically; restart it if needed."
 }
 
 dump_local_gateway_diagnostics() {
@@ -781,7 +814,7 @@ wait_for_local_gateway_listener() {
 
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
   dump_local_gateway_diagnostics
-  error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
+  gateway_startup_error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 
 wait_for_local_gateway_status() {
@@ -806,7 +839,7 @@ wait_for_local_gateway_status() {
 
   [ -z "$_status_output" ] || printf '%s\n' "$_status_output" >&2
   dump_local_gateway_diagnostics
-  error "openshell status did not report connected within ${_timeout}s"
+  gateway_startup_error "openshell status did not report connected within ${_timeout}s"
 }
 
 remove_local_gateway_registration() {
@@ -902,7 +935,8 @@ install_linux_deb() {
 
   info "installing ${_deb_file}..."
   install_deb_package "$_deb_path"
-  info "installed ${APP_NAME} package from ${RELEASE_TAG}"
+  info "package installation succeeded: installed ${APP_NAME} from ${RELEASE_TAG}"
+  report_detected_compute_driver
   start_user_gateway
 }
 
@@ -949,7 +983,8 @@ install_linux_rpm() {
 
   info "installing ${_rpm_file} and ${_gateway_rpm_file}..."
   install_rpm_packages "${_tmpdir}/${_rpm_file}" "${_tmpdir}/${_gateway_rpm_file}"
-  info "installed ${APP_NAME} RPM packages from ${RELEASE_TAG}"
+  info "package installation succeeded: installed ${APP_NAME} RPM packages from ${RELEASE_TAG}"
+  report_detected_compute_driver
   start_user_gateway
 }
 
@@ -987,16 +1022,15 @@ install_macos_homebrew() {
     info "installing OpenShell with Homebrew..."
     as_target_user brew install --formula "$_formula_ref"
   fi
-
-  info "restarting OpenShell Homebrew service..."
-  if ! as_target_user brew services restart "$_formula_ref"; then
-    warn "could not restart the OpenShell Homebrew service"
-    info "restart it later with: brew services restart ${_formula_ref}"
-    info "then register it with: openshell gateway add https://127.0.0.1:${LOCAL_GATEWAY_PORT} --local --name openshell"
-    return 0
-  fi
+  info "package installation succeeded: installed ${APP_NAME} with Homebrew from ${RELEASE_TAG}"
 
   _brew_prefix="$(as_target_user brew --prefix 2>/dev/null || true)"
+  if [ -n "$_brew_prefix" ]; then
+    OPENSHELL_GATEWAY_BIN="${_brew_prefix}/bin/openshell-gateway"
+  fi
+  report_detected_compute_driver
+  restart_homebrew_gateway "$_formula_ref"
+
   if [ -n "$_brew_prefix" ] && [ -x "${_brew_prefix}/bin/openshell" ]; then
     OPENSHELL_REGISTER_BIN="${_brew_prefix}/bin/openshell"
   fi
@@ -1005,6 +1039,16 @@ install_macos_homebrew() {
   register_local_gateway
   wait_for_local_gateway_listener
   wait_for_local_gateway_status
+  info "gateway service is healthy"
+}
+
+restart_homebrew_gateway() {
+  _formula_ref="$1"
+  info "restarting OpenShell Homebrew service..."
+  if ! as_target_user brew services restart "$_formula_ref"; then
+    dump_local_gateway_diagnostics
+    gateway_startup_error "could not restart the OpenShell Homebrew service"
+  fi
 }
 
 main() {

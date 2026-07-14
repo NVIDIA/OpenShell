@@ -27,6 +27,26 @@ Non-reserved names select an extension driver and require a
 
 When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
 
+For Linux package-managed gateways, persist the selection without editing TOML
+directly:
+
+```shell
+openshell-gateway config set 'openshell.gateway.compute_drivers=["docker"]'
+systemctl --user restart openshell-gateway
+```
+
+Package availability differs by installation method:
+
+| Installation | `openshell-driver-vm` availability |
+|---|---|
+| Debian/Ubuntu package | Included under `/usr/libexec/openshell`; the gateway searches this location automatically after you select VM. |
+| Homebrew | Included under the formula's libexec directory; the gateway searches the formula prefix automatically after you select VM. |
+| Fedora/RHEL RPM | Not included. Install the matching standalone release artifact in a conventional libexec directory or configure `driver_dir`. |
+| Snap | Not included. |
+
+Standalone VM driver tarballs are published with OpenShell releases. Installing
+the binary does not select it; VM always requires an explicit driver setting.
+
 Common gateway options:
 
 | Gateway TOML option | Description |
@@ -256,7 +276,8 @@ For maintainer-level implementation details, refer to the [VM driver README](htt
 
 ### Enable the VM Driver
 
-The VM driver is opt-in. Release packages can install `openshell-driver-vm`, but the gateway does not select it unless you configure the driver explicitly.
+The VM driver is opt-in. The gateway does not select VM unless you configure
+the driver explicitly, even when `openshell-driver-vm` is installed.
 
 Enable VM by setting `compute_drivers = ["vm"]` in the gateway TOML file:
 

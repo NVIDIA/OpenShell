@@ -197,10 +197,14 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
         path: path.to_path_buf(),
         source,
     })?;
+    parse(&contents, path)
+}
+
+pub(crate) fn parse(contents: &str, path: &Path) -> Result<ConfigFile, ConfigFileError> {
     if contents.trim().is_empty() {
         return Ok(ConfigFile::default());
     }
-    let file: ConfigFile = toml::from_str(&contents).map_err(|source| ConfigFileError::Parse {
+    let file: ConfigFile = toml::from_str(contents).map_err(|source| ConfigFileError::Parse {
         path: path.to_path_buf(),
         source,
     })?;
@@ -618,15 +622,15 @@ version = 2
     }
 
     /// Contract test: the RPM default config template must parse against the
-    /// current schema and must pin the settings that Podman deployments require.
+    /// current schema and must retain the safe package defaults.
     ///
     /// This test loads `deploy/rpm/gateway.toml.default` through the same
     /// `load()` path that the gateway uses at runtime, catching:
     ///   - template corruption or unknown fields (`deny_unknown_fields`)
     ///   - schema drift (version bump or field renames)
-    ///   - accidental changes to the bind address or compute driver list
+    ///   - accidental changes to the bind address or runtime-neutral driver selection
     #[test]
-    fn rpm_default_config_parses_and_has_podman_defaults() {
+    fn rpm_default_config_parses_and_auto_detects_compute_driver() {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/rpm/gateway.toml.default");
         let config =
@@ -637,9 +641,8 @@ version = 2
             .bind_address
             .expect("bind_address must be explicitly set in the RPM default config");
         assert!(
-            addr.ip().is_unspecified(),
-            "RPM default bind_address must be 0.0.0.0 so Podman sandbox containers \
-             can reach the gateway over the host network bridge, got {addr}"
+            addr.ip().is_loopback(),
+            "RPM default bind_address must remain loopback-only, got {addr}"
         );
         assert_eq!(
             addr.port(),
@@ -648,15 +651,10 @@ version = 2
             openshell_core::config::DEFAULT_SERVER_PORT
         );
 
-        let drivers = gw
-            .compute_drivers
-            .as_ref()
-            .expect("compute_drivers must be explicitly set in the RPM default config");
-        assert_eq!(
-            drivers,
-            &["podman".to_string()],
-            "RPM default must pin compute_drivers to [podman] to prevent unexpected \
-             driver selection when Docker is also installed"
+        assert!(
+            gw.compute_drivers.is_none(),
+            "RPM default must leave compute_drivers unset so the gateway auto-detects \
+             an available local runtime"
         );
     }
 }

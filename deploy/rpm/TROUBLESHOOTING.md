@@ -6,10 +6,9 @@ and upgrade procedures for the RPM deployment.
 ## CLI compatibility
 
 The RPM installs the gateway as a systemd user service. On a standard RPM
-install the gateway auto-detects Podman because the package depends on it.
-The published online docs and some CLI commands assume a Docker/K3s
-deployment model. This section clarifies which commands work, which do not,
-and what to use instead.
+install the gateway auto-detects a reachable Podman socket, then Docker. The RPM
+does not install either runtime. This section clarifies which commands work,
+which do not, and what to use instead.
 
 ### Commands that work normally
 
@@ -47,9 +46,9 @@ systemd commands directly:
 
 ### Building from local Dockerfiles
 
-`openshell sandbox create --from ./Dockerfile` builds via the local
-Docker daemon. With the RPM Podman driver, build the image with Podman
-and reference it directly:
+`openshell sandbox create --from ./Dockerfile` builds via the local Docker
+daemon. When using Podman, build the image with Podman and reference it
+directly:
 
 ```shell
 podman build -t my-sandbox ./my-dir
@@ -134,6 +133,24 @@ journalctl --user -u openshell-gateway --no-pager -n 50
 
 Common causes:
 
+**No compute driver is available.** Install and start Docker or Podman, then
+restart the gateway:
+
+```shell
+# Docker
+docker info
+systemctl --user restart openshell-gateway
+
+# Or rootless Podman
+systemctl --user enable --now podman.socket
+systemctl --user restart openshell-gateway
+```
+
+To use VM instead, install the matching `openshell-driver-vm` release artifact
+in a conventional libexec directory (or configure `driver_dir`), set
+`compute_drivers = ["vm"]`, and restart the gateway. Configuration alone does
+not install the VM driver, and the gateway never auto-detects it.
+
 **cgroups v1 detected.** The Podman driver requires cgroups v2.
 Check the version:
 
@@ -214,14 +231,14 @@ After upgrading the RPM packages:
 
 ```shell
 sudo dnf update openshell openshell-gateway
-systemctl --user restart podman.socket
 systemctl --user restart openshell-gateway
 ```
 
 The SQLite database schema is auto-migrated on startup. Running
 sandboxes are stopped during the restart.
 
-Restarting `podman.socket` after a package upgrade is recommended: if the
+When using Podman, restarting `podman.socket` after a package upgrade is
+recommended: if the
 unit file changed on disk during the upgrade, the running socket may become
 non-functional until restarted, causing the gateway to fail with a
 connection error on `/run/user/<uid>/podman/podman.sock`. The gateway
@@ -230,6 +247,10 @@ retries briefly on startup, but a stale socket will not recover on its own.
 Package upgrades do not overwrite `~/.config/openshell/gateway.toml` when you
 create one. New gateway process options can be added manually by referencing
 CONFIGURATION.md or running `openshell-gateway --help`.
+
+Existing RPM configurations that contain `compute_drivers = ["podman"]` keep
+that explicit selection after upgrade. Remove the setting to use automatic
+Podman/Docker detection, or change it to `compute_drivers = ["docker"]`.
 
 To pick up new container images after an upgrade:
 

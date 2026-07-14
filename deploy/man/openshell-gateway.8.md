@@ -14,6 +14,11 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
+**openshell-gateway config detect-driver**
+
+**openshell-gateway config set** \[*--config PATH*\]
+*KEY=VALUE* \[*KEY=VALUE* ...\]
+
 # DESCRIPTION
 
 **openshell-gateway** is the control-plane server for OpenShell. It
@@ -94,10 +99,9 @@ TLS.
 
 **--disable-tls**
 :   Disable TLS entirely and listen on plaintext HTTP. When the bind
-    address is **0.0.0.0** (the RPM default), disabling TLS exposes the
-    API to the entire network without authentication. Only use when the
-    gateway sits behind a TLS-terminating reverse proxy, or restrict
-    **--bind-address** to **127.0.0.1**.
+    address is **0.0.0.0**, disabling TLS exposes the API to the entire
+    network without authentication. Only use when the gateway sits behind a
+    TLS-terminating reverse proxy. The RPM default is **127.0.0.1**.
     Environment: **OPENSHELL_DISABLE_TLS**.
 
 **--server-san** *SAN*
@@ -110,6 +114,29 @@ TLS.
 Compute driver settings such as sandbox image, callback endpoint, image
 pull policy, network name, VM state directory, and guest TLS material are
 configured in the TOML file passed with **--config**.
+
+# CONFIG SUBCOMMAND
+
+**openshell-gateway config detect-driver** runs the same automatic driver
+detection as gateway startup and prints one value: **kubernetes**, **podman**,
+**docker**, or **none**. It does not detect the opt-in VM driver, read the
+gateway configuration, or change system state.
+
+**openshell-gateway config set** updates the gateway TOML file without
+discarding comments or unrelated settings. It creates the default XDG config
+file when needed, validates the complete result, and replaces the file
+atomically. Each argument uses a dotted TOML key. TOML booleans, integers,
+arrays, and quoted strings retain their types; other unquoted values are
+stored as strings. Multiple assignments are applied in one transaction.
+
+*KEY=VALUE*
+:   Set a field by its dotted TOML path. Repeat to update multiple fields.
+    Set **openshell.gateway.compute_drivers=[]** to restore automatic driver
+    selection.
+
+**--config** *PATH*
+:   Update a specific gateway TOML file instead of the default XDG location.
+    Environment: **OPENSHELL_GATEWAY_CONFIG**.
 
 # SYSTEMD INTEGRATION
 

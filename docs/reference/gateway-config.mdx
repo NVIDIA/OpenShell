@@ -29,6 +29,41 @@ Package-managed gateways do not require a TOML file. Create one at the package's
 | Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
 | Snap | `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
 
+## Update Configuration from the CLI
+
+Use `detect-driver` to run the same automatic driver detection as gateway
+startup:
+
+```shell
+openshell-gateway config detect-driver
+```
+
+The command prints one machine-readable value: `kubernetes`, `podman`,
+`docker`, or `none`. It checks drivers in that order and does not detect the
+opt-in VM driver. The command only inspects the current environment; it does
+not read or update the gateway configuration.
+
+Use `openshell-gateway config set` with one or more dotted `KEY=VALUE`
+assignments. The command applies every assignment atomically:
+
+```shell
+openshell-gateway config set \
+  'openshell.gateway.compute_drivers=["podman"]' \
+  openshell.gateway.bind_address=0.0.0.0:17670
+```
+
+The command updates `$XDG_CONFIG_HOME/openshell/gateway.toml`, creating the
+file and parent directory when needed. Pass `--config <PATH>` or set
+`OPENSHELL_GATEWAY_CONFIG` to update another file. The command validates the
+result, replaces the file atomically, and preserves comments and unrelated
+settings. TOML booleans, integers, arrays, and quoted strings retain their
+types. Other unquoted values are stored as strings. Set
+`openshell.gateway.compute_drivers=[]` to restore automatic driver selection.
+
+Restart the gateway service after updating a running installation. Gateway
+process flags and `OPENSHELL_*` runtime overrides still take precedence over
+the TOML file.
+
 ## Layout
 
 The file is rooted at `[openshell]`. Gateway-wide settings live under `[openshell.gateway]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Shared keys set at gateway scope are inherited into driver tables when not overridden.
