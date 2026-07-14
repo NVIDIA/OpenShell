@@ -50,11 +50,12 @@
     clippy::doc_markdown
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::WIN32_ERROR;
 use windows::Win32::System::Diagnostics::Etw::{
@@ -229,7 +230,8 @@ impl EtwSession {
             self.handle = 0;
         }
         // ControlTraceW(STOP) makes ProcessTrace return → the pump thread ends and
-        // drops the boxed Sender → the consumer thread's `for ev in rx` ends.
+        // drops the boxed Sender → the consumer thread's recv loop sees
+        // `Disconnected`, does a final pending drain, and exits.
         if let Some(t) = self.pump_thread.take() {
             let _ = t.join();
         }
@@ -273,18 +275,32 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
         .spawn(move || {
             // Decode off the pump thread: the callback only copies bytes, so the
             // real-time buffers drain fast and the create burst isn't dropped.
-            for mut raw in rx {
-                match decode_raw(&mut raw) {
-                    Some(ev) => process_event(&index, ev),
-                    None => tracing::debug!(
-                        target: "mxc_etw",
-                        id = raw.header.EventDescriptor.Id,
-                        opcode = raw.header.EventDescriptor.Opcode,
-                        pid = raw.header.ProcessId,
-                        "TDH decode failed for event"
-                    ),
+            //
+            // A *timed* recv lets us also re-drive the pending buffer during a
+            // lull: an event that beat the driver's `register_launch` is replayed
+            // within one tick once attribution lands, without having to wait for
+            // the next ETW event (which may never arrive for a lone/last sandbox).
+            loop {
+                match rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(mut raw) => {
+                        match decode_raw(&mut raw) {
+                            Some(ev) => process_event(&index, ev),
+                            None => tracing::debug!(
+                                target: "mxc_etw",
+                                id = raw.header.EventDescriptor.Id,
+                                opcode = raw.header.EventDescriptor.Opcode,
+                                pid = raw.header.ProcessId,
+                                "TDH decode failed for event"
+                            ),
+                        }
+                        drain_and_emit(&index);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => drain_and_emit(&index),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
+            // Final drain on shutdown so anything still resolvable is emitted.
+            drain_and_emit(&index);
         })
         .map_err(|e| {
             stop_session(handle);
@@ -812,18 +828,49 @@ fn format_property_value(
 ///   `activity_id → sandbox_id`, so the payload-keyless `SandboxConfig`
 ///   (no identity/CV) resolves via the ETW `ActivityId` it shares.
 /// - `commandLine` and a per-pid "last resolved" value are fallbacks.
+/// An ETW event that could not yet be attributed, held so it can be replayed
+/// once its sandbox's attribution is seeded.
+struct PendingEvent {
+    at: Instant,
+    ev: DecodedEtwEvent,
+}
+
+/// Max number of unattributed events buffered at once (memory bound). The
+/// create/config burst is ~10 events per sandbox, so this comfortably holds
+/// many concurrent racing launches while still capping worst-case memory.
+const PENDING_MAX: usize = 4096;
+
+/// How long an unattributed event is held before being given up on. The
+/// driver seeds attribution within milliseconds of spawning `wxc-exec`, so a
+/// few seconds is ample; anything older is almost certainly genuinely
+/// unattributable (e.g. an unrelated Sandboxing-provider consumer on the box).
+const PENDING_TTL: Duration = Duration::from_secs(5);
+
 #[derive(Default)]
 pub(crate) struct AttributionIndex {
     by_pid: HashMap<u32, String>,
     by_identity: HashMap<String, String>,
     by_activity: HashMap<String, String>,
     by_cv: HashMap<String, String>,
+    /// Command line → sandbox_id, but **only while that command line is unique**.
+    /// The instant a second sandbox registers the same command line it is moved to
+    /// [`Self::ambiguous_cmds`] and removed here, so an ambiguous command can never
+    /// misroute an event. Command line is a weak, last-resort key for exactly this
+    /// reason (two sandboxes commonly run the identical agent command).
     by_cmd: HashMap<String, String>,
+    /// Command lines seen for more than one sandbox — never usable for resolution.
+    ambiguous_cmds: std::collections::HashSet<String>,
     last_pid_sid: HashMap<u32, String>,
     names: HashMap<String, String>,
     /// Sandboxes for which a lifecycle [6002] row has already been emitted, so
     /// the two redundant create events don't double-count.
     lifecycle_emitted: std::collections::HashSet<String>,
+    /// Events that arrived before their sandbox's attribution was seeded. ETW
+    /// delivers the create/config burst the instant `wxc-exec` starts, which can
+    /// race the driver's `register_launch`; rather than drop those events we hold
+    /// them here and replay when a later registration/cross-link resolves them.
+    /// Bounded by [`PENDING_MAX`] and [`PENDING_TTL`].
+    pending: VecDeque<PendingEvent>,
 }
 
 impl AttributionIndex {
@@ -832,7 +879,9 @@ impl AttributionIndex {
     }
 
     /// Register a launched sandbox. `wxc_pid` (the process we spawned) is the
-    /// collision-proof anchor; `command_line` is a fallback matcher.
+    /// primary anchor — unique *while that process is alive* (Windows won't reuse
+    /// a live PID). `command_line` is only a weak fallback and is dropped the
+    /// moment it stops being unique (see [`Self::ambiguous_cmds`]).
     pub fn register_launch(
         &mut self,
         sandbox_id: &str,
@@ -840,11 +889,40 @@ impl AttributionIndex {
         wxc_pid: u32,
         command_line: &str,
     ) {
-        self.by_pid.insert(wxc_pid, sandbox_id.to_string());
-        if !command_line.is_empty() {
-            self.by_cmd
-                .insert(command_line.to_string(), sandbox_id.to_string());
+        // PID-reuse guard: if this PID still maps to a *different* sandbox, the
+        // prior sandbox was never `forget()`-ten (e.g. a crash skipped `delete`)
+        // and Windows has recycled the number. Rebind to the new owner and drop
+        // the stale per-PID "last resolved" hint so it can't misroute.
+        if let Some(prev) = self.by_pid.get(&wxc_pid) {
+            if prev != sandbox_id {
+                tracing::warn!(
+                    target: "mxc_etw",
+                    pid = wxc_pid,
+                    prev = %prev,
+                    new = %sandbox_id,
+                    "wxc-exec PID reused before prior sandbox was forgotten; rebinding attribution"
+                );
+            }
         }
+        self.by_pid.insert(wxc_pid, sandbox_id.to_string());
+        self.last_pid_sid.remove(&wxc_pid);
+
+        // Command line is only trustworthy while unique. Promote to `by_cmd` on
+        // first sight; on a second, different owner, demote to ambiguous forever.
+        if !command_line.is_empty() && !self.ambiguous_cmds.contains(command_line) {
+            match self.by_cmd.get(command_line) {
+                Some(existing) if existing != sandbox_id => {
+                    self.by_cmd.remove(command_line);
+                    self.ambiguous_cmds.insert(command_line.to_string());
+                }
+                Some(_) => {} // same owner re-registering; keep
+                None => {
+                    self.by_cmd
+                        .insert(command_line.to_string(), sandbox_id.to_string());
+                }
+            }
+        }
+
         self.names
             .insert(sandbox_id.to_string(), sandbox_name.to_string());
     }
@@ -915,6 +993,57 @@ impl AttributionIndex {
 
         Some(sid)
     }
+
+    /// Hold an event that didn't resolve yet, evicting expired and (if needed)
+    /// oldest entries first so the buffer stays bounded.
+    fn buffer_unresolved(&mut self, ev: DecodedEtwEvent) {
+        let now = Instant::now();
+        while let Some(front) = self.pending.front() {
+            if now.duration_since(front.at) > PENDING_TTL {
+                let stale = self.pending.pop_front();
+                if let Some(p) = stale {
+                    tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
+                }
+            } else {
+                break;
+            }
+        }
+        if self.pending.len() >= PENDING_MAX {
+            if let Some(p) = self.pending.pop_front() {
+                tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (buffer full) {}", p.ev.summary());
+            }
+        }
+        self.pending.push_back(PendingEvent { at: now, ev });
+    }
+
+    /// Re-resolve buffered events. Returns those that now attribute (removed
+    /// from the buffer, in arrival order, ready to emit) and drops any that have
+    /// aged past [`PENDING_TTL`] still unresolved. Callers emit the returned
+    /// events *after* releasing the index lock.
+    fn drain_resolved(&mut self) -> Vec<(String, String, DecodedEtwEvent)> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        let drained = std::mem::take(&mut self.pending);
+        let mut ready = Vec::new();
+        let mut keep = VecDeque::with_capacity(drained.len());
+        for p in drained {
+            if now.duration_since(p.at) > PENDING_TTL {
+                tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
+                continue;
+            }
+            match self.resolve(&p.ev) {
+                Some(sid) => {
+                    let name = self.name_of(&sid);
+                    ready.push((sid, name, p.ev));
+                }
+                None => keep.push_back(p),
+            }
+        }
+        self.pending = keep;
+        ready
+    }
 }
 
 /// Consumer-thread entry point: attribute one decoded event and, for the mapped
@@ -926,25 +1055,56 @@ fn process_event(index: &Mutex<AttributionIndex>, ev: DecodedEtwEvent) {
         return;
     }
 
-    let (sandbox_id, sandbox_name) = {
+    let resolved = {
         let mut idx = index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match idx.resolve(&ev) {
             Some(sid) => {
                 let name = idx.name_of(&sid);
-                (sid, name)
+                Some((sid, name, ev))
             }
             None => {
-                drop(idx);
-                tracing::debug!(target: "mxc_etw", pid = ev.process_id, "unattributed {}", ev.summary());
-                return;
+                // Not attributable yet: ETW delivers the create/config burst the
+                // instant `wxc-exec` starts, which can beat the driver's
+                // `register_launch`. Hold the event for replay instead of dropping
+                // it (see `drain_and_emit`).
+                idx.buffer_unresolved(ev);
+                None
             }
         }
     };
 
-    // STOP twins are already filtered above, so activity events reaching here
-    // are STARTs.
+    if let Some((sandbox_id, sandbox_name, ev)) = resolved {
+        emit_resolved(index, &sandbox_id, &sandbox_name, &ev);
+    }
+}
+
+/// Re-resolve and emit any buffered events that have since become attributable.
+/// Called by the consumer thread after each incoming event and on a periodic
+/// tick, so a create/config burst that raced `register_launch` still lands in
+/// the trail (and aged-out unresolvable events are dropped, bounded).
+fn drain_and_emit(index: &Mutex<AttributionIndex>) {
+    let ready = {
+        let mut idx = index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        idx.drain_resolved()
+    };
+    for (sandbox_id, sandbox_name, ev) in ready {
+        emit_resolved(index, &sandbox_id, &sandbox_name, &ev);
+    }
+}
+
+/// Map one attributed event to its OCSF class and emit it into the gateway trail.
+fn emit_resolved(
+    index: &Mutex<AttributionIndex>,
+    sandbox_id: &str,
+    sandbox_name: &str,
+    ev: &DecodedEtwEvent,
+) {
+    // STOP twins are already filtered before buffering, so activity events
+    // reaching here are STARTs.
     match ev.event_name.as_deref().unwrap_or("") {
         // Lifecycle [6002]: MXC emits two create events per sandbox —
         // `SandboxEngineCreate` and `SandboxCreateWithPolicyEnforcement` — and
@@ -957,10 +1117,10 @@ fn process_event(index: &Mutex<AttributionIndex>, ev: DecodedEtwEvent) {
             let first = index
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take_lifecycle_once(&sandbox_id);
+                .take_lifecycle_once(sandbox_id);
             if first {
-                let ctx = etw_ctx(&sandbox_id, &sandbox_name);
-                emit_ocsf(&sandbox_id, map_lifecycle_create(&ctx, &sandbox_name));
+                let ctx = etw_ctx(sandbox_id, sandbox_name);
+                emit_ocsf(sandbox_id, map_lifecycle_create(&ctx, sandbox_name));
             }
         }
         // Process [1007]: `CreateProcessInSandbox` carries the real agent command
@@ -968,8 +1128,8 @@ fn process_event(index: &Mutex<AttributionIndex>, ev: DecodedEtwEvent) {
         // once with the command — only emit for the populated one.
         "CreateProcessInSandbox" if ev.opcode == OPCODE_START => {
             if let Some(cmd) = ev.get_unquoted("commandLine") {
-                let ctx = etw_ctx(&sandbox_id, &sandbox_name);
-                emit_ocsf(&sandbox_id, map_process_launch(&ctx, &ev, &cmd));
+                let ctx = etw_ctx(sandbox_id, sandbox_name);
+                emit_ocsf(sandbox_id, map_process_launch(&ctx, ev, &cmd));
             } else {
                 tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
             }
@@ -980,8 +1140,8 @@ fn process_event(index: &Mutex<AttributionIndex>, ev: DecodedEtwEvent) {
         // command line). We emit it as a distinct PROC row so the trail records both
         // the launch request (with cmd line) and the confirmed start (with real pid).
         "ProcessLaunched" => {
-            let ctx = etw_ctx(&sandbox_id, &sandbox_name);
-            emit_ocsf(&sandbox_id, map_process_started(&ctx, &ev));
+            let ctx = etw_ctx(sandbox_id, sandbox_name);
+            emit_ocsf(sandbox_id, map_process_started(&ctx, ev));
         }
         // Config [5019]: several distinct config/hardening/setup state changes. Each
         // is a genuine audit-worthy config event; `SandboxConfig` is the richest but
@@ -996,15 +1156,15 @@ fn process_event(index: &Mutex<AttributionIndex>, ev: DecodedEtwEvent) {
         | "EnforceOsPolicy"
         | "SandboxProxyConfigured"
         | "SandboxConsoleReferencePlumbed" => {
-            let ctx = etw_ctx(&sandbox_id, &sandbox_name);
-            emit_ocsf(&sandbox_id, map_config_state(&ctx, &ev));
+            let ctx = etw_ctx(sandbox_id, sandbox_name);
+            emit_ocsf(sandbox_id, map_config_state(&ctx, ev));
         }
         // Finding [2004]: MXC surfaces WIL error/fallback activities during
         // sandbox setup. Captured as informational (non-alert) findings so the
         // audit trail records setup anomalies without crying wolf.
         "ActivityError" | "FallbackError" => {
-            let ctx = etw_ctx(&sandbox_id, &sandbox_name);
-            emit_ocsf(&sandbox_id, map_finding(&ctx, &ev));
+            let ctx = etw_ctx(sandbox_id, sandbox_name);
+            emit_ocsf(sandbox_id, map_finding(&ctx, ev));
         }
         _ => {
             tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
@@ -1295,4 +1455,128 @@ fn wide_str_at(buf: &[u8], offset: u32) -> Option<String> {
     }
 
     Some(String::from_utf16_lossy(&wchars[..len]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_event(pid: u32, name: &str) -> DecodedEtwEvent {
+        DecodedEtwEvent {
+            provider: GUID::from_u128(0),
+            event_id: 1,
+            level: 4,
+            opcode: OPCODE_START,
+            process_id: pid,
+            activity_id: GUID::from_u128(0),
+            event_name: Some(name.to_string()),
+            props: Vec::new(),
+        }
+    }
+
+    // Shailendra #2: the create/config burst can reach the consumer before the
+    // driver's `register_launch` seeds attribution. An event that doesn't resolve
+    // must be held and replayed once attribution lands — not dropped.
+    #[test]
+    fn buffered_event_replays_after_registration() {
+        let mut idx = AttributionIndex::new();
+        let ev = mk_event(1234, "SandboxConfig");
+
+        // Arrives before registration → unresolved → buffered, not dropped.
+        assert!(idx.resolve(&ev).is_none());
+        idx.buffer_unresolved(ev);
+        assert!(
+            idx.drain_resolved().is_empty(),
+            "nothing to drain pre-registration"
+        );
+
+        // Driver seeds attribution for the wxc-exec pid we spawned.
+        idx.register_launch("sbx-1", "my-sandbox", 1234, "agent --run");
+
+        // The buffered event now attributes and is returned for emit, in order.
+        let ready = idx.drain_resolved();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].0, "sbx-1");
+        assert_eq!(ready[0].1, "my-sandbox");
+        assert_eq!(ready[0].2.process_id, 1234);
+
+        // And it's removed from the buffer (no double emit).
+        assert!(idx.drain_resolved().is_empty());
+    }
+
+    // Genuinely unattributable events (e.g. from unrelated Sandboxing activity)
+    // must never grow the buffer without bound.
+    #[test]
+    fn pending_buffer_is_bounded() {
+        let mut idx = AttributionIndex::new();
+        for pid in 0..(PENDING_MAX as u32 + 50) {
+            idx.buffer_unresolved(mk_event(pid, "SandboxConfig"));
+        }
+        assert!(
+            idx.pending.len() <= PENDING_MAX,
+            "buffer exceeded PENDING_MAX"
+        );
+    }
+
+    // A buffered event that resolves via a cross-linked correlator (not just the
+    // pid) is also replayed: register one pid, then an event sharing only the
+    // activity id resolves after the first event cross-links it.
+    #[test]
+    fn buffered_event_replays_via_crosslink() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-9", "s9", 4321, "agent");
+
+        // First event carries the pid + an activity id → resolves and cross-links
+        // the activity id to sbx-9.
+        let mut anchor = mk_event(4321, "CreateProcessInSandbox");
+        anchor.activity_id = GUID::from_u128(0xABCD);
+        assert_eq!(idx.resolve(&anchor).as_deref(), Some("sbx-9"));
+
+        // A later payload-keyless event shares only the activity id (different
+        // pid) — it must now resolve via the cross-link.
+        let mut keyless = mk_event(0, "SandboxConfig");
+        keyless.activity_id = GUID::from_u128(0xABCD);
+        assert_eq!(idx.resolve(&keyless).as_deref(), Some("sbx-9"));
+    }
+
+    // Shailendra #1 (PID reuse): if a sandbox leaked (no `forget`) and Windows
+    // recycles its wxc-exec PID for a new sandbox, events on that PID must route
+    // to the *new* owner, never the dead one.
+    #[test]
+    fn pid_reuse_rebinds_to_new_sandbox() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-A", "A", 1000, "agent --a");
+        let ev_a = mk_event(1000, "CreateProcessInSandbox");
+        assert_eq!(idx.resolve(&ev_a).as_deref(), Some("sbx-A"));
+
+        // A leaks (delete never ran). PID 1000 is recycled for B.
+        idx.register_launch("sbx-B", "B", 1000, "agent --b");
+        let ev_b = mk_event(1000, "CreateProcessInSandbox");
+        assert_eq!(idx.resolve(&ev_b).as_deref(), Some("sbx-B"));
+    }
+
+    // Shailendra #1 (cmd ambiguity): two sandboxes running the identical command
+    // line must not let that command line resolve anything (it's ambiguous); a
+    // unique command line still works as a fallback.
+    #[test]
+    fn duplicate_command_line_is_not_used_for_resolution() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 11, "agent --run");
+        idx.register_launch("sbx-2", "s2", 22, "agent --run"); // same cmd → ambiguous
+
+        // Event carrying ONLY the duplicate command line (unknown pid, no
+        // identity/activity) must NOT resolve — refusing beats misrouting.
+        let mut only_cmd = mk_event(999, "SandboxConfig");
+        only_cmd
+            .props
+            .push(("commandLine".into(), "\"agent --run\"".into()));
+        assert!(idx.resolve(&only_cmd).is_none());
+
+        // A still-unique command line resolves via the fallback as before.
+        idx.register_launch("sbx-3", "s3", 33, "agent --unique");
+        let mut uniq = mk_event(998, "SandboxConfig");
+        uniq.props
+            .push(("commandLine".into(), "\"agent --unique\"".into()));
+        assert_eq!(idx.resolve(&uniq).as_deref(), Some("sbx-3"));
+    }
 }
