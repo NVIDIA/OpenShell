@@ -6465,6 +6465,9 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 mod tests {
     use super::*;
     use openshell_core::proposals::AgentProposals;
+    use openshell_core::proto::{
+        NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy as ProtoSandboxPolicy,
+    };
     use std::collections::HashMap as TestHashMap;
     use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -7475,6 +7478,79 @@ network_policies:
             #[cfg(target_os = "linux")]
             ProxyIdentityMode::Procfs { .. } => panic!("expected static identity mode"),
         }
+    }
+
+    #[test]
+    fn static_identity_evaluate_opa_tcp_allows_and_denies_with_proto_policy() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"static-agent").unwrap();
+        let identity = ProxyIdentityMode::static_binary(tmp.path()).unwrap();
+        let binary_path = tmp.path().to_string_lossy().into_owned();
+        let policy_name = "static_agent";
+        let engine = OpaEngine::from_proto(&ProtoSandboxPolicy {
+            version: 1,
+            network_policies: std::collections::HashMap::from([(
+                policy_name.to_string(),
+                NetworkPolicyRule {
+                    name: policy_name.to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.test".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: binary_path,
+                        ..Default::default()
+                    }],
+                },
+            )]),
+            ..Default::default()
+        })
+        .unwrap();
+        let peer_addr: SocketAddr = ([127, 0, 0, 1], 49152).into();
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(
+            peer_addr,
+            ([127, 0, 0, 1], 18080).into(),
+        );
+
+        let allowed = authorize_egress_intent(
+            connection,
+            &engine,
+            &identity,
+            EgressIntent::connect("api.example.test".to_string(), 443),
+        );
+        match allowed.action {
+            NetworkAction::Allow { matched_policy } => {
+                assert_eq!(matched_policy.as_deref(), Some(policy_name));
+            }
+            NetworkAction::Deny { reason } => panic!("expected allow, got deny: {reason}"),
+        }
+        assert_eq!(allowed.binary.as_deref(), Some(tmp.path()));
+        assert_eq!(allowed.binary_pid, None);
+        assert!(allowed.ancestors.is_empty());
+        assert!(allowed.cmdline_paths.is_empty());
+
+        let denied = authorize_egress_intent(
+            connection,
+            &engine,
+            &identity,
+            EgressIntent::connect("blocked.example.test".to_string(), 443),
+        );
+        match denied.action {
+            NetworkAction::Allow { matched_policy } => {
+                panic!("expected deny, got allow from policy {matched_policy:?}");
+            }
+            NetworkAction::Deny { reason } => {
+                assert!(
+                    reason.contains("endpoint blocked.example.test:443 is not allowed"),
+                    "unexpected deny reason: {reason}"
+                );
+            }
+        }
+        assert_eq!(denied.binary.as_deref(), Some(tmp.path()));
+        assert_eq!(denied.binary_pid, None);
+        assert!(denied.ancestors.is_empty());
+        assert!(denied.cmdline_paths.is_empty());
     }
 
     #[test]

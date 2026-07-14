@@ -120,3 +120,101 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         policy_local_ctx,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use openshell_core::proposals::AgentProposals;
+    use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    use super::*;
+
+    fn test_config(bind_addr: SocketAddr, binary_path: PathBuf) -> HostProxyConfig {
+        HostProxyConfig {
+            bind_addr,
+            policy: ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            },
+            binary_path,
+            sandbox_id: Some("sandbox-123".to_string()),
+            sandbox_name: Some("agent-box".to_string()),
+            openshell_endpoint: None,
+            inference_routes: None,
+            provider_credentials: None,
+            agent_proposals: AgentProposals::new(true),
+            denial_tx: None,
+            activity_tx: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_non_loopback_bind_addr() {
+        let result = start_host_proxy(test_config(
+            ([192, 0, 2, 1], 0).into(),
+            PathBuf::from("missing-agent.exe"),
+        ))
+        .await;
+
+        let Err(err) = result else {
+            panic!("host proxy should reject non-loopback bind addresses");
+        };
+        assert!(
+            err.to_string().contains("loopback-only"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn starts_loopback_proxy_and_serves_policy_local() {
+        let binary = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(binary.path(), b"agent").unwrap();
+
+        let handle = start_host_proxy(test_config(
+            ([127, 0, 0, 1], 0).into(),
+            binary.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+
+        let addr = handle.http_addr().expect("proxy should report bound addr");
+        assert!(addr.ip().is_loopback());
+        assert_ne!(addr.port(), 0);
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                b"GET http://policy.local/v1/policy/current HTTP/1.1\r\n\
+                  Host: policy.local\r\n\
+                  Connection: close\r\n\
+                  \r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "unexpected response: {response}"
+        );
+        let (_, body) = response.split_once("\r\n\r\n").expect("response body");
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["format"], "yaml");
+        assert!(
+            body["policy_yaml"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("version: 1"),
+            "unexpected policy payload: {body}"
+        );
+    }
+}
