@@ -227,12 +227,32 @@ pub struct ChainRunner {
 struct MiddlewareServiceState {
     service: Arc<dyn SupervisorMiddleware>,
     manifest: OnceCell<MiddlewareManifest>,
+    diagnostic_policy: MiddlewareDiagnosticPolicy,
     operator_max_body_bytes: Option<usize>,
 }
 
-impl MiddlewareServiceState {
-    fn is_external(&self) -> bool {
-        self.operator_max_body_bytes.is_some()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MiddlewareDiagnosticPolicy {
+    Preserve,
+    Normalize,
+}
+
+impl MiddlewareDiagnosticPolicy {
+    fn error_reason(self, error: &tonic::Status) -> String {
+        match self {
+            Self::Preserve => safe_reason(&error.to_string()),
+            Self::Normalize => "external_service_error".to_string(),
+        }
+    }
+
+    fn process_result(
+        self,
+        binding: &MiddlewareBinding,
+        result: &mut openshell_core::proto::HttpRequestResult,
+    ) {
+        if self == Self::Normalize {
+            normalize_untrusted_diagnostics(binding, result);
+        }
     }
 }
 
@@ -403,7 +423,7 @@ fn validate_external_manifest(
 /// External diagnostic text is untrusted and may contain request data. Keep
 /// only values derived from the validated, startup-time binding identifier and
 /// numeric finding counts; do not carry per-request free-form text into logs.
-fn normalize_external_result(
+fn normalize_untrusted_diagnostics(
     binding: &MiddlewareBinding,
     result: &mut openshell_core::proto::HttpRequestResult,
 ) {
@@ -469,6 +489,7 @@ impl MiddlewareRegistry {
             services.push(Arc::new(MiddlewareServiceState {
                 service,
                 manifest: manifest_cell,
+                diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                 operator_max_body_bytes: None,
             }));
         }
@@ -520,6 +541,7 @@ impl MiddlewareRegistry {
             services.push(Arc::new(MiddlewareServiceState {
                 service,
                 manifest: manifest_cell,
+                diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                 operator_max_body_bytes: Some(operator_max_body_bytes),
             }));
             registered_services.push(RegisteredMiddlewareService {
@@ -610,6 +632,7 @@ impl ChainRunner {
                 services: Arc::new(vec![Arc::new(MiddlewareServiceState {
                     service,
                     manifest: OnceCell::new(),
+                    diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
                 })]),
                 registered_services: Arc::new(Vec::new()),
@@ -812,11 +835,7 @@ impl ChainRunner {
             {
                 Ok(result) => result.into_inner(),
                 Err(err) => {
-                    let reason = if service.is_external() {
-                        "external_service_error".to_string()
-                    } else {
-                        safe_reason(&err.to_string())
-                    };
+                    let reason = service.diagnostic_policy.error_reason(&err);
                     match apply_on_error(entry, &reason, &mut applied) {
                         OnErrorAction::FailOpen => continue,
                         OnErrorAction::FailClosed(reason) => {
@@ -834,9 +853,9 @@ impl ChainRunner {
                 }
             };
 
-            if service.is_external() {
-                normalize_external_result(binding, &mut result);
-            }
+            service
+                .diagnostic_policy
+                .process_result(binding, &mut result);
 
             let decision = match Decision::try_from(result.decision) {
                 Ok(decision @ (Decision::Allow | Decision::Deny)) => decision,
@@ -1842,11 +1861,13 @@ mod tests {
                 Arc::new(MiddlewareServiceState {
                     service: builtin_service,
                     manifest: builtin_manifest_cell,
+                    diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
                     operator_max_body_bytes: None,
                 }),
                 Arc::new(MiddlewareServiceState {
                     service,
                     manifest: manifest_cell,
+                    diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                     operator_max_body_bytes: Some(operator_max_body_bytes),
                 }),
             ]),
