@@ -33,6 +33,10 @@
           overlays = [ (import rust-overlay) ];
         };
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        daggerConfig = builtins.fromJSON (builtins.readFile ./dagger.json);
+        dagger = pkgs.callPackage ./nix/dagger.nix {
+          version = pkgs.lib.removePrefix "v" daggerConfig.engineVersion;
+        };
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
@@ -42,6 +46,12 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustToolchain
+            # Reproducible local build and packaging pipelines.
+            dagger
+            # Required for running packaging tests.
+            (lima.override {
+              withAdditionalGuestAgents = true;
+            })
             # Required to find packages
             pkg-config
             # Required for bindgen generation.

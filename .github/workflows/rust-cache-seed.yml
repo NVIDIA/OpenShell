@@ -51,7 +51,7 @@ jobs:
           cache-on-failure: true
 
       - name: Format
-        run: mise run rust:format:check
+        run: cargo xtask run rust:format:check
 
       - name: Lint
         run: mise run rust:lint

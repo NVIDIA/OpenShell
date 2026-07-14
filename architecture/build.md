@@ -79,6 +79,38 @@ step via the `rust-native-build.yml` workflow (per-architecture, per-component)
 and uploads the result as an artifact that the image build job downloads back
 into the staging directory before running Buildx.
 
+The Dagger module provides a local, architecture-selectable build path for the
+Linux CLI and can assemble a Debian package with that CLI plus prebuilt gateway
+and VM driver binaries. It uses the same CI toolchain image and
+`tasks/scripts/package-deb.sh` as the GitHub Actions workflows. The gateway and
+VM driver remain explicit file inputs until their native builds move into
+Dagger.
+
+`cargo xtask release-smoke-test --deb <path>` validates a Debian release
+artifact in an architecture-specific `os-ubuntu<version>-<arch>-<backend>-podman-rl`
+Lima VM.
+Ubuntu 26.04 is the default; `--guest-os` selects another supported versioned
+Lima template. Lima starts in plain mode so the test provisions the rootless
+Podman compute-driver environment itself without Lima-managed containerd,
+mounts, or port forwarding. Snapshot reuse is
+opt-in with `--snapshot`: when QEMU is available, the xtask selects it
+explicitly, stores a `base-v1` snapshot, and restores that snapshot before each
+artifact test. When QEMU is unavailable or snapshotting is not requested, Lima
+uses its default backend and the xtask deletes the VM after the test. It starts
+the packaged gateway, creates a sandbox, and verifies that the default policy
+denies an undeclared network request. Guest preparation is split by OS/driver
+combination: `scripts/install-podman-rootless.sh` provisions the rootless Podman
+compute-driver environment, and each supported release smoke path has its own
+script under `scripts/release-smoke/`. The current supported release path is
+`ubuntu-podman-rootless.sh`; adding Fedora rootless Podman support should add a
+Fedora-specific script there and a matching `release_smoke_guest_script` arm in
+`crates/xtask/src/release_smoke_test.rs`. If multiple scripts later share a
+proven chunk of logic, extract that chunk then. The Ubuntu path temporarily
+writes the Podman-ready gateway bind configuration that Debian packages do not
+yet seed; remove that workaround when Debian first-start configuration matches
+RPM. CI jobs omit `--snapshot` while still benefiting from Lima's cached
+guest-image download.
+
 Runtime layout:
 
 - **Gateway**: `gcr.io/distroless/cc-debian13:nonroot` base, GNU-linked binary at

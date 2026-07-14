@@ -14,9 +14,11 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 | `macos` | `macos-latest-xlarge` | `install.sh` resolves the Homebrew formula, brew installs the cask, and `openshell status` reaches the brew-services–backed local gateway with the VM driver. |
 | `ubuntu` | `ubuntu-latest` | `install.sh` installs the Debian package, the post-install systemd user service starts, and `openshell status` reaches the local gateway with the Docker driver. |
 | `fedora` | `fedora:latest` container | `install.sh` installs the RPM packages, the local gateway starts under Podman, and `openshell status` succeeds. |
+| `ubuntu-snap` | `ubuntu-latest` | Downloads the `snap-linux-amd64` artifact from the triggering Release Dev run, installs it with `snap install --dangerous`, connects required interfaces, registers the snap gateway, and runs `openshell status`. |
+| `ubuntu-podman-rootless` | `ubuntu-latest` + Lima/QEMU | Downloads the `deb-linux-amd64` artifact from the triggering Release Dev run, installs repo tools with mise, boots an Ubuntu Lima VM with rootless Podman, installs the `.deb`, starts the packaged gateway, creates a sandbox, and verifies that `curl` is denied without policy. |
 | `kubernetes` | `ubuntu-latest` + kind | `helm install oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev` succeeds in a kind cluster, the gateway pod becomes Ready, port-forward exposes 8080, and the released CLI registers the in-cluster gateway and runs `openshell status` against it. |
 
-`install.sh` defaults to the *latest tagged* release — the canary is therefore checking that the most recent public release still installs, not the just-published `dev` build. The `kubernetes` job is the exception: it pins to `0.0.0-dev` chart + `:dev` images.
+`install.sh` defaults to the *latest tagged* release — the `macos`, `ubuntu`, and `fedora` jobs are therefore checking that the most recent public release still installs, not the just-published `dev` build. The jobs that download workflow artifacts (`ubuntu-snap` and `ubuntu-podman-rootless`) test artifacts from the triggering Release Dev run. The `kubernetes` job pins to the `0.0.0-dev` chart + `:dev` images.
 
 ## Trigger paths
 
@@ -34,6 +36,10 @@ on:
 - **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition.
 
 When dispatched manually, `github.event.workflow_run.head_sha` is empty and the workflow falls back to `github.sha` (the branch tip) for the `install.sh` URL.
+
+The `ubuntu-snap` and `ubuntu-podman-rootless` jobs run only for `workflow_run`
+events because they need a completed Release Dev run ID for
+`actions/download-artifact`.
 
 ## Manual dispatch
 
@@ -109,6 +115,8 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 |---|---|---|
 | `macos`/`ubuntu`/`fedora` job fails on `install.sh` | Latest tagged release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
 | `macos`/`ubuntu`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_DRIVERS` env in the "Ensure …" step. |
+| `ubuntu-podman-rootless` fails before `cargo xtask release-smoke-test` | Lima/QEMU installation, KVM access, or Release Dev artifact download failed. | "Install Lima and QEMU", "Cache ~/.cache/lima", and "Download Debian package from release-dev artifacts". |
+| `ubuntu-podman-rootless` fails inside `cargo xtask release-smoke-test` | Lima could not boot the VM, rootless Podman setup failed, the `.deb` did not install, the packaged gateway did not start, or sandbox creation/default-deny curl failed. | The xtask guest script emits OpenShell, systemd, Podman, container, and gateway diagnostics on failure. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
 | `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
 | `kubernetes` job fails on `openshell gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `openshell gateway list` in the diagnostics dump. |

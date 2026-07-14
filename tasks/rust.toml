@@ -23,7 +23,7 @@ hide = true
 
 ["rust:format:check"]
 description = "Check Rust formatting"
-run = "cargo fmt --all -- --check"
+run = "cargo xtask run rust:format:check"
 hide = true
 
 ["rust:verify:telemetry-off"]
