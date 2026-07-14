@@ -235,22 +235,30 @@ add a periodic reconcile loop when MXC exposes a list/inspect API.
 
 #### Governed egress
 
-Governed egress is the core value layer. When the agent opens a connection, MXC's
-`network.proxy = { localhost: N }` redirect sends it to the host CONNECT proxy on
-`127.0.0.1:N` (loopback inside an AppContainer is host loopback). The proxy
-attributes the connection to a sandbox, loads that sandbox's policy, evaluates L4
-host:port allow/deny via OPA, intercepts `inference.local` (terminate TLS with
-the sandbox CA, run the privacy router, route via `openshell-router`), applies
-L7 method/path rules for other HTTPS, and emits OCSF events. Because the default
-`processcontainer` backend already honors `network.proxy`, governed egress works
-with no MXC changes.
+Governed egress is the core value layer. When it is enabled,
+`egress_proxy_addr` serves as a loopback address seed. For each sandbox, the MXC
+driver preserves the configured IP and binds port `0` to allocate a fresh
+ephemeral port. It starts the existing OpenShell host CONNECT proxy with that
+sandbox's trimmed network-only policy, then writes the allocated port to MXC's
+`network.proxy = { localhost: N }` redirect. Loopback inside an AppContainer is
+host loopback, so sandbox egress reaches the proxy running in the in-process MXC
+driver and gateway service.
 
-The intended topology is many sandboxes to one host-side proxy, with per-sandbox
-attribution in the proxy before policy evaluation. That avoids running one full
-proxy stack per sandbox on client systems. If MXC cannot provide reliable
-attribution for shared loopback traffic, the implementation can fall back to a
-one-proxy-per-sandbox or per-sandbox loopback port/address model while still
-keeping the proxy on the host.
+The host-listener-to-sandbox topology is **1:1**, not many-to-one. Multiple
+sandboxes share `127.0.0.1`, but each active sandbox owns a unique ephemeral port
+and host proxy handle in the driver registry. The resulting
+`127.0.0.1:<port>` tuple scopes every inbound proxy connection to exactly one
+sandbox, eliminating the need to infer sandbox identity from shared loopback
+traffic. Dropping the handle when the sandbox stops, exits, or fails terminates
+that sandbox's proxy accept loop.
+
+Because MXC does not expose Linux procfs socket ownership, the proxy evaluates
+each connection against the listener's sandbox policy and a static sandbox-agent
+identity derived from the configured `agent_command`. The current host-mode path
+evaluates L4 host:port allow/deny via OPA, handles plaintext and forward-proxy L7
+traffic, and emits OCSF events. HTTPS MITM trust bootstrap and gateway
+denial/activity bus wiring remain follow-up work. The default `processcontainer`
+backend already honors `network.proxy`, so this design requires no MXC changes.
 
 ### Part 3 - Policy translation between OpenShell and MXC
 
@@ -335,17 +343,19 @@ are never affected and the changes can land additively.
   Unsupported drivers become contract stubs with tests asserting they return
   unsupported.
 - **MXC driver and host proxy.** Add `openshell-driver-mxc` driving the default
-  `processcontainer` backend: lifecycle, policy translation, governed egress +
-  inference + privacy on the host CONNECT proxy, credential injection, and
-  interactive exec via the driver's ConPTY bridge. Unenforceable policy is
-  rejected in `ValidateSandboxCreate` with `invalid_argument` naming the rule.
+  `processcontainer` backend: lifecycle, policy translation, one host CONNECT
+  proxy listener per sandbox, credential injection, and interactive exec via
+  the driver's ConPTY bridge. Unenforceable policy is rejected in
+  `ValidateSandboxCreate` with `invalid_argument` naming the rule. HTTPS MITM,
+  inference/privacy routing, and gateway event-bus wiring follow after host-mode
+  trust bootstrap is available.
 - **Gateway as a Windows Service.** Package `openshell-gateway.exe` as a Windows
   Service with SQLite under `%ProgramData%`, Windows Event Log integration, and
   mTLS bootstrap on first run.
-- **Hardening.** Confirm reliable per-sandbox loopback attribution and
-  `processcontainer` concurrency. Persist the sandbox-id ⇄ session-id mapping so
-  a gateway restart can reconcile or clean up orphaned sessions, and add a
-  periodic reconcile loop once MXC exposes a list/inspect API.
+- **Hardening.** Validate collision-free per-sandbox ephemeral port allocation
+  and `processcontainer` concurrency. Persist the sandbox-id ⇄ session-id
+  mapping so a gateway restart can reconcile or clean up orphaned sessions, and
+  add a periodic reconcile loop once MXC exposes a list/inspect API.
 - **Opt-in `isolation_session` egress.** Becomes available if and when Microsoft
   extends `network.proxy` to that backend; the same host proxy then governs its
   egress.
@@ -353,17 +363,17 @@ are never affected and the changes can land additively.
 Validation follows a layered pyramid: pure-Rust unit tests for the JSON
 builders/parsers and policy mapper (on the Windows MSVC test lane), a mock
 `wxc-exec` shim (`OPENSHELL_MXC_MOCK_WXC=1`) for lifecycle logic, egress-proxy
-component tests for redirect → attribution → OPA decision, gated integration
-tests against a real `wxc-exec` (`#[ignore]` unless present), and manual E2E on a
-real Windows 11 host. User-facing configuration is documented in the gateway
-config reference and the architecture docs.
+component tests for redirect → listener-scoped policy → OPA decision, gated
+integration tests against a real `wxc-exec` (`#[ignore]` unless present), and
+manual E2E on a real Windows 11 host. User-facing configuration is documented in
+the gateway config reference and the architecture docs.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
 | MXC `allowedHosts`/`blockedHosts` not enforced on Windows yet, so there is no kernel-level defense-in-depth beneath the host proxy. | Rely on the host proxy for host-level allow/deny |
-| The host proxy must reliably attribute an inbound loopback connection to its originating sandbox; AppContainer source-port attribution is not guaranteed across MXC versions. | Use a per-sandbox source-port window or per-sandbox `127.0.0.x` address, and validate attribution as a hardening step. |
+| Per-sandbox proxy routing must remain collision-free when multiple sandboxes run concurrently. | Bind a fresh ephemeral port on `127.0.0.1` for each sandbox and retain its proxy handle in the driver registry, making the listener-to-sandbox mapping 1:1. |
 | `--config-base64` carries credentials in argv (briefly visible in process listings). | Zero-fill after invocation; prefer passing config on stdin. |
 | Concurrency: `isolation_session` is single-session; `processcontainer` limits are unverified. | Validate `processcontainer` concurrency and document any cap. |
 | OCSF fidelity: with no in-sandbox supervisor, arbitrary in-process events are not visible (only network + lifecycle). | Accept reduced fidelity; an ETW/callback hook from the Microsoft MXC team will help restore in-process visibility later. |
