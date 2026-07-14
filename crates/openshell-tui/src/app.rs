@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use openshell_bootstrap::GatewayMetadataSource;
-use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::setting_value;
 use openshell_core::settings::{self, SettingValueKind};
+use openshell_sdk::EdgeAuthInterceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 

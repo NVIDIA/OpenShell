@@ -2,25 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use miette::{IntoDiagnostic, Result, WrapErr};
-use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::inference_client::InferenceClient;
 use openshell_core::proto::open_shell_client::OpenShellClient;
+use openshell_sdk::EdgeAuthInterceptor;
 use rustls::{
     RootCertStore,
-    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+    pki_types::{CertificateDer, PrivateKeyDer},
 };
-use std::collections::HashMap;
-use std::future::Future;
 use std::io::Cursor;
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
-use tracing::debug;
+
+// `build_insecure_rustls_config` lives in the SDK (used by the SDK's
+// transport stack and by CLI's HTTP health check). The other former
+// `tls.rs` helpers (`build_rustls_config`, `build_tonic_tls_config`,
+// `load_private_key`, `TlsMaterials`) were tied to mTLS and now live
+// below as CLI-private legacy code — they will go away when mTLS is
+// retired as an auth method.
+pub use openshell_sdk::transport::build_insecure_rustls_config;
 
 /// Concrete gRPC client type used by all commands.
 pub type GrpcClient = OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
@@ -104,12 +105,44 @@ impl TlsOptions {
     pub fn is_bearer_auth(&self) -> bool {
         self.edge_token.is_some() || self.oidc_token.is_some()
     }
-}
 
-pub struct TlsMaterials {
-    ca: Vec<u8>,
-    cert: Vec<u8>,
-    key: Vec<u8>,
+    /// Returns `true` when this `TlsOptions` carries a full mTLS client
+    /// identity (cert + key on disk). Used by [`build_channel`] to route
+    /// mTLS-authenticated gateways through the legacy inline path.
+    pub fn has_mtls_identity(&self, server: &str) -> bool {
+        let resolved = self.with_default_paths(server);
+        resolved.cert.as_ref().is_some_and(|p| p.exists())
+            && resolved.key.as_ref().is_some_and(|p| p.exists())
+    }
+
+    /// Convert this CLI-side `TlsOptions` into an SDK [`openshell_sdk::ClientConfig`]
+    /// for non-mTLS gateways.
+    ///
+    /// Reads the CA cert from disk if a path resolves; a missing file is
+    /// non-fatal and falls back to system roots (matches today's OIDC
+    /// fallback behavior). Maps tokens to [`openshell_sdk::AuthConfig`]
+    /// with OIDC taking precedence over `EdgeJwt` when both are set.
+    ///
+    /// mTLS materials are intentionally not carried through; gateways
+    /// requiring client certificates are dispatched to the legacy inline
+    /// path in [`build_channel`] before this conversion is reached.
+    pub fn to_client_config(&self, server: &str) -> openshell_sdk::ClientConfig {
+        let resolved = self.with_default_paths(server);
+        let ca_cert = resolved
+            .ca
+            .as_ref()
+            .and_then(|ca_path| std::fs::read(ca_path).ok());
+        let auth = match (&resolved.oidc_token, &resolved.edge_token) {
+            (Some(token), _) => Some(openshell_sdk::AuthConfig::Oidc(token.clone())),
+            (None, Some(token)) => Some(openshell_sdk::AuthConfig::EdgeJwt(token.clone())),
+            (None, None) => None,
+        };
+        let mut config = openshell_sdk::ClientConfig::new(server);
+        config.ca_cert = ca_cert;
+        config.auth = auth;
+        config.insecure_skip_verify = resolved.gateway_insecure;
+        config
+    }
 }
 
 /// Resolve the TLS cert directory for a known gateway name.
@@ -163,6 +196,20 @@ fn xdg_config_dir() -> Result<PathBuf> {
     openshell_core::paths::xdg_config_dir()
 }
 
+// ── Legacy mTLS path ─────────────────────────────────────────────────
+// Everything in this section supports gateways that authenticate clients
+// with an mTLS certificate. mTLS is being retired as an auth method, and
+// the SDK does not speak it. Until product removes mTLS support, these
+// helpers stay in CLI for the `else { full mTLS }` branch of
+// `build_channel` and the matching branch of `http_health_check`.
+
+/// In-memory mTLS materials read from disk by [`require_tls_materials`].
+pub struct TlsMaterials {
+    pub ca: Vec<u8>,
+    pub cert: Vec<u8>,
+    pub key: Vec<u8>,
+}
+
 pub fn require_tls_materials(server: &str, tls: &TlsOptions) -> Result<TlsMaterials> {
     let resolved = tls.with_default_paths(server);
     let default_hint = default_tls_dir(server).map_or_else(String::new, |dir| {
@@ -192,6 +239,7 @@ pub fn require_tls_materials(server: &str, tls: &TlsOptions) -> Result<TlsMateri
     Ok(TlsMaterials { ca, cert, key })
 }
 
+/// Parse a PEM-encoded private key for the legacy mTLS rustls path.
 fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
     let mut cursor = Cursor::new(pem);
     let key = rustls_pemfile::private_key(&mut cursor)
@@ -200,11 +248,12 @@ fn load_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
     Ok(key)
 }
 
+/// Build a `rustls` mTLS client config (used by `http_health_check`).
 pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientConfig> {
     let mut roots = RootCertStore::empty();
     let mut ca_cursor = Cursor::new(&materials.ca);
     let ca_certs = rustls_pemfile::certs(&mut ca_cursor)
-        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
         .into_diagnostic()?;
     for cert in ca_certs {
         roots.add(cert).into_diagnostic()?;
@@ -212,7 +261,7 @@ pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientCon
 
     let mut cert_cursor = Cursor::new(&materials.cert);
     let cert_chain = rustls_pemfile::certs(&mut cert_cursor)
-        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        .collect::<std::result::Result<Vec<CertificateDer<'static>>, _>>()
         .into_diagnostic()?;
     let key = load_private_key(&materials.key)?;
 
@@ -222,6 +271,8 @@ pub fn build_rustls_config(materials: &TlsMaterials) -> Result<rustls::ClientCon
         .into_diagnostic()
 }
 
+/// Build a `tonic` mTLS client config (used by the legacy `build_channel`
+/// mTLS branch and by `completers.rs`).
 pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
     let ca_cert = Certificate::from_pem(materials.ca.clone());
     let identity = Identity::from_pem(materials.cert.clone(), materials.key.clone());
@@ -230,202 +281,48 @@ pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
         .identity(identity)
 }
 
-#[derive(Debug)]
-struct InsecureServerCertVerifier;
-
-impl ServerCertVerifier for InsecureServerCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-#[derive(Clone)]
-struct InsecureTlsConnector {
-    tls_connector: tokio_rustls::TlsConnector,
-}
-
-impl tower::Service<hyper::Uri> for InsecureTlsConnector {
-    type Response = hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
-    type Future =
-        std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, uri: hyper::Uri) -> Self::Future {
-        let tls_connector = self.tls_connector.clone();
-        Box::pin(async move {
-            let host = uri.host().unwrap_or("localhost").to_string();
-            let port = uri.port_u16().unwrap_or(443);
-            let addr = format!("{host}:{port}");
-            let tcp = tokio::net::TcpStream::connect(addr).await?;
-            let server_name = ServerName::try_from(host)?;
-            let tls_stream = tls_connector.connect(server_name, tcp).await?;
-            Ok(hyper_util::rt::TokioIo::new(tls_stream))
-        })
-    }
-}
-
-pub fn build_insecure_rustls_config() -> Result<rustls::ClientConfig> {
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier))
-        .with_no_client_auth();
-    Ok(config)
-}
-
-/// Tunnel proxy addresses keyed by upstream endpoint + token.
-///
-/// Each distinct edge-authenticated gateway gets its own local proxy instead of
-/// reusing the first gateway touched in the current process.
-static EDGE_TUNNEL_ADDRS: OnceLock<Mutex<HashMap<(String, String), SocketAddr>>> = OnceLock::new();
-
-async fn edge_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
-    let key = (server.to_string(), token.to_string());
-    let registry = EDGE_TUNNEL_ADDRS.get_or_init(|| Mutex::new(HashMap::new()));
-
-    {
-        let addrs = registry.lock().await;
-        if let Some(addr) = addrs.get(&key).copied() {
-            return Ok(addr);
-        }
-    }
-
-    let proxy = crate::edge_tunnel::start_tunnel_proxy(server, token).await?;
-    debug!(
-        local_addr = %proxy.local_addr,
-        server,
-        "edge tunnel proxy started, routing gRPC through local proxy"
-    );
-
-    let mut addrs = registry.lock().await;
-    Ok(*addrs.entry(key).or_insert(proxy.local_addr))
-}
+// ── Channel construction (legacy mTLS dispatcher) ────────────────────
+// `build_channel` is a thin dispatcher: gateways that authenticate
+// clients with mTLS take the inline `build_legacy_mtls_channel` path
+// below; everything else converts to a `ClientConfig` and delegates to
+// `openshell_sdk::transport::build_channel`. When mTLS retires as an
+// auth method, `needs_legacy_mtls` and `build_legacy_mtls_channel` go
+// with it.
 
 pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
-    if server.starts_with("http://") {
-        let endpoint = Endpoint::from_shared(server.to_string())
-            .into_diagnostic()?
-            .connect_timeout(Duration::from_secs(10))
-            .http2_adaptive_window(true)
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-        return endpoint.connect().await.into_diagnostic();
+    if needs_legacy_mtls(tls, server) {
+        return build_legacy_mtls_channel(server, tls).await;
     }
+    let config = tls.to_client_config(server);
+    Ok(openshell_sdk::transport::build_channel(&config).await?)
+}
 
-    // When Cloudflare edge bearer auth is active and the server is HTTPS,
-    // route traffic through a local WebSocket tunnel proxy instead.
-    // OIDC tokens bypass the tunnel — they connect directly.
-    if tls.edge_token.is_some() && server.starts_with("https://") {
-        let token = tls
-            .edge_token
-            .as_deref()
-            .ok_or_else(|| miette::miette!("edge token required for tunnel"))?;
-        let local_addr = edge_tunnel_addr(server, token).await?;
+/// Returns `true` when this connection should run through the CLI's
+/// inline mTLS path: HTTPS, no insecure-skip, no edge tunnel, and either
+/// no OIDC token or OIDC paired with mTLS materials on disk. The combined
+/// mTLS+OIDC case preserves the documented "mTLS as transport trust
+/// boundary, Bearer for full scope" deployment model.
+fn needs_legacy_mtls(tls: &TlsOptions, server: &str) -> bool {
+    server.starts_with("https://")
+        && !tls.gateway_insecure
+        && tls.edge_token.is_none()
+        && (tls.oidc_token.is_none() || tls.has_mtls_identity(server))
+}
 
-        // Connect to the local tunnel proxy over plaintext HTTP/2.
-        let local_url = format!("http://{local_addr}");
-        let endpoint = Endpoint::from_shared(local_url)
-            .into_diagnostic()?
-            .connect_timeout(Duration::from_secs(10))
-            .http2_adaptive_window(true)
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-        return endpoint.connect().await.into_diagnostic();
-    }
-
-    if tls.gateway_insecure && server.starts_with("https://") {
-        tracing::warn!("TLS certificate verification is disabled — do not use in production");
-        let rustls_config = build_insecure_rustls_config()?;
-        let tls_connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(rustls_config));
-        let connector = InsecureTlsConnector { tls_connector };
-        // Use http:// so tonic does not layer its own TLS on top — our
-        // connector performs TLS with the insecure config.
-        let http_uri = server.replacen("https://", "http://", 1);
-        let endpoint = Endpoint::from_shared(http_uri)
-            .into_diagnostic()?
-            .connect_timeout(Duration::from_secs(10))
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_while_idle(true);
-        return endpoint
-            .connect_with_connector(connector)
-            .await
-            .into_diagnostic();
-    }
-
-    let mut endpoint = Endpoint::from_shared(server.to_string())
+/// Inline mTLS channel construction for gateways that require client
+/// certificates as the transport-level trust boundary. Goes away when
+/// mTLS is retired as an auth method.
+async fn build_legacy_mtls_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
+    let materials = require_tls_materials(server, tls)?;
+    let tls_config = build_tonic_tls_config(&materials);
+    let endpoint = Endpoint::from_shared(server.to_string())
         .into_diagnostic()?
         .connect_timeout(Duration::from_secs(10))
         .http2_adaptive_window(true)
         .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_while_idle(true);
-
-    let tls_config = if tls.oidc_token.is_some() {
-        // Bearer auth over HTTPS: use mTLS certs for the transport layer when
-        // available (server may still require client certs), and layer the
-        // Bearer token on top via the interceptor.
-        require_tls_materials(server, tls).map_or_else(
-            |_| {
-                let resolved = tls.with_default_paths(server);
-                resolved
-                    .ca
-                    .as_ref()
-                    .and_then(|ca_path| std::fs::read(ca_path).ok())
-                    .map_or_else(
-                        || ClientTlsConfig::new().with_enabled_roots(),
-                        |ca_pem| {
-                            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem))
-                        },
-                    )
-            },
-            |materials| build_tonic_tls_config(&materials),
-        )
-    } else if tls.edge_token.is_some() {
-        // Edge bearer mode — routed through tunnel above; if we reach here
-        // the server is not HTTPS so connect plaintext.
-        return endpoint.connect().await.into_diagnostic();
-    } else {
-        // Standard mTLS: private CA + client cert.
-        let materials = require_tls_materials(server, tls)?;
-        build_tonic_tls_config(&materials)
-    };
-    endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
+        .keep_alive_while_idle(true)
+        .tls_config(tls_config)
+        .into_diagnostic()?;
     endpoint.connect().await.into_diagnostic()
 }
 
@@ -441,7 +338,10 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
 }
 
 fn interceptor_from_tls(tls: &TlsOptions) -> Result<EdgeAuthInterceptor> {
-    EdgeAuthInterceptor::new(tls.oidc_token.as_deref(), tls.edge_token.as_deref())
+    Ok(EdgeAuthInterceptor::new(
+        tls.oidc_token.as_deref(),
+        tls.edge_token.as_deref(),
+    )?)
 }
 
 pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<GrpcInferenceClient> {

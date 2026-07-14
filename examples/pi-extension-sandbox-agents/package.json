@@ -1,0 +1,27 @@
+{
+  "name": "@openshell-examples/pi-extension-sandbox-agents",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pi coding-agent extension that uses @openshell/sdk to spawn OpenShell sandboxes as disposable sub-agents.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": ["./extension.ts"]
+  },
+  "dependencies": {
+    "@openshell/sdk": "file:../../crates/openshell-sdk-node"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.76.0",
+    "@types/node": "^20",
+    "typebox": "1.1.38",
+    "typescript": "^5"
+  }
+}

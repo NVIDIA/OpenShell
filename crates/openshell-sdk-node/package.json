@@ -1,0 +1,55 @@
+{
+  "name": "@openshell/sdk",
+  "version": "0.0.0-alpha.0",
+  "description": "TypeScript SDK for OpenShell gateways. Wraps the openshell-sdk Rust core via napi-rs.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./lib.d.ts",
+        "default": "./lib.mjs"
+      },
+      "require": {
+        "types": "./index.d.ts",
+        "default": "./index.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NVIDIA/OpenShell.git",
+    "directory": "crates/openshell-sdk-node"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "lib.mjs",
+    "lib.d.ts"
+  ],
+  "napi": {
+    "binaryName": "openshell-sdk",
+    "targets": [
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node test/smoke.mjs",
+    "prepublishOnly": "napi prepublish -t npm"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3"
+  }
+}

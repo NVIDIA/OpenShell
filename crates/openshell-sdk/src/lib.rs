@@ -1,0 +1,51 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Shared async Rust client for `OpenShell` gateways.
+//!
+//! Two layers:
+//!
+//! - [`OpenShellClient`] — the high-level sandbox-focused MVP surface:
+//!   health, sandbox CRUD, readiness/deletion waits, non-streaming exec.
+//! - [`raw`] — direct access to the generated tonic clients for RPCs the
+//!   curated surface doesn't yet cover (inference, providers, policy, logs,
+//!   settings, SSH, forwarding).
+//!
+//! Owns the gRPC transport stack — channel construction, TLS material
+//! handling, request interceptors, OIDC token refresh, and the Cloudflare
+//! Access tunnel proxy. Consumed by `openshell-cli`, `openshell-tui`, and
+//! the napi-rs wrapper that ships as `@openshell/sdk`.
+//!
+//! # Quick start
+//!
+//! ```ignore
+//! use openshell_sdk::{ClientConfig, ListOptions, OpenShellClient};
+//!
+//! # async fn run() -> Result<(), openshell_sdk::SdkError> {
+//! let client = OpenShellClient::connect(ClientConfig::new("http://127.0.0.1:8080")).await?;
+//! let health = client.health().await?;
+//! let sandboxes = client.list_sandboxes(ListOptions::default()).await?;
+//! # Ok(())
+//! # }
+//! ```
+
+pub mod auth;
+pub mod client;
+pub mod config;
+pub mod edge_tunnel;
+pub mod error;
+pub mod oidc;
+pub mod raw;
+pub mod refresh;
+pub mod transport;
+pub mod types;
+
+pub use auth::EdgeAuthInterceptor;
+pub use client::OpenShellClient;
+pub use config::{AuthConfig, ClientConfig};
+pub use error::SdkError;
+pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
+pub use types::{
+    ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
+    ServiceStatus,
+};

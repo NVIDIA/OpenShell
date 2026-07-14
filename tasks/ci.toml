@@ -56,7 +56,7 @@ hide = true
 
 [ci]
 description = "Run full checks (lint, compile/type checks, and tests)"
-depends = ["lint", "check", "test"]
+depends = ["lint", "check", "test", "sdk-node:check"]
 
 [all]
 description = "Alias for ci"

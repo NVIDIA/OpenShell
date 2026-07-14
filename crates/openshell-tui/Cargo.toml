@@ -15,6 +15,7 @@ openshell-core = { path = "../openshell-core", default-features = false }
 openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
+openshell-sdk = { path = "../openshell-sdk" }
 
 base64 = { workspace = true }
 ratatui = { workspace = true }
