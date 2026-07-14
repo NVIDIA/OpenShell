@@ -191,10 +191,15 @@ struct DockerDriverRuntimeConfig {
     supervisor_bin: PathBuf,
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
-    supports_gpu: bool,
-    allow_all_default_gpu: bool,
+    gpu: DockerGpuRuntimeConfig,
     sandbox_pids_limit: i64,
     enable_bind_mounts: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DockerGpuRuntimeConfig {
+    supports_gpu: bool,
+    allow_all_default: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,12 +341,14 @@ impl DockerComputeDriver {
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
-        let supports_gpu = info
-            .cdi_spec_dirs
-            .as_ref()
-            .is_some_and(|dirs| !dirs.is_empty());
+        let gpu = DockerGpuRuntimeConfig {
+            supports_gpu: info
+                .cdi_spec_dirs
+                .as_ref()
+                .is_some_and(|dirs| !dirs.is_empty()),
+            allow_all_default: docker_info_reports_wsl2(&info),
+        };
         let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
-        let allow_all_default_gpu = docker_info_reports_wsl2(&info);
         validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
         let gateway_port = config.bind_address.port();
         if gateway_port == 0 {
@@ -388,8 +395,7 @@ impl DockerComputeDriver {
                 supervisor_bin,
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
-                supports_gpu,
-                allow_all_default_gpu,
+                gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
             },
@@ -398,7 +404,7 @@ impl DockerComputeDriver {
             supervisor_readiness,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 cdi_gpu_inventory,
-                allow_all_default_gpu,
+                gpu.allow_all_default,
             )),
         };
 
@@ -454,7 +460,7 @@ impl DockerComputeDriver {
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
         validate_docker_driver_mounts(&driver_config.mounts, config.enable_bind_mounts)?;
         let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
-        Self::validate_gpu_request(gpu_requirements, config.supports_gpu, &driver_config)?;
+        Self::validate_gpu_request(gpu_requirements, config.gpu.supports_gpu, &driver_config)?;
         Ok(ValidatedDockerSandbox {
             template,
             driver_config,
@@ -562,7 +568,7 @@ impl DockerComputeDriver {
             .map_err(|err| internal_status("query Docker daemon info", err))?;
         self.gpu_selector.refresh(
             docker_cdi_gpu_inventory(&info),
-            self.config.allow_all_default_gpu,
+            self.config.gpu.allow_all_default,
         );
         Ok(())
     }
