@@ -62,8 +62,9 @@ use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_HEADER, EVENT_HEADER_EXTENDED_DATA_ITEM,
     EVENT_PROPERTY_INFO, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
     EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW,
-    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, ProcessTrace, StartTraceW,
-    TRACE_EVENT_INFO, TRACE_LEVEL_VERBOSE, TdhGetEventInformation, WNODE_FLAG_TRACED_GUID,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE,
+    ProcessTrace, StartTraceW, TRACE_EVENT_INFO, TRACE_LEVEL_VERBOSE, TdhGetEventInformation,
+    WNODE_FLAG_TRACED_GUID,
 };
 use windows::core::{GUID, PCWSTR, PWSTR};
 
@@ -247,11 +248,22 @@ impl Drop for EtwSession {
     }
 }
 
-/// Wrapper to move a raw `Sender` pointer across the thread boundary into the
-/// blocking `ProcessTrace` worker. SAFETY: the boxed `Sender` lives until the
-/// worker reclaims it after `ProcessTrace` returns.
-struct SendPtr(*mut mpsc::Sender<RawEtwEvent>);
-unsafe impl Send for SendPtr {}
+/// A successfully-opened real-time trace, handed to the pump thread to run the
+/// blocking `ProcessTrace`. Produced by [`open_trace`] on the *caller* thread so
+/// an `OpenTraceW` failure is surfaced synchronously (review #4) rather than
+/// dying silently on the worker after `start_session` already returned `Ok`.
+///
+/// SAFETY (`Send`): the contained raw `Sender` pointer and trace handle are only
+/// ever touched by the single pump thread that takes ownership of this struct;
+/// the boxed `Sender` lives until that thread reclaims it after `ProcessTrace`
+/// returns, and `name` (the `LoggerName` buffer `OpenTraceW` referenced) is kept
+/// alive for the whole `ProcessTrace` duration.
+struct OpenedTrace {
+    handle: PROCESSTRACE_HANDLE,
+    name: Vec<u16>,
+    tx_ptr: *mut mpsc::Sender<RawEtwEvent>,
+}
+unsafe impl Send for OpenedTrace {}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -307,14 +319,37 @@ pub(crate) fn start_session(index: Arc<Mutex<AttributionIndex>>) -> Result<EtwSe
             format!("failed to spawn ETW consumer thread: {e}")
         })?;
 
-    let send_ptr = SendPtr(Box::into_raw(Box::new(tx)));
-    let pump_thread = std::thread::Builder::new()
-        .name("etw-ocsf-pump".into())
-        .spawn(move || process_trace_loop(send_ptr))
-        .map_err(|e| {
+    // Open the trace on THIS thread (review #4): `OpenTraceW` is a quick,
+    // synchronous call, so we can return its failure to the caller instead of
+    // reporting the session "started" and then having the worker die silently.
+    // Only the *blocking* `ProcessTrace` runs on the pump thread. On failure we
+    // reclaim the boxed Sender (which disconnects the consumer's channel so it
+    // exits), stop the session, and join the consumer before returning `Err`.
+    let tx_ptr = Box::into_raw(Box::new(tx));
+    let opened = match open_trace(tx_ptr) {
+        Ok(o) => o,
+        Err(e) => {
+            unsafe { drop(Box::from_raw(tx_ptr)) };
             stop_session(handle);
-            format!("failed to spawn ETW pump thread: {e}")
-        })?;
+            let _ = consumer_thread.join();
+            return Err(e);
+        }
+    };
+
+    let pump_thread = match std::thread::Builder::new()
+        .name("etw-ocsf-pump".into())
+        .spawn(move || run_trace(opened))
+    {
+        Ok(t) => t,
+        Err(e) => {
+            // The trace is open but we couldn't spawn the pump. Stop the session,
+            // reclaim the boxed Sender so the consumer disconnects, and join it.
+            unsafe { drop(Box::from_raw(tx_ptr)) };
+            stop_session(handle);
+            let _ = consumer_thread.join();
+            return Err(format!("failed to spawn ETW pump thread: {e}"));
+        }
+    };
 
     tracing::info!(
         session = SESSION_NAME,
@@ -473,9 +508,13 @@ fn cleanup_stale_session() {
 // ProcessTrace loop (dedicated blocking thread)
 // ---------------------------------------------------------------------------
 
+/// Open the real-time consumer with `OpenTraceW` on the **caller** thread so the
+/// result is synchronous (review #4). `tx_ptr` is the boxed event `Sender`; on
+/// failure the caller reclaims it (we do not drop it here). On success the boxed
+/// `Sender` and the `LoggerName` buffer are handed to the returned [`OpenedTrace`]
+/// so they outlive the subsequent blocking `ProcessTrace`.
 #[allow(clippy::field_reassign_with_default)]
-fn process_trace_loop(send_ptr: SendPtr) {
-    let tx_ptr = send_ptr.0;
+fn open_trace(tx_ptr: *mut mpsc::Sender<RawEtwEvent>) -> Result<OpenedTrace, String> {
     let mut name = session_name_wide();
 
     let mut logfile = EVENT_TRACE_LOGFILEW::default();
@@ -485,20 +524,39 @@ fn process_trace_loop(send_ptr: SendPtr) {
     logfile.Anonymous2.EventRecordCallback = Some(event_record_callback);
     logfile.Context = tx_ptr.cast::<c_void>();
 
-    let trace_handle = unsafe { OpenTraceW(&mut logfile) };
-    if trace_handle.Value == u64::MAX {
-        tracing::error!(err = %std::io::Error::last_os_error(), "ETW OpenTraceW failed");
-        // Reclaim the boxed Sender so the consumer thread's channel closes.
-        unsafe { drop(Box::from_raw(tx_ptr)) };
-        return;
+    let handle = unsafe { OpenTraceW(&mut logfile) };
+    if handle.Value == u64::MAX {
+        return Err(format!(
+            "ETW OpenTraceW failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 
-    let _ = unsafe { ProcessTrace(&[trace_handle], None, None) };
+    Ok(OpenedTrace {
+        handle,
+        name,
+        tx_ptr,
+    })
+}
+
+/// Run the blocking `ProcessTrace` pump for an already-opened trace, then clean
+/// up. Owns [`OpenedTrace`] for its whole lifetime so the `LoggerName` buffer and
+/// boxed `Sender` stay valid until `ProcessTrace` returns.
+fn run_trace(opened: OpenedTrace) {
+    let OpenedTrace {
+        handle,
+        name,
+        tx_ptr,
+    } = opened;
+
+    let _ = unsafe { ProcessTrace(&[handle], None, None) };
 
     unsafe {
-        let _ = CloseTrace(trace_handle);
+        let _ = CloseTrace(handle);
         drop(Box::from_raw(tx_ptr));
     }
+    // Keep the LoggerName buffer alive until ProcessTrace has fully returned.
+    drop(name);
 }
 
 unsafe extern "system" fn event_record_callback(event_record: *mut EVENT_RECORD) {
