@@ -248,16 +248,22 @@ When `userns` is configured (e.g. `userns = "auto"` or `userns = "keep-id"`):
 helm -n openshell status openshell
 helm -n openshell get values openshell
 kubectl -n openshell get deployment,statefulset,pod,svc,pvc
-kubectl -n openshell logs deployment/openshell -c openshell-gateway --tail=200
-kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200
-kubectl -n openshell rollout status deployment/openshell
-kubectl -n openshell rollout status statefulset/openshell
+if kubectl -n openshell get deployment openshell >/dev/null 2>&1; then
+  GATEWAY_WORKLOAD="deployment/openshell"
+elif kubectl -n openshell get statefulset openshell >/dev/null 2>&1; then
+  GATEWAY_WORKLOAD="statefulset/openshell"
+else
+  echo "ERROR: neither deployment/openshell nor statefulset/openshell exists in namespace openshell" >&2
+  exit 1
+fi
+kubectl -n openshell logs "${GATEWAY_WORKLOAD}" -c openshell-gateway --tail=200
+kubectl -n openshell rollout status "${GATEWAY_WORKLOAD}"
 ```
 
-Use the log and rollout commands for the workload kind that exists in the
-release. Look for failed installs, unexpected values, missing namespace, wrong
-image tag, TLS settings that do not match the registered endpoint, and
-scheduling failures.
+The workload discovery fails explicitly if the release has neither supported
+gateway controller. Look for failed installs, unexpected values, missing
+namespace, wrong image tag, TLS settings that do not match the registered
+endpoint, and scheduling failures.
 
 `server.telemetryEnabled` renders `OPENSHELL_TELEMETRY_ENABLED` on the gateway
 pod, and the gateway propagates the effective value to sandbox supervisors.
@@ -370,11 +376,18 @@ label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
 `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET`, plus both the projected
 `openshell-sa-token` volume and the `spiffe-workload-api` CSI volume.
 
-Check the image references currently used by the gateway deployment:
+Check the image references currently used by the gateway workload:
 
 ```bash
-kubectl -n openshell get deployment openshell -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
-kubectl -n openshell get statefulset openshell -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
+if kubectl -n openshell get deployment openshell >/dev/null 2>&1; then
+  GATEWAY_WORKLOAD="deployment/openshell"
+elif kubectl -n openshell get statefulset openshell >/dev/null 2>&1; then
+  GATEWAY_WORKLOAD="statefulset/openshell"
+else
+  echo "ERROR: neither deployment/openshell nor statefulset/openshell exists in namespace openshell" >&2
+  exit 1
+fi
+kubectl -n openshell get "${GATEWAY_WORKLOAD}" -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
 helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
@@ -418,8 +431,15 @@ If the gateway is healthy but sandbox creation fails:
 ```bash
 kubectl -n openshell get pods
 kubectl -n openshell get events --sort-by=.lastTimestamp | tail -n 50
-kubectl -n openshell logs deployment/openshell -c openshell-gateway --tail=200
-kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200
+if kubectl -n openshell get deployment openshell >/dev/null 2>&1; then
+  GATEWAY_WORKLOAD="deployment/openshell"
+elif kubectl -n openshell get statefulset openshell >/dev/null 2>&1; then
+  GATEWAY_WORKLOAD="statefulset/openshell"
+else
+  echo "ERROR: neither deployment/openshell nor statefulset/openshell exists in namespace openshell" >&2
+  exit 1
+fi
+kubectl -n openshell logs "${GATEWAY_WORKLOAD}" -c openshell-gateway --tail=200
 ```
 
 Check the configured sandbox namespace:
@@ -571,7 +591,7 @@ openshell logs <sandbox-name>
 | Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
-| Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
+| Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | Set `GATEWAY_WORKLOAD` as shown in Step 5, then run `kubectl -n openshell logs "${GATEWAY_WORKLOAD}" -c openshell-gateway` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Edge or OIDC gateway returns `Unauthenticated` | Stored login expired, audience/scopes mismatch, or gateway auth configuration changed | `openshell gateway info`, `openshell gateway login <name>`, gateway auth logs |
 | Gateway fails before serving health after enabling an interceptor | Interceptor endpoint unavailable or manifest/binding validation failed | Gateway and interceptor logs; interceptor socket; `binding_policy`, phases, and failure policy |
