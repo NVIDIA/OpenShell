@@ -778,6 +778,29 @@ async fn self_reject_mechanistic_if_already_covered(
         return;
     }
 
+    // `put_draft_chunk` dedups mechanistic submissions on `(host, port,
+    // binary)` and returns the id of whatever row now owns that key. On a
+    // dedup hit that id belongs to a pre-existing row, which may already be
+    // `approved`. Self-reject must only fire on a genuinely fresh, still
+    // `pending` submission: flipping a non-pending row here would move an
+    // already-decided chunk to `rejected` with no human action, and because
+    // this path never un-merges the rule (unlike the human reject handler),
+    // the live policy would keep enforcing an access the ledger now reports as
+    // revoked.
+    match state.store.get_draft_chunk(new_chunk_id).await {
+        Ok(Some(chunk)) if chunk.status == "pending" => {}
+        Ok(_) => return,
+        Err(err) => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                chunk_id = %new_chunk_id,
+                error = %err,
+                "self-reject status check failed; mechanistic chunk remains pending"
+            );
+            return;
+        }
+    }
+
     let approved = match state
         .store
         .list_draft_chunks(sandbox_id, Some("approved"))
@@ -794,11 +817,14 @@ async fn self_reject_mechanistic_if_already_covered(
         }
     };
 
-    // If any approved chunk for this sandbox already targets the same
-    // (host, port, binary), the mechanistic submission is redundant.
+    // If any *other* approved chunk for this sandbox already targets the same
+    // (host, port, binary), the mechanistic submission is redundant. Excluding
+    // `new_chunk_id` is load-bearing: the dedup upsert can alias the incoming
+    // id onto an approved row for this endpoint, and without the exclusion that
+    // row would be found as its own "covering" chunk and reject itself.
     let covered_by = approved
         .iter()
-        .find(|c| c.host == host && c.port == port && c.binary == binary);
+        .find(|c| c.id != new_chunk_id && c.host == host && c.port == port && c.binary == binary);
     let Some(covering) = covered_by else {
         return;
     };
@@ -809,15 +835,10 @@ async fn self_reject_mechanistic_if_already_covered(
     );
     match state
         .store
-        .update_draft_chunk_status(
-            new_chunk_id,
-            "rejected",
-            Some(current_time_ms()),
-            Some(&reason),
-        )
+        .conditionally_reject_draft_chunk(new_chunk_id, current_time_ms(), &reason)
         .await
     {
-        Ok(_) => {
+        Ok(true) => {
             info!(
                 sandbox_id = %sandbox_id,
                 chunk_id = %new_chunk_id,
@@ -826,6 +847,13 @@ async fn self_reject_mechanistic_if_already_covered(
                 port = port,
                 binary = %binary,
                 "Auto-rejected incoming mechanistic chunk: endpoint already covered by an approved chunk"
+            );
+        }
+        Ok(false) => {
+            info!(
+                sandbox_id = %sandbox_id,
+                chunk_id = %new_chunk_id,
+                "mechanistic self-reject skipped: chunk no longer pending (decided concurrently)"
             );
         }
         Err(err) => {
@@ -8028,6 +8056,269 @@ mod tests {
         assert_eq!(
             &second.accepted_chunk_ids[0], stored_id,
             "second submit must report the same id as the first (dedup fold-in), not a fresh UUID"
+        );
+    }
+
+    /// Regression: a mechanistic denial flush for an endpoint already covered
+    /// by an auto-approved mechanistic chunk must NOT flip that chunk to
+    /// `rejected`. The dedup upsert returns the approved row's own id; before
+    /// the self-exclusion + pending guard the self-reject scan matched the row
+    /// against itself and rejected it, corrupting the governance ledger (status
+    /// read `rejected`) while the merged rule stayed enforced.
+    #[tokio::test]
+    async fn resubmitted_mechanistic_endpoint_keeps_approved_chunk() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "mechanistic-reapprove".to_string();
+        let sandbox_id = "sb-mechanistic-reapprove";
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: sandbox_id.to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        // No providers in scope + auto mode → empty-delta prover verdict → the
+        // first mechanistic submit auto-approves and merges the rule.
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "allow_10_0_0_5_8080".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "10.0.0.5".to_string(),
+                port: 8080,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let submit_one = || {
+            let state = state.clone();
+            let sandbox_name = sandbox_name.clone();
+            let rule = proposed_rule.clone();
+            async move {
+                handle_submit_policy_analysis(
+                    &state,
+                    with_user(Request::new(SubmitPolicyAnalysisRequest {
+                        name: sandbox_name,
+                        analysis_mode: "mechanistic".to_string(),
+                        proposed_chunks: vec![PolicyChunk {
+                            rule_name: "allow_10_0_0_5_8080".to_string(),
+                            proposed_rule: Some(rule),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .unwrap()
+                .into_inner()
+            }
+        };
+
+        // First submit: auto-approves the endpoint.
+        submit_one().await;
+        let after_first = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.clone(),
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(after_first.chunks.len(), 1);
+        assert_eq!(
+            after_first.chunks[0].status, "approved",
+            "first mechanistic submit under auto mode must auto-approve; got {}",
+            after_first.chunks[0].status
+        );
+
+        // Second submit for the SAME endpoint: the dedup upsert returns the
+        // approved row's own id. The chunk must stay approved, not self-reject.
+        submit_one().await;
+        let after_second = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.clone(),
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            after_second.chunks.len(),
+            1,
+            "resubmit must dedup into the one existing row"
+        );
+        let chunk = &after_second.chunks[0];
+        assert_eq!(
+            chunk.status, "approved",
+            "resubmitting a mechanistic denial for an already-approved endpoint must not flip \
+             the approved chunk to rejected; got status {}",
+            chunk.status
+        );
+        assert!(
+            chunk.rejection_reason.is_empty(),
+            "approved chunk must carry no rejection reason; got {:?}",
+            chunk.rejection_reason
+        );
+        assert_eq!(
+            chunk.hit_count, 2,
+            "the redundant denial must fold into hit_count, not a status flip"
+        );
+
+        // The rule must remain merged in the active policy — the ledger and the
+        // enforced policy must agree.
+        let latest = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .unwrap()
+            .expect("auto-approve must have persisted a policy revision");
+        let policy = SandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
+        assert!(
+            policy.network_policies.contains_key("allow_10_0_0_5_8080"),
+            "approved rule must stay merged after resubmit; keys: {:?}",
+            policy.network_policies.keys().collect::<Vec<_>>()
+        );
+    }
+
+    fn pending_draft_chunk(id: &str, sandbox_id: &str) -> DraftChunkRecord {
+        DraftChunkRecord {
+            id: id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            draft_version: 1,
+            status: "pending".to_string(),
+            rule_name: "allow_endpoint".to_string(),
+            proposed_rule: Vec::new(),
+            rationale: String::new(),
+            security_notes: String::new(),
+            confidence: 0.5,
+            created_at_ms: 1_000,
+            decided_at_ms: None,
+            host: "10.0.0.5".to_string(),
+            port: 8080,
+            binary: "/usr/bin/curl".to_string(),
+            hit_count: 1,
+            first_seen_ms: 1_000,
+            last_seen_ms: 1_000,
+            validation_result: String::new(),
+            rejection_reason: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn conditionally_reject_transitions_pending_chunk() {
+        let store = test_store().await;
+        store
+            .put_draft_chunk(&pending_draft_chunk("cas-pending", "sb-cas-pending"), None)
+            .await
+            .unwrap();
+
+        let changed = store
+            .conditionally_reject_draft_chunk("cas-pending", 5, "covered by approved chunk cover-1")
+            .await
+            .unwrap();
+        assert!(changed, "a pending chunk must transition to rejected");
+
+        let stored = store.get_draft_chunk("cas-pending").await.unwrap().unwrap();
+        assert_eq!(stored.status, "rejected");
+        assert_eq!(stored.decided_at_ms, Some(5));
+        assert_eq!(stored.rejection_reason, "covered by approved chunk cover-1");
+    }
+
+    #[tokio::test]
+    async fn conditionally_reject_leaves_approved_chunk_untouched() {
+        let store = test_store().await;
+        store
+            .put_draft_chunk(
+                &pending_draft_chunk("cas-approved", "sb-cas-approved"),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .update_draft_chunk_status("cas-approved", "approved", Some(1), None)
+                .await
+                .unwrap()
+        );
+
+        let changed = store
+            .conditionally_reject_draft_chunk("cas-approved", 2, "covered")
+            .await
+            .unwrap();
+        assert!(
+            !changed,
+            "an approved chunk must not be conditionally rejected"
+        );
+
+        let stored = store
+            .get_draft_chunk("cas-approved")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.status, "approved",
+            "the approved status must survive a losing conditional reject"
+        );
+        assert!(stored.rejection_reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn conditionally_reject_loses_race_to_approval() {
+        let store = test_store().await;
+        store
+            .put_draft_chunk(&pending_draft_chunk("cas-race", "sb-cas-race"), None)
+            .await
+            .unwrap();
+
+        let observed = store.get_draft_chunk("cas-race").await.unwrap().unwrap();
+        assert_eq!(observed.status, "pending");
+
+        assert!(
+            store
+                .update_draft_chunk_status("cas-race", "approved", Some(10), None)
+                .await
+                .unwrap()
+        );
+
+        let changed = store
+            .conditionally_reject_draft_chunk("cas-race", 11, "covered")
+            .await
+            .unwrap();
+        assert!(!changed);
+
+        let stored = store.get_draft_chunk("cas-race").await.unwrap().unwrap();
+        assert_eq!(
+            stored.status, "approved",
+            "an approval that commits before the conditional reject must win; the ledger must \
+             never read rejected while the merged rule stays enforced"
         );
     }
 

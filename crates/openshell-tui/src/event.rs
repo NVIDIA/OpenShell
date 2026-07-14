@@ -118,6 +118,15 @@ impl EventHandler {
         self.rx.recv().await
     }
 
+    /// Discard events queued before or while the TUI was suspended.
+    ///
+    /// The input reader is paused before this is called, so terminal input
+    /// remains in the TTY for the resumed reader. This primarily removes stale
+    /// tick events that would otherwise run refresh work before new key input.
+    pub fn discard_pending(&mut self) {
+        while self.rx.try_recv().is_ok() {}
+    }
+
     /// Get a sender handle for dispatching events from background tasks.
     pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
         self.keepalive.clone()

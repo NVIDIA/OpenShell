@@ -754,6 +754,44 @@ WHERE object_type = $1 AND id = $2
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn conditionally_reject_draft_chunk(
+        &self,
+        id: &str,
+        decided_at_ms: i64,
+        rejection_reason: &str,
+    ) -> PersistenceResult<bool> {
+        let Some(mut record) = self.get_draft_chunk(id).await? else {
+            return Ok(false);
+        };
+
+        if record.status != "pending" {
+            return Ok(false);
+        }
+
+        record.status = "rejected".to_string();
+        record.decided_at_ms = Some(decided_at_ms);
+        record.rejection_reason = rejection_reason.to_string();
+        record.last_seen_ms = current_time_ms();
+        let payload = draft_chunk_payload_from_record(&record)?;
+
+        let result = sqlx::query(
+            r"
+UPDATE objects
+SET status = $3, payload = $4, updated_at_ms = $5
+WHERE object_type = $1 AND id = $2 AND status = 'pending'
+",
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(id)
+        .bind("rejected")
+        .bind(payload)
+        .bind(record.last_seen_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn update_draft_chunk_rule(
         &self,
         id: &str,

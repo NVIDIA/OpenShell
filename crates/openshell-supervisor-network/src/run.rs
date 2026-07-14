@@ -225,9 +225,13 @@ pub async fn run_networking(
                         (Some(state), Some(paths))
                     }
                     Err(e) => {
+                        // High severity: with TLS termination disabled the proxy
+                        // cannot rewrite credentials, so it fails closed on
+                        // TLS-bearing connections (see proxy.rs) rather than
+                        // leaking placeholders through a raw tunnel.
                         ocsf_emit!(
                             ConfigStateChangeBuilder::new(ocsf_ctx())
-                                .severity(SeverityId::Medium)
+                                .severity(SeverityId::High)
                                 .status(StatusId::Failure)
                                 .state(StateId::Disabled, "disabled")
                                 .message(format!(
@@ -240,9 +244,13 @@ pub async fn run_networking(
                 }
             }
             Err(e) => {
+                // High severity: with TLS termination disabled the proxy cannot
+                // rewrite credentials, so it fails closed on TLS-bearing
+                // connections (see proxy.rs) rather than leaking placeholders
+                // through a raw tunnel.
                 ocsf_emit!(
                     ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Medium)
+                        .severity(SeverityId::High)
                         .status(StatusId::Failure)
                         .state(StateId::Disabled, "disabled")
                         .message(format!(

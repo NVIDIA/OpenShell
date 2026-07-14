@@ -22,7 +22,9 @@ assert_status() {
 make_mock_gh() {
     local dir="$1"
     local existing_body="$2"
+    local current_is_draft="${3:-false}"
     export MOCK_EXISTING_BODY="$existing_body"
+    export MOCK_CURRENT_IS_DRAFT="$current_is_draft"
 
     cat > "$dir/mock-gh" <<'MOCK'
 #!/usr/bin/env bash
@@ -31,7 +33,7 @@ set -euo pipefail
 printf '%s\n' "$*" >> "$MOCK_GH_LOG"
 
 if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/pulls/1865" ]]; then
-    printf '%s\n' '0e4d7af7722fbedce2307d571b0c937a1eb3250f'
+    jq -n --arg sha '0e4d7af7722fbedce2307d571b0c937a1eb3250f' --argjson draft "$MOCK_CURRENT_IS_DRAFT" '{head:{sha:$sha},draft:$draft}'
     exit 0
 fi
 
@@ -62,12 +64,13 @@ run_case() {
     local existing_body="$2"
     local post_body="$3"
     local expected_status="$4"
+    local current_is_draft="${5:-false}"
 
     local tmp
     tmp="$(mktemp -d)"
     trap 'rm -rf "$tmp"' RETURN
     export MOCK_GH_LOG="$tmp/gh.log"
-    make_mock_gh "$tmp" "$existing_body"
+    make_mock_gh "$tmp" "$existing_body" "$current_is_draft"
 
     printf '{"body":%s}\n' "$(jq -Rn --arg body "$post_body" '$body')" > "$tmp/body.json"
 
@@ -138,5 +141,35 @@ Gator is blocked from completing the required independent re-review for current 
 
 Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
     0
+
+draft_blocked_body='> **gator-agent**
+
+## Blocked
+
+Gator is blocked because PR #1865 is still marked as a draft.
+
+Next action: @author, mark the pull request ready for review.
+
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`'
+
+run_case "ignores draft blocker after PR is ready" \
+    "$draft_blocked_body" \
+    '> **gator-agent**
+
+## PR Review Status
+
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
+    0 \
+    false
+
+run_case "blocks duplicate draft blocker while PR remains draft" \
+    "$draft_blocked_body" \
+    '> **gator-agent**
+
+## Blocked
+
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
+    20 \
+    true
 
 printf 'PASS: gh same-SHA guard tests\n'

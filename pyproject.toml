@@ -12,7 +12,7 @@ description = "OpenShell is the safe, private runtime for autonomous AI agents. 
 license = "Apache-2.0"
 readme = "README.md"
 authors = [{ name = "NVIDIA Inc." }]
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "cloudpickle>=3.0",
     "grpcio>=1.60",
@@ -25,6 +25,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Intended Audience :: Information Technology",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -79,7 +80,7 @@ include = [
 ]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py311"
 line-length = 88
 exclude = ["python/openshell/_proto"]
 
