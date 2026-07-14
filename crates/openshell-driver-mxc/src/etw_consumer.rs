@@ -904,9 +904,27 @@ const PENDING_MAX: usize = 4096;
 /// unattributable (e.g. an unrelated Sandboxing-provider consumer on the box).
 const PENDING_TTL: Duration = Duration::from_secs(5);
 
+/// Grace window for trusting a PID match when *replaying* a buffered event.
+/// The driver seeds `by_pid` within milliseconds of spawning `wxc-exec`, so a
+/// legitimate seed event's registration lands at (or just after) the moment the
+/// event was buffered. A recycled PID, by contrast, requires the prior
+/// `wxc-exec` to exit and a new one to spawn — far longer than this window — so
+/// a registration that is newer than the buffered event by more than this grace
+/// is treated as a *different* (recycled) owner and the PID match is refused.
+const REPLAY_PID_GRACE: Duration = Duration::from_secs(2);
+
+/// A `wxc-exec` PID registration: which sandbox owns the PID and *when* it was
+/// registered. The timestamp lets the replay path (see [`AttributionIndex::
+/// resolve_replay`]) reject a PID that was recycled to a different sandbox after
+/// a still-buffered event was captured.
+struct PidReg {
+    sid: String,
+    at: Instant,
+}
+
 #[derive(Default)]
 pub(crate) struct AttributionIndex {
-    by_pid: HashMap<u32, String>,
+    by_pid: HashMap<u32, PidReg>,
     by_identity: HashMap<String, String>,
     by_activity: HashMap<String, String>,
     by_cv: HashMap<String, String>,
@@ -952,17 +970,23 @@ impl AttributionIndex {
         // and Windows has recycled the number. Rebind to the new owner and drop
         // the stale per-PID "last resolved" hint so it can't misroute.
         if let Some(prev) = self.by_pid.get(&wxc_pid) {
-            if prev != sandbox_id {
+            if prev.sid != sandbox_id {
                 tracing::warn!(
                     target: "mxc_etw",
                     pid = wxc_pid,
-                    prev = %prev,
+                    prev = %prev.sid,
                     new = %sandbox_id,
                     "wxc-exec PID reused before prior sandbox was forgotten; rebinding attribution"
                 );
             }
         }
-        self.by_pid.insert(wxc_pid, sandbox_id.to_string());
+        self.by_pid.insert(
+            wxc_pid,
+            PidReg {
+                sid: sandbox_id.to_string(),
+                at: Instant::now(),
+            },
+        );
         self.last_pid_sid.remove(&wxc_pid);
 
         // Command line is only trustworthy while unique. Promote to `by_cmd` on
@@ -987,7 +1011,7 @@ impl AttributionIndex {
 
     /// Drop all keys for a finished sandbox to bound memory.
     pub fn forget(&mut self, sandbox_id: &str) {
-        self.by_pid.retain(|_, v| v != sandbox_id);
+        self.by_pid.retain(|_, r| r.sid != sandbox_id);
         self.by_identity.retain(|_, v| v != sandbox_id);
         self.by_activity.retain(|_, v| v != sandbox_id);
         self.by_cv.retain(|_, v| v != sandbox_id);
@@ -1023,7 +1047,7 @@ impl AttributionIndex {
         let sid = self
             .by_pid
             .get(&ev.process_id)
-            .cloned()
+            .map(|registration| registration.sid.clone())
             .or_else(|| {
                 identity
                     .as_ref()
@@ -1038,18 +1062,78 @@ impl AttributionIndex {
             .or_else(|| cmd.as_ref().and_then(|c| self.by_cmd.get(c).cloned()))
             .or_else(|| self.last_pid_sid.get(&ev.process_id).cloned())?;
 
+        self.cross_link(&sid, identity, cv, activity, ev.process_id);
+        Some(sid)
+    }
+
+    /// Resolve a *buffered* (replayed) event. Unlike [`Self::resolve`], this is
+    /// hardened against PID recycling and command-line ambiguity that can occur
+    /// during the buffer window ([`PENDING_TTL`]):
+    ///
+    /// - It **never** falls back to `by_cmd` or `last_pid_sid` — both are
+    ///   recycle-/ambiguity-prone and a stale entry could bind a buffered event
+    ///   to the wrong sandbox.
+    /// - A `by_pid` match is only trusted if the PID's registration is not newer
+    ///   than the buffered event by more than [`REPLAY_PID_GRACE`]. If the PID
+    ///   was recycled to a *different* sandbox after this event was captured, the
+    ///   registration timestamp will be well beyond the grace window and the PID
+    ///   match is refused (the event stays buffered and ages out rather than
+    ///   being misattributed to the new owner).
+    ///
+    /// Strong, per-sandbox-unique correlators (`identity`, `activity`, CV) are
+    /// always trusted — they are cross-linked from the driver-owned PID anchor
+    /// and are not reused across sandboxes.
+    fn resolve_replay(&mut self, ev: &DecodedEtwEvent, buffered_at: Instant) -> Option<String> {
+        let identity = ev.identity();
+        let cv = ev.cv_base();
+        let activity = guid_key(&ev.activity_id);
+
+        let sid = identity
+            .as_ref()
+            .and_then(|i| self.by_identity.get(i).cloned())
+            .or_else(|| {
+                activity
+                    .as_ref()
+                    .and_then(|a| self.by_activity.get(a).cloned())
+            })
+            .or_else(|| cv.as_ref().and_then(|c| self.by_cv.get(c).cloned()))
+            .or_else(|| {
+                self.by_pid.get(&ev.process_id).and_then(|r| {
+                    // Refuse a PID that was (re)registered well after this event
+                    // was buffered — that registration belongs to a recycled PID
+                    // owned by a different sandbox, not this event's emitter.
+                    if r.at <= buffered_at + REPLAY_PID_GRACE {
+                        Some(r.sid.clone())
+                    } else {
+                        None
+                    }
+                })
+            })?;
+
+        self.cross_link(&sid, identity, cv, activity, ev.process_id);
+        Some(sid)
+    }
+
+    /// Cross-link the strong keys an event carries to its resolved `sandbox_id`
+    /// so later keyless events for the same sandbox attribute correctly.
+    fn cross_link(
+        &mut self,
+        sid: &str,
+        identity: Option<String>,
+        cv: Option<String>,
+        activity: Option<String>,
+        pid: u32,
+    ) {
         if let Some(i) = identity {
-            self.by_identity.entry(i).or_insert_with(|| sid.clone());
+            self.by_identity.entry(i).or_insert_with(|| sid.to_string());
         }
         if let Some(c) = cv {
-            self.by_cv.entry(c).or_insert_with(|| sid.clone());
+            self.by_cv.entry(c).or_insert_with(|| sid.to_string());
         }
         if let Some(a) = activity {
-            self.by_activity.entry(a).or_insert_with(|| sid.clone());
+            self.by_activity.entry(a).or_insert_with(|| sid.to_string());
         }
-        self.last_pid_sid.insert(ev.process_id, sid.clone());
-
-        Some(sid)
+        self.last_pid_sid.insert(pid, sid.to_string());
     }
 
     /// Hold an event that didn't resolve yet, evicting expired and (if needed)
@@ -1091,7 +1175,7 @@ impl AttributionIndex {
                 tracing::debug!(target: "mxc_etw", pid = p.ev.process_id, "dropping unattributed (aged out) {}", p.ev.summary());
                 continue;
             }
-            match self.resolve(&p.ev) {
+            match self.resolve_replay(&p.ev, p.at) {
                 Some(sid) => {
                     let name = self.name_of(&sid);
                     ready.push((sid, name, p.ev));
@@ -1650,5 +1734,60 @@ mod tests {
         uniq.props
             .push(("commandLine".into(), "\"agent --unique\"".into()));
         assert_eq!(idx.resolve(&uniq).as_deref(), Some("sbx-3"));
+    }
+
+    // CodeRabbit (replay PID recycle): a buffered event whose only key is a PID
+    // must NOT be replayed onto a sandbox that registered that PID *after* the
+    // event was captured — that registration is a recycled PID owned by someone
+    // else. Refusing (event ages out) beats misattributing to the new owner.
+    #[test]
+    fn replayed_pid_match_refused_after_recycle() {
+        let mut idx = AttributionIndex::new();
+        // Stale event for a now-dead sandbox, buffered a while ago.
+        let ev = mk_event(1000, "CreateProcessInSandbox");
+        let buffered_at = Instant::now() - Duration::from_secs(3);
+
+        // PID 1000 is recycled and registered to a brand-new sandbox *now*.
+        idx.register_launch("sbx-new", "new", 1000, "agent");
+
+        assert!(
+            idx.resolve_replay(&ev, buffered_at).is_none(),
+            "stale PID-only event must not bind to the recycled PID's new owner"
+        );
+    }
+
+    // The legitimate #2 seed race is preserved: an event buffered essentially
+    // when the driver seeds attribution still replays via its PID.
+    #[test]
+    fn replayed_pid_match_accepted_within_grace() {
+        let mut idx = AttributionIndex::new();
+        let ev = mk_event(1000, "CreateProcessInSandbox");
+        let buffered_at = Instant::now();
+        idx.register_launch("sbx-1", "s1", 1000, "agent");
+        assert_eq!(
+            idx.resolve_replay(&ev, buffered_at).as_deref(),
+            Some("sbx-1"),
+            "a seed event buffered at registration time must still replay"
+        );
+    }
+
+    // Replay must not lean on the weak fallbacks (`by_cmd` / `last_pid_sid`):
+    // a buffered event whose only match is a command line is refused on replay
+    // (it would be resolved on the live path, but is too weak to trust after a
+    // buffering delay).
+    #[test]
+    fn replay_ignores_weak_fallbacks() {
+        let mut idx = AttributionIndex::new();
+        idx.register_launch("sbx-1", "s1", 11, "agent --unique");
+
+        let mut only_cmd = mk_event(999, "SandboxConfig");
+        only_cmd
+            .props
+            .push(("commandLine".into(), "\"agent --unique\"".into()));
+
+        // Live path would resolve it via by_cmd...
+        // (not asserted here to avoid mutating cross-links)
+        // ...but the replay path refuses the weak command-line key.
+        assert!(idx.resolve_replay(&only_cmd, Instant::now()).is_none());
     }
 }
