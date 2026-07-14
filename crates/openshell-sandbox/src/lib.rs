@@ -1967,12 +1967,19 @@ async fn load_policy(
             }
         };
 
+        // Install the in-process catalog before any external connection can
+        // fail. A newly started sandbox must always be able to resolve built-in
+        // bindings, even while operator-run services are unavailable.
+        install_builtin_middleware_registry(&engine).await?;
+
         // Connect operator-registered middleware services. A connect/describe
         // failure keeps the built-in registry active so each request's
         // `on_error` policy governs matched traffic. The policy poll loop
         // retries the install without waiting for a config change.
         let middleware_services = snapshot.supervisor_middleware_services.clone();
-        let middleware_registry_status = match grpc_retry("Middleware connect", || {
+        let middleware_registry_status = if middleware_services.is_empty() {
+            MiddlewareRegistryStatus::Synchronized
+        } else if let Err(error) = grpc_retry("Middleware connect", || {
             openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
                 openshell_supervisor_middleware_builtins::services(),
                 middleware_services.clone(),
@@ -1981,24 +1988,23 @@ async fn load_policy(
         .await
         .and_then(|registry| engine.replace_middleware_registry(registry))
         {
-            Ok(()) => MiddlewareRegistryStatus::Synchronized,
-            Err(error) => {
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .state(StateId::Other, "degraded")
-                        .unmapped(
-                            "supervisor_middleware_service_count",
-                            serde_json::json!(middleware_services.len())
-                        )
-                        .message(format!(
-                            "Supervisor middleware connect failed at startup; continuing with built-in middleware only, per-request on_error governs matched requests [error:{error}]"
-                        ))
-                        .build()
-                );
-                MiddlewareRegistryStatus::NeedsReconciliation
-            }
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Other, "degraded")
+                    .unmapped(
+                        "supervisor_middleware_service_count",
+                        serde_json::json!(middleware_services.len())
+                    )
+                    .message(format!(
+                        "Supervisor middleware connect failed at startup; continuing with built-in middleware only, per-request on_error governs matched requests [error:{error}]"
+                    ))
+                    .build()
+            );
+            MiddlewareRegistryStatus::NeedsReconciliation
+        } else {
+            MiddlewareRegistryStatus::Synchronized
         };
         let opa_engine = Some(Arc::new(engine));
 
@@ -2474,6 +2480,15 @@ async fn connect_middleware_registry(
         services.to_vec(),
     )
     .await
+}
+
+async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<()> {
+    let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+        openshell_supervisor_middleware_builtins::services(),
+        Vec::new(),
+    )
+    .await?;
+    opa_engine.replace_middleware_registry(registry)
 }
 
 async fn reconcile_middleware_registry(
@@ -3259,6 +3274,27 @@ filesystem_policy:
             provider_env_revision: 0,
             supervisor_middleware_services: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_external_startup_registry_build_preserves_installed_builtins() {
+        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
+        install_builtin_middleware_registry(&engine)
+            .await
+            .expect("install built-in middleware registry");
+        let builtins_generation = engine.current_generation();
+        assert_eq!(builtins_generation, 1);
+
+        let invalid_external = openshell_core::proto::SupervisorMiddlewareService {
+            name: "unavailable-guard".into(),
+            grpc_endpoint: "http://127.0.0.1:1".into(),
+            max_body_bytes: 1024,
+        };
+        connect_middleware_registry(&[invalid_external])
+            .await
+            .expect_err("unavailable external service must not replace built-ins");
+
+        assert_eq!(engine.current_generation(), builtins_generation);
     }
 
     #[test]

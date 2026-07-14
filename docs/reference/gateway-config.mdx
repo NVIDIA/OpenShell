@@ -163,7 +163,7 @@ Each service implements the supervisor middleware gRPC contract and may expose m
 
 The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
 
-`max_body_bytes` is the operator limit for every binding exposed by the service. It must be greater than zero and no larger than each binding's advertised limit. OpenShell rejects an oversized value instead of silently clamping it.
+`max_body_bytes` is the operator limit for every binding exposed by the service. It must be greater than zero, no larger than each binding's advertised limit, and no larger than the 4 MiB platform maximum. OpenShell rejects an oversized value instead of silently clamping it. Middleware gRPC servers should allow messages of at least 4 MiB plus 64 KiB so a maximum-size body and its protobuf envelope fit on the transport.
 
 The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
 

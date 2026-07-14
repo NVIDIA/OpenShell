@@ -82,6 +82,42 @@ fn truncate_with_ellipsis(text: &str, max: usize) -> String {
     format!("{}...", &text[..end])
 }
 
+fn escape_quoted_field(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{{{:x}}}", u32::from(character));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn escape_context_field(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '[' => escaped.push_str("\\["),
+            ']' => escaped.push_str("\\]"),
+            character if character.is_whitespace() || character.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(escaped, "\\u{{{:x}}}", u32::from(character));
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 fn reason_text(text: Option<&str>) -> Option<String> {
     let text = text?;
     if text.is_empty() {
@@ -109,12 +145,12 @@ fn unmapped_fields(base: &BaseEventData) -> Vec<String> {
                 serde_json::Value::Bool(value) => value.to_string(),
                 serde_json::Value::Number(value) => value.to_string(),
                 serde_json::Value::String(value) => {
-                    let value = value.replace(['\n', '\r'], " ");
-                    truncate_with_ellipsis(&value, MAX_REASON_LEN)
+                    let value = truncate_with_ellipsis(value, MAX_REASON_LEN);
+                    escape_context_field(&value)
                 }
                 _ => return None,
             };
-            Some(format!("{key}:{value}"))
+            Some(format!("{}:{value}", escape_context_field(key)))
         })
         .collect()
 }
@@ -326,8 +362,14 @@ impl OcsfEvent {
                     || e.base.activity_name.to_uppercase(),
                     |d| d.label().to_uppercase(),
                 );
-                let title = &e.finding_info.title;
-                let mut context = vec![format!("type:{}", e.finding_info.uid)];
+                let title = escape_quoted_field(&truncate_with_ellipsis(
+                    &e.finding_info.title,
+                    MAX_MESSAGE_LEN,
+                ));
+                let mut context = vec![format!(
+                    "type:{}",
+                    escape_context_field(&e.finding_info.uid)
+                )];
                 context.extend(unmapped_fields(&e.base));
                 if let Some(confidence) = e.confidence {
                     context.push(format!("confidence:{}", confidence.label().to_lowercase()));
@@ -1025,6 +1067,37 @@ mod tests {
             "FINDING:CREATE [INFO] \"configured content matched\" [type:content_guard.match count:1 source:content_guard]"
         );
         assert!(!shorthand.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn detection_finding_shorthand_escapes_control_characters_and_delimiters() {
+        let mut base = base(2004, "Detection Finding", 2, "Findings", 1, "Create");
+        base.add_unmapped(
+            "source\nforged",
+            serde_json::json!("guard]\nFINDING:FORGED"),
+        );
+        let event = OcsfEvent::DetectionFinding(DetectionFindingEvent {
+            base,
+            finding_info: FindingInfo::new(
+                "content_guard\nforged",
+                "matched \"value\"\nFINDING:FORGED",
+            ),
+            evidences: None,
+            attacks: None,
+            remediation: None,
+            is_alert: None,
+            confidence: None,
+            risk_level: None,
+            action: None,
+            disposition: None,
+        });
+
+        let shorthand = event.format_shorthand();
+
+        assert_eq!(shorthand.lines().count(), 1);
+        assert!(shorthand.contains("matched \\\"value\\\"\\nFINDING:FORGED"));
+        assert!(shorthand.contains("type:content_guard\\u{a}forged"));
+        assert!(shorthand.contains("source\\u{a}forged:guard\\]\\u{a}FINDING:FORGED"));
     }
 
     #[test]

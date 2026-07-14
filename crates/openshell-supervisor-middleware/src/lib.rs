@@ -23,9 +23,16 @@ use openshell_core::proto::{
 use tokio::sync::OnceCell;
 use tonic::Request;
 
+/// Largest request or replacement body accepted by the middleware platform.
+pub const MAX_MIDDLEWARE_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// gRPC message limit for middleware calls, including protobuf envelope fields.
+pub const MIDDLEWARE_GRPC_MESSAGE_BYTES: usize = MAX_MIDDLEWARE_BODY_BYTES + 64 * 1024;
+
 const HTTP_REQUEST_OPERATION: SupervisorMiddlewareOperation =
     SupervisorMiddlewareOperation::HttpRequest;
 const PRE_CREDENTIALS_PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
+const MAX_STABLE_IDENTIFIER_BYTES: usize = 128;
+const EXTERNAL_FINDING_LABEL: &str = "External middleware finding";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnError {
     FailClosed,
@@ -223,6 +230,12 @@ struct MiddlewareServiceState {
     operator_max_body_bytes: Option<usize>,
 }
 
+impl MiddlewareServiceState {
+    fn is_external(&self) -> bool {
+        self.operator_max_body_bytes.is_some()
+    }
+}
+
 /// Validated middleware services available to a gateway or one supervisor.
 ///
 /// In-process services are supplied by the composition root; the generic
@@ -283,7 +296,42 @@ fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<(
             registration.name
         ));
     }
+    if registration.max_body_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
+        return Err(miette!(
+            "middleware registration '{}' max_body_bytes exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}",
+            registration.name
+        ));
+    }
     Ok(())
+}
+
+fn is_stable_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_STABLE_IDENTIFIER_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+}
+
+fn validate_body_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
+    if binding.max_body_bytes == 0 {
+        return Err(miette!(
+            "middleware binding '{}' must advertise a non-zero body limit",
+            binding.id
+        ));
+    }
+    if binding.max_body_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
+        return Err(miette!(
+            "{source} binding '{}' body limit exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}",
+            binding.id
+        ));
+    }
+    usize::try_from(binding.max_body_bytes).map_err(|_| {
+        miette!(
+            "middleware binding '{}' reports a body limit too large for this platform",
+            binding.id
+        )
+    })
 }
 
 fn validate_manifest_bindings(
@@ -299,8 +347,10 @@ fn validate_manifest_bindings(
 
     let mut described_ids = Vec::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
-        if binding.id.trim().is_empty() {
-            return Err(miette!("{source} describes an empty binding id"));
+        if !is_stable_identifier(&binding.id) {
+            return Err(miette!(
+                "{source} binding ids must be 1-{MAX_STABLE_IDENTIFIER_BYTES} bytes and contain only ASCII letters, digits, '.', '_', '-', or '/'"
+            ));
         }
         if !allow_reserved_bindings && binding.id.starts_with("openshell/") {
             return Err(miette!(
@@ -316,18 +366,7 @@ fn validate_manifest_bindings(
                 binding.id,
             ));
         }
-        let advertised = usize::try_from(binding.max_body_bytes).map_err(|_| {
-            miette!(
-                "middleware binding '{}' reports a body limit too large for this platform",
-                binding.id
-            )
-        })?;
-        if advertised == 0 {
-            return Err(miette!(
-                "middleware binding '{}' must advertise a non-zero body limit",
-                binding.id
-            ));
-        }
+        let advertised = validate_body_limit(source, binding)?;
         if operator_max_body_bytes.is_some_and(|limit| limit > advertised) {
             return Err(miette!(
                 "{source} max_body_bytes ({}) exceeds binding '{}' capability ({advertised})",
@@ -359,6 +398,39 @@ fn validate_external_manifest(
         false,
         known_binding_ids,
     )
+}
+
+/// External diagnostic text is untrusted and may contain request data. Keep
+/// only values derived from the validated, startup-time binding identifier and
+/// numeric finding counts; do not carry per-request free-form text into logs.
+fn normalize_external_result(
+    binding: &MiddlewareBinding,
+    result: &mut openshell_core::proto::HttpRequestResult,
+) {
+    let reason_id: String = binding
+        .id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    result.reason = format!("middleware_denied:{reason_id}");
+    result.metadata.clear();
+    for finding in &mut result.findings {
+        finding.r#type = format!("{}.finding", binding.id);
+        finding.label = EXTERNAL_FINDING_LABEL.to_string();
+        finding.confidence.clear();
+        finding.severity = match finding.severity.as_str() {
+            "low" => "low",
+            "high" => "high",
+            _ => "medium",
+        }
+        .to_string();
+    }
 }
 
 impl MiddlewareRegistry {
@@ -597,16 +669,13 @@ impl ChainRunner {
                 let max_body_bytes = binding
                     .as_ref()
                     .map(|binding| {
-                        let advertised = usize::try_from(binding.max_body_bytes).map_err(|_| {
-                            miette!(
-                                "middleware binding '{}' reports a body limit too large for this platform",
-                                binding.id
-                            )
-                        })?;
-                        Ok::<_, miette::Report>(service
-                            .as_ref()
-                            .and_then(|state| state.operator_max_body_bytes)
-                            .unwrap_or(advertised))
+                        let advertised = validate_body_limit("middleware manifest", binding)?;
+                        Ok::<_, miette::Report>(
+                            service
+                                .as_ref()
+                                .and_then(|state| state.operator_max_body_bytes)
+                                .unwrap_or(advertised),
+                        )
                     })
                     .transpose()?
                     .unwrap_or(0);
@@ -736,14 +805,19 @@ impl ChainRunner {
             let Some(service) = entry.service.as_ref() else {
                 unreachable!("described binding always has a service")
             };
-            let result = match service
+            let mut result = match service
                 .service
                 .evaluate_http_request(Request::new(evaluation))
                 .await
             {
                 Ok(result) => result.into_inner(),
                 Err(err) => {
-                    match apply_on_error(entry, &safe_reason(&err.to_string()), &mut applied) {
+                    let reason = if service.is_external() {
+                        "external_service_error".to_string()
+                    } else {
+                        safe_reason(&err.to_string())
+                    };
+                    match apply_on_error(entry, &reason, &mut applied) {
                         OnErrorAction::FailOpen => continue,
                         OnErrorAction::FailClosed(reason) => {
                             return Ok(ChainOutcome {
@@ -759,6 +833,10 @@ impl ChainRunner {
                     }
                 }
             };
+
+            if service.is_external() {
+                normalize_external_result(binding, &mut result);
+            }
 
             let decision = match Decision::try_from(result.decision) {
                 Ok(decision @ (Decision::Allow | Decision::Deny)) => decision,
@@ -1975,6 +2053,50 @@ mod tests {
     }
 
     #[test]
+    fn external_registration_rejects_body_limit_above_platform_maximum() {
+        let registration = external_registration(u64::MAX);
+        let error = validate_registration(&registration)
+            .expect_err("extreme body limit must be rejected before allocation");
+        assert!(error.to_string().contains("platform maximum"));
+    }
+
+    #[test]
+    fn manifest_rejects_body_limit_above_platform_maximum() {
+        let registration = external_registration(4096);
+        let manifest = MiddlewareManifest {
+            name: "example/service".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                id: "example/content-guard".into(),
+                operation: HTTP_REQUEST_OPERATION as i32,
+                phase: PRE_CREDENTIALS_PHASE as i32,
+                max_body_bytes: u64::MAX,
+            }],
+        };
+        let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
+            .expect_err("extreme advertised body limit must be rejected");
+        assert!(error.to_string().contains("platform maximum"));
+    }
+
+    #[test]
+    fn manifest_rejects_unstable_binding_identifier() {
+        let registration = external_registration(4096);
+        let manifest = MiddlewareManifest {
+            name: "example/service".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                id: "example/content-guard\nforged".into(),
+                operation: HTTP_REQUEST_OPERATION as i32,
+                phase: PRE_CREDENTIALS_PHASE as i32,
+                max_body_bytes: 4096,
+            }],
+        };
+        let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
+            .expect_err("control characters must be rejected in binding ids");
+        assert!(error.to_string().contains("binding ids must be"));
+    }
+
+    #[test]
     fn external_manifest_cannot_claim_reserved_binding() {
         let registration = external_registration(4096);
         let manifest = MiddlewareManifest {
@@ -2076,6 +2198,108 @@ mod tests {
             .await
             .expect("join test middleware")
             .expect("serve");
+    }
+
+    #[tokio::test]
+    async fn remote_transport_accepts_platform_maximum_response_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test middleware");
+        let address = listener.local_addr().expect("test middleware address");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tonic::transport::Server::builder()
+            .add_service(
+                SupervisorMiddlewareServer::new(ScriptedService {
+                    binding_id: "example/content-guard".into(),
+                    max_body_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
+                    result: openshell_core::proto::HttpRequestResult {
+                        body: vec![b'x'; MAX_MIDDLEWARE_BODY_BYTES],
+                        has_body: true,
+                        ..allow_result()
+                    },
+                })
+                .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
+            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _ = shutdown_rx.await;
+            });
+        let server_task = tokio::spawn(server);
+
+        let mut registration = external_registration(MAX_MIDDLEWARE_BODY_BYTES as u64);
+        registration.grpc_endpoint = format!("http://{address}");
+        let registry = MiddlewareRegistry::connect_services(Vec::new(), vec![registration])
+            .await
+            .expect("connect external middleware");
+        let outcome = ChainRunner::from_registry(registry)
+            .evaluate(
+                &[ChainEntry {
+                    name: "guard".into(),
+                    implementation: "example/content-guard".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                input("hello"),
+            )
+            .await
+            .expect("maximum-size response should fit configured transport limit");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.body.len(), MAX_MIDDLEWARE_BODY_BYTES);
+        let _ = shutdown_tx.send(());
+        server_task
+            .await
+            .expect("join test middleware")
+            .expect("serve");
+    }
+
+    #[tokio::test]
+    async fn external_diagnostics_are_normalized_before_reaching_logs() {
+        let secret = "sk-secret-request-value";
+        let registration = external_registration(4096);
+        let service = Arc::new(ScriptedService {
+            binding_id: "example/content-guard".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                decision: Decision::Deny as i32,
+                reason: format!("denied body={secret}\nFINDING:FORGED"),
+                findings: vec![Finding {
+                    r#type: format!("secret.{secret}\nforged"),
+                    label: format!("matched {secret}\nFINDING:FORGED"),
+                    count: 1,
+                    confidence: secret.into(),
+                    severity: "high\nFINDING:FORGED".into(),
+                }],
+                metadata: std::iter::once(("request".into(), secret.into())).collect(),
+                ..allow_result()
+            },
+        });
+        let registry = registry_with_external(service, registration).await;
+        let outcome = ChainRunner::from_registry(registry)
+            .evaluate(
+                &[ChainEntry {
+                    name: "guard".into(),
+                    implementation: "example/content-guard".into(),
+                    order: 0,
+                    config: prost_types::Struct::default(),
+                    on_error: OnError::FailClosed,
+                }],
+                input("hello"),
+            )
+            .await
+            .expect("evaluate external middleware");
+
+        assert_eq!(outcome.reason, "middleware_denied:example_content-guard");
+        assert_eq!(
+            outcome.findings[0].finding.r#type,
+            "example/content-guard.finding"
+        );
+        assert_eq!(outcome.findings[0].finding.label, EXTERNAL_FINDING_LABEL);
+        assert_eq!(outcome.findings[0].finding.severity, "medium");
+        assert!(outcome.metadata.is_empty());
+        assert!(!format!("{outcome:?}").contains(secret));
+        assert!(!format!("{outcome:?}").contains("FINDING:FORGED"));
     }
 
     #[tokio::test]

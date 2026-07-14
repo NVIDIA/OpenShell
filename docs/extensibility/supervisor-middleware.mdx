@@ -26,7 +26,7 @@ Because each transformed body is re-checked before the next stage runs, a middle
 
 If post-transformation policy evaluation itself fails, OpenShell denies the request and emits a high-severity detection finding. This failure is separate from middleware `on_error` because the middleware completed successfully; the sandbox policy could not validate its output.
 
-Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials. Request headers are delivered in wire order and repeated header names are preserved as separate entries, so a service inspects every value the upstream will receive.
+Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials. Middleware-visible request headers are delivered in wire order and repeated header names are preserved as separate entries. OpenShell filters credential, routing, framing, and hop-by-hop headers before invoking middleware.
 
 ## Choose a Middleware Type
 
@@ -54,7 +54,7 @@ max_body_bytes = 262144
 | --- | --- |
 | `name` | Operator-facing registration name used in diagnostics. Policies do not reference this value. |
 | `grpc_endpoint` | Service address reachable from both the gateway and sandbox supervisors. Supports plaintext `http://` and TLS `https://` with platform trust roots. |
-| `max_body_bytes` | Operator limit applied to every binding exposed by the service. |
+| `max_body_bytes` | Operator limit applied to every binding exposed by the service, up to the 4 MiB platform maximum. |
 
 The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes a binding ID already owned by another service. Operator-run services cannot claim the reserved `openshell/` namespace.
 
@@ -109,7 +109,9 @@ Every middleware binding declares the largest request or replacement body it sup
 - A selected chain buffers using its largest stage limit, so every stage that can process the body receives it.
 - The same per-stage limit applies to request bodies and replacement bodies.
 
-The gateway rejects a registration whose operator limit exceeds the service capability instead of silently clamping it. At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. A body larger than every stage limit cannot be inspected at all and is denied unless every selected stage is `fail_open`.
+The gateway rejects a registration whose operator limit exceeds the service capability or the 4 MiB platform maximum instead of silently clamping it. Middleware gRPC servers should configure request and response message limits to at least 4 MiB plus 64 KiB for protobuf envelope fields.
+
+At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. OpenShell can apply `fail_open` to an oversized `Content-Length` before consuming body bytes. A chunked body can cross the limit only after bytes have been consumed, so OpenShell denies that request because it cannot safely resume the original stream.
 
 ## Mutate Request Headers
 
@@ -142,10 +144,10 @@ When the effective sandbox configuration changes, a running supervisor validates
 Middleware activity is emitted through OpenShell's OCSF logging:
 
 - Each invocation records its policy-local middleware name, binding, decision, transformation state, and failure state.
-- A denied invocation records the service-provided audit-safe reason without request content, configured terms, credentials, or other secrets.
+- A denied built-in invocation records its audit-safe reason. For operator-run services, OpenShell records a stable reason derived from the validated binding ID instead of service-provided per-request text.
 - A bypass under `fail_open` emits a detection finding.
 - A required stage that fails closed emits a high-severity detection finding.
-- Findings include the service-provided type and label plus aggregate counts. Middleware services should keep those fields audit-safe and omit request content or matched values.
+- Built-in findings include their type, label, and aggregate count. Operator-run findings use the validated binding ID and a platform label plus the aggregate count; OpenShell does not log service-provided finding text or diagnostic metadata.
 - Registry reload success and failure are emitted as configuration state changes.
 
 See [Logging](/observability/logging) for log access and [OCSF JSON Export](/observability/ocsf-json-export) for structured export.
@@ -158,5 +160,3 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 - Required middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic.
 - Operator-run services support plaintext `http://` and TLS `https://` endpoints. HTTPS certificates must chain to a CA in the platform trust store.
 - Custom trust roots, client authentication, health checks, and runtime registration are not available.
-
-For a runnable operator workflow, see the [content guard example](https://github.com/NVIDIA/OpenShell/tree/main/examples/supervisor-middleware-content-guard).

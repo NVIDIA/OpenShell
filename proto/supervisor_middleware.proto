@@ -76,9 +76,8 @@ message HttpRequestEvaluation {
   // Destination and HTTP request target.
   HttpRequestTarget target = 5;
   // HTTP request headers before OpenShell injects credentials, in wire
-  // order. Repeated header names are preserved as separate entries so a
-  // service inspects every value the upstream will receive. Protected
-  // headers such as authorization or cookie are omitted.
+  // order. Repeated header names are preserved as separate entries. Protected
+  // credential, routing, framing, and hop-by-hop headers are omitted.
   repeated HttpHeader headers = 6;
   // Buffered request body. Empty for a bodyless request.
   bytes body = 7;
@@ -201,9 +200,8 @@ message HeaderMutation {
 message HttpRequestResult {
   // Allow or deny decision for this request.
   Decision decision = 1;
-  // Audit-safe human-readable reason used for diagnostics, denied responses,
-  // and security logs. Must not contain request content, configured terms,
-  // credentials, or other secrets.
+  // Audit-safe human-readable reason. OpenShell does not relay text from an
+  // operator-run service into denied responses or security logs.
   string reason = 2;
   // Replacement request body when has_body is true.
   bytes body = 3;
@@ -216,7 +214,9 @@ message HttpRequestResult {
   // are always protected. A violating result is a middleware failure handled
   // according to the policy failure mode.
   repeated HeaderMutation header_mutations = 5;
-  // Audit-safe findings produced during evaluation.
+  // Audit-safe findings produced during evaluation. For operator-run services,
+  // OpenShell logs platform-owned fields derived from the validated binding id
+  // rather than service-provided type, label, confidence, or metadata text.
   repeated Finding findings = 6;
   // Non-secret service-defined metadata included in diagnostics.
   map<string, string> metadata = 7;

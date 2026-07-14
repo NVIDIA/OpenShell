@@ -13,6 +13,8 @@ use openshell_core::proto::{
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Request, Response, Status};
 
+use crate::MIDDLEWARE_GRPC_MESSAGE_BYTES;
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -51,7 +53,9 @@ impl RemoteMiddlewareService {
             })?;
         Ok(Self {
             registration_name: registration_name.to_string(),
-            client: SupervisorMiddlewareClient::new(channel),
+            client: SupervisorMiddlewareClient::new(channel)
+                .max_decoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(MIDDLEWARE_GRPC_MESSAGE_BYTES),
         })
     }
 

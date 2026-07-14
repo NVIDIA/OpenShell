@@ -879,7 +879,10 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + AsyncWrite
                 return Ok(BufferResult::OverCapacity { recoverable: true });
             }
             let initial_len = already_read.len().min(len);
-            let mut body = Vec::with_capacity(len);
+            let mut body = Vec::new();
+            body.try_reserve_exact(len).map_err(|_| {
+                miette!("unable to allocate {len} bytes for middleware request body")
+            })?;
             body.extend_from_slice(&already_read[..initial_len]);
             let mut remaining = len.saturating_sub(initial_len);
             if remaining > 0 && already_read.is_empty() {
@@ -1363,9 +1366,48 @@ async fn read_buffered_exact<C: AsyncRead + Unpin>(
     out: &mut Vec<u8>,
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> std::result::Result<(), CollectChunkedError> {
-    for _ in 0..len {
-        let byte = read_buffered_byte(client, already_read, state, generation_guard).await?;
-        out.push(byte);
+    if state
+        .max_wire_bytes
+        .is_some_and(|max| len > max.saturating_sub(state.wire_bytes))
+    {
+        return Err(CollectChunkedError::OverCapacity);
+    }
+    out.try_reserve_exact(len).map_err(|_| {
+        CollectChunkedError::Failed(miette!(
+            "unable to allocate {len} bytes for chunked request body"
+        ))
+    })?;
+
+    let buffered = len.min(already_read.len().saturating_sub(state.buffered_pos));
+    if buffered > 0 {
+        let end = state.buffered_pos + buffered;
+        out.extend_from_slice(&already_read[state.buffered_pos..end]);
+        state.buffered_pos = end;
+        state.wire_bytes += buffered;
+    }
+
+    let mut remaining = len - buffered;
+    let mut buf = [0u8; RELAY_BUF_SIZE];
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len());
+        let read = client
+            .read(&mut buf[..to_read])
+            .await
+            .into_diagnostic()
+            .map_err(CollectChunkedError::Failed)?;
+        if read == 0 {
+            return Err(CollectChunkedError::Failed(miette!(
+                "connection closed with {remaining} bytes remaining"
+            )));
+        }
+        if let Some(guard) = generation_guard {
+            guard
+                .ensure_current()
+                .map_err(CollectChunkedError::Failed)?;
+        }
+        out.extend_from_slice(&buf[..read]);
+        state.wire_bytes += read;
+        remaining -= read;
     }
     Ok(())
 }
@@ -2797,12 +2839,47 @@ mod tests {
     use crate::opa::OpaEngine;
     use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
     use openshell_core::secrets::SecretResolver;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
     const VALID_WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
     const VALID_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
     const TEXT_OPCODE: u8 = 0x1;
+
+    struct CountingReader {
+        bytes: Vec<u8>,
+        position: usize,
+        reads: usize,
+    }
+
+    impl CountingReader {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                bytes,
+                position: 0,
+                reads: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for CountingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.reads += 1;
+            let available = self.bytes.len().saturating_sub(self.position);
+            let amount = available.min(buffer.remaining());
+            let end = self.position + amount;
+            buffer.put_slice(&self.bytes[self.position..end]);
+            self.position = end;
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn write_header(name: &str, value: &str, on_existing: ExistingHeaderAction) -> HeaderMutation {
         HeaderMutation {
@@ -3523,6 +3600,57 @@ mod tests {
         .expect("chunked body should decode");
 
         assert_eq!(body, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn collect_chunked_body_reads_payload_in_blocks() {
+        let payload_len = 64 * 1024;
+        let mut wire = format!("{payload_len:x}\r\n").into_bytes();
+        wire.extend(std::iter::repeat_n(b'x', payload_len));
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        let mut client = CountingReader::new(wire);
+
+        let body = collect_chunked_body(
+            &mut client,
+            &[],
+            None,
+            Some(openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES),
+        )
+        .await
+        .expect("chunked body should decode");
+
+        assert_eq!(body.len(), payload_len);
+        assert!(
+            client.reads <= 32,
+            "payload should be read in blocks, observed {} reads",
+            client.reads
+        );
+    }
+
+    #[tokio::test]
+    async fn extreme_content_length_is_rejected_before_allocation() {
+        let req = L7Request {
+            action: "POST".into(),
+            target: "/upload".into(),
+            query_params: HashMap::new(),
+            raw_header: b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 18446744073709551615\r\n\r\n".to_vec(),
+            body_length: BodyLength::ContentLength(u64::MAX),
+        };
+        let (mut client, _peer) = tokio::io::duplex(1);
+
+        let result = buffer_request_body_for_middleware(
+            &req,
+            &mut client,
+            None,
+            openshell_supervisor_middleware::MAX_MIDDLEWARE_BODY_BYTES,
+        )
+        .await
+        .expect("oversized body should produce a capacity result");
+
+        assert!(matches!(
+            result,
+            BufferResult::OverCapacity { recoverable: true }
+        ));
     }
 
     #[tokio::test]
