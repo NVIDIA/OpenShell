@@ -82,11 +82,11 @@ Policies contain at most 10 middleware configs with 32 combined host selector
 patterns each. Runtime selection defensively allows at most 10 stages, each of
 which can return 32 findings, for a derived chain maximum of 320 findings.
 Middleware RPCs default to a 500 ms deadline. Operators can set a service-wide
-`timeout` in gateway configuration, and a service can advertise a more specific
+`timeout` in gateway configuration, and a service can advertise a shorter
 timeout for each binding in its `Describe` manifest. Both use integer `ms` or
-`s` values bounded from 10 ms through 30 s. Binding values take precedence over
-the service value; `Describe` uses the service value because bindings have not
-been discovered yet.
+`s` values bounded from 10 ms through 30 s. The operator value is a ceiling,
+so binding calls use the smaller value; `Describe` uses the service value
+because bindings have not been discovered yet.
 Registration and manifest body limits above the platform boundary fail before
 request-body allocation. External per-request reason, finding text, mutation
 errors, and diagnostic metadata are untrusted: the supervisor maps logged
@@ -105,8 +105,9 @@ registry and chain runner live in
 `openshell-supervisor-middleware`;
 first-party implementations and their config schemas live in
 `openshell-supervisor-middleware-builtins`. The initial `openshell/regex`
-implementation is only a best-effort example with fixed regular expressions;
-it is not a parser-aware secret scanner and makes no redaction guarantee. The
+implementation is only a best-effort example for simple, self-contained token
+patterns; it does not infer values from keyword assignments, is not a
+parser-aware secret scanner, and makes no redaction guarantee. The
 gateway and supervisor inject
 those services explicitly and discover their binding IDs through the same
 `Describe` contract used by external services. Reusable compiled DNS host
@@ -127,6 +128,9 @@ policy generation. Each replacement is reclassified and evaluated before the
 next stage runs. Hard-deny classification is shared by CONNECT relays,
 route-selected relays, and forward proxying; evaluator failures become
 structured fail-closed outcomes instead of escaping the middleware pipeline.
+The shared HTTP/1 request parser rejects obsolete folded continuations,
+colonless fields, whitespace before field-name colons, and invalid field-name
+tokens before policy evaluation, middleware projection, or forwarding.
 Each middleware stage can also return ordered header write and remove
 operations. Rust validates and applies a stage atomically to the logical header
 state before the next stage runs, then replays the validated operations against

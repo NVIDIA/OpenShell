@@ -172,7 +172,33 @@ mod tests {
         assert_eq!(result.decision, Decision::Allow as i32);
         assert!(result.has_body);
         let body = String::from_utf8(result.body).unwrap();
-        assert!(!body.contains("top-secret"));
+        assert!(body.contains("top-secret"));
         assert!(!body.contains("sk-ABCDEFGHIJKLMNOP"));
+        assert!(
+            result
+                .findings
+                .iter()
+                .all(|finding| finding.r#type != "regex.keyword")
+        );
+    }
+
+    #[test]
+    fn regex_replacement_does_not_parse_keyword_assignments() {
+        let body = concat!(
+            r#"{"password":"alpha beta","secret":"alpha,beta","api_key":"alpha\"beta"}"#,
+            "\npassword=alpha\nnotpassword=omega"
+        );
+        let result = evaluate_http_request(&HttpRequestEvaluation {
+            binding_id: BUILTIN_REGEX.into(),
+            body: body.as_bytes().to_vec(),
+            config: Some(prost_types::Struct::default()),
+            ..Default::default()
+        })
+        .expect("evaluate regex binding");
+
+        assert_eq!(result.decision, Decision::Allow as i32);
+        assert!(!result.has_body);
+        assert_eq!(result.body, body.as_bytes());
+        assert!(result.findings.is_empty());
     }
 }

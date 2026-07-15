@@ -205,6 +205,7 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     // raw bytes). This gap enables request smuggling via mutated header names.
     let header_str = std::str::from_utf8(&buf[..header_end])
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    validate_http_request_header_block(header_str)?;
 
     let request_line = header_str
         .lines()
@@ -283,6 +284,7 @@ pub(crate) fn request_from_buffered_http(
         + 4;
     let header_str = std::str::from_utf8(&raw_header[..header_end])
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    validate_http_request_header_block(header_str)?;
     let body_length = parse_body_length(header_str)?;
     let (_, query_params) = parse_target_query(query_target)?;
 
@@ -293,6 +295,72 @@ pub(crate) fn request_from_buffered_http(
         raw_header,
         body_length,
     })
+}
+
+/// Validate HTTP/1 request header fields before policy evaluation or forwarding.
+///
+/// This parser deliberately rejects obsolete line folding and malformed field
+/// names rather than allowing downstream middleware and the upstream server to
+/// interpret the same wire bytes differently.
+pub(crate) fn validate_http_request_header_block(headers: &str) -> Result<()> {
+    let header_block = headers
+        .strip_suffix("\r\n\r\n")
+        .ok_or_else(|| miette!("HTTP request headers are missing the CRLF terminator"))?;
+    let mut lines = header_block.split("\r\n");
+    lines
+        .next()
+        .ok_or_else(|| miette!("HTTP request is missing a request line"))?;
+
+    for line in lines {
+        if line
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            return Err(miette!(
+                "HTTP request header continuation lines are not supported"
+            ));
+        }
+        let (name, _) = line
+            .split_once(':')
+            .ok_or_else(|| miette!("HTTP request header field is missing ':'"))?;
+        if name
+            .as_bytes()
+            .last()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            return Err(miette!(
+                "HTTP request header field contains whitespace before ':'"
+            ));
+        }
+        if name.is_empty() || !name.bytes().all(is_http_field_name_byte) {
+            return Err(miette!(
+                "HTTP request header field name is not a valid HTTP token"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_http_field_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 /// Rebuild the request line in a raw HTTP header block with a canonicalized
@@ -1283,19 +1351,20 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
         })?;
 
         if chunk_size == 0 {
-            loop {
-                let trailer_line =
-                    read_chunked_line(client, already_read, &mut read_state, generation_guard)
-                        .await
-                        .map_err(|error| {
-                            error.context(|e| {
-                                miette!("Chunked body ended before trailer terminator: {e}")
-                            })
-                        })?;
-                if trailer_line.is_empty() {
-                    return Ok(body);
-                }
+            let trailer_line =
+                read_chunked_line(client, already_read, &mut read_state, generation_guard)
+                    .await
+                    .map_err(|error| {
+                        error.context(|e| {
+                            miette!("Chunked body ended before trailer terminator: {e}")
+                        })
+                    })?;
+            if trailer_line.is_empty() {
+                return Ok(body);
             }
+            return Err(CollectChunkedError::Failed(miette!(
+                "chunked request trailers are not supported when buffering or transforming request bodies"
+            )));
         }
 
         if body.len().saturating_add(chunk_size) > max_decoded_bytes {
@@ -3418,6 +3487,19 @@ mod tests {
     }
 
     #[test]
+    fn buffered_request_parser_rejects_malformed_header_fields() {
+        for raw in [
+            b"GET /v1/items HTTP/1.1\r\nX-Test: first\r\n continued\r\n\r\n".as_slice(),
+            b"GET /v1/items HTTP/1.1\r\nX-Test value\r\n\r\n".as_slice(),
+            b"GET /v1/items HTTP/1.1\r\nX-Test : value\r\n\r\n".as_slice(),
+            b"GET /v1/items HTTP/1.1\r\nX@Test: value\r\n\r\n".as_slice(),
+        ] {
+            request_from_buffered_http("GET", "/v1/items", "/v1/items", raw.to_vec())
+                .expect_err("malformed buffered header fields must be rejected");
+        }
+    }
+
+    #[test]
     fn parse_chunked() {
         let headers =
             "POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n";
@@ -3601,7 +3683,7 @@ mod tests {
         let mut client = tokio::io::empty();
         let body = collect_chunked_body(
             &mut client,
-            b"5\r\nhello\r\n6;ext=value\r\n world\r\n0\r\nx-checksum: abc\r\n\r\n",
+            b"5\r\nhello\r\n6;ext=value\r\n world\r\n0\r\n\r\n",
             None,
             None,
         )
@@ -3612,9 +3694,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn middleware_chunked_normalization_discards_trailers_and_declaration() {
+    async fn middleware_chunked_request_with_trailers_is_rejected() {
         let mut raw = b"POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTrailer: X-Checksum\r\n\r\n".to_vec();
-        raw.extend_from_slice(b"5\r\nhello\r\n0\r\nX-Checksum: ignored\r\n\r\n");
+        raw.extend_from_slice(b"5\r\nhello\r\n0\r\nX-Checksum: digest\r\n\r\n");
         let req = L7Request {
             action: "POST".into(),
             target: "/api".into(),
@@ -3623,27 +3705,16 @@ mod tests {
             body_length: BodyLength::Chunked,
         };
 
-        let buffered =
+        let error =
             buffer_request_body_for_middleware(&req, &mut tokio::io::empty(), None, 64 * 1024)
                 .await
-                .expect("chunked request should buffer");
-        let BufferResult::Buffered(buffered) = buffered else {
-            panic!("chunked request should fit in middleware buffer")
-        };
-        let rebuilt =
-            rebuild_request_with_buffered_body(&req, &buffered.headers, &buffered.body, &[])
-                .expect("chunked request should normalize");
-        let forwarded = String::from_utf8(rebuilt.raw_header).expect("normalized request is UTF-8");
-
-        assert!(forwarded.contains("Content-Length: 5\r\n"));
+                .expect_err("middleware must reject non-empty chunked trailers");
         assert!(
-            !forwarded
-                .to_ascii_lowercase()
-                .contains("transfer-encoding:")
+            error.to_string().contains(
+                "chunked request trailers are not supported when buffering or transforming request bodies"
+            ),
+            "unexpected error: {error}"
         );
-        assert!(!forwarded.to_ascii_lowercase().contains("trailer:"));
-        assert!(!forwarded.contains("X-Checksum: ignored"));
-        assert!(forwarded.ends_with("hello"));
     }
 
     #[tokio::test]
@@ -3686,14 +3757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn credential_rewrite_rejects_aggregate_chunk_trailer_overflow() {
-        let mut wire = b"1\r\nx\r\n0\r\n".to_vec();
-        let trailer = format!("x-pad: {}\r\n", "a".repeat(64));
-        while wire.len() <= MAX_REWRITE_BODY_BYTES {
-            wire.extend_from_slice(trailer.as_bytes());
-        }
-        wire.extend_from_slice(b"\r\n");
-
+    async fn credential_rewrite_chunked_request_with_trailers_is_rejected() {
         let req = L7Request {
             action: "POST".into(),
             target: "/api".into(),
@@ -3702,24 +3766,24 @@ mod tests {
             body_length: BodyLength::Chunked,
         };
         let headers =
-            b"POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n";
+            b"POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTrailer: Digest\r\n\r\n";
         let result = collect_and_rewrite_request_body(
             &req,
             &mut tokio::io::empty(),
             headers,
             std::str::from_utf8(headers).expect("headers"),
-            &wire,
+            b"1\r\nx\r\n0\r\nDigest: sha-256=:abc123:\r\n\r\n",
             None,
             None,
         )
         .await;
         let Err(error) = result else {
-            panic!("aggregate chunk trailers must be bounded")
+            panic!("credential rewriting must reject non-empty chunked trailers")
         };
         assert!(
-            error
-                .to_string()
-                .contains("chunked body wire representation exceeds configured buffer limit"),
+            error.to_string().contains(
+                "chunked request trailers are not supported when buffering or transforming request bodies"
+            ),
             "unexpected error: {error}"
         );
     }
@@ -3985,6 +4049,43 @@ mod tests {
         )
         .await;
         assert!(result.is_err(), "Must reject headers with invalid UTF-8");
+    }
+
+    #[tokio::test]
+    async fn reject_malformed_header_fields_before_forwarding() {
+        let cases = [
+            (
+                "space continuation",
+                b"GET /api HTTP/1.1\r\nX-Test: first\r\n continued\r\nHost: x\r\n\r\n".as_slice(),
+            ),
+            (
+                "tab continuation",
+                b"GET /api HTTP/1.1\r\nX-Test: first\r\n\tcontinued\r\nHost: x\r\n\r\n".as_slice(),
+            ),
+            (
+                "missing colon",
+                b"GET /api HTTP/1.1\r\nX-Test value\r\nHost: x\r\n\r\n".as_slice(),
+            ),
+            (
+                "whitespace before colon",
+                b"GET /api HTTP/1.1\r\nX-Test : value\r\nHost: x\r\n\r\n".as_slice(),
+            ),
+            (
+                "invalid field-name token",
+                b"GET /api HTTP/1.1\r\nX@Test: value\r\nHost: x\r\n\r\n".as_slice(),
+            ),
+        ];
+
+        for (case, raw) in cases {
+            let (mut client, mut writer) = tokio::io::duplex(4096);
+            writer.write_all(raw).await.unwrap();
+            let result = parse_http_request(
+                &mut client,
+                &crate::l7::path::CanonicalizeOptions::default(),
+            )
+            .await;
+            assert!(result.is_err(), "{case} must be rejected before forwarding");
+        }
     }
 
     /// SEC-009: Reject unsupported HTTP versions.
@@ -6055,9 +6156,8 @@ mod tests {
             "POST /api/messages HTTP/1.1\r\n\
              Host: api.example.com\r\n\
              Authorization: Bearer {alias}\r\n\
-             Transfer-Encoding: chunked\r\n\
-             Trailer: X-Checksum\r\n\r\n\
-             5\r\nhello\r\n0\r\nX-Checksum: ignored\r\n\r\n",
+             Transfer-Encoding: chunked\r\n\r\n\
+             5\r\nhello\r\n0\r\n\r\n",
         );
 
         let forwarded = relay_and_capture_with_options(
@@ -6072,8 +6172,6 @@ mod tests {
         assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
         assert!(forwarded.contains("Content-Length: 5\r\n"));
         assert!(!forwarded.contains("Transfer-Encoding: chunked\r\n"));
-        assert!(!forwarded.contains("Trailer: X-Checksum\r\n"));
-        assert!(!forwarded.contains("X-Checksum: ignored\r\n"));
         assert!(forwarded.ends_with("hello"));
     }
 

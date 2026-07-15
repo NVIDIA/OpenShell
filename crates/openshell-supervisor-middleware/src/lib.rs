@@ -295,12 +295,14 @@ impl MiddlewareServiceState {
         if binding.timeout.trim().is_empty() {
             Ok(self.operator_timeout)
         } else {
-            parse_middleware_timeout(&binding.timeout).map_err(|reason| {
-                miette!(
-                    "middleware binding '{}' has invalid timeout: {reason}",
-                    binding.id
-                )
-            })
+            parse_middleware_timeout(&binding.timeout)
+                .map(|binding_timeout| binding_timeout.min(self.operator_timeout))
+                .map_err(|reason| {
+                    miette!(
+                        "middleware binding '{}' has invalid timeout: {reason}",
+                        binding.id
+                    )
+                })
         }
     }
 }
@@ -1469,13 +1471,13 @@ mod tests {
             entry("second", OnError::FailClosed),
         ];
         let outcome = builtin_runner()
-            .evaluate(&entries, input(r#"password="top-secret""#))
+            .evaluate(&entries, input(r#"token="sk-ABCDEFGHIJKLMNOP""#))
             .await
             .expect("evaluate");
         assert!(outcome.allowed);
         assert_eq!(
             String::from_utf8(outcome.body).expect("utf8"),
-            r#"password="[REDACTED]""#
+            r#"token="[REDACTED]""#
         );
         assert_eq!(outcome.applied.len(), 2);
     }
@@ -1701,6 +1703,7 @@ mod tests {
             tonic::Response<openshell_core::proto::ValidateConfigResponse>,
             tonic::Status,
         > {
+            tokio::time::sleep(self.delay).await;
             Ok(tonic::Response::new(
                 openshell_core::proto::ValidateConfigResponse {
                     valid: true,
@@ -2341,14 +2344,14 @@ mod tests {
         assert_eq!(described[1].max_body_bytes(), 1024);
 
         let outcome = runner
-            .evaluate_described(&described, input(r#"password="top-secret""#))
+            .evaluate_described(&described, input(r#"token="sk-ABCDEFGHIJKLMNOP""#))
             .await
             .expect("evaluate mixed chain");
         assert!(outcome.allowed);
         assert_eq!(outcome.applied.len(), 2);
         assert_eq!(
             String::from_utf8(outcome.body).expect("utf8"),
-            r#"password="[REDACTED]""#
+            r#"token="[REDACTED]""#
         );
     }
 
@@ -2375,7 +2378,7 @@ mod tests {
         redact_entry.order = 10;
         let entries = [guard_entry, redact_entry];
 
-        let body = format!("{}password=\"top-secret\"", "x".repeat(1500));
+        let body = format!("{}token=\"sk-ABCDEFGHIJKLMNOP\"", "x".repeat(1500));
         let outcome = runner
             .evaluate(&entries, input(&body))
             .await
@@ -2392,7 +2395,7 @@ mod tests {
         assert!(outcome.applied[1].transformed);
         let body = String::from_utf8(outcome.body).expect("utf8");
         assert!(body.contains("[REDACTED]"));
-        assert!(!body.contains("top-secret"));
+        assert!(!body.contains("sk-ABCDEFGHIJKLMNOP"));
     }
 
     #[tokio::test]
@@ -2416,7 +2419,7 @@ mod tests {
         };
         let entries = [entry("redact", OnError::FailClosed), guard_entry];
 
-        let body = format!("{}password=\"top-secret\"", "x".repeat(1500));
+        let body = format!("{}token=\"sk-ABCDEFGHIJKLMNOP\"", "x".repeat(1500));
         let outcome = runner
             .evaluate(&entries, input(&body))
             .await
@@ -2655,6 +2658,52 @@ mod tests {
             .evaluate(&[slow_entry], input("payload"))
             .await
             .expect("operator timeout outcome");
+        assert!(!outcome.allowed);
+        assert_eq!(outcome.reason, "middleware_failed: middleware_timeout");
+    }
+
+    #[tokio::test]
+    async fn operator_timeout_caps_longer_binding_timeout_for_validation_and_evaluation() {
+        let mut registration = external_registration(4096);
+        registration.timeout = "10ms".into();
+        let registry = registry_with_external(
+            Arc::new(SlowService {
+                delay: Duration::from_millis(50),
+                binding_timeout: "2s".into(),
+            }),
+            registration,
+        )
+        .await;
+        let runner = ChainRunner::from_registry(registry);
+        let slow_entry = ChainEntry {
+            name: "slow".into(),
+            implementation: "example/slow".into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: OnError::FailClosed,
+        };
+
+        let described = runner
+            .describe_chain(std::slice::from_ref(&slow_entry))
+            .await
+            .expect("describe slow binding");
+        assert_eq!(described[0].timeout(), Duration::from_millis(10));
+
+        let validation_error = runner
+            .validate_config("example/slow", prost_types::Struct::default())
+            .await
+            .expect_err("operator timeout must cap ValidateConfig");
+        assert!(
+            validation_error
+                .to_string()
+                .contains("ValidateConfig failed")
+        );
+        assert!(validation_error.to_string().contains("timed out"));
+
+        let outcome = runner
+            .evaluate(&[slow_entry], input("payload"))
+            .await
+            .expect("operator-capped evaluation outcome");
         assert!(!outcome.allowed);
         assert_eq!(outcome.reason, "middleware_failed: middleware_timeout");
     }

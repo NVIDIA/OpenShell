@@ -35,7 +35,7 @@ Middleware receives the request before credential injection. Operator-run servic
 | Built-in | None | Defined by OpenShell | Runs inside the supervisor |
 | Operator-run service | Required in gateway TOML | Set by the operator, up to the service capability | Runs as a separate service reachable by the gateway and supervisors |
 
-`openshell/regex` is an example built-in middleware. It applies a small, fixed set of regular-expression replacements to UTF-8 request bodies. This best-effort text transformation is not parser-aware and does not guarantee that it will detect or fully remove sensitive values. Its `config` accepts one field, `mode: redact`, which is also the default when the field is omitted. Unknown config fields and non-string values are rejected at policy validation. Custom expressions are not configurable yet.
+`openshell/regex` is an example built-in middleware. It replaces only simple, self-contained token patterns in UTF-8 request bodies; the initial pattern recognizes `sk-` tokens. It does not infer values from keyword assignments such as JSON `password` fields. This best-effort text transformation is not parser-aware and does not guarantee that it will detect or fully remove sensitive values. Its `config` accepts one field, `mode: redact`, which is also the default when the field is omitted. Unknown config fields and non-string values are rejected at policy validation. Custom expressions are not configurable yet.
 
 Operator-run services expose one or more binding IDs. Policies reference a binding ID, such as `example/content-guard`, rather than the gateway registration name.
 
@@ -58,7 +58,7 @@ timeout = "500ms"
 | `max_body_bytes` | Operator limit applied to every binding exposed by the service, up to the 4 MiB platform maximum. |
 | `timeout` | Optional service-wide RPC timeout using an integer with an `ms` or `s` suffix. Defaults to `500ms`; valid values range from `10ms` through `30s`. |
 
-Each binding returned by `Describe` may advertise its own `timeout` using the same syntax and bounds. A binding timeout takes precedence over the gateway service setting; an omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The service timeout applies to `Describe`, while the effective binding timeout applies to `ValidateConfig` and `EvaluateHttpRequest`.
+Each binding returned by `Describe` may advertise a shorter `timeout` using the same syntax and bounds. The operator-configured service timeout is a ceiling: OpenShell uses the smaller of the binding and service values. An omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The service timeout applies to `Describe`, while the effective binding timeout applies to `ValidateConfig` and `EvaluateHttpRequest`.
 
 The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes a binding ID already owned by another service. Operator-run services cannot claim the reserved `openshell/` namespace.
 

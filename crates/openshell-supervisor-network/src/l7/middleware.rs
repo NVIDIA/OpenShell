@@ -300,12 +300,18 @@ struct SafeMiddlewareHeaders {
 fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    let parsed: Vec<(String, String)> = header_str
-        .lines()
+    crate::l7::rest::validate_http_request_header_block(header_str)?;
+    let header_block = header_str
+        .strip_suffix("\r\n\r\n")
+        .expect("validated header block has terminator");
+    let parsed: Vec<(String, String)> = header_block
+        .split("\r\n")
         .skip(1)
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .map(|line| {
+            let (name, value) = line
+                .split_once(':')
+                .expect("validated header field contains colon");
+            (name.to_ascii_lowercase(), value.trim().to_string())
         })
         .collect();
     let connection_nominated: HashSet<String> = parsed
@@ -573,5 +579,20 @@ mod tests {
             vec![("x-visible".to_string(), "visible-value".to_string())]
         );
         assert_eq!(headers.connection_nominated, vec!["keep-alive", "x-hop"]);
+    }
+
+    #[test]
+    fn middleware_headers_reject_malformed_fields_instead_of_dropping_them() {
+        for headers in [
+            b"GET /v1 HTTP/1.1\r\nX-Test: first\r\n continued\r\n\r\n".as_slice(),
+            b"GET /v1 HTTP/1.1\r\nX-Test value\r\n\r\n".as_slice(),
+            b"GET /v1 HTTP/1.1\r\nX-Test : value\r\n\r\n".as_slice(),
+            b"GET /v1 HTTP/1.1\r\nX@Test: value\r\n\r\n".as_slice(),
+        ] {
+            assert!(
+                safe_middleware_headers(headers).is_err(),
+                "middleware must reject malformed header fields"
+            );
+        }
     }
 }

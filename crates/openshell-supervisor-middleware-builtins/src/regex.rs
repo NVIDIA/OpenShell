@@ -75,15 +75,8 @@ impl ReplacementPattern {
 // TODO: Allow policies to supply custom replacement expressions after the
 // configuration contract, validation limits, and replacement semantics are
 // designed. The initial example deliberately exposes only these fixed patterns.
-static REPLACEMENT_PATTERNS: LazyLock<[ReplacementPattern; 2]> = LazyLock::new(|| {
-    [
-        ReplacementPattern::new(
-            "keyword",
-            r#"(?i)(api[_-]?key|access[_-]?token|secret|password)(["']?\s*[:=]\s*["'])[^"',\s}]+(["']?)"#,
-        ),
-        ReplacementPattern::new("openai", r"(sk-[A-Za-z0-9_-]{16,})"),
-    ]
-});
+static REPLACEMENT_PATTERNS: LazyLock<[ReplacementPattern; 1]> =
+    LazyLock::new(|| [ReplacementPattern::new("openai", r"sk-[A-Za-z0-9_-]{16,}")]);
 
 pub fn validate_config(config: &prost_types::Struct) -> Result<()> {
     RegexConfig::from_struct(config).map(|_| ())
@@ -134,13 +127,7 @@ fn apply_replacements(input: &str) -> (String, Vec<(&'static str, u32)>) {
         }
         output = pattern
             .regex
-            .replace_all(&output, |captures: &regex::Captures<'_>| {
-                if captures.len() >= 4 {
-                    format!("{}{}[REDACTED]{}", &captures[1], &captures[2], &captures[3])
-                } else {
-                    "[REDACTED]".to_string()
-                }
-            })
+            .replace_all(&output, "[REDACTED]")
             .into_owned();
     }
     (output, matches)
