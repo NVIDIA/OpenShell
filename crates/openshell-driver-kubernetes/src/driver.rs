@@ -781,6 +781,11 @@ impl KubernetesComputeDriver {
         validate_gpu_request(gpu_requirements).map_err(|status| {
             KubernetesDriverError::InvalidArgument(status.message().to_string())
         })?;
+
+        // Validate sandbox name against Kubernetes naming requirements
+        validate_kubernetes_dns1123_label(&sandbox.name, "sandbox name")
+            .map_err(KubernetesDriverError::InvalidArgument)?;
+
         let name = sandbox.name.as_str();
         info!(
             sandbox_id = %sandbox.id,
@@ -5624,5 +5629,19 @@ mod tests {
         let vct = default_workspace_volume_claim_templates("");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn sandbox_name_validation_accepts_valid_dns_labels() {
+        assert!(validate_kubernetes_dns1123_label("my-sandbox", "sandbox name").is_ok());
+        assert!(validate_kubernetes_dns1123_label("test123", "sandbox name").is_ok());
+        assert!(validate_kubernetes_dns1123_label("123abc", "sandbox name").is_ok());
+    }
+
+    #[test]
+    fn sandbox_name_validation_rejects_invalid_dns_labels() {
+        assert!(validate_kubernetes_dns1123_label("my_sandbox", "sandbox name").is_err());
+        assert!(validate_kubernetes_dns1123_label("MySandbox", "sandbox name").is_err());
+        assert!(validate_kubernetes_dns1123_label("dotted.name", "sandbox name").is_err());
     }
 }
