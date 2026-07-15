@@ -751,13 +751,13 @@ enum ProviderCommands {
     /// Create a provider config.
     #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "from_claude_login", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
-        /// Provider name.
-        #[arg(long)]
-        name: String,
+        /// Provider name. Defaults to `claude-subscription` with `--from-claude-login`.
+        #[arg(long, required_unless_present = "from_claude_login")]
+        name: Option<String>,
 
-        /// Provider type.
-        #[arg(long = "type")]
-        provider_type: String,
+        /// Provider type. Defaults to `anthropic-oauth` with `--from-claude-login`.
+        #[arg(long = "type", required_unless_present = "from_claude_login")]
+        provider_type: Option<String>,
 
         /// Load provider credentials/config from existing local state.
         #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "from_claude_login", "runtime_credentials"])]
@@ -2840,6 +2840,11 @@ async fn main() -> Result<()> {
                     runtime_credentials,
                     config,
                 } => {
+                    // clap guarantees these are present unless --from-claude-login was given.
+                    let name = name
+                        .unwrap_or_else(|| run::ANTHROPIC_OAUTH_DEFAULT_PROVIDER_NAME.to_string());
+                    let provider_type = provider_type
+                        .unwrap_or_else(|| run::ANTHROPIC_OAUTH_PROVIDER_TYPE.to_string());
                     run::provider_create_with_options(
                         endpoint,
                         &name,
@@ -4024,12 +4029,51 @@ mod tests {
                         ..
                     }),
             }) => {
-                assert_eq!(name, "work-github");
-                assert_eq!(provider_type, "github-readonly");
+                assert_eq!(name.as_deref(), Some("work-github"));
+                assert_eq!(provider_type.as_deref(), Some("github-readonly"));
                 assert_eq!(credentials, vec!["GITHUB_TOKEN=token"]);
             }
             other => panic!("expected provider create command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_create_from_claude_login_defaults_name_and_type() {
+        let cli = Cli::try_parse_from(["openshell", "provider", "create", "--from-claude-login"])
+            .expect("provider create should parse bare --from-claude-login");
+
+        match cli.command {
+            Some(Commands::Provider {
+                command:
+                    Some(ProviderCommands::Create {
+                        name,
+                        provider_type,
+                        from_claude_login,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name, None);
+                assert_eq!(provider_type, None);
+                assert!(from_claude_login);
+            }
+            other => panic!("expected provider create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_create_requires_name_and_type_without_claude_login() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--credential",
+            "SOME_KEY=value",
+        ])
+        .expect_err("provider create should require --name and --type");
+
+        let message = err.to_string();
+        assert!(message.contains("--name"), "unexpected error: {message}");
+        assert!(message.contains("--type"), "unexpected error: {message}");
     }
 
     #[test]
@@ -4075,8 +4119,8 @@ mod tests {
                         ..
                     }),
             }) => {
-                assert_eq!(name, "spiffe-token-demo");
-                assert_eq!(provider_type, "spiffe-token-demo");
+                assert_eq!(name.as_deref(), Some("spiffe-token-demo"));
+                assert_eq!(provider_type.as_deref(), Some("spiffe-token-demo"));
                 assert!(!from_existing);
                 assert!(credentials.is_empty());
                 assert!(!from_gcloud_adc);

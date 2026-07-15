@@ -3977,6 +3977,20 @@ async fn auto_create_provider(
 ) -> Result<()> {
     eprintln!("Missing provider: {provider_type}");
 
+    // Subscription OAuth material lives in the host keychain and is harvested
+    // by `provider create --from-claude-login`, not by env discovery — and it
+    // cannot be configured from inside a sandbox.
+    if openshell_core::inference::normalize_inference_provider_type(provider_type)
+        == Some(ANTHROPIC_OAUTH_PROVIDER_TYPE)
+    {
+        eprintln!(
+            "{} '{provider_type}' uses your Anthropic subscription login. Create the provider first, then retry:\n    openshell provider create --from-claude-login",
+            "!".yellow(),
+        );
+        eprintln!();
+        return Ok(());
+    }
+
     // --no-auto-providers: skip silently.
     if auto_providers_override == Some(false) {
         eprintln!(
@@ -4619,7 +4633,14 @@ fn read_gcloud_adc() -> Result<(String, String, String)> {
 }
 
 /// Canonical provider type string for the Anthropic subscription OAuth flow.
-const ANTHROPIC_OAUTH_PROVIDER_TYPE: &str = "anthropic-oauth";
+pub const ANTHROPIC_OAUTH_PROVIDER_TYPE: &str = "anthropic-oauth";
+
+/// Default provider name when `--from-claude-login` is used without `--name`.
+pub const ANTHROPIC_OAUTH_DEFAULT_PROVIDER_NAME: &str = "claude-subscription";
+
+/// Model used when auto-configuring the inference route for a freshly created
+/// Anthropic subscription provider.
+const ANTHROPIC_OAUTH_DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
 /// Anthropic's public OAuth client ID used by Claude Code. The refresh grant
 /// requires only this client ID (no client secret).
@@ -5278,11 +5299,88 @@ pub async fn provider_create_with_options(
 
         println!("{} Created provider {}", "✓".green().bold(), provider_name);
         println!("Configured Anthropic subscription credentials from the local Claude Code login");
+        configure_default_inference_route_if_unset(server, &provider_name, tls).await;
         return Ok(());
     }
 
     println!("{} Created provider {}", "✓".green().bold(), provider_name);
     Ok(())
+}
+
+/// Point the user-facing inference route at a freshly created provider when no
+/// route is configured yet, so `--from-claude-login` yields a working setup
+/// without a separate `inference set` step. Best-effort: the provider was
+/// already created successfully, so route problems only print a hint instead
+/// of failing the command. Verification is skipped because subscription rate
+/// limits make the validation probe flaky (a 429 would reject a valid token).
+async fn configure_default_inference_route_if_unset(
+    server: &str,
+    provider_name: &str,
+    tls: &TlsOptions,
+) {
+    let manual_hint = format!(
+        "run `openshell inference set --provider {provider_name} --model {ANTHROPIC_OAUTH_DEFAULT_MODEL} --no-verify` to configure it manually"
+    );
+
+    let mut client = match grpc_inference_client(server, tls).await {
+        Ok(client) => client,
+        Err(e) => {
+            println!("Could not reach the inference API to configure a route ({e}); {manual_hint}");
+            return;
+        }
+    };
+
+    let route_unset = match client
+        .get_cluster_inference(GetClusterInferenceRequest {
+            route_name: String::new(),
+        })
+        .await
+    {
+        Ok(response) => response.into_inner().provider_name.trim().is_empty(),
+        Err(status) if status.code() == Code::NotFound => true,
+        Err(status) => {
+            println!(
+                "Could not check the current inference route ({}); {manual_hint}",
+                status.message()
+            );
+            return;
+        }
+    };
+
+    if !route_unset {
+        println!(
+            "Inference route already configured; left unchanged (use `openshell inference set --provider {provider_name}` to switch)"
+        );
+        return;
+    }
+
+    match client
+        .set_cluster_inference(SetClusterInferenceRequest {
+            provider_name: provider_name.to_string(),
+            model_id: ANTHROPIC_OAUTH_DEFAULT_MODEL.to_string(),
+            route_name: String::new(),
+            verify: false,
+            no_verify: true,
+            timeout_secs: 0,
+        })
+        .await
+    {
+        Ok(response) => {
+            let configured = response.into_inner();
+            println!(
+                "{} Configured inference route: provider {} model {}",
+                "✓".green().bold(),
+                configured.provider_name,
+                configured.model_id
+            );
+        }
+        Err(status) => {
+            println!(
+                "Could not auto-configure the inference route ({}); {manual_hint}",
+                status.message()
+            );
+        }
+    }
 }
 
 fn provider_profile_allows_empty_credentials(profile: &ProviderProfile) -> bool {
