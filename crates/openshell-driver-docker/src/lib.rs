@@ -93,6 +93,11 @@ pub trait SupervisorReadiness: Send + Sync + 'static {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DockerComputeConfig {
+    /// Docker API Unix socket. When unset, use the socket selected by gateway
+    /// auto-detection, falling back to `/var/run/docker.sock` for an explicitly
+    /// configured Docker driver.
+    pub socket_path: Option<PathBuf>,
+
     /// Default OCI image for sandboxes.
     pub default_image: String,
 
@@ -145,6 +150,7 @@ pub struct DockerComputeConfig {
 impl Default for DockerComputeConfig {
     fn default() -> Self {
         Self {
+            socket_path: None,
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: String::new(),
             sandbox_namespace: "default".to_string(),
@@ -307,8 +313,22 @@ impl DockerComputeDriver {
         docker_config: &DockerComputeConfig,
         supervisor_readiness: Arc<dyn SupervisorReadiness>,
     ) -> CoreResult<Self> {
-        let docker = Docker::connect_with_local_defaults()
-            .map_err(|err| Error::execution(format!("failed to create Docker client: {err}")))?;
+        let socket_path = docker_config
+            .socket_path
+            .clone()
+            .or_else(openshell_core::config::detect_docker_socket)
+            .unwrap_or_else(|| PathBuf::from("/var/run/docker.sock"));
+        let socket_path_str = socket_path.to_str().ok_or_else(|| {
+            Error::config(format!(
+                "Docker socket path is not valid UTF-8: {}",
+                socket_path.display()
+            ))
+        })?;
+        let docker =
+            Docker::connect_with_socket(socket_path_str, 120, bollard::API_DEFAULT_VERSION)
+                .map_err(|err| {
+                    Error::execution(format!("failed to create Docker client: {err}"))
+                })?;
         let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;

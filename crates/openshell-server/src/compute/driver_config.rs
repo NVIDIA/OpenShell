@@ -322,6 +322,21 @@ enable_bind_mounts = true
     }
 
     #[test]
+    fn docker_config_reads_socket_path_from_driver_table() {
+        let file: config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.drivers.docker]
+socket_path = "/tmp/docker.sock"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = docker_config_from_context(test_context(Some(&file))).expect("docker config");
+
+        assert_eq!(cfg.socket_path, Some(PathBuf::from("/tmp/docker.sock")));
+    }
+
+    #[test]
     fn remote_driver_config_reads_socket_path_from_named_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
