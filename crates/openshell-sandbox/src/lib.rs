@@ -16,6 +16,7 @@ mod sidecar_control;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
@@ -460,7 +461,7 @@ pub async fn run_sandbox(
             retained_proto.clone(),
             openshell_endpoint.clone(),
             sandbox_id.clone(),
-            std::path::PathBuf::from(trusted_ssh_socket_path),
+            PathBuf::from(trusted_ssh_socket_path),
         );
     }
 
