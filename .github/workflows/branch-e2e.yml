@@ -46,9 +46,9 @@ jobs:
               run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               ;;
             merge_group)
-              # Merge groups have no PR labels. If GPU E2E skips, its required gate
-              # stays pending until the queue times out and ejects the PR. HA stays
-              # off until stable.
+              # Merge groups have no PR labels. When GPU E2E is required as documented
+              # in CI.md, skipping it leaves the gate pending until the queue times out
+              # and ejects the PR. HA stays off until stable.
               run_core_e2e=true
               run_gpu_e2e=true
               run_kubernetes_ha_e2e=false
