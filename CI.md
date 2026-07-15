@@ -14,13 +14,20 @@ Merge queue validation is a second integration gate for `main`. After a PR has p
 
 Three opt-in labels enable the long-running E2E suites:
 
-- `test:e2e` runs the standard E2E suite in `Branch E2E Checks`
+- `test:e2e` runs the standard Docker, rootless Podman, Kubernetes, and VM E2E
+  suites in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
   (`replicaCount: 2` and bundled PostgreSQL) in `Branch E2E Checks`
 
 When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once and fans out all enabled suites in parallel.
 The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while HA behavior is under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
+
+The VM suite runs directly on a standard GitHub-hosted Ubuntu runner. It grants
+the runner user access to KVM, then exercises VM sandbox creation, host gateway
+networking, and sandbox resume after a gateway restart. GitHub-hosted macOS
+runners cannot run this suite because they do not support nested
+virtualization.
 
 The GitHub ruleset should require the `OpenShell / ...` statuses published by `Required CI Gates`, not the push-triggered workflow jobs directly.
 
