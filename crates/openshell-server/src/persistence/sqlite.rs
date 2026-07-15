@@ -6,10 +6,14 @@ use super::{
     WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
-    draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
-    policy_record_from_parts,
+    AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
+    policy_payload_from_record, policy_record_for_atomic_write, policy_record_from_parts,
+    project_policy_revision_onto_sandbox,
 };
+use openshell_core::SetResourceVersion;
 use openshell_core::paths::set_file_owner_only;
+use openshell_core::proto::Sandbox;
+use prost::Message;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Connection, Row, SqlitePool};
 use std::path::{Path, PathBuf};
@@ -468,6 +472,7 @@ LIMIT ?3 OFFSET ?4
             load_error: None,
             created_at_ms: now_ms,
             loaded_at_ms: None,
+            provenance: std::collections::HashMap::default(),
         };
         let wrapped_payload = policy_payload_from_record(&record)?;
 
@@ -490,6 +495,107 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
         .await
         .map_err(|e| map_db_error(&e))?;
         Ok(())
+    }
+
+    pub async fn put_policy_revision_atomic(
+        &self,
+        write: &AtomicPolicyRevisionWrite,
+    ) -> PersistenceResult<Sandbox> {
+        let now_ms = current_time_ms();
+        let record = policy_record_for_atomic_write(write, now_ms);
+        let wrapped_payload = policy_payload_from_record(&record)?;
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+
+        let row = sqlx::query(
+            r#"
+SELECT "payload", "resource_version"
+FROM "objects"
+WHERE "object_type" = 'sandbox' AND "id" = ?1
+"#,
+        )
+        .bind(&write.sandbox_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?
+        .ok_or_else(|| {
+            PersistenceError::Database(format!("sandbox object {} not found", write.sandbox_id))
+        })?;
+
+        let sandbox_payload: Vec<u8> = row.get("payload");
+        let current_version: i64 = row.try_get("resource_version").unwrap_or(1);
+        let current_version = current_version.max(1).cast_unsigned();
+        let (mut sandbox, sandbox_changed) =
+            project_policy_revision_onto_sandbox(write, &sandbox_payload, current_version)?;
+
+        let resulting_version = if sandbox_changed {
+            let result = sqlx::query(
+                r#"
+UPDATE "objects"
+SET "payload" = ?2, "updated_at_ms" = ?3, "resource_version" = "resource_version" + 1
+WHERE "object_type" = 'sandbox' AND "id" = ?1 AND "resource_version" = ?4
+"#,
+            )
+            .bind(&write.sandbox_id)
+            .bind(sandbox.encode_to_vec())
+            .bind(now_ms)
+            .bind(i64::try_from(current_version).unwrap_or(i64::MAX))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+            if result.rows_affected() != 1 {
+                return Err(PersistenceError::Conflict {
+                    current_resource_version: Some(current_version),
+                });
+            }
+            current_version.saturating_add(1)
+        } else {
+            current_version
+        };
+
+        sqlx::query(
+            r#"
+INSERT INTO "objects" (
+    "object_type", "id", "scope", "version", "status", "payload", "created_at_ms", "updated_at_ms"
+)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+"#,
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(&write.id)
+        .bind(&write.sandbox_id)
+        .bind(write.version)
+        .bind("pending")
+        .bind(wrapped_payload)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        sqlx::query(
+            r#"
+UPDATE "objects"
+SET "status" = 'superseded', "updated_at_ms" = ?4
+WHERE "object_type" = ?1
+  AND "scope" = ?2
+  AND "version" < ?3
+  AND "status" IN ('pending', 'loaded')
+"#,
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(&write.sandbox_id)
+        .bind(write.version)
+        .bind(now_ms)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+        sandbox.set_resource_version(resulting_version);
+        Ok(sandbox)
     }
 
     pub async fn get_latest_policy(

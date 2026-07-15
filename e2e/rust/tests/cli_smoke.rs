@@ -364,13 +364,7 @@ async fn gateway_add_can_shadow_system_gateway_with_user_registration() {
     let (add_output, add_code) = run_with_config(
         config_dir.path(),
         Some(system_dir.path()),
-        &[
-            "gateway",
-            "add",
-            "http://127.0.0.1:17671",
-            "--name",
-            "beta",
-        ],
+        &["gateway", "add", "http://127.0.0.1:17671", "--name", "beta"],
     )
     .await;
     assert_eq!(

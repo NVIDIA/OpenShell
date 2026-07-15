@@ -384,6 +384,12 @@ pub struct Config {
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
+    /// Disabled-by-default gateway interceptor service configs.
+    pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
+
+    /// Ordered provider-profile sources used to build the effective catalog.
+    pub provider_profile_sources: Vec<GatewayProviderProfileSourceConfig>,
+
     /// mTLS user authentication configuration. When enabled, a verified TLS
     /// client certificate can authenticate CLI/SDK callers as a
     /// `Principal::User`. This is for local single-user gateways only;
@@ -547,6 +553,112 @@ pub struct GatewayAuthConfig {
     pub allow_unauthenticated_users: bool,
 }
 
+/// One configured gateway interceptor service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayInterceptorConfig {
+    /// Operator-assigned instance name used in logs and config overrides.
+    pub name: String,
+    /// Interceptor gRPC endpoint. Supports `http://`, `https://`, and
+    /// `unix://` endpoints.
+    pub grpc_endpoint: String,
+    /// Deterministic service ordering. Lower values run first.
+    #[serde(default)]
+    pub order: i32,
+    /// Default failure policy for this configured service.
+    #[serde(default)]
+    pub failure_policy: Option<GatewayInterceptorFailurePolicy>,
+    /// RFC-style timeout string such as `500ms` or `2s`.
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// Maximum accepted encoded `Evaluate` response size.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+    /// Maximum JSON patches accepted from one evaluation result.
+    #[serde(default)]
+    pub max_patches: Option<usize>,
+    /// Controls whether manifest bindings are dynamic, allowlisted, or must
+    /// exactly match operator configuration.
+    #[serde(default)]
+    pub binding_policy: GatewayInterceptorBindingPolicy,
+    /// Binding configuration. Its validation and authorization semantics are
+    /// selected by `binding_policy`.
+    #[serde(default)]
+    pub bindings: Vec<GatewayInterceptorBindingOverride>,
+}
+
+/// Operator policy for authorizing interceptor manifest bindings.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorBindingPolicy {
+    /// Preserve manifest-controlled binding discovery. Configured bindings
+    /// may narrow or disable manifest declarations.
+    #[default]
+    Dynamic,
+    /// Enable only configured RPC selectors and phases. Extra manifest
+    /// declarations are ignored.
+    Allowlist,
+    /// Require configured and manifest RPC selectors and phases to match.
+    Exact,
+}
+
+/// One configured source in the gateway's effective provider-profile catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayProviderProfileSourceConfig {
+    /// Profiles bundled with the `OpenShell` build.
+    Builtin,
+    /// Profiles managed through the provider profile mutation APIs.
+    User,
+    /// Profiles vended by a configured gateway interceptor instance.
+    Interceptor { name: String },
+}
+
+/// Failure behavior when an interceptor evaluation cannot produce a valid
+/// result.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorFailurePolicy {
+    FailClosed,
+    FailOpen,
+}
+
+/// Configured binding authorization or dynamic-manifest override.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayInterceptorBindingOverride {
+    /// Binding id from the interceptor manifest.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Full selector form: `openshell.v1.OpenShell/CreateSandbox`.
+    #[serde(default)]
+    pub rpc: Option<String>,
+    /// Structured selector service, e.g. `openshell.v1.OpenShell`.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Structured selector method, e.g. `CreateSandbox`.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Narrowed phase set.
+    #[serde(default)]
+    pub phases: Option<Vec<GatewayInterceptorPhaseConfig>>,
+    /// Disable the selected binding.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Binding-specific failure policy override.
+    #[serde(default)]
+    pub failure_policy: Option<GatewayInterceptorFailurePolicy>,
+}
+
+/// Config file phase names.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorPhaseConfig {
+    ModifyOperation,
+    Validate,
+    PostCommit,
+}
+
 const fn default_jwks_ttl_secs() -> u64 {
     3600
 }
@@ -607,6 +719,11 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            gateway_interceptors: Vec::new(),
+            provider_profile_sources: vec![
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+            ],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
@@ -694,6 +811,26 @@ impl Config {
     ) -> Self {
         self.grpc_rate_limit_requests = requests;
         self.grpc_rate_limit_window_secs = window_secs;
+        self
+    }
+
+    /// Set configured gateway interceptors.
+    #[must_use]
+    pub fn with_gateway_interceptors<I>(mut self, interceptors: I) -> Self
+    where
+        I: IntoIterator<Item = GatewayInterceptorConfig>,
+    {
+        self.gateway_interceptors = interceptors.into_iter().collect();
+        self
+    }
+
+    /// Set the ordered provider-profile sources used by the gateway.
+    #[must_use]
+    pub fn with_provider_profile_sources<I>(mut self, sources: I) -> Self
+    where
+        I: IntoIterator<Item = GatewayProviderProfileSourceConfig>,
+    {
+        self.provider_profile_sources = sources.into_iter().collect();
         self
     }
 
@@ -821,9 +958,11 @@ mod tests {
     #[cfg(unix)]
     use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket, normalize_compute_driver_name,
-        podman_socket_candidates_from_env, podman_socket_responds,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
+        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
+        GatewayProviderProfileSourceConfig, detect_driver, docker_host_unix_socket_path,
+        is_unix_socket, normalize_compute_driver_name, podman_socket_candidates_from_env,
+        podman_socket_responds,
     };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
@@ -890,6 +1029,18 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_to_builtin_and_user_provider_profile_sources() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.provider_profile_sources,
+            vec![
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+            ]
+        );
+    }
+
+    #[test]
     fn gateway_jwt_ttl_defaults_to_non_expiring() {
         let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
             "signing_key_path": "/tmp/signing.pem",
@@ -899,6 +1050,35 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, 0);
+    }
+
+    #[test]
+    fn gateway_interceptor_failure_policy_rejects_ignore() {
+        let err =
+            serde_json::from_value::<GatewayInterceptorFailurePolicy>(serde_json::json!("ignore"))
+                .unwrap_err();
+
+        assert!(err.to_string().contains("unknown variant `ignore`"));
+    }
+
+    #[test]
+    fn gateway_interceptor_binding_policy_defaults_and_parses_strict_modes() {
+        let defaulted: GatewayInterceptorConfig = serde_json::from_value(serde_json::json!({
+            "name": "governance",
+            "grpc_endpoint": "unix:///tmp/governance.sock"
+        }))
+        .unwrap();
+        let allowlist: GatewayInterceptorBindingPolicy =
+            serde_json::from_value(serde_json::json!("allowlist")).unwrap();
+        let exact: GatewayInterceptorBindingPolicy =
+            serde_json::from_value(serde_json::json!("exact")).unwrap();
+
+        assert_eq!(
+            defaulted.binding_policy,
+            GatewayInterceptorBindingPolicy::Dynamic
+        );
+        assert_eq!(allowlist, GatewayInterceptorBindingPolicy::Allowlist);
+        assert_eq!(exact, GatewayInterceptorBindingPolicy::Exact);
     }
 
     #[test]

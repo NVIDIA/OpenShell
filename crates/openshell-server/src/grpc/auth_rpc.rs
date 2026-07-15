@@ -200,6 +200,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::default(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,

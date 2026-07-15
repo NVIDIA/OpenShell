@@ -230,6 +230,7 @@ uv run python -m grpc_tools.protoc \
   proto/inference.proto \
   proto/openshell.proto \
   proto/datamodel.proto \
+  proto/options.proto \
   proto/sandbox.proto
 # Fix absolute imports in generated stubs to use package-relative imports
 uv run python - <<'PY'
@@ -239,6 +240,7 @@ import re
 line_rewrites = {
     "python/openshell/_proto/inference_pb2.py": [
         (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
+        (r"^import options_pb2 as options__pb2$", "from . import options_pb2 as options__pb2"),
     ],
     "python/openshell/_proto/inference_pb2_grpc.py": [
         (r"^import inference_pb2 as inference__pb2$", "from . import inference_pb2 as inference__pb2"),
@@ -249,9 +251,11 @@ line_rewrites = {
     ],
     "python/openshell/_proto/openshell_pb2.py": [
         (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
+        (r"^import options_pb2 as options__pb2$", "from . import options_pb2 as options__pb2"),
         (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
     "python/openshell/_proto/datamodel_pb2.py": [
+        (r"^import options_pb2 as options__pb2$", "from . import options_pb2 as options__pb2"),
         (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
     "python/openshell/_proto/datamodel_pb2_grpc.py": [

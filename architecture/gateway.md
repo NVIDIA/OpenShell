@@ -41,6 +41,92 @@ Operators can configure a gateway-wide gRPC request rate limit. The limit is
 applied only to gRPC API traffic after protocol multiplexing; health, metrics,
 and local sandbox-service HTTP routes are not rate limited by this control.
 
+Gateway interceptors run in one middleware layer on the `openshell.v1.OpenShell`
+gRPC service after authentication and before tonic dispatches to individual
+handlers. At startup the gateway calls each configured interceptor's `Describe`
+RPC, validates declared bindings against the compiled OpenShell descriptor set,
+and builds an immutable execution plan. Only unary OpenShell methods in the
+gateway's explicit interceptable-method allowlist are decoded through the
+descriptor set into protobuf JSON, evaluated through configured phases, and
+re-encoded before the handler sees the request. New RPCs are non-interceptable
+until deliberately added to this allowlist. Interception remains centralized:
+allowlisting a unary RPC does not require method-specific gateway
+instrumentation.
+
+Each configured interceptor selects a binding policy. `dynamic` accepts valid
+manifest declarations and preserves the compatibility behavior. `allowlist`
+enables only operator-configured RPCs and phases, while `exact` requires the
+configured and declared sets to match. Strict policies match by RPC rather than
+manifest binding ID, so renaming a binding does not change authority. Provider
+profile sources remain a separate operator-controlled capability.
+
+The protobuf schema marks dedicated credential, token, and refresh-material
+fields with a custom secret option. The middleware recursively omits those
+fields from every request and post-commit response sent to an interceptor while
+retaining the complete protobuf operation for handler dispatch. JSON Patch
+paths and source paths cannot select an omitted field or replace a containing
+object. There is no configuration that exposes annotated fields.
+
+`SubmitPolicyAnalysis` is interceptable because proposed chunks can eventually
+change active policy through the gateway's approval workflow. An interceptor
+may therefore reject policy proposals while permitting telemetry-only requests.
+Gateways without a matching binding retain the standard proposal behavior.
+
+The descriptor codec uses protobuf's standard `oneof` semantics. If binary
+input contains multiple alternatives from one group, the last member on the
+wire wins. The middleware converts that selected value to ProtoJSON and
+re-encodes it before dispatch, so the interceptor and handler observe the same
+canonical request. ProtoJSON input that names multiple alternatives remains
+invalid.
+
+Modification results are atomic per binding. After applying one binding's full
+JSON Patch list, the middleware re-encodes the candidate as the request's
+protobuf type and decodes those accepted bytes back to canonical ProtoJSON.
+Invalid candidates follow that binding's failure policy: fail-open restores the
+exact pre-binding operation, while fail-closed rejects the request before
+handler dispatch. Later bindings only observe the same schema-valid operation
+that the handler will receive; protobuf map entry ordering is not treated as a
+semantic difference.
+
+Each interceptor evaluation selects exactly one phase payload:
+`modify_operation`, `validate`, or `post_commit`. Modification and validation
+payloads carry the protobuf JSON operation entering that phase. Post-commit
+payloads carry the successful committed response instead of echoing the
+request. Only the `validate` payload can also carry optional read-only
+`current_state`; modification and post-commit evaluations never receive it. The
+gateway does not yet load method-specific state, so the field remains absent;
+an absent state is distinct from an explicitly empty object. Method-specific
+state schemas and persistence-version binding are deferred until a concrete
+consumer requires them.
+
+Post-commit evaluation is strictly observational. A binding that includes
+`post_commit` must resolve to `fail_open`, or interceptor initialization fails.
+After a handler returns success, failures never replace the committed response.
+Binding failures emit the standard fail-open warning and counter; response
+observation or evaluation failures outside binding policy emit warnings and the
+`openshell_gateway_interceptor_post_commit_observation_failures_total` metric.
+The gateway reconstructs the original response frames, including trailers and
+body errors, before evaluating the observer.
+
+Interceptor manifests can also vend provider profile catalogs. Gateway
+configuration selects the exact ordered source set from the in-tree built-in
+source, the stored user source, and named profile-capable interceptors. Omitting
+the setting selects `builtin + user`; selecting only an interceptor makes it
+authoritative by omission. Every selected source uses the same snapshot,
+semantic-validation, and duplicate-detection path. Duplicate normalized profile
+IDs fail instead of creating source precedence. The gateway treats configured
+interceptors as trusted sources and does not verify signature annotations in
+their profile payloads.
+
+Each logical gateway request captures the selected sources into one validated,
+immutable effective catalog before deriving provider behavior. Policy layers,
+credential scope, injected environment material, dynamic token grants, and
+provider-environment revisions use that same catalog. Each configured source is
+therefore fetched at most once per request, and a source revision change becomes
+visible on the next request instead of partway through the current request. The
+capture emits debug diagnostics with the combined catalog revision, source fetch
+count, and profile count; it never logs provider credentials or profile material.
+
 Supported auth modes:
 
 | Mode | Use |
@@ -143,6 +229,15 @@ populate `scope`, `version`, `status`, `dedup_key`, and `hit_count` so the
 gateway can efficiently fetch the latest policy, track load status, and manage
 advisor drafts without creating resource-specific tables.
 
+Each sandbox policy revision stores the complete provenance annotation map
+supplied with that update. The revision payload is the authoritative immutable
+record; sandbox metadata receives the same annotations only as a convenience
+projection and can retain keys from earlier revisions. Policy revision creation,
+optional first-policy backfill, metadata projection, and superseding older
+revisions commit in one database transaction. SQLite serializes this operation
+with an immediate transaction, while Postgres locks the sandbox row. A failed
+resource-version check or revision insert rolls back the entire operation.
+
 SQLite is the default local store; Postgres is supported for deployments that
 need an external database or multi-replica coordination. Both backends expose
 the same `Store` API and the same logical schema. Backend differences stay
@@ -220,7 +315,7 @@ modes:
   write. Client-facing operations that carry an `expected_resource_version`
   field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
   `UpdateProvider`, `UpdateProviderProfiles`, and `UpdateConfig` (policy
-  backfill path).
+  backfill and sandbox annotation updates).
 
 **Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
 protobuf payloads from list results and hydrate `resource_version` from the

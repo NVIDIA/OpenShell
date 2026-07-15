@@ -97,7 +97,7 @@ typically `~/snap/openshell/common`. Gateway registrations live under
 ### Snap store installs
 
 When installing from the Snap Store, snapd automatically connects the `home`,
-`network`, `network-bind`, and `ssh-keys` plugs. The `docker` plug still
+`network`, and `network-bind` plugs. The `docker` plug still
 requires manual connection:
 
 ```shell
@@ -117,7 +117,6 @@ sudo snap install ./openshell_*.snap --dangerous
 sudo snap connect openshell:home
 sudo snap connect openshell:network
 sudo snap connect openshell:network-bind
-sudo snap connect openshell:ssh-keys
 sudo snap connect openshell:docker docker:docker-daemon
 sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe

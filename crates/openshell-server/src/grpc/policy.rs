@@ -13,7 +13,10 @@
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
-use crate::policy_store::PolicyStoreExt;
+use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
+use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
+#[cfg(test)]
+use crate::provider_profile_sources::ProviderProfileSources;
 use openshell_core::net::is_internal_ip;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
@@ -61,7 +64,7 @@ use openshell_prover::{
     registry::load_embedded_binary_registry,
     report::finding_shorthand,
 };
-use openshell_providers::{get_default_profile, normalize_provider_type};
+use openshell_providers::normalize_provider_type;
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -71,7 +74,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, source_matches, validate_no_reserved_provider_policy_keys,
+    level_matches, source_matches, validate_annotations, validate_no_reserved_provider_policy_keys,
     validate_policy_safety, validate_static_fields_unchanged,
 };
 use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
@@ -517,8 +520,9 @@ fn run_prover_findings(
 /// a `warn!` — the merged policy already excludes them at compose time, so
 /// silently treating them as absent here keeps the credential set consistent
 /// with the merged policy the prover validates against.
-async fn build_credential_set_for_sandbox(
+async fn build_credential_set_for_sandbox_with_catalog(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<CredentialSet, Status> {
     let mut credentials = Vec::new();
@@ -534,28 +538,16 @@ async fn build_credential_set_for_sandbox(
         };
 
         let provider_type = provider.r#type.trim();
-        let profile = if let Some(canonical_type) = normalize_provider_type(provider_type) {
-            let Some(profile) = get_default_profile(canonical_type) else {
-                warn!(
-                    provider_name = %name,
-                    provider_type,
-                    "legacy provider type has no profile; skipping credential entry"
-                );
-                continue;
-            };
-            profile.clone()
-        } else {
-            let Some(profile) =
-                super::provider::get_provider_type_profile(store, provider_type).await?
-            else {
-                warn!(
-                    provider_name = %name,
-                    provider_type,
-                    "provider type has no profile; skipping credential entry"
-                );
-                continue;
-            };
-            profile
+        let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
+        let Some(profile) =
+            super::provider::get_provider_type_profile_with_catalog(catalog, profile_id)
+        else {
+            warn!(
+                provider_name = %name,
+                provider_type,
+                "provider type has no profile; skipping credential entry"
+            );
+            continue;
         };
 
         let target_hosts: Vec<String> = profile
@@ -987,6 +979,7 @@ async fn auto_approve_chunk(
 // agent-authored proposal validation slice.
 async fn current_effective_policy_for_sandbox(
     state: &ServerState,
+    catalog: &EffectiveProviderProfileCatalog,
     sandbox: &Sandbox,
     sandbox_id: &str,
 ) -> Result<ProtoSandboxPolicy, Status> {
@@ -1023,8 +1016,12 @@ async fn current_effective_policy_for_sandbox(
             .as_ref()
             .map(|spec| spec.providers.clone())
             .unwrap_or_default();
-        let provider_layers =
-            profile_provider_policy_layers(state.store.as_ref(), &provider_names).await?;
+        let provider_layers = profile_provider_policy_layers_with_catalog(
+            state.store.as_ref(),
+            catalog,
+            &provider_names,
+        )
+        .await?;
         if !provider_layers.is_empty() {
             policy = compose_effective_policy(&policy, &provider_layers);
         }
@@ -1075,6 +1072,97 @@ fn validate_sandbox_caller_update(req: &UpdateConfigRequest) -> Result<(), Statu
         ));
     }
     Ok(())
+}
+
+fn sandbox_metadata_annotations(sandbox: &Sandbox) -> HashMap<String, String> {
+    sandbox
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.annotations.clone())
+        .unwrap_or_default()
+}
+
+fn update_config_response(
+    version: u32,
+    policy_hash: impl Into<String>,
+    settings_revision: u64,
+    deleted: bool,
+    annotations: HashMap<String, String>,
+) -> Response<UpdateConfigResponse> {
+    Response::new(UpdateConfigResponse {
+        version,
+        policy_hash: policy_hash.into(),
+        settings_revision,
+        deleted,
+        annotations,
+    })
+}
+
+async fn persist_update_config_annotations(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    expected_resource_version: u64,
+    annotations: &HashMap<String, String>,
+    current_annotations: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, Status> {
+    if annotations.is_empty() {
+        return Ok(current_annotations.clone());
+    }
+    if annotations
+        .iter()
+        .all(|(key, value)| current_annotations.get(key) == Some(value))
+    {
+        return Ok(current_annotations.clone());
+    }
+
+    let annotations = annotations.clone();
+    let updated = state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
+            if let Some(metadata) = sandbox.metadata.as_mut() {
+                metadata.annotations.extend(annotations.clone());
+            }
+        })
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "store update annotations"))?;
+
+    Ok(sandbox_metadata_annotations(&updated))
+}
+
+async fn persist_existing_policy_projection(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    expected_resource_version: u64,
+    annotations: &HashMap<String, String>,
+    current_annotations: &HashMap<String, String>,
+    backfill_policy: Option<&ProtoSandboxPolicy>,
+) -> Result<HashMap<String, String>, Status> {
+    let annotations_match = annotations
+        .iter()
+        .all(|(key, value)| current_annotations.get(key) == Some(value));
+    if backfill_policy.is_none() && annotations_match {
+        return Ok(current_annotations.clone());
+    }
+
+    let annotations = annotations.clone();
+    let backfill_policy = backfill_policy.cloned();
+    let updated = state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
+            if let Some(policy) = backfill_policy.as_ref()
+                && let Some(spec) = sandbox.spec.as_mut()
+                && spec.policy.is_none()
+            {
+                spec.policy = Some(policy.clone());
+            }
+            if let Some(metadata) = sandbox.metadata.as_mut() {
+                metadata.annotations.extend(annotations.clone());
+            }
+        })
+        .await
+        .map_err(|e| super::persistence_error_to_status(e, "store policy projection"))?;
+
+    Ok(sandbox_metadata_annotations(&updated))
 }
 
 async fn resolve_sandbox_by_name_for_principal(
@@ -1135,6 +1223,10 @@ pub(super) async fn handle_get_sandbox_config(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
 
     // Try to get the latest policy from the policy history table.
     let latest = state
@@ -1237,8 +1329,12 @@ pub(super) async fn handle_get_sandbox_config(
         && !matches!(policy_source, PolicySource::Global)
         && let Some(source_policy) = policy.as_ref()
     {
-        let provider_layers =
-            profile_provider_policy_layers(state.store.as_ref(), &sandbox_provider_names).await?;
+        let provider_layers = profile_provider_policy_layers_with_catalog(
+            state.store.as_ref(),
+            &provider_profile_catalog,
+            &sandbox_provider_names,
+        )
+        .await?;
         if !provider_layers.is_empty() {
             let effective_policy = compose_effective_policy(source_policy, &provider_layers);
             validate_policy_safety(&effective_policy).map_err(|error| {
@@ -1272,8 +1368,12 @@ pub(super) async fn handle_get_sandbox_config(
         policy_source,
         &supervisor_middleware_services,
     );
-    let provider_env_revision =
-        compute_provider_env_revision(state.store.as_ref(), &sandbox_provider_names).await?;
+    let provider_env_revision = compute_provider_env_revision_with_catalog(
+        state.store.as_ref(),
+        &provider_profile_catalog,
+        &sandbox_provider_names,
+    )
+    .await?;
 
     Ok(Response::new(GetSandboxConfigResponse {
         policy,
@@ -1288,8 +1388,20 @@ pub(super) async fn handle_get_sandbox_config(
     }))
 }
 
-pub(super) async fn compute_provider_env_revision(
+#[cfg(test)]
+async fn compute_provider_env_revision(
     store: &Store,
+    provider_names: &[String],
+) -> Result<u64, Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    compute_provider_env_revision_with_catalog(store, &catalog, provider_names).await
+}
+
+pub(super) async fn compute_provider_env_revision_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
@@ -1311,7 +1423,7 @@ pub(super) async fn compute_provider_env_revision(
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
                 hasher.update(provider.r#type.as_bytes());
-                hash_provider_profile_revision(store, &provider.r#type, &mut hasher).await?;
+                hash_provider_profile_revision(catalog, &provider.r#type, &mut hasher);
 
                 let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
                 credential_keys.sort();
@@ -1337,43 +1449,29 @@ pub(super) async fn compute_provider_env_revision(
     )?))
 }
 
-async fn hash_provider_profile_revision(
-    store: &Store,
+fn hash_provider_profile_revision(
+    catalog: &EffectiveProviderProfileCatalog,
     provider_type: &str,
     hasher: &mut Sha256,
-) -> Result<(), Status> {
-    if let Some(profile) = get_default_profile(provider_type) {
-        hasher.update(b"builtin-profile");
-        hasher.update(profile.to_proto().encode_to_vec());
-        return Ok(());
-    }
-
-    hasher.update(b"custom-profile");
-    match store
-        .get_by_name(
-            openshell_core::proto::StoredProviderProfile::object_type(),
-            provider_type,
-        )
-        .await
-        .map_err(|e| {
-            Status::internal(format!(
-                "fetch provider profile '{provider_type}' failed: {e}"
-            ))
-        })? {
-        Some(record) => {
-            hasher.update(record.id.as_bytes());
-            hasher.update(record.updated_at_ms.to_le_bytes());
-            hasher.update(record.payload.as_slice());
-        }
-        None => {
-            hasher.update(b"missing");
-        }
-    }
-    Ok(())
+) {
+    let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
+    catalog.hash_profile_revision(profile_id, hasher);
 }
 
+#[cfg(test)]
 async fn profile_provider_policy_layers(
     store: &Store,
+    provider_names: &[String],
+) -> Result<Vec<ProviderPolicyLayer>, Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    profile_provider_policy_layers_with_catalog(store, &catalog, provider_names).await
+}
+
+async fn profile_provider_policy_layers_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
     let mut layers = Vec::new();
@@ -1386,28 +1484,16 @@ async fn profile_provider_policy_layers(
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
         let provider_type = provider.r#type.trim();
-        let profile = if let Some(canonical_type) = normalize_provider_type(provider_type) {
-            let Some(profile) = get_default_profile(canonical_type) else {
-                warn!(
-                    provider_name = %name,
-                    provider_type,
-                    "legacy provider type has no profile; skipping provider policy layer"
-                );
-                continue;
-            };
-            profile.clone()
-        } else {
-            let Some(profile) =
-                super::provider::get_provider_type_profile(store, provider_type).await?
-            else {
-                warn!(
-                    provider_name = %name,
-                    provider_type,
-                    "provider type has no profile; skipping provider policy layer"
-                );
-                continue;
-            };
-            profile
+        let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
+        let Some(profile) =
+            super::provider::get_provider_type_profile_with_catalog(catalog, profile_id)
+        else {
+            warn!(
+                provider_name = %name,
+                provider_type,
+                "provider type has no profile; skipping provider policy layer"
+            );
+            continue;
         };
 
         let rule_name = openshell_policy::provider_rule_name(provider.object_name());
@@ -1462,11 +1548,22 @@ pub(super) async fn handle_get_sandbox_provider_environment(
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
     let provider_names = spec.providers;
-    let provider_env_revision =
-        compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
-    let provider_environment =
-        super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
-            .await?;
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let provider_env_revision = compute_provider_env_revision_with_catalog(
+        state.store.as_ref(),
+        &provider_profile_catalog,
+        &provider_names,
+    )
+    .await?;
+    let provider_environment = super::provider::resolve_provider_environment_with_catalog(
+        state.store.as_ref(),
+        &provider_profile_catalog,
+        &provider_names,
+    )
+    .await?;
 
     info!(
         sandbox_id = %sandbox_id,
@@ -1511,6 +1608,7 @@ async fn handle_update_config_inner(
     sandbox_caller: bool,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let req = request.into_inner();
+    validate_annotations(&req.annotations, "annotations")?;
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
         resolve_sandbox_by_name_for_principal(
@@ -1543,6 +1641,11 @@ async fn handle_update_config_inner(
     }
 
     if req.global {
+        if !req.annotations.is_empty() {
+            return Err(Status::invalid_argument(
+                "annotations are only supported for sandbox-scoped updates",
+            ));
+        }
         let _settings_guard = state.settings_mutex.lock().await;
 
         if has_merge_ops {
@@ -1590,12 +1693,13 @@ async fn handle_update_config_inner(
                     global_settings.revision = global_settings.revision.wrapping_add(1);
                     save_global_settings(state.store.as_ref(), &global_settings).await?;
                 }
-                return Ok(Response::new(UpdateConfigResponse {
-                    version: u32::try_from(current.version).unwrap_or(0),
-                    policy_hash: hash,
-                    settings_revision: global_settings.revision,
-                    deleted: false,
-                }));
+                return Ok(update_config_response(
+                    u32::try_from(current.version).unwrap_or(0),
+                    hash,
+                    global_settings.revision,
+                    false,
+                    HashMap::new(),
+                ));
             }
 
             let next_version = latest.map_or(1, |r| r.version + 1);
@@ -1645,12 +1749,13 @@ async fn handle_update_config_inner(
                 save_global_settings(state.store.as_ref(), &global_settings).await?;
             }
 
-            return Ok(Response::new(UpdateConfigResponse {
-                version: u32::try_from(next_version).unwrap_or(0),
-                policy_hash: hash,
-                settings_revision: global_settings.revision,
-                deleted: false,
-            }));
+            return Ok(update_config_response(
+                u32::try_from(next_version).unwrap_or(0),
+                hash,
+                global_settings.revision,
+                false,
+                HashMap::new(),
+            ));
         }
 
         // Global setting mutation.
@@ -1693,12 +1798,13 @@ async fn handle_update_config_inner(
             save_global_settings(state.store.as_ref(), &global_settings).await?;
         }
 
-        return Ok(Response::new(UpdateConfigResponse {
-            version: 0,
-            policy_hash: String::new(),
-            settings_revision: global_settings.revision,
-            deleted: req.delete_setting && changed,
-        }));
+        return Ok(update_config_response(
+            0,
+            String::new(),
+            global_settings.revision,
+            req.delete_setting && changed,
+            HashMap::new(),
+        ));
     }
 
     if req.name.is_empty() {
@@ -1715,6 +1821,7 @@ async fn handle_update_config_inner(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    let mut response_annotations = sandbox_metadata_annotations(&sandbox);
 
     if has_setting {
         let _settings_guard = state.settings_mutex.lock().await;
@@ -1748,12 +1855,22 @@ async fn handle_update_config_inner(
                 .await?;
             }
 
-            return Ok(Response::new(UpdateConfigResponse {
-                version: 0,
-                policy_hash: String::new(),
-                settings_revision: sandbox_settings.revision,
-                deleted: removed,
-            }));
+            response_annotations = persist_update_config_annotations(
+                state,
+                &sandbox_id,
+                req.expected_resource_version,
+                &req.annotations,
+                &response_annotations,
+            )
+            .await?;
+
+            return Ok(update_config_response(
+                0,
+                String::new(),
+                sandbox_settings.revision,
+                removed,
+                response_annotations,
+            ));
         }
 
         if globally_managed {
@@ -1781,12 +1898,22 @@ async fn handle_update_config_inner(
             .await?;
         }
 
-        return Ok(Response::new(UpdateConfigResponse {
-            version: 0,
-            policy_hash: String::new(),
-            settings_revision: sandbox_settings.revision,
-            deleted: false,
-        }));
+        response_annotations = persist_update_config_annotations(
+            state,
+            &sandbox_id,
+            req.expected_resource_version,
+            &req.annotations,
+            &response_annotations,
+        )
+        .await?;
+
+        return Ok(update_config_response(
+            0,
+            String::new(),
+            sandbox_settings.revision,
+            false,
+            response_annotations,
+        ));
     }
 
     if has_merge_ops {
@@ -1803,13 +1930,32 @@ async fn handle_update_config_inner(
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
         let merge_ops = parse_merge_operations(&req.merge_operations)?;
         validate_merge_operations_for_server(&merge_ops)?;
-        let (version, hash) = apply_merge_operations_with_retry(
+        let atomic_context = AtomicPolicyWriteContext {
+            expected_resource_version: req.expected_resource_version,
+            provenance: &req.annotations,
+            annotations: &req.annotations,
+        };
+        let (version, hash, updated_sandbox) = apply_merge_operations_with_retry(
             state.store.as_ref(),
             &sandbox_id,
             spec.policy.as_ref(),
             &merge_ops,
+            Some(&atomic_context),
         )
         .await?;
+        response_annotations = if let Some(updated_sandbox) = updated_sandbox {
+            sandbox_metadata_annotations(&updated_sandbox)
+        } else {
+            persist_existing_policy_projection(
+                state,
+                &sandbox_id,
+                req.expected_resource_version,
+                &req.annotations,
+                &response_annotations,
+                None,
+            )
+            .await?
+        };
 
         state.sandbox_watch_bus.notify(&sandbox_id);
         emit_gateway_policy_audit_log(
@@ -1845,12 +1991,13 @@ async fn handle_update_config_inner(
         );
         emit_config_update_policy_success(sandbox_caller);
 
-        return Ok(Response::new(UpdateConfigResponse {
-            version: u32::try_from(version).unwrap_or(0),
-            policy_hash: hash,
-            settings_revision: 0,
-            deleted: false,
-        }));
+        return Ok(update_config_response(
+            u32::try_from(version).unwrap_or(0),
+            hash,
+            0,
+            false,
+            response_annotations,
+        ));
     }
 
     // Sandbox-scoped policy update.
@@ -1882,72 +2029,111 @@ async fn handle_update_config_inner(
         validate_no_reserved_provider_policy_keys(&new_policy)?;
     }
 
-    if let Some(baseline_policy) = spec.policy.as_ref() {
+    let backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
-    }
+        None
+    } else {
+        Some(new_policy.clone())
+    };
 
     validate_policy_safety(&new_policy)?;
     crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
 
-    if spec.policy.is_none() {
-        // Backfill spec.policy using CAS (first-time policy discovery)
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-        let sandbox_id = sandbox.object_id().to_string();
-        let new_policy_clone = new_policy.clone();
-        state
-            .store
-            .update_message_cas::<Sandbox, _>(
-                &sandbox_id,
-                req.expected_resource_version,
-                |sandbox| {
-                    if let Some(ref mut spec) = sandbox.spec
-                        && spec.policy.is_none()
-                    {
-                        spec.policy = Some(new_policy_clone.clone());
-                    }
-                },
-            )
-            .await
-            .map_err(|e| super::persistence_error_to_status(e, "backfill spec.policy"))?;
+    let _sandbox_sync_guard = if backfill_policy.is_some() {
+        Some(state.compute.sandbox_sync_guard().await)
+    } else {
+        None
+    };
+
+    let payload = new_policy.encode_to_vec();
+    let hash = deterministic_policy_hash(&new_policy);
+    let (next_version, committed_annotations) = {
+        let mut committed = None;
+        for attempt in 1..=MERGE_RETRY_LIMIT {
+            let latest = state
+                .store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
+
+            if let Some(ref current) = latest
+                && current.policy_hash == hash
+                && current.provenance == req.annotations
+            {
+                response_annotations = persist_existing_policy_projection(
+                    state,
+                    &sandbox_id,
+                    req.expected_resource_version,
+                    &req.annotations,
+                    &response_annotations,
+                    backfill_policy.as_ref(),
+                )
+                .await?;
+                if backfill_policy.is_some() {
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
+                    );
+                }
+                return Ok(update_config_response(
+                    u32::try_from(current.version).unwrap_or(0),
+                    hash,
+                    0,
+                    false,
+                    response_annotations,
+                ));
+            }
+
+            let next_version = latest.as_ref().map_or(1, |record| record.version + 1);
+            let write = AtomicPolicyRevisionWrite {
+                id: uuid::Uuid::new_v4().to_string(),
+                sandbox_id: sandbox_id.clone(),
+                version: next_version,
+                policy_payload: payload.clone(),
+                policy_hash: hash.clone(),
+                provenance: req.annotations.clone(),
+                expected_resource_version: req.expected_resource_version,
+                annotations: req.annotations.clone(),
+                backfill_policy: backfill_policy.clone(),
+            };
+
+            match state.store.put_policy_revision_atomic(&write).await {
+                Ok(updated_sandbox) => {
+                    committed =
+                        Some((next_version, sandbox_metadata_annotations(&updated_sandbox)));
+                    break;
+                }
+                Err(error) if error.is_unique_violation_on("objects_version_uq") => {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        attempt,
+                        conflicting_version = next_version,
+                        "UpdateConfig: policy version conflict, retrying"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => {
+                    return Err(super::persistence_error_to_status(
+                        error,
+                        "persist policy revision",
+                    ));
+                }
+            }
+        }
+        committed.ok_or_else(|| {
+            Status::aborted(format!(
+                "UpdateConfig: gave up after {MERGE_RETRY_LIMIT} policy version conflict retries"
+            ))
+        })?
+    };
+    response_annotations = committed_annotations;
+
+    if backfill_policy.is_some() {
         info!(
             sandbox_id = %sandbox_id,
             "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
         );
     }
-
-    let latest = state
-        .store
-        .get_latest_policy(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
-
-    let payload = new_policy.encode_to_vec();
-    let hash = deterministic_policy_hash(&new_policy);
-
-    if let Some(ref current) = latest
-        && current.policy_hash == hash
-    {
-        return Ok(Response::new(UpdateConfigResponse {
-            version: u32::try_from(current.version).unwrap_or(0),
-            policy_hash: hash,
-            settings_revision: 0,
-            deleted: false,
-        }));
-    }
-
-    let next_version = latest.map_or(1, |r| r.version + 1);
-    let policy_id = uuid::Uuid::new_v4().to_string();
-
-    state
-        .store
-        .put_policy_revision(&policy_id, &sandbox_id, next_version, &payload, &hash)
-        .await
-        .map_err(|e| Status::internal(format!("persist policy revision failed: {e}")))?;
-
-    let _ = state
-        .store
-        .supersede_older_policies(&sandbox_id, next_version)
-        .await;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
 
@@ -1959,12 +2145,13 @@ async fn handle_update_config_inner(
     );
     emit_full_policy_update_success(sandbox_caller, next_version);
 
-    Ok(Response::new(UpdateConfigResponse {
-        version: u32::try_from(next_version).unwrap_or(0),
-        policy_hash: hash,
-        settings_revision: 0,
-        deleted: false,
-    }))
+    Ok(update_config_response(
+        u32::try_from(next_version).unwrap_or(0),
+        hash,
+        0,
+        false,
+        response_annotations,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2294,7 +2481,17 @@ pub(super) async fn handle_submit_policy_analysis(
     // case for the common single-chunk submission shape. If real workloads
     // surface a problem with batches that interact across chunks, the right
     // fix is to recompute baseline after each successful auto-approve.
-    let current_policy = current_effective_policy_for_sandbox(state, &sandbox, &sandbox_id).await?;
+    let provider_profile_catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let current_policy = current_effective_policy_for_sandbox(
+        state,
+        &provider_profile_catalog,
+        &sandbox,
+        &sandbox_id,
+    )
+    .await?;
 
     // Auto-approval is an opt-in behavior, sourced from the settings model
     // (sandbox or gateway scope) so it can be flipped on a running sandbox
@@ -2313,8 +2510,12 @@ pub(super) async fn handle_submit_policy_analysis(
         .as_ref()
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
-    let credential_set =
-        build_credential_set_for_sandbox(state.store.as_ref(), &provider_names_for_creds).await?;
+    let credential_set = build_credential_set_for_sandbox_with_catalog(
+        state.store.as_ref(),
+        &provider_profile_catalog,
+        &provider_names_for_creds,
+    )
+    .await?;
 
     let current_version = state
         .store
@@ -3291,6 +3492,7 @@ fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> San
         created_at_ms: record.created_at_ms,
         loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
         policy,
+        provenance: record.provenance.clone(),
     }
 }
 
@@ -3579,12 +3781,19 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
     }
 }
 
+struct AtomicPolicyWriteContext<'a> {
+    expected_resource_version: u64,
+    provenance: &'a HashMap<String, String>,
+    annotations: &'a HashMap<String, String>,
+}
+
 async fn apply_merge_operations_with_retry(
     store: &Store,
     sandbox_id: &str,
     baseline_policy: Option<&ProtoSandboxPolicy>,
     operations: &[PolicyMergeOp],
-) -> Result<(i64, String), Status> {
+    atomic_context: Option<&AtomicPolicyWriteContext<'_>>,
+) -> Result<(i64, String, Option<Sandbox>), Status> {
     for attempt in 1..=MERGE_RETRY_LIMIT {
         let latest = store
             .get_latest_policy(sandbox_id)
@@ -3609,26 +3818,48 @@ async fn apply_merge_operations_with_retry(
 
         if let Some(ref current) = latest
             && current.policy_hash == hash
+            && atomic_context.is_none_or(|context| current.provenance == *context.provenance)
         {
-            return Ok((current.version, hash));
+            return Ok((current.version, hash, None));
         }
 
         if latest.is_none() && !merged.changed {
-            return Ok((0, hash));
+            return Ok((0, hash, None));
         }
 
         let payload = new_policy.encode_to_vec();
         let next_version = latest.as_ref().map_or(1, |record| record.version + 1);
         let policy_id = uuid::Uuid::new_v4().to_string();
 
-        match store
-            .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
-            .await
-        {
-            Ok(()) => {
-                let _ = store
-                    .supersede_older_policies(sandbox_id, next_version)
-                    .await;
+        let write_result = if let Some(context) = atomic_context {
+            store
+                .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+                    id: policy_id,
+                    sandbox_id: sandbox_id.to_string(),
+                    version: next_version,
+                    policy_payload: payload,
+                    policy_hash: hash.clone(),
+                    provenance: context.provenance.clone(),
+                    expected_resource_version: context.expected_resource_version,
+                    annotations: context.annotations.clone(),
+                    backfill_policy: None,
+                })
+                .await
+                .map(Some)
+        } else {
+            store
+                .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
+                .await
+                .map(|()| None)
+        };
+
+        match write_result {
+            Ok(updated_sandbox) => {
+                if atomic_context.is_none() {
+                    let _ = store
+                        .supersede_older_policies(sandbox_id, next_version)
+                        .await;
+                }
 
                 if attempt > 1 {
                     info!(
@@ -3640,7 +3871,7 @@ async fn apply_merge_operations_with_retry(
                     );
                 }
 
-                return Ok((next_version, hash));
+                return Ok((next_version, hash, updated_sandbox));
             }
             Err(e) => {
                 if e.is_unique_violation_on("objects_version_uq") {
@@ -3678,7 +3909,9 @@ pub(super) async fn merge_chunk_into_policy(
         rule,
     }];
     validate_merge_operations_for_server(&operations)?;
-    apply_merge_operations_with_retry(store, sandbox_id, None, &operations).await
+    apply_merge_operations_with_retry(store, sandbox_id, None, &operations, None)
+        .await
+        .map(|(version, hash, _)| (version, hash))
 }
 
 async fn remove_chunk_from_policy(
@@ -3694,8 +3927,10 @@ async fn remove_chunk_from_policy(
             rule_name: chunk.rule_name.clone(),
             binary_path: chunk.binary.clone(),
         }],
+        None,
     )
     .await
+    .map(|(version, hash, _)| (version, hash))
 }
 
 // ---------------------------------------------------------------------------
@@ -3989,6 +4224,7 @@ mod tests {
     use crate::persistence::test_store;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tonic::Code;
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
@@ -4140,6 +4376,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -4173,6 +4410,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4205,6 +4443,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -4240,6 +4479,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -4327,6 +4567,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4407,6 +4648,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4433,6 +4675,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once(("GITHUB_TOKEN".to_string(), "ghp-test".to_string()))
@@ -4476,6 +4719,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(policy),
@@ -4518,6 +4762,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_paths_use_one_provider_profile_snapshot() {
+        use openshell_core::proto::{
+            ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
+            ProviderProfileCredential,
+        };
+
+        fn snapshot_profile(
+            id: &str,
+            host: &str,
+            credential_env: &str,
+            token_endpoint: &str,
+        ) -> ProviderProfile {
+            ProviderProfile {
+                id: id.to_string(),
+                display_name: id.to_string(),
+                category: ProviderProfileCategory::Other as i32,
+                credentials: vec![ProviderProfileCredential {
+                    name: "access_token".to_string(),
+                    env_vars: vec![credential_env.to_string()],
+                    auth_style: "bearer".to_string(),
+                    header_name: "authorization".to_string(),
+                    token_grant: Some(ProviderCredentialTokenGrant {
+                        token_endpoint: token_endpoint.to_string(),
+                        audience: "api://snapshot-test".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                endpoints: vec![NetworkEndpoint {
+                    host: host.to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+
+        let fetch_count = Arc::new(AtomicUsize::new(0));
+        let state = test_server_state().await;
+        let mut state = Arc::into_inner(state).expect("test state should be uniquely owned");
+        state.provider_profile_sources = ProviderProfileSources::from_test_snapshot_sequence(
+            vec![
+                (
+                    "revision-a".to_string(),
+                    vec![
+                        snapshot_profile(
+                            "moving-a",
+                            "one.revision-a.example",
+                            "TOKEN_A",
+                            "https://auth.revision-a.example/token-a",
+                        ),
+                        snapshot_profile(
+                            "moving-b",
+                            "two.revision-a.example",
+                            "TOKEN_B",
+                            "https://auth.revision-a.example/token-b",
+                        ),
+                    ],
+                ),
+                (
+                    "revision-b".to_string(),
+                    vec![
+                        snapshot_profile(
+                            "moving-a",
+                            "one.revision-b.example",
+                            "TOKEN_A",
+                            "https://auth.revision-b.example/token-a",
+                        ),
+                        snapshot_profile(
+                            "moving-b",
+                            "two.revision-b.example",
+                            "TOKEN_B",
+                            "https://auth.revision-b.example/token-b",
+                        ),
+                    ],
+                ),
+            ],
+            Arc::clone(&fetch_count),
+        );
+        let state = Arc::new(state);
+        enable_providers_v2(&state).await;
+
+        let mut provider_a = test_provider("provider-a", "moving-a");
+        provider_a.credentials = HashMap::from([("TOKEN_A".to_string(), "a".to_string())]);
+        let mut provider_b = test_provider("provider-b", "moving-b");
+        provider_b.credentials = HashMap::from([("TOKEN_B".to_string(), "b".to_string())]);
+        state.store.put_message(&provider_a).await.unwrap();
+        state.store.put_message(&provider_b).await.unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-snapshot-consistency",
+                "snapshot-consistency",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["provider-a".to_string(), "provider-b".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let first = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-snapshot-consistency".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+        let first_policy = first.policy.unwrap();
+        assert!(first_policy.network_policies.values().any(|rule| {
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "one.revision-a.example")
+        }));
+        assert!(first_policy.network_policies.values().any(|rule| {
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "two.revision-a.example")
+        }));
+
+        let second = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-snapshot-consistency".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
+        assert_ne!(first.provider_env_revision, second.provider_env_revision);
+        let second_policy = second.policy.unwrap();
+        assert!(second_policy.network_policies.values().any(|rule| {
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "one.revision-b.example")
+        }));
+        assert!(!second_policy.network_policies.values().any(|rule| {
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "one.revision-a.example")
+        }));
+
+        let environment = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-snapshot-consistency".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            environment.provider_env_revision,
+            second.provider_env_revision
+        );
+        assert_eq!(environment.dynamic_credentials.len(), 2);
+        assert!(environment.dynamic_credentials.values().all(|credential| {
+            credential
+                .token_grant
+                .as_ref()
+                .is_some_and(|grant| grant.token_endpoint.contains("revision-b"))
+        }));
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: "snapshot-consistency".to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "snapshot_consistency_test".to_string(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        name: "snapshot_consistency_test".to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "proposal.example.com".to_string(),
+                            port: 443,
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                            ..Default::default()
+                        }],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetch_count.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
     async fn provider_policy_layers_skip_unknown_provider_types() {
         let store = test_store().await;
         store
@@ -4533,7 +4973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_policy_layers_skip_custom_profile_for_legacy_provider_type() {
+    async fn provider_policy_layers_resolve_user_profile_for_normalized_provider_type() {
         let store = test_store().await;
         store
             .put_message(&test_provider("custom-provider", "generic"))
@@ -4547,10 +4987,12 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "generic".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Generic Override".to_string(),
                     description: String::new(),
                     category: openshell_core::proto::ProviderProfileCategory::Other as i32,
@@ -4572,7 +5014,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(layers.is_empty());
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rule.endpoints[0].host, "backdoor.example");
     }
 
     #[tokio::test]
@@ -4591,10 +5034,12 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Custom API".to_string(),
                     description: String::new(),
                     category: openshell_core::proto::ProviderProfileCategory::Other as i32,
@@ -4656,10 +5101,12 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Custom API".to_string(),
                     description: String::new(),
                     category: openshell_core::proto::ProviderProfileCategory::Other as i32,
@@ -4840,6 +5287,7 @@ mod tests {
                 name: "tls-skip".to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                annotations: HashMap::new(),
                 resource_version: 0,
             }),
             profile: Some(ProviderProfile {
@@ -4998,10 +5446,12 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-policy".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Custom Policy".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other as i32,
@@ -5282,10 +5732,12 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-token".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Custom Token".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other as i32,
@@ -5506,6 +5958,7 @@ mod tests {
                     profile: Some(ProviderProfile {
                         id: "custom-api".to_string(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                         display_name: "Custom API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Other as i32,
@@ -5683,6 +6136,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(sandbox_policy),
@@ -5772,6 +6226,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -5876,6 +6331,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -6091,6 +6547,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -6187,6 +6644,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6302,6 +6760,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6505,6 +6964,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6602,6 +7062,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6707,6 +7168,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6800,6 +7262,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6885,6 +7348,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6972,6 +7436,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -7059,6 +7524,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -7151,6 +7617,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -7325,6 +7792,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -7421,6 +7889,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -7506,6 +7975,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -7600,10 +8070,12 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-api".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Custom API".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other as i32,
@@ -7638,6 +8110,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -7760,6 +8233,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -7946,6 +8420,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -8060,6 +8535,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -8164,6 +8640,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -8423,6 +8900,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -8537,6 +9015,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -8553,6 +9032,7 @@ mod tests {
                 created_at_ms: 1_000_001,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -9156,8 +9636,8 @@ mod tests {
         }];
 
         let (left, right) = tokio::join!(
-            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_allow),
-            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_deny),
+            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_allow, None),
+            apply_merge_operations_with_retry(&store, sandbox_id, None, &add_deny, None),
         );
 
         let mut versions = vec![left.unwrap().0, right.unwrap().0];
@@ -10199,6 +10679,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None, // No policy yet - will be backfilled
@@ -10233,6 +10714,7 @@ mod tests {
                 global: false,
                 merge_operations: vec![],
                 expected_resource_version: current_version,
+                annotations: HashMap::new(),
             }),
         )
         .await
@@ -10258,6 +10740,561 @@ mod tests {
             updated_sandbox.spec.as_ref().unwrap().policy.is_some(),
             "policy should be backfilled"
         );
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_persists_and_returns_annotations() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-annotated-backfill".to_string(),
+                name: "annotated-backfill".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::from([(
+                    "openshell.nvidia.com/existing".to_string(),
+                    "keep".to_string(),
+                )]),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("annotated-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+        let annotations = HashMap::from([
+            (
+                "openshell.nvidia.com/policy-signature".to_string(),
+                "signed-policy".to_string(),
+            ),
+            (
+                "openshell.nvidia.com/policy-provenance".to_string(),
+                "governance-interceptor".to_string(),
+            ),
+        ]);
+
+        let response = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                name: "annotated-backfill".to_string(),
+                policy: Some(ProtoSandboxPolicy::default()),
+                setting_key: String::new(),
+                setting_value: None,
+                delete_setting: false,
+                global: false,
+                merge_operations: vec![],
+                expected_resource_version: current_version,
+                annotations: annotations.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.version, 1);
+        assert_eq!(
+            response.annotations.get("openshell.nvidia.com/existing"),
+            Some(&"keep".to_string())
+        );
+        for (key, value) in &annotations {
+            assert_eq!(response.annotations.get(key), Some(value));
+        }
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("annotated-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_annotations = &stored.metadata.as_ref().unwrap().annotations;
+        assert_eq!(
+            stored_annotations.get("openshell.nvidia.com/existing"),
+            Some(&"keep".to_string())
+        );
+        for (key, value) in &annotations {
+            assert_eq!(stored_annotations.get(key), Some(value));
+        }
+        assert!(
+            stored.spec.as_ref().unwrap().policy.is_some(),
+            "policy should still be backfilled"
+        );
+        let revision = state
+            .store
+            .get_latest_policy("sb-annotated-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision.provenance, annotations);
+    }
+
+    #[tokio::test]
+    async fn update_config_same_policy_hash_with_new_provenance_creates_revision() {
+        let state = test_server_state().await;
+        let mut policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut policy);
+        let hash = deterministic_policy_hash(&policy);
+        let sandbox = test_sandbox("sb-same-hash", "same-hash", policy.clone(), Vec::new());
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "policy-same-hash-v1",
+                "sb-same-hash",
+                1,
+                &policy.encode_to_vec(),
+                &hash,
+            )
+            .await
+            .unwrap();
+
+        let response = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                name: "same-hash".to_string(),
+                policy: Some(policy),
+                annotations: HashMap::from([(
+                    "openshell.nvidia.com/policy-signature".to_string(),
+                    "same-hash-signature".to_string(),
+                )]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.version, 2);
+        assert_eq!(
+            response
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("same-hash-signature")
+        );
+
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("same-hash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("same-hash-signature")
+        );
+        let latest = state
+            .store
+            .get_latest_policy("sb-same-hash")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.version, 2);
+        assert_eq!(
+            latest.provenance,
+            HashMap::from([(
+                "openshell.nvidia.com/policy-signature".to_string(),
+                "same-hash-signature".to_string(),
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_same_policy_and_provenance_is_idempotent() {
+        let state = test_server_state().await;
+        let mut policy = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut policy);
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-idempotent-provenance",
+                "idempotent-provenance",
+                policy.clone(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let annotations = HashMap::from([(
+            "openshell.nvidia.com/policy-signature".to_string(),
+            "same-signature".to_string(),
+        )]);
+
+        let first = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "idempotent-provenance".to_string(),
+                policy: Some(policy.clone()),
+                annotations: annotations.clone(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let second = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "idempotent-provenance".to_string(),
+                policy: Some(policy),
+                annotations: annotations.clone(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(first.version, 1);
+        assert_eq!(second.version, 1);
+        assert_eq!(second.annotations, annotations);
+        let revisions = state
+            .store
+            .list_policies("sb-idempotent-provenance", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert_eq!(revisions[0].provenance, annotations);
+    }
+
+    #[tokio::test]
+    async fn update_config_full_policy_empty_annotations_preserves_existing_annotations() {
+        let state = test_server_state().await;
+        let mut baseline = test_policy_with_rule("sandbox_only", "old.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut baseline);
+        let mut sandbox = test_sandbox(
+            "sb-preserve-full",
+            "preserve-full",
+            baseline.clone(),
+            Vec::new(),
+        );
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            "openshell.nvidia.com/policy-signature".to_string(),
+            "keep".to_string(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "policy-preserve-full-v1",
+                "sb-preserve-full",
+                1,
+                &baseline.encode_to_vec(),
+                &deterministic_policy_hash(&baseline),
+            )
+            .await
+            .unwrap();
+
+        let mut updated = test_policy_with_rule("sandbox_only", "new.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut updated);
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "preserve-full".to_string(),
+                policy: Some(updated),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("keep")
+        );
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("preserve-full")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("keep")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_merge_empty_annotations_preserves_existing_annotations() {
+        let state = test_server_state().await;
+        let mut baseline = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut baseline);
+        let mut sandbox = test_sandbox("sb-preserve-merge", "preserve-merge", baseline, Vec::new());
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            "openshell.nvidia.com/policy-provenance".to_string(),
+            "keep".to_string(),
+        );
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "preserve-merge".to_string(),
+                merge_operations: vec![PolicyMergeOperation {
+                    operation: Some(policy_merge_operation::Operation::AddRule(
+                        openshell_core::proto::AddNetworkRule {
+                            rule_name: "allow_api_example".to_string(),
+                            rule: Some(NetworkPolicyRule {
+                                name: "allow_api_example".to_string(),
+                                endpoints: vec![NetworkEndpoint {
+                                    host: "api.example.com".to_string(),
+                                    port: 443,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }),
+                        },
+                    )),
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response
+                .annotations
+                .get("openshell.nvidia.com/policy-provenance")
+                .map(String::as_str),
+            Some("keep")
+        );
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("preserve-merge")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get("openshell.nvidia.com/policy-provenance")
+                .map(String::as_str),
+            Some("keep")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_merge_stores_revision_provenance_atomically() {
+        let state = test_server_state().await;
+        let mut baseline = test_policy_with_rule("sandbox_only", "sandbox.example.com");
+        openshell_policy::ensure_sandbox_process_identity(&mut baseline);
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-merge-provenance",
+                "merge-provenance",
+                baseline,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let provenance = HashMap::from([(
+            "openshell.nvidia.com/policy-signature".to_string(),
+            "merge-signature".to_string(),
+        )]);
+
+        let response = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "merge-provenance".to_string(),
+                merge_operations: vec![PolicyMergeOperation {
+                    operation: Some(policy_merge_operation::Operation::AddRule(
+                        openshell_core::proto::AddNetworkRule {
+                            rule_name: "allow_api_example".to_string(),
+                            rule: Some(NetworkPolicyRule {
+                                name: "allow_api_example".to_string(),
+                                endpoints: vec![NetworkEndpoint {
+                                    host: "api.example.com".to_string(),
+                                    port: 443,
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }),
+                        },
+                    )),
+                }],
+                annotations: provenance.clone(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.version, 1);
+        assert_eq!(response.annotations, provenance);
+        let revision = state
+            .store
+            .get_latest_policy("sb-merge-provenance")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(revision.provenance, provenance);
+    }
+
+    #[tokio::test]
+    async fn update_config_backfill_empty_annotations_preserves_existing_annotations() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-preserve-backfill".to_string(),
+                name: "preserve-backfill".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::from([(
+                    "openshell.nvidia.com/policy-signature".to_string(),
+                    "keep".to_string(),
+                )]),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("preserve-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        let response = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                name: "preserve-backfill".to_string(),
+                policy: Some(ProtoSandboxPolicy::default()),
+                expected_resource_version: current_version,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("keep")
+        );
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("preserve-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored
+                .metadata
+                .as_ref()
+                .unwrap()
+                .annotations
+                .get("openshell.nvidia.com/policy-signature")
+                .map(String::as_str),
+            Some("keep")
+        );
+        assert!(
+            stored.spec.as_ref().unwrap().policy.is_some(),
+            "policy should still be backfilled"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_global_rejects_annotations() {
+        let state = test_server_state().await;
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+                setting_value: Some(SettingValue {
+                    value: Some(setting_value::Value::StringValue("auto".to_string())),
+                }),
+                annotations: HashMap::from([(
+                    "openshell.nvidia.com/policy-signature".to_string(),
+                    "global".to_string(),
+                )]),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("sandbox-scoped"));
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_invalid_annotations() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-invalid-annotation",
+                "invalid-annotation",
+                ProtoSandboxPolicy::default(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "invalid-annotation".to_string(),
+                policy: Some(ProtoSandboxPolicy::default()),
+                annotations: HashMap::from([("bad key".to_string(), "value".to_string())]),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("label key"));
     }
 
     #[tokio::test]
@@ -10305,6 +11342,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -10408,6 +11446,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -10442,6 +11481,7 @@ mod tests {
                 global: false,
                 merge_operations: vec![],
                 expected_resource_version: 99, // stale version
+                annotations: HashMap::new(),
             }),
         )
         .await
@@ -10472,6 +11512,15 @@ mod tests {
             unchanged.spec.as_ref().unwrap().policy.is_none(),
             "policy should still be None after failed backfill"
         );
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "failed backfill must not leave an orphan revision"
+        );
     }
 
     #[tokio::test]
@@ -10489,6 +11538,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -10527,6 +11577,7 @@ mod tests {
                         global: false,
                         merge_operations: vec![],
                         expected_resource_version: initial_version,
+                        annotations: HashMap::new(),
                     }),
                 )
                 .await
@@ -10570,6 +11621,16 @@ mod tests {
         assert!(
             final_sandbox.spec.as_ref().unwrap().policy.is_some(),
             "policy should be backfilled after one success"
+        );
+        assert_eq!(
+            state
+                .store
+                .list_policies("sb-1", 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "concurrent backfills must create exactly one revision"
         );
     }
 }

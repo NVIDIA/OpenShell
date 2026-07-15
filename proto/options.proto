@@ -1,0 +1,14 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.options.v1;
+
+import "google/protobuf/descriptor.proto";
+
+// Marks a protobuf field whose value must not cross generic observation or
+// extension boundaries such as gateway interceptors.
+extend google.protobuf.FieldOptions {
+  bool secret = 50001;
+}

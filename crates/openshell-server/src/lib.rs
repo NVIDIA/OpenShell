@@ -36,6 +36,7 @@ mod middleware;
 mod multiplex;
 mod persistence;
 pub(crate) mod policy_store;
+mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
 mod sandbox_index;
@@ -152,6 +153,14 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+
+    /// Immutable gateway interceptor execution plan. `None` when disabled.
+    pub(crate) gateway_interceptors:
+        Option<openshell_gateway_interceptors::GatewayInterceptorRuntime>,
+
+    /// Gateway-local provider profile sources. User-imported profiles are read
+    /// on demand when the user source is configured.
+    pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -203,6 +212,9 @@ impl ServerState {
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
             grpc_rate_limiter,
+            gateway_interceptors: None,
+            provider_profile_sources:
+                provider_profile_sources::ProviderProfileSources::with_default_sources(),
         }
     }
 }
@@ -289,6 +301,25 @@ pub(crate) async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
+    let gateway_interceptors =
+        openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone())
+            .await
+            .map_err(|e| {
+                Error::config(format!("gateway interceptor initialization failed: {e}"))
+            })?;
+    let provider_profile_sources = provider_profile_sources::ProviderProfileSources::from_config(
+        &config.provider_profile_sources,
+        gateway_interceptors.as_ref(),
+    )
+    .map_err(|err| {
+        Error::config(format!(
+            "provider profile source configuration failed: {err}"
+        ))
+    })?;
+    info!(
+        sources = ?provider_profile_sources.source_ids(),
+        "provider profile sources configured"
+    );
     let mut state = ServerState::new(
         config.clone(),
         store.clone(),
@@ -300,6 +331,8 @@ pub(crate) async fn run_server(
         oidc_cache,
     );
     state.middleware_registry = middleware_registry;
+    state.gateway_interceptors = gateway_interceptors;
+    state.provider_profile_sources = provider_profile_sources;
 
     // Load the gateway-minted sandbox JWT signing key when configured.
     // Optional so single-driver dev deployments without certgen continue

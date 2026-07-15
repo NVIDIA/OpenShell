@@ -575,6 +575,8 @@ pub struct App {
     pub sandbox_notes: Vec<String>,
     /// Formatted labels for each sandbox (e.g., "env=prod,team=platform" or empty string).
     pub sandbox_labels: Vec<String>,
+    /// Formatted annotations for each sandbox (e.g., "policy-signature=abc" or empty string).
+    pub sandbox_annotations: Vec<String>,
     pub sandbox_policy_versions: Vec<u32>,
     pub sandbox_selected: usize,
     pub sandbox_count: usize,
@@ -687,6 +689,11 @@ pub fn format_labels(labels: &HashMap<String, String>) -> String {
         .map(|(k, v)| format!("{}={}", sanitize_for_display(k), sanitize_for_display(v)))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Format object annotations as a comma-separated key=value string.
+pub fn format_annotations(annotations: &HashMap<String, String>) -> String {
+    format_labels(annotations)
 }
 
 pub fn provider_name(provider: &openshell_core::proto::Provider) -> &str {
@@ -903,6 +910,7 @@ impl App {
             sandbox_images: Vec::new(),
             sandbox_notes: Vec::new(),
             sandbox_labels: Vec::new(),
+            sandbox_annotations: Vec::new(),
             sandbox_policy_versions: Vec::new(),
             sandbox_selected: 0,
             sandbox_count: 0,
@@ -2765,6 +2773,7 @@ impl App {
         self.sandbox_images.clear();
         self.sandbox_notes.clear();
         self.sandbox_labels.clear();
+        self.sandbox_annotations.clear();
         self.sandbox_policy_versions.clear();
         self.sandbox_selected = 0;
         self.sandbox_count = 0;

@@ -20,6 +20,7 @@ openshell-core = { path = "../openshell-core", default-features = false }
 openshell-driver-docker = { path = "../openshell-driver-docker" }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
 openshell-driver-podman = { path = "../openshell-driver-podman" }
+openshell-gateway-interceptors = { path = "../openshell-gateway-interceptors" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-prover = { path = "../openshell-prover" }

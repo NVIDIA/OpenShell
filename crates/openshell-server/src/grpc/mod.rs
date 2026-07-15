@@ -115,6 +115,8 @@ const MAX_MAP_VALUE_LEN: usize = 8192;
 const MAX_TEMPLATE_STRING_LEN: usize = 1024;
 /// Maximum number of entries in template map fields.
 const MAX_TEMPLATE_MAP_ENTRIES: usize = 128;
+/// Maximum number of entries in metadata annotations.
+const MAX_METADATA_ANNOTATIONS_ENTRIES: usize = 128;
 /// Maximum serialized size (bytes) for template Struct fields.
 const MAX_TEMPLATE_STRUCT_SIZE: usize = 65_536;
 /// Maximum serialized size (bytes) for the policy field.
