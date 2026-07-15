@@ -68,8 +68,8 @@ path = "tests/vm_gateway_resume.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
-name = "readyz_health"
-path = "tests/readyz_health.rs"
+name = "kubernetes_ha_rebalancing"
+path = "tests/kubernetes_ha_rebalancing.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]

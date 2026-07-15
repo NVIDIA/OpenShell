@@ -33,14 +33,14 @@ use openshell_core::proto::{
     ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ListServicesRequest,
-    ListServicesResponse, ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest,
-    PushSandboxLogsResponse, RefreshSandboxTokenRequest, RefreshSandboxTokenResponse,
-    RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    ListServicesResponse, PeerRelayFrame, ProviderProfileResponse, ProviderResponse,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, RotateProviderCredentialRequest, RotateProviderCredentialResponse,
+    SandboxResponse, SandboxStreamEvent, ServiceEndpointResponse, ServiceStatus,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame,
+    UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
 };
@@ -668,6 +668,17 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
         crate::supervisor_session::handle_relay_stream(&self.state.supervisor_sessions, request)
             .await
+    }
+
+    type PeerRelayStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send + 'static>>;
+
+    #[rpc_auth(auth = "peer")]
+    async fn peer_relay(
+        &self,
+        request: Request<tonic::Streaming<PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
+        crate::supervisor_session::handle_peer_relay(&self.state, request).await
     }
 }
 

@@ -426,13 +426,16 @@ where
 /// Assemble the authenticator chain for the gateway.
 ///
 /// Chain order (first-match-wins):
-/// 1. `K8sServiceAccountAuthenticator` (path-scoped to `IssueSandboxToken`)
+/// 1. `PeerServiceAccountAuthenticator` (path-scoped to `PeerRelay`)
+///    — validates gateway replica projected `ServiceAccount` tokens with
+///    `TokenReview` for internal peer relay calls. No-op on every other path.
+/// 2. `K8sServiceAccountAuthenticator` (path-scoped to `IssueSandboxToken`)
 ///    — exchanges a projected SA token for a `Principal::Sandbox` so the
 ///    `IssueSandboxToken` handler can mint a gateway JWT. No-op on every
 ///    other path; only present when the gateway runs in-cluster.
-/// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
+/// 3. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
-/// 3. `OidcAuthenticator` — validates user Bearer tokens against the
+/// 4. `OidcAuthenticator` — validates user Bearer tokens against the
 ///    configured OIDC issuer. Returns `Unauthenticated` for missing
 ///    Bearer headers so non-OIDC clients can't sneak through.
 ///
@@ -447,6 +450,9 @@ where
 /// to pass-through unless mTLS or local unauthenticated users are enabled.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
+    if let Some(peer) = state.peer_authenticator.clone() {
+        authenticators.push(peer);
+    }
     if let Some(k8s) = state.k8s_sa_authenticator.clone() {
         authenticators.push(k8s);
     }
@@ -610,6 +616,13 @@ where
                     if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
                         return Ok(status_response(tonic::Status::permission_denied(
                             "sandbox principals may not call this method",
+                        )));
+                    }
+                }
+                Principal::Peer(_) => {
+                    if !crate::auth::method_authz::is_peer_callable(&path) {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "gateway peer principals may not call this method",
                         )));
                     }
                 }

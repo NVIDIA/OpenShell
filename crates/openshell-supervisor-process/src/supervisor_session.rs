@@ -255,6 +255,7 @@ async fn run_session_loop(
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
+    let instance_id = uuid::Uuid::new_v4().to_string();
 
     loop {
         attempt += 1;
@@ -265,6 +266,8 @@ async fn run_session_loop(
             &ssh_socket_path,
             netns_fd,
             expected_ssh_peer_pid,
+            &instance_id,
+            attempt,
         )
         .await
         {
@@ -295,6 +298,8 @@ async fn run_single_session(
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
     expected_ssh_peer_pid: Option<u32>,
+    instance_id: &str,
+    connection_epoch: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -310,11 +315,11 @@ async fn run_single_session(
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
 
     // Send hello as the first message.
-    let instance_id = uuid::Uuid::new_v4().to_string();
     tx.send(SupervisorMessage {
         payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
             sandbox_id: sandbox_id.to_string(),
-            instance_id: instance_id.clone(),
+            instance_id: instance_id.to_string(),
+            connection_epoch,
         })),
     })
     .await

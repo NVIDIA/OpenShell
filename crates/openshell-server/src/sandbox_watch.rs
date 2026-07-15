@@ -3,11 +3,15 @@
 
 //! In-memory buses to support sandbox watch streaming.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tonic::Status;
+
+use crate::persistence::Store;
+use openshell_core::proto::Sandbox;
 
 /// Broadcast bus of sandbox updates keyed by sandbox id.
 ///
@@ -57,6 +61,71 @@ impl SandboxWatchBus {
         let mut inner = self.inner.lock().expect("sandbox watch bus lock poisoned");
         inner.remove(sandbox_id);
     }
+
+    fn active_sandbox_ids(&self) -> HashSet<String> {
+        self.inner
+            .lock()
+            .expect("sandbox watch bus lock poisoned")
+            .iter()
+            .filter(|(_, sender)| sender.receiver_count() > 0)
+            .map(|(sandbox_id, _)| sandbox_id.clone())
+            .collect()
+    }
+}
+
+/// Poll persisted sandbox resource versions once per gateway and notify the
+/// existing in-memory watch bus when another replica changes a record.
+///
+/// The poller performs at most one lookup per actively watched sandbox per
+/// interval, regardless of how many clients are watching that sandbox.
+pub fn spawn_store_poller(
+    store: Arc<Store>,
+    bus: SandboxWatchBus,
+    interval: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut known_versions: HashMap<String, Option<u64>> = HashMap::new();
+        let mut timer = tokio::time::interval(interval);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = timer.tick() => {
+                    let active = bus.active_sandbox_ids();
+                    known_versions.retain(|sandbox_id, _| active.contains(sandbox_id));
+
+                    for sandbox_id in active {
+                        let current = match store.get_message::<Sandbox>(&sandbox_id).await {
+                            Ok(sandbox) => sandbox.map(|sandbox| {
+                                sandbox.metadata.as_ref().map_or(0, |metadata| metadata.resource_version)
+                            }),
+                            Err(err) => {
+                                tracing::warn!(
+                                    sandbox_id,
+                                    error = %err,
+                                    "sandbox watch poller: failed to read persisted sandbox"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let changed = known_versions
+                            .insert(sandbox_id.clone(), current)
+                            .is_none_or(|previous| previous != current);
+                        if changed {
+                            bus.notify(&sandbox_id);
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Helper to translate broadcast lag into a gRPC status.
@@ -72,6 +141,7 @@ pub fn broadcast_to_status(err: broadcast::error::RecvError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
 
     #[test]
     fn sandbox_watch_bus_remove_cleans_up() {
@@ -113,5 +183,42 @@ mod tests {
         let bus = SandboxWatchBus::new();
         // Should not panic
         bus.remove("nonexistent");
+    }
+
+    #[tokio::test]
+    async fn shared_store_poller_notifies_remote_resource_version_change() {
+        let store = Arc::new(crate::persistence::test_store().await);
+        let bus = SandboxWatchBus::new();
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        store.put_message(&sandbox).await.unwrap();
+
+        let mut rx = bus.subscribe("sb-1");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        spawn_store_poller(store.clone(), bus, Duration::from_millis(10), shutdown_rx);
+
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("poller should publish its initial observation")
+            .unwrap();
+
+        store
+            .update_message_cas::<Sandbox, _>("sb-1", 0, |stored| {
+                stored.set_phase(1);
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("poller should observe a remote store update")
+            .unwrap();
+
+        shutdown_tx.send(true).unwrap();
     }
 }

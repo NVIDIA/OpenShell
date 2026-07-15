@@ -638,9 +638,17 @@ pub(super) async fn handle_watch_sandbox(
             None
         };
 
+        let mut last_sandbox_resource_version: Option<u64>;
+
         // Re-read the snapshot now that we have subscriptions active.
         match state.store.get_message::<Sandbox>(&sandbox_id).await {
             Ok(Some(sandbox)) => {
+                last_sandbox_resource_version = Some(
+                    sandbox
+                        .metadata
+                        .as_ref()
+                        .map_or(0, |metadata| metadata.resource_version),
+                );
                 state.sandbox_index.update_from_sandbox(&sandbox);
                 let _ = tx
                     .send(Ok(SandboxStreamEvent {
@@ -719,6 +727,14 @@ pub(super) async fn handle_watch_sandbox(
                         Ok(()) => {
                             match state.store.get_message::<Sandbox>(&sandbox_id).await {
                                 Ok(Some(sandbox)) => {
+                                    let resource_version = sandbox
+                                        .metadata
+                                        .as_ref()
+                                        .map_or(0, |metadata| metadata.resource_version);
+                                    if last_sandbox_resource_version == Some(resource_version) {
+                                        continue;
+                                    }
+                                    last_sandbox_resource_version = Some(resource_version);
                                     state.sandbox_index.update_from_sandbox(&sandbox);
                                     if tx.send(Ok(SandboxStreamEvent { payload: Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(sandbox.clone()))})).await.is_err() {
                                         return;
@@ -834,11 +850,15 @@ pub(super) async fn handle_exec_sandbox(
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
     // while still failing quickly during normal operation.
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
+        state,
+        sandbox.object_id(),
+        relay_open::Target::Ssh(SshRelayTarget {}),
+        String::new(),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -946,16 +966,15 @@ pub(super) async fn handle_forward_tcp(
     }
 
     let connection_guard = acquire_forward_connection_guard(state, &init, &sandbox).await?;
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay_with_target(
-            sandbox.object_id(),
-            target,
-            init.service_id.clone(),
-            std::time::Duration::from_secs(15),
-        )
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
+        state,
+        sandbox.object_id(),
+        target,
+        init.service_id.clone(),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
     let sandbox_id = sandbox.object_id().to_string();
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
@@ -1274,11 +1293,15 @@ pub(super) async fn handle_exec_sandbox_interactive(
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    let (channel_id, relay_rx) = crate::supervisor_session::open_routed_relay_with_target(
+        state,
+        sandbox.object_id(),
+        relay_open::Target::Ssh(SshRelayTarget {}),
+        String::new(),
+        std::time::Duration::from_secs(15),
+    )
+    .await
+    .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
@@ -2008,6 +2031,7 @@ mod tests {
     use crate::grpc::test_support::test_server_state;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use std::collections::HashMap;
+    use tokio_stream::StreamExt;
 
     // ---- shell_escape ----
 
@@ -2335,6 +2359,79 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(7);
         sandbox
+    }
+
+    #[tokio::test]
+    async fn watch_sandbox_observes_shared_store_poller_notification() {
+        let state = test_server_state().await;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        crate::sandbox_watch::spawn_store_poller(
+            state.store.clone(),
+            state.sandbox_watch_bus.clone(),
+            std::time::Duration::from_millis(10),
+            shutdown_rx,
+        );
+        let mut sandbox = test_sandbox("watch-poll", Vec::new());
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        let sandbox_id = sandbox.object_id().to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let response = handle_watch_sandbox(
+            &state,
+            Request::new(WatchSandboxRequest {
+                id: sandbox_id.clone(),
+                follow_status: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let mut stream = response.into_inner();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("initial watch snapshot should arrive")
+            .expect("stream should remain open")
+            .expect("initial watch snapshot should be ok");
+        let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(first)) =
+            first.payload
+        else {
+            panic!("expected initial sandbox snapshot");
+        };
+        assert_eq!(
+            SandboxPhase::try_from(first.phase()).ok(),
+            Some(SandboxPhase::Provisioning)
+        );
+
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(&sandbox_id, 0, |sandbox| {
+                sandbox.set_phase(SandboxPhase::Ready as i32);
+            })
+            .await
+            .unwrap();
+
+        let ready =
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let event = stream
+                        .next()
+                        .await
+                        .expect("stream should remain open")
+                        .expect("watch event should be ok");
+                    if let Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(
+                        sandbox,
+                    )) = event.payload
+                        && SandboxPhase::try_from(sandbox.phase()).ok() == Some(SandboxPhase::Ready)
+                    {
+                        break sandbox;
+                    }
+                }
+            })
+            .await
+            .expect("watch should observe cross-replica store update by polling");
+
+        assert_eq!(ready.object_id(), sandbox_id);
     }
 
     #[tokio::test]

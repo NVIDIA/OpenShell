@@ -15,3 +15,24 @@ metadata:
   name: eg
 spec:
   controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+# OpenShell gRPC streams can remain active across sandbox create, exec, relay,
+# and watch operations. Disable Envoy's backend request and stream duration
+# timeouts for the OpenShell GRPCRoute so the proxy does not reset long-running
+# HTTP/2 streams while gateway pods rotate behind it.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: openshell-grpc-timeouts
+  namespace: openshell
+  labels:
+    app.kubernetes.io/name: openshell
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+      name: openshell
+  timeout:
+    http:
+      requestTimeout: 0s
+      maxStreamDuration: 0s

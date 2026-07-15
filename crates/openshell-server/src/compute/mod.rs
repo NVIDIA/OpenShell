@@ -16,6 +16,7 @@ use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::persistence::{ObjectId, ObjectName, ObjectRecord, ObjectType, Store, WriteCondition};
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
+use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
@@ -1134,24 +1135,21 @@ impl ComputeRuntime {
             use crate::persistence::WriteCondition;
             let now_ms = openshell_core::time::now_ms();
 
-            let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+            let session_connected = self.supervisor_session_ready(&incoming.id).await?;
             let mut phase = derive_phase(incoming.status.as_ref());
             let sandbox_name = incoming.name.clone();
-
-            let supervisor_promoted = session_connected
-                && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
-            if supervisor_promoted {
-                phase = SandboxPhase::Ready;
-            }
 
             let mut status = incoming
                 .status
                 .as_ref()
                 .map(|s| public_status_from_driver(s, phase, 0));
             rewrite_user_facing_conditions(&mut status, None);
-            if supervisor_promoted {
-                ensure_supervisor_ready_status(&mut status, &sandbox_name);
-            }
+            gate_phase_on_supervisor_session(
+                &mut phase,
+                &mut status,
+                &sandbox_name,
+                session_connected,
+            );
             let mut sandbox = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: incoming.id.clone(),
@@ -1192,7 +1190,7 @@ impl ComputeRuntime {
         }
 
         // Single-attempt CAS: on conflict, the next watch event will naturally retry
-        let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+        let session_connected = self.supervisor_session_ready(&incoming.id).await?;
         let sandbox_name = incoming.name.clone();
 
         let sandbox = self
@@ -1204,11 +1202,6 @@ impl ComputeRuntime {
                     .status
                     .as_ref()
                     .map_or(old_phase, |status| derive_phase(Some(status)));
-                let supervisor_promoted = session_connected
-                    && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
-                if supervisor_promoted {
-                    phase = SandboxPhase::Ready;
-                }
 
                 let cpv = sandbox.current_policy_version();
                 let mut status = incoming
@@ -1217,9 +1210,12 @@ impl ComputeRuntime {
                     .map(|s| public_status_from_driver(s, phase, cpv))
                     .or_else(|| sandbox.status.clone());
                 rewrite_user_facing_conditions(&mut status, sandbox.spec.as_ref());
-                if supervisor_promoted {
-                    ensure_supervisor_ready_status(&mut status, &sandbox_name);
-                }
+                gate_phase_on_supervisor_session(
+                    &mut phase,
+                    &mut status,
+                    &sandbox_name,
+                    session_connected,
+                );
 
                 if let Some(s) = status.as_mut()
                     && s.sandbox_name.is_empty()
@@ -1282,20 +1278,64 @@ impl ComputeRuntime {
     }
 
     pub async fn supervisor_session_connected(&self, sandbox_id: &str) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, true).await
+        let _guard = self.sync_lock.lock().await;
+        let sandbox = self
+            .update_supervisor_session_state(sandbox_id, true)
+            .await?;
+        self.publish_supervisor_session_state(sandbox_id, sandbox);
+        Ok(())
     }
 
     pub async fn supervisor_session_disconnected(&self, sandbox_id: &str) -> Result<(), String> {
-        self.set_supervisor_session_state(sandbox_id, false).await
+        let _guard = self.sync_lock.lock().await;
+
+        // A replacement session may already be owned by another replica. Do
+        // not let cleanup from this replica overwrite the new owner's Ready
+        // state. Recheck after the demotion as well: if ownership changed
+        // between the first read and the CAS, restore Ready before releasing
+        // the synchronization lock. A new owner published after the second
+        // read will run supervisor_session_connected and promote the sandbox.
+        if self.supervisor_session_ready(sandbox_id).await? {
+            return Ok(());
+        }
+
+        let demoted = self
+            .update_supervisor_session_state(sandbox_id, false)
+            .await?;
+        let sandbox = if self.supervisor_session_ready(sandbox_id).await? {
+            self.update_supervisor_session_state(sandbox_id, true)
+                .await?
+        } else {
+            demoted
+        };
+        self.publish_supervisor_session_state(sandbox_id, sandbox);
+        Ok(())
     }
 
-    async fn set_supervisor_session_state(
+    async fn supervisor_session_ready(&self, sandbox_id: &str) -> Result<bool, String> {
+        if self.supervisor_sessions.has_session(sandbox_id) {
+            return Ok(true);
+        }
+
+        let owner_index = SupervisorOwnerIndex::new(self.store.clone(), OWNER_TTL);
+        let Some(owner) = owner_index
+            .read(sandbox_id)
+            .await
+            .map_err(|err| err.to_string())?
+        else {
+            return Ok(false);
+        };
+
+        let age_ms = openshell_core::time::now_ms() - owner.updated_at_ms;
+        let ttl_ms = i64::try_from(OWNER_TTL.as_millis()).unwrap_or(i64::MAX);
+        Ok(age_ms < ttl_ms)
+    }
+
+    async fn update_supervisor_session_state(
         &self,
         sandbox_id: &str,
         connected: bool,
-    ) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
-
+    ) -> Result<Option<Sandbox>, String> {
         // Use CAS to update sandbox phase based on supervisor session state
         let result = self
             .store
@@ -1325,7 +1365,7 @@ impl ComputeRuntime {
             Err(crate::persistence::PersistenceError::Database(ref msg))
                 if msg.contains("not found") =>
             {
-                return Ok(());
+                return Ok(None);
             }
             Err(crate::persistence::PersistenceError::Conflict {
                 current_resource_version,
@@ -1339,9 +1379,14 @@ impl ComputeRuntime {
             Err(e) => return Err(e.to_string()),
         };
 
-        self.sandbox_index.update_from_sandbox(&sandbox);
-        self.sandbox_watch_bus.notify(sandbox_id);
-        Ok(())
+        Ok(Some(sandbox))
+    }
+
+    fn publish_supervisor_session_state(&self, sandbox_id: &str, sandbox: Option<Sandbox>) {
+        if let Some(sandbox) = sandbox {
+            self.sandbox_index.update_from_sandbox(&sandbox);
+            self.sandbox_watch_bus.notify(sandbox_id);
+        }
     }
 
     async fn apply_deleted(&self, sandbox_id: &str) -> Result<(), String> {
@@ -1866,6 +1911,21 @@ fn ensure_supervisor_ready_status(status: &mut Option<SandboxStatus>, sandbox_na
     );
 }
 
+fn gate_phase_on_supervisor_session(
+    phase: &mut SandboxPhase,
+    status: &mut Option<SandboxStatus>,
+    sandbox_name: &str,
+    session_connected: bool,
+) {
+    if session_connected && matches!(*phase, SandboxPhase::Provisioning | SandboxPhase::Unknown) {
+        *phase = SandboxPhase::Ready;
+        ensure_supervisor_ready_status(status, sandbox_name);
+    } else if !session_connected && *phase == SandboxPhase::Ready {
+        *phase = SandboxPhase::Provisioning;
+        ensure_supervisor_not_ready_status(status, sandbox_name);
+    }
+}
+
 fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
     upsert_ready_condition(
         status,
@@ -1874,7 +1934,7 @@ fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>, sandbo
             r#type: "Ready".to_string(),
             status: "False".to_string(),
             reason: "DependenciesNotReady".to_string(),
-            message: "Supervisor session disconnected".to_string(),
+            message: "Supervisor session not connected".to_string(),
             last_transition_time: String::new(),
         },
     );
@@ -2826,12 +2886,133 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Ready
+            SandboxPhase::Provisioning
         );
     }
 
     #[tokio::test]
-    async fn apply_sandbox_update_without_status_preserves_existing_status() {
+    async fn apply_sandbox_update_keeps_driver_ready_provisioning_until_supervisor_connects() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(DriverSandboxStatus {
+                    sandbox_name: "sandbox-a".to_string(),
+                    instance_id: "agent-pod".to_string(),
+                    agent_fd: String::new(),
+                    sandbox_fd: String::new(),
+                    conditions: vec![DriverCondition {
+                        r#type: "Ready".to_string(),
+                        status: "True".to_string(),
+                        reason: "DependenciesReady".to_string(),
+                        message: "Pod is Ready".to_string(),
+                        last_transition_time: String::new(),
+                    }],
+                    deleting: false,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "DependenciesNotReady");
+        assert_eq!(ready.message, "Supervisor session not connected");
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_treats_fresh_remote_supervisor_owner_as_ready() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        SupervisorOwnerIndex::new(runtime.store.clone(), OWNER_TTL)
+            .publish(
+                "sb-1",
+                "session-remote",
+                "instance-remote",
+                1,
+                "openshell-1",
+                "http://openshell-1.openshell-peer.openshell.svc.cluster.local:8080",
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(DriverSandboxStatus {
+                    sandbox_name: "sandbox-a".to_string(),
+                    instance_id: "agent-pod".to_string(),
+                    agent_fd: String::new(),
+                    sandbox_fd: String::new(),
+                    conditions: vec![DriverCondition {
+                        r#type: "Ready".to_string(),
+                        status: "True".to_string(),
+                        reason: "DependenciesReady".to_string(),
+                        message: "Pod is Ready".to_string(),
+                        last_transition_time: String::new(),
+                    }],
+                    deleting: false,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "True");
+        assert_eq!(ready.reason, "DependenciesReady");
+        assert_eq!(ready.message, "Pod is Ready");
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_without_status_preserves_policy_and_gates_ready() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         sandbox.status = Some(SandboxStatus {
@@ -2868,7 +3049,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Ready
+            SandboxPhase::Provisioning
         );
         assert_eq!(stored.current_policy_version(), 7);
         let ready = stored
@@ -2881,9 +3062,9 @@ mod tests {
                     .find(|condition| condition.r#type == "Ready")
             })
             .unwrap();
-        assert_eq!(ready.status, "True");
-        assert_eq!(ready.reason, "DependenciesReady");
-        assert_eq!(ready.message, "Pod is Ready");
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "DependenciesNotReady");
+        assert_eq!(ready.message, "Supervisor session not connected");
     }
 
     #[tokio::test]
@@ -2998,7 +3179,43 @@ mod tests {
             .unwrap();
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "DependenciesNotReady");
-        assert_eq!(ready.message, "Supervisor session disconnected");
+        assert_eq!(ready.message, "Supervisor session not connected");
+    }
+
+    #[tokio::test]
+    async fn stale_session_disconnect_preserves_new_remote_owner_ready_state() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        SupervisorOwnerIndex::new(runtime.store.clone(), OWNER_TTL)
+            .publish(
+                "sb-1",
+                "replacement-session",
+                "supervisor-instance",
+                2,
+                "gateway-b",
+                "http://gateway-b:8080",
+            )
+            .await
+            .unwrap();
+
+        runtime
+            .supervisor_session_disconnected("sb-1")
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
     }
 
     #[tokio::test]
@@ -3072,7 +3289,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Ready
+            SandboxPhase::Provisioning
         );
         assert!(stored.spec.as_ref().is_some_and(|spec| {
             openshell_core::gpu::sandbox_gpu_requested(spec.resource_requirements.as_ref())
@@ -3167,7 +3384,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
-            SandboxPhase::Ready
+            SandboxPhase::Provisioning
         );
     }
 
