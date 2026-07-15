@@ -13,7 +13,7 @@ use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Gid, Group, Pid, Uid, User};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -1284,6 +1284,24 @@ pub fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 // `effective_gid`/`effective_uid` are intentionally parallel names (same role
 // for different identifiers) and the noise from renaming would obscure intent.
 #[cfg(unix)]
+fn merged_supplemental_gids(base: Vec<Gid>, extra: &[u32]) -> Result<Vec<Gid>> {
+    let mut groups = base
+        .into_iter()
+        .map(Gid::as_raw)
+        .filter(|gid| *gid != 0)
+        .collect::<BTreeSet<_>>();
+
+    for raw_gid in extra {
+        if *raw_gid == 0 {
+            return Err(miette::miette!("Supplemental group GID 0 is not allowed"));
+        }
+        groups.insert(*raw_gid);
+    }
+
+    Ok(groups.into_iter().map(Gid::from_raw).collect())
+}
+
+#[cfg(unix)]
 #[allow(clippy::similar_names)]
 pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
     let user_name = match policy.process.run_as_user.as_deref() {
@@ -1306,6 +1324,11 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             fallback.process.run_as_user = Some("sandbox".into());
             fallback.process.run_as_group = Some("sandbox".into());
             return drop_privileges(&fallback);
+        }
+        if !policy.process.supplemental_groups.is_empty() {
+            return Err(miette::miette!(
+                "Supplemental groups require a privileged supervisor process"
+            ));
         }
         return Ok(());
     }
@@ -1363,6 +1386,8 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
 
     // Set supplementary groups only when we have a name-based identity.
     // Numeric UIDs may not have a passwd entry, so initgroups would fail.
+    let extra_supplemental_groups = &policy.process.supplemental_groups;
+    let mut supplemental_groups = Vec::new();
     if let Some(ref user) = user
         && target_uid != nix::unistd::geteuid()
     {
@@ -1385,6 +1410,19 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         )))]
         {
             nix::unistd::initgroups(user_cstr.as_c_str(), target_gid).into_diagnostic()?;
+            if !extra_supplemental_groups.is_empty() {
+                supplemental_groups = nix::unistd::getgroups().into_diagnostic()?;
+            }
+        }
+    }
+    if !extra_supplemental_groups.is_empty() {
+        // CDI `additionalGids` are carried in the policy as Linux supplemental
+        // groups. They must be set while the supervisor still has privilege,
+        // before setgid/setuid drop the ability to change group membership.
+        let supplemental_groups =
+            merged_supplemental_gids(supplemental_groups, extra_supplemental_groups)?;
+        if !supplemental_groups.is_empty() {
+            nix::unistd::setgroups(&supplemental_groups).into_diagnostic()?;
         }
     }
 
@@ -1635,6 +1673,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: None,
+            ..Default::default()
         });
         if nix::unistd::geteuid().is_root() {
             // As root, drop_privileges falls back to "sandbox:sandbox".
@@ -1652,6 +1691,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(String::new()),
             run_as_group: Some(String::new()),
+            ..Default::default()
         });
         if nix::unistd::geteuid().is_root() {
             let has_sandbox = User::from_name("sandbox").ok().flatten().is_some();
@@ -1659,6 +1699,21 @@ mod tests {
         } else {
             assert!(drop_privileges(&policy).is_ok());
         }
+    }
+
+    #[test]
+    fn merged_supplemental_gids_deduplicates_and_rejects_root() {
+        let merged = merged_supplemental_gids(
+            vec![Gid::from_raw(44), Gid::from_raw(44), Gid::from_raw(0)],
+            &[44, 107],
+        )
+        .unwrap();
+
+        assert_eq!(
+            merged.iter().map(|gid| gid.as_raw()).collect::<Vec<_>>(),
+            vec![44, 107]
+        );
+        assert!(merged_supplemental_gids(Vec::new(), &[0]).is_err());
     }
 
     #[test]
@@ -1675,6 +1730,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: Some(current_group.name),
+            ..Default::default()
         });
 
         let result = drop_privileges(&policy);
@@ -1712,6 +1768,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: Some(current_group.name),
+            ..Default::default()
         });
 
         let mut cmd = std::process::Command::new(std::env::current_exe().expect("current exe"));
@@ -1753,6 +1810,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name),
             run_as_group: Some(current_group.name),
+            ..Default::default()
         });
 
         assert!(drop_privileges(&policy).is_ok());
@@ -1763,6 +1821,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("__nonexistent_test_user_42__".to_string()),
             run_as_group: None,
+            ..Default::default()
         });
 
         let result = drop_privileges(&policy);
@@ -1776,6 +1835,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: Some("__nonexistent_test_group_42__".to_string()),
+            ..Default::default()
         });
 
         let result = drop_privileges(&policy);
@@ -1949,6 +2009,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user,
                 run_as_group,
+                ..Default::default()
             },
         }
     }
@@ -2322,6 +2383,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(uid_raw.to_string()),
             run_as_group: Some(gid_raw.to_string()),
+            ..Default::default()
         });
 
         assert!(
@@ -2348,6 +2410,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_uid.to_string()), // numeric UID, no passwd entry needed
             run_as_group: Some(current_group.name),     // name-based group
+            ..Default::default()
         });
 
         assert!(
@@ -2364,6 +2427,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("999999".into()),
             run_as_group: Some("999999".into()),
+            ..Default::default()
         });
         match drop_privileges(&policy) {
             Ok(()) => {}

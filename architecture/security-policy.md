@@ -23,10 +23,20 @@ dynamic and can be hot-reloaded when the new policy validates successfully.
 
 Before applying Landlock, the supervisor enriches baseline filesystem paths that
 the runtime needs. Missing baseline paths are skipped so one absent runtime path
-does not weaken the whole ruleset. When GPU devices are present, GPU baseline
-enrichment adds existing GPU device nodes as read-write paths and promotes
-`/proc` to read-write because CUDA workloads write thread metadata under
-`/proc/<pid>/task/<tid>/comm`.
+does not weaken the whole ruleset. When GPU devices are present without a CDI
+context, GPU baseline enrichment adds existing GPU device nodes as read-write
+paths. GPU sandboxes with CDI context use CDI-derived paths instead of the
+hard-coded GPU baseline. Both paths promote `/proc` to read-write because CUDA
+workloads write thread metadata under `/proc/<pid>/task/<tid>/comm`.
+
+GPU/CDI sandboxes can also carry a supervisor-only CDI context from the compute
+driver. The supervisor resolves selected CDI IDs from mounted CDI specs and
+adds derived device nodes, library mount destinations, and supplemental GIDs
+before agent exec. CDI host paths are ignored for policy. Derived mount
+destinations default to read-only; writable CDI single-file mounts require an
+exact `filesystem_policy.read_write` opt-in, and writable CDI directory mounts
+fail closed. CDI resolution errors are security-relevant startup failures and
+emit OCSF findings.
 
 Landlock rules are tailored to the inode type reported by the already-opened
 path descriptor. Directories retain the requested directory and file rights;

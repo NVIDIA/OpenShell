@@ -1666,6 +1666,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: Some("1000".into()),
                 run_as_group: None,
+                ..Default::default()
             },
         };
         let (user, home) = session_user_and_home(&policy);
@@ -1687,6 +1688,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: Some("sandbox".into()),
                 run_as_group: None,
+                ..Default::default()
             },
         };
         let (user, home) = session_user_and_home(&policy);
@@ -1708,6 +1710,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: Some(String::new()),
                 run_as_group: None,
+                ..Default::default()
             },
         };
         let (user, home) = session_user_and_home(&policy);
@@ -1728,6 +1731,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: None,
                 run_as_group: None,
+                ..Default::default()
             },
         };
         let (user, home) = session_user_and_home(&policy);
@@ -1748,6 +1752,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: Some("1000660000".into()),
                 run_as_group: None,
+                ..Default::default()
             },
         };
         let (user, home) = session_user_and_home(&policy);
@@ -1777,6 +1782,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: None,
                 run_as_group: None,
+                ..Default::default()
             },
         };
 
@@ -1807,6 +1813,7 @@ mod tests {
                         process: ProcessPolicy {
                             run_as_user: None,
                             run_as_group: None,
+                            ..Default::default()
                         },
                     },
                     None,
