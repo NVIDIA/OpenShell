@@ -84,10 +84,19 @@ The active gateway is the persisted default. The `-g` flag and the `OPENSHELL_GA
 
 Installers can seed read-only gateway entries for package-managed local services. By default the CLI reads these from `/etc/openshell`, using the same `active_gateway` plus `gateways/<name>/metadata.json` layout as per-user config. Packages can override that system config root with a non-empty absolute `OPENSHELL_SYSTEM_GATEWAY_DIR` when needed; empty or relative values fall back to `/etc/openshell` and log a warning. These entries appear in `openshell gateway list` and can be selected like user registrations. `openshell gateway list` and `openshell term` label each gateway as `user` or `system` so you can see which config layer owns it. `openshell gateway remove` removes only per-user registrations. Register a per-user gateway with the same name when you need to shadow an installer-provided default.
 
-List all registered gateways:
+List all registered gateways. The table shows each gateway's endpoint, type,
+config source, authentication mode, and remote target when a remote registration
+has one:
 
 ```shell
 openshell gateway list
+```
+
+Use structured output when you need the complete local registration metadata,
+including `remote_host` and `resolved_host` for remote registrations:
+
+```shell
+openshell gateway list -o json
 ```
 
 Switch the active gateway:
@@ -104,17 +113,24 @@ openshell status -g staging
 
 ## Inspect Gateway Status
 
-Use `openshell status` for a quick health check:
+Use `openshell status` for a live gateway check. It verifies that the CLI can
+reach the running gateway, then reports health and the gateway version:
 
 ```shell
 openshell status
 ```
 
-Use `openshell gateway info` when you need the registered endpoint, gateway metadata, or compute driver details:
+Use `openshell gateway info` when you need elevated runtime details such as
+initialized compute drivers and driver-reported capability versions:
 
 ```shell
 openshell gateway info
-openshell gateway info --name production
+```
+
+Use structured output when scripting against live runtime info:
+
+```shell
+openshell gateway info -o json
 ```
 
 Remove a local CLI registration without stopping the gateway service:
@@ -136,7 +152,7 @@ For Docker-backed local gateways, inspect Docker and the gateway process or cont
 
 ```shell
 openshell doctor check
-openshell gateway info
+openshell gateway list
 ```
 
 For Kubernetes gateways, inspect the gateway workload and cluster events:

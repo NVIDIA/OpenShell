@@ -22,6 +22,9 @@ service OpenShell {
   // Check the health of the service.
   rpc Health(HealthRequest) returns (HealthResponse);
 
+  // Fetch elevated live gateway runtime metadata.
+  rpc GetGatewayInfo(GetGatewayInfoRequest) returns (GetGatewayInfoResponse);
+
   // Create a new sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse);
 
@@ -288,6 +291,40 @@ message HealthResponse {
 
   // Service version.
   string version = 2;
+}
+
+// Gateway info request.
+message GetGatewayInfoRequest {}
+
+// Gateway info response.
+message GetGatewayInfoResponse {
+  // Service status.
+  ServiceStatus status = 1;
+
+  // OpenShell gateway binary version.
+  string gateway_version = 2;
+
+  // Compute driver runtimes initialized by this gateway. Current gateways
+  // return exactly one entry.
+  repeated ComputeDriverInfo compute_drivers = 3;
+}
+
+// Info for one initialized compute driver runtime.
+message ComputeDriverInfo {
+  // Gateway-selected driver name used for routing and driver_config keys.
+  string name = 1;
+
+  // Capabilities reported by the driver during gateway runtime initialization.
+  ComputeDriverCapabilities capabilities = 2;
+}
+
+// Public compute driver capability snapshot.
+message ComputeDriverCapabilities {
+  // Driver-reported human-readable name from the startup capability snapshot.
+  string driver_name = 1;
+
+  // Driver-reported implementation version from the startup capability snapshot.
+  string driver_version = 2;
 }
 
 // Public sandbox resource exposed by the OpenShell API.

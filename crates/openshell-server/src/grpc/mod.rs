@@ -13,18 +13,19 @@ mod validation;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, AttachSandboxProviderRequest, AttachSandboxProviderResponse,
-    ClearDraftChunksRequest, ClearDraftChunksResponse, ConfigureProviderRefreshRequest,
-    ConfigureProviderRefreshResponse, CreateProviderRequest, CreateSandboxRequest,
-    CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderProfileRequest,
-    DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteServiceRequest, DeleteServiceResponse, DetachSandboxProviderRequest,
-    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
-    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, GatewayMessage,
-    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    ClearDraftChunksRequest, ClearDraftChunksResponse, ComputeDriverCapabilities,
+    ComputeDriverInfo, ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse,
+    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
+    DeleteProviderProfileRequest, DeleteProviderProfileResponse, DeleteProviderRefreshRequest,
+    DeleteProviderRefreshResponse, DeleteProviderRequest, DeleteProviderResponse,
+    DeleteSandboxRequest, DeleteSandboxResponse, DeleteServiceRequest, DeleteServiceResponse,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
+    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
+    ExposeServiceRequest, GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse,
+    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetGatewayInfoRequest, GetGatewayInfoResponse,
+    GetProviderProfileRequest, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     GetServiceRequest, HealthRequest, HealthResponse, ImportProviderProfilesRequest,
@@ -203,6 +204,32 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
+        }))
+    }
+
+    #[rpc_auth(auth = "bearer", scope = "config:read", role = "admin")]
+    async fn get_gateway_info(
+        &self,
+        _request: Request<GetGatewayInfoRequest>,
+    ) -> Result<Response<GetGatewayInfoResponse>, Status> {
+        let compute_drivers = self
+            .state
+            .compute
+            .driver_info_snapshots()
+            .iter()
+            .map(|driver| ComputeDriverInfo {
+                name: driver.name.clone(),
+                capabilities: Some(ComputeDriverCapabilities {
+                    driver_name: driver.driver_name.clone(),
+                    driver_version: driver.driver_version.clone(),
+                }),
+            })
+            .collect();
+
+        Ok(Response::new(GetGatewayInfoResponse {
+            status: ServiceStatus::Healthy.into(),
+            gateway_version: openshell_core::VERSION.to_string(),
+            compute_drivers,
         }))
     }
 
