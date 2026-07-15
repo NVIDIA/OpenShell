@@ -5978,6 +5978,14 @@ mod tests {
             .unwrap();
 
         assert!(!result.contains_key(openshell_core::inference::ANTHROPIC_OAUTH_TOKEN_KEY));
+        // The plugin projects the inference endpoint into the sandbox env so
+        // agent CLIs work without manual configuration.
+        assert_eq!(
+            result.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("https://inference.local")
+        );
+        assert!(result.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!result.contains_key("ANTHROPIC_API_KEY"));
     }
 
     #[tokio::test]

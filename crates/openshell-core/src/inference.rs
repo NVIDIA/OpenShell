@@ -120,6 +120,14 @@ pub const ANTHROPIC_OAUTH_TOKEN_KEY: &str = "ANTHROPIC_OAUTH_TOKEN";
 /// Anthropic subscription OAuth token (as opposed to an API key).
 pub const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 
+/// Non-secret Anthropic env keys that sandbox clients must read at process
+/// startup. The credential pipeline placeholderizes all provider env values;
+/// these keys are resolved back to real values in the sandbox env because a
+/// placeholderized base URL cannot be parsed by SDKs. `ANTHROPIC_AUTH_TOKEN`
+/// and `ANTHROPIC_API_KEY` are deliberately excluded: they may hold real
+/// secrets and stay egress-time placeholders.
+pub const ANTHROPIC_STATIC_CONFIG_KEYS: &[&str] = &["ANTHROPIC_BASE_URL"];
+
 /// Inference profile for the Anthropic subscription ("plan") OAuth flow.
 ///
 /// Differs from [`ANTHROPIC_PROFILE`] in two ways the Anthropic API requires for
@@ -254,7 +262,7 @@ pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
     match input.trim().to_ascii_lowercase().as_str() {
         "openai" => Some("openai"),
         "anthropic" => Some("anthropic"),
-            "anthropic-oauth" | "claude-subscription" => Some("anthropic-oauth"),
+        "anthropic-oauth" | "claude-subscription" => Some("anthropic-oauth"),
         "nvidia" => Some("nvidia"),
         "deepinfra" => Some("deepinfra"),
         "aws-bedrock" => Some("aws-bedrock"),
