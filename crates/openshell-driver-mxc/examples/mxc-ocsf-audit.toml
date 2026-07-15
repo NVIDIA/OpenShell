@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# MXC gateway config for the ETW -> OCSF audit-trail example.
+#
+# Goal: exercise the in-process ETW consumer (Plane A) end-to-end so that
+# creating a sandbox produces a full OCSF audit trail — Application Lifecycle
+# [6002], Device Config State Change [5019], Process Activity [1007] and
+# Detection Finding [2004] — written to a durable JSONL log, just like the Linux
+# OCSF pipeline.
+#
+# run-ocsf-audit.ps1 patches wxc_exec_path, backend, etw_audit, the egress-proxy
+# switch and agent_command into a disposable copy of this file, so the values
+# here are sane defaults; edit them if you run the gateway directly.
+
+[openshell.drivers.mxc]
+# Path to wxc-exec.exe on the box (patched by the run script; default is the
+# location observed on the MXC test boxes).
+wxc_exec_path = "C:\\mxc-kit\\bin\\wxc-exec.exe"
+
+# One-shot AppContainer. This is the backend whose Sandboxing ETW the consumer
+# captures. (isolation_session is "dark" — it emits no provider events.)
+backend = "process_container"
+
+default_configuration_id = "composable"
+
+# Host folder mapped read-write into the sandbox.
+share_dir = "C:/work/openshell-mxc-demo"
+agent_cwd = "C:/work/openshell-mxc-demo"
+
+# A simple in-policy write — enough to make wxc-exec provision an AppContainer and
+# drive the Sandboxing provider. Absolute cmd.exe path is REQUIRED when the egress
+# proxy is on (the host proxy hashes agent_command[0] as its static identity
+# binary, so it must be an absolute, existing exe).
+agent_command = [
+  "C:\\Windows\\System32\\cmd.exe",
+  "/c",
+  "echo hello from openshell ocsf audit 1>C:\\work\\openshell-mxc-demo\\hello.txt",
+]
+
+debug = false
+
+# Turn ON the Plane-A ETW -> OCSF audit consumer. This is the core of the example.
+etw_audit = true
+
+# Per-sandbox governed egress. Enabling this makes the driver start a host CONNECT
+# proxy and hand MXC a `network.proxy` redirect, which is what makes MXC emit the
+# SandboxProxyConfigured event — the config event mapped to OCSF CONFIG [5019]
+# that completes full event coverage. Requires backend = process_container and a
+# loopback (127.0.0.1) seed address; the driver allocates a unique ephemeral port
+# per sandbox from this seed. Run-ocsf-audit.ps1 disables this when passed
+# -NoProxy.
+egress_proxy = true
+egress_proxy_addr = "127.0.0.1:18080"

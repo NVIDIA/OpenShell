@@ -1356,6 +1356,10 @@ fn emit_resolved(
         | "EnforceOsPolicy"
         | "SandboxProxyConfigured"
         | "SandboxConsoleReferencePlumbed" => {
+            // Dump the raw decoded field set for config-family events at debug so we
+            // can confirm the exact property names MXC emits (e.g. which key carries
+            // the proxy port on `SandboxProxyConfigured`). Guarded by `debug=true`.
+            tracing::debug!(target: "mxc_etw", pid = ev.process_id, sandbox_id = %sandbox_id, "{}", ev.summary());
             let ctx = etw_ctx(sandbox_id, sandbox_name);
             emit_ocsf(sandbox_id, map_config_state(&ctx, ev));
         }
@@ -1412,11 +1416,20 @@ fn map_config_state(ctx: &SandboxContext, ev: &DecodedEtwEvent) -> OcsfEvent {
         "ApplyUILimits" => "MXC sandbox UI restrictions applied".to_string(),
         "EnforceOsPolicy" => "MXC sandbox OS policy enforced".to_string(),
         "SandboxConsoleReferencePlumbed" => "MXC sandbox console reference plumbed".to_string(),
-        // The one network-plane event the provider emits; `proxyPort=0` means no
-        // proxy was configured. Surface the port so the CONFIG row is self-describing.
+        // The one network-plane event the provider emits. Empirically the OS
+        // Sandboxing provider fires this event *only* when an egress proxy is
+        // configured for the sandbox, but it does **not** surface the port for
+        // MXC's URL-based proxy — `proxyPort` is always 0 (MXC redirects egress via
+        // a `network.proxy.localhost` policy URL, not the OS built-in proxy-port
+        // mechanism this field reflects). The real per-sandbox listening port is
+        // recorded on the host proxy's own Network Activity [4001] "Listen" event.
+        // So the presence of this event means a proxy WAS configured; only append a
+        // port on the off chance a future provider/build populates it.
         "SandboxProxyConfigured" => match ev.get_unquoted("proxyPort").as_deref() {
-            Some("0") | None => "MXC sandbox proxy configured (no proxy)".to_string(),
-            Some(port) => format!("MXC sandbox proxy configured (port {port})"),
+            Some(port) if port != "0" => {
+                format!("MXC sandbox proxy configured (port {port})")
+            }
+            _ => "MXC sandbox proxy configured".to_string(),
         },
         _ => "MXC sandbox OS policy configured".to_string(),
     };
