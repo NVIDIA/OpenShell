@@ -113,10 +113,24 @@ openshell status -g staging
 
 ## Inspect Gateway Status
 
-Use `openshell status` for a quick health check:
+Use `openshell status` for a live gateway check. It verifies that the CLI can
+reach the running gateway, then reports health and the gateway version:
 
 ```shell
 openshell status
+```
+
+Use `openshell gateway info` when you need elevated runtime details such as
+initialized compute drivers and driver-reported capability versions:
+
+```shell
+openshell gateway info
+```
+
+Use structured output when scripting against live runtime info:
+
+```shell
+openshell gateway info -o json
 ```
 
 Remove a local CLI registration without stopping the gateway service:
@@ -131,6 +145,7 @@ Check gateway health:
 
 ```shell
 openshell status
+openshell gateway info
 ```
 
 For Docker-backed local gateways, inspect Docker and the gateway process or container started by your local workflow:

@@ -26,6 +26,10 @@ The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated
 when a sandbox create request asks for GPU resources.
 
+The gateway records driver identity and version from the startup capability
+response. Elevated gateway info reports that initialized driver snapshot instead
+of re-querying drivers on each request.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |

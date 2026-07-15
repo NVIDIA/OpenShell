@@ -240,7 +240,7 @@ const HELP_TEMPLATE: &str = "\
   provider:    Manage provider configuration
 
 \x1b[1mGATEWAY COMMANDS\x1b[0m
-  gateway:     Manage gateway registrations
+  gateway:     Manage gateways
   status:      Show gateway status and information
   inference:   Manage inference configuration
   doctor:      Diagnose gateway issues
@@ -366,6 +366,7 @@ const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell gateway add http://127.0.0.1:8080 --local
   $ openshell gateway select my-gateway
+  $ openshell gateway info
   $ openshell gateway remove my-gateway
 ";
 
@@ -523,7 +524,7 @@ enum Commands {
     // ===================================================================
     // GATEWAY COMMANDS
     // ===================================================================
-    /// Manage gateway registrations.
+    /// Manage gateways.
     #[command(alias = "gw", after_help = GATEWAY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Gateway {
         #[command(subcommand)]
@@ -1102,6 +1103,14 @@ enum GatewayCommands {
         /// Gateway name (omit to choose interactively or list in non-interactive mode).
         #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
+    },
+
+    /// Show elevated live gateway runtime information.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Info {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List registered gateways.
@@ -2047,6 +2056,15 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Select { name } => {
                 run::gateway_select(name.as_deref(), &cli.gateway)?;
+            }
+            GatewayCommands::Info { output } => {
+                if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                    let mut tls = tls.with_gateway_name(&ctx.name);
+                    apply_auth(&mut tls, &ctx.name);
+                    run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
+                } else {
+                    run::gateway_info_not_configured()?;
+                }
             }
             GatewayCommands::List { output } => {
                 run::gateway_list(&cli.gateway, output.as_str())?;
@@ -3457,6 +3475,26 @@ mod tests {
 
         assert_eq!(cli.gateway.as_deref(), Some("demo"));
         assert!(matches!(cli.command, Some(Commands::Status)));
+    }
+
+    #[test]
+    fn gateway_info_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "info", "-o", "json"])
+            .expect("gateway info -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::Info {
+                    output: OutputFormat::Json
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn top_level_info_is_not_a_command() {
+        assert!(Cli::try_parse_from(["openshell", "info"]).is_err());
     }
 
     #[test]
