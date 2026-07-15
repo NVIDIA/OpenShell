@@ -13,7 +13,7 @@ type ErrorCode int
 
 // ErrorCode values for classifying gRPC errors.
 const (
-	ErrorNotFound         ErrorCode = iota + 1
+	ErrorNotFound ErrorCode = iota + 1
 	ErrorAlreadyExists
 	ErrorUnavailable
 	ErrorPermissionDenied

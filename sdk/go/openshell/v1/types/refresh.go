@@ -34,10 +34,10 @@ type RefreshStatus struct {
 // RefreshConfig holds configuration parameters for gateway-owned credential
 // refresh on a provider credential.
 type RefreshConfig struct {
-	Provider          string
-	CredentialKey     string
-	Strategy          RefreshStrategy
-	Material          map[string]string
+	Provider           string
+	CredentialKey      string
+	Strategy           RefreshStrategy
+	Material           map[string]string
 	SecretMaterialKeys []string
-	ExpiresAt         *time.Time
+	ExpiresAt          *time.Time
 }

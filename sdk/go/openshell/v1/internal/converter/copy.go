@@ -3,6 +3,8 @@
 
 package converter
 
+import "google.golang.org/protobuf/types/known/structpb"
+
 // CopyStringMap returns a shallow copy of a string-to-string map.
 // Returns nil for nil input.
 func CopyStringMap(m map[string]string) map[string]string {
@@ -46,6 +48,21 @@ func CopyByteSlice(b []byte) []byte {
 	c := make([]byte, len(b))
 	copy(c, b)
 	return c
+}
+
+func structToMap(s *structpb.Struct) map[string]any {
+	if s == nil {
+		return nil
+	}
+	return s.AsMap()
+}
+
+func mapToStruct(m map[string]any) *structpb.Struct {
+	if m == nil {
+		return nil
+	}
+	s, _ := structpb.NewStruct(m)
+	return s
 }
 
 func boolCount(flags ...bool) int {

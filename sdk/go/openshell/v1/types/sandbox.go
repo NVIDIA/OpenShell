@@ -29,13 +29,15 @@ type SandboxSpec struct {
 
 // SandboxTemplate defines the container template for a sandbox.
 type SandboxTemplate struct {
-	Image             string
-	RuntimeClassName  string
-	AgentSocket       string
-	Labels            map[string]string
-	Annotations       map[string]string
-	Environment       map[string]string
-	UserNamespaces    *bool
+	Image            string
+	RuntimeClassName string
+	AgentSocket      string
+	Labels           map[string]string
+	Annotations      map[string]string
+	Environment      map[string]string
+	Resources        map[string]any
+	UserNamespaces   *bool
+	DriverConfig     map[string]any
 }
 
 // SandboxStatus holds the observed state of a sandbox.

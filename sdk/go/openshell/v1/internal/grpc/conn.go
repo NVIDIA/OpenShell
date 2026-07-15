@@ -26,13 +26,21 @@ type TLSParams struct {
 
 // NewConnection creates a gRPC client connection.
 // The address may include an http:// or https:// scheme (as written by the
-// upstream gateway), which is stripped since gRPC expects host:port.
+// upstream gateway). The scheme drives transport selection: http:// uses
+// plaintext, https:// or no scheme uses TLS.
 func NewConnection(address string, tlsCfg *TLSParams, auth credentials.PerRPCCredentials) (*grpc.ClientConn, error) {
-	address = strings.TrimPrefix(address, "https://")
-	address = strings.TrimPrefix(address, "http://")
+	usePlaintext := false
+	if strings.HasPrefix(address, "http://") {
+		usePlaintext = true
+		address = strings.TrimPrefix(address, "http://")
+	} else {
+		address = strings.TrimPrefix(address, "https://")
+	}
 	opts := []grpc.DialOption{}
 
 	if tlsCfg != nil && tlsCfg.Insecure {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	} else if usePlaintext {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	} else if tlsCfg != nil {
 		creds, err := buildTLSCredentials(tlsCfg)

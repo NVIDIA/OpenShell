@@ -38,7 +38,6 @@ type ClientInterface interface {
 
 // FileInterface is defined in file.go
 
-
 // Client implements ClientInterface. It holds a gRPC connection and provides
 // sub-client accessors following the Kubernetes client-go pattern.
 type Client struct {

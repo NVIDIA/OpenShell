@@ -17,24 +17,24 @@ type NetworkPolicyRule struct {
 // as used in sandbox network policy rules. This is distinct from [NetworkEndpoint]
 // which is the simplified profile-level endpoint (Host, Port, Protocol only).
 type PolicyNetworkEndpoint struct {
-	Host                        string
-	Port                        uint32
-	Ports                       []uint32
-	Protocol                    string
-	TLS                         string
-	Enforcement                 string
-	Access                      string
-	Rules                       []L7Rule
-	AllowedIPs                  []string
-	DenyRules                   []L7DenyRule
-	AllowEncodedSlash           bool
-	PersistedQueries            string
-	GraphqlPersistedQueries     map[string]GraphqlOperation
-	GraphqlMaxBodyBytes         uint32
-	Path                        string
-	WebsocketCredentialRewrite  bool
+	Host                         string
+	Port                         uint32
+	Ports                        []uint32
+	Protocol                     string
+	TLS                          string
+	Enforcement                  string
+	Access                       string
+	Rules                        []L7Rule
+	AllowedIPs                   []string
+	DenyRules                    []L7DenyRule
+	AllowEncodedSlash            bool
+	PersistedQueries             string
+	GraphqlPersistedQueries      map[string]GraphqlOperation
+	GraphqlMaxBodyBytes          uint32
+	Path                         string
+	WebsocketCredentialRewrite   bool
 	RequestBodyCredentialRewrite bool
-	AdvisorProposed             bool
+	AdvisorProposed              bool
 }
 
 // PolicyNetworkBinary identifies a binary subject to network policy enforcement.

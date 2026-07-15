@@ -64,19 +64,19 @@ func NetworkPolicyRuleToProto(r *types.NetworkPolicyRule) *sbv1.NetworkPolicyRul
 
 func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetworkEndpoint {
 	result := types.PolicyNetworkEndpoint{
-		Host:                        ep.GetHost(),
-		Port:                        ep.GetPort(),
-		Protocol:                    ep.GetProtocol(),
-		TLS:                         ep.GetTls(),
-		Enforcement:                 ep.GetEnforcement(),
-		Access:                      ep.GetAccess(),
-		AllowEncodedSlash:           ep.GetAllowEncodedSlash(),
-		PersistedQueries:            ep.GetPersistedQueries(),
-		GraphqlMaxBodyBytes:         ep.GetGraphqlMaxBodyBytes(),
-		Path:                        ep.GetPath(),
-		WebsocketCredentialRewrite:  ep.GetWebsocketCredentialRewrite(),
+		Host:                         ep.GetHost(),
+		Port:                         ep.GetPort(),
+		Protocol:                     ep.GetProtocol(),
+		TLS:                          ep.GetTls(),
+		Enforcement:                  ep.GetEnforcement(),
+		Access:                       ep.GetAccess(),
+		AllowEncodedSlash:            ep.GetAllowEncodedSlash(),
+		PersistedQueries:             ep.GetPersistedQueries(),
+		GraphqlMaxBodyBytes:          ep.GetGraphqlMaxBodyBytes(),
+		Path:                         ep.GetPath(),
+		WebsocketCredentialRewrite:   ep.GetWebsocketCredentialRewrite(),
 		RequestBodyCredentialRewrite: ep.GetRequestBodyCredentialRewrite(),
-		AdvisorProposed:             ep.GetAdvisorProposed(),
+		AdvisorProposed:              ep.GetAdvisorProposed(),
 	}
 	if ports := ep.GetPorts(); len(ports) > 0 {
 		result.Ports = make([]uint32, len(ports))
@@ -114,19 +114,19 @@ func policyNetworkEndpointFromProto(ep *sbv1.NetworkEndpoint) types.PolicyNetwor
 
 func policyNetworkEndpointToProto(ep *types.PolicyNetworkEndpoint) *sbv1.NetworkEndpoint {
 	result := &sbv1.NetworkEndpoint{
-		Host:                        ep.Host,
-		Port:                        ep.Port,
-		Protocol:                    ep.Protocol,
-		Tls:                         ep.TLS,
-		Enforcement:                 ep.Enforcement,
-		Access:                      ep.Access,
-		AllowEncodedSlash:           ep.AllowEncodedSlash,
-		PersistedQueries:            ep.PersistedQueries,
-		GraphqlMaxBodyBytes:         ep.GraphqlMaxBodyBytes,
-		Path:                        ep.Path,
-		WebsocketCredentialRewrite:  ep.WebsocketCredentialRewrite,
+		Host:                         ep.Host,
+		Port:                         ep.Port,
+		Protocol:                     ep.Protocol,
+		Tls:                          ep.TLS,
+		Enforcement:                  ep.Enforcement,
+		Access:                       ep.Access,
+		AllowEncodedSlash:            ep.AllowEncodedSlash,
+		PersistedQueries:             ep.PersistedQueries,
+		GraphqlMaxBodyBytes:          ep.GraphqlMaxBodyBytes,
+		Path:                         ep.Path,
+		WebsocketCredentialRewrite:   ep.WebsocketCredentialRewrite,
 		RequestBodyCredentialRewrite: ep.RequestBodyCredentialRewrite,
-		AdvisorProposed:             ep.AdvisorProposed,
+		AdvisorProposed:              ep.AdvisorProposed,
 	}
 	if len(ep.Ports) > 0 {
 		result.Ports = make([]uint32, len(ep.Ports))

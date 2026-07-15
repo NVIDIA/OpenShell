@@ -504,8 +504,23 @@ type NetworkEndpoint struct {
 	// Advisor-proposed endpoints must not satisfy exact-host SSRF trust unless
 	// they are converted through an explicit user-authored policy path.
 	AdvisorProposed bool `protobuf:"varint,18,opt,name=advisor_proposed,json=advisorProposed,proto3" json:"advisor_proposed,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Proxy-side credential signing mode: "sigv4" for AWS SigV4 re-signing.
+	// When set, the proxy strips the client's Authorization header and computes
+	// a fresh SigV4 signature using real credentials from the provider.
+	CredentialSigning string `protobuf:"bytes,19,opt,name=credential_signing,json=credentialSigning,proto3" json:"credential_signing,omitempty"`
+	// AWS signing service name override. Required when credential_signing is
+	// "sigv4" — e.g. "bedrock" for bedrock-runtime endpoints.
+	SigningService string `protobuf:"bytes,20,opt,name=signing_service,json=signingService,proto3" json:"signing_service,omitempty"`
+	// AWS region override for SigV4 signing. When set, takes precedence over
+	// hostname-based region extraction. Required for non-standard endpoints.
+	SigningRegion string `protobuf:"bytes,21,opt,name=signing_region,json=signingRegion,proto3" json:"signing_region,omitempty"`
+	// Maximum JSON-RPC-over-HTTP request body bytes to buffer for inspection.
+	// Defaults to 65536 when unset.
+	JsonRpcMaxBodyBytes uint32 `protobuf:"varint,22,opt,name=json_rpc_max_body_bytes,json=jsonRpcMaxBodyBytes,proto3" json:"json_rpc_max_body_bytes,omitempty"`
+	// MCP-only policy and inspection options. Only used when protocol is "mcp".
+	Mcp           *McpOptions `protobuf:"bytes,23,opt,name=mcp,proto3" json:"mcp,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NetworkEndpoint) Reset() {
@@ -664,6 +679,120 @@ func (x *NetworkEndpoint) GetAdvisorProposed() bool {
 	return false
 }
 
+func (x *NetworkEndpoint) GetCredentialSigning() string {
+	if x != nil {
+		return x.CredentialSigning
+	}
+	return ""
+}
+
+func (x *NetworkEndpoint) GetSigningService() string {
+	if x != nil {
+		return x.SigningService
+	}
+	return ""
+}
+
+func (x *NetworkEndpoint) GetSigningRegion() string {
+	if x != nil {
+		return x.SigningRegion
+	}
+	return ""
+}
+
+func (x *NetworkEndpoint) GetJsonRpcMaxBodyBytes() uint32 {
+	if x != nil {
+		return x.JsonRpcMaxBodyBytes
+	}
+	return 0
+}
+
+func (x *NetworkEndpoint) GetMcp() *McpOptions {
+	if x != nil {
+		return x.Mcp
+	}
+	return nil
+}
+
+// MCP options are grouped so MCP-specific policy can grow without adding more
+// top-level NetworkEndpoint fields. Current enforcement targets the active
+// 2025-11-25 Streamable HTTP/tools behavior, while preserving space for
+// version-profile policy if OpenShell adopts 2026-07-28 draft behavior later.
+//
+// Planned policy extensions should use OpenShell-owned static definitions for
+// MCP method/version profiles rather than treating dependency enums as the
+// policy contract. Candidate profile checks include request metadata/header
+// validation, response/SSE introspection, trusted annotation handling,
+// resultType/cache metadata validation, x-mcp-header tool-definition checks,
+// and subscriptions/listen handling.
+//
+// Sources:
+// - https://modelcontextprotocol.io/specification/2025-11-25/server/tools
+// - https://modelcontextprotocol.io/specification/draft/changelog
+// - https://modelcontextprotocol.io/specification/draft/basic/transports/streamable-http
+// - https://modelcontextprotocol.io/specification/draft/server/tools
+type McpOptions struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Hardening boundary for tools/call params.name. When unset or true, the
+	// supervisor enforces the MCP recommended tool-name syntax
+	// ^[A-Za-z0-9_.-]{1,128}$ before policy evaluation. Set false only for
+	// compatibility with servers that intentionally use non-recommended names.
+	//
+	// Source:
+	// - https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool-names
+	StrictToolNames *bool `protobuf:"varint,1,opt,name=strict_tool_names,json=strictToolNames,proto3,oneof" json:"strict_tool_names,omitempty"`
+	// Method-layer default for MCP endpoints. When true, OpenShell allows parsed
+	// MCP-family methods at the method layer unless a tool-name policy narrows
+	// tools/call. When unset or false, explicit method rules are required.
+	AllowAllKnownMcpMethods *bool `protobuf:"varint,2,opt,name=allow_all_known_mcp_methods,json=allowAllKnownMcpMethods,proto3,oneof" json:"allow_all_known_mcp_methods,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
+}
+
+func (x *McpOptions) Reset() {
+	*x = McpOptions{}
+	mi := &file_sandbox_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *McpOptions) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*McpOptions) ProtoMessage() {}
+
+func (x *McpOptions) ProtoReflect() protoreflect.Message {
+	mi := &file_sandbox_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use McpOptions.ProtoReflect.Descriptor instead.
+func (*McpOptions) Descriptor() ([]byte, []int) {
+	return file_sandbox_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *McpOptions) GetStrictToolNames() bool {
+	if x != nil && x.StrictToolNames != nil {
+		return *x.StrictToolNames
+	}
+	return false
+}
+
+func (x *McpOptions) GetAllowAllKnownMcpMethods() bool {
+	if x != nil && x.AllowAllKnownMcpMethods != nil {
+		return *x.AllowAllKnownMcpMethods
+	}
+	return false
+}
+
 // Trusted GraphQL operation classification.
 type GraphqlOperation struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -679,7 +808,7 @@ type GraphqlOperation struct {
 
 func (x *GraphqlOperation) Reset() {
 	*x = GraphqlOperation{}
-	mi := &file_sandbox_proto_msgTypes[6]
+	mi := &file_sandbox_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -691,7 +820,7 @@ func (x *GraphqlOperation) String() string {
 func (*GraphqlOperation) ProtoMessage() {}
 
 func (x *GraphqlOperation) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[6]
+	mi := &file_sandbox_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -704,7 +833,7 @@ func (x *GraphqlOperation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GraphqlOperation.ProtoReflect.Descriptor instead.
 func (*GraphqlOperation) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{6}
+	return file_sandbox_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GraphqlOperation) GetOperationType() string {
@@ -733,7 +862,8 @@ func (x *GraphqlOperation) GetFields() []string {
 // Deny rules are evaluated after allow rules and take precedence.
 type L7DenyRule struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// HTTP method (REST): GET, POST, etc. or "*" for any.
+	// Protocol method: HTTP method (REST/WebSocket), JSON-RPC method name, or
+	// "*" for any when supported by the protocol.
 	Method string `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
 	// URL path glob pattern (REST): "/repos/*/pulls/*/reviews", "**" for any.
 	Path string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
@@ -748,14 +878,17 @@ type L7DenyRule struct {
 	OperationName string `protobuf:"bytes,6,opt,name=operation_name,json=operationName,proto3" json:"operation_name,omitempty"`
 	// GraphQL root field globs. Deny rules match when any selected root field
 	// matches any configured glob.
-	Fields        []string `protobuf:"bytes,7,rep,name=fields,proto3" json:"fields,omitempty"`
+	Fields []string `protobuf:"bytes,7,rep,name=fields,proto3" json:"fields,omitempty"`
+	// MCP params matcher map. Currently only params.name is supported for
+	// tools/call filtering. Generic protocol "json-rpc" rejects params matchers.
+	Params        map[string]*L7QueryMatcher `protobuf:"bytes,9,rep,name=params,proto3" json:"params,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *L7DenyRule) Reset() {
 	*x = L7DenyRule{}
-	mi := &file_sandbox_proto_msgTypes[7]
+	mi := &file_sandbox_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -767,7 +900,7 @@ func (x *L7DenyRule) String() string {
 func (*L7DenyRule) ProtoMessage() {}
 
 func (x *L7DenyRule) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[7]
+	mi := &file_sandbox_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -780,7 +913,7 @@ func (x *L7DenyRule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use L7DenyRule.ProtoReflect.Descriptor instead.
 func (*L7DenyRule) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{7}
+	return file_sandbox_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *L7DenyRule) GetMethod() string {
@@ -832,6 +965,13 @@ func (x *L7DenyRule) GetFields() []string {
 	return nil
 }
 
+func (x *L7DenyRule) GetParams() map[string]*L7QueryMatcher {
+	if x != nil {
+		return x.Params
+	}
+	return nil
+}
+
 // An L7 policy rule (allow-only).
 type L7Rule struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -842,7 +982,7 @@ type L7Rule struct {
 
 func (x *L7Rule) Reset() {
 	*x = L7Rule{}
-	mi := &file_sandbox_proto_msgTypes[8]
+	mi := &file_sandbox_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -854,7 +994,7 @@ func (x *L7Rule) String() string {
 func (*L7Rule) ProtoMessage() {}
 
 func (x *L7Rule) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[8]
+	mi := &file_sandbox_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -867,7 +1007,7 @@ func (x *L7Rule) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use L7Rule.ProtoReflect.Descriptor instead.
 func (*L7Rule) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{8}
+	return file_sandbox_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *L7Rule) GetAllow() *L7Allow {
@@ -880,7 +1020,8 @@ func (x *L7Rule) GetAllow() *L7Allow {
 // Allowed action definition for L7 rules.
 type L7Allow struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// HTTP method (REST): GET, POST, etc. or "*" for any.
+	// Protocol method: HTTP method (REST/WebSocket), JSON-RPC method name, or
+	// "*" for any when supported by the protocol.
 	Method string `protobuf:"bytes,1,opt,name=method,proto3" json:"method,omitempty"`
 	// URL path glob pattern (REST): "/repos/**", "**" for any.
 	Path string `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`
@@ -896,14 +1037,17 @@ type L7Allow struct {
 	OperationName string `protobuf:"bytes,6,opt,name=operation_name,json=operationName,proto3" json:"operation_name,omitempty"`
 	// GraphQL root field globs. Allow rules match only when every selected root
 	// field matches one of the configured globs. Omit to match all fields.
-	Fields        []string `protobuf:"bytes,7,rep,name=fields,proto3" json:"fields,omitempty"`
+	Fields []string `protobuf:"bytes,7,rep,name=fields,proto3" json:"fields,omitempty"`
+	// MCP params matcher map. Currently only params.name is supported for
+	// tools/call filtering. Generic protocol "json-rpc" rejects params matchers.
+	Params        map[string]*L7QueryMatcher `protobuf:"bytes,9,rep,name=params,proto3" json:"params,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *L7Allow) Reset() {
 	*x = L7Allow{}
-	mi := &file_sandbox_proto_msgTypes[9]
+	mi := &file_sandbox_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -915,7 +1059,7 @@ func (x *L7Allow) String() string {
 func (*L7Allow) ProtoMessage() {}
 
 func (x *L7Allow) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[9]
+	mi := &file_sandbox_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -928,7 +1072,7 @@ func (x *L7Allow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use L7Allow.ProtoReflect.Descriptor instead.
 func (*L7Allow) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{9}
+	return file_sandbox_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *L7Allow) GetMethod() string {
@@ -980,6 +1124,13 @@ func (x *L7Allow) GetFields() []string {
 	return nil
 }
 
+func (x *L7Allow) GetParams() map[string]*L7QueryMatcher {
+	if x != nil {
+		return x.Params
+	}
+	return nil
+}
+
 // Query value matcher for one query parameter key.
 type L7QueryMatcher struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -993,7 +1144,7 @@ type L7QueryMatcher struct {
 
 func (x *L7QueryMatcher) Reset() {
 	*x = L7QueryMatcher{}
-	mi := &file_sandbox_proto_msgTypes[10]
+	mi := &file_sandbox_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1005,7 +1156,7 @@ func (x *L7QueryMatcher) String() string {
 func (*L7QueryMatcher) ProtoMessage() {}
 
 func (x *L7QueryMatcher) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[10]
+	mi := &file_sandbox_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1018,7 +1169,7 @@ func (x *L7QueryMatcher) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use L7QueryMatcher.ProtoReflect.Descriptor instead.
 func (*L7QueryMatcher) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{10}
+	return file_sandbox_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *L7QueryMatcher) GetGlob() string {
@@ -1049,7 +1200,7 @@ type NetworkBinary struct {
 
 func (x *NetworkBinary) Reset() {
 	*x = NetworkBinary{}
-	mi := &file_sandbox_proto_msgTypes[11]
+	mi := &file_sandbox_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1061,7 +1212,7 @@ func (x *NetworkBinary) String() string {
 func (*NetworkBinary) ProtoMessage() {}
 
 func (x *NetworkBinary) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[11]
+	mi := &file_sandbox_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1074,7 +1225,7 @@ func (x *NetworkBinary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkBinary.ProtoReflect.Descriptor instead.
 func (*NetworkBinary) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{11}
+	return file_sandbox_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *NetworkBinary) GetPath() string {
@@ -1103,7 +1254,7 @@ type GetSandboxConfigRequest struct {
 
 func (x *GetSandboxConfigRequest) Reset() {
 	*x = GetSandboxConfigRequest{}
-	mi := &file_sandbox_proto_msgTypes[12]
+	mi := &file_sandbox_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1115,7 +1266,7 @@ func (x *GetSandboxConfigRequest) String() string {
 func (*GetSandboxConfigRequest) ProtoMessage() {}
 
 func (x *GetSandboxConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[12]
+	mi := &file_sandbox_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1128,7 +1279,7 @@ func (x *GetSandboxConfigRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSandboxConfigRequest.ProtoReflect.Descriptor instead.
 func (*GetSandboxConfigRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{12}
+	return file_sandbox_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *GetSandboxConfigRequest) GetSandboxId() string {
@@ -1147,7 +1298,7 @@ type GetGatewayConfigRequest struct {
 
 func (x *GetGatewayConfigRequest) Reset() {
 	*x = GetGatewayConfigRequest{}
-	mi := &file_sandbox_proto_msgTypes[13]
+	mi := &file_sandbox_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1159,7 +1310,7 @@ func (x *GetGatewayConfigRequest) String() string {
 func (*GetGatewayConfigRequest) ProtoMessage() {}
 
 func (x *GetGatewayConfigRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[13]
+	mi := &file_sandbox_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1172,7 +1323,7 @@ func (x *GetGatewayConfigRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetGatewayConfigRequest.ProtoReflect.Descriptor instead.
 func (*GetGatewayConfigRequest) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{13}
+	return file_sandbox_proto_rawDescGZIP(), []int{14}
 }
 
 // Response containing gateway-global settings.
@@ -1189,7 +1340,7 @@ type GetGatewayConfigResponse struct {
 
 func (x *GetGatewayConfigResponse) Reset() {
 	*x = GetGatewayConfigResponse{}
-	mi := &file_sandbox_proto_msgTypes[14]
+	mi := &file_sandbox_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1201,7 +1352,7 @@ func (x *GetGatewayConfigResponse) String() string {
 func (*GetGatewayConfigResponse) ProtoMessage() {}
 
 func (x *GetGatewayConfigResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[14]
+	mi := &file_sandbox_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1214,7 +1365,7 @@ func (x *GetGatewayConfigResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetGatewayConfigResponse.ProtoReflect.Descriptor instead.
 func (*GetGatewayConfigResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{14}
+	return file_sandbox_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *GetGatewayConfigResponse) GetSettings() map[string]*SettingValue {
@@ -1247,7 +1398,7 @@ type SettingValue struct {
 
 func (x *SettingValue) Reset() {
 	*x = SettingValue{}
-	mi := &file_sandbox_proto_msgTypes[15]
+	mi := &file_sandbox_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1259,7 +1410,7 @@ func (x *SettingValue) String() string {
 func (*SettingValue) ProtoMessage() {}
 
 func (x *SettingValue) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[15]
+	mi := &file_sandbox_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1272,7 +1423,7 @@ func (x *SettingValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SettingValue.ProtoReflect.Descriptor instead.
 func (*SettingValue) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{15}
+	return file_sandbox_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *SettingValue) GetValue() isSettingValue_Value {
@@ -1357,7 +1508,7 @@ type EffectiveSetting struct {
 
 func (x *EffectiveSetting) Reset() {
 	*x = EffectiveSetting{}
-	mi := &file_sandbox_proto_msgTypes[16]
+	mi := &file_sandbox_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1369,7 +1520,7 @@ func (x *EffectiveSetting) String() string {
 func (*EffectiveSetting) ProtoMessage() {}
 
 func (x *EffectiveSetting) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[16]
+	mi := &file_sandbox_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1382,7 +1533,7 @@ func (x *EffectiveSetting) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EffectiveSetting.ProtoReflect.Descriptor instead.
 func (*EffectiveSetting) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{16}
+	return file_sandbox_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *EffectiveSetting) GetValue() *SettingValue {
@@ -1427,7 +1578,7 @@ type GetSandboxConfigResponse struct {
 
 func (x *GetSandboxConfigResponse) Reset() {
 	*x = GetSandboxConfigResponse{}
-	mi := &file_sandbox_proto_msgTypes[17]
+	mi := &file_sandbox_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1439,7 +1590,7 @@ func (x *GetSandboxConfigResponse) String() string {
 func (*GetSandboxConfigResponse) ProtoMessage() {}
 
 func (x *GetSandboxConfigResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_sandbox_proto_msgTypes[17]
+	mi := &file_sandbox_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1452,7 +1603,7 @@ func (x *GetSandboxConfigResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSandboxConfigResponse.ProtoReflect.Descriptor instead.
 func (*GetSandboxConfigResponse) Descriptor() ([]byte, []int) {
-	return file_sandbox_proto_rawDescGZIP(), []int{17}
+	return file_sandbox_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *GetSandboxConfigResponse) GetPolicy() *SandboxPolicy {
@@ -1541,7 +1692,7 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x11NetworkPolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12C\n" +
 	"\tendpoints\x18\x02 \x03(\v2%.openshell.sandbox.v1.NetworkEndpointR\tendpoints\x12?\n" +
-	"\bbinaries\x18\x03 \x03(\v2#.openshell.sandbox.v1.NetworkBinaryR\bbinaries\"\x9b\a\n" +
+	"\bbinaries\x18\x03 \x03(\v2#.openshell.sandbox.v1.NetworkBinaryR\bbinaries\"\x84\t\n" +
 	"\x0fNetworkEndpoint\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x1a\n" +
@@ -1563,14 +1714,25 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x04path\x18\x0f \x01(\tR\x04path\x12@\n" +
 	"\x1cwebsocket_credential_rewrite\x18\x10 \x01(\bR\x1awebsocketCredentialRewrite\x12E\n" +
 	"\x1frequest_body_credential_rewrite\x18\x11 \x01(\bR\x1crequestBodyCredentialRewrite\x12)\n" +
-	"\x10advisor_proposed\x18\x12 \x01(\bR\x0fadvisorProposed\x1ar\n" +
+	"\x10advisor_proposed\x18\x12 \x01(\bR\x0fadvisorProposed\x12-\n" +
+	"\x12credential_signing\x18\x13 \x01(\tR\x11credentialSigning\x12'\n" +
+	"\x0fsigning_service\x18\x14 \x01(\tR\x0esigningService\x12%\n" +
+	"\x0esigning_region\x18\x15 \x01(\tR\rsigningRegion\x124\n" +
+	"\x17json_rpc_max_body_bytes\x18\x16 \x01(\rR\x13jsonRpcMaxBodyBytes\x122\n" +
+	"\x03mcp\x18\x17 \x01(\v2 .openshell.sandbox.v1.McpOptionsR\x03mcp\x1ar\n" +
 	"\x1cGraphqlPersistedQueriesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12<\n" +
-	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"x\n" +
+	"\x05value\x18\x02 \x01(\v2&.openshell.sandbox.v1.GraphqlOperationR\x05value:\x028\x01\"\xb6\x01\n" +
+	"\n" +
+	"McpOptions\x12/\n" +
+	"\x11strict_tool_names\x18\x01 \x01(\bH\x00R\x0fstrictToolNames\x88\x01\x01\x12A\n" +
+	"\x1ballow_all_known_mcp_methods\x18\x02 \x01(\bH\x01R\x17allowAllKnownMcpMethods\x88\x01\x01B\x14\n" +
+	"\x12_strict_tool_namesB\x1e\n" +
+	"\x1c_allow_all_known_mcp_methods\"x\n" +
 	"\x10GraphqlOperation\x12%\n" +
 	"\x0eoperation_type\x18\x01 \x01(\tR\roperationType\x12%\n" +
 	"\x0eoperation_name\x18\x02 \x01(\tR\roperationName\x12\x16\n" +
-	"\x06fields\x18\x03 \x03(\tR\x06fields\"\xdb\x02\n" +
+	"\x06fields\x18\x03 \x03(\tR\x06fields\"\x88\x04\n" +
 	"\n" +
 	"L7DenyRule\x12\x16\n" +
 	"\x06method\x18\x01 \x01(\tR\x06method\x12\x12\n" +
@@ -1579,13 +1741,17 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05query\x18\x04 \x03(\v2+.openshell.sandbox.v1.L7DenyRule.QueryEntryR\x05query\x12%\n" +
 	"\x0eoperation_type\x18\x05 \x01(\tR\roperationType\x12%\n" +
 	"\x0eoperation_name\x18\x06 \x01(\tR\roperationName\x12\x16\n" +
-	"\x06fields\x18\a \x03(\tR\x06fields\x1a^\n" +
+	"\x06fields\x18\a \x03(\tR\x06fields\x12D\n" +
+	"\x06params\x18\t \x03(\v2,.openshell.sandbox.v1.L7DenyRule.ParamsEntryR\x06params\x1a^\n" +
 	"\n" +
 	"QueryEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12:\n" +
-	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01\"=\n" +
+	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01\x1a_\n" +
+	"\vParamsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12:\n" +
+	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01J\x04\b\b\x10\t\"=\n" +
 	"\x06L7Rule\x123\n" +
-	"\x05allow\x18\x01 \x01(\v2\x1d.openshell.sandbox.v1.L7AllowR\x05allow\"\xd5\x02\n" +
+	"\x05allow\x18\x01 \x01(\v2\x1d.openshell.sandbox.v1.L7AllowR\x05allow\"\xff\x03\n" +
 	"\aL7Allow\x12\x16\n" +
 	"\x06method\x18\x01 \x01(\tR\x06method\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x18\n" +
@@ -1593,11 +1759,15 @@ const file_sandbox_proto_rawDesc = "" +
 	"\x05query\x18\x04 \x03(\v2(.openshell.sandbox.v1.L7Allow.QueryEntryR\x05query\x12%\n" +
 	"\x0eoperation_type\x18\x05 \x01(\tR\roperationType\x12%\n" +
 	"\x0eoperation_name\x18\x06 \x01(\tR\roperationName\x12\x16\n" +
-	"\x06fields\x18\a \x03(\tR\x06fields\x1a^\n" +
+	"\x06fields\x18\a \x03(\tR\x06fields\x12A\n" +
+	"\x06params\x18\t \x03(\v2).openshell.sandbox.v1.L7Allow.ParamsEntryR\x06params\x1a^\n" +
 	"\n" +
 	"QueryEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12:\n" +
-	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01\"6\n" +
+	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01\x1a_\n" +
+	"\vParamsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12:\n" +
+	"\x05value\x18\x02 \x01(\v2$.openshell.sandbox.v1.L7QueryMatcherR\x05value:\x028\x01J\x04\b\b\x10\t\"6\n" +
 	"\x0eL7QueryMatcher\x12\x12\n" +
 	"\x04glob\x18\x01 \x01(\tR\x04glob\x12\x10\n" +
 	"\x03any\x18\x02 \x03(\tR\x03any\"A\n" +
@@ -1660,7 +1830,7 @@ func file_sandbox_proto_rawDescGZIP() []byte {
 }
 
 var file_sandbox_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_sandbox_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
+var file_sandbox_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_sandbox_proto_goTypes = []any{
 	(SettingScope)(0),                // 0: openshell.sandbox.v1.SettingScope
 	(PolicySource)(0),                // 1: openshell.sandbox.v1.PolicySource
@@ -1670,55 +1840,63 @@ var file_sandbox_proto_goTypes = []any{
 	(*ProcessPolicy)(nil),            // 5: openshell.sandbox.v1.ProcessPolicy
 	(*NetworkPolicyRule)(nil),        // 6: openshell.sandbox.v1.NetworkPolicyRule
 	(*NetworkEndpoint)(nil),          // 7: openshell.sandbox.v1.NetworkEndpoint
-	(*GraphqlOperation)(nil),         // 8: openshell.sandbox.v1.GraphqlOperation
-	(*L7DenyRule)(nil),               // 9: openshell.sandbox.v1.L7DenyRule
-	(*L7Rule)(nil),                   // 10: openshell.sandbox.v1.L7Rule
-	(*L7Allow)(nil),                  // 11: openshell.sandbox.v1.L7Allow
-	(*L7QueryMatcher)(nil),           // 12: openshell.sandbox.v1.L7QueryMatcher
-	(*NetworkBinary)(nil),            // 13: openshell.sandbox.v1.NetworkBinary
-	(*GetSandboxConfigRequest)(nil),  // 14: openshell.sandbox.v1.GetSandboxConfigRequest
-	(*GetGatewayConfigRequest)(nil),  // 15: openshell.sandbox.v1.GetGatewayConfigRequest
-	(*GetGatewayConfigResponse)(nil), // 16: openshell.sandbox.v1.GetGatewayConfigResponse
-	(*SettingValue)(nil),             // 17: openshell.sandbox.v1.SettingValue
-	(*EffectiveSetting)(nil),         // 18: openshell.sandbox.v1.EffectiveSetting
-	(*GetSandboxConfigResponse)(nil), // 19: openshell.sandbox.v1.GetSandboxConfigResponse
-	nil,                              // 20: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
-	nil,                              // 21: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
-	nil,                              // 22: openshell.sandbox.v1.L7DenyRule.QueryEntry
-	nil,                              // 23: openshell.sandbox.v1.L7Allow.QueryEntry
-	nil,                              // 24: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
-	nil,                              // 25: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
+	(*McpOptions)(nil),               // 8: openshell.sandbox.v1.McpOptions
+	(*GraphqlOperation)(nil),         // 9: openshell.sandbox.v1.GraphqlOperation
+	(*L7DenyRule)(nil),               // 10: openshell.sandbox.v1.L7DenyRule
+	(*L7Rule)(nil),                   // 11: openshell.sandbox.v1.L7Rule
+	(*L7Allow)(nil),                  // 12: openshell.sandbox.v1.L7Allow
+	(*L7QueryMatcher)(nil),           // 13: openshell.sandbox.v1.L7QueryMatcher
+	(*NetworkBinary)(nil),            // 14: openshell.sandbox.v1.NetworkBinary
+	(*GetSandboxConfigRequest)(nil),  // 15: openshell.sandbox.v1.GetSandboxConfigRequest
+	(*GetGatewayConfigRequest)(nil),  // 16: openshell.sandbox.v1.GetGatewayConfigRequest
+	(*GetGatewayConfigResponse)(nil), // 17: openshell.sandbox.v1.GetGatewayConfigResponse
+	(*SettingValue)(nil),             // 18: openshell.sandbox.v1.SettingValue
+	(*EffectiveSetting)(nil),         // 19: openshell.sandbox.v1.EffectiveSetting
+	(*GetSandboxConfigResponse)(nil), // 20: openshell.sandbox.v1.GetSandboxConfigResponse
+	nil,                              // 21: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
+	nil,                              // 22: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
+	nil,                              // 23: openshell.sandbox.v1.L7DenyRule.QueryEntry
+	nil,                              // 24: openshell.sandbox.v1.L7DenyRule.ParamsEntry
+	nil,                              // 25: openshell.sandbox.v1.L7Allow.QueryEntry
+	nil,                              // 26: openshell.sandbox.v1.L7Allow.ParamsEntry
+	nil,                              // 27: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
+	nil,                              // 28: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
 }
 var file_sandbox_proto_depIdxs = []int32{
 	3,  // 0: openshell.sandbox.v1.SandboxPolicy.filesystem:type_name -> openshell.sandbox.v1.FilesystemPolicy
 	4,  // 1: openshell.sandbox.v1.SandboxPolicy.landlock:type_name -> openshell.sandbox.v1.LandlockPolicy
 	5,  // 2: openshell.sandbox.v1.SandboxPolicy.process:type_name -> openshell.sandbox.v1.ProcessPolicy
-	20, // 3: openshell.sandbox.v1.SandboxPolicy.network_policies:type_name -> openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
+	21, // 3: openshell.sandbox.v1.SandboxPolicy.network_policies:type_name -> openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry
 	7,  // 4: openshell.sandbox.v1.NetworkPolicyRule.endpoints:type_name -> openshell.sandbox.v1.NetworkEndpoint
-	13, // 5: openshell.sandbox.v1.NetworkPolicyRule.binaries:type_name -> openshell.sandbox.v1.NetworkBinary
-	10, // 6: openshell.sandbox.v1.NetworkEndpoint.rules:type_name -> openshell.sandbox.v1.L7Rule
-	9,  // 7: openshell.sandbox.v1.NetworkEndpoint.deny_rules:type_name -> openshell.sandbox.v1.L7DenyRule
-	21, // 8: openshell.sandbox.v1.NetworkEndpoint.graphql_persisted_queries:type_name -> openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
-	22, // 9: openshell.sandbox.v1.L7DenyRule.query:type_name -> openshell.sandbox.v1.L7DenyRule.QueryEntry
-	11, // 10: openshell.sandbox.v1.L7Rule.allow:type_name -> openshell.sandbox.v1.L7Allow
-	23, // 11: openshell.sandbox.v1.L7Allow.query:type_name -> openshell.sandbox.v1.L7Allow.QueryEntry
-	24, // 12: openshell.sandbox.v1.GetGatewayConfigResponse.settings:type_name -> openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
-	17, // 13: openshell.sandbox.v1.EffectiveSetting.value:type_name -> openshell.sandbox.v1.SettingValue
-	0,  // 14: openshell.sandbox.v1.EffectiveSetting.scope:type_name -> openshell.sandbox.v1.SettingScope
-	2,  // 15: openshell.sandbox.v1.GetSandboxConfigResponse.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
-	25, // 16: openshell.sandbox.v1.GetSandboxConfigResponse.settings:type_name -> openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
-	1,  // 17: openshell.sandbox.v1.GetSandboxConfigResponse.policy_source:type_name -> openshell.sandbox.v1.PolicySource
-	6,  // 18: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
-	8,  // 19: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
-	12, // 20: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	12, // 21: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
-	17, // 22: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
-	18, // 23: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
-	24, // [24:24] is the sub-list for method output_type
-	24, // [24:24] is the sub-list for method input_type
-	24, // [24:24] is the sub-list for extension type_name
-	24, // [24:24] is the sub-list for extension extendee
-	0,  // [0:24] is the sub-list for field type_name
+	14, // 5: openshell.sandbox.v1.NetworkPolicyRule.binaries:type_name -> openshell.sandbox.v1.NetworkBinary
+	11, // 6: openshell.sandbox.v1.NetworkEndpoint.rules:type_name -> openshell.sandbox.v1.L7Rule
+	10, // 7: openshell.sandbox.v1.NetworkEndpoint.deny_rules:type_name -> openshell.sandbox.v1.L7DenyRule
+	22, // 8: openshell.sandbox.v1.NetworkEndpoint.graphql_persisted_queries:type_name -> openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry
+	8,  // 9: openshell.sandbox.v1.NetworkEndpoint.mcp:type_name -> openshell.sandbox.v1.McpOptions
+	23, // 10: openshell.sandbox.v1.L7DenyRule.query:type_name -> openshell.sandbox.v1.L7DenyRule.QueryEntry
+	24, // 11: openshell.sandbox.v1.L7DenyRule.params:type_name -> openshell.sandbox.v1.L7DenyRule.ParamsEntry
+	12, // 12: openshell.sandbox.v1.L7Rule.allow:type_name -> openshell.sandbox.v1.L7Allow
+	25, // 13: openshell.sandbox.v1.L7Allow.query:type_name -> openshell.sandbox.v1.L7Allow.QueryEntry
+	26, // 14: openshell.sandbox.v1.L7Allow.params:type_name -> openshell.sandbox.v1.L7Allow.ParamsEntry
+	27, // 15: openshell.sandbox.v1.GetGatewayConfigResponse.settings:type_name -> openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry
+	18, // 16: openshell.sandbox.v1.EffectiveSetting.value:type_name -> openshell.sandbox.v1.SettingValue
+	0,  // 17: openshell.sandbox.v1.EffectiveSetting.scope:type_name -> openshell.sandbox.v1.SettingScope
+	2,  // 18: openshell.sandbox.v1.GetSandboxConfigResponse.policy:type_name -> openshell.sandbox.v1.SandboxPolicy
+	28, // 19: openshell.sandbox.v1.GetSandboxConfigResponse.settings:type_name -> openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry
+	1,  // 20: openshell.sandbox.v1.GetSandboxConfigResponse.policy_source:type_name -> openshell.sandbox.v1.PolicySource
+	6,  // 21: openshell.sandbox.v1.SandboxPolicy.NetworkPoliciesEntry.value:type_name -> openshell.sandbox.v1.NetworkPolicyRule
+	9,  // 22: openshell.sandbox.v1.NetworkEndpoint.GraphqlPersistedQueriesEntry.value:type_name -> openshell.sandbox.v1.GraphqlOperation
+	13, // 23: openshell.sandbox.v1.L7DenyRule.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	13, // 24: openshell.sandbox.v1.L7DenyRule.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	13, // 25: openshell.sandbox.v1.L7Allow.QueryEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	13, // 26: openshell.sandbox.v1.L7Allow.ParamsEntry.value:type_name -> openshell.sandbox.v1.L7QueryMatcher
+	18, // 27: openshell.sandbox.v1.GetGatewayConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.SettingValue
+	19, // 28: openshell.sandbox.v1.GetSandboxConfigResponse.SettingsEntry.value:type_name -> openshell.sandbox.v1.EffectiveSetting
+	29, // [29:29] is the sub-list for method output_type
+	29, // [29:29] is the sub-list for method input_type
+	29, // [29:29] is the sub-list for extension type_name
+	29, // [29:29] is the sub-list for extension extendee
+	0,  // [0:29] is the sub-list for field type_name
 }
 
 func init() { file_sandbox_proto_init() }
@@ -1726,7 +1904,8 @@ func file_sandbox_proto_init() {
 	if File_sandbox_proto != nil {
 		return
 	}
-	file_sandbox_proto_msgTypes[15].OneofWrappers = []any{
+	file_sandbox_proto_msgTypes[6].OneofWrappers = []any{}
+	file_sandbox_proto_msgTypes[16].OneofWrappers = []any{
 		(*SettingValue_StringValue)(nil),
 		(*SettingValue_BoolValue)(nil),
 		(*SettingValue_IntValue)(nil),
@@ -1738,7 +1917,7 @@ func file_sandbox_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_sandbox_proto_rawDesc), len(file_sandbox_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   24,
+			NumMessages:   27,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

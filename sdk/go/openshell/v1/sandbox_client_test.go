@@ -26,20 +26,20 @@ const bufSize = 1024 * 1024
 
 type mockSandboxServer struct {
 	pb.UnimplementedOpenShellServer
-	mu         sync.Mutex
-	sandboxes  map[string]*pb.Sandbox
-	providers  map[string][]*dm.Provider
-	createErr  error
-	getErr     error
-	listErr    error
-	deleteErr  error
-	attachErr  error
-	detachErr  error
-	listProvErr error
-	watchEvents    []*pb.SandboxStreamEvent
-	watchErr       error
-	watchKeepOpen  chan struct{} // if non-nil, WatchSandbox blocks after sending events until closed
-	watchRequest   *pb.WatchSandboxRequest // recorded request
+	mu            sync.Mutex
+	sandboxes     map[string]*pb.Sandbox
+	providers     map[string][]*dm.Provider
+	createErr     error
+	getErr        error
+	listErr       error
+	deleteErr     error
+	attachErr     error
+	detachErr     error
+	listProvErr   error
+	watchEvents   []*pb.SandboxStreamEvent
+	watchErr      error
+	watchKeepOpen chan struct{}           // if non-nil, WatchSandbox blocks after sending events until closed
+	watchRequest  *pb.WatchSandboxRequest // recorded request
 
 	// GetLogs fields
 	getLogsResp    *pb.GetSandboxLogsResponse

@@ -68,7 +68,7 @@ func (s *stubProviders) Ensure(_ context.Context, _ *Provider) (*Provider, error
 	return nil, stubError("Providers.Ensure")
 }
 func (s *stubProviders) Profiles() ProfileInterface { return &stubProfiles{} }
-func (s *stubProviders) Refresh() RefreshInterface   { return &stubRefresh{} }
+func (s *stubProviders) Refresh() RefreshInterface  { return &stubRefresh{} }
 
 // stubProfiles implements ProfileInterface as a placeholder.
 type stubProfiles struct{}

@@ -54,7 +54,9 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 			Labels:           CopyStringMap(tmpl.GetLabels()),
 			Annotations:      CopyStringMap(tmpl.GetAnnotations()),
 			Environment:      CopyStringMap(tmpl.GetEnvironment()),
+			Resources:        structToMap(tmpl.GetResources()),
 			UserNamespaces:   CopyBoolPtr(tmpl.UserNamespaces),
+			DriverConfig:     structToMap(tmpl.GetDriverConfig()),
 		}
 	}
 
@@ -165,7 +167,9 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 			Labels:           CopyStringMap(spec.Template.Labels),
 			Annotations:      CopyStringMap(spec.Template.Annotations),
 			Environment:      CopyStringMap(spec.Template.Environment),
+			Resources:        mapToStruct(spec.Template.Resources),
 			UserNamespaces:   CopyBoolPtr(spec.Template.UserNamespaces),
+			DriverConfig:     mapToStruct(spec.Template.DriverConfig),
 		}
 	}
 

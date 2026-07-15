@@ -67,9 +67,9 @@ type ProfileImportItem struct {
 type ProfileDiagnostic struct {
 	Source    string
 	ProfileID string
-	Field    string
-	Message  string
-	Severity string
+	Field     string
+	Message   string
+	Severity  string
 }
 
 // ImportResult holds the result of a profile import operation.

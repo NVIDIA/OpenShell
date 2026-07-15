@@ -30,8 +30,8 @@ type SettingScope string
 // SettingScope constants.
 const (
 	SettingScopeUnspecified SettingScope = ""
-	SettingScopeSandbox    SettingScope = "sandbox"
-	SettingScopeGlobal     SettingScope = "global"
+	SettingScopeSandbox     SettingScope = "sandbox"
+	SettingScopeGlobal      SettingScope = "global"
 )
 
 // PolicySource indicates the source of the policy payload in a SandboxConfig response.
@@ -40,8 +40,8 @@ type PolicySource string
 // PolicySource constants.
 const (
 	PolicySourceUnspecified PolicySource = ""
-	PolicySourceSandbox    PolicySource = "sandbox"
-	PolicySourceGlobal     PolicySource = "global"
+	PolicySourceSandbox     PolicySource = "sandbox"
+	PolicySourceGlobal      PolicySource = "global"
 )
 
 // EffectiveSetting is a setting value paired with the scope it was resolved from.
