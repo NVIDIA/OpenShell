@@ -22,6 +22,11 @@ on:
         required: false
         type: string
         default: ""
+      gateway-artifact-prefix:
+        description: "Optional prebuilt gateway artifact prefix (artifact suffix is linux-<arch>)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   actions: read
@@ -74,6 +79,12 @@ jobs:
         uses: ./.github/actions/setup-e2e-cli
         with:
           artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell gateway
+        if: inputs.gateway-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
 
       - name: Check out MCP conformance tests
         if: matrix.suite == 'mcp'
@@ -143,6 +154,12 @@ jobs:
         uses: ./.github/actions/setup-e2e-cli
         with:
           artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell gateway
+        if: inputs.gateway-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
 
       - name: Install mise
         run: |
