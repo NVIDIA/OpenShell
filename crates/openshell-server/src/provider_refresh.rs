@@ -468,6 +468,14 @@ pub async fn refresh_provider_credential(
         }
         Err(err) => {
             let now_ms = current_time_ms();
+            let err = if anthropic_subscription_login_rejected(&provider, &err) {
+                Status::new(
+                    err.code(),
+                    format!("{}{ANTHROPIC_RELOGIN_HINT}", err.message()),
+                )
+            } else {
+                err
+            };
             state.status = "error".to_string();
             state.last_error = err.message().to_string();
             state.next_refresh_at_ms =
@@ -486,6 +494,18 @@ pub async fn refresh_provider_credential(
             Err(err)
         }
     }
+}
+
+const ANTHROPIC_RELOGIN_HINT: &str = "; the subscription login is no longer valid — run `claude login` on the host, then delete and recreate the provider with `openshell provider create --from-claude-login`";
+
+/// True when an `anthropic-oauth` refresh failed because the token endpoint
+/// rejected the grant (revoked login, lapsed plan) rather than a transient
+/// network or gateway error, so re-authenticating on the host is the fix.
+fn anthropic_subscription_login_rejected(provider: &Provider, err: &Status) -> bool {
+    openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
+        == Some("anthropic-oauth")
+        && err.code() == tonic::Code::FailedPrecondition
+        && err.message().contains("token endpoint returned HTTP 4")
 }
 
 async fn apply_minted_credential(
@@ -1060,9 +1080,9 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NewRefreshStateConfig, delete_refresh_state, get_refresh_state, new_refresh_state,
-        put_refresh_state, refresh_provider_credential, refresh_state_name, refresh_strategy_name,
-        run_refresh_worker_tick, seconds_until_ms,
+        NewRefreshStateConfig, anthropic_subscription_login_rejected, delete_refresh_state,
+        get_refresh_state, new_refresh_state, put_refresh_state, refresh_provider_credential,
+        refresh_state_name, refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
     };
     use crate::persistence::test_store;
     use openshell_core::ObjectId;
@@ -1071,6 +1091,7 @@ mod tests {
         Provider, ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
     };
     use std::collections::HashMap;
+    use tonic::Status;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2235,6 +2256,42 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn relogin_hint_applies_only_to_anthropic_oauth_grant_rejection() {
+        let rejected = Status::failed_precondition("token endpoint returned HTTP 400 Bad Request");
+        assert!(anthropic_subscription_login_rejected(
+            &provider("plan", "anthropic-oauth"),
+            &rejected
+        ));
+        assert!(
+            anthropic_subscription_login_rejected(
+                &provider("plan", "claude-subscription"),
+                &rejected
+            ),
+            "type alias must get the hint too"
+        );
+        assert!(
+            !anthropic_subscription_login_rejected(
+                &provider("plan", "anthropic-oauth"),
+                &Status::unavailable("token endpoint request failed: timeout")
+            ),
+            "transient network errors must not suggest re-login"
+        );
+        assert!(
+            !anthropic_subscription_login_rejected(
+                &provider("plan", "anthropic-oauth"),
+                &Status::failed_precondition(
+                    "token endpoint returned HTTP 500 Internal Server Error"
+                )
+            ),
+            "server-side errors must not suggest re-login"
+        );
+        assert!(!anthropic_subscription_login_rejected(
+            &provider("graph", "custom"),
+            &rejected
+        ));
     }
 
     const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----
