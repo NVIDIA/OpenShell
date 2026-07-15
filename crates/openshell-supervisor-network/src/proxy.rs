@@ -3493,6 +3493,38 @@ async fn handle_forward_proxy(
     };
     let host_lc = host.to_ascii_lowercase();
 
+    if host_lc == POLICY_LOCAL_HOST {
+        if scheme != "http" || port != 80 {
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_policy_local_scheme",
+                    "Use http://policy.local only",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(ctx) = policy_local_ctx {
+            return crate::policy_local::handle_forward_request(
+                &ctx,
+                method,
+                &path,
+                &buf[..used],
+                client,
+            )
+            .await;
+        }
+        respond(
+            client,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 31\r\n\r\npolicy.local is not configured",
+        )
+        .await?;
+        return Ok(());
+    }
+
     if scheme != "http" {
         let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Refuse)
@@ -3524,38 +3556,6 @@ async fn handle_forward_proxy(
             )
             .await?;
         }
-        return Ok(());
-    }
-
-    if host_lc == POLICY_LOCAL_HOST {
-        if port != 80 {
-            respond(
-                client,
-                &build_json_error_response(
-                    400,
-                    "Bad Request",
-                    "invalid_policy_local_scheme",
-                    "Use http://policy.local only",
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-        if let Some(ctx) = policy_local_ctx {
-            return crate::policy_local::handle_forward_request(
-                &ctx,
-                method,
-                &path,
-                &buf[..used],
-                client,
-            )
-            .await;
-        }
-        respond(
-            client,
-            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 31\r\n\r\npolicy.local is not configured",
-        )
-        .await?;
         return Ok(());
     }
 
@@ -4965,6 +4965,23 @@ network_policies: {}
                 .windows(b"unsupported_proxy_scheme".len())
                 .any(|window| window == b"unsupported_proxy_scheme")
         );
+    }
+
+    #[tokio::test]
+    async fn policy_local_preserves_specific_non_http_scheme_error() {
+        for scheme in ["https", "ftp"] {
+            let raw = format!(
+                "GET {scheme}://policy.local/resource HTTP/1.1\r\nHost: policy.local\r\n\r\n"
+            )
+            .into_bytes();
+            let response = Box::pin(drive_raw_request_through_handler(raw)).await;
+            assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+            assert!(
+                response
+                    .windows(b"invalid_policy_local_scheme".len())
+                    .any(|window| window == b"invalid_policy_local_scheme")
+            );
+        }
     }
 
     #[test]
