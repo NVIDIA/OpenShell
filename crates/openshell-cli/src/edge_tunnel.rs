@@ -179,7 +179,12 @@ async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream
     let tcp = match ws_stream.get_ref() {
         MaybeTlsStream::Plain(tcp) => Some(tcp),
         MaybeTlsStream::Rustls(tls) => Some(tls.get_ref().0),
-        _ => None,
+        // `MaybeTlsStream` is #[non_exhaustive]; surface any future/unknown
+        // variant so a silent TCP_NODELAY miss doesn't go unnoticed.
+        _ => {
+            debug!("edge tunnel: unrecognized MaybeTlsStream variant; skipping TCP_NODELAY");
+            None
+        }
     };
     if let Some(tcp) = tcp {
         set_tcp_nodelay_best_effort(tcp);

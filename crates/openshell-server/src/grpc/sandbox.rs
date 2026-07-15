@@ -12,6 +12,7 @@
 use crate::ServerState;
 use crate::persistence::{ObjectType, WriteCondition, generate_name};
 use futures::future;
+use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
     CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -1725,6 +1726,9 @@ async fn run_interactive_exec_with_russh(
     let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
         .await
         .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
+    // russh client end of the loopback exec bridge — disable Nagle so keystroke
+    // and PTY tinygrams don't stall on delayed ACKs.
+    set_tcp_nodelay_best_effort(&stream);
 
     let config = Arc::new(exec_ssh_client_config());
     let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
@@ -1854,6 +1858,9 @@ async fn start_single_use_ssh_proxy_over_relay(
             warn!("SSH relay proxy: failed to accept local connection");
             return;
         };
+        // Loopback bridge for interactive SSH exec (keystrokes, line-buffered
+        // PTY output) — disable Nagle so tinygrams don't stall on delayed ACKs.
+        set_tcp_nodelay_best_effort(&client_conn);
         let _ = tokio::io::copy_bidirectional(&mut client_conn, &mut relay_stream).await;
     });
 
@@ -1896,6 +1903,9 @@ async fn run_exec_with_russh(
     let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
         .await
         .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
+    // russh client end of the loopback exec bridge — disable Nagle so keystroke
+    // and PTY tinygrams don't stall on delayed ACKs.
+    set_tcp_nodelay_best_effort(&stream);
 
     let config = Arc::new(exec_ssh_client_config());
     let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
