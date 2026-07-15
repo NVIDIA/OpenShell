@@ -73,6 +73,10 @@ Runtime-specific implementation notes belong in the driver crate README:
 - `crates/openshell-driver-kubernetes/README.md`
 - `crates/openshell-driver-vm/README.md`
 
+The combined VM topology runs `openshell-sandbox` as guest PID 1. libkrun
+executes the driver-owned guest bootstrap as PID 1, and the bootstrap preserves
+that identity when it execs the supervisor after mounting and network setup.
+
 ## Supervisor Delivery
 
 The supervisor must be available inside each sandbox workload:
