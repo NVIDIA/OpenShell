@@ -3493,8 +3493,42 @@ async fn handle_forward_proxy(
     };
     let host_lc = host.to_ascii_lowercase();
 
+    if scheme != "http" {
+        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Refuse)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Rejected)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .message(format!(
+                "FORWARD rejected: unsupported scheme {scheme} for {host_lc}:{port}"
+            ))
+            .build();
+        ocsf_emit!(event);
+        if scheme == "https" {
+            respond(
+                client,
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 27\r\n\r\nUse CONNECT for HTTPS URLs",
+            )
+            .await?;
+        } else {
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "unsupported_proxy_scheme",
+                    "Forward proxy requests must use http",
+                ),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
     if host_lc == POLICY_LOCAL_HOST {
-        if scheme != "http" || port != 80 {
+        if port != 80 {
             respond(
                 client,
                 &build_json_error_response(
@@ -3525,31 +3559,7 @@ async fn handle_forward_proxy(
         return Ok(());
     }
 
-    // 2. Reject HTTPS — must use CONNECT for TLS
-    if scheme == "https" {
-        {
-            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                .activity(ActivityId::Refuse)
-                .action(ActionId::Denied)
-                .disposition(DispositionId::Rejected)
-                .severity(SeverityId::Informational)
-                .status(StatusId::Failure)
-                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .message(format!(
-                    "FORWARD rejected: HTTPS requires CONNECT for {host_lc}:{port}"
-                ))
-                .build();
-            ocsf_emit!(event);
-        }
-        respond(
-            client,
-            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 27\r\n\r\nUse CONNECT for HTTPS URLs",
-        )
-        .await?;
-        return Ok(());
-    }
-
-    // 3. Evaluate OPA policy (same identity binding as CONNECT)
+    // 2. Evaluate OPA policy (same identity binding as CONNECT)
     let peer_addr = client.peer_addr().into_diagnostic()?;
     let _local_addr = client.local_addr().into_diagnostic()?;
 
@@ -4925,6 +4935,36 @@ network_policies: {}
                 "malformed request for {host} must fail at ingress"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_request_lines_are_rejected_before_connect_or_forward_dispatch() {
+        for host in ["api.example.com", "unmatched.example.com"] {
+            for request_line in [
+                format!("GET http://{host}/ HTTP/1.1 extra"),
+                format!("CONNECT {host}:443 HTTP/1.1 extra"),
+            ] {
+                let raw = format!("{request_line}\r\nHost: {host}\r\n\r\n").into_bytes();
+                let response = Box::pin(drive_raw_request_through_handler(raw)).await;
+                assert!(
+                    response.starts_with(b"HTTP/1.1 400 Bad Request"),
+                    "malformed request for {host} must fail before dispatch"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_forward_scheme_is_rejected_before_policy_or_middleware_dispatch() {
+        let raw = b"GET ftp://api.example.com/resource HTTP/1.1\r\nHost: api.example.com\r\n\r\n"
+            .to_vec();
+        let response = Box::pin(drive_raw_request_through_handler(raw)).await;
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+        assert!(
+            response
+                .windows(b"unsupported_proxy_scheme".len())
+                .any(|window| window == b"unsupported_proxy_scheme")
+        );
     }
 
     #[test]

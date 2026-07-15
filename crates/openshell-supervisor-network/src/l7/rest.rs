@@ -297,11 +297,11 @@ pub(crate) fn request_from_buffered_http(
     })
 }
 
-/// Validate HTTP/1 request header fields before policy evaluation or forwarding.
+/// Validate an HTTP/1 request line and header fields before policy evaluation or forwarding.
 ///
-/// This parser deliberately rejects obsolete line folding and malformed field
-/// names rather than allowing downstream middleware and the upstream server to
-/// interpret the same wire bytes differently.
+/// This parser deliberately rejects malformed request lines, obsolete line
+/// folding, and malformed field names rather than allowing policy, middleware,
+/// and the upstream server to interpret the same wire bytes differently.
 pub(crate) fn validate_http_request_header_block(headers: &[u8]) -> Result<()> {
     let headers =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
@@ -309,9 +309,10 @@ pub(crate) fn validate_http_request_header_block(headers: &[u8]) -> Result<()> {
         .strip_suffix("\r\n\r\n")
         .ok_or_else(|| miette!("HTTP request headers are missing the CRLF terminator"))?;
     let mut lines = header_block.split("\r\n");
-    lines
+    let request_line = lines
         .next()
         .ok_or_else(|| miette!("HTTP request is missing a request line"))?;
+    validate_http_request_line(request_line)?;
     let mut connection_nominated = HashSet::new();
 
     for line in lines {
@@ -368,6 +369,38 @@ pub(crate) fn validate_http_request_header_block(headers: &[u8]) -> Result<()> {
             "HTTP Connection header nominates a request framing or routing field"
         ));
     }
+    Ok(())
+}
+
+fn validate_http_request_line(request_line: &str) -> Result<()> {
+    let mut parts = request_line.split(' ');
+    let method = parts
+        .next()
+        .ok_or_else(|| miette!("HTTP request line is missing a method"))?;
+    let target = parts
+        .next()
+        .ok_or_else(|| miette!("HTTP request line is missing a target"))?;
+    let version = parts
+        .next()
+        .ok_or_else(|| miette!("HTTP request line is missing a version"))?;
+
+    if parts.next().is_some() || method.is_empty() || target.is_empty() || version.is_empty() {
+        return Err(miette!(
+            "HTTP request line must be exactly 'METHOD SP target SP HTTP/1.0|HTTP/1.1'"
+        ));
+    }
+    if !method.bytes().all(is_http_field_name_byte) {
+        return Err(miette!("HTTP request method is not a valid HTTP token"));
+    }
+    if target.bytes().any(|byte| byte <= b' ' || byte == 0x7f) {
+        return Err(miette!(
+            "HTTP request target contains whitespace or a control byte"
+        ));
+    }
+    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(miette!("Unsupported HTTP version: {version}"));
+    }
+
     Ok(())
 }
 
@@ -3616,6 +3649,22 @@ mod tests {
         ] {
             request_from_buffered_http("GET", "/v1/items", "/v1/items", raw.to_vec())
                 .expect_err("malformed buffered header fields must be rejected");
+        }
+    }
+
+    #[test]
+    fn buffered_request_parser_rejects_malformed_request_lines() {
+        for raw in [
+            b"GET /v1/items HTTP/1.1 extra\r\nHost: api.example.com\r\n\r\n".as_slice(),
+            b"GET  /v1/items HTTP/1.1\r\nHost: api.example.com\r\n\r\n".as_slice(),
+            b"GET\t/v1/items HTTP/1.1\r\nHost: api.example.com\r\n\r\n".as_slice(),
+            b"GE(T /v1/items HTTP/1.1\r\nHost: api.example.com\r\n\r\n".as_slice(),
+            b"GET /v1/\0items HTTP/1.1\r\nHost: api.example.com\r\n\r\n".as_slice(),
+            b"GET /v1/items HTTP/2\r\nHost: api.example.com\r\n\r\n".as_slice(),
+            b"GET /v1/items\r\nHost: api.example.com\r\n\r\n".as_slice(),
+        ] {
+            request_from_buffered_http("GET", "/v1/items", "/v1/items", raw.to_vec())
+                .expect_err("malformed buffered request lines must be rejected");
         }
     }
 
