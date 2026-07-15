@@ -935,7 +935,7 @@ jobs:
               release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'dev' });
             } catch (err) {
               if (err.status === 404) {
-                core.info('No existing dev release found; skipping wheel pruning.');
+                core.info('No existing dev release found; skipping managed asset pruning.');
                 return;
               }
               throw err;
@@ -954,7 +954,8 @@ jobs:
                 name.endsWith('.txt') ||
                 name.endsWith('.whl') ||
                 name.endsWith('.deb') ||
-                name.endsWith('.rpm')
+                name.endsWith('.rpm') ||
+                name.endsWith('.snap')
               )
             );
 
