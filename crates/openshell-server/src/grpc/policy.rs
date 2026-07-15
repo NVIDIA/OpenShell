@@ -1481,7 +1481,7 @@ async fn profile_provider_policy_layers_with_catalog(
     Ok(layers)
 }
 
-fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
+pub(super) fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
     match settings.settings.get(key) {
         None => Ok(false),
         Some(StoredSettingValue::Bool(value)) => Ok(*value),
@@ -3979,6 +3979,30 @@ fn upsert_setting_value(
 
 pub(super) async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
     load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, GLOBAL_SETTINGS_NAME).await
+}
+
+/// Whether a boolean global setting is enabled, loading global settings from the
+/// store. Exposed to sibling modules that need a gate check without depending on
+/// the private `StoredSettings` type.
+pub async fn global_bool_setting_enabled(store: &Store, key: &str) -> Result<bool, Status> {
+    let global_settings = load_global_settings(store).await?;
+    bool_setting_enabled(&global_settings, key)
+}
+
+/// Test helper: set a boolean global setting, loading current settings first so
+/// the CAS write succeeds whether the record already exists or not. Available to
+/// sibling test modules without exposing the private `StoredSettings` type.
+#[cfg(test)]
+pub async fn set_global_bool_setting_for_test(
+    store: &Store,
+    key: &str,
+    value: bool,
+) -> Result<(), Status> {
+    let mut settings = load_global_settings(store).await?;
+    settings
+        .settings
+        .insert(key.to_string(), StoredSettingValue::Bool(value));
+    save_global_settings(store, &settings).await
 }
 
 pub(super) async fn save_global_settings(

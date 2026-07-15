@@ -311,8 +311,9 @@ Profile YAML can declare these refresh strategies:
 | `oauth2_refresh_token` | The gateway exchanges a refresh token for a short-lived access token. |
 | `oauth2_client_credentials` | The gateway mints a short-lived access token with OAuth2 client credentials. |
 | `google_service_account_jwt` | The gateway signs a Google service account JWT and exchanges it for an access token. |
+| `aws_sts_assume_role` | The gateway calls `sts:AssumeRole` and mints `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` in one operation. Requires `providers_v2_enabled=true`. |
 
-`openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, and `google-service-account-jwt`. Use `openshell provider update` for `static` and `external` refresh patterns.
+`openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, `google-service-account-jwt`, and `aws-sts-assume-role`. Use `openshell provider update` for `static` and `external` refresh patterns.
 
 Gateway-managed refresh strategies use these material keys:
 
@@ -321,8 +322,35 @@ Gateway-managed refresh strategies use these material keys:
 | `oauth2_refresh_token` | `client_id`, `refresh_token`, optional `client_secret`. |
 | `oauth2_client_credentials` | `client_id`, `client_secret`, optional `tenant_id` for Microsoft Entra token URLs. |
 | `google_service_account_jwt` | `client_email`, `private_key`, optional `subject` or `sub`. |
+| `aws_sts_assume_role` | `role_arn`, optional `session_name`, `external_id`, `aws_region`, and optional long-lived `aws_access_key_id` / `aws_secret_access_key` for gateways without ambient AWS credentials. |
 
 OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
+
+### Additional Outputs
+
+Most refresh strategies mint a single credential. `aws_sts_assume_role` mints three. A refresh declares the extra credentials it co-mints with `additional_outputs`, mapping each strategy-defined output id to a sibling credential whose `env_vars` receive the value:
+
+```yaml
+credentials:
+  - name: access_key_id
+    env_vars: [AWS_ACCESS_KEY_ID]
+    required: true
+    refresh:
+      strategy: aws_sts_assume_role
+      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token
+  - name: secret_access_key
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true
+```
+
+The refresh attaches to the primary credential (`access_key_id`). Each referenced sibling must exist, declare exactly one env var, and not carry its own refresh. Because a refresh's outputs are runtime-resolvable, a profile whose only credentials are STS-minted can be created with `--runtime-credentials`. The resolved output-to-env-key mapping is pinned when refresh is configured, so later profile edits do not silently redirect where minted values are written.
 
 ### Dynamic Token Grants
 

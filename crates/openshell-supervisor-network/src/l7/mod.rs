@@ -455,17 +455,25 @@ fn validate_host_wildcard(errors: &mut Vec<String>, loc: &str, host: &str) {
 
     let labels: Vec<&str> = host.split('.').collect();
     let first_label = labels.first().copied().unwrap_or_default();
-    if labels.iter().skip(1).any(|label| label.contains('*')) {
-        errors.push(format!(
-            "{loc}: host wildcard may only appear in the first DNS label, got '{host}'"
-        ));
-        return;
-    }
     if first_label.contains("**") && first_label != "**" {
         errors.push(format!(
             "{loc}: recursive host wildcard '**' is only allowed as the entire first DNS label, got '{host}'"
         ));
         return;
+    }
+    for label in labels.iter().skip(1).copied() {
+        if label.contains("**") {
+            errors.push(format!(
+                "{loc}: recursive host wildcard '**' is only allowed as the entire first DNS label, got '{host}'"
+            ));
+            return;
+        }
+        if label.contains('*') && label != "*" {
+            errors.push(format!(
+                "{loc}: middle DNS label wildcard must be the entire label '*', got '{host}'"
+            ));
+            return;
+        }
     }
 
     // Reject TLD or single-label wildcards. They are accepted by the policy
@@ -2877,12 +2885,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_wildcard_host_mid_label_error() {
+    fn validate_wildcard_host_middle_label_star_valid_no_error() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
                     "endpoints": [{
-                        "host": "foo.*.example.com",
+                        "host": "*.s3.*.amazonaws.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "*.s3.*.amazonaws.com should be valid, got errors: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "*.s3.*.amazonaws.com should not warn, got warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_middle_label_partial_star_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*.s3.us-*.amazonaws.com",
                         "port": 443
                     }],
                     "binaries": []
@@ -2891,8 +2923,30 @@ mod tests {
         });
         let (errors, _warnings) = validate_l7_policies(&data);
         assert!(
-            errors.iter().any(|e| e.contains("first DNS label")),
-            "Mid-label wildcard should be rejected, got errors: {errors:?}"
+            errors
+                .iter()
+                .any(|e| e.contains("middle DNS label wildcard")),
+            "Partial middle-label wildcard should be rejected, got errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_middle_label_double_star_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*.s3.**.amazonaws.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("recursive host wildcard")),
+            "Middle-label ** wildcard should be rejected, got errors: {errors:?}"
         );
     }
 
