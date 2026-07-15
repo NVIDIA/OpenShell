@@ -267,10 +267,5 @@ jobs:
           shared-key: e2e-vm-linux-amd64
           cache-on-failure: "true"
 
-      - name: Run VM smoke and host gateway E2E
-        run: mise run --no-deps --skip-deps e2e:vm
-
-      - name: Run VM gateway resume E2E
-        env:
-          OPENSHELL_E2E_VM_TEST: vm_gateway_resume
+      - name: Run VM E2E
         run: mise run --no-deps --skip-deps e2e:vm
