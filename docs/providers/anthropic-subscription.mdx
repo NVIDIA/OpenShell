@@ -22,13 +22,12 @@ Use this provider when you want sandboxed agents to consume your Claude subscrip
 Create the provider with `--from-claude-login`:
 
 ```shell
-openshell provider create \
-  --name claude-subscription \
-  --type anthropic-oauth \
-  --from-claude-login
+openshell provider create --from-claude-login
 ```
 
 `--from-claude-login` reads the local Claude Code login, stores the access token as the gateway-side `ANTHROPIC_OAUTH_TOKEN` credential, and configures an OAuth2 refresh-token flow using your subscription's refresh token. The gateway refreshes the access token ahead of expiry and updates running sandboxes without a restart.
+
+The provider name defaults to `claude-subscription` and the type to `anthropic-oauth`; pass `--name` or `--type` to override. When no inference route is configured yet, the command also points the user-facing route at the new provider with a default model, so no separate `inference set` step is needed.
 
 The CLI reads the macOS Keychain first, then falls back to `~/.claude/.credentials.json`. If neither contains a login, the command fails and directs you to run `claude login`.
 
@@ -46,6 +45,8 @@ The subscription OAuth token represents your whole plan, so it is shared across 
 
 To rotate or revoke, delete and recreate the provider, or rotate the credential through `openshell provider refresh`.
 
+If the refresh token becomes invalid — you logged out of Claude Code, revoked the session, or the plan lapsed — `openshell provider refresh status` reports the failure with recovery instructions: run `claude login` on the host, then delete and recreate the provider with `--from-claude-login`.
+
 ## Configure Inference Routing
 
 Enable provider endpoint injection so the Anthropic network endpoint is added to sandbox policies automatically:
@@ -54,7 +55,7 @@ Enable provider endpoint injection so the Anthropic network endpoint is added to
 openshell settings set --global --key providers_v2_enabled --value true --yes
 ```
 
-Then point `inference.local` at the provider:
+Provider creation with `--from-claude-login` configures the route automatically when none exists. To change the model, or when another route was already configured, set it explicitly:
 
 ```shell
 openshell inference set \
@@ -74,24 +75,25 @@ The complete setup from scratch:
 # 1. Enable provider endpoint injection
 openshell settings set --global --key providers_v2_enabled --value true --yes
 
-# 2. Authenticate on the host, then create the provider
-claude login
-openshell provider create --name claude-subscription --type anthropic-oauth --from-claude-login
+# 2. Create the provider from the local Claude Code login
+#    (also configures the inference route when none exists)
+openshell provider create --from-claude-login
 
-# 3. Configure inference routing
-openshell inference set --provider claude-subscription --model claude-sonnet-4-6
-
-# 4. Create a sandbox with the provider attached
-openshell sandbox create --name my-sandbox --provider claude-subscription
+# 3. Create a sandbox with the provider attached and launch Claude Code
+openshell sandbox create --provider claude-subscription -- claude
 ```
 
-Then inside the sandbox, launch Claude Code against the local endpoint:
+Step 3 drops you into Claude Code running inside the sandbox on your subscription. In an existing sandbox, launch it with no configuration:
 
 ```shell
-ANTHROPIC_BASE_URL="https://inference.local" ANTHROPIC_API_KEY=unused claude -p "Reply with exactly: pong"
+claude -p "Reply with exactly: pong"
 ```
 
-Setting `ANTHROPIC_API_KEY` to any placeholder makes Claude Code talk to the gateway endpoint directly instead of starting its own OAuth login flow inside the sandbox. The placeholder key never reaches Anthropic — `inference.local` strips it and injects the real subscription token before forwarding. Drop the `-p "…"` to launch the interactive TUI instead.
+Sandboxes bound to an `anthropic-oauth` provider start with `ANTHROPIC_BASE_URL=https://inference.local` and a placeholder `ANTHROPIC_AUTH_TOKEN` preset, so agent CLIs use the gateway endpoint instead of prompting for an interactive login. The auth token is used rather than `ANTHROPIC_API_KEY` because Claude Code accepts it without a confirmation prompt. The placeholder never reaches Anthropic — `inference.local` replaces caller auth with the real subscription token before forwarding. Set either variable explicitly to override the preset; tools that only read `ANTHROPIC_API_KEY` can be pointed at the gateway by setting that variable to any value. Drop the `-p "…"` to launch the interactive TUI instead.
+
+<Note>
+Claude Code's startup banner may report API billing because it authenticates through an environment token. The label is cosmetic: the subscription token is injected at the egress boundary, outside the sandbox, so requests are billed to your subscription plan, not to metered API usage.
+</Note>
 
 ## Next Steps
 

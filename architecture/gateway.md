@@ -459,10 +459,19 @@ The CLI `--from-claude-login` harvests the local Claude Code login (macOS
 Keychain `Claude Code-credentials` or `~/.claude/.credentials.json`) on the host,
 stores the access token under the non-injectable `ANTHROPIC_OAUTH_TOKEN`
 credential, and calls `ConfigureProviderRefresh` with the subscription's refresh
-token (Anthropic public `client_id` only, no secret). The background refresh
+token (Anthropic public `client_id` only, no secret). With `--from-claude-login`
+the provider name and type default (`claude-subscription` / `anthropic-oauth`),
+and when no user inference route exists the CLI points the route at the new
+provider (best-effort, unverified). The background refresh
 worker rotates the access token ahead of expiry and persists Anthropic's rotated
 refresh token. The access token is never exported into sandbox environments; it
 rides the inference route bundle and is injected only at the egress boundary.
+Instead, the provider plugin projects `ANTHROPIC_BASE_URL=https://inference.local`
+and a placeholder `ANTHROPIC_AUTH_TOKEN` into bound sandboxes so agent CLIs work
+without manual configuration or confirmation prompts; `inference.local` replaces
+the placeholder auth with the real token before forwarding. The base URL is
+resolved to its real value in the sandbox env (agents must parse it at startup);
+the auth token stays an egress placeholder like any other credential.
 
 ## Supervisor Relay
 
