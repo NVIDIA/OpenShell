@@ -662,7 +662,21 @@ async fn handle_tcp_connection(
         }
     }
 
-    let request = String::from_utf8_lossy(&buf[..used]);
+    let header_end = buf[..used]
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("header terminator was observed")
+        + 4;
+    if crate::l7::rest::validate_http_request_header_block(&buf[..header_end]).is_err() {
+        respond(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+        return Ok(());
+    }
+    let request =
+        std::str::from_utf8(&buf[..header_end]).expect("validated HTTP request headers are UTF-8");
+    if crate::l7::rest::parse_body_length(request).is_err() {
+        respond(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+        return Ok(());
+    }
     let mut lines = request.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
@@ -3240,6 +3254,15 @@ fn rewrite_forward_request(
 
     let header_str = String::from_utf8_lossy(&raw[..header_end]);
     let lines = header_str.split("\r\n").collect::<Vec<_>>();
+    let connection_nominated: std::collections::HashSet<String> = lines
+        .iter()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect();
 
     // Rebuild headers, stripping hop-by-hop and adding proxy headers
     let mut output = Vec::with_capacity(header_end + 128);
@@ -3267,25 +3290,39 @@ fn rewrite_forward_request(
             break;
         }
 
-        let lower = line.to_ascii_lowercase();
+        let (field_name, _) = line
+            .split_once(':')
+            .expect("forward request passed strict ingress header validation");
+        let field_name = field_name.to_ascii_lowercase();
 
         // Strip proxy hop-by-hop headers
-        if lower.starts_with("proxy-connection:")
-            || lower.starts_with("proxy-authorization:")
-            || lower.starts_with("proxy-authenticate:")
+        if matches!(
+            field_name.as_str(),
+            "proxy-connection" | "proxy-authorization" | "proxy-authenticate"
+        ) {
+            continue;
+        }
+
+        if connection_nominated.contains(&field_name)
+            && !(websocket_upgrade && field_name == "upgrade")
         {
             continue;
         }
 
         // Replace Connection header
-        if lower.starts_with("connection:") {
+        if field_name == "connection" {
+            if has_connection {
+                continue;
+            }
             has_connection = true;
             if websocket_upgrade {
-                output.extend_from_slice(line.as_bytes());
-                output.extend_from_slice(b"\r\n");
+                output.extend_from_slice(b"Connection: Upgrade\r\n");
                 continue;
             }
             output.extend_from_slice(b"Connection: close\r\n");
+            continue;
+        }
+        if field_name == "upgrade" && !websocket_upgrade {
             continue;
         }
 
@@ -3297,7 +3334,7 @@ fn rewrite_forward_request(
         output.extend_from_slice(rewritten_line.as_bytes());
         output.extend_from_slice(b"\r\n");
 
-        if lower.starts_with("via:") {
+        if field_name == "via" {
             has_via = true;
         }
     }
@@ -4842,6 +4879,62 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    async fn drive_raw_request_through_handler(raw: Vec<u8>) -> Vec<u8> {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let data = r#"
+network_middlewares:
+  - name: guard
+    middleware: openshell/regex
+    endpoints:
+      include: ["api.example.com"]
+network_policies: {}
+"#;
+        let engine = Arc::new(OpaEngine::from_strings(policy, data).expect("load policy"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut socket = TcpStream::connect(address).await.unwrap();
+            socket.write_all(&raw).await.unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            response
+        });
+        let (server, _) = listener.accept().await.unwrap();
+
+        Box::pin(handle_tcp_connection(
+            server,
+            engine,
+            Arc::new(BinaryIdentityCache::new()),
+            Arc::new(AtomicU32::new(std::process::id())),
+            None,
+            None,
+            None,
+            Arc::new(None),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .expect("malformed request should be handled");
+        client.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn malformed_forward_headers_are_rejected_before_route_or_middleware_dispatch() {
+        for host in ["api.example.com", "unmatched.example.com"] {
+            let raw = format!(
+                "GET http://{host}/ HTTP/1.1\r\nHost: {host}\r\nX-Guard: before\0after\r\n\r\n"
+            )
+            .into_bytes();
+            let response = Box::pin(drive_raw_request_through_handler(raw)).await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 400 Bad Request"),
+                "malformed request for {host} must fail at ingress"
+            );
+        }
+    }
 
     #[test]
     fn middleware_denial_response_contains_only_platform_mutation_reason() {
@@ -8051,6 +8144,20 @@ network_policies:
     }
 
     #[test]
+    fn test_rewrite_strips_connection_nominated_headers() {
+        let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nX-Guard: hidden\r\nConnection: keep-alive, x-guard\r\nKeep-Alive: timeout=5\r\nX-Visible: yes\r\n\r\n";
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
+        let result_str = String::from_utf8_lossy(&result);
+        let lower = result_str.to_ascii_lowercase();
+
+        assert!(!lower.contains("x-guard:"));
+        assert!(!lower.contains("keep-alive:"));
+        assert!(result_str.contains("Connection: close\r\n"));
+        assert!(result_str.contains("X-Visible: yes\r\n"));
+    }
+
+    #[test]
     fn test_rewrite_preserves_body_overflow() {
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 13\r\n\r\n{\"key\":\"val\"}";
         let result =
@@ -8279,6 +8386,9 @@ network_policies:
                    Host: gateway.example.test\r\n\
                    Upgrade: websocket\r\n\
                    Connection: keep-alive, Upgrade\r\n\
+                   Keep-Alive: timeout=5\r\n\
+                   X-Guard: hidden\r\n\
+                   Connection: x-guard\r\n\
                    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                    Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\
                    Sec-WebSocket-Version: 13\r\n\r\n";
@@ -8288,7 +8398,9 @@ network_policies:
         let result_str = String::from_utf8_lossy(&result);
 
         assert!(result_str.starts_with("GET /ws HTTP/1.1\r\n"));
-        assert!(result_str.contains("Connection: keep-alive, Upgrade\r\n"));
+        assert!(result_str.contains("Connection: Upgrade\r\n"));
+        assert!(!result_str.contains("keep-alive"));
+        assert!(!result_str.to_ascii_lowercase().contains("x-guard:"));
         assert!(
             !result_str.contains("Connection: close\r\n"),
             "websocket forward proxy must not strip the upgrade token"

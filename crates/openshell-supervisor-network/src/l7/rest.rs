@@ -203,9 +203,9 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     // bytes with U+FFFD, creating an interpretation gap between this proxy
     // (which parses the lossy string) and upstream servers (which receive the
     // raw bytes). This gap enables request smuggling via mutated header names.
+    validate_http_request_header_block(&buf[..header_end])?;
     let header_str = std::str::from_utf8(&buf[..header_end])
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    validate_http_request_header_block(header_str)?;
 
     let request_line = header_str
         .lines()
@@ -282,9 +282,9 @@ pub(crate) fn request_from_buffered_http(
         .position(|window| window == b"\r\n\r\n")
         .ok_or_else(|| miette!("HTTP request headers are missing the CRLF terminator"))?
         + 4;
+    validate_http_request_header_block(&raw_header[..header_end])?;
     let header_str = std::str::from_utf8(&raw_header[..header_end])
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    validate_http_request_header_block(header_str)?;
     let body_length = parse_body_length(header_str)?;
     let (_, query_params) = parse_target_query(query_target)?;
 
@@ -302,7 +302,9 @@ pub(crate) fn request_from_buffered_http(
 /// This parser deliberately rejects obsolete line folding and malformed field
 /// names rather than allowing downstream middleware and the upstream server to
 /// interpret the same wire bytes differently.
-pub(crate) fn validate_http_request_header_block(headers: &str) -> Result<()> {
+pub(crate) fn validate_http_request_header_block(headers: &[u8]) -> Result<()> {
+    let headers =
+        std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let header_block = headers
         .strip_suffix("\r\n\r\n")
         .ok_or_else(|| miette!("HTTP request headers are missing the CRLF terminator"))?;
@@ -310,6 +312,7 @@ pub(crate) fn validate_http_request_header_block(headers: &str) -> Result<()> {
     lines
         .next()
         .ok_or_else(|| miette!("HTTP request is missing a request line"))?;
+    let mut connection_nominated = HashSet::new();
 
     for line in lines {
         if line
@@ -321,7 +324,7 @@ pub(crate) fn validate_http_request_header_block(headers: &str) -> Result<()> {
                 "HTTP request header continuation lines are not supported"
             ));
         }
-        let (name, _) = line
+        let (name, value) = line
             .split_once(':')
             .ok_or_else(|| miette!("HTTP request header field is missing ':'"))?;
         if name
@@ -338,6 +341,32 @@ pub(crate) fn validate_http_request_header_block(headers: &str) -> Result<()> {
                 "HTTP request header field name is not a valid HTTP token"
             ));
         }
+        if !value.bytes().all(is_http_field_value_byte) {
+            return Err(miette!(
+                "HTTP request header field value contains an invalid control byte"
+            ));
+        }
+        if name.eq_ignore_ascii_case("connection") {
+            for token in value.split(',') {
+                let token = token.trim();
+                if token.is_empty() || !token.bytes().all(is_http_field_name_byte) {
+                    return Err(miette!(
+                        "HTTP Connection header contains an invalid option token"
+                    ));
+                }
+                connection_nominated.insert(token.to_ascii_lowercase());
+            }
+        }
+    }
+    if connection_nominated.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "host" | "content-length" | "transfer-encoding"
+        )
+    }) {
+        return Err(miette!(
+            "HTTP Connection header nominates a request framing or routing field"
+        ));
     }
     Ok(())
 }
@@ -361,6 +390,10 @@ fn is_http_field_name_byte(byte: u8) -> bool {
                 | b'|'
                 | b'~'
         )
+}
+
+fn is_http_field_value_byte(byte: u8) -> bool {
+    byte == b'\t' || (b' '..=b'~').contains(&byte) || byte >= 0x80
 }
 
 /// Rebuild the request line in a raw HTTP header block with a canonicalized
@@ -565,6 +598,7 @@ where
     let header_str = std::str::from_utf8(&req.raw_header[..header_end])
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
     let client_requested_upgrade = client_requested_upgrade(header_str);
+    let is_websocket_request = request_is_websocket_upgrade(&req.raw_header[..header_end]);
     let websocket_request = if options.websocket_extensions == WebSocketExtensionMode::Preserve {
         None
     } else {
@@ -587,6 +621,7 @@ where
         options.websocket_extensions,
         websocket_request.is_some(),
     )?;
+    let header_bytes = strip_connection_nominated_headers(&header_bytes, is_websocket_request)?;
     let websocket_response =
         websocket_request
             .as_ref()
@@ -1608,6 +1643,44 @@ fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
     Ok(out.into_bytes())
 }
 
+pub(crate) fn connection_nominated_header_names(headers: &[u8]) -> Result<HashSet<String>> {
+    validate_http_request_header_block(headers)?;
+    let header_str =
+        std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    Ok(header_str
+        .strip_suffix("\r\n\r\n")
+        .expect("validated header block has terminator")
+        .split("\r\n")
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, value)| value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect())
+}
+
+fn strip_connection_nominated_headers(
+    headers: &[u8],
+    preserve_websocket_upgrade: bool,
+) -> Result<Vec<u8>> {
+    let nominated = connection_nominated_header_names(headers)?;
+    let mut out = headers.to_vec();
+    for name in nominated {
+        if preserve_websocket_upgrade && name == "upgrade" {
+            continue;
+        }
+        out = strip_header(&out, &name)?;
+    }
+    out = strip_header(&out, "connection")?;
+    if preserve_websocket_upgrade {
+        out = append_header(&out, "Connection", "Upgrade");
+    } else {
+        out = strip_header(&out, "upgrade")?;
+    }
+    Ok(out)
+}
+
 fn append_header(headers: &[u8], name: &str, value: &str) -> Vec<u8> {
     let split = headers
         .windows(4)
@@ -2192,20 +2265,25 @@ fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
 /// `Content-Length` and `Transfer-Encoding` headers to prevent request
 /// smuggling via CL/TE ambiguity.
 pub(crate) fn parse_body_length(headers: &str) -> Result<BodyLength> {
-    let mut has_te_chunked = false;
+    let mut transfer_codings = Vec::new();
     let mut cl_value: Option<u64> = None;
 
     for line in headers.lines().skip(1) {
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("transfer-encoding:") {
-            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            if val.split(',').any(|enc| enc.trim() == "chunked") {
-                has_te_chunked = true;
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            for coding in value.split(',') {
+                let coding = coding.trim();
+                if coding.is_empty() {
+                    return Err(miette!("Request contains an empty Transfer-Encoding value"));
+                }
+                transfer_codings.push(coding.to_ascii_lowercase());
             }
         }
-        if lower.starts_with("content-length:") {
-            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            let len: u64 = val
+        if name.eq_ignore_ascii_case("content-length") {
+            let len: u64 = value
+                .trim()
                 .parse()
                 .map_err(|_| miette!("Request contains invalid Content-Length value"))?;
             if let Some(prev) = cl_value
@@ -2219,14 +2297,19 @@ pub(crate) fn parse_body_length(headers: &str) -> Result<BodyLength> {
         }
     }
 
-    if has_te_chunked && cl_value.is_some() {
+    if !transfer_codings.is_empty() && cl_value.is_some() {
         return Err(miette!(
             "Request contains both Transfer-Encoding and Content-Length headers"
         ));
     }
 
-    if has_te_chunked {
-        return Ok(BodyLength::Chunked);
+    if !transfer_codings.is_empty() {
+        if transfer_codings.len() == 1 && transfer_codings[0] == "chunked" {
+            return Ok(BodyLength::Chunked);
+        }
+        return Err(miette!(
+            "Request contains an unsupported Transfer-Encoding sequence"
+        ));
     }
     if let Some(len) = cl_value {
         return Ok(BodyLength::ContentLength(len));
@@ -3493,6 +3576,12 @@ mod tests {
             b"GET /v1/items HTTP/1.1\r\nX-Test value\r\n\r\n".as_slice(),
             b"GET /v1/items HTTP/1.1\r\nX-Test : value\r\n\r\n".as_slice(),
             b"GET /v1/items HTTP/1.1\r\nX@Test: value\r\n\r\n".as_slice(),
+            b"GET /v1/items HTTP/1.1\r\nX-Test: before\0after\r\n\r\n".as_slice(),
+            b"GET /v1/items HTTP/1.1\r\nX-Test: before\x7fafter\r\n\r\n".as_slice(),
+            b"GET /v1/items HTTP/1.1\r\nX-Test: before\rafter\r\n\r\n".as_slice(),
+            b"GET /v1/items HTTP/1.1\r\nConnection: x guard\r\n\r\n".as_slice(),
+            b"GET /v1/items HTTP/1.1\r\nConnection: content-length\r\nContent-Length: 0\r\n\r\n"
+                .as_slice(),
         ] {
             request_from_buffered_http("GET", "/v1/items", "/v1/items", raw.to_vec())
                 .expect_err("malformed buffered header fields must be rejected");
@@ -3668,14 +3757,63 @@ mod tests {
         );
     }
 
-    /// SEC: Transfer-Encoding substring match must not match partial tokens.
+    /// SEC: Unsupported transfer codings must not be silently treated as no body.
     #[test]
-    fn te_substring_not_chunked() {
-        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunkedx\r\n\r\n";
-        match parse_body_length(headers).unwrap() {
-            BodyLength::None => {}
-            other => panic!("Expected None for non-matching TE, got {other:?}"),
+    fn reject_unsupported_transfer_encoding_sequences() {
+        for value in [
+            "gzip",
+            "gzip, chunked",
+            "chunked, gzip",
+            "chunked, chunked",
+            "chunkedx",
+            "chunked,",
+        ] {
+            let headers =
+                format!("POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: {value}\r\n\r\n");
+            assert!(
+                parse_body_length(&headers).is_err(),
+                "unsupported transfer coding must be rejected: {value}"
+            );
         }
+    }
+
+    #[test]
+    fn reject_multiple_chunked_transfer_encoding_fields() {
+        let headers = "POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(parse_body_length(headers).is_err());
+    }
+
+    #[test]
+    fn reject_content_length_with_unsupported_transfer_encoding() {
+        let headers =
+            "POST /api HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nTransfer-Encoding: gzip\r\n\r\n";
+        assert!(parse_body_length(headers).is_err());
+    }
+
+    #[test]
+    fn strip_connection_nominated_headers_before_forwarding() {
+        let raw = b"GET /api HTTP/1.1\r\nHost: x\r\nX-Guard: hidden\r\nConnection: keep-alive, x-guard\r\nKeep-Alive: timeout=5\r\nX-Visible: yes\r\n\r\n";
+        let sanitized =
+            strip_connection_nominated_headers(raw, false).expect("sanitize request headers");
+        let sanitized = String::from_utf8(sanitized).unwrap();
+
+        assert!(!sanitized.to_ascii_lowercase().contains("x-guard:"));
+        assert!(!sanitized.to_ascii_lowercase().contains("keep-alive:"));
+        assert!(!sanitized.to_ascii_lowercase().contains("connection:"));
+        assert!(sanitized.contains("X-Visible: yes\r\n"));
+    }
+
+    #[test]
+    fn connection_sanitization_preserves_only_websocket_upgrade_exception() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade, x-guard\r\nX-Guard: hidden\r\n\r\n";
+        let sanitized =
+            strip_connection_nominated_headers(raw, true).expect("sanitize websocket headers");
+        let sanitized = String::from_utf8(sanitized).unwrap();
+
+        assert!(sanitized.contains("Upgrade: websocket\r\n"));
+        assert!(sanitized.contains("Connection: Upgrade\r\n"));
+        assert!(!sanitized.to_ascii_lowercase().contains("x-guard:"));
+        assert!(!sanitized.contains("keep-alive"));
     }
 
     #[tokio::test]
@@ -6105,6 +6243,20 @@ mod tests {
         upstream_task
             .await
             .map_err(|e| miette!("upstream task failed: {e}"))
+    }
+
+    #[tokio::test]
+    async fn connect_rest_relay_strips_connection_nominated_headers_upstream() {
+        let raw = b"GET /api HTTP/1.1\r\nHost: api.example.com\r\nX-Guard: hidden\r\nConnection: keep-alive, x-guard\r\nKeep-Alive: timeout=5\r\nX-Visible: yes\r\n\r\n".to_vec();
+        let forwarded = relay_and_capture_with_options(raw, BodyLength::None, None, false)
+            .await
+            .expect("relay request");
+        let lower = forwarded.to_ascii_lowercase();
+
+        assert!(!lower.contains("x-guard:"));
+        assert!(!lower.contains("keep-alive:"));
+        assert!(!lower.contains("connection:"));
+        assert!(forwarded.contains("X-Visible: yes\r\n"));
     }
 
     #[tokio::test]

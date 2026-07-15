@@ -10,7 +10,6 @@ use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
-use std::collections::HashSet;
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -298,13 +297,15 @@ struct SafeMiddlewareHeaders {
 }
 
 fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
+    crate::l7::rest::validate_http_request_header_block(headers)?;
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    crate::l7::rest::validate_http_request_header_block(header_str)?;
     let header_block = header_str
         .strip_suffix("\r\n\r\n")
         .expect("validated header block has terminator");
-    let parsed: Vec<(String, String)> = header_block
+    let connection_nominated = crate::l7::rest::connection_nominated_header_names(headers)?;
+
+    let visible = header_block
         .split("\r\n")
         .skip(1)
         .map(|line| {
@@ -313,17 +314,6 @@ fn safe_middleware_headers(headers: &[u8]) -> Result<SafeMiddlewareHeaders> {
                 .expect("validated header field contains colon");
             (name.to_ascii_lowercase(), value.trim().to_string())
         })
-        .collect();
-    let connection_nominated: HashSet<String> = parsed
-        .iter()
-        .filter(|(name, _)| name == "connection")
-        .flat_map(|(_, value)| value.split(','))
-        .map(|token| token.trim().to_ascii_lowercase())
-        .filter(|token| !token.is_empty())
-        .collect();
-
-    let visible = parsed
-        .into_iter()
         .filter(|(name, _)| {
             !name.is_empty()
                 && !matches!(

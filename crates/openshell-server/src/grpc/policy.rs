@@ -1241,6 +1241,12 @@ pub(super) async fn handle_get_sandbox_config(
             profile_provider_policy_layers(state.store.as_ref(), &sandbox_provider_names).await?;
         if !provider_layers.is_empty() {
             let effective_policy = compose_effective_policy(source_policy, &provider_layers);
+            validate_policy_safety(&effective_policy).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "provider composition produced an invalid effective policy: {}",
+                    error.message()
+                ))
+            })?;
             policy_hash = deterministic_policy_hash(&effective_policy);
             policy = Some(effective_policy);
         }
@@ -4816,6 +4822,82 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.host == "api.github.com")
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_rejects_invalid_provider_composed_policy() {
+        use openshell_core::proto::{
+            MiddlewareEndpointSelector, NetworkMiddlewareConfig, ProviderProfile,
+            ProviderProfileCategory, StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+
+        let profile = StoredProviderProfile {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "profile-tls-skip".to_string(),
+                name: "tls-skip".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            profile: Some(ProviderProfile {
+                id: "tls-skip".to_string(),
+                display_name: "TLS skip".to_string(),
+                category: ProviderProfileCategory::Other as i32,
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    tls: "skip".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        state.store.put_message(&profile).await.unwrap();
+        state
+            .store
+            .put_message(&test_provider("work-tls-skip", "tls-skip"))
+            .await
+            .unwrap();
+
+        let policy = ProtoSandboxPolicy {
+            network_middlewares: vec![NetworkMiddlewareConfig {
+                name: "redactor".to_string(),
+                middleware: "openshell/regex".to_string(),
+                on_error: "fail_closed".to_string(),
+                endpoints: Some(MiddlewareEndpointSelector {
+                    include: vec!["api.example.com".to_string()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-invalid-composed-policy",
+                "invalid-composed-policy",
+                policy,
+                vec!["work-tls-skip".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let error = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-invalid-composed-policy".to_string(),
+            })),
+        )
+        .await
+        .expect_err("invalid composed policy must not be delivered");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("provider composition"));
+        assert!(error.message().contains("tls: skip"));
     }
 
     #[tokio::test]

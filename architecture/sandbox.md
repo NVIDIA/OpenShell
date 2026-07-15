@@ -119,7 +119,9 @@ implementation-owned config before gateway admission. The supervisor's
 local-file path supplies its built-in catalog to the same JSON projection so it
 retains early config validation. Rego exposes the middleware list as policy
 data, but Rust performs selector validation, overlap detection, matching, chain
-ordering, implementation discovery, and config validation.
+ordering, implementation discovery, and config validation. When provider layers
+are composed just in time, the gateway reruns structural validation on the
+complete effective policy before delivering it to a supervisor.
 
 The Rust HTTP pipeline makes transformed-body handling explicit for every
 middleware invocation: body-independent protocols select a no-recheck mode,
@@ -128,9 +130,12 @@ policy generation. Each replacement is reclassified and evaluated before the
 next stage runs. Hard-deny classification is shared by CONNECT relays,
 route-selected relays, and forward proxying; evaluator failures become
 structured fail-closed outcomes instead of escaping the middleware pipeline.
-The shared HTTP/1 request parser rejects obsolete folded continuations,
-colonless fields, whitespace before field-name colons, and invalid field-name
-tokens before policy evaluation, middleware projection, or forwarding.
+The shared HTTP/1 request parser validates raw headers at ingress and rejects
+obsolete folded continuations, colonless fields, whitespace before field-name
+colons, invalid field-name tokens, invalid UTF-8, and control bytes in field
+values before policy evaluation, middleware projection, or forwarding. Request
+framing accepts either `Content-Length` or exactly one `chunked` transfer coding;
+unsupported transfer codings and every CL/TE combination fail closed.
 Each middleware stage can also return ordered header write and remove
 operations. Rust validates and applies a stage atomically to the logical header
 state before the next stage runs, then replays the validated operations against
@@ -138,7 +143,8 @@ the raw request before credential injection. Credential, routing, framing, and
 hop-by-hop headers remain supervisor-owned and cannot be mutated.
 Names dynamically nominated by the original request's `Connection` header are
 carried separately after header filtering so write and remove mutations cannot
-reintroduce them.
+reintroduce them. The proxy also removes nominated fields before forwarding;
+only a validated WebSocket handshake preserves the required `Upgrade` pair.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:

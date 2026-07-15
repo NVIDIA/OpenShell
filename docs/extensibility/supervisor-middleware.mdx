@@ -26,7 +26,7 @@ Because each transformed body is re-checked before the next stage runs, a middle
 
 If post-transformation policy evaluation itself fails, OpenShell denies the request and emits a high-severity detection finding. This failure is separate from middleware `on_error` because the middleware completed successfully; the sandbox policy could not validate its output.
 
-Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials. Middleware-visible request headers are delivered in wire order and repeated header names are preserved as separate entries. OpenShell filters credential, routing, framing, and hop-by-hop headers before invoking middleware.
+Middleware receives the request before credential injection. Operator-run services cannot inspect OpenShell-managed credentials. Middleware-visible request headers are delivered in wire order and repeated header names are preserved as separate entries. OpenShell filters credential, routing, framing, and hop-by-hop headers before invoking middleware. It rejects malformed request headers and unsupported transfer-coding sequences before middleware or policy dispatch. Headers named by a request's `Connection` field are omitted from middleware input and removed before forwarding, except for the validated WebSocket upgrade pair.
 
 ## Choose a Middleware Type
 
