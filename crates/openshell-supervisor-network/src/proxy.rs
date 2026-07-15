@@ -3229,6 +3229,68 @@ fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
     Ok((scheme, host, port, path.to_string()))
 }
 
+/// Build the HTTP/1.1 `Host` value for a plain-HTTP absolute-form target.
+///
+/// Forward proxy requests are restricted to `http`, so port 80 is omitted as
+/// the default port. IPv6 literals regain the brackets removed by
+/// `parse_proxy_uri` before they are written as an authority.
+fn canonical_forward_authority(host: &str, port: u16) -> String {
+    let host = host.to_ascii_lowercase();
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    if port == 80 {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Replace every received `Host` field with the authority selected from the
+/// absolute-form request-target, preserving any body bytes already read.
+///
+/// RFC 9112 section 3.2.2 requires a proxy to ignore the received `Host` field
+/// and generate a new value from the absolute request-target. Doing this before
+/// L7 and middleware processing also keeps every buffered representation tied
+/// to the same authority used for policy selection.
+fn canonicalize_forward_host_header(raw: &[u8], authority: &str) -> Result<Vec<u8>> {
+    let header_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| miette::miette!("HTTP request headers are missing the CRLF terminator"))?
+        + 4;
+    crate::l7::rest::validate_http_request_header_block(&raw[..header_end])?;
+    let header_block = std::str::from_utf8(&raw[..header_end])
+        .map_err(|_| miette::miette!("HTTP headers contain invalid UTF-8"))?
+        .strip_suffix("\r\n\r\n")
+        .expect("validated header block has terminator");
+    let mut lines = header_block.split("\r\n");
+    let request_line = lines
+        .next()
+        .expect("validated header block contains a request line");
+
+    let mut output = Vec::with_capacity(raw.len() + authority.len() + 8);
+    output.extend_from_slice(request_line.as_bytes());
+    output.extend_from_slice(b"\r\nHost: ");
+    output.extend_from_slice(authority.as_bytes());
+    output.extend_from_slice(b"\r\n");
+    for line in lines {
+        let (field_name, _) = line
+            .split_once(':')
+            .expect("validated header field contains colon");
+        if field_name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        output.extend_from_slice(line.as_bytes());
+        output.extend_from_slice(b"\r\n");
+    }
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(&raw[header_end..]);
+    Ok(output)
+}
+
 /// Rewrite an absolute-form HTTP proxy request to origin-form for upstream.
 ///
 /// Transforms `GET http://host:port/path HTTP/1.1` into `GET /path HTTP/1.1`,
@@ -3239,6 +3301,7 @@ fn rewrite_forward_request(
     raw: &[u8],
     used: usize,
     path: &str,
+    canonical_authority: &str,
     secret_resolver: Option<&SecretResolver>,
     request_body_credential_rewrite: bool,
 ) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
@@ -3294,6 +3357,12 @@ fn rewrite_forward_request(
             .expect("forward request passed strict ingress header validation");
         let field_name = field_name.to_ascii_lowercase();
 
+        // RFC 9112 section 3.2.2 requires proxies to replace every received
+        // Host field with one generated from the absolute request-target.
+        if field_name == "host" {
+            continue;
+        }
+
         // Strip proxy hop-by-hop headers
         if matches!(
             field_name.as_str(),
@@ -3323,6 +3392,11 @@ fn rewrite_forward_request(
             has_via = true;
         }
     }
+
+    // Generate the only Host field from the absolute request-target authority.
+    output.extend_from_slice(b"Host: ");
+    output.extend_from_slice(canonical_authority.as_bytes());
+    output.extend_from_slice(b"\r\n");
 
     // Inject missing headers
     if websocket_upgrade {
@@ -3559,6 +3633,10 @@ async fn handle_forward_proxy(
         return Ok(());
     }
 
+    let canonical_authority = canonical_forward_authority(&host_lc, port);
+    let mut forward_request_bytes =
+        canonicalize_forward_host_header(&buf[..used], &canonical_authority)?;
+
     // 2. Evaluate OPA policy (same identity binding as CONNECT)
     let peer_addr = client.peer_addr().into_diagnostic()?;
     let _local_addr = client.local_addr().into_diagnostic()?;
@@ -3697,7 +3775,6 @@ async fn handle_forward_proxy(
             return Ok(());
         }
     };
-    let mut forward_request_bytes = buf[..used].to_vec();
     let mut upstream_target = path.clone();
     let mut websocket_extensions = crate::l7::rest::WebSocketExtensionMode::Preserve;
     let mut forward_tunnel_engine: Option<crate::opa::TunnelPolicyEngine> = None;
@@ -4639,6 +4716,7 @@ async fn handle_forward_proxy(
         &forward_request_bytes,
         forward_request_bytes.len(),
         &upstream_target,
+        &canonical_authority,
         secret_resolver.as_deref(),
         request_body_credential_rewrite,
     ) {
@@ -5498,10 +5576,19 @@ network_policies:
         request_body_credential_rewrite: bool,
     ) -> Result<String> {
         let guard = forward_test_guard();
+        let target_uri = std::str::from_utf8(raw)
+            .expect("forward test request is UTF-8")
+            .lines()
+            .next()
+            .and_then(|line| line.split(' ').nth(1))
+            .expect("forward test request has an absolute target");
+        let (_, host, port, _) = parse_proxy_uri(target_uri)?;
+        let authority = canonical_forward_authority(&host, port);
         let rewritten = rewrite_forward_request(
             raw,
             raw.len(),
             path,
+            &authority,
             resolver,
             request_body_credential_rewrite,
         )
@@ -5713,8 +5800,15 @@ network_policies:
              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
              Sec-WebSocket-Version: 13\r\n\r\n"
         );
-        let rewritten = rewrite_forward_request(raw.as_bytes(), raw.len(), path, None, false)
-            .expect("forward websocket request should rewrite to origin form");
+        let rewritten = rewrite_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            path,
+            &canonical_forward_authority(&host, port),
+            None,
+            false,
+        )
+        .expect("forward websocket request should rewrite to origin form");
         let websocket_extensions = crate::l7::relay::websocket_extension_mode(&config);
         let target = path.to_string();
         let query_params = std::collections::HashMap::new();
@@ -8144,9 +8238,15 @@ network_policies:
         let with_token = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
             .await
             .expect("forward token grant should inject");
-        let rewritten =
-            rewrite_forward_request(&with_token, with_token.len(), "/v1/projects", None, false)
-                .expect("forward request should rewrite");
+        let rewritten = rewrite_forward_request(
+            &with_token,
+            with_token.len(),
+            "/v1/projects",
+            "api.example.test:8080",
+            None,
+            false,
+        )
+        .expect("forward request should rewrite");
         let rewritten = String::from_utf8_lossy(&rewritten);
 
         assert!(rewritten.starts_with("GET /v1/projects HTTP/1.1\r\n"));
@@ -8174,8 +8274,8 @@ network_policies:
     fn test_rewrite_get_request() {
         let raw =
             b"GET http://10.0.0.1:8000/api HTTP/1.1\r\nHost: 10.0.0.1:8000\r\nAccept: */*\r\n\r\n";
-        let result =
-            rewrite_forward_request(raw, raw.len(), "/api", None, false).expect("should succeed");
+        let result = rewrite_forward_request(raw, raw.len(), "/api", "10.0.0.1:8000", None, false)
+            .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.starts_with("GET /api HTTP/1.1\r\n"));
         assert!(result_str.contains("Host: 10.0.0.1:8000"));
@@ -8184,10 +8284,152 @@ network_policies:
     }
 
     #[test]
+    fn canonical_forward_authority_formats_ports_and_ipv6() {
+        for (uri, expected) in [
+            ("http://API.EXAMPLE.TEST/path", "api.example.test"),
+            ("http://api.example.test:8080/path", "api.example.test:8080"),
+            ("http://[2001:DB8::1]/path", "[2001:db8::1]"),
+            ("http://[2001:DB8::1]:8080/path", "[2001:db8::1]:8080"),
+        ] {
+            let (_, host, port, _) = parse_proxy_uri(uri).expect("parse absolute target");
+            assert_eq!(canonical_forward_authority(&host, port), expected);
+        }
+    }
+
+    #[test]
+    fn forward_host_header_is_replaced_from_absolute_target() {
+        let raw = b"POST http://allowed.example.test:8080/api HTTP/1.1\r\n\
+                    Host: disallowed.example.test\r\n\
+                    hOsT: second.example.test\r\n\
+                    Content-Length: 4\r\n\r\nbody";
+        let authority = "allowed.example.test:8080";
+
+        let canonical = canonicalize_forward_host_header(raw, authority)
+            .expect("canonicalize received Host fields");
+        let canonical = String::from_utf8(canonical).expect("canonical request is UTF-8");
+        let host_fields: Vec<_> = canonical
+            .split("\r\n")
+            .skip(1)
+            .take_while(|line| !line.is_empty())
+            .filter(|line| {
+                line.split_once(':')
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("host"))
+            })
+            .collect();
+        assert_eq!(host_fields, ["Host: allowed.example.test:8080"]);
+        assert!(!canonical.contains("disallowed.example.test"));
+        assert!(!canonical.contains("second.example.test"));
+        assert!(canonical.ends_with("\r\n\r\nbody"));
+
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", authority, None, false)
+            .expect("final rewrite enforces canonical Host");
+        let rewritten = String::from_utf8(rewritten).expect("rewritten request is UTF-8");
+        assert_eq!(
+            rewritten
+                .split("\r\n")
+                .filter(|line| {
+                    line.split_once(':')
+                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("host"))
+                })
+                .collect::<Vec<_>>(),
+            ["Host: allowed.example.test:8080"]
+        );
+        assert!(!rewritten.contains("disallowed.example.test"));
+        assert!(!rewritten.contains("second.example.test"));
+    }
+
+    #[test]
+    fn forward_host_header_is_generated_when_missing() {
+        let raw = b"GET http://allowed.example.test/api HTTP/1.1\r\nAccept: */*\r\n\r\n";
+        let canonical = canonicalize_forward_host_header(raw, "allowed.example.test")
+            .expect("generate missing Host field");
+        let canonical = String::from_utf8(canonical).expect("canonical request is UTF-8");
+        assert!(canonical.starts_with(
+            "GET http://allowed.example.test/api HTTP/1.1\r\nHost: allowed.example.test\r\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn middleware_selected_forward_keeps_canonical_host_on_the_wire() {
+        let authority = "allowed.example.test";
+        let raw = b"GET http://allowed.example.test/api HTTP/1.1\r\n\
+                    Host: disallowed.example.test\r\n\
+                    HOST: second.example.test\r\n\r\n";
+        let raw = canonicalize_forward_host_header(raw, authority)
+            .expect("canonicalize Host before middleware");
+        let request = crate::l7::rest::request_from_buffered_http("GET", "/api", "/api", raw)
+            .expect("build middleware request");
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: authority.into(),
+            port: 80,
+            policy_name: "test".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let runner = openshell_supervisor_middleware::ChainRunner::new(
+            openshell_supervisor_middleware_builtins::services()
+                .into_iter()
+                .next()
+                .expect("built-in middleware service"),
+        );
+        let guard = forward_test_guard();
+        let pipeline = ForwardMiddlewarePipeline {
+            ctx: &ctx,
+            scheme: "http",
+            runner: &runner,
+            generation_guard: &guard,
+            l7_reevaluation: None,
+        };
+        let chain = vec![openshell_supervisor_middleware::ChainEntry {
+            name: "redactor".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+            order: 0,
+            config: prost_types::Struct::default(),
+            on_error: openshell_supervisor_middleware::OnError::FailClosed,
+        }];
+        let (_app, mut client) = tokio::io::duplex(8192);
+
+        let allowed = pipeline
+            .apply(request, &mut client, chain)
+            .await
+            .expect("middleware pipeline");
+        let crate::l7::middleware::MiddlewareApplyResult::Allowed(request) = allowed else {
+            panic!("middleware-selected request should be allowed");
+        };
+        let rewritten = rewrite_forward_request(
+            &request.raw_header,
+            request.raw_header.len(),
+            "/api",
+            authority,
+            None,
+            false,
+        )
+        .expect("rewrite middleware-selected request");
+        let rewritten = String::from_utf8(rewritten).expect("rewritten request is UTF-8");
+        assert_eq!(
+            rewritten
+                .split("\r\n")
+                .filter(|line| {
+                    line.split_once(':')
+                        .is_some_and(|(name, _)| name.eq_ignore_ascii_case("host"))
+                })
+                .collect::<Vec<_>>(),
+            ["Host: allowed.example.test"]
+        );
+        assert!(!rewritten.contains("disallowed.example.test"));
+        assert!(!rewritten.contains("second.example.test"));
+    }
+
+    #[test]
     fn test_rewrite_strips_proxy_headers() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
-        let result =
-            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
+        let result = rewrite_forward_request(raw, raw.len(), "/p", "host", None, false)
+            .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(
             !result_str
@@ -8201,8 +8443,8 @@ network_policies:
     #[test]
     fn test_rewrite_replaces_connection_header() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nConnection: keep-alive\r\n\r\n";
-        let result =
-            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
+        let result = rewrite_forward_request(raw, raw.len(), "/p", "host", None, false)
+            .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Connection: close"));
         assert!(!result_str.contains("keep-alive"));
@@ -8211,8 +8453,8 @@ network_policies:
     #[test]
     fn test_rewrite_strips_connection_nominated_headers() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nX-Guard: hidden\r\nConnection: keep-alive, x-guard\r\nKeep-Alive: timeout=5\r\nX-Visible: yes\r\n\r\n";
-        let result =
-            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
+        let result = rewrite_forward_request(raw, raw.len(), "/p", "host", None, false)
+            .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         let lower = result_str.to_ascii_lowercase();
 
@@ -8225,8 +8467,8 @@ network_policies:
     #[test]
     fn test_rewrite_preserves_body_overflow() {
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 13\r\n\r\n{\"key\":\"val\"}";
-        let result =
-            rewrite_forward_request(raw, raw.len(), "/api", None, false).expect("should succeed");
+        let result = rewrite_forward_request(raw, raw.len(), "/api", "host", None, false)
+            .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("{\"key\":\"val\"}"));
         assert!(result_str.contains("POST /api HTTP/1.1"));
@@ -8235,8 +8477,8 @@ network_policies:
     #[test]
     fn test_rewrite_preserves_existing_via() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nVia: 1.0 upstream\r\n\r\n";
-        let result =
-            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
+        let result = rewrite_forward_request(raw, raw.len(), "/p", "host", None, false)
+            .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Via: 1.0 upstream"));
         // Should not add a second Via header
@@ -8259,7 +8501,7 @@ network_policies:
         .expect("canonicalization should succeed for the attack payload");
         assert_eq!(canon.path, "/secret");
 
-        let rewritten = rewrite_forward_request(raw, raw.len(), &canon.path, None, false)
+        let rewritten = rewrite_forward_request(raw, raw.len(), &canon.path, "host", None, false)
             .expect("rewrite_forward_request should succeed");
         let rewritten_str = String::from_utf8_lossy(&rewritten);
         assert!(
@@ -8285,8 +8527,9 @@ network_policies:
             _ => canon.path,
         };
 
-        let rewritten = rewrite_forward_request(raw, raw.len(), &upstream_target, None, false)
-            .expect("rewrite_forward_request should succeed");
+        let rewritten =
+            rewrite_forward_request(raw, raw.len(), &upstream_target, "host", None, false)
+                .expect("rewrite_forward_request should succeed");
         let rewritten_str = String::from_utf8_lossy(&rewritten);
         assert!(
             rewritten_str.starts_with(
@@ -8304,8 +8547,9 @@ network_policies:
                 .collect(),
         );
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref(), false)
-            .expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", "host", resolver.as_ref(), false)
+                .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
@@ -8411,6 +8655,7 @@ network_policies:
             raw.as_bytes(),
             raw.len(),
             "/api/messages",
+            "api.example.com",
             Some(&resolver),
             true,
         )
@@ -8459,8 +8704,15 @@ network_policies:
                    Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\
                    Sec-WebSocket-Version: 13\r\n\r\n";
 
-        let result = rewrite_forward_request(raw.as_bytes(), raw.len(), "/ws", None, false)
-            .expect("websocket forward rewrite should succeed");
+        let result = rewrite_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/ws",
+            "gateway.example.test",
+            None,
+            false,
+        )
+        .expect("websocket forward rewrite should succeed");
         let result_str = String::from_utf8_lossy(&result);
 
         assert!(result_str.starts_with("GET /ws HTTP/1.1\r\n"));
@@ -8486,7 +8738,7 @@ network_policies:
         engine.reload(policy, policy_data).unwrap();
 
         let raw = b"GET http://host/api HTTP/1.1\r\nHost: host\r\n\r\n";
-        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", None, false)
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", "host", None, false)
             .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
@@ -8529,7 +8781,7 @@ network_policies:
             .unwrap();
 
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", None, false)
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", "host", None, false)
             .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
