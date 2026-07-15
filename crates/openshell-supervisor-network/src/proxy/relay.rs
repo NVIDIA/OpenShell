@@ -211,3 +211,96 @@ where
         .into_diagnostic()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{EgressIntent, EndpointDecision, ProcessIdentityEvidence};
+    use super::*;
+
+    const POLICY_REGO: &str = include_str!("../../data/sandbox-policy.rego");
+    const EMPTY_POLICY_DATA: &str = "network_policies: {}\n";
+
+    fn decision(l4_policy_generation: u64) -> EgressDecision {
+        EgressDecision {
+            intent: EgressIntent::connect("example.com".to_string(), 80),
+            action: NetworkAction::Allow {
+                matched_policy: Some("test".to_string()),
+            },
+            l4_policy_generation,
+            identity: ProcessIdentityEvidence::Available,
+            endpoint: EndpointDecision::default(),
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        }
+    }
+
+    fn request_context() -> L7EvalContext {
+        L7EvalContext {
+            host: "example.com".to_string(),
+            port: 80,
+            policy_name: "test".to_string(),
+            binary_path: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        }
+    }
+
+    #[test]
+    fn relay_without_route_pins_l4_decision_generation() {
+        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let decision = decision(engine.current_generation());
+        let request = request_context();
+
+        let context = prepare_http_relay(None, &engine, &decision, &request)
+            .expect("current L4 generation should prepare a relay");
+        let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
+            panic!("route-less relay should use a generation guard");
+        };
+
+        assert_eq!(
+            generation_guard.captured_generation(),
+            decision.l4_policy_generation
+        );
+    }
+
+    #[test]
+    fn empty_hydrated_route_pins_l7_lookup_generation() {
+        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let decision = decision(u64::MAX);
+        let route = L7RouteSnapshot {
+            configs: vec![],
+            l7_policy_generation: engine.current_generation(),
+        };
+        let request = request_context();
+
+        let context = prepare_http_relay(Some(&route), &engine, &decision, &request)
+            .expect("the hydrated route generation should take precedence over stale L4 data");
+        let PreparedHttpPolicy::Passthrough { generation_guard } = context.policy else {
+            panic!("empty L7 route should use a generation guard");
+        };
+
+        assert_eq!(
+            generation_guard.captured_generation(),
+            route.l7_policy_generation
+        );
+    }
+
+    #[test]
+    fn stale_generation_fails_before_relay_context_is_created() {
+        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let decision = decision(engine.current_generation());
+        let request = request_context();
+        engine.reload(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+
+        assert!(
+            prepare_http_relay(None, &engine, &decision, &request).is_none(),
+            "policy reload must prevent a stale relay from starting"
+        );
+    }
+}
