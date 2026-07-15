@@ -966,6 +966,7 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + AsyncWrite
                     already_read.len()
                 ));
             }
+            handle_buffered_expect_continue(client, &mut headers, false).await?;
             Ok(BufferResult::Buffered(BufferedRequestBody {
                 headers,
                 body: Vec::new(),
@@ -988,9 +989,7 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + AsyncWrite
             })?;
             body.extend_from_slice(&already_read[..initial_len]);
             let mut remaining = len.saturating_sub(initial_len);
-            if remaining > 0 && already_read.is_empty() {
-                acknowledge_expect_continue(client, &mut headers).await?;
-            }
+            handle_buffered_expect_continue(client, &mut headers, remaining > 0).await?;
             let mut buf = [0u8; RELAY_BUF_SIZE];
             while remaining > 0 {
                 let to_read = remaining.min(buf.len());
@@ -1018,9 +1017,8 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + AsyncWrite
             // we have already consumed wire bytes from the client stream and
             // cannot re-enter the normal raw relay path without a separate
             // splice-through buffer.
-            if already_read.is_empty() {
-                acknowledge_expect_continue(client, &mut headers).await?;
-            }
+            let needs_client_read = !chunked_body_is_fully_buffered(already_read);
+            handle_buffered_expect_continue(client, &mut headers, needs_client_read).await?;
             match collect_chunked_body(client, already_read, generation_guard, Some(max_body_bytes))
                 .await
             {
@@ -1037,23 +1035,59 @@ pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + AsyncWrite
     }
 }
 
-async fn acknowledge_expect_continue<C: AsyncWrite + Unpin>(
+async fn handle_buffered_expect_continue<C: AsyncWrite + Unpin>(
     client: &mut C,
     headers: &mut Vec<u8>,
+    needs_client_read: bool,
 ) -> Result<()> {
     let header_str =
         std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
-    if !has_expect_continue(header_str) {
-        return Ok(());
+    if needs_client_read && has_expect_continue(header_str) {
+        client
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .into_diagnostic()?;
+        client.flush().await.into_diagnostic()?;
     }
-
-    client
-        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-        .await
-        .into_diagnostic()?;
-    client.flush().await.into_diagnostic()?;
+    // Middleware has taken responsibility for collecting the body. Never
+    // forward Expect upstream alongside the completed, normalized request.
     *headers = strip_header(headers, "expect")?;
     Ok(())
+}
+
+fn chunked_body_is_fully_buffered(bytes: &[u8]) -> bool {
+    let mut pos = 0usize;
+    loop {
+        let Some(line_end) = bytes[pos..].windows(2).position(|window| window == b"\r\n") else {
+            return false;
+        };
+        let line_end = pos + line_end;
+        let Ok(size_line) = std::str::from_utf8(&bytes[pos..line_end]) else {
+            return false;
+        };
+        let size_token = size_line
+            .split(';')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+        let Ok(chunk_size) = usize::from_str_radix(size_token, 16) else {
+            return false;
+        };
+        pos = line_end + 2;
+        if chunk_size == 0 {
+            return bytes.get(pos..pos.saturating_add(2)) == Some(b"\r\n");
+        }
+        let Some(chunk_end) = pos.checked_add(chunk_size) else {
+            return false;
+        };
+        let Some(terminator_end) = chunk_end.checked_add(2) else {
+            return false;
+        };
+        if bytes.get(chunk_end..terminator_end) != Some(b"\r\n") {
+            return false;
+        }
+        pos = terminator_end;
+    }
 }
 
 pub(crate) fn rebuild_request_with_buffered_body(
@@ -1667,16 +1701,13 @@ fn strip_connection_nominated_headers(
     let nominated = connection_nominated_header_names(headers)?;
     let mut out = headers.to_vec();
     for name in nominated {
-        if preserve_websocket_upgrade && name == "upgrade" {
-            continue;
-        }
         out = strip_header(&out, &name)?;
     }
     out = strip_header(&out, "connection")?;
+    out = strip_header(&out, "upgrade")?;
     if preserve_websocket_upgrade {
         out = append_header(&out, "Connection", "Upgrade");
-    } else {
-        out = strip_header(&out, "upgrade")?;
+        out = append_header(&out, "Upgrade", "websocket");
     }
     Ok(out)
 }
@@ -3805,15 +3836,114 @@ mod tests {
 
     #[test]
     fn connection_sanitization_preserves_only_websocket_upgrade_exception() {
-        let raw = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade, x-guard\r\nX-Guard: hidden\r\n\r\n";
+        let raw = b"GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: h2c\r\nUpgrade: h2c, websocket\r\nConnection: keep-alive, Upgrade, x-guard\r\nX-Guard: hidden\r\n\r\n";
         let sanitized =
             strip_connection_nominated_headers(raw, true).expect("sanitize websocket headers");
         let sanitized = String::from_utf8(sanitized).unwrap();
 
-        assert!(sanitized.contains("Upgrade: websocket\r\n"));
-        assert!(sanitized.contains("Connection: Upgrade\r\n"));
+        assert_eq!(sanitized.matches("Upgrade: websocket\r\n").count(), 1);
+        assert_eq!(sanitized.matches("Connection: Upgrade\r\n").count(), 1);
+        assert!(!sanitized.to_ascii_lowercase().contains("upgrade: h2c"));
         assert!(!sanitized.to_ascii_lowercase().contains("x-guard:"));
         assert!(!sanitized.contains("keep-alive"));
+    }
+
+    #[tokio::test]
+    async fn middleware_fixed_read_ahead_consumes_expect_continue() {
+        for (already_read, remaining, should_acknowledge) in [
+            (b"hello".as_slice(), b"".as_slice(), false),
+            (b"he".as_slice(), b"llo".as_slice(), true),
+        ] {
+            let mut raw = b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n".to_vec();
+            raw.extend_from_slice(already_read);
+            let req = L7Request {
+                action: "POST".into(),
+                target: "/api".into(),
+                query_params: HashMap::new(),
+                raw_header: raw,
+                body_length: BodyLength::ContentLength(5),
+            };
+            let (mut client, mut peer) = tokio::io::duplex(128);
+            peer.write_all(remaining).await.unwrap();
+
+            let result = buffer_request_body_for_middleware(&req, &mut client, None, 1024)
+                .await
+                .expect("fixed body should buffer");
+            let BufferResult::Buffered(buffered) = result else {
+                panic!("fixed body unexpectedly exceeded capacity")
+            };
+            assert_eq!(buffered.body, b"hello");
+            assert!(
+                !String::from_utf8_lossy(&buffered.headers)
+                    .to_ascii_lowercase()
+                    .contains("expect:")
+            );
+
+            let mut response = [0u8; 64];
+            let read = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                peer.read(&mut response),
+            )
+            .await;
+            if should_acknowledge {
+                let count = read.expect("partial body should be acknowledged").unwrap();
+                assert_eq!(&response[..count], b"HTTP/1.1 100 Continue\r\n\r\n");
+            } else {
+                assert!(
+                    read.is_err(),
+                    "complete read-ahead should not be acknowledged"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn middleware_chunked_read_ahead_consumes_expect_continue() {
+        for (already_read, remaining, should_acknowledge) in [
+            (b"5\r\nhello\r\n0\r\n\r\n".as_slice(), b"".as_slice(), false),
+            (b"5\r\nhe".as_slice(), b"llo\r\n0\r\n\r\n".as_slice(), true),
+        ] {
+            let mut raw = b"POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n".to_vec();
+            raw.extend_from_slice(already_read);
+            let req = L7Request {
+                action: "POST".into(),
+                target: "/api".into(),
+                query_params: HashMap::new(),
+                raw_header: raw,
+                body_length: BodyLength::Chunked,
+            };
+            let (mut client, mut peer) = tokio::io::duplex(128);
+            peer.write_all(remaining).await.unwrap();
+
+            let result = buffer_request_body_for_middleware(&req, &mut client, None, 1024)
+                .await
+                .expect("chunked body should buffer");
+            let BufferResult::Buffered(buffered) = result else {
+                panic!("chunked body unexpectedly exceeded capacity")
+            };
+            assert_eq!(buffered.body, b"hello");
+            assert!(
+                !String::from_utf8_lossy(&buffered.headers)
+                    .to_ascii_lowercase()
+                    .contains("expect:")
+            );
+
+            let mut response = [0u8; 64];
+            let read = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                peer.read(&mut response),
+            )
+            .await;
+            if should_acknowledge {
+                let count = read.expect("partial body should be acknowledged").unwrap();
+                assert_eq!(&response[..count], b"HTTP/1.1 100 Continue\r\n\r\n");
+            } else {
+                assert!(
+                    read.is_err(),
+                    "complete read-ahead should not be acknowledged"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -6257,6 +6387,19 @@ mod tests {
         assert!(!lower.contains("keep-alive:"));
         assert!(!lower.contains("connection:"));
         assert!(forwarded.contains("X-Visible: yes\r\n"));
+    }
+
+    #[tokio::test]
+    async fn connect_rest_relay_canonicalizes_websocket_upgrade_headers() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: api.example.com\r\nUpgrade: h2c\r\nUpgrade: h2c, websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n".to_vec();
+        let forwarded = relay_and_capture_with_options(raw, BodyLength::None, None, false)
+            .await
+            .expect("relay websocket request");
+        let lower = forwarded.to_ascii_lowercase();
+
+        assert_eq!(lower.matches("connection: upgrade\r\n").count(), 1);
+        assert_eq!(lower.matches("upgrade: websocket\r\n").count(), 1);
+        assert!(!lower.contains("upgrade: h2c"));
     }
 
     #[tokio::test]

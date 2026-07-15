@@ -191,6 +191,10 @@ Sandbox events that represent observable behavior use OCSF structured logs:
 
 Use plain tracing for internal plumbing such as retries, debug state, and
 intermediate steps where the final observable event is logged separately.
+Forward-proxy success is a final observable event: emit it only after
+middleware, token grants, credential rewriting, policy-generation checks, and
+the HTTP relay have succeeded so a later denial cannot coexist with an allowed
+record for the same request.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.

@@ -144,7 +144,10 @@ hop-by-hop headers remain supervisor-owned and cannot be mutated.
 Names dynamically nominated by the original request's `Connection` header are
 carried separately after header filtering so write and remove mutations cannot
 reintroduce them. The proxy also removes nominated fields before forwarding;
-only a validated WebSocket handshake preserves the required `Upgrade` pair.
+only a validated WebSocket handshake preserves a canonical `Connection:
+Upgrade` and `Upgrade: websocket` pair. When middleware buffers a request body,
+the proxy consumes `Expect: 100-continue` locally, acknowledges it only if more
+client bytes are required, and never forwards it with the normalized body.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:

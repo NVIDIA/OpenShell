@@ -3266,7 +3266,6 @@ fn rewrite_forward_request(
 
     // Rebuild headers, stripping hop-by-hop and adding proxy headers
     let mut output = Vec::with_capacity(header_end + 128);
-    let mut has_connection = false;
     let mut has_via = false;
 
     for (i, line) in lines.iter().enumerate() {
@@ -3303,26 +3302,12 @@ fn rewrite_forward_request(
             continue;
         }
 
-        if connection_nominated.contains(&field_name)
-            && !(websocket_upgrade && field_name == "upgrade")
-        {
+        if connection_nominated.contains(&field_name) {
             continue;
         }
 
-        // Replace Connection header
-        if field_name == "connection" {
-            if has_connection {
-                continue;
-            }
-            has_connection = true;
-            if websocket_upgrade {
-                output.extend_from_slice(b"Connection: Upgrade\r\n");
-                continue;
-            }
-            output.extend_from_slice(b"Connection: close\r\n");
-            continue;
-        }
-        if field_name == "upgrade" && !websocket_upgrade {
+        // Reconstruct hop-by-hop upgrade fields after processing the originals.
+        if field_name == "connection" || field_name == "upgrade" {
             continue;
         }
 
@@ -3340,7 +3325,10 @@ fn rewrite_forward_request(
     }
 
     // Inject missing headers
-    if !has_connection && !websocket_upgrade {
+    if websocket_upgrade {
+        output.extend_from_slice(b"Connection: Upgrade\r\n");
+        output.extend_from_slice(b"Upgrade: websocket\r\n");
+    } else {
         output.extend_from_slice(b"Connection: close\r\n");
     }
     if !has_via {
@@ -4531,31 +4519,6 @@ async fn handle_forward_proxy(
         }
     };
 
-    // Log success
-    {
-        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Other)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .http_request(HttpRequest::new(
-                method,
-                OcsfUrl::new("http", &host_lc, &path, port),
-            ))
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
-            .firewall_rule(policy_str, "opa")
-            .message(format!("FORWARD allowed {method} {host_lc}:{port}{path}"))
-            .build();
-        ocsf_emit!(event);
-    }
-    emit_forward_success_activity(activity_tx, l7_activity_pending);
-
     let middleware_path = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
     let middleware_input = crate::opa::NetworkInput {
         host: host_lc.clone(),
@@ -4727,6 +4690,34 @@ async fn handle_forward_proxy(
         },
     )
     .await?;
+
+    // The request has now survived middleware, token grant, credential
+    // rewriting, generation checks, and the HTTP relay. Only now record the
+    // final allowed outcome.
+    {
+        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Other)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .http_request(HttpRequest::new(
+                method,
+                OcsfUrl::new("http", &host_lc, &path, port),
+            ))
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+            .actor_process(
+                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                    .with_cmd_line(&cmdline_str),
+            )
+            .firewall_rule(policy_str, "opa")
+            .message(format!("FORWARD allowed {method} {host_lc}:{port}{path}"))
+            .build();
+        ocsf_emit!(event);
+    }
+    emit_forward_success_activity(activity_tx, l7_activity_pending);
+
     if let crate::l7::provider::RelayOutcome::Upgraded {
         overflow,
         websocket_permessage_deflate,
@@ -5401,6 +5392,23 @@ network_policies:
             .expect("L7 activity should emit after SSRF succeeds");
         assert!(!event.denied);
         assert_eq!(event.deny_group, "l7_policy");
+    }
+
+    #[test]
+    fn forward_middleware_denial_does_not_emit_success_activity() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let activity_tx = Some(tx);
+
+        emit_activity_simple(activity_tx.as_ref(), true, "middleware");
+        let event = rx
+            .try_recv()
+            .expect("middleware denial should emit the request activity");
+        assert!(event.denied);
+        assert_eq!(event.deny_group, "middleware");
+        assert!(
+            rx.try_recv().is_err(),
+            "middleware-denied forward request must not emit success activity"
+        );
     }
 
     #[test]
@@ -8384,7 +8392,8 @@ network_policies:
     fn test_forward_rewrite_preserves_websocket_upgrade_connection_header() {
         let raw = "GET http://gateway.example.test/ws HTTP/1.1\r\n\
                    Host: gateway.example.test\r\n\
-                   Upgrade: websocket\r\n\
+                   Upgrade: h2c\r\n\
+                   Upgrade: h2c, websocket\r\n\
                    Connection: keep-alive, Upgrade\r\n\
                    Keep-Alive: timeout=5\r\n\
                    X-Guard: hidden\r\n\
@@ -8398,7 +8407,9 @@ network_policies:
         let result_str = String::from_utf8_lossy(&result);
 
         assert!(result_str.starts_with("GET /ws HTTP/1.1\r\n"));
-        assert!(result_str.contains("Connection: Upgrade\r\n"));
+        assert_eq!(result_str.matches("Connection: Upgrade\r\n").count(), 1);
+        assert_eq!(result_str.matches("Upgrade: websocket\r\n").count(), 1);
+        assert!(!result_str.to_ascii_lowercase().contains("upgrade: h2c"));
         assert!(!result_str.contains("keep-alive"));
         assert!(!result_str.to_ascii_lowercase().contains("x-guard:"));
         assert!(
