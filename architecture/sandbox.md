@@ -104,7 +104,10 @@ hash and registrations unchanged so the snapshot is retried. The generic
 registry and chain runner live in
 `openshell-supervisor-middleware`;
 first-party implementations and their config schemas live in
-`openshell-supervisor-middleware-builtins`. The gateway and supervisor inject
+`openshell-supervisor-middleware-builtins`. The initial `openshell/regex`
+implementation is only a best-effort example with fixed regular expressions;
+it is not a parser-aware secret scanner and makes no redaction guarantee. The
+gateway and supervisor inject
 those services explicitly and discover their binding IDs through the same
 `Describe` contract used by external services. Reusable compiled DNS host
 patterns and selectors remain in `openshell-core::host_pattern`.

@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+//! Example built-in middleware that applies a fixed set of regular-expression
+//! replacements to UTF-8 request bodies.
+//!
+//! This is intentionally a best-effort text transformation, not a secret
+//! scanner or a parser-aware redactor. It provides no guarantee that sensitive
+//! values will be detected or fully removed.
+
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -12,29 +19,29 @@ use openshell_core::proto::{
 use regex::Regex;
 use serde::Deserialize;
 
-pub const BINDING_ID: &str = "openshell/secrets";
+pub const BINDING_ID: &str = "openshell/regex";
 const MAX_BODY_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct SecretsConfig {
-    /// Redaction mode. Omitting the field selects [`SecretsMode::Redact`].
-    pub secrets: SecretsMode,
+pub struct RegexConfig {
+    /// Replacement mode. Omitting the field selects [`RegexMode::Redact`].
+    pub mode: RegexMode,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum SecretsMode {
+pub enum RegexMode {
     #[default]
     Redact,
 }
 
-impl SecretsConfig {
+impl RegexConfig {
     pub fn from_struct(config: &prost_types::Struct) -> Result<Self> {
         serde_json::from_value(openshell_core::proto_struct::struct_to_json_value(config)).map_err(
             |error| {
                 miette!(
-                    "invalid {BINDING_ID} config: {error}; phase 1 supports only secrets: redact"
+                    "invalid {BINDING_ID} config: {error}; this example supports only mode: redact"
                 )
             },
         )
@@ -51,32 +58,35 @@ pub fn describe() -> MiddlewareBinding {
     }
 }
 
-struct SecretPattern {
+struct ReplacementPattern {
     kind: &'static str,
     regex: Regex,
 }
 
-impl SecretPattern {
+impl ReplacementPattern {
     fn new(kind: &'static str, pattern: &str) -> Self {
         Self {
             kind,
-            regex: Regex::new(pattern).expect("valid built-in secret redaction pattern"),
+            regex: Regex::new(pattern).expect("valid built-in replacement pattern"),
         }
     }
 }
 
-static SECRET_PATTERNS: LazyLock<[SecretPattern; 2]> = LazyLock::new(|| {
+// TODO: Allow policies to supply custom replacement expressions after the
+// configuration contract, validation limits, and replacement semantics are
+// designed. The initial example deliberately exposes only these fixed patterns.
+static REPLACEMENT_PATTERNS: LazyLock<[ReplacementPattern; 2]> = LazyLock::new(|| {
     [
-        SecretPattern::new(
+        ReplacementPattern::new(
             "keyword",
             r#"(?i)(api[_-]?key|access[_-]?token|secret|password)(["']?\s*[:=]\s*["'])[^"',\s}]+(["']?)"#,
         ),
-        SecretPattern::new("openai", r"(sk-[A-Za-z0-9_-]{16,})"),
+        ReplacementPattern::new("openai", r"(sk-[A-Za-z0-9_-]{16,})"),
     ]
 });
 
 pub fn validate_config(config: &prost_types::Struct) -> Result<()> {
-    SecretsConfig::from_struct(config).map(|_| ())
+    RegexConfig::from_struct(config).map(|_| ())
 }
 
 pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpRequestResult> {
@@ -84,7 +94,7 @@ pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpR
     validate_config(evaluation.config.as_ref().unwrap_or(&default_config))?;
     let text = String::from_utf8(evaluation.body.clone())
         .map_err(|_| miette!("{} requires UTF-8 request bodies", BINDING_ID))?;
-    let (body, matches) = redact_common_secrets(&text);
+    let (body, matches) = apply_replacements(&text);
     let total: u32 = matches
         .iter()
         .fold(0u32, |acc, (_, count)| acc.saturating_add(*count));
@@ -99,8 +109,8 @@ pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpR
     };
     for (kind, count) in &matches {
         result.findings.push(Finding {
-            r#type: format!("secret.{kind}"),
-            label: format!("{kind} secret pattern"),
+            r#type: format!("regex.{kind}"),
+            label: format!("{kind} regex match"),
             count: *count,
             confidence: "medium".into(),
             severity: "medium".into(),
@@ -109,15 +119,15 @@ pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpR
     if !matches.is_empty() {
         result
             .metadata
-            .insert("secrets_redacted".into(), total.to_string());
+            .insert("regex_matches_replaced".into(), total.to_string());
     }
     Ok(result)
 }
 
-fn redact_common_secrets(input: &str) -> (String, Vec<(&'static str, u32)>) {
+fn apply_replacements(input: &str) -> (String, Vec<(&'static str, u32)>) {
     let mut output = input.to_string();
     let mut matches = Vec::new();
-    for pattern in SECRET_PATTERNS.iter() {
+    for pattern in REPLACEMENT_PATTERNS.iter() {
         let count = u32::try_from(pattern.regex.find_iter(&output).count()).unwrap_or(u32::MAX);
         if count > 0 {
             matches.push((pattern.kind, count));

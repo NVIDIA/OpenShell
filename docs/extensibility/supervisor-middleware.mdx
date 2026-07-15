@@ -35,7 +35,7 @@ Middleware receives the request before credential injection. Operator-run servic
 | Built-in | None | Defined by OpenShell | Runs inside the supervisor |
 | Operator-run service | Required in gateway TOML | Set by the operator, up to the service capability | Runs as a separate service reachable by the gateway and supervisors |
 
-`openshell/secrets` is the built-in middleware currently available. It identifies common secret patterns in UTF-8 request bodies and replaces matched values before the request leaves the sandbox. Its `config` accepts one field, `secrets: redact`, which is also the default when the field is omitted. Unknown config fields and non-string values are rejected at policy validation.
+`openshell/regex` is an example built-in middleware. It applies a small, fixed set of regular-expression replacements to UTF-8 request bodies. This best-effort text transformation is not parser-aware and does not guarantee that it will detect or fully remove sensitive values. Its `config` accepts one field, `mode: redact`, which is also the default when the field is omitted. Unknown config fields and non-string values are rejected at policy validation. Custom expressions are not configurable yet.
 
 Operator-run services expose one or more binding IDs. Policies reference a binding ID, such as `example/content-guard`, rather than the gateway registration name.
 
@@ -70,11 +70,11 @@ Add middleware configs to the top-level `network_middlewares` list:
 
 ```yaml
 network_middlewares:
-  - name: redact-secrets
-    middleware: openshell/secrets
+  - name: regex-redactor
+    middleware: openshell/regex
     order: 10
     config:
-      secrets: redact
+      mode: redact
     on_error: fail_closed
     endpoints:
       include: ["*.example.com"]
@@ -161,6 +161,6 @@ See [Logging](/observability/logging) for log access and [OCSF JSON Export](/obs
 - Middleware applies only to HTTP requests parsed by the supervisor. Traffic the supervisor cannot inspect, such as HTTP/2 prior knowledge or non-HTTP TCP protocols, is denied on hosts matched by a fail-closed middleware, and relayed with a detection finding when every matching middleware is `fail_open`.
 - The typed operation and phase are `HTTP_REQUEST/PRE_CREDENTIALS`.
 - Selection uses destination host include and exclude patterns.
-- Required middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic.
+- A fail-closed middleware cannot cover `tls: skip` endpoints because OpenShell cannot inspect that traffic. An all-`fail_open` match may cover the endpoint; OpenShell bypasses the middleware and emits a detection finding.
 - Operator-run services support plaintext `http://` and TLS `https://` endpoints. HTTPS certificates must chain to a CA in the platform trust store.
 - Custom trust roots, client authentication, health checks, and runtime registration are not available.

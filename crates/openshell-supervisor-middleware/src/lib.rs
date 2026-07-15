@@ -1363,7 +1363,7 @@ mod tests {
         SupervisorMiddleware, SupervisorMiddlewareServer,
     };
     use openshell_core::proto::{ExistingHeaderAction, header_mutation};
-    use openshell_supervisor_middleware_builtins::{BUILTIN_SECRETS, services};
+    use openshell_supervisor_middleware_builtins::{BUILTIN_REGEX, services};
     use tokio_stream::wrappers::TcpListenerStream;
 
     fn builtin_runner() -> ChainRunner {
@@ -1378,11 +1378,11 @@ mod tests {
     fn entry(name: &str, on_error: OnError) -> ChainEntry {
         ChainEntry {
             name: name.into(),
-            implementation: BUILTIN_SECRETS.into(),
+            implementation: BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct {
                 fields: std::iter::once((
-                    "secrets".into(),
+                    "mode".into(),
                     prost_types::Value {
                         kind: Some(prost_types::value::Kind::StringValue("redact".into())),
                     },
@@ -1446,7 +1446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redacts_common_secret_patterns() {
+    async fn applies_fixed_regex_replacements() {
         let outcome = builtin_runner()
             .evaluate(
                 &[entry("redact", OnError::FailClosed)],
@@ -1573,7 +1573,7 @@ mod tests {
         let policy = SandboxPolicy {
             network_middlewares: vec![NetworkMiddlewareConfig {
                 name: "redactor".into(),
-                middleware: BUILTIN_SECRETS.into(),
+                middleware: BUILTIN_REGEX.into(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1936,7 +1936,7 @@ mod tests {
 
     fn scripted_service(result: openshell_core::proto::HttpRequestResult) -> ScriptedService {
         ScriptedService {
-            binding_id: BUILTIN_SECRETS.into(),
+            binding_id: BUILTIN_REGEX.into(),
             max_body_bytes: 256 * 1024,
             result,
         }
@@ -2507,7 +2507,7 @@ mod tests {
             name: "example/service".into(),
             service_version: "test".into(),
             bindings: vec![MiddlewareBinding {
-                id: "openshell/secrets".into(),
+                id: "openshell/regex".into(),
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: 4096,
@@ -3121,7 +3121,7 @@ mod tests {
     #[tokio::test]
     async fn deny_decision_ignores_oversized_replacement_under_fail_open() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: BUILTIN_SECRETS.into(),
+            binding_id: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
@@ -3242,7 +3242,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_replacement_body_honors_on_error() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: BUILTIN_SECRETS.into(),
+            binding_id: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: openshell_core::proto::HttpRequestResult {
                 body: b"too large".to_vec(),
@@ -3277,7 +3277,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_request_body_honors_on_error() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: BUILTIN_SECRETS.into(),
+            binding_id: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: allow_result(),
         }));

@@ -9625,8 +9625,8 @@ mod tests {
         let policy_a = ProtoSandboxPolicy::default();
         let policy_b = ProtoSandboxPolicy {
             network_middlewares: vec![openshell_core::proto::NetworkMiddlewareConfig {
-                name: "redact-secrets".into(),
-                middleware: "openshell/secrets".into(),
+                name: "regex-redactor".into(),
+                middleware: "openshell/regex".into(),
                 on_error: "fail_closed".into(),
                 ..Default::default()
             }],

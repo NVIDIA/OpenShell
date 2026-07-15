@@ -2677,7 +2677,7 @@ network_policies:
     #[tokio::test]
     async fn l7_rest_middleware_redacts_body_before_upstream() {
         let (config, tunnel_engine, ctx) =
-            middleware_relay_context("openshell/secrets", "fail_closed");
+            middleware_relay_context("openshell/regex", "fail_closed");
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -2735,7 +2735,7 @@ network_policies:
     #[tokio::test]
     async fn l7_rest_middleware_acknowledges_expect_continue_before_reading_body() {
         let (config, tunnel_engine, ctx) =
-            middleware_relay_context("openshell/secrets", "fail_closed");
+            middleware_relay_context("openshell/regex", "fail_closed");
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -2855,7 +2855,7 @@ network_policies:
         // still forwarded on an `enforcement: audit` endpoint when the
         // middleware chain is healthy and allows it.
         let (config, tunnel_engine, ctx) =
-            middleware_relay_context_with_enforcement("openshell/secrets", "fail_closed", "audit");
+            middleware_relay_context_with_enforcement("openshell/regex", "fail_closed", "audit");
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -3066,7 +3066,7 @@ network_policies:
     #[tokio::test]
     async fn l7_rest_middleware_over_capacity_fails_closed() {
         let (config, tunnel_engine, ctx) =
-            middleware_relay_context("openshell/secrets", "fail_closed");
+            middleware_relay_context("openshell/regex", "fail_closed");
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
         let relay = tokio::spawn(async move {
@@ -3141,7 +3141,7 @@ network_policies:
         };
         let fail_open = ChainEntry {
             name: "m".into(),
-            implementation: "openshell/secrets".into(),
+            implementation: "openshell/regex".into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailOpen,
@@ -3186,7 +3186,7 @@ network_policies:
 
         let resolved = ChainEntry {
             name: "redact".into(),
-            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -3805,7 +3805,7 @@ network_policies:
         // guard is skipped through its own on_error, instead of the whole
         // chain taking the unbuffered over-capacity path.
         let (_config, tunnel_engine, ctx) =
-            middleware_relay_context("openshell/secrets", "fail_closed");
+            middleware_relay_context("openshell/regex", "fail_closed");
         let runner = ChainRunner::new(Arc::new(TwoLimitService));
         let chain = vec![
             ChainEntry {
@@ -4009,10 +4009,10 @@ network_policies:
             body: format!(r#"{{"api_key":"{RAW_SECRET}"}}"#).into_bytes(),
             header_mutations: Vec::new(),
             findings: vec![NamespacedFinding {
-                middleware: "redact-secrets".into(),
+                middleware: "regex-redactor".into(),
                 finding: openshell_core::proto::Finding {
-                    r#type: "secret.common".into(),
-                    label: "common secret pattern".into(),
+                    r#type: "regex.keyword".into(),
+                    label: "keyword regex match".into(),
                     count: 1,
                     confidence: "medium".into(),
                     severity: "medium".into(),
@@ -4020,8 +4020,8 @@ network_policies:
             }],
             metadata: BTreeMap::new(),
             applied: vec![MiddlewareInvocation {
-                name: "redact-secrets".into(),
-                implementation: "openshell/secrets".into(),
+                name: "regex-redactor".into(),
+                implementation: "openshell/regex".into(),
                 decision: openshell_core::proto::Decision::Allow,
                 transformed: true,
                 failed: false,
@@ -4053,7 +4053,7 @@ network_policies:
             "raw secret leaked into OCSF events: {serialized}"
         );
         // Safe finding metadata is still present.
-        assert!(serialized.contains("secret.common"));
+        assert!(serialized.contains("regex.keyword"));
 
         let mut bounded_outcome = outcome;
         bounded_outcome.findings = (0
@@ -4148,7 +4148,7 @@ network_policies:
         let data = r#"
 network_middlewares:
   - name: request-middleware
-    middleware: openshell/secrets
+    middleware: openshell/regex
     on_error: fail_closed
     endpoints:
       include: ["api.example.test"]

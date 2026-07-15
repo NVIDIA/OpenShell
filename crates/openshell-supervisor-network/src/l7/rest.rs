@@ -38,7 +38,7 @@ async fn max_middleware_body_bytes() -> usize {
     )
     .describe_chain(&[openshell_supervisor_middleware::ChainEntry {
         name: "test".into(),
-        implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+        implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
         order: 0,
         config: prost_types::Struct::default(),
         on_error: openshell_supervisor_middleware::OnError::FailClosed,
@@ -978,6 +978,9 @@ pub(crate) fn rebuild_request_with_buffered_body(
 
     let mut header_bytes = set_content_length(headers, body.len())?;
     header_bytes = strip_header(&header_bytes, "transfer-encoding")?;
+    if matches!(req.body_length, BodyLength::Chunked) {
+        header_bytes = strip_header(&header_bytes, "trailer")?;
+    }
     header_bytes = apply_header_mutations(&header_bytes, header_mutations)?;
     header_bytes.extend_from_slice(body);
     Ok(L7Request {
@@ -1054,6 +1057,7 @@ async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
                 rewrite_buffered_body(rewritten_headers, original_header_str, body, resolver)?;
             headers = set_content_length(&headers, body.len())?;
             headers = strip_header(&headers, "transfer-encoding")?;
+            headers = strip_header(&headers, "trailer")?;
             Ok(PreparedRequestBody { headers, body })
         }
     }
@@ -3608,6 +3612,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn middleware_chunked_normalization_discards_trailers_and_declaration() {
+        let mut raw = b"POST /api HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\nTrailer: X-Checksum\r\n\r\n".to_vec();
+        raw.extend_from_slice(b"5\r\nhello\r\n0\r\nX-Checksum: ignored\r\n\r\n");
+        let req = L7Request {
+            action: "POST".into(),
+            target: "/api".into(),
+            query_params: HashMap::new(),
+            raw_header: raw,
+            body_length: BodyLength::Chunked,
+        };
+
+        let buffered =
+            buffer_request_body_for_middleware(&req, &mut tokio::io::empty(), None, 64 * 1024)
+                .await
+                .expect("chunked request should buffer");
+        let BufferResult::Buffered(buffered) = buffered else {
+            panic!("chunked request should fit in middleware buffer")
+        };
+        let rebuilt =
+            rebuild_request_with_buffered_body(&req, &buffered.headers, &buffered.body, &[])
+                .expect("chunked request should normalize");
+        let forwarded = String::from_utf8(rebuilt.raw_header).expect("normalized request is UTF-8");
+
+        assert!(forwarded.contains("Content-Length: 5\r\n"));
+        assert!(
+            !forwarded
+                .to_ascii_lowercase()
+                .contains("transfer-encoding:")
+        );
+        assert!(!forwarded.to_ascii_lowercase().contains("trailer:"));
+        assert!(!forwarded.contains("X-Checksum: ignored"));
+        assert!(forwarded.ends_with("hello"));
+    }
+
+    #[tokio::test]
     async fn credential_rewrite_rejects_aggregate_chunk_extension_overflow() {
         let mut wire = Vec::new();
         let chunk = format!("1;pad={}\r\nx\r\n", "a".repeat(64));
@@ -6016,8 +6055,9 @@ mod tests {
             "POST /api/messages HTTP/1.1\r\n\
              Host: api.example.com\r\n\
              Authorization: Bearer {alias}\r\n\
-             Transfer-Encoding: chunked\r\n\r\n\
-             5\r\nhello\r\n0\r\n\r\n",
+             Transfer-Encoding: chunked\r\n\
+             Trailer: X-Checksum\r\n\r\n\
+             5\r\nhello\r\n0\r\nX-Checksum: ignored\r\n\r\n",
         );
 
         let forwarded = relay_and_capture_with_options(
@@ -6032,6 +6072,8 @@ mod tests {
         assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
         assert!(forwarded.contains("Content-Length: 5\r\n"));
         assert!(!forwarded.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(!forwarded.contains("Trailer: X-Checksum\r\n"));
+        assert!(!forwarded.contains("X-Checksum: ignored\r\n"));
         assert!(forwarded.ends_with("hello"));
     }
 

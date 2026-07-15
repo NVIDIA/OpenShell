@@ -52,10 +52,10 @@ mod tests {
         let policy = SandboxPolicy {
             network_middlewares: vec![NetworkMiddlewareConfig {
                 name: "redactor".into(),
-                middleware: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+                middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
                 config: Some(prost_types::Struct {
                     fields: std::iter::once((
-                        "secrets".into(),
+                        "mode".into(),
                         prost_types::Value {
                             kind: Some(prost_types::value::Kind::StringValue("allow".into())),
                         },
@@ -71,6 +71,6 @@ mod tests {
             .await
             .expect_err("invalid built-in config must fail admission");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(error.message().contains("supports only secrets: redact"));
+        assert!(error.message().contains("supports only mode: redact"));
     }
 }

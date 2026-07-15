@@ -3,7 +3,7 @@
 
 //! First-party in-process supervisor middleware implementations.
 
-mod secrets;
+mod regex;
 
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use openshell_core::proto::{
 };
 use tonic::{Request, Response, Status};
 
-pub use secrets::{BINDING_ID as BUILTIN_SECRETS, SecretsConfig, SecretsMode};
+pub use regex::{BINDING_ID as BUILTIN_REGEX, RegexConfig, RegexMode};
 
 /// Return the first-party services that the gateway and supervisor install.
 pub fn services() -> Vec<Arc<dyn SupervisorMiddleware>> {
@@ -25,7 +25,7 @@ pub fn services() -> Vec<Arc<dyn SupervisorMiddleware>> {
 /// Validate configuration for a first-party binding.
 pub fn validate_config(implementation: &str, config: &prost_types::Struct) -> Result<()> {
     match implementation {
-        BUILTIN_SECRETS => secrets::validate_config(config),
+        BUILTIN_REGEX => regex::validate_config(config),
         other => Err(miette!(
             "middleware implementation '{other}' is not a registered OpenShell built-in"
         )),
@@ -34,7 +34,7 @@ pub fn validate_config(implementation: &str, config: &prost_types::Struct) -> Re
 
 fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpRequestResult> {
     match evaluation.binding_id.as_str() {
-        BUILTIN_SECRETS => secrets::evaluate_http_request(evaluation),
+        BUILTIN_REGEX => regex::evaluate_http_request(evaluation),
         other => Err(miette!(
             "middleware implementation '{other}' is not a registered OpenShell built-in"
         )),
@@ -55,7 +55,7 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
         Ok(Response::new(MiddlewareManifest {
             name: "openshell/builtins".into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
-            bindings: vec![secrets::describe()],
+            bindings: vec![regex::describe()],
         }))
     }
 
@@ -109,14 +109,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn service_describes_secrets_binding() {
+    async fn service_describes_regex_binding() {
         let manifest = BuiltinMiddlewareService
             .describe(Request::new(()))
             .await
             .expect("describe")
             .into_inner();
         assert_eq!(manifest.bindings.len(), 1);
-        assert_eq!(manifest.bindings[0].id, BUILTIN_SECRETS);
+        assert_eq!(manifest.bindings[0].id, BUILTIN_REGEX);
         assert_eq!(
             manifest.bindings[0].operation,
             SupervisorMiddlewareOperation::HttpRequest as i32
@@ -129,25 +129,25 @@ mod tests {
     }
 
     #[test]
-    fn secrets_config_defaults_to_redact() {
-        let config = SecretsConfig::from_struct(&prost_types::Struct::default()).unwrap();
-        assert_eq!(config.secrets, SecretsMode::Redact);
+    fn regex_config_defaults_to_redact() {
+        let config = RegexConfig::from_struct(&prost_types::Struct::default()).unwrap();
+        assert_eq!(config.mode, RegexMode::Redact);
     }
 
     #[test]
-    fn secrets_config_accepts_explicit_redact() {
-        let config = SecretsConfig::from_struct(&string_config("secrets", "redact")).unwrap();
-        assert_eq!(config.secrets, SecretsMode::Redact);
+    fn regex_config_accepts_explicit_redact() {
+        let config = RegexConfig::from_struct(&string_config("mode", "redact")).unwrap();
+        assert_eq!(config.mode, RegexMode::Redact);
     }
 
     #[test]
-    fn secrets_config_rejects_unsupported_or_malformed_values() {
+    fn regex_config_rejects_unsupported_or_malformed_values() {
         for config in [
-            string_config("secrets", "allow"),
-            string_config("secret", "redact"),
+            string_config("mode", "allow"),
+            string_config("patterns", "password"),
             prost_types::Struct {
                 fields: std::iter::once((
-                    "secrets".into(),
+                    "mode".into(),
                     prost_types::Value {
                         kind: Some(prost_types::value::Kind::NumberValue(42.0)),
                     },
@@ -155,19 +155,19 @@ mod tests {
                 .collect(),
             },
         ] {
-            assert!(validate_config(BUILTIN_SECRETS, &config).is_err());
+            assert!(validate_config(BUILTIN_REGEX, &config).is_err());
         }
     }
 
     #[test]
-    fn secrets_redaction_evaluates_through_binding() {
+    fn regex_replacement_evaluates_through_binding() {
         let result = evaluate_http_request(&HttpRequestEvaluation {
-            binding_id: BUILTIN_SECRETS.into(),
+            binding_id: BUILTIN_REGEX.into(),
             body: br#"{"password":"top-secret","token":"sk-ABCDEFGHIJKLMNOP"}"#.to_vec(),
             config: Some(prost_types::Struct::default()),
             ..Default::default()
         })
-        .expect("evaluate secrets binding");
+        .expect("evaluate regex binding");
 
         assert_eq!(result.decision, Decision::Allow as i32);
         assert!(result.has_body);

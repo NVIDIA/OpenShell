@@ -1509,19 +1509,16 @@ network_policies:
 version: 1
 network_middlewares:
   - name: global-redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 20
     on_error: fail_open
     endpoints:
       include: ["api.example.com", "*.service.test"]
       exclude: ["internal.example.com"]
     config:
-      secrets: ["api_key", "authorization"]
-      service:
-        mode: redact
-        max_matches: 2
+      mode: redact
   - name: secondary-redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
 network_policies:
@@ -1537,7 +1534,7 @@ network_policies:
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         assert_eq!(proto.network_middlewares.len(), 2);
         assert_eq!(proto.network_middlewares[0].name, "global-redactor");
-        assert_eq!(proto.network_middlewares[0].middleware, "openshell/secrets");
+        assert_eq!(proto.network_middlewares[0].middleware, "openshell/regex");
         assert_eq!(proto.network_middlewares[0].order, 20);
         assert_eq!(proto.network_middlewares[0].on_error, "fail_open");
         assert_eq!(
@@ -1556,13 +1553,15 @@ network_policies:
                 .exclude,
             vec!["internal.example.com"]
         );
-        assert!(
+        assert_eq!(
             proto.network_middlewares[0]
                 .config
                 .as_ref()
                 .expect("config")
                 .fields
-                .contains_key("service")
+                .get("mode")
+                .and_then(|value| value.kind.as_ref()),
+            Some(&prost_types::value::Kind::StringValue("redact".into()))
         );
         let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
         let reparsed = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
@@ -1859,7 +1858,7 @@ network_policies:
             .map(|index| {
                 serde_json::json!({
                     "name": format!("middleware-{index}"),
-                    "middleware": "openshell/secrets",
+                    "middleware": "openshell/regex",
                     "endpoints": {"include": ["api.example.com"]}
                 })
             })
@@ -1913,7 +1912,7 @@ network_policies:
     fn validate_rejects_invalid_middleware_control_fields() {
         let cases = [
             (
-                middleware_config("", "openshell/secrets"),
+                middleware_config("", "openshell/regex"),
                 "name must not be empty",
             ),
             (
@@ -1922,7 +1921,7 @@ network_policies:
             ),
             (
                 {
-                    let mut middleware = middleware_config("redactor", "openshell/secrets");
+                    let mut middleware = middleware_config("redactor", "openshell/regex");
                     middleware.on_error = "maybe".into();
                     middleware
                 },
@@ -1930,7 +1929,7 @@ network_policies:
             ),
             (
                 {
-                    let mut middleware = middleware_config("redactor", "openshell/secrets");
+                    let mut middleware = middleware_config("redactor", "openshell/regex");
                     middleware.endpoints = None;
                     middleware
                 },
@@ -1938,7 +1937,7 @@ network_policies:
             ),
             (
                 {
-                    let mut middleware = middleware_config("redactor", "openshell/secrets");
+                    let mut middleware = middleware_config("redactor", "openshell/regex");
                     middleware.endpoints.as_mut().unwrap().include.clear();
                     middleware
                 },
@@ -1967,10 +1966,10 @@ network_policies:
         let mut policy = restrictive_default_policy();
         policy
             .network_middlewares
-            .push(middleware_config("redactor", "openshell/secrets"));
+            .push(middleware_config("redactor", "openshell/regex"));
         policy
             .network_middlewares
-            .push(middleware_config("redactor", "openshell/secrets"));
+            .push(middleware_config("redactor", "openshell/regex"));
 
         let violations = validate_sandbox_policy(&policy).expect_err("duplicate name");
         assert!(violations.iter().any(|violation| matches!(
@@ -1985,7 +1984,7 @@ network_policies:
         for index in 0..openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS {
             policy.network_middlewares.push(middleware_config(
                 &format!("middleware-{index}"),
-                "openshell/secrets",
+                "openshell/regex",
             ));
         }
 
@@ -1998,7 +1997,7 @@ network_policies:
         for index in 0..=openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS {
             policy.network_middlewares.push(middleware_config(
                 &format!("middleware-{index}"),
-                "openshell/secrets",
+                "openshell/regex",
             ));
         }
 
@@ -2013,7 +2012,7 @@ network_policies:
     #[test]
     fn validate_accepts_maximum_middleware_selector_patterns() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redactor", "openshell/secrets");
+        let mut middleware = middleware_config("redactor", "openshell/regex");
         let selector = middleware.endpoints.as_mut().expect("selector");
         selector.exclude = vec![
             "excluded.example.com".into();
@@ -2027,7 +2026,7 @@ network_policies:
     #[test]
     fn validate_rejects_middleware_selector_patterns_over_capacity() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redactor", "openshell/secrets");
+        let mut middleware = middleware_config("redactor", "openshell/regex");
         let selector = middleware.endpoints.as_mut().expect("selector");
         selector.exclude = vec![
             "excluded.example.com".into();
@@ -2049,7 +2048,7 @@ network_policies:
     #[test]
     fn validate_rejects_malformed_middleware_selector_patterns() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redactor", "openshell/secrets");
+        let mut middleware = middleware_config("redactor", "openshell/regex");
         middleware.endpoints.as_mut().unwrap().include = vec!["api[.example.com".into()];
         policy.network_middlewares.push(middleware);
 
@@ -2076,7 +2075,7 @@ network_policies:
         let mut policy = restrictive_default_policy();
         policy
             .network_middlewares
-            .push(middleware_config("redactor", "openshell/secrets"));
+            .push(middleware_config("redactor", "openshell/regex"));
         policy.network_policies.insert(
             "api".into(),
             NetworkPolicyRule {
@@ -2103,9 +2102,61 @@ network_policies:
     }
 
     #[test]
+    fn validate_accepts_fail_open_middleware_selector_matching_tls_skip_endpoint() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("redactor", "openshell/regex");
+        middleware.on_error = "fail_open".into();
+        policy.network_middlewares.push(middleware);
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    tls: "skip".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        validate_sandbox_policy(&policy)
+            .expect("fail-open middleware may select uninspectable tls: skip traffic");
+    }
+
+    #[test]
+    fn validate_rejects_explicit_fail_closed_middleware_on_tls_skip_endpoint() {
+        let mut policy = restrictive_default_policy();
+        let mut middleware = middleware_config("redactor", "openshell/regex");
+        middleware.on_error = "fail_closed".into();
+        policy.network_middlewares.push(middleware);
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    tls: "skip".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("tls skip conflict");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::MiddlewareTlsSkipConflict { middleware_name, .. }
+                if middleware_name == "redactor"
+        )));
+    }
+
+    #[test]
     fn validate_rejects_concrete_selector_overlapping_tls_skip_wildcard() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redactor", "openshell/secrets");
+        let mut middleware = middleware_config("redactor", "openshell/regex");
         middleware.endpoints.as_mut().unwrap().include = vec!["api.example.com".into()];
         policy.network_middlewares.push(middleware);
         policy.network_policies.insert(

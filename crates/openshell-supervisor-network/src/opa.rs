@@ -6637,8 +6637,8 @@ network_policies:
         assert!(engine.evaluate_network(&python_input).unwrap().allowed);
 
         let entry = ChainEntry {
-            name: "secrets".into(),
-            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
@@ -6699,8 +6699,8 @@ network_policies:
         assert!(engine.evaluate_network(&python_input).unwrap().allowed);
 
         let entry = ChainEntry {
-            name: "secrets".into(),
-            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
@@ -6731,7 +6731,7 @@ network_policies:
         let mut invalid = proto;
         invalid.network_middlewares.push(NetworkMiddlewareConfig {
             name: String::new(),
-            middleware: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             ..Default::default()
         });
         let empty_registry = MiddlewareRegistry::connect_services(Vec::new(), Vec::new())
@@ -6754,8 +6754,8 @@ network_policies:
         assert!(engine.evaluate_network(&claude_input).unwrap().allowed);
 
         let entry = ChainEntry {
-            name: "secrets".into(),
-            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            name: "regex".into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
@@ -7112,17 +7112,17 @@ network_policies:
         let data = r#"
 network_middlewares:
   - name: global-redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 20
     endpoints:
       include: ["api.example.com"]
   - name: policy-redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 10
     endpoints:
       include: ["api.example.com"]
   - name: endpoint-redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 10
     endpoints:
       include: ["api.example.com"]
@@ -7163,7 +7163,7 @@ network_policies:
             .map(|index| {
                 regorus::Value::from(serde_json::json!({
                     "name": format!("stage-{index}"),
-                    "middleware": "openshell/secrets",
+                    "middleware": "openshell/regex",
                     "endpoints": {"include": ["api.example.com"]}
                 }))
             })
@@ -7204,18 +7204,18 @@ network_policies:
         let data = r#"
 network_middlewares:
   - name: single-label
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 10
     endpoints:
       include: ["*.Example.COM"]
       exclude: ["trusted.example.com"]
   - name: recursive
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 20
     endpoints:
       include: ["**.example.com"]
   - name: intra-label
-    middleware: openshell/secrets
+    middleware: openshell/regex
     order: 30
     endpoints:
       include: ["*-api.example.com"]
@@ -7325,7 +7325,7 @@ host_match if {
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     on_error: maybe
     endpoints:
       include: ["api.example.com"]
@@ -7337,11 +7337,11 @@ network_middlewares:
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
 "#,
@@ -7352,7 +7352,7 @@ network_middlewares:
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
 "#,
                 "endpoint selector is required",
             ),
@@ -7361,7 +7361,7 @@ network_middlewares:
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api[.example.com"]
 "#,
@@ -7372,7 +7372,7 @@ network_middlewares:
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
 network_policies:
@@ -7391,7 +7391,7 @@ network_policies:
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
 network_policies:
@@ -7438,17 +7438,17 @@ network_middlewares:
                 "not a registered OpenShell built-in",
             ),
             (
-                "invalid secrets config",
+                "invalid regex config",
                 r#"
 network_middlewares:
   - name: redactor
-    middleware: openshell/secrets
+    middleware: openshell/regex
     config:
-      secrets: allow
+      mode: allow
     endpoints:
       include: ["api.example.com"]
 "#,
-                "supports only secrets: redact",
+                "supports only mode: redact",
             ),
         ] {
             let error =
@@ -7468,7 +7468,7 @@ network_middlewares:
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.network_middlewares.push(NetworkMiddlewareConfig {
             name: "redactor".into(),
-            middleware: "openshell/secrets".into(),
+            middleware: "openshell/regex".into(),
             endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
                 include: vec!["api[.example.com".into()],
                 exclude: Vec::new(),

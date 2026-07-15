@@ -263,6 +263,7 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
             None
         };
 
+        let requires_inspection = matches!(middleware.on_error.as_str(), "" | "fail_closed");
         for (key, rule) in &policy.network_policies {
             let policy_name = if rule.name.is_empty() {
                 key
@@ -270,7 +271,8 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
                 &rule.name
             };
             for endpoint in &rule.endpoints {
-                let overlaps_tls_skip = endpoint.tls == "skip"
+                let overlaps_tls_skip = requires_inspection
+                    && endpoint.tls == "skip"
                     && compiled_selector.as_ref().is_some_and(|selector| {
                         HostPattern::new(&endpoint.host)
                             .is_ok_and(|endpoint| selector.may_match_pattern(&endpoint))

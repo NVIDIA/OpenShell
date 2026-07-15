@@ -1634,7 +1634,7 @@ mod tests {
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.network_middlewares.push(NetworkMiddlewareConfig {
             name: "redactor".into(),
-            middleware: "openshell/secrets".into(),
+            middleware: "openshell/regex".into(),
             on_error: "maybe".into(),
             endpoints: Some(MiddlewareEndpointSelector {
                 include: vec!["api[.example.com".into()],

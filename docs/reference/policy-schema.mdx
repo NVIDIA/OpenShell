@@ -482,11 +482,11 @@ An ordered list of up to 10 middleware configs selected after network and L7 pol
 
 ```yaml showLineNumbers={false}
 network_middlewares:
-  - name: redact-secrets
-    middleware: openshell/secrets
+  - name: regex-redactor
+    middleware: openshell/regex
     order: 10
     config:
-      secrets: redact
+      mode: redact
     on_error: fail_closed
     endpoints:
       include: ["*.example.com"]
@@ -502,7 +502,7 @@ network_middlewares:
 | `on_error` | string | No | `fail_closed` denies the request when the stage fails; `fail_open` skips the failed stage. Defaults to `fail_closed`. |
 | `endpoints` | object | Yes | Host selector with required non-empty `include` and optional `exclude` lists, limited to 32 combined patterns. Exclusions take precedence. |
 
-Host selectors use the same case-insensitive exact and DNS glob semantics as network endpoints: `*` matches exactly one DNS label and `**` matches one or more labels, so `**.example.com` covers subdomains but not `example.com` itself. Brace alternates are rejected at validation. Middleware runs only on HTTP requests the supervisor parses. A selector that can require middleware on a `tls: skip` endpoint is rejected because OpenShell cannot inspect that traffic.
+Host selectors use the same case-insensitive exact and DNS glob semantics as network endpoints: `*` matches exactly one DNS label and `**` matches one or more labels, so `**.example.com` covers subdomains but not `example.com` itself. Brace alternates are rejected at validation. Middleware runs only on HTTP requests the supervisor parses. A fail-closed selector that can cover a `tls: skip` endpoint is rejected because OpenShell cannot inspect that traffic. An all-`fail_open` match may cover the endpoint; the supervisor bypasses the middleware and emits a detection finding.
 
 See [Supervisor Middleware](/extensibility/supervisor-middleware) for registration, failure behavior, body limits, and operational guidance.
 

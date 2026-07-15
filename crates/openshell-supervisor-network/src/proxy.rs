@@ -5257,7 +5257,7 @@ network_policies:
         };
         let chain = vec![openshell_supervisor_middleware::ChainEntry {
             name: "redactor".into(),
-            implementation: openshell_supervisor_middleware_builtins::BUILTIN_SECRETS.into(),
+            implementation: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: openshell_supervisor_middleware::OnError::FailClosed,
