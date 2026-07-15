@@ -205,11 +205,15 @@ func (s *sandboxClient) Watch(ctx context.Context, name string, opts ...WatchOpt
 	go func() {
 		defer close(ch)
 		ev := first
+		isFirst := true
 		for {
 			if sbPayload, ok := ev.Payload.(*pb.SandboxStreamEvent_Sandbox); ok && sbPayload.Sandbox != nil {
 				sandbox := converter.SandboxFromProto(sbPayload.Sandbox)
 				eventType := EventModified
-				if sandbox.Status.Phase == SandboxDeleting {
+				if isFirst {
+					eventType = EventAdded
+					isFirst = false
+				} else if sandbox.Status.Phase == SandboxDeleting {
 					eventType = EventDeleted
 				}
 				select {

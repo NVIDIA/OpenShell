@@ -26,8 +26,10 @@ type UpdateOptions struct{}
 
 // WatchOptions configures watch behavior.
 type WatchOptions struct {
+	// TimeoutSeconds is reserved for future use. Use context for timeout control.
 	TimeoutSeconds int64
-	LabelSelector  string
+	// LabelSelector is reserved for future use.
+	LabelSelector string
 	// StopOnTerminal causes the watch to close automatically when the sandbox
 	// reaches a terminal phase (Ready or Error).
 	StopOnTerminal bool

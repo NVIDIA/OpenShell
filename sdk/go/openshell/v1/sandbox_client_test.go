@@ -55,6 +55,8 @@ func newMockSandboxServer() *mockSandboxServer {
 }
 
 func (s *mockSandboxServer) CreateSandbox(_ context.Context, req *pb.CreateSandboxRequest) (*pb.SandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.createErr != nil {
 		return nil, s.createErr
 	}
@@ -96,6 +98,8 @@ func (s *mockSandboxServer) setPhase(name string, phase pb.SandboxPhase) {
 }
 
 func (s *mockSandboxServer) ListSandboxes(_ context.Context, _ *pb.ListSandboxesRequest) (*pb.ListSandboxesResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -107,6 +111,8 @@ func (s *mockSandboxServer) ListSandboxes(_ context.Context, _ *pb.ListSandboxes
 }
 
 func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandboxRequest) (*pb.DeleteSandboxResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.deleteErr != nil {
 		return nil, s.deleteErr
 	}
@@ -119,6 +125,8 @@ func (s *mockSandboxServer) DeleteSandbox(_ context.Context, req *pb.DeleteSandb
 }
 
 func (s *mockSandboxServer) AttachSandboxProvider(_ context.Context, req *pb.AttachSandboxProviderRequest) (*pb.AttachSandboxProviderResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.attachErr != nil {
 		return nil, s.attachErr
 	}
@@ -131,6 +139,8 @@ func (s *mockSandboxServer) AttachSandboxProvider(_ context.Context, req *pb.Att
 }
 
 func (s *mockSandboxServer) DetachSandboxProvider(_ context.Context, req *pb.DetachSandboxProviderRequest) (*pb.DetachSandboxProviderResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.detachErr != nil {
 		return nil, s.detachErr
 	}
@@ -567,7 +577,7 @@ func TestSandboxWatch_ReceivesEvents(t *testing.T) {
 	defer w.Stop()
 
 	ev1 := <-w.ResultChan()
-	assert.Equal(t, EventModified, ev1.Type)
+	assert.Equal(t, EventAdded, ev1.Type)
 	require.NotNil(t, ev1.Object)
 	assert.Equal(t, "sb-1", ev1.Object.Name)
 	assert.Equal(t, SandboxProvisioning, ev1.Object.Status.Phase)
@@ -599,7 +609,7 @@ func TestSandboxWatch_FiltersSandboxEventsOnly(t *testing.T) {
 	defer w.Stop()
 
 	ev := <-w.ResultChan()
-	assert.Equal(t, EventModified, ev.Type)
+	assert.Equal(t, EventAdded, ev.Type)
 	assert.Equal(t, "sb-1", ev.Object.Name)
 
 	// Stream ends after server sends all events; channel should close
@@ -738,7 +748,7 @@ func TestSandboxWatch_StopOnTerminal_Ready(t *testing.T) {
 
 	// Should receive the Provisioning event
 	ev1 := <-w.ResultChan()
-	assert.Equal(t, EventModified, ev1.Type)
+	assert.Equal(t, EventAdded, ev1.Type)
 	assert.Equal(t, SandboxProvisioning, ev1.Object.Status.Phase)
 
 	// Should receive the Ready event (terminal)
@@ -782,7 +792,7 @@ func TestSandboxWatch_StopOnTerminal_Error(t *testing.T) {
 
 	// Should receive the Provisioning event
 	ev1 := <-w.ResultChan()
-	assert.Equal(t, EventModified, ev1.Type)
+	assert.Equal(t, EventAdded, ev1.Type)
 	assert.Equal(t, SandboxProvisioning, ev1.Object.Status.Phase)
 
 	// Should receive the Error event (terminal)
@@ -820,7 +830,7 @@ func TestSandboxWatch_StopOnTerminal_False_DoesNotClose(t *testing.T) {
 	defer w.Stop()
 
 	ev := <-w.ResultChan()
-	assert.Equal(t, EventModified, ev.Type)
+	assert.Equal(t, EventAdded, ev.Type)
 	assert.Equal(t, SandboxReady, ev.Object.Status.Phase)
 
 	// Channel closes because mock stream ends (not because of StopOnTerminal)

@@ -34,7 +34,7 @@
 //	    log.Fatal(err)
 //	}
 //
-// # Command Execution
+// # Command Execution (available in a future release)
 //
 //	result, err := client.Exec().Run(ctx, sandbox.Name, []string{"echo", "hello"}, v1.ExecOptions{})
 //	if err != nil {
@@ -76,7 +76,7 @@
 //	}
 //	// channel closes automatically after Ready or Error
 //
-// # Service Exposure
+// # Service Exposure (available in a future release)
 //
 // Expose an HTTP service running inside a sandbox and retrieve its public URL:
 //
@@ -94,7 +94,7 @@
 //	    fmt.Printf("  %s → port %d (URL: %s)\n", ep.ServiceName, ep.TargetPort, ep.URL)
 //	}
 //
-// # Provider Profiles
+// # Provider Profiles (available in a future release)
 //
 // List available provider profiles and import new ones:
 //
@@ -119,7 +119,7 @@
 //	    fmt.Printf("[%s] %s: %s\n", d.Severity, d.Field, d.Message)
 //	}
 //
-// # Credential Refresh
+// # Credential Refresh (available in a future release)
 //
 // Configure gateway-owned credential refresh for a provider:
 //
@@ -192,7 +192,7 @@
 //	    "x-proxy-key": "proxy-secret",
 //	})
 //
-// # SSH Session Management
+// # SSH Session Management (available in a future release)
 //
 // Create an SSH session for a sandbox and use the returned connection details.
 // Note: CreateSession accepts a sandbox ID, not a name. For name-based access
@@ -213,7 +213,7 @@
 //	}
 //	fmt.Printf("Session revoked: %v\n", revoked)
 //
-// # TCP Port Forwarding
+// # TCP Port Forwarding (available in a future release)
 //
 // Forward a local connection to a port inside a sandbox:
 //
@@ -242,7 +242,7 @@
 //	    v1.WithForwardServiceID("billing-db"),
 //	)
 //
-// # SSH Tunneling
+// # SSH Tunneling (available in a future release)
 //
 // Create an SSH tunnel to a sandbox port in a single call. Tunnel combines
 // session creation, TCP forwarding with an SSH relay target, and automatic
@@ -300,7 +300,7 @@
 //	    },
 //	}, nil)
 //
-// Replace the full policy at runtime via configuration update:
+// Replace the full policy at runtime via configuration update (available in a future release):
 //
 //	result, err := client.Config().Update(ctx, &v1.ConfigUpdate{
 //	    Name: "secure-sandbox",
@@ -312,7 +312,7 @@
 //	    },
 //	})
 //
-// Read a policy back from revision history:
+// Read a policy back from revision history (available in a future release):
 //
 //	revisions, err := client.Policy().List(ctx, "secure-sandbox")
 //	if err != nil {
@@ -324,7 +324,7 @@
 //	    }
 //	}
 //
-// # Configuration Management
+// # Configuration Management (available in a future release)
 //
 // Read sandbox and gateway configuration, and update settings:
 //
