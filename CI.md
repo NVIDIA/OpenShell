@@ -23,12 +23,6 @@ Three opt-in labels enable the long-running E2E suites:
 When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once and fans out all enabled suites in parallel.
 The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while HA behavior is under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
 
-The VM suite runs directly on a standard GitHub-hosted Ubuntu runner. It grants
-the runner user access to KVM, then exercises VM sandbox creation, host gateway
-networking, and sandbox resume after a gateway restart. GitHub-hosted macOS
-runners cannot run this suite because they do not support nested
-virtualization.
-
 The GitHub ruleset should require the `OpenShell / ...` statuses published by `Required CI Gates`, not the push-triggered workflow jobs directly.
 
 ## Commit signing
