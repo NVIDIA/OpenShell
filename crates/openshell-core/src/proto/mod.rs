@@ -16,6 +16,14 @@ pub mod openshell {
     include!(concat!(env!("OUT_DIR"), "/openshell.v1.rs"));
 }
 
+// Cross-package references from packages nested under `openshell.*.v1` can be
+// generated as `super::super::v1::*`. Keep that path available as an alias for
+// the root `openshell.v1` package.
+#[doc(hidden)]
+pub mod v1 {
+    pub use super::openshell::*;
+}
+
 #[allow(
     clippy::all,
     clippy::pedantic,
@@ -79,7 +87,24 @@ pub mod inference {
     }
 }
 
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    unused_qualifications,
+    rust_2018_idioms
+)]
+pub mod gateway_interceptor {
+    pub mod v1 {
+        include!(concat!(
+            env!("OUT_DIR"),
+            "/openshell.gateway_interceptor.v1.rs"
+        ));
+    }
+}
+
 pub use datamodel::v1::*;
+pub use gateway_interceptor::v1::*;
 pub use inference::v1::*;
 pub use openshell::*;
 pub use sandbox::v1::*;

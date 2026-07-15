@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{ObjectType, PersistenceError, Store, generate_name, test_store};
-use crate::policy_store::PolicyStoreExt;
-use openshell_core::proto::{ObjectForTest, SandboxPolicy};
+use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
+use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
+use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
 use prost::Message;
+use std::collections::HashMap as StdHashMap;
 
 #[tokio::test]
 async fn sqlite_put_get_round_trip() {
@@ -606,6 +608,134 @@ async fn empty_labels_not_matched_by_selector() {
 // ---------------------------------------------------------------------------
 // Policy revision tests
 // ---------------------------------------------------------------------------
+
+fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
+    Sandbox {
+        metadata: Some(ProtoObjectMeta {
+            id: id.to_string(),
+            name: name.to_string(),
+            created_at_ms: 1,
+            ..Default::default()
+        }),
+        spec: Some(SandboxSpec::default()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn policy_atomic_write_commits_revision_provenance_and_sandbox_projection() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox("sandbox-atomic", "atomic"))
+        .await
+        .unwrap();
+    let current = store
+        .get_message::<Sandbox>("sandbox-atomic")
+        .await
+        .unwrap()
+        .unwrap();
+    let current_version = current.metadata.as_ref().unwrap().resource_version;
+    let policy = SandboxPolicy {
+        version: 1,
+        ..Default::default()
+    };
+    let provenance = StdHashMap::from([("signature".to_string(), "signed".to_string())]);
+
+    let updated = store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-atomic-1".to_string(),
+            sandbox_id: "sandbox-atomic".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-atomic-1".to_string(),
+            provenance: provenance.clone(),
+            expected_resource_version: current_version,
+            annotations: provenance.clone(),
+            backfill_policy: Some(policy.clone()),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        updated.metadata.as_ref().unwrap().resource_version,
+        current_version + 1
+    );
+    assert_eq!(updated.metadata.as_ref().unwrap().annotations, provenance);
+    assert_eq!(
+        updated.spec.as_ref().unwrap().policy.as_ref(),
+        Some(&policy)
+    );
+    let revision = store
+        .get_latest_policy("sandbox-atomic")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(revision.provenance, provenance);
+    store
+        .update_policy_status("sandbox-atomic", 1, "loaded", None, Some(100))
+        .await
+        .unwrap();
+    let loaded = store
+        .get_latest_policy("sandbox-atomic")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.provenance, provenance);
+}
+
+#[tokio::test]
+async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox("sandbox-rollback", "rollback"))
+        .await
+        .unwrap();
+    let policy = SandboxPolicy::default();
+    store
+        .put_policy_revision(
+            "existing-policy",
+            "sandbox-rollback",
+            1,
+            &policy.encode_to_vec(),
+            "existing-hash",
+        )
+        .await
+        .unwrap();
+    let before = store
+        .get_message::<Sandbox>("sandbox-rollback")
+        .await
+        .unwrap()
+        .unwrap();
+    let before_version = before.metadata.as_ref().unwrap().resource_version;
+
+    let error = store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "conflicting-policy".to_string(),
+            sandbox_id: "sandbox-rollback".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "conflicting-hash".to_string(),
+            provenance: StdHashMap::from([("signature".to_string(), "new".to_string())]),
+            expected_resource_version: before_version,
+            annotations: StdHashMap::from([("signature".to_string(), "new".to_string())]),
+            backfill_policy: Some(policy),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.is_unique_violation_on("objects_version_uq"));
+
+    let after = store
+        .get_message::<Sandbox>("sandbox-rollback")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.metadata.as_ref().unwrap().resource_version,
+        before_version
+    );
+    assert!(after.metadata.as_ref().unwrap().annotations.is_empty());
+    assert!(after.spec.as_ref().unwrap().policy.is_none());
+}
 
 #[tokio::test]
 async fn policy_put_and_get_latest() {
@@ -1243,6 +1373,7 @@ async fn cas_update_message_cas_succeeds() {
             created_at_ms: 1000,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
         }),
         spec: None,
         status: None,
@@ -1282,6 +1413,7 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
             created_at_ms: 1000,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
         }),
         spec: None,
         status: None,

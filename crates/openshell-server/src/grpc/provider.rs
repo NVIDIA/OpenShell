@@ -8,6 +8,10 @@
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
 };
+use crate::provider_profile_sources::{
+    EffectiveProviderProfileCatalog, ProviderProfileSources, profile_response_payload,
+    profile_storage_payload, stored_profile_resource_version, stored_provider_profile,
+};
 use openshell_core::proto::{
     Provider, ProviderCredentialTokenGrantAudienceOverride, ProviderProfile,
     ProviderProfileCredential, Sandbox,
@@ -63,8 +67,20 @@ impl ProviderEnvironment {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn create_provider_record(
     store: &Store,
+    provider: Provider,
+) -> Result<Provider, Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    create_provider_record_with_catalog(store, &catalog, provider).await
+}
+
+pub(super) async fn create_provider_record_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     mut provider: Provider,
 ) -> Result<Provider, Status> {
     use crate::persistence::{ObjectName, current_time_ms};
@@ -78,6 +94,7 @@ pub(super) async fn create_provider_record(
             created_at_ms: now_ms,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
         });
     }
 
@@ -98,7 +115,7 @@ pub(super) async fn create_provider_record(
         return Err(Status::invalid_argument("provider.type is required"));
     }
     if provider.credentials.is_empty()
-        && !provider_type_allows_empty_credentials(store, &provider.r#type).await?
+        && !provider_type_allows_empty_credentials(catalog, &provider.r#type)
     {
         return Err(Status::invalid_argument(
             "provider.credentials must not be empty",
@@ -173,8 +190,20 @@ pub(super) async fn list_provider_records(
         .collect())
 }
 
+#[cfg(test)]
 pub(super) async fn update_provider_record(
     store: &Store,
+    provider: Provider,
+) -> Result<Provider, Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    update_provider_record_with_catalog(store, &catalog, provider).await
+}
+
+pub(super) async fn update_provider_record_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider: Provider,
 ) -> Result<Provider, Status> {
     use crate::persistence::{ObjectId, ObjectName};
@@ -230,7 +259,8 @@ pub(super) async fn update_provider_record(
     // #1347.
     super::validation::validate_object_metadata(candidate.metadata.as_ref(), "provider")?;
     validate_provider_mutable_fields(&candidate)?;
-    validate_provider_update_against_attached_sandboxes(store, &candidate).await?;
+    validate_provider_update_against_attached_sandboxes_with_catalog(store, catalog, &candidate)
+        .await?;
 
     // Serialize labels for storage
     let labels_map = candidate.object_labels();
@@ -431,8 +461,20 @@ fn merge_i64_map(
 /// collects credential key-value pairs. Returns a map of environment variables
 /// to inject into the sandbox. Credential keys must be unique across attached
 /// providers so one provider cannot silently overwrite another provider's token.
+#[cfg(test)]
 pub(super) async fn resolve_provider_environment(
     store: &Store,
+    provider_names: &[String],
+) -> Result<ProviderEnvironment, Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    resolve_provider_environment_with_catalog(store, &catalog, provider_names).await
+}
+
+pub(super) async fn resolve_provider_environment_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<ProviderEnvironment, Status> {
     if provider_names.is_empty() {
@@ -442,7 +484,8 @@ pub(super) async fn resolve_provider_environment(
     let mut env = std::collections::HashMap::new();
     let mut expires = std::collections::HashMap::new();
     let now_ms = crate::persistence::current_time_ms();
-    validate_provider_environment_keys_unique_at(store, provider_names, None, now_ms).await?;
+    validate_provider_environment_keys_unique_at(store, catalog, provider_names, None, now_ms)
+        .await?;
     let registry = openshell_providers::ProviderRegistry::new();
 
     for name in provider_names {
@@ -495,7 +538,12 @@ pub(super) async fn resolve_provider_environment(
     Ok(ProviderEnvironment {
         environment: env,
         credential_expires_at_ms: expires,
-        dynamic_credentials: resolve_dynamic_credentials(store, provider_names).await?,
+        dynamic_credentials: resolve_dynamic_credentials_with_catalog(
+            store,
+            catalog,
+            provider_names,
+        )
+        .await?,
     })
 }
 
@@ -504,8 +552,9 @@ pub(super) async fn resolve_provider_environment(
 /// Returns a map of endpoint-bound keys to credential metadata for credentials
 /// that have `token_grant` configuration. Keys are internal supervisor metadata:
 /// host, port, endpoint path, and provider credential identity.
-pub(super) async fn resolve_dynamic_credentials(
+pub(super) async fn resolve_dynamic_credentials_with_catalog(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<std::collections::HashMap<String, ProviderProfileCredential>, Status> {
     if provider_names.is_empty() {
@@ -527,7 +576,7 @@ pub(super) async fn resolve_dynamic_credentials(
 
         let profile_id =
             normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
-        let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
+        let Some(profile) = get_provider_type_profile_with_catalog(catalog, profile_id) else {
             continue;
         };
 
@@ -818,8 +867,20 @@ pub async fn validate_provider_environment_keys_unique(
     store: &Store,
     provider_names: &[String],
 ) -> Result<(), Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    validate_provider_environment_keys_unique_with_catalog(store, &catalog, provider_names).await
+}
+
+pub async fn validate_provider_environment_keys_unique_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    provider_names: &[String],
+) -> Result<(), Status> {
     validate_provider_environment_keys_unique_at(
         store,
+        catalog,
         provider_names,
         None,
         crate::persistence::current_time_ms(),
@@ -827,8 +888,9 @@ pub async fn validate_provider_environment_keys_unique(
     .await
 }
 
-pub async fn validate_provider_credential_key_available_for_attached_sandboxes(
+pub async fn validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     credential_key: &str,
 ) -> Result<(), Status> {
@@ -838,11 +900,24 @@ pub async fn validate_provider_credential_key_available_for_attached_sandboxes(
         .entry(credential_key.to_string())
         .or_insert_with(|| "pending".to_string());
     candidate.credential_expires_at_ms.remove(credential_key);
-    validate_provider_update_against_attached_sandboxes(store, &candidate).await
+    validate_provider_update_against_attached_sandboxes_with_catalog(store, catalog, &candidate)
+        .await
 }
 
 pub async fn validate_provider_update_against_attached_sandboxes(
     store: &Store,
+    provider: &Provider,
+) -> Result<(), Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    validate_provider_update_against_attached_sandboxes_with_catalog(store, &catalog, provider)
+        .await
+}
+
+pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
 ) -> Result<(), Status> {
     let provider_name = provider.object_name().to_string();
@@ -853,6 +928,7 @@ pub async fn validate_provider_update_against_attached_sandboxes(
         };
         validate_provider_environment_keys_unique_at(
             store,
+            catalog,
             &spec.providers,
             Some(provider),
             crate::persistence::current_time_ms(),
@@ -870,6 +946,7 @@ pub async fn validate_provider_update_against_attached_sandboxes(
 
 async fn validate_provider_environment_keys_unique_at(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
     candidate_provider: Option<&Provider>,
     now_ms: i64,
@@ -899,7 +976,9 @@ async fn validate_provider_environment_keys_unique_at(
                 seen.insert(key, provider_name.clone());
             }
         }
-        dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider(store, &provider).await?);
+        dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
+            catalog, &provider,
+        ));
     }
     validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)?;
     Ok(())
@@ -915,19 +994,16 @@ struct DynamicTokenGrantBinding {
     score: u32,
 }
 
-async fn dynamic_token_grant_bindings_for_provider(
-    store: &Store,
+fn dynamic_token_grant_bindings_for_provider_with_catalog(
+    catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
-) -> Result<Vec<DynamicTokenGrantBinding>, Status> {
+) -> Vec<DynamicTokenGrantBinding> {
     let provider_name = provider.object_name().to_string();
     let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
-    let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
-        return Ok(Vec::new());
+    let Some(profile) = get_provider_type_profile_with_catalog(catalog, profile_id) else {
+        return Vec::new();
     };
-    Ok(dynamic_token_grant_bindings_for_profile(
-        &provider_name,
-        &profile.to_proto(),
-    ))
+    dynamic_token_grant_bindings_for_profile(&provider_name, &profile.to_proto())
 }
 
 fn dynamic_token_grant_bindings_for_profile(
@@ -1141,8 +1217,8 @@ use openshell_core::proto::{
     UpdateProviderProfilesResponse, UpdateProviderRequest,
 };
 use openshell_providers::{
-    CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
-    get_default_profile, normalize_profile_id, normalize_provider_type, validate_profile_set,
+    CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
+    normalize_profile_id, normalize_provider_type, validate_profile_set,
 };
 use std::sync::Arc;
 use tonic::{Request, Response};
@@ -1161,7 +1237,12 @@ pub(super) async fn handle_create_provider(
         return Err(Status::invalid_argument("provider is required"));
     };
     let provider_type = provider.r#type.clone();
-    let result = create_provider_record(state.store.as_ref(), provider).await;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let result =
+        create_provider_record_with_catalog(state.store.as_ref(), &catalog, provider).await;
     match result {
         Ok(provider) => {
             emit_provider_lifecycle(
@@ -1207,12 +1288,6 @@ pub(super) async fn handle_list_providers(
     Ok(Response::new(ListProvidersResponse { providers }))
 }
 
-impl ObjectType for StoredProviderProfile {
-    fn object_type() -> &'static str {
-        "provider_profile"
-    }
-}
-
 pub(super) async fn handle_list_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<ListProviderProfilesRequest>,
@@ -1220,13 +1295,15 @@ pub(super) async fn handle_list_provider_profiles(
     let request = request.into_inner();
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
     let offset = request.offset as usize;
-    let mut profiles = merged_provider_profiles(state.store.as_ref()).await?;
-    profiles.sort_by(|left, right| left.id.cmp(&right.id));
-    let profiles = profiles
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let profiles = catalog
+        .list_profiles()
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|profile| profile.to_proto())
         .collect();
 
     Ok(Response::new(ListProviderProfilesResponse { profiles }))
@@ -1238,10 +1315,13 @@ pub(super) async fn handle_get_provider_profile(
 ) -> Result<Response<ProviderProfileResponse>, Status> {
     let id = request.into_inner().id;
     let id = normalize_profile_id_request(&id)?;
-    let profile = get_provider_type_profile(state.store.as_ref(), &id)
-        .await?
-        .ok_or_else(|| Status::not_found("provider profile not found"))?
-        .to_proto();
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let profile = catalog
+        .get_profile(&id)
+        .ok_or_else(|| Status::not_found("provider profile not found"))?;
 
     Ok(Response::new(ProviderProfileResponse {
         profile: Some(profile),
@@ -1256,11 +1336,22 @@ pub(super) async fn handle_import_provider_profiles(
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-    diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    diagnostics
+        .extend(profile_conflict_diagnostics(state.store.as_ref(), &catalog, &profiles).await?);
     diagnostics.extend(validate_profile_set(&profiles));
     if !has_errors(&diagnostics) {
         diagnostics.extend(
-            profile_attached_sandbox_diagnostics(state.store.as_ref(), &profiles, "import").await?,
+            profile_attached_sandbox_diagnostics(
+                state.store.as_ref(),
+                &catalog,
+                &profiles,
+                "import",
+            )
+            .await?,
         );
     }
 
@@ -1313,8 +1404,14 @@ pub(super) async fn handle_update_provider_profiles(
     let (profiles, mut diagnostics) = profiles_from_import_items(&items);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let target_id = normalize_profile_id_request(&request.id)?;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
     diagnostics.extend(
-        profile_update_target_diagnostics(state.store.as_ref(), &profiles, &target_id).await?,
+        profile_update_target_diagnostics(state.store.as_ref(), &catalog, &profiles, &target_id)
+            .await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
     let expected_resource_version = if request.expected_resource_version != 0 {
@@ -1335,14 +1432,15 @@ pub(super) async fn handle_update_provider_profiles(
             severity: "error".to_string(),
         });
     }
-    let _sandbox_sync_guard = if has_errors(&diagnostics) {
-        None
-    } else {
-        Some(state.compute.sandbox_sync_guard().await)
-    };
     if !has_errors(&diagnostics) {
         diagnostics.extend(
-            profile_attached_sandbox_diagnostics(state.store.as_ref(), &profiles, "update").await?,
+            profile_attached_sandbox_diagnostics(
+                state.store.as_ref(),
+                &catalog,
+                &profiles,
+                "update",
+            )
+            .await?,
         );
     }
 
@@ -1416,7 +1514,12 @@ pub(super) async fn handle_lint_provider_profiles(
     let request = request.into_inner();
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
-    diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    diagnostics
+        .extend(profile_conflict_diagnostics(state.store.as_ref(), &catalog, &profiles).await?);
     diagnostics.extend(validate_profile_set(&profiles));
     let valid = !has_errors(&diagnostics);
 
@@ -1432,13 +1535,17 @@ pub(super) async fn handle_delete_provider_profile(
 ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
     let id = request.into_inner().id;
     let id = normalize_profile_id_request(&id)?;
-    if get_default_profile(&id).is_some() {
-        return Err(Status::failed_precondition(
-            "built-in provider profiles cannot be deleted",
-        ));
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    if let Some(source_id) = catalog.static_source_for_profile(&id) {
+        return Err(Status::failed_precondition(format!(
+            "provider profile '{id}' is managed by source '{source_id}' and cannot be deleted"
+        )));
     }
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let existing = state
         .store
         .get_message_by_name::<StoredProviderProfile>(&id)
@@ -1465,41 +1572,20 @@ pub(super) async fn handle_delete_provider_profile(
     Ok(Response::new(DeleteProviderProfileResponse { deleted }))
 }
 
-pub(super) async fn get_provider_type_profile(
-    store: &Store,
+pub(super) fn get_provider_type_profile_with_catalog(
+    catalog: &EffectiveProviderProfileCatalog,
     id: &str,
-) -> Result<Option<ProviderTypeProfile>, Status> {
-    let Some(id) = normalize_profile_id(id) else {
-        return Ok(None);
-    };
-    if let Some(profile) = get_default_profile(&id) {
-        return Ok(Some(profile.clone()));
-    }
-    let profile = store
-        .get_message_by_name::<StoredProviderProfile>(&id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
-        .and_then(|stored| {
-            let resource_version = stored_profile_resource_version(&stored);
-            stored.profile.map(|profile| {
-                ProviderTypeProfile::from_proto(&profile_response_payload(
-                    profile,
-                    resource_version,
-                ))
-            })
-        });
-    Ok(profile)
+) -> Option<ProviderTypeProfile> {
+    catalog.get_type_profile(id)
 }
 
-async fn provider_refresh_defaults(
-    store: &Store,
+fn provider_refresh_defaults(
+    catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     credential_key: &str,
-) -> Result<Option<CredentialRefreshProfile>, Status> {
-    let Some(profile) = get_provider_type_profile(store, &provider.r#type).await? else {
-        return Ok(None);
-    };
-    Ok(profile
+) -> Option<CredentialRefreshProfile> {
+    let profile = get_provider_type_profile_with_catalog(catalog, &provider.r#type)?;
+    profile
         .credentials
         .iter()
         .find(|credential| {
@@ -1509,7 +1595,7 @@ async fn provider_refresh_defaults(
                     .iter()
                     .any(|env_var| env_var == credential_key)
         })
-        .and_then(|credential| credential.refresh.clone()))
+        .and_then(|credential| credential.refresh.clone())
 }
 
 fn validate_refresh_material(
@@ -1537,41 +1623,14 @@ fn validate_refresh_material(
     Ok(())
 }
 
-async fn provider_type_allows_empty_credentials(
-    store: &Store,
+fn provider_type_allows_empty_credentials(
+    catalog: &EffectiveProviderProfileCatalog,
     provider_type: &str,
-) -> Result<bool, Status> {
-    let Some(profile) = get_provider_type_profile(store, provider_type).await? else {
-        return Ok(false);
+) -> bool {
+    let Some(profile) = get_provider_type_profile_with_catalog(catalog, provider_type) else {
+        return false;
     };
-    Ok(profile.allows_empty_provider_credentials())
-}
-
-async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfile>, Status> {
-    let mut profiles = default_profiles().to_vec();
-    profiles.extend(
-        custom_provider_profiles(store)
-            .await?
-            .into_iter()
-            .filter_map(|stored| {
-                let resource_version = stored_profile_resource_version(&stored);
-                stored.profile.map(|profile| {
-                    ProviderTypeProfile::from_proto(&profile_response_payload(
-                        profile,
-                        resource_version,
-                    ))
-                })
-            }),
-    );
-    Ok(profiles)
-}
-
-async fn custom_provider_profiles(store: &Store) -> Result<Vec<StoredProviderProfile>, Status> {
-    let profiles: Vec<StoredProviderProfile> = store
-        .list_messages(10_000, 0)
-        .await
-        .map_err(|e| Status::internal(format!("list provider profiles failed: {e}")))?;
-    Ok(profiles)
+    profile.allows_empty_provider_credentials()
 }
 
 fn normalize_profile_id_request(id: &str) -> Result<String, Status> {
@@ -1625,6 +1684,7 @@ fn add_empty_profile_set_diagnostic(
 
 async fn profile_conflict_diagnostics(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     profiles: &[(String, ProviderTypeProfile)],
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
     let mut diagnostics = Vec::new();
@@ -1632,12 +1692,14 @@ async fn profile_conflict_diagnostics(
         let Some(id) = normalize_profile_id(&profile.id) else {
             continue;
         };
-        if get_default_profile(&id).is_some() {
+        if let Some(source_id) = catalog.static_source_for_profile(&id) {
             diagnostics.push(ProfileValidationDiagnostic {
                 source: source.clone(),
                 profile_id: id.clone(),
                 field: "id".to_string(),
-                message: format!("provider profile '{id}' is built-in and cannot be overwritten"),
+                message: format!(
+                    "provider profile '{id}' is managed by source '{source_id}' and cannot be overwritten"
+                ),
                 severity: "error".to_string(),
             });
             continue;
@@ -1662,6 +1724,7 @@ async fn profile_conflict_diagnostics(
 
 async fn profile_update_target_diagnostics(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     profiles: &[(String, ProviderTypeProfile)],
     target_id: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
@@ -1682,12 +1745,14 @@ async fn profile_update_target_diagnostics(
             });
         }
     }
-    if get_default_profile(target_id).is_some() {
+    if let Some(source_id) = catalog.static_source_for_profile(target_id) {
         diagnostics.push(ProfileValidationDiagnostic {
             source: target_id.to_string(),
             profile_id: target_id.to_string(),
             field: "id".to_string(),
-            message: format!("provider profile '{target_id}' is built-in and cannot be updated"),
+            message: format!(
+                "provider profile '{target_id}' is managed by source '{source_id}' and cannot be updated"
+            ),
             severity: "error".to_string(),
         });
         return Ok(diagnostics);
@@ -1710,12 +1775,14 @@ async fn profile_update_target_diagnostics(
         let Some(id) = normalize_profile_id(&profile.id) else {
             continue;
         };
-        if get_default_profile(&id).is_some() {
+        if let Some(source_id) = catalog.static_source_for_profile(&id) {
             diagnostics.push(ProfileValidationDiagnostic {
                 source: source.clone(),
                 profile_id: id.clone(),
                 field: "id".to_string(),
-                message: format!("provider profile '{id}' is built-in and cannot be updated"),
+                message: format!(
+                    "provider profile '{id}' is managed by source '{source_id}' and cannot be updated"
+                ),
                 severity: "error".to_string(),
             });
         }
@@ -1725,6 +1792,7 @@ async fn profile_update_target_diagnostics(
 
 async fn profile_attached_sandbox_diagnostics(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     profiles: &[(String, ProviderTypeProfile)],
     operation: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
@@ -1775,7 +1843,9 @@ async fn profile_attached_sandbox_diagnostics(
                     imported_profiles_used.push(used);
                 }
             } else {
-                bindings.extend(dynamic_token_grant_bindings_for_provider(store, &provider).await?);
+                bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
+                    catalog, &provider,
+                ));
             }
         }
 
@@ -1799,42 +1869,6 @@ async fn profile_attached_sandbox_diagnostics(
     }
 
     Ok(diagnostics)
-}
-
-fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
-    use crate::persistence::current_time_ms;
-    let now_ms = current_time_ms();
-    let profile = profile_storage_payload(profile);
-    StoredProviderProfile {
-        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: profile.id.clone(),
-            created_at_ms: now_ms,
-            labels: std::collections::HashMap::new(),
-            resource_version: 0,
-        }),
-        profile: Some(profile),
-    }
-}
-
-fn profile_storage_payload(mut profile: ProviderProfile) -> ProviderProfile {
-    profile.resource_version = 0;
-    profile
-}
-
-fn profile_response_payload(
-    mut profile: ProviderProfile,
-    resource_version: u64,
-) -> ProviderProfile {
-    profile.resource_version = resource_version;
-    profile
-}
-
-fn stored_profile_resource_version(stored: &StoredProviderProfile) -> u64 {
-    stored
-        .metadata
-        .as_ref()
-        .map_or(0, |metadata| metadata.resource_version)
 }
 
 fn proto_diagnostic(diagnostic: ProfileValidationDiagnostic) -> ProviderProfileDiagnostic {
@@ -1904,7 +1938,12 @@ pub(super) async fn handle_update_provider(
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
-    let result = update_provider_record(state.store.as_ref(), provider).await;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let result =
+        update_provider_record_with_catalog(state.store.as_ref(), &catalog, provider).await;
     match result {
         Ok(provider) => {
             emit_provider_lifecycle(
@@ -2058,14 +2097,18 @@ pub(super) async fn handle_configure_provider_refresh(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
-    validate_provider_credential_key_available_for_attached_sandboxes(
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
         state.store.as_ref(),
+        &catalog,
         &provider,
         credential_key,
     )
     .await?;
-    let refresh_defaults =
-        provider_refresh_defaults(state.store.as_ref(), &provider, credential_key).await?;
+    let refresh_defaults = provider_refresh_defaults(&catalog, &provider, credential_key);
     validate_refresh_material(&request.material, refresh_defaults.as_ref())?;
     let material_scopes = crate::provider_refresh::material_scopes(&request.material);
     let token_url = refresh_defaults
@@ -2146,6 +2189,7 @@ pub(super) async fn handle_configure_provider_refresh(
                 created_at_ms: 0,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: String::new(),
             credentials: std::collections::HashMap::new(),
@@ -2155,7 +2199,7 @@ pub(super) async fn handle_configure_provider_refresh(
                 expires_at_ms,
             )]),
         };
-        update_provider_record(state.store.as_ref(), updated).await?;
+        update_provider_record_with_catalog(state.store.as_ref(), &catalog, updated).await?;
     }
 
     Ok(Response::new(ConfigureProviderRefreshResponse {
@@ -2234,6 +2278,10 @@ pub(super) async fn handle_delete_provider_refresh(
                     .is_some_and(|expires_at_ms| *expires_at_ms == refresh_state.expires_at_ms)
         });
     if refresh_owned_expiry {
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref())
+            .await?;
         let updated = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
@@ -2241,6 +2289,7 @@ pub(super) async fn handle_delete_provider_refresh(
                 created_at_ms: 0,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: String::new(),
             credentials: std::collections::HashMap::new(),
@@ -2250,7 +2299,7 @@ pub(super) async fn handle_delete_provider_refresh(
                 0,
             )]),
         };
-        update_provider_record(state.store.as_ref(), updated).await?;
+        update_provider_record_with_catalog(state.store.as_ref(), &catalog, updated).await?;
     }
 
     Ok(Response::new(DeleteProviderRefreshResponse {
@@ -2453,6 +2502,7 @@ mod tests {
         let profile = ProviderProfile {
             id: "keycloak-sso".to_string(),
             resource_version: 0,
+            annotations: HashMap::new(),
             display_name: "Keycloak SSO".to_string(),
             description: String::new(),
             category: ProviderProfileCategory::Other as i32,
@@ -2526,6 +2576,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
@@ -2603,6 +2654,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec![
@@ -2766,7 +2818,7 @@ mod tests {
         assert!(built_in.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("built-in and cannot be updated")
+                .contains("managed by source 'builtin' and cannot be updated")
         }));
 
         let missing = handle_update_provider_profiles(
@@ -2918,6 +2970,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec![
@@ -2980,6 +3033,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
             credentials: [
@@ -3002,6 +3056,7 @@ mod tests {
         ProviderProfile {
             id: id.to_string(),
             resource_version: 0,
+            annotations: HashMap::new(),
             display_name: format!("{id} Profile"),
             description: String::new(),
             category: ProviderProfileCategory::Other as i32,
@@ -3269,7 +3324,7 @@ mod tests {
             response
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("built-in"))
+                .any(|diagnostic| diagnostic.message.contains("managed by source 'builtin'"))
         );
     }
 
@@ -3441,6 +3496,7 @@ mod tests {
                     profile: Some(ProviderProfile {
                         id: "advanced-api".to_string(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                         display_name: "Advanced API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Other as i32,
@@ -3589,6 +3645,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["custom-provider".to_string()],
@@ -3624,6 +3681,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -3724,6 +3782,139 @@ mod tests {
         );
     }
 
+    async fn state_with_authoritative_profiles_over_default_grants() -> Arc<ServerState> {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-a", "api.example.com", 443, "/v1/**").await;
+        import_token_grant_profile(&state, "grant-b", "api.example.com", 443, "/v1/**").await;
+        create_empty_token_grant_provider(store, "provider-a", "grant-a").await;
+        create_empty_token_grant_provider(store, "provider-b", "grant-b").await;
+        store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-authoritative-profiles-id".to_string(),
+                    name: "sandbox-authoritative-profiles".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut state = Arc::into_inner(state).expect("test server state should be uniquely owned");
+        state.provider_profile_sources = ProviderProfileSources::from_test_profiles(vec![
+            custom_profile("grant-a"),
+            custom_profile("grant-b"),
+        ]);
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_uses_authoritative_profile_sources_for_expiry_update() {
+        let state = state_with_authoritative_profiles_over_default_grants().await;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+
+        handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "provider-a".to_string(),
+                credential_key: "REFRESH_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: Some(expires_at_ms),
+            }),
+        )
+        .await
+        .expect("authoritative profiles should govern the provider expiry update");
+
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("provider-a")
+            .await
+            .unwrap()
+            .expect("provider-a");
+        assert_eq!(
+            provider.credential_expires_at_ms.get("REFRESH_TOKEN"),
+            Some(&expires_at_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_provider_refresh_uses_authoritative_profile_sources_for_expiry_update() {
+        let state = state_with_authoritative_profiles_over_default_grants().await;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+        let updated = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "provider-a".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+            }),
+            r#type: String::new(),
+            credentials: HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::from([("REFRESH_TOKEN".to_string(), expires_at_ms)]),
+        };
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref())
+            .await
+            .unwrap();
+        let provider = update_provider_record_with_catalog(state.store.as_ref(), &catalog, updated)
+            .await
+            .unwrap();
+        let refresh_state = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "REFRESH_TOKEN",
+            crate::provider_refresh::NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 0,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .unwrap();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &refresh_state)
+            .await
+            .unwrap();
+
+        handle_delete_provider_refresh(
+            &state,
+            Request::new(DeleteProviderRefreshRequest {
+                provider: "provider-a".to_string(),
+                credential_key: "REFRESH_TOKEN".to_string(),
+            }),
+        )
+        .await
+        .expect("authoritative profiles should govern the provider expiry update");
+
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("provider-a")
+            .await
+            .unwrap()
+            .expect("provider-a");
+        assert!(
+            !provider
+                .credential_expires_at_ms
+                .contains_key("REFRESH_TOKEN")
+        );
+    }
+
     #[tokio::test]
     async fn configure_provider_refresh_accepts_vertex_service_account_token_key() {
         let state = test_server_state().await;
@@ -3736,6 +3927,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -3799,6 +3991,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -3842,6 +4035,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -3894,6 +4088,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -3916,6 +4111,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once(("OTHER_TOKEN".to_string(), "other".to_string()))
@@ -3935,6 +4131,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
@@ -3986,6 +4183,7 @@ mod tests {
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                     }),
                     r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                     credentials: HashMap::new(),
@@ -4005,6 +4203,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["first-graph".to_string(), "second-graph".to_string()],
@@ -4071,6 +4270,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -4138,6 +4338,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "outlook".to_string(),
                 credentials: std::iter::once((
@@ -4289,6 +4490,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -4411,6 +4613,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["gitlab-local".to_string()],
@@ -4455,6 +4658,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: std::iter::once((
@@ -4484,6 +4688,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: std::iter::once((
@@ -4518,6 +4723,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4538,6 +4744,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: HashMap::new(),
@@ -4556,6 +4763,7 @@ mod tests {
                     profile: Some(ProviderProfile {
                         id: "delegated-refresh-api".to_string(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                         display_name: "Delegated Refresh API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Messaging as i32,
@@ -4612,6 +4820,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "delegated-refresh-api".to_string(),
                 credentials: HashMap::new(),
@@ -4648,6 +4857,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "mixed-required-api".to_string(),
                 credentials: HashMap::new(),
@@ -4684,6 +4894,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "optional-static-api".to_string(),
                 credentials: HashMap::new(),
@@ -4704,6 +4915,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: HashMap::new(),
@@ -4730,6 +4942,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4758,6 +4971,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4805,6 +5019,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
@@ -4856,6 +5071,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4885,6 +5101,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: HashMap::new(),
@@ -4916,6 +5133,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
@@ -4944,6 +5162,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: oversized_type.clone(),
             credentials: std::iter::once(("API_TOKEN".to_string(), "old".to_string())).collect(),
@@ -4961,6 +5180,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once(("API_TOKEN".to_string(), "new".to_string()))
@@ -4992,6 +5212,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "claude".to_string(),
             credentials: [
@@ -5046,6 +5267,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "test".to_string(),
             credentials: [
@@ -5095,6 +5317,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "test".to_string(),
             credentials: [
@@ -5129,6 +5352,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
@@ -5151,6 +5375,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
@@ -5184,6 +5409,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
@@ -5203,6 +5429,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -5241,6 +5468,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -5315,6 +5543,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: [
@@ -5359,6 +5588,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -5407,6 +5637,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: [
@@ -5454,6 +5685,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
@@ -5492,6 +5724,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "outlook".to_string(),
                 credentials: std::iter::once((
@@ -5514,6 +5747,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-drive".to_string(),
                 credentials: std::iter::once((
@@ -5534,6 +5768,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["provider-a".to_string(), "provider-b".to_string()],
@@ -5552,6 +5787,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((
@@ -5586,6 +5822,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
@@ -5607,6 +5844,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["my-claude".to_string()],
@@ -5643,6 +5881,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec::default()),
             status: None,
@@ -5690,6 +5929,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: String::new(), // Empty type is ignored in update
             credentials: HashMap::new(),
@@ -6037,6 +6277,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "google-cloud".to_string(),
             credentials: HashMap::new(),
@@ -6139,6 +6380,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "github".to_string(),
             credentials: HashMap::new(),

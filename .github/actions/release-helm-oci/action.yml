@@ -41,7 +41,7 @@ runs:
         password: ${{ github.token }}
 
     - name: Install Helm
-      uses: azure/setup-helm@v4
+      uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
 
     - name: Stage chart and patch version
       id: prep

@@ -7,6 +7,7 @@ package openshell.v1;
 
 import "datamodel.proto";
 import "google/protobuf/struct.proto";
+import "options.proto";
 import "sandbox.proto";
 
 // OpenShell service provides sandbox, provider, and runtime management capabilities.
@@ -256,7 +257,7 @@ message IssueSandboxTokenRequest {}
 // gateway RPC.
 message IssueSandboxTokenResponse {
   // Gateway-minted JWT bound to the calling sandbox's UUID.
-  string token = 1;
+  string token = 1 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the issued token, milliseconds since the epoch. 0 means
   // the token is non-expiring.
   int64 expires_at_ms = 2;
@@ -271,7 +272,7 @@ message RefreshSandboxTokenRequest {}
 // in-memory bearer credential.
 message RefreshSandboxTokenResponse {
   // Fresh gateway-minted JWT bound to the same sandbox UUID.
-  string token = 1;
+  string token = 1 [(openshell.options.v1.secret) = true];
   // Absolute expiry of the new token, milliseconds since the epoch. 0 means
   // the token is non-expiring.
   int64 expires_at_ms = 2;
@@ -447,6 +448,8 @@ message CreateSandboxRequest {
   string name = 2;
   // Optional labels for the sandbox (key-value metadata).
   map<string, string> labels = 3;
+  // Optional annotations for the sandbox (non-selector metadata).
+  map<string, string> annotations = 4;
 }
 
 // Get sandbox request.
@@ -555,7 +558,7 @@ message CreateSshSessionResponse {
   // Session token for the gateway tunnel. URL-safe ASCII
   // ([A-Za-z0-9._~+/=-]) up to 4096 bytes. No shell metacharacters or
   // whitespace.
-  string token = 2;
+  string token = 2 [(openshell.options.v1.secret) = true];
 
   // Gateway host for SSH proxy connection. IPv4 address, bracketed IPv6
   // address, or DNS hostname (Punycode-encoded for IDN). Alphanumeric plus
@@ -649,7 +652,7 @@ message ServiceEndpointResponse {
 // Revoke SSH session request.
 message RevokeSshSessionRequest {
   // Session token to revoke.
-  string token = 1;
+  string token = 1 [(openshell.options.v1.secret) = true];
 }
 
 // Revoke SSH session response.
@@ -725,7 +728,7 @@ message TcpForwardInit {
   }
   // Optional target-specific authorization token. SSH targets use this as the
   // short-lived SSH session token issued by CreateSshSession.
-  string authorization_token = 7;
+  string authorization_token = 7 [(openshell.options.v1.secret) = true];
 }
 
 // A single frame on the CLI-to-gateway TCP forward stream.
@@ -764,7 +767,7 @@ message SshSession {
   string sandbox_id = 2;
 
   // Session token.
-  string token = 3;
+  string token = 3 [(openshell.options.v1.secret) = true];
 
   // Expiry timestamp in milliseconds since epoch. 0 means no expiry
   // (backward-compatible default for sessions created before this field existed).
@@ -1016,7 +1019,7 @@ message StoredProviderCredentialRefreshState {
   string provider_name = 3;
   string credential_key = 4;
   ProviderCredentialRefreshStrategy strategy = 5;
-  map<string, string> material = 6;
+  map<string, string> material = 6 [(openshell.options.v1.secret) = true];
   repeated string secret_material_keys = 7;
   int64 expires_at_ms = 8;
   int64 next_refresh_at_ms = 9;
@@ -1042,7 +1045,7 @@ message ConfigureProviderRefreshRequest {
   string provider = 1;
   string credential_key = 2;
   ProviderCredentialRefreshStrategy strategy = 3;
-  map<string, string> material = 4;
+  map<string, string> material = 4 [(openshell.options.v1.secret) = true];
   repeated string secret_material_keys = 5;
   optional int64 expires_at_ms = 6;
 }
@@ -1096,6 +1099,8 @@ message ProviderProfile {
   // profile files use 0. Gateway responses set this for stored custom profiles.
   // Update calls use this for optimistic concurrency.
   uint64 resource_version = 10;
+  // Optional non-secret annotations attached by profile sources or importers.
+  map<string, string> annotations = 11;
 }
 
 // Stored custom provider profile object.
@@ -1180,7 +1185,7 @@ message GetSandboxProviderEnvironmentRequest {
 // Get sandbox provider environment response.
 message GetSandboxProviderEnvironmentResponse {
   // Provider credential environment variables.
-  map<string, string> environment = 1;
+  map<string, string> environment = 1 [(openshell.options.v1.secret) = true];
   // Fingerprint for the provider credential inputs that produced environment.
   uint64 provider_env_revision = 2;
   // Expiration timestamps for returned environment variables.
@@ -1226,6 +1231,13 @@ message UpdateConfigRequest {
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   // Ignored for global-scoped updates.
   uint64 expected_resource_version = 8;
+  // Caller-provided annotations associated with a sandbox-scoped update. Values
+  // must not contain secrets; the gateway treats them as opaque metadata and does
+  // not interpret or verify their semantics. For policy updates, the gateway
+  // stores the annotations immutably with the revision and merges them into
+  // sandbox metadata as a convenience projection. For setting-only updates, it
+  // only merges them into sandbox metadata.
+  map<string, string> annotations = 9;
 }
 
 message PolicyMergeOperation {
@@ -1281,6 +1293,8 @@ message UpdateConfigResponse {
   uint64 settings_revision = 3;
   // True when a setting delete operation removed an existing key.
   bool deleted = 4;
+  // Sandbox metadata annotations after the update. Empty for global updates.
+  map<string, string> annotations = 5;
 }
 
 // Get sandbox policy status request.
@@ -1347,6 +1361,8 @@ message SandboxPolicyRevision {
   int64 loaded_at_ms = 6;
   // The full policy (only populated when explicitly requested).
   openshell.sandbox.v1.SandboxPolicy policy = 7;
+  // Immutable provenance supplied with this policy revision.
+  map<string, string> provenance = 8;
 }
 
 // Policy load status.
@@ -1828,6 +1844,8 @@ message PolicyRevisionPayload {
   string load_error = 3;
   // When the policy version was reported as loaded (ms since epoch). 0 if unset.
   int64 loaded_at_ms = 4;
+  // Immutable provenance supplied when this revision was created.
+  map<string, string> provenance = 5;
 }
 
 // Stored payload for a draft policy chunk row in the generic objects table.
@@ -1871,6 +1889,7 @@ message StoredPolicyRevision {
   optional string load_error = 7;
   int64 created_at_ms = 8;
   optional int64 loaded_at_ms = 9;
+  map<string, string> provenance = 10;
 }
 
 // Internal stored draft chunk row materialized from the generic objects table.

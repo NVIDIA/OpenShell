@@ -1929,6 +1929,7 @@ pub async fn sandbox_create(
         }),
         name: name.unwrap_or_default().to_string(),
         labels,
+        annotations: HashMap::new(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -1971,13 +1972,9 @@ pub async fn sandbox_create(
         match client
             .update_config(UpdateConfigRequest {
                 name: sandbox_name.clone(),
-                policy: None,
                 setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
                 setting_value: Some(setting),
-                delete_setting: false,
-                global: false,
-                merge_operations: vec![],
-                expected_resource_version: 0,
+                ..Default::default()
             })
             .await
         {
@@ -2680,6 +2677,17 @@ pub async fn sandbox_get(
         let mut labels: Vec<_> = metadata.labels.iter().collect();
         labels.sort_by_key(|(k, _)| *k);
         for (key, value) in labels {
+            println!("    {key}: {value}");
+        }
+    }
+
+    if let Some(metadata) = &sandbox.metadata
+        && !metadata.annotations.is_empty()
+    {
+        println!("  {} ", "Annotations:".dimmed());
+        let mut annotations: Vec<_> = metadata.annotations.iter().collect();
+        annotations.sort_by_key(|(k, _)| *k);
+        for (key, value) in annotations {
             println!("    {key}: {value}");
         }
     }
@@ -3429,10 +3437,15 @@ pub async fn sandbox_list(
 fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
     let meta = sandbox.metadata.as_ref();
     let labels = meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.labels));
+    let annotations = meta.map_or_else(
+        || serde_json::json!({}),
+        |m| serde_json::json!(m.annotations),
+    );
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "labels": labels,
+        "annotations": annotations,
         "resource_version": meta.map_or(0, |m| m.resource_version),
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase()),
@@ -3885,6 +3898,7 @@ async fn auto_create_provider(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
@@ -3927,6 +3941,7 @@ async fn auto_create_provider(
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                     }),
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
@@ -4713,13 +4728,14 @@ pub async fn provider_create_with_options(
     };
 
     let adc_credential_key = if from_gcloud_adc {
-        let profile =
-            openshell_providers::get_default_profile(&provider_type).ok_or_else(|| {
+        let profile = fetch_provider_profile(&mut client, &provider_type)
+            .await
+            .map_err(|err| {
                 miette::miette!(
-                    "--from-gcloud-adc requires a built-in provider profile, \
-                 but '{provider_type}' has none"
+                    "--from-gcloud-adc is not supported for '{provider_type}' providers ({err})"
                 )
             })?;
+        let profile = ProviderTypeProfile::from_proto(&profile);
         let adc_cred = profile.adc_credential().ok_or_else(|| {
             miette::miette!(
                 "--from-gcloud-adc is not supported for '{provider_type}' providers \
@@ -4807,6 +4823,7 @@ pub async fn provider_create_with_options(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.clone(),
                 credentials: credential_map,
@@ -5753,6 +5770,7 @@ pub async fn provider_update(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: credential_map,
@@ -6364,12 +6382,8 @@ pub async fn sandbox_policy_set_global(
         .update_config(UpdateConfigRequest {
             name: String::new(),
             policy: Some(policy),
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6562,13 +6576,10 @@ pub async fn gateway_setting_set(
     let response = client
         .update_config(UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
-            delete_setting: false,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6597,13 +6608,9 @@ pub async fn sandbox_setting_set(
     let response = client
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
-            policy: None,
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6632,13 +6639,10 @@ pub async fn gateway_setting_delete(
     let response = client
         .update_config(UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key.to_string(),
-            setting_value: None,
             delete_setting: true,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6667,13 +6671,9 @@ pub async fn sandbox_setting_delete(
     let response = client
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
-            policy: None,
             setting_key: key.to_string(),
-            setting_value: None,
             delete_setting: true,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6727,12 +6727,7 @@ pub async fn sandbox_policy_set(
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
             policy: Some(policy),
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?;
@@ -6901,13 +6896,8 @@ pub async fn sandbox_policy_update(
     let response = client
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
-            policy: None,
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
-            global: false,
             merge_operations: plan.merge_operations,
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -7340,6 +7330,9 @@ fn policy_revision_to_json(
     }
     if !rev.load_error.is_empty() {
         obj.insert("load_error".to_string(), serde_json::json!(rev.load_error));
+    }
+    if !rev.provenance.is_empty() {
+        obj.insert("provenance".to_string(), serde_json::json!(rev.provenance));
     }
     if view.includes_policy() {
         let policy = match rev.policy.as_ref() {
@@ -7896,7 +7889,7 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
+        PolicyGetView, ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_to_json,
@@ -7904,7 +7897,7 @@ mod tests {
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
-        plaintext_gateway_is_remote, progress_step_from_metadata,
+        plaintext_gateway_is_remote, policy_revision_to_json, progress_step_from_metadata,
         provider_profile_allows_empty_credentials, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
         sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
@@ -7929,11 +7922,40 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GpuResourceRequirements, Provider, ProviderCredentialRefresh,
+        GpuResourceRequirements, PolicyStatus, Provider, ProviderCredentialRefresh,
         ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
         ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        ResourceRequirements, SandboxCondition, SandboxPolicyRevision, SandboxStatus,
+        datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn policy_revision_json_includes_revision_provenance() {
+        let revision = SandboxPolicyRevision {
+            version: 2,
+            policy_hash: "hash".to_string(),
+            provenance: std::collections::HashMap::from([(
+                "openshell.nvidia.com/policy-signature".to_string(),
+                "signed".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let json = policy_revision_to_json(
+            "sandbox",
+            Some("example"),
+            Some(2),
+            &revision,
+            PolicyStatus::Pending,
+            PolicyGetView::Metadata,
+        )
+        .unwrap();
+
+        assert_eq!(
+            json["provenance"]["openshell.nvidia.com/policy-signature"],
+            "signed"
+        );
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -9726,6 +9748,7 @@ mod tests {
             resource_version: 42,
             created_at_ms: 1_234_567_890_000,
             labels,
+            annotations: std::collections::HashMap::new(),
         };
 
         let provider = Provider {

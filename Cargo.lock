@@ -3754,6 +3754,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-gateway-interceptors"
+version = "0.0.0"
+dependencies = [
+ "hyper-util",
+ "json-patch",
+ "metrics",
+ "openshell-core",
+ "prost",
+ "prost-reflect",
+ "prost-types",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-ocsf"
 version = "0.0.0"
 dependencies = [
@@ -3881,6 +3902,7 @@ dependencies = [
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
  "openshell-driver-podman",
+ "openshell-gateway-interceptors",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-prover",
@@ -4564,6 +4586,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "prost-reflect"
+version = "0.16.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01b80ea363c31af2de2b92e3c07ed1156628f7838c4afb4df75ee78a37fedbd1"
+dependencies = [
+ "base64 0.22.1",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde-value",
 ]
 
 [[package]]
