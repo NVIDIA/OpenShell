@@ -8,13 +8,28 @@
 // added alongside a conformance suite that pins it byte-identical across the
 // TypeScript, Python, and Go SDKs.
 
-export { OpenShellClient, SandboxClient, errorCode } from './client.js'
 export type {
   ConnectOptions,
+  EffectiveSettingView,
+  ExecInteractiveOptions,
+  ExecInteractiveSession,
   ExecOptions,
   ExecResult,
+  ExecStreamChunk,
+  ForwardHandle,
+  ForwardOptions,
   Health,
   ListOptions,
+  ProviderChange,
+  ProviderChangeOptions,
+  ProviderRef,
+  SandboxConfig,
+  SandboxPolicy,
   SandboxRef,
   SandboxSpec,
-} from './client.js'
+  SetPolicyOptions,
+  SettingValue,
+  SshSession,
+  UpdateConfigResult,
+} from './client.js';
+export { errorCode, OpenShellClient, SandboxClient } from './client.js';
