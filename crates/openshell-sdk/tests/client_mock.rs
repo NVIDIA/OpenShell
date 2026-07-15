@@ -624,6 +624,7 @@ async fn create_sandbox_passes_spec_through() {
     let observed = state.last_create.lock().await.clone().unwrap();
     assert_eq!(observed.name, "my-box");
     assert_eq!(observed.labels, labels);
+    assert!(observed.annotations.is_empty());
     let observed_spec = observed.spec.unwrap();
     assert!(
         observed_spec
