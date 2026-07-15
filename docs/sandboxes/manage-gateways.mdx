@@ -84,10 +84,19 @@ The active gateway is the persisted default. The `-g` flag and the `OPENSHELL_GA
 
 Installers can seed read-only gateway entries for package-managed local services. By default the CLI reads these from `/etc/openshell`, using the same `active_gateway` plus `gateways/<name>/metadata.json` layout as per-user config. Packages can override that system config root with a non-empty absolute `OPENSHELL_SYSTEM_GATEWAY_DIR` when needed; empty or relative values fall back to `/etc/openshell` and log a warning. These entries appear in `openshell gateway list` and can be selected like user registrations. `openshell gateway list` and `openshell term` label each gateway as `user` or `system` so you can see which config layer owns it. `openshell gateway remove` removes only per-user registrations. Register a per-user gateway with the same name when you need to shadow an installer-provided default.
 
-List all registered gateways:
+List all registered gateways. The table shows each gateway's endpoint, type,
+config source, authentication mode, and remote target when a remote registration
+has one:
 
 ```shell
 openshell gateway list
+```
+
+Use structured output when you need the complete local registration metadata,
+including `remote_host` and `resolved_host` for remote registrations:
+
+```shell
+openshell gateway list -o json
 ```
 
 Switch the active gateway:
@@ -110,13 +119,6 @@ Use `openshell status` for a quick health check:
 openshell status
 ```
 
-Use `openshell gateway info` when you need the registered endpoint, gateway metadata, or compute driver details:
-
-```shell
-openshell gateway info
-openshell gateway info --name production
-```
-
 Remove a local CLI registration without stopping the gateway service:
 
 ```shell
@@ -129,14 +131,13 @@ Check gateway health:
 
 ```shell
 openshell status
-openshell gateway info
 ```
 
 For Docker-backed local gateways, inspect Docker and the gateway process or container started by your local workflow:
 
 ```shell
 openshell doctor check
-openshell gateway info
+openshell gateway list
 ```
 
 For Kubernetes gateways, inspect the gateway workload and cluster events:

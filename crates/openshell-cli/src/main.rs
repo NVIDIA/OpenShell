@@ -366,7 +366,6 @@ const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell gateway add http://127.0.0.1:8080 --local
   $ openshell gateway select my-gateway
-  $ openshell gateway info
   $ openshell gateway remove my-gateway
 ";
 
@@ -1105,18 +1104,11 @@ enum GatewayCommands {
         name: Option<String>,
     },
 
-    /// Show gateway registration details.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Info {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
-        name: Option<String>,
-    },
-
     /// List registered gateways.
     ///
-    /// Prints a table of all registered gateways with their endpoint, type,
-    /// and authentication mode. The active gateway is marked with `*`.
+    /// Prints all registered gateways with their endpoint, type,
+    /// authentication mode, source, and remote registration details.
+    /// The active gateway is marked with `*`.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
         /// Output format.
@@ -2055,12 +2047,6 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Select { name } => {
                 run::gateway_select(name.as_deref(), &cli.gateway)?;
-            }
-            GatewayCommands::Info { name } => {
-                let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
-                    .unwrap_or_else(|| "openshell".to_string());
-                run::gateway_admin_info(&name)?;
             }
             GatewayCommands::List { output } => {
                 run::gateway_list(&cli.gateway, output.as_str())?;
@@ -3445,7 +3431,7 @@ mod tests {
             for (raw_args, index) in [
                 (vec!["openshell", "--gateway", "a"], 2),
                 (vec!["openshell", "gateway", "select", "a"], 3),
-                (vec!["openshell", "gateway", "info", "--name", "a"], 4),
+                (vec!["openshell", "gateway", "remove", "a"], 3),
             ] {
                 let mut cmd = Cli::command();
                 let args: Vec<OsString> = raw_args.iter().copied().map(Into::into).collect();
