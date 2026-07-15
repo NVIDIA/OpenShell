@@ -55,6 +55,7 @@ fn sandbox_with_phase(name: &str, phase: proto::SandboxPhase) -> proto::Sandbox 
             created_at_ms: 0,
             labels: HashMap::new(),
             resource_version: 1,
+            annotations: HashMap::new(),
         }),
         spec: None,
         status: Some(proto::SandboxStatus {

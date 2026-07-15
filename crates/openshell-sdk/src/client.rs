@@ -468,6 +468,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         }),
         name: name.unwrap_or_default(),
         labels,
+        annotations: std::collections::HashMap::new(),
     }
 }
 
