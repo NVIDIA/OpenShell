@@ -1,203 +1,258 @@
 # Implementation Plan
 
 This plan is intentionally separate from the main RFC so the proposal can stay
-direction-focused.
+direction-focused. The RFC is an incremental roadmap, not one pull request.
+Phases 0 through 7 form the compatibility foundation: they restructure current
+CONNECT, forward HTTP, raw TCP, and local-service behavior without adding a new
+user-facing transport. Phases 8 and later add the forward-looking capabilities
+after the shared contracts are authoritative.
 
-## Phase 0 - Regression Tests
+## Phase 0 - Compatibility Baseline
 
-- Add tests for forward HTTP pipelining and keep-alive follow-on requests,
-  including the current `Connection: close` mitigation.
-- Add tests for forward HTTP h2c rejection on inspected endpoints.
-- Add tests for overlapping endpoint metadata selection.
-- Add tests for endpoint metadata query failures.
-- Add tests for control-plane port blocking through all destination validation
-  paths.
-- Add tests for exact declared private endpoint trust and `allowed_ips`
-  behavior across CONNECT and forward HTTP.
-- Add tests for identity-less runtime modes where process identity is
-  intentionally unavailable and binary/path scoped policy does not
-  accidentally match.
-- Add tests proving static credential injection works in L4-only HTTP and
-  HTTP-inspected paths.
-- Add tests proving token grant success injects the configured header and token
-  grant failure does not forward upstream.
-- Add tests proving supervisor middleware runs after request policy and before
-  credential injection, including allow, deny, mutation, `fail_open`,
-  `fail_closed`, and body-cap behavior.
-- Add tests for REST request-body credential rewrite, WebSocket text-frame
-  credential rewrite, WebSocket GraphQL policy, and compression handling.
-- Add tests for JSON-RPC method policy, batch behavior, response-frame denial,
-  and MCP method/tool policy.
-- Add tests for `policy.local` proposal wait behavior and `inference.local`
-  buffered/streaming route limits.
-- Add tests for metadata loopback startup/failure behavior when provider
-  credentials require it.
-- Add nftables bypass enforcement tests that verify proxy-bound traffic is
-  accepted while direct TCP/UDP egress is rejected and logged when available.
+- Cover CONNECT and forward HTTP allow/deny responses, including exact status,
+  headers, and adapter-specific error bodies.
+- Cover forward HTTP pipelining, keep-alive follow-on requests, the current
+  `Connection: close` mitigation, `https://` absolute-form rejection, and h2c
+  rejection on inspected endpoints.
+- Cover the current overlapping-policy outcomes separately for matched policy,
+  L7 route selection, TLS, `allowed_ips`, and exact-declared-host.
+- Inject failures into L7, TLS, `allowed_ips`, and exact-declared-host queries.
+  Record the current fail-open or fail-closed result for each query rather than
+  treating all endpoint metadata errors as equivalent.
+- Cover control-plane ports, cloud metadata, always-blocked addresses, exact
+  declared private endpoints, IP-literal synthesis, trusted gateway aliases,
+  and explicit `allowed_ips` through CONNECT and forward HTTP.
+- Cover identity-required success/failure, unsupported-platform behavior where
+  possible, and intentional endpoint-only evaluation. Prove an empty
+  `exec.path` cannot satisfy binary-scoped policy while identity is required.
+- Cover static credential injection, token grants, REST body rewrite,
+  WebSocket text-frame rewrite and policy, GraphQL, JSON-RPC, and MCP behavior.
+- Cover `inference.local`, `policy.local`, metadata loopback, and unchanged
+  nftables bypass reject/log behavior.
+- Capture stable OCSF event class, activity/action/disposition, severity,
+  status, destination, actor, firewall rule, message, and status detail for
+  representative allow and deny paths.
+- Record a performance baseline for OPA evaluations, per-connection
+  allocations, and CONNECT/forward request latency.
 
-## Phase 1 - Authorization Result
+## Phase 1 - Adapters And Compatibility Decision Envelope
 
-- Introduce `EgressIntent` and `EgressDecision` inside
+- Introduce CONNECT and forward HTTP `EgressIntent` construction inside
   `openshell-supervisor-network`.
-- Make authorization return matched policy and matched endpoint metadata
-  together.
-- Include policy source on the decision: user-authored, provider-derived, or
-  local-service internal.
-- Include protocol enforcement, supervisor middleware, and credential injection
-  plans on the decision.
-- Include process identity availability and fields used on the decision. Treat
-  missing process identity as an explicit runtime mode, not as an implicit
-  lookup failure.
-- Fail closed when required endpoint metadata cannot be materialized.
-- Emit consistent OCSF network denial events from the shared boundary.
+- Introduce a transitional `EgressDecision` carrying L4 outcome, policy
+  generation, process evidence, and endpoint fields while preserving the
+  current query timing, precedence, and failure defaults.
+- Keep `LookupFailed`/unsupported identity as a denial when identity is
+  required. Keep explicitly configured endpoint-only mode behavior unchanged.
+- Keep adapter-specific responses and OCSF emission at the protocol boundary.
+- Do not claim the transitional decision is one atomic OPA result; document its
+  compatibility hydration until Phase 3 cuts over.
+
+This phase is a mechanical extraction. It must be independently shippable and
+revertible without changing user-visible policy or relay behavior.
 
 ## Phase 2 - Shared Destination Validation
 
-- Move DNS resolution, allowed IP filtering, SSRF checks, exact declared
-  endpoint handling, trusted gateway aliases, and control-plane port checks
-  into one destination validation path.
-- Return an `UpstreamConnector` rather than an opened upstream socket.
-- Add tests proving CONNECT, forward HTTP, and future transparent TCP use the
-  same validation behavior.
+- Move DNS resolution, explicit `allowed_ips`, exact declared endpoints,
+  implicit IP-literal handling, trusted gateway aliases, SSRF checks,
+  cloud-metadata blocks, and control-plane-port blocks into one validator.
+- Represent the selected validation mode explicitly instead of passing an
+  ambiguous collection of booleans.
+- Return an unopened `UpstreamConnector` so adapters and relays preserve the
+  current point at which upstream TCP is created.
+- Prove CONNECT and forward HTTP retain their existing denial responses, OCSF
+  fields, and dial timing while using the shared validator.
 
-## Phase 3 - Forward HTTP Adapter
+## Phase 3 - Generation-Consistent Authorization Cutover
 
-- Convert forward HTTP into an adapter that parses the first absolute-form
-  request and builds an egress intent.
-- Route the parsed first request into the shared HTTP relay or preserve the
-  current guarded single-request relay behavior.
-- Preserve `https://` absolute-form rejection.
-- Preserve h2c rejection on inspected routes.
-- Keep the no-raw-copy invariant after the first request.
+- Define either rejection of ambiguous overlapping endpoint metadata or one
+  documented policy/endpoint precedence key before changing enforcement.
+- Add one OPA result that materializes matched policy/source, matched endpoint,
+  destination constraints, TLS, HTTP enforcement, credential plan, and
+  middleware selection from one policy generation.
+- Attach a generation-pinned `TunnelPolicyEngine` to relay context for
+  per-request REST, GraphQL, JSON-RPC, MCP, and WebSocket evaluation. Relays do
+  not rematerialize connection-level endpoint policy.
+- Run the new query in shadow mode beside legacy queries. Emit internal,
+  audit-safe mismatch telemetry without changing existing OCSF network/HTTP
+  events or enforcement.
+- Add reload-race tests proving every materialized field matches the top-level
+  generation and stale decisions stop before upstream request write.
+- Make deterministic selection and fail-closed L7/TLS metadata errors a
+  dedicated cutover only after mismatch cases are understood. Retain the
+  legacy evaluator temporarily for immediate rollback.
 
-## Phase 4 - HTTP, WebSocket, Middleware, And Credential Relay Consolidation
+This is the only phase that intentionally tightens ambiguous or error behavior;
+it must not be hidden inside the structural refactor commits.
 
-- Centralize HTTP request parsing, REST policy, GraphQL policy, WebSocket
-  upgrade policy, JSON-RPC/MCP policy, supervisor middleware, credential
-  resolution, redaction, request rewrite, upstream dial, and response relay.
-- Evaluate every HTTP request before upstream write.
-- Ensure denied HTTP requests do not create upstream TCP sessions.
-- Run `HTTP_REQUEST / PRE_CREDENTIALS` middleware after request allow and
-  before static or dynamic credential injection.
-- Preserve middleware ordering, body caps, failure policy, safe header
-  mutation, findings, and metadata emission.
-- Reject or strip newly introduced reserved credential placeholders from
-  middleware-transformed content unless a future hook is explicitly
-  credential-capable.
-- Preserve static placeholder rewrite for target, query, and headers.
-- Preserve dynamic token grant injection after request allow and before
-  upstream write.
-- Preserve opt-in REST request-body credential rewrite behind the shared HTTP
-  relay, including bounded buffering, supported content-type handling,
-  `Content-Length` recomputation, and fail-closed unresolved placeholders.
-- Preserve WebSocket upgrade handling behind the shared relay, including
-  opt-in client-to-server text-frame credential rewrite, WebSocket transport
-  message policy, GraphQL-over-WebSocket policy, and raw passthrough for other
-  upgraded protocols.
-- Preserve JSON-RPC and MCP handling behind the shared HTTP relay, including
-  bounded body inspection, JSON-RPC batch evaluation, MCP `tools/call` tool
-  selectors, and audit-safe logging that omits params and tool arguments.
+## Phase 4 - Forward HTTP Adapter
 
-## Phase 5 - Shared TLS Termination
+- Keep absolute-form parsing and adapter-specific errors at the forward HTTP
+  boundary.
+- Pass the buffered first request into a shared HTTP relay, or retain the
+  guarded single-request/`Connection: close` path until Phase 5a is ready.
+- Preserve `https://` absolute-form rejection and inspected h2c rejection.
+- Preserve the invariant that no unevaluated follow-on request can reach raw
+  bidirectional copy.
 
-- Move client-side TLS detection and termination before the HTTP/TCP relay
-  split.
-- Keep endpoint TLS behavior on `EgressDecision`.
-- Treat `tls: skip` as the explicit opt-out for TLS handling.
-- Remove duplicate HTTP-specific and TCP-specific TLS termination decisions.
+## Phase 5 - Relay Consolidation
 
-## Phase 6 - TCP Relay And Protocol Processor Boundary
+### Phase 5a - HTTP request loop
 
-- Use `TcpRelay` for byte relay and native protocol processor dispatch.
-- Keep `protocol: tcp` or omitted protocol as L4 authorization plus byte copy.
-- Add a native protocol processor dispatch point for future protocol
-  enforcement.
-- Let protocol processors own their message loop and call the connector
-  when protocol state allows.
-- Allow processors to expose typed middleware hooks instead of requiring all
-  payload logic to live in-tree.
+- Centralize HTTP parsing and per-request REST, GraphQL, JSON-RPC, and MCP
+  evaluation behind the generation-pinned request-policy handle.
+- Evaluate every request before upstream write and preserve the current rule
+  that a denied request does not create an upstream session.
+- Preserve bounded JSON-RPC/MCP inspection and audit-safe logging that omits
+  params and tool arguments.
 
-## Phase 7 - Policy DNS And Transparent TCP
+### Phase 5b - Credential injection
+
+- Unify static target/query/header rewrite, endpoint-bound token grants, and
+  opt-in REST request-body rewrite after request allow and before upstream
+  write.
+- Preserve buffering limits, supported content types, `Content-Length`
+  recomputation, redaction, token caching, and fail-closed unresolved secrets.
+
+### Phase 5c - WebSocket
+
+- Move allowed upgrades behind the shared relay while preserving raw upgraded
+  passthrough, opt-in text-frame credential rewrite, WebSocket transport policy,
+  GraphQL-over-WebSocket policy, and safe compression behavior.
+
+### Phase 5d - Supervisor middleware
+
+- Land only after the supervisor middleware dependency is available.
+- Run `HTTP_REQUEST / PRE_CREDENTIALS` after request allow and before static or
+  dynamic credential injection.
+- Preserve ordering, body caps, `fail_open`/`fail_closed`, safe headers,
+  findings, metadata, and rejection of middleware-introduced credential
+  placeholders.
+
+Each subphase must be independently testable and shippable; Phase 5 is not a
+single flag-day cutover.
+
+## Phase 6 - Shared TLS And TCP Relay Boundary
+
+- Move client-side TLS detection and termination before the HTTP/raw-TCP relay
+  split without changing handshake, certificate, or upstream-connect timing.
+- Keep endpoint TLS behavior on `EgressDecision` and preserve `tls: skip` as the
+  explicit raw-tunnel path.
+- Use one existing raw `TcpRelay` byte-copy primitive for L4 traffic.
+- Add a protocol-processor dispatch contract without enabling a concrete new
+  protocol in the compatibility milestone.
+- Let processors own their message loop and call the validated connector only
+  when protocol state allows. Permit in-tree, middleware-backed, and hybrid
+  processors with typed middleware operations.
+
+## Phase 7 - Existing Local Services And Cleanup
+
+- Keep `inference.local` as a local adapter with its existing TLS, route,
+  provider-auth, streaming/buffered limit, and OCSF behavior.
+- Keep `policy.local` as a local adapter for current policy, bounded denial
+  summaries, proposals, and proposal wait.
+- Decide whether metadata loopback remains orchestrated by `openshell-sandbox`
+  or moves behind a local adapter boundary; preserve startup/failure behavior
+  either way.
+- Keep the local-routing and destination contracts extensible for issue
+  [#1633](https://github.com/NVIDIA/OpenShell/issues/1633), while leaving its
+  policy surface and host-loopback authorization to separate feature work.
+- Remove compatibility endpoint queries only after Phase 3 is authoritative.
+- Remove duplicated destination/relay plumbing without centralizing
+  adapter-specific response rendering.
+- Update the living architecture documentation once each implemented boundary
+  reflects current code.
+
+Completion of Phase 7 is the compatibility milestone: existing user-facing
+features and capabilities are preserved on the new internal structure. The
+following phases are feature-bearing work and land in separate pull requests or
+series.
+
+## Phase 8 - Policy DNS And Transparent TCP
 
 - Add policy DNS registration for native TCP endpoint names.
-- Replace static host-file mapping with query-driven DNS answers.
-- Publish active DNS answer state and capture rules.
-- Implement nftables REDIRECT/TPROXY capture rules ahead of the bypass reject
-  path; do not add a parallel iptables path.
-- Coordinate capture rule ownership with `openshell-supervisor-process::netns`.
-- Implement transparent TCP adapter lookup from captured original destination
-  to active endpoint generation.
-- Decide TTL and stale-generation behavior.
+- Replace static host-file mapping with query-driven DNS answers resolved
+  through trusted DNS and filtered through destination controls.
+- Store normalized name, endpoint ID, IP/port, policy generation, distinct DNS
+  mapping generation, mapping ID, and expiration in active mapping state.
+- Require every captured connect to correlate with the unexpired mapping
+  created by its policy-eligible DNS answer. Do not allow unrelated bare-IP
+  traffic to inherit a policy-DNS decision.
+- Publish mapping and nftables capture updates atomically from the adapter's
+  perspective.
+- Add nftables REDIRECT/TPROXY capture rules ahead of the bypass reject path;
+  do not add a parallel iptables path.
+- Coordinate capture-rule ownership with
+  `openshell-supervisor-process::netns` and preserve reject/log fallback for
+  unmatched traffic.
+- Recover the original destination, construct a transparent-TCP intent, and run
+  normal generation-consistent authorization and destination validation.
+- Define TTL caps, policy-reload invalidation, stale-mapping behavior, and
+  rollback before enabling capture by default.
 
-## Phase 8 - Local Service Adapters
+## Phase 9 - Native Protocol Processors
 
-- Model `inference.local` as a local adapter with TLS termination, route
-  validation, provider auth injection, streaming/buffered limits, and OCSF
-  logging.
-- Model `policy.local` as a local adapter for current policy, bounded denial
-  summaries, policy proposals, and proposal wait.
-- Decide whether metadata loopback remains orchestrated in `openshell-sandbox`
-  or moves behind a local adapter boundary in `openshell-supervisor-network`.
-- Keep these paths outside normal external egress relay while preserving
-  credential redaction and route validation.
+- Add concrete Redis, Postgres, MySQL, or other processors one protocol at a
+  time, each with a separately reviewed policy schema and operational limits.
+- Keep omitted/`tcp` endpoints on raw L4 byte copy; never infer a native
+  processor from traffic alone.
+- Test multi-message sessions, pre-dial denial, handshake-required dialing,
+  per-command/query evaluation, middleware hooks, timeouts, and redaction.
+- Capability-gate policy that names a processor unavailable in the running
+  proxy build.
 
-## Phase 9 - Runtime Boundary
+## Phase 10 - Runtime Boundary
 
-- Keep embedded supervisor mode as the first migration target.
-- Treat the existing `openshell-supervisor-network` and
-  `openshell-supervisor-process` split as the structural baseline.
-- Define the proxy runtime API needed for a future standalone binary:
-  configured listeners, policy updates, provider credentials, token grants,
-  supervisor middleware registry, gateway calls, telemetry, denial/activity
+- Keep embedded and network-only supervisor modes as the migration baseline.
+- Define the proxy runtime API needed for a future standalone binary or
+  sidecar: configured listeners, policy updates, provider credentials, token
+  grants, middleware registry, gateway calls, telemetry, denial/activity
   events, and shutdown.
-- Advertise process identity capability for embedded, network-only,
-  standalone, and sidecar modes. Reject policies that require unavailable
-  identity dimensions, or define those predicates as non-matching for the
-  runtime mode.
-- Add capability negotiation with the gateway if standalone proxy versions can
-  differ from gateway versions.
+- Advertise process-identity and protocol-processor capabilities. Reject policy
+  that requires unavailable binary/path identity or processor support.
+- Represent intentional runtime identity unavailability separately from the
+  existing endpoint-only mode and from lookup failure.
+- Add gateway capability negotiation if proxy and gateway versions can differ.
 
-## Phase 10 - Cleanup
+## Phase 11 - Final Cleanup
 
-- Remove duplicated endpoint metadata queries from relay paths.
-- Remove duplicated destination validation and deny rendering where adapters
-  can own response shape.
-- Remove any remaining forward HTTP raw-copy fallback.
-- Remove stale references to iptables or static `/etc/hosts` native TCP
-  mapping from proxy design docs.
-- Update architecture docs once implementation lands.
+- Remove any compatibility query/evaluator retained for deterministic-decision
+  rollback after its observation window closes.
+- Remove stale static `/etc/hosts`, iptables, or single-process assumptions from
+  proxy design and architecture documentation as the corresponding later phase
+  lands.
+- Keep adapter-specific response rendering and OCSF contracts at their protocol
+  boundaries.
 
-## Testing Plan
+## Testing And Operational Validation
 
-- Unit-test each adapter's intent construction and deny response shape.
-- Unit-test authorization precedence for overlapping policy and endpoint rules.
-- Unit-test provider-derived rule namespace handling and `policy.local`
-  filtering.
-- Unit-test identity-available and identity-unavailable authorization inputs.
-- Integration-test shared destination validation across CONNECT, forward HTTP,
-  and transparent TCP.
-- Integration-test HTTP keep-alive and pipelined requests with REST, GraphQL,
-  and WebSocket upgrade enforcement.
-- Integration-test credential injection in L4-only HTTP and HTTP-inspected
-  paths.
-- Integration-test token grant success, cache hit, malformed token, resolver
-  unavailable, and token endpoint failure.
-- Integration-test supervisor middleware allow/deny/mutate, unavailable
-  service, unresolved binding, body over-capacity, safe header mutation,
-  finding emission, and no-credential-visible behavior.
-- Integration-test REST request-body credential rewrite for JSON,
-  form-url-encoded, `text/*`, unsupported content types, chunked framing, body
-  caps, and unresolved placeholders.
-- Integration-test WebSocket text-frame credential rewrite, raw upgraded
-  passthrough, WebSocket message policy, GraphQL-over-WebSocket policy, and
-  safe compression negotiation.
-- Integration-test JSON-RPC method allow/deny, batch denial, response-frame
-  handling, MCP method profile behavior, and MCP tool selector enforcement.
-- Integration-test TLS termination before HTTP/TCP relay split.
-- Integration-test `protocol: tcp` byte-copy behavior.
-- Add protocol processor harness tests before adding Redis, Postgres, or
-  similar native protocol enforcement.
-- Integration-test policy DNS TTL, stale generation handling, and captured
-  connect correlation.
-- Integration-test `inference.local`, `policy.local`, and metadata loopback
-  body limits, timeout behavior, redaction, and local denial responses.
+- Unit-test adapter intent construction, response rendering, explicit
+  destination modes, identity evidence, and authorization precedence.
+- Integration-test destination validation across CONNECT and forward HTTP,
+  then reuse the same suite for transparent TCP when Phase 8 lands.
+- Integration-test HTTP keep-alive/pipelining, REST, GraphQL, JSON-RPC, MCP,
+  WebSocket, credentials, token grants, middleware, and TLS/raw-TCP selection.
+- Integration-test `inference.local`, `policy.local`, and metadata loopback body
+  limits, timeouts, redaction, and local denial responses.
+- Compare OCSF fixtures before and after each migration subphase.
+- Exercise policy reload between L4 decision, endpoint materialization, relay
+  startup, and long-lived per-request evaluation.
+- Add protocol-processor harness tests before adding Redis, Postgres, MySQL, or
+  similar enforcement. Each concrete processor adds multi-message, handshake,
+  timeout, denial, redaction, and middleware coverage.
+- Integration-test policy DNS filtering, TTL, distinct mapping generations,
+  policy-reload invalidation, atomic capture-rule updates, original-destination
+  recovery, captured-connect correlation, and rejection of unrelated bare-IP
+  connects.
+- Test standalone/sidecar capability negotiation and prove missing identity or
+  processor support fails during policy validation rather than broadening an
+  allow at runtime.
+- Re-run the performance baseline after the compatibility envelope, after the
+  single-decision query, and after relay consolidation. Treat reduced OPA calls
+  as a measured result rather than an assumed benefit.
+- Back out structural phases by reverting their isolated commits. Keep shadow
+  comparison and the legacy evaluator available through the deterministic
+  cutover observation window.
+- Gate later transport/runtime phases independently so disabling policy DNS or
+  transparent capture restores the existing explicit-proxy and bypass-reject
+  behavior without reverting the compatibility foundation.

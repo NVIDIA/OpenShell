@@ -39,12 +39,12 @@ routes, identity cache, provider credential injection, and token grants.
 helpers, nftables bypass rules, and the bypass monitor that turns nftables LOG
 entries into OCSF events.
 
-In embedded supervisor mode, the network leaf can usually use process metadata
+In embedded supervisor mode, the network leaf normally uses process metadata
 resolved by the process/orchestrator side for binary-scoped policy and OCSF
-context. Future network-only, standalone, or sidecar proxy modes may
-intentionally lack that metadata. The adapter model should preserve this as an
-explicit "identity unavailable" state rather than fabricating an empty binary
-identity.
+context. Current runtime configuration can instead select endpoint-only policy
+evaluation. The adapter model must preserve that intentional mode separately
+from an identity lookup failure; the latter continues to deny when binary
+identity is required.
 
 ## Current Userland-Facing Surfaces
 
@@ -204,19 +204,37 @@ by passing the first parsed request into a shared HTTP relay loop.
 
 ### Endpoint config is not tied to deterministic matched policy
 
-The policy name used for L4 authorization and logging can be selected through a
-different precedence rule than endpoint metadata. With overlapping host, port,
-and binary rules, allowed IPs, TLS behavior, enforcement, and
-`allow_encoded_slash` can come from a different endpoint than the policy name
-logged and used for L4 allow.
+The policy name used for L4 authorization and logging is the lexicographically
+smallest matching policy. L7 candidates are collected independently and later
+selected by request-path specificity. TLS and `allowed_ips` use the first
+extended endpoint config returned by a separate query. Exact-declared-host is
+another independent existential query. With overlapping host, port, and binary
+rules, those results can describe different endpoints and policies on the same
+connection.
 
 The adapter model requires authorization to return one decision with one
 deterministic matched endpoint.
 
+### Policy materialization can span generations
+
+The L4 decision, L7 route, TLS mode, `allowed_ips`, and exact-declared-host
+signal are materialized through separate engine calls. The L7 route records a
+generation for its tunnel evaluator, but the sibling metadata queries are not
+all asserted against the L4 decision generation. A reload during setup can
+therefore assemble one logical connection decision from different policy
+generations.
+
+The target decision carries one top-level policy generation. Every
+policy-derived field must be evaluated from that generation, and relay startup
+must reject a stale decision before an upstream request is written.
+
 ### Endpoint metadata query failures should not erase enforcement
 
-If endpoint metadata lookup fails, callers can interpret the result as no L7
-configuration and downgrade to credential-only or raw L4 relay.
+Failure behavior is not uniform today. L7 configuration failure becomes no L7
+configuration, and TLS configuration failure becomes automatic TLS handling;
+either can erase intended enforcement. `allowed_ips` and the downstream SSRF
+validation path are already more conservative. The migration must test each
+query independently instead of describing all metadata failures as equivalent.
 
 The adapter model treats endpoint metadata as part of the authorization result.
 Failure to materialize required metadata should deny rather than erase extended
@@ -226,9 +244,9 @@ configuration.
 
 Private address checks, `allowed_ips`, exact declared private endpoint trust,
 trusted gateway aliases, SSRF checks, and control-plane port blocks have grown
-over time. They should be centralized so CONNECT, forward HTTP, future
-transparent TCP, and local-service egress use the same resolved-destination
-rules.
+over time. They should be centralized so CONNECT and forward HTTP use the same
+resolved-destination rules. Existing local services remain outside normal
+external destination validation.
 
 ## Existing Feature Inventory
 

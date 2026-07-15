@@ -14,7 +14,9 @@ middleware registry construction and reload behavior.
 This is a useful outer boundary, but it is not yet the proxy adapter boundary.
 The proxy still needs internal `EgressIntent` and `EgressDecision` boundaries
 so CONNECT, forward HTTP, local routes, and future native TCP capture do not
-duplicate policy and relay orchestration.
+duplicate policy and relay orchestration. The first implementation milestone
+wires only current surfaces; later milestones add new adapters to the same
+contract.
 
 ## Shared Data Boundaries
 
@@ -30,7 +32,8 @@ It should carry:
 - optional process identity inputs collected by the adapter/runtime;
 - optional first HTTP request for forward proxy traffic;
 - optional local service route;
-- policy generation or DNS mapping generation when relevant.
+- policy generation and, for policy DNS/transparent TCP, a distinct DNS
+  mapping generation and correlation handle.
 
 Adapters build intents. They should not query endpoint metadata, select TLS
 mode, or select relays.
@@ -42,6 +45,7 @@ mode, or select relays.
 It should carry:
 
 - allow or deny;
+- one top-level policy generation used for every policy-derived field;
 - deterministic matched policy identifier;
 - whether the policy is user-authored, provider-derived, or local-service
   internal;
@@ -52,11 +56,17 @@ It should carry:
 - protocol enforcement;
 - credential injection plan;
 - supervisor middleware plan;
+- the request-policy selection needed to create a pinned per-request L7
+  evaluator when HTTP inspection is configured;
 - logging context and denial reason.
 
 Relay code should read this decision. It should not query OPA again for
 endpoint metadata, TLS mode, allowed IPs, credential behavior, middleware
-selection, or processor selection.
+selection, or relay selection. Long-lived HTTP relays still evaluate each
+request through the generation-pinned L7 evaluator carried in `RelayContext`;
+that is request authorization, not endpoint rematerialization. Later native
+protocol processors use the same pattern with a generation-pinned protocol
+evaluator for per-command or per-query decisions.
 
 ## Protocol Enforcement
 
@@ -75,7 +85,7 @@ Use a protocol enforcement value derived from endpoint policy:
 `protocol: tcp` is effectively the default L4 mode. It should not run native
 protocol processors. Avoid using the term "provider" for processor concepts
 because providers are already a first-class credential and routing domain in
-OpenShell.
+OpenShell. Concrete native processors land after the shared dispatch contract.
 
 ## Suggested Types
 
@@ -97,10 +107,11 @@ struct EgressIntent {
     process: ProcessIdentityEvidence,
     first_request: Option<ParsedHttpRequest>,
     local_route: Option<LocalRoute>,
-    generation: Option<PolicyGeneration>,
+    correlation: Option<ResolvedEndpointCorrelation>,
 }
 
 struct EgressDecision {
+    policy_generation: PolicyGeneration,
     outcome: PolicyOutcome,
     matched_policy: Option<MatchedPolicy>,
     endpoint: Option<MatchedEndpoint>,
@@ -115,8 +126,9 @@ enum ProcessIdentityEvidence {
 }
 
 enum ProcessIdentityUnavailableReason {
-    RuntimeMode,
-    UnsupportedAdapter,
+    EndpointOnlyMode,
+    DeclaredRuntimeMode(RuntimeMode),
+    UnsupportedPlatform,
     LookupFailed,
 }
 
@@ -138,9 +150,21 @@ enum PolicySource {
 
 struct MatchedEndpoint {
     id: EndpointId,
-    allowed_ips: AllowedIpPolicy,
+    destination: DestinationValidationPlan,
     tls: TlsPolicy,
     enforcement: ProtocolEnforcement,
+}
+
+struct DestinationValidationPlan {
+    address_authorization: AddressAuthorization,
+}
+
+enum AddressAuthorization {
+    DefaultPublicOnly,
+    ExplicitAllowedIps(Vec<IpNet>),
+    ExactDeclaredHost,
+    ImplicitIpLiteral(IpAddr),
+    TrustedGatewayAlias { expected_ip: IpAddr },
 }
 
 struct RequestProcessingPlan {
@@ -220,36 +244,70 @@ enum MiddlewarePhase {
 
 struct RelayContext {
     decision: EgressDecision,
+    request_policy: Option<PinnedRequestPolicy>,
+    protocol_policy: Option<PinnedProtocolPolicy>,
     connector: UpstreamConnector,
     deadlines: RelayDeadlines,
     telemetry: RelayTelemetry,
 }
+
+struct ResolvedEndpointCorrelation {
+    policy_generation: PolicyGeneration,
+    mapping_generation: DnsMappingGeneration,
+    mapping_id: DnsMappingId,
+}
+
+struct PinnedRequestPolicy {
+    generation: PolicyGeneration,
+    evaluator: TunnelPolicyEngine,
+}
+
+struct PinnedProtocolPolicy {
+    generation: PolicyGeneration,
+    evaluator: ProtocolPolicyEngine,
+}
 ```
 
 `UpstreamConnector` is the relay-owned dial boundary. It encapsulates the
-validated destination and lets relays/processors open an upstream connection
-only after protocol policy allows it.
+validated destination and lets relays or processors open an upstream connection
+only after current request or protocol policy allows it.
+
+`DestinationValidationPlan` selects one current validation mode. All modes
+retain control-plane-port and cloud-metadata blocks. Default and explicit IP
+paths retain the always-blocked loopback, link-local, and unspecified-address
+checks. `ImplicitIpLiteral` is synthesized only for an explicitly declared IP
+host. `TrustedGatewayAlias` may accept the one runtime-discovered gateway IP but
+does not become a general private-address exemption.
+
+`policy_generation`, the optional pinned request/protocol evaluators, endpoint
+metadata, and middleware selection must describe one policy snapshot.
+Authorization asserts that every sub-materialization used that generation. If
+the generation changes before relay startup, the adapter receives a
+stale-policy denial rather than a mixed decision.
 
 ## Process Identity Availability
 
-Process identity is evidence, not an always-present input. Embedded supervisor
-mode can usually populate binary, PID, ancestry, command-line path, and binary
-hash data. Network-only, standalone binary, or sidecar proxy modes may
-intentionally have no local process metadata. That should be represented as
-`ProcessIdentityEvidence::Unavailable(RuntimeMode)`, not as an empty string
-that accidentally matches policy.
+Process identity is evidence, not a string to fabricate when lookup fails.
+Embedded mode normally populates binary, PID, ancestry, command-line path, and
+binary hash data. When binary identity is required, `LookupFailed` and
+`UnsupportedPlatform` remain denials. An explicitly configured endpoint-only
+runtime records `Unavailable(EndpointOnlyMode)` and keeps the current
+endpoint-only policy behavior. This RFC does not silently turn one state into
+the other or change the endpoint-only trust contract.
 
-Authorization should evaluate only identity dimensions that are available. If
-no identity is available, binary/path scoped policy should either be skipped as
-non-matching or rejected at policy/capability validation time, depending on the
-runtime mode contract. The important invariant is that missing identity must
-not produce a synthetic binary, broaden a binary-scoped allow rule, or cause
-the relay to query process metadata later. During `EgressDecision` hydration,
-absent process evidence should be carried forward as unavailable identity and
-process-derived fields should be omitted from the hydrated decision. The
-decision should record identity availability and fields used so OCSF logs and
-deny responses can distinguish "policy denied this binary" from "this runtime
-did not provide process identity."
+A future standalone or sidecar runtime that intentionally lacks local identity
+uses `DeclaredRuntimeMode`, not `EndpointOnlyMode`, and advertises that
+capability to policy validation. The runtime contract must define binary/path
+predicates as unavailable and reject incompatible policy before traffic starts,
+unless a later accepted policy design specifies a different fail-closed rule.
+
+The decision records identity availability and fields used so OCSF logs and
+deny responses distinguish a binary policy denial, an identity lookup failure,
+and intentional endpoint-only evaluation. Tests must prove an empty synthetic
+`exec.path` cannot satisfy a binary-scoped rule while identity is required.
+Adding new identity-less deployment modes, or changing how binary predicates
+behave in endpoint-only mode, requires the capability work in the later runtime
+phase and cannot be smuggled into the compatibility refactor.
 
 ## Current Owners And Proposed Cleanup
 
@@ -268,22 +326,32 @@ did not provide process identity."
 
 ## Policy DNS And Resolved TCP State
 
-Policy DNS should be query-driven rather than a static `/etc/hosts` snapshot.
+Policy DNS is query-driven rather than a static `/etc/hosts` snapshot.
 
 1. Policy load registers eligible native TCP endpoint names.
-2. Userland performs DNS lookup.
-3. Policy DNS checks whether the name is registered for native TCP.
-4. Policy DNS resolves through trusted upstream DNS.
-5. Answers are filtered against endpoint metadata and SSRF controls.
-6. The adapter publishes the DNS answer, endpoint generation, and capture rule.
+2. Userland performs a DNS lookup.
+3. Policy DNS checks whether the name is eligible in the current policy
+   generation.
+4. Policy DNS resolves through trusted upstream DNS and filters answers through
+   endpoint metadata and SSRF controls.
+5. The adapter publishes the DNS answer plus an active mapping containing the
+   normalized name, endpoint identifier, IP/port, policy generation, distinct
+   DNS mapping generation, opaque mapping ID, and expiration.
+6. Capture rules are updated atomically for the active mapping.
 7. Userland later calls `connect(ip:port)`.
-8. Transparent TCP recovers the original destination and maps it to the active
-   endpoint generation.
-9. Normal egress authorization and relay selection run.
+8. Transparent TCP recovers the original destination and requires an unexpired
+   mapping that correlates that connect with the policy-eligible DNS answer.
+9. Normal egress authorization and relay selection run against a policy
+   generation consistent with the mapping contract.
 
-The resolved endpoint store is therefore not a preemptive global DNS snapshot.
-It is active state produced by policy-eligible lookups and consumed by
-transparent TCP connects.
+The resolved endpoint store is active state produced by policy-eligible lookups
+and consumed by transparent TCP connects. Policy generation and DNS mapping
+generation are separate values: a DNS refresh can replace mappings without a
+policy reload, while a policy reload can invalidate mappings whose endpoint
+contract is no longer current. A captured connection with no mapping, a stale
+mapping, or a mismatched endpoint/port fails closed. An unrelated bare-IP
+connection cannot inherit a policy-DNS authorization merely because it targets
+an IP currently present in the mapping store.
 
 ## nftables Boundary
 
@@ -293,20 +361,27 @@ loopback, and established/related flows, then rejects and optionally logs other
 TCP/UDP traffic. The bypass monitor reads those log lines and emits OCSF
 network and detection events.
 
-Transparent TCP capture should build on this same nftables substrate:
+Transparent TCP capture builds on this same nftables substrate in a later
+feature phase:
 
-- capture rules must run before the generic bypass reject rules;
-- capture rules should be scoped to active policy DNS IP/port mappings;
-- capture state should be updated atomically with endpoint generation changes;
+- capture rules run before the generic bypass reject rules;
+- capture rules are scoped to active policy-DNS IP/port mappings;
+- mapping and capture-rule updates are atomic from the adapter's perspective;
 - reject/log rules remain the fallback for unmatched TCP/UDP egress;
-- VM or Podman driver nftables rules are infrastructure NAT/isolation and
-  should not be treated as the proxy policy enforcement point.
+- VM or Podman driver nftables rules are infrastructure NAT/isolation and are
+  not the proxy policy enforcement point.
+
+The initial CONNECT/forward refactor does not change the installed table. This
+section defines the consumer contract that the shared adapter and decision
+boundaries must support when transparent capture lands.
 
 ## Endpoint Selection And OPA
 
-OPA/Rego should return policy and endpoint metadata through one deterministic
-authorization result. It should not let policy name and endpoint config be
-selected by different precedence rules.
+Today the matched policy name, L7 candidates, first TLS/`allowed_ips` endpoint,
+and exact-declared-host signal are selected through independent rules. OPA/Rego
+should return policy and endpoint metadata through one deterministic
+authorization result. It should not let those fields describe different
+matches.
 
 Two acceptable approaches:
 
@@ -316,6 +391,16 @@ Two acceptable approaches:
 
 Endpoint metadata query failures should fail closed when metadata is required
 for the selected endpoint. They should not silently downgrade to L4 behavior.
+The top-level decision generation must also match every policy-derived field;
+reload during materialization yields a stale decision instead of mixing
+generations.
+
+This semantic cutover is separate from introducing the Rust types. The new
+query first runs in shadow mode beside the legacy queries, records audit-safe
+mismatches through internal telemetry, and preserves legacy enforcement. After
+the precedence rule is accepted and mismatch cases are understood, a dedicated
+change switches the authoritative result and retains the legacy evaluator long
+enough for immediate rollback.
 
 Provider-derived policies use a reserved rule-name namespace. The gateway and
 sandbox sync should prevent user-authored `_provider_*` rules, and
@@ -416,15 +501,18 @@ Protocol processors operate on streams owned by the relay.
   handshake/frame stream and owns client-to-server text-frame inspection when
   credential rewrite, transport message policy, GraphQL-over-WebSocket policy,
   or compression handling is configured.
-- Native TCP protocol processors read client and upstream streams as needed
-  and own their message loop.
+- Native TCP protocol processors read client and upstream streams as needed and
+  own their message loop.
 - A protocol processor can deny before dialing, dial for a server handshake, or
-  keep evaluating commands/queries throughout the session.
+  keep evaluating commands or queries throughout the session.
 - A protocol processor may be in-tree, middleware-backed, or a hybrid where
   in-tree framing exposes typed middleware operations for content evaluation.
 
-This avoids a separate dial strategy enum. The processor knows which protocol
-milestone is sufficient to call the validated connector.
+HTTP and WebSocket relays receive the generation-pinned request evaluator
+because request policy must continue throughout long-lived sessions. No
+processor rematerializes endpoint, TLS, allowed-IP, credential, or middleware
+selection. This avoids a separate dial-strategy enum: each processor knows
+which protocol milestone is sufficient to call the validated connector.
 
 ## Local Service Adapter Boundary
 
@@ -443,6 +531,17 @@ Local services are network surfaces but not normal external egress:
 These adapters may call gateway APIs or local credential helpers, but they
 should not bypass policy and credential invariants that apply to external
 egress.
+
+Issue [#1633](https://github.com/NVIDIA/OpenShell/issues/1633) is a prospective
+consumer of these boundaries, not a feature defined by this RFC. A
+policy-declared host-local endpoint should use an explicit local-routing adapter
+or destination mode; it must not become a general loopback exemption in the
+external destination validator. Its feature design still needs to choose the
+policy surface (reserved hostname versus endpoint flag), define authorization
+before the supervisor connects to host loopback, and specify driver/runtime
+capabilities. That work can reuse `EgressIntent`, adapter-specific responses,
+and the unopened connector boundary without changing this RFC's compatibility
+milestone.
 
 ## Timeout And Resource Ownership
 

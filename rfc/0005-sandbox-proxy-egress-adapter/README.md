@@ -1,9 +1,10 @@
 ---
 authors:
   - "@johntmyers"
-state: draft
+state: review
 links:
   - https://github.com/NVIDIA/OpenShell/issues/1107
+  - https://github.com/NVIDIA/OpenShell/pull/2155
   - https://github.com/NVIDIA/OpenShell/pull/1083
   - https://github.com/NVIDIA/OpenShell/pull/1151
   - https://github.com/NVIDIA/OpenShell/pull/1286
@@ -22,13 +23,20 @@ See rfc/README.md for the full RFC process and state definitions.
 
 ## Summary
 
-Refactor sandbox egress around one shared authorization and relay pipeline.
-CONNECT, forward HTTP, native TCP capture, policy DNS, `inference.local`,
-`policy.local`, and metadata loopback should become narrow adapters that
-translate userland entry points into common runtime intents. Policy evaluation,
-destination validation, supervisor middleware, credential injection,
-request-body rewrite, WebSocket handling, protocol processing, and upstream
-dialing should happen behind shared boundaries.
+Refactor sandbox egress around shared authorization, destination-validation,
+and relay boundaries. CONNECT, forward HTTP, native TCP capture, policy DNS,
+`inference.local`, `policy.local`, and metadata loopback become narrow adapters
+that translate userland entry points into common runtime intents. Policy
+evaluation, destination validation, supervisor middleware, credential
+injection, request-body rewrite, WebSocket handling, protocol processing, and
+upstream dialing happen behind shared boundaries.
+
+The RFC describes the complete forward-looking architecture. It is designed
+to land incrementally across multiple pull requests. The first milestone only
+restructures CONNECT and forward HTTP, extracts shared primitives, and
+preserves every current user-facing feature and enforcement behavior. Later
+milestones add policy DNS, transparent TCP capture, native protocol processors,
+and optional deployment shapes on top of those boundaries.
 
 The codebase has already moved in this direction by splitting networking into
 `openshell-supervisor-network` and process/netns work into
@@ -63,11 +71,11 @@ The target shape separates three concerns:
   behavior applies.
 - **Relays** own bytes, credentials, protocol parsing, and upstream dialing.
 
-This also prepares the proxy for future deployment modes. Today the proxy runs
-inside the sandbox supervisor process. The networking leaf can already run in a
-network-only mode, and a future standalone binary or sidecar should be possible
-if it implements the same userland surfaces, gateway APIs, and policy
-enforcement contracts.
+The first milestone targets the current embedded/network-only supervisor
+runtime and preserves its existing user-facing behavior while the internal
+seams move. The same boundaries then support policy DNS and transparent TCP,
+native protocol processing, and future deployment modes without duplicating
+authorization or relay logic.
 
 ## Non-goals
 
@@ -80,6 +88,13 @@ enforcement contracts.
 - Reintroduce iptables as the sandbox packet filtering backend.
 - Use eBPF connect hooks for transparent capture. Native TCP capture needs a
   userland proxy in the byte stream for TLS termination and protocol parsing.
+- Add policy-declared supervisor-proxied host-local endpoints. Issue
+  [#1633](https://github.com/NVIDIA/OpenShell/issues/1633) can consume these
+  boundaries in separate feature work.
+- Change the existing endpoint-only runtime's process-identity semantics during
+  the compatibility refactor. Future identity-less deployment modes require an
+  explicit capability contract and cannot inherit endpoint-only behavior by
+  accident.
 
 ## Proposal
 
@@ -101,6 +116,13 @@ enforcement contracts.
    stream to a protocol processor when endpoint policy requires native protocol
    enforcement.
 
+The first implementation milestone populates a compatibility
+`EgressDecision` through the existing separate queries so type extraction does
+not change behavior. That transitional envelope is not the target single
+authorization result. Generation-consistent materialization and deterministic
+endpoint selection cut over separately after shadow comparison, before later
+transport adapters depend on the result.
+
 ### Unified Adapter Flow
 
 ```mermaid
@@ -120,7 +142,7 @@ flowchart TD
     subgraph NativeTcp["Policy DNS + native TCP"]
         NameLookup["Userland DNS lookup"]
         PolicyDns["Policy DNS adapter"]
-        DnsAnswer["DNS answer + active mapping"]
+        DnsAnswer["DNS answer + correlated active mapping"]
         NativeConnect["Userland connect(ip:port)"]
         TcpAdapter["Transparent TCP adapter"]
         NameLookup --> PolicyDns
@@ -174,8 +196,8 @@ flowchart TD
 Each adapter still owns its response shape. If authorization denies a CONNECT
 intent, the CONNECT adapter returns a tunnel denial. If forward HTTP is denied,
 the forward adapter returns an HTTP denial. If policy DNS refuses a name, it
-returns the appropriate DNS response. The shared layer decides the outcome; the
-adapter renders it for its protocol.
+returns the appropriate DNS response. The shared layer decides the outcome;
+the adapter renders it for its protocol.
 
 ### Relay Flow
 
@@ -287,7 +309,8 @@ The CONNECT adapter parses `CONNECT host:port` into an `EgressIntent`, asks the
 shared authorization boundary for an `EgressDecision`, returns the tunnel-ready
 response only after the connection is allowed, and then hands the tunnel to the
 relay. The upstream connection is opened by the HTTP relay or protocol
-processor when payload policy allows it.
+processor when payload policy allows it. The compatibility milestone preserves
+the current raw-relay dial point until the processor boundary exists.
 
 Forward HTTP is compatibility for clients that send absolute-form HTTP
 requests. The adapter parses the first request, rewrites proxy framing only at
@@ -296,16 +319,16 @@ unsupported h2c upgrades on inspected routes, and either stays in a shared HTTP
 request loop or forces `Connection: close` for a guarded single request.
 
 Transparent TCP is for native clients that do not know they are using a proxy.
-It depends on policy DNS and nftables capture: DNS answers create active
-endpoint mappings, userland later calls `connect(ip:port)`, nftables redirects
-matching traffic to a userland listener, and the TCP adapter recovers the
-original destination before building an intent.
+It depends on policy DNS and nftables capture: DNS answers create correlated
+active endpoint mappings, userland later calls `connect(ip:port)`, nftables
+redirects matching traffic to a userland listener, and the TCP adapter recovers
+the original destination before building an intent.
 
 Policy DNS replaces static `/etc/hosts` snapshots for native TCP names. It is
 query-driven: check whether the name is policy-eligible, resolve through
 trusted DNS, filter returned IPs, publish the active endpoint mapping, and
 answer userland. The later `connect(ip:port)` still runs through normal
-authorization.
+authorization and must correlate with the mapping created by that DNS answer.
 
 Local service adapters stay outside the normal external egress relay:
 `inference.local` routes chat, completion, model discovery, embeddings, and
@@ -318,22 +341,23 @@ credentials to SDKs that bypass HTTP proxy variables.
 
 Current main uses nftables for sandbox bypass enforcement. It accepts
 proxy-bound traffic, loopback, and established flows, then rejects and
-optionally logs other TCP/UDP traffic for the bypass monitor. That is
+optionally logs other TCP/UDP traffic for the bypass monitor. That is current
 enforcement, not native TCP capture.
 
 ```mermaid
 flowchart TD
     Packet["Userland packet"] --> ProxyDest{"Proxy destination?"}
     ProxyDest -- Yes --> AcceptProxy["nftables accept"]
-    ProxyDest -- No --> Capture{"Future native TCP capture match?"}
+    ProxyDest -- No --> Capture{"Active policy-DNS capture match?"}
     Capture -- Yes --> Redirect["nftables redirect/TPROXY to transparent adapter"]
     Capture -- No --> Reject["nftables log + reject bypass"]
     Reject --> Monitor["Bypass monitor emits OCSF"]
 ```
 
-Transparent TCP work should extend this nftables model with explicit capture
-rules that run before the reject path and are scoped to active policy DNS
-mappings. It should not add a parallel iptables path.
+Transparent TCP extends this nftables model with explicit capture rules that
+run before the reject path and are scoped to unexpired, policy-correlated DNS
+mappings. It does not add a parallel iptables path. The compatibility milestone
+leaves the current table unchanged; capture arrives in a later feature phase.
 
 ### Deployment Modes
 
@@ -347,58 +371,92 @@ mappings. It should not add a parallel iptables path.
 A pluggable proxy must expose the right userland surfaces, implement the
 gateway APIs it needs, and prove equivalent policy enforcement through tests.
 If supervisor middleware is configured, the proxy runtime must also receive the
-effective middleware service registry, validate/refresh bindings, enforce
+effective middleware service registry, validate and refresh bindings, enforce
 `fail_open` and `fail_closed`, buffer within configured caps, invoke middleware
 on the request path, and emit middleware OCSF events.
 
-Process identity is mode-dependent. Embedded supervisor mode can usually
-resolve the workload process, binary, and ancestors. Network-only, standalone,
-and sidecar modes may intentionally have no local process identity. In those
-modes the adapter should pass an explicit unavailable identity envelope, and
-the decision should record identity as unavailable rather than treating it as
-an accidental lookup failure. Authorization must not turn a missing identity
-into a broader allow. Process-scoped predicates should either be treated as
-non-matching for that runtime or rejected during policy/capability validation.
-Policies that require binary/path scoping need an explicit capability check or
-fallback rule before they are allowed to run in identity-less modes.
+Process identity is mode-dependent. Embedded supervisor mode normally requires
+successful workload process, binary, and ancestor resolution; a lookup failure
+continues to deny. A trusted runtime can explicitly select the existing
+endpoint-only mode, in which identity is recorded as intentionally unavailable
+and policy evaluation keeps its current endpoint-only semantics. The refactor
+must not represent either case as a fabricated empty identity or accidentally
+convert a lookup failure into endpoint-only evaluation.
 
-The nftables rules that force or reject userland traffic belong to the sandbox
-network boundary even if the proxy process later moves into a standalone binary
-or sidecar.
+Future standalone and sidecar modes must advertise identity capability. A mode
+without local identity needs an explicit unavailable-identity contract and
+policy validation for binary/path predicates; it does not automatically inherit
+endpoint-only semantics. The nftables rules that force, capture, or reject
+userland traffic remain owned by the sandbox network boundary even if the proxy
+process later moves into a standalone binary or sidecar.
+
+### Migration And Operational Contract
+
+Mechanical adapter, destination, and relay extractions ship as isolated,
+revertible changes without a permanent feature flag. The deterministic
+authorization result is different: it first runs beside the legacy queries in
+shadow mode, reports audit-safe mismatches through internal telemetry, and
+retains the legacy evaluator through the cutover observation window.
+
+Policy DNS, transparent TCP, native processors, and alternate deployment modes
+land only after the shared authorization and relay contracts are authoritative.
+Each is a separate, feature-bearing pull request or series with its own
+capability gating, migration, telemetry, and rollback plan; they are not bundled
+into the compatibility-only refactor.
+
+Adapter response bytes and OCSF event class, action, disposition, severity,
+status, destination, actor, firewall rule, message, and status detail are
+compatibility surfaces. Moving code does not justify changing them. Performance
+is also measured at each phase; fewer OPA evaluations are a target to verify,
+not an unmeasured claim.
 
 ## Implementation plan
 
 The detailed migration plan lives in [implementation-plan.md](implementation-plan.md).
 The intended order is:
 
-1. Add regression coverage around the current split, forward HTTP invariants,
-   endpoint selection, supervisor middleware, token grants, WebSocket/body
-   rewrite, metadata loopback, and nftables bypass enforcement.
-2. Introduce `EgressIntent` and `EgressDecision` inside
-   `openshell-supervisor-network`.
-3. Move destination validation and endpoint metadata materialization behind the
-   shared decision and connector boundary.
-4. Consolidate forward HTTP, CONNECT HTTP inspection, supervisor middleware,
-   credential injection, request-body rewrite, JSON-RPC/MCP inspection, and
-   WebSocket handling behind shared HTTP/WebSocket relay code.
-5. Move TLS detection and termination ahead of the HTTP/TCP relay split.
-6. Add the TCP relay/protocol processor boundary, then policy DNS and native
-   TCP capture.
-7. Treat local services and deployment modes as explicit runtime contracts.
+1. Lock down current responses, OCSF events, policy outcomes, credential
+   behavior, upstream-dial timing, and local-service behavior with regression
+   coverage.
+2. Introduce compatibility `EgressIntent` and `EgressDecision` envelopes while
+   preserving current lookup precedence and failure defaults.
+3. Centralize destination validation behind an unopened connector.
+4. Materialize one generation-consistent authorization decision, compare it
+   against the legacy queries, then cut over deterministic endpoint selection
+   and fail-closed metadata handling as an independently reviewable step.
+5. Consolidate HTTP request-loop, credential, WebSocket, and middleware relay
+   behavior in separately shippable subphases.
+6. Consolidate TLS handling and existing raw TCP relay selection.
+7. Preserve current local-service boundaries and remove compatibility plumbing.
+8. Add the native protocol-processor dispatch contract, then add protocol
+   implementations as independently reviewed features.
+9. Add policy DNS state and transparent TCP capture with mandatory
+   DNS-answer-to-connect correlation and separate mapping generations.
+10. Define capability-checked standalone or sidecar runtime contracts and
+    complete cleanup after each boundary is in use.
+
+Steps 1 through 7 are the compatibility foundation and may themselves span
+several pull requests. Steps 8 through 10 are later feature milestones; their
+presence in this RFC defines the direction without adding them to the initial
+refactor branch.
 
 ## Risks
 
-- Tightening endpoint metadata failures from fail-open to deny may expose
-  latent policy or Rego errors.
-- Deterministic endpoint selection may reject policies that currently load but
-  only work by accident.
+- Tightening L7 and TLS metadata failures from fail-open to deny may expose
+  latent policy or Rego errors. `allowed_ips` and SSRF validation already fail
+  more conservatively; tests must cover each query independently.
+- Deterministic endpoint selection may change ambiguous overlapping policies.
+  The new decision must shadow the legacy queries and report mismatches before
+  any semantic cutover.
 - Token grants add a runtime dependency on SPIFFE Workload API and token
   endpoints. Failures should remain fail-closed and sanitized.
-- Transparent TCP capture adds network namespace interception complexity and
-  must coexist with the nftables bypass reject/log table.
-- Sidecar mode may intentionally lack process identity. Binary/path scoped
-  policy needs a reliable identity source or must be rejected/ignored for that
-  deployment mode.
+- Transparent TCP capture adds network-namespace interception and mutable DNS
+  mapping state. It must coexist with nftables reject/log enforcement, prevent
+  unrelated bare-IP connections from inheriting DNS authorization, and fail
+  closed across policy or mapping generation changes.
+- Sidecar or standalone modes may intentionally lack process identity.
+  Binary/path-scoped policy needs an advertised identity capability and policy
+  validation; missing identity cannot silently broaden an allow.
 - Metadata loopback and `policy.local` expand sandbox-local control surfaces
   and need strict route validation, body limits, redaction, and authentication
   boundaries.
@@ -408,6 +466,16 @@ The intended order is:
 - Supervisor middleware adds a synchronous request-path dependency. Body caps,
   timeout behavior, registry reloads, and `fail_open` choices must be visible
   in telemetry so operators can diagnose whether content inspection ran.
+- Moving OCSF emission sites can accidentally change event class, action,
+  disposition, severity, message, or actor/destination fields. Adapter response
+  shapes and OCSF schemas are compatibility requirements, not cleanup targets.
+- New decision/context objects add per-connection allocations on a hot path.
+  Performance claims require before/after measurements of OPA evaluation count,
+  allocation volume, and connection/request latency.
+- Structural phases back out by reverting their isolated commits. The
+  deterministic-decision cutover must retain the legacy evaluator long enough
+  for shadow comparison and immediate rollback; a permanent feature flag is not
+  required for the purely mechanical phases.
 
 ## Alternatives
 
@@ -427,8 +495,10 @@ CONNECT should remain the generic explicit proxy mode.
 ### Build only transparent TCP
 
 Transparent TCP helps native clients but does not replace explicit proxy
-support used by common HTTP tooling. It also requires policy DNS and nftables
-capture before it can safely preserve endpoint identity.
+support used by common HTTP tooling. It also requires the shared authorization,
+destination, and relay boundaries plus policy DNS and nftables capture before
+it can safely preserve endpoint identity. For that reason it is a later phase
+of this RFC, not the first implementation change.
 
 ## Prior art
 
@@ -437,8 +507,8 @@ it already separates proxy, OPA, L7, inference routing, policy-local routes,
 TLS, and token grants from process supervision.
 
 The current `openshell-supervisor-process` netns and bypass monitor are the
-packet-enforcement substrate. Transparent TCP should extend that nftables
-model rather than creating a second firewall path.
+packet-enforcement substrate. Transparent TCP extends that nftables model in a
+later phase rather than creating a second firewall path.
 
 The existing L7 relay is the behavioral prior art for this RFC. It already
 proves per-request HTTP evaluation, GraphQL parsing, JSON-RPC/MCP body
@@ -454,13 +524,17 @@ adapter wire middleware separately.
 ## Open questions
 
 1. Should overlapping endpoint metadata be rejected at policy load time, or
-   should policy name plus endpoint index define precedence?
-2. Should direct IP connects to a policy-DNS-resolved TCP endpoint be accepted,
-   or should DNS query correlation be required for stricter modes?
-3. What TTL cap and stale-generation grace period should policy DNS use?
-4. Which policy features should be disabled, rejected, or treated as
-   non-matching when the proxy runtime advertises no process identity support?
-5. Which proxy capabilities should be negotiated with the gateway at startup?
-6. Should metadata loopback be modeled as an adapter inside
+   should one documented policy/endpoint precedence key select the complete
+   decision? The initial compatibility refactor does not choose between them.
+2. What mismatch-free observation window is sufficient before the
+   deterministic decision replaces the legacy endpoint queries?
+3. Should metadata loopback be modeled as an adapter inside
    `openshell-supervisor-network`, or remain orchestrated by `openshell-sandbox`
    with shared credential/provider helpers?
+4. What TTL cap should policy DNS use, and should policy reload immediately
+   invalidate all active mappings or permit a bounded drain period that cannot
+   authorize new connections?
+5. Which original-destination mechanism and nftables redirect mode should each
+   supported runtime use while keeping capture rules ahead of bypass rejection?
+6. Which identity capabilities must standalone and sidecar runtimes advertise
+   before the gateway accepts binary/path-scoped policy for them?
