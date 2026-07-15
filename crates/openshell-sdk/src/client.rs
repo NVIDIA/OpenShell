@@ -19,6 +19,7 @@ use crate::types::{
 };
 use futures::StreamExt;
 use openshell_core::proto;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -468,6 +469,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         }),
         name: name.unwrap_or_default(),
         labels,
+        annotations: HashMap::new(),
     }
 }
 
