@@ -9,6 +9,7 @@
 //! independent of CONNECT and forward HTTP prevents policy behavior from
 //! drifting as more adapters are added.
 
+use super::destination::DestinationValidationPlan;
 use crate::opa::NetworkAction;
 use std::path::PathBuf;
 
@@ -31,8 +32,8 @@ pub(super) struct L7RouteSnapshot {
 pub(super) struct EndpointDecision {
     pub(super) tls_mode: crate::l7::TlsMode,
     pub(super) l7_route: Option<L7RouteSnapshot>,
-    pub(super) raw_allowed_ips: Vec<String>,
-    pub(super) exact_declared_host: bool,
+    /// Destination authorization selected at the legacy hydration point.
+    pub(super) destination: Option<DestinationValidationPlan>,
 }
 
 impl Default for EndpointDecision {
@@ -40,8 +41,7 @@ impl Default for EndpointDecision {
         Self {
             tls_mode: crate::l7::TlsMode::Auto,
             l7_route: None,
-            raw_allowed_ips: vec![],
-            exact_declared_host: false,
+            destination: None,
         }
     }
 }

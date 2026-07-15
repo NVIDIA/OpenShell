@@ -36,7 +36,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use self::destination::{
-    DestinationDenial, DestinationDenialKind, DestinationRequest, validate_destination,
+    DestinationDenial, DestinationDenialKind, DestinationRequest, build_validation_plan,
+    validate_destination,
 };
 use self::egress::{
     EgressDecision, EgressIntent, EndpointDecision, IdentityUnavailableReason, L7ConfigSnapshot,
@@ -1188,18 +1189,40 @@ async fn handle_tcp_connection(
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
 
-    hydrate_destination_constraints(&opa_engine, &mut decision);
+    match hydrate_destination_plan(&opa_engine, &mut decision, *trusted_host_gateway) {
+        Ok(()) => {}
+        Err(denial) => {
+            deny_connect_destination(
+                &mut client,
+                &denial,
+                peer_addr,
+                &host_lc,
+                port,
+                &binary_str,
+                &pid_str,
+                &ancestors_str,
+                &cmdline_str,
+                &decision,
+                &denial_tx,
+                &activity_tx,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+    let destination_plan = decision
+        .endpoint
+        .destination
+        .as_ref()
+        .expect("destination plan hydrated");
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let dns_connect_start = std::time::Instant::now();
     let connector = match validate_destination(DestinationRequest {
         host: &host,
-        normalized_host: &host_lc,
         port,
         sandbox_entrypoint_pid,
-        trusted_host_gateway: *trusted_host_gateway,
-        raw_allowed_ips: decision.endpoint.raw_allowed_ips.clone(),
-        exact_declared_endpoint_host: decision.endpoint.exact_declared_host,
+        plan: destination_plan,
     })
     .await
     {
@@ -2439,12 +2462,24 @@ fn hydrate_tls_mode(engine: &OpaEngine, decision: &mut EgressDecision) {
     decision.endpoint.tls_mode = query_tls_mode(engine, decision, &host, port);
 }
 
-fn hydrate_destination_constraints(engine: &OpaEngine, decision: &mut EgressDecision) {
+fn hydrate_destination_plan(
+    engine: &OpaEngine,
+    decision: &mut EgressDecision,
+    trusted_host_gateway: Option<IpAddr>,
+) -> std::result::Result<(), DestinationDenial> {
     let host = decision.intent.destination.host.clone();
     let port = decision.intent.destination.port;
-    decision.endpoint.raw_allowed_ips = query_allowed_ips(engine, decision, &host, port);
-    decision.endpoint.exact_declared_host =
-        query_exact_declared_endpoint_host(engine, decision, &host, port);
+    let raw_allowed_ips = query_allowed_ips(engine, decision, &host, port);
+    let exact_declared_host = query_exact_declared_endpoint_host(engine, decision, &host, port);
+    let plan = build_validation_plan(
+        &host,
+        &host.to_ascii_lowercase(),
+        trusted_host_gateway,
+        &raw_allowed_ips,
+        exact_declared_host,
+    )?;
+    decision.endpoint.destination = Some(plan);
+    Ok(())
 }
 
 fn query_l7_route_snapshot(
@@ -4334,16 +4369,41 @@ async fn handle_forward_proxy(
     //    - Otherwise: reject internal IPs, allow public IPs through.
     //    When the policy host is already a literal IP address, treat it as
     //    implicitly allowed — the user explicitly declared the destination.
-    hydrate_destination_constraints(&opa_engine, &mut decision);
+    match hydrate_destination_plan(&opa_engine, &mut decision, *trusted_host_gateway) {
+        Ok(()) => {}
+        Err(denial) => {
+            deny_forward_destination(
+                client,
+                &denial,
+                peer_addr,
+                method,
+                &host_lc,
+                port,
+                &path,
+                &binary_str,
+                &pid_str,
+                &ancestors_str,
+                &cmdline_str,
+                policy_str,
+                &decision,
+                denial_tx,
+                activity_tx,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+    let destination_plan = decision
+        .endpoint
+        .destination
+        .as_ref()
+        .expect("destination plan hydrated");
 
     let connector = match validate_destination(DestinationRequest {
         host: &host,
-        normalized_host: &host_lc,
         port,
         sandbox_entrypoint_pid,
-        trusted_host_gateway: *trusted_host_gateway,
-        raw_allowed_ips: decision.endpoint.raw_allowed_ips.clone(),
-        exact_declared_endpoint_host: decision.endpoint.exact_declared_host,
+        plan: destination_plan,
     })
     .await
     {

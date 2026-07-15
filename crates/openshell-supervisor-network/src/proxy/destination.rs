@@ -8,18 +8,32 @@ use super::{
     resolve_and_check_allowed_ips, resolve_and_check_declared_endpoint,
     resolve_and_check_trusted_gateway, resolve_and_reject_internal,
 };
+use ipnet::IpNet;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::TcpStream;
+
+/// Address-validation mode selected from the current endpoint configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AddressAuthorization {
+    DefaultPublicOnly,
+    ExplicitAllowedIps(Vec<IpNet>),
+    ExactDeclaredHost,
+    ImplicitIpLiteral(IpAddr),
+    TrustedGatewayAlias { expected_ip: IpAddr },
+}
+
+/// Fully materialized input to shared destination validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DestinationValidationPlan {
+    pub(super) address_authorization: AddressAuthorization,
+}
 
 /// Inputs needed to apply the current SSRF and endpoint destination policy.
 pub(super) struct DestinationRequest<'a> {
     pub(super) host: &'a str,
-    pub(super) normalized_host: &'a str,
     pub(super) port: u16,
     pub(super) sandbox_entrypoint_pid: u32,
-    pub(super) trusted_host_gateway: Option<IpAddr>,
-    pub(super) raw_allowed_ips: Vec<String>,
-    pub(super) exact_declared_endpoint_host: bool,
+    pub(super) plan: &'a DestinationValidationPlan,
 }
 
 /// Destination-validation branch that rejected an egress request.
@@ -45,6 +59,38 @@ impl DestinationDenial {
     fn new(kind: DestinationDenialKind, reason: String) -> Self {
         Self { kind, reason }
     }
+}
+
+/// Select one current destination-validation mode without changing precedence.
+pub(super) fn build_validation_plan(
+    host: &str,
+    normalized_host: &str,
+    trusted_host_gateway: Option<IpAddr>,
+    raw_allowed_ips: &[String],
+    exact_declared_endpoint_host: bool,
+) -> Result<DestinationValidationPlan, DestinationDenial> {
+    let address_authorization = if is_host_gateway_alias(normalized_host)
+        && let Some(expected_ip) = trusted_host_gateway
+    {
+        AddressAuthorization::TrustedGatewayAlias { expected_ip }
+    } else if !raw_allowed_ips.is_empty() {
+        AddressAuthorization::ExplicitAllowedIps(parse_allowed_ips(raw_allowed_ips).map_err(
+            |reason| DestinationDenial::new(DestinationDenialKind::InvalidAllowedIps, reason),
+        )?)
+    } else if let Some(ip) = implicit_allowed_ips_for_ip_host(host)
+        .first()
+        .and_then(|raw| raw.parse::<IpAddr>().ok())
+    {
+        AddressAuthorization::ImplicitIpLiteral(ip)
+    } else if exact_declared_endpoint_host {
+        AddressAuthorization::ExactDeclaredHost
+    } else {
+        AddressAuthorization::DefaultPublicOnly
+    };
+
+    Ok(DestinationValidationPlan {
+        address_authorization,
+    })
 }
 
 /// Validated, but not yet opened, upstream destination.
@@ -87,46 +133,48 @@ pub(super) async fn validate_destination(
 ) -> Result<UpstreamConnector, DestinationDenial> {
     let DestinationRequest {
         host,
-        normalized_host,
         port,
         sandbox_entrypoint_pid,
-        trusted_host_gateway,
-        mut raw_allowed_ips,
-        exact_declared_endpoint_host,
+        plan,
     } = request;
 
-    if raw_allowed_ips.is_empty() {
-        raw_allowed_ips = implicit_allowed_ips_for_ip_host(host);
-    }
-
-    #[allow(clippy::if_not_else)]
-    let addrs = if is_host_gateway_alias(normalized_host)
-        && let Some(gateway) = trusted_host_gateway
-    {
-        resolve_and_check_trusted_gateway(host, port, gateway, sandbox_entrypoint_pid)
-            .await
-            .map_err(|reason| {
-                DestinationDenial::new(DestinationDenialKind::TrustedGateway, reason)
-            })?
-    } else if !raw_allowed_ips.is_empty() {
-        let networks = parse_allowed_ips(&raw_allowed_ips).map_err(|reason| {
-            DestinationDenial::new(DestinationDenialKind::InvalidAllowedIps, reason)
-        })?;
-        resolve_and_check_allowed_ips(host, port, &networks, sandbox_entrypoint_pid)
-            .await
-            .map_err(|reason| DestinationDenial::new(DestinationDenialKind::AllowedIps, reason))?
-    } else if exact_declared_endpoint_host {
-        resolve_and_check_declared_endpoint(host, port, sandbox_entrypoint_pid)
-            .await
-            .map_err(|reason| {
-                DestinationDenial::new(DestinationDenialKind::DeclaredEndpoint, reason)
-            })?
-    } else {
-        resolve_and_reject_internal(host, port, sandbox_entrypoint_pid)
-            .await
-            .map_err(|reason| {
-                DestinationDenial::new(DestinationDenialKind::InternalAddress, reason)
-            })?
+    let addrs = match &plan.address_authorization {
+        AddressAuthorization::TrustedGatewayAlias { expected_ip } => {
+            resolve_and_check_trusted_gateway(host, port, *expected_ip, sandbox_entrypoint_pid)
+                .await
+                .map_err(|reason| {
+                    DestinationDenial::new(DestinationDenialKind::TrustedGateway, reason)
+                })?
+        }
+        AddressAuthorization::ExplicitAllowedIps(networks) => {
+            resolve_and_check_allowed_ips(host, port, networks, sandbox_entrypoint_pid)
+                .await
+                .map_err(|reason| {
+                    DestinationDenial::new(DestinationDenialKind::AllowedIps, reason)
+                })?
+        }
+        AddressAuthorization::ImplicitIpLiteral(ip) => {
+            let network = IpNet::from(*ip);
+            resolve_and_check_allowed_ips(host, port, &[network], sandbox_entrypoint_pid)
+                .await
+                .map_err(|reason| {
+                    DestinationDenial::new(DestinationDenialKind::AllowedIps, reason)
+                })?
+        }
+        AddressAuthorization::ExactDeclaredHost => {
+            resolve_and_check_declared_endpoint(host, port, sandbox_entrypoint_pid)
+                .await
+                .map_err(|reason| {
+                    DestinationDenial::new(DestinationDenialKind::DeclaredEndpoint, reason)
+                })?
+        }
+        AddressAuthorization::DefaultPublicOnly => {
+            resolve_and_reject_internal(host, port, sandbox_entrypoint_pid)
+                .await
+                .map_err(|reason| {
+                    DestinationDenial::new(DestinationDenialKind::InternalAddress, reason)
+                })?
+        }
     };
 
     Ok(UpstreamConnector::new(host, port, addrs))
@@ -137,21 +185,21 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    fn request(host: &str) -> DestinationRequest<'_> {
+    fn request<'a>(host: &'a str, plan: &'a DestinationValidationPlan) -> DestinationRequest<'a> {
         DestinationRequest {
             host,
-            normalized_host: host,
             port: 80,
             sandbox_entrypoint_pid: 0,
-            trusted_host_gateway: None,
-            raw_allowed_ips: vec![],
-            exact_declared_endpoint_host: false,
+            plan,
         }
     }
 
     #[tokio::test]
     async fn default_mode_classifies_loopback_as_internal_address() {
-        let denial = validate_destination(request("127.0.0.1"))
+        let plan = DestinationValidationPlan {
+            address_authorization: AddressAuthorization::DefaultPublicOnly,
+        };
+        let denial = validate_destination(request("127.0.0.1", &plan))
             .await
             .err()
             .expect("loopback must be denied");
@@ -161,21 +209,24 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_allowed_ips_has_a_distinct_denial_kind() {
-        let mut request = request("api.example.test");
-        request.raw_allowed_ips = vec!["not-an-ip".to_string()];
-        let denial = validate_destination(request)
-            .await
-            .err()
-            .expect("invalid allowed_ips must be denied");
+        let denial = build_validation_plan(
+            "api.example.test",
+            "api.example.test",
+            None,
+            &["not-an-ip".to_string()],
+            false,
+        )
+        .expect_err("invalid allowed_ips must be denied");
 
         assert_eq!(denial.kind, DestinationDenialKind::InvalidAllowedIps);
     }
 
     #[tokio::test]
     async fn declared_endpoint_preserves_its_denial_classification() {
-        let mut request = request("127.0.0.1");
-        request.exact_declared_endpoint_host = true;
-        let denial = validate_destination(request)
+        let plan = DestinationValidationPlan {
+            address_authorization: AddressAuthorization::ExactDeclaredHost,
+        };
+        let denial = validate_destination(request("127.0.0.1", &plan))
             .await
             .err()
             .expect("declared loopback must remain denied");
@@ -185,9 +236,12 @@ mod tests {
 
     #[tokio::test]
     async fn trusted_gateway_preserves_its_denial_classification() {
-        let mut request = request("host.openshell.internal");
-        request.trusted_host_gateway = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let denial = validate_destination(request)
+        let plan = DestinationValidationPlan {
+            address_authorization: AddressAuthorization::TrustedGatewayAlias {
+                expected_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            },
+        };
+        let denial = validate_destination(request("host.openshell.internal", &plan))
             .await
             .err()
             .expect("loopback cannot be a trusted gateway");
