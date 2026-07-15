@@ -233,7 +233,7 @@ pub(crate) async fn run_server(
         .as_ref()
         .map(|file| {
             file.openshell
-                .gateway
+                .supervisor
                 .middleware
                 .iter()
                 .map(Into::into)

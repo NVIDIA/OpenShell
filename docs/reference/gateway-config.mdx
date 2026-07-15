@@ -106,7 +106,7 @@ grpc_rate_limit_window_seconds = 60
 
 # Operator-run supervisor middleware. The gRPC endpoint must be reachable from
 # both the gateway and sandbox supervisors.
-[[openshell.gateway.middleware]]
+[[openshell.supervisor.middleware]]
 name = "local-content-guard"
 grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
@@ -151,10 +151,10 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 
 ## Supervisor Middleware Services
 
-Register operator-run supervisor middleware services with one or more `[[openshell.gateway.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
+Register operator-run supervisor middleware services with one or more `[[openshell.supervisor.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
 
 ```toml
-[[openshell.gateway.middleware]]
+[[openshell.supervisor.middleware]]
 name = "local-content-guard"
 grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144

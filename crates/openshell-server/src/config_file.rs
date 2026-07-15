@@ -56,6 +56,9 @@ pub struct OpenShellRoot {
     #[serde(default)]
     pub gateway: GatewayFileSection,
 
+    #[serde(default)]
+    pub supervisor: SupervisorFileSection,
+
     /// `[openshell.drivers.<name>]` tables — passed verbatim to each driver
     /// crate's `Deserialize` impl after the gateway-side inheritance merge.
     /// Stored as raw [`toml::Value`] so each driver can evolve its schema
@@ -152,12 +155,6 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
 
-    // ── Supervisor middleware ─────────────────────────────────────────────
-    /// Statically registered supervisor middleware services. Registration is
-    /// operator-owned and changes require a gateway restart.
-    #[serde(default)]
-    pub middleware: Vec<MiddlewareServiceFileConfig>,
-
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
     // Captured so we can produce a friendly "set this via env/CLI instead"
@@ -167,7 +164,17 @@ pub struct GatewayFileSection {
     pub database_url: Option<String>,
 }
 
-/// One `[[openshell.gateway.middleware]]` supervisor middleware registration.
+/// `[openshell.supervisor]` section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorFileSection {
+    /// Statically registered supervisor middleware services. Registration is
+    /// operator-owned and changes require a gateway restart.
+    #[serde(default)]
+    pub middleware: Vec<MiddlewareServiceFileConfig>,
+}
+
+/// One `[[openshell.supervisor.middleware]]` supervisor middleware registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MiddlewareServiceFileConfig {
@@ -437,7 +444,7 @@ allow_unauthenticated_users = true
     #[test]
     fn parses_supervisor_middleware_registration() {
         let toml = r#"
-[[openshell.gateway.middleware]]
+[[openshell.supervisor.middleware]]
 name = "local-guard"
 grpc_endpoint = "http://127.0.0.1:50051"
 max_body_bytes = 262144
@@ -446,7 +453,7 @@ timeout = "2s"
         let tmp = write_tmp(toml);
         let file = load(tmp.path()).expect("valid middleware registration parses");
         assert_eq!(
-            file.openshell.gateway.middleware,
+            file.openshell.supervisor.middleware,
             vec![MiddlewareServiceFileConfig {
                 name: "local-guard".into(),
                 grpc_endpoint: "http://127.0.0.1:50051".into(),
@@ -454,7 +461,8 @@ timeout = "2s"
                 timeout: Some("2s".into()),
             }]
         );
-        let registration = SupervisorMiddlewareService::from(&file.openshell.gateway.middleware[0]);
+        let registration =
+            SupervisorMiddlewareService::from(&file.openshell.supervisor.middleware[0]);
         assert_eq!(registration.timeout, "2s");
     }
 

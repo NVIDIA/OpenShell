@@ -271,9 +271,10 @@ config path. A gateway-global policy can override sandbox-scoped policy. The
 sandbox supervisor polls for config revisions and hot-reloads dynamic policy
 when the policy engine accepts the update.
 
-External supervisor middleware registration is operator-owned gateway
-configuration. At startup the gateway connects to each service, validates its
-described bindings and operator body limit, and rejects duplicate binding IDs.
+External supervisor middleware registration is operator-owned configuration
+under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to
+each service, validates its described bindings and operator body limit, and
+rejects duplicate binding IDs.
 Before persisting a policy, the gateway asks each selected implementation to
 validate its config. The effective sandbox config contains only the registered
 services required by that policy; supervisors invoke those services directly on

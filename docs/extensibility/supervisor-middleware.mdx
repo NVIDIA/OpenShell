@@ -44,7 +44,7 @@ Operator-run services expose one or more binding IDs. Policies reference a bindi
 Start an operator-run service before starting the gateway, then add a registration to the local gateway TOML:
 
 ```toml
-[[openshell.gateway.middleware]]
+[[openshell.supervisor.middleware]]
 name = "local-content-guard"
 grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
