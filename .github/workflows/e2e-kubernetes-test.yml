@@ -42,8 +42,14 @@ on:
         required: false
         type: string
         default: "v2026.4.25"
+      cli-artifact-prefix:
+        description: "Optional prebuilt CLI artifact prefix (artifact suffix is linux-<arch>)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
+  actions: read
   contents: read
   packages: read
 
@@ -56,6 +62,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 60
     permissions:
+      actions: read
       contents: read
       packages: read
     env:
@@ -67,6 +74,12 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
+
+      - name: Use prebuilt OpenShell CLI
+        if: inputs.cli-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-cli
+        with:
+          artifact-prefix: ${{ inputs.cli-artifact-prefix }}
 
       - name: Install mise
         run: |

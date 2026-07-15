@@ -60,14 +60,12 @@ hide = true
 ["e2e:rust"]
 description = "Run Rust CLI e2e tests against a Docker-backed gateway"
 run = [
-  "cargo build -p openshell-cli",
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker",
 ]
 
 ["e2e:websocket-conformance"]
 description = "Run focused WebSocket conformance e2e tests against a Docker-backed gateway"
 run = [
-  "cargo build -p openshell-cli",
   "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test websocket_conformance",
 ]
 

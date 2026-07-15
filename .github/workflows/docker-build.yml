@@ -154,7 +154,7 @@ jobs:
             echo "arches=${arches[*]}"
             echo "binary_component=$binary_component"
             echo "binary_name=$binary_name"
-            echo "artifact_prefix=rust-binary-${component}-${binary_component}"
+            echo "artifact_prefix=rust-binary-${component}"
             echo "image_tag_base=$image_tag_base"
             echo "features=$features"
             echo "has_image=$has_image"
