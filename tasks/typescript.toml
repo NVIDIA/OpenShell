@@ -32,15 +32,39 @@ depends = ["sdk:ts:proto"]
 dir = "sdk/typescript"
 run = "npm run typecheck"
 
+["sdk:ts:lint"]
+description = "Lint + format-check the TypeScript SDK (Biome, read-only)"
+depends = ["sdk:ts:install"]
+dir = "sdk/typescript"
+run = "npm run lint"
+
+["sdk:ts:format"]
+description = "Format the TypeScript SDK and apply safe fixes (Biome, writes)"
+depends = ["sdk:ts:install"]
+dir = "sdk/typescript"
+run = "npm run format"
+
 ["sdk:ts:build"]
 description = "Build the TypeScript SDK (emit dist/)"
 depends = ["sdk:ts:proto"]
 dir = "sdk/typescript"
 run = "npm run build"
 
+["sdk:ts:test"]
+description = "Run TypeScript SDK unit tests (Vitest, in-memory transport)"
+depends = ["sdk:ts:proto"]
+dir = "sdk/typescript"
+run = "npm test"
+
 ["sdk:ts:ci"]
-description = "TypeScript SDK checks (proto lint, codegen, typecheck, build)"
-depends = ["proto:lint", "sdk:ts:typecheck", "sdk:ts:build"]
+description = "TypeScript SDK checks (proto lint, Biome lint, codegen, typecheck, test, build)"
+depends = [
+  "proto:lint",
+  "sdk:ts:lint",
+  "sdk:ts:typecheck",
+  "sdk:ts:test",
+  "sdk:ts:build",
+]
 hide = true
 
 # Publish to the registry in package.json publishConfig. Set OPENSHELL_NPM_VERSION
