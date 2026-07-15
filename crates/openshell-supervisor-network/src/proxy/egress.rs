@@ -21,7 +21,8 @@ pub(super) struct L7ConfigSnapshot {
 #[derive(Debug, Clone)]
 pub(super) struct L7RouteSnapshot {
     pub(super) configs: Vec<L7ConfigSnapshot>,
-    pub(super) generation: u64,
+    /// Policy generation used to materialize this L7 route.
+    pub(super) l7_policy_generation: u64,
 }
 
 /// Endpoint metadata materialized for an allowed egress decision.
@@ -111,7 +112,7 @@ pub(super) struct EgressDecision {
     pub(super) intent: EgressIntent,
     pub(super) action: NetworkAction,
     /// Policy generation used for the L4 network decision.
-    pub(super) generation: u64,
+    pub(super) l4_policy_generation: u64,
     /// Whether process identity evidence was available to policy evaluation.
     pub(super) identity: ProcessIdentityEvidence,
     /// Endpoint behavior hydrated for destination validation and relays.

@@ -1086,7 +1086,7 @@ async fn handle_tcp_connection(
     let pid_clone = entrypoint_pid.clone();
     let intent = EgressIntent::connect(host_lc.clone(), port);
     let mut decision = tokio::task::spawn_blocking(move || {
-        evaluate_opa_tcp(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
@@ -1403,16 +1403,13 @@ async fn handle_tcp_connection(
                 let mut tls_upstream =
                     crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
                         .await?;
+                let Some(relay_context) =
+                    relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
+                else {
+                    return Ok(());
+                };
 
-                relay::relay_http_stream(
-                    l7_route,
-                    &opa_engine,
-                    &decision,
-                    &mut tls_client,
-                    &mut tls_upstream,
-                    &ctx,
-                )
-                .await
+                relay::relay_http_stream(&mut tls_client, &mut tls_upstream, relay_context).await
             };
             if let Err(e) = tls_result.await {
                 if is_benign_relay_error(&e) {
@@ -1480,16 +1477,11 @@ async fn handle_tcp_connection(
     } else if tunnel_protocol == TunnelProtocol::Http1 {
         // Plaintext HTTP detected.
         let is_l7_relay = l7_route.is_some_and(|route| !route.configs.is_empty());
-        if let Err(e) = relay::relay_http_stream(
-            l7_route,
-            &opa_engine,
-            &decision,
-            &mut client,
-            &mut upstream,
-            &ctx,
-        )
-        .await
-        {
+        let Some(relay_context) = relay::prepare_http_relay(l7_route, &opa_engine, &decision, &ctx)
+        else {
+            return Ok(());
+        };
+        if let Err(e) = relay::relay_http_stream(&mut client, &mut upstream, relay_context).await {
             if is_benign_relay_error(&e) {
                 if is_l7_relay {
                     debug!(host = %host_lc, port = port, error = %e, "L7 connection closed");
@@ -1581,7 +1573,7 @@ async fn handle_tcp_connection(
 /// Resolved process identity for a TCP peer: binary path, PID, ancestor chain,
 /// cmdline paths, and the TOFU-verified binary hash.
 ///
-/// Produced by [`resolve_process_identity`]; consumed by [`evaluate_opa_tcp`]
+/// Produced by [`resolve_process_identity`]; consumed by [`authorize_egress_intent`]
 /// and by the identity-chain regression tests.
 #[cfg(target_os = "linux")]
 struct ResolvedIdentity {
@@ -1718,7 +1710,7 @@ fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathB
 /// walks each ancestor chain verifying every ancestor, and collects
 /// cmdline-derived absolute paths for script detection.
 ///
-/// This is the identity-resolution block of [`evaluate_opa_tcp`] extracted
+/// This is the identity-resolution block of [`authorize_egress_intent`] extracted
 /// into a standalone helper so it can be exercised by Linux-only regression
 /// tests without a full OPA engine. The key hot-swap invariant under test is
 /// that display paths are stripped for policy/logging, while integrity hashing
@@ -1794,7 +1786,7 @@ fn resolve_process_identity(
 
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
 #[cfg(target_os = "linux")]
-fn evaluate_opa_tcp(
+fn authorize_egress_intent(
     connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
@@ -1814,7 +1806,7 @@ fn evaluate_opa_tcp(
         EgressDecision {
             intent: intent.clone(),
             action: NetworkAction::Deny { reason },
-            generation: engine.current_generation(),
+            l4_policy_generation: engine.current_generation(),
             identity,
             endpoint: EndpointDecision::default(),
             binary,
@@ -1827,7 +1819,7 @@ fn evaluate_opa_tcp(
     if !crate::opa::network_binary_identity_required() {
         let result = evaluate_endpoint_only_opa(engine, intent);
         debug!(
-            "evaluate_opa_tcp endpoint-only: host={} port={} transport={:?} action={:?}",
+            "authorize_egress_intent endpoint-only: host={} port={} transport={:?} action={:?}",
             result.intent.destination.host,
             result.intent.destination.port,
             result.intent.transport,
@@ -1884,7 +1876,7 @@ fn evaluate_opa_tcp(
         Ok((action, generation)) => EgressDecision {
             intent: intent.clone(),
             action,
-            generation,
+            l4_policy_generation: generation,
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::default(),
             binary: Some(bin_path),
@@ -1902,7 +1894,7 @@ fn evaluate_opa_tcp(
         ),
     };
     debug!(
-        "evaluate_opa_tcp TOTAL: {}ms host={} port={} transport={:?}",
+        "authorize_egress_intent TOTAL: {}ms host={} port={} transport={:?}",
         total_start.elapsed().as_millis(),
         intent.destination.host,
         intent.destination.port,
@@ -1939,7 +1931,7 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
         Ok((action, generation)) => EgressDecision {
             intent,
             action,
-            generation,
+            l4_policy_generation: generation,
             identity: ProcessIdentityEvidence::Unavailable(
                 IdentityUnavailableReason::EndpointOnlyMode,
             ),
@@ -1954,7 +1946,7 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
             action: NetworkAction::Deny {
                 reason: format!("policy evaluation error: {e}"),
             },
-            generation: engine.current_generation(),
+            l4_policy_generation: engine.current_generation(),
             identity: ProcessIdentityEvidence::Unavailable(
                 IdentityUnavailableReason::EndpointOnlyMode,
             ),
@@ -1969,7 +1961,7 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, intent: EgressIntent) -> Egres
 
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
-fn evaluate_opa_tcp(
+fn authorize_egress_intent(
     _connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
@@ -1985,7 +1977,7 @@ fn evaluate_opa_tcp(
         action: NetworkAction::Deny {
             reason: "identity binding unavailable on this platform".into(),
         },
-        generation: engine.current_generation(),
+        l4_policy_generation: engine.current_generation(),
         identity: ProcessIdentityEvidence::Unavailable(
             IdentityUnavailableReason::UnsupportedPlatform,
         ),
@@ -2446,7 +2438,7 @@ fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette
     ocsf_emit!(event);
 }
 
-/// Query L7 endpoint config from the OPA engine for a matched CONNECT decision.
+/// Query L7 endpoint config from the OPA engine for an allowed egress decision.
 ///
 /// Returns `Some(L7EndpointConfig)` if the matched endpoint has L7 config (protocol field),
 /// `None` for L4-only endpoints.
@@ -2522,7 +2514,7 @@ fn query_l7_route_snapshot(
             );
             Some(L7RouteSnapshot {
                 configs,
-                generation,
+                l7_policy_generation: generation,
             })
         }
         Err(e) => {
@@ -3773,7 +3765,7 @@ async fn handle_forward_proxy(
     let pid_clone = entrypoint_pid.clone();
     let intent = EgressIntent::forward_http(host_lc.clone(), port);
     let mut decision = tokio::task::spawn_blocking(move || {
-        evaluate_opa_tcp(connection, &opa_clone, &cache_clone, &pid_clone, intent)
+        authorize_egress_intent(connection, &opa_clone, &cache_clone, &pid_clone, intent)
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
@@ -3869,19 +3861,22 @@ async fn handle_forward_proxy(
         binary = %binary_str,
         binary_pid = %pid_str,
         matched_policy = %policy_str,
-        decision_generation = decision.generation,
+        l4_policy_generation = decision.l4_policy_generation,
         current_generation = opa_engine.current_generation(),
         action = ?decision.action,
         "Forward proxy L4 policy decision"
     );
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
-    let forward_generation_guard = match opa_engine.generation_guard(decision.generation) {
+    let forward_generation_guard = match relay::pin_policy_generation(
+        &opa_engine,
+        decision.l4_policy_generation,
+    ) {
         Ok(guard) => guard,
         Err(e) => {
             warn!(
                 host = %host_lc,
                 port,
-                decision_generation = decision.generation,
+                l4_policy_generation = decision.l4_policy_generation,
                 current_generation = opa_engine.current_generation(),
                 error = %e,
                 "Forward proxy rejected request because policy generation changed after L4 decision"
@@ -3934,13 +3929,13 @@ async fn handle_forward_proxy(
         .as_ref()
         .filter(|route| !route.configs.is_empty())
     {
-        if route.generation != forward_generation_guard.captured_generation() {
+        if route.l7_policy_generation != forward_generation_guard.captured_generation() {
             warn!(
                 host = %host_lc,
                 port,
-                decision_generation = decision.generation,
-                guard_generation = forward_generation_guard.captured_generation(),
-                route_generation = route.generation,
+                l4_policy_generation = decision.l4_policy_generation,
+                l4_guard_generation = forward_generation_guard.captured_generation(),
+                l7_policy_generation = route.l7_policy_generation,
                 current_generation = opa_engine.current_generation(),
                 "Forward proxy rejected request because L7 route lookup used a different policy generation"
             );
@@ -3950,7 +3945,7 @@ async fn handle_forward_proxy(
                 miette::miette!(
                     "policy changed before forward L7 evaluation [expected_generation:{} current_generation:{}]",
                     forward_generation_guard.captured_generation(),
-                    route.generation,
+                    route.l7_policy_generation,
                 ),
             );
             emit_activity_simple(activity_tx, true, "policy_stale");
@@ -3966,13 +3961,13 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
-        let tunnel_engine = match opa_engine.clone_engine_for_tunnel(route.generation) {
+        let tunnel_engine = match relay::pin_l7_evaluator(&opa_engine, route.l7_policy_generation) {
             Ok(engine) => engine,
             Err(e) => {
                 warn!(
                     host = %host_lc,
                     port,
-                    route_generation = route.generation,
+                    l7_policy_generation = route.l7_policy_generation,
                     current_generation = opa_engine.current_generation(),
                     error = %e,
                     "Forward proxy rejected request because L7 tunnel engine could not be cloned"
@@ -5334,11 +5329,11 @@ network_policies:
             configs: vec![L7ConfigSnapshot {
                 config: websocket_l7_config(crate::l7::L7Protocol::Rest, false),
             }],
-            generation: 1,
+            l7_policy_generation: 1,
         };
         let l4_route = L7RouteSnapshot {
             configs: Vec::new(),
-            generation: 1,
+            l7_policy_generation: 1,
         };
 
         emit_connect_activity_if_l4_only(&activity_tx, Some(&l7_route));
@@ -5749,7 +5744,7 @@ network_policies:
             action: NetworkAction::Allow {
                 matched_policy: Some(policy_name.to_string()),
             },
-            generation: engine.current_generation(),
+            l4_policy_generation: engine.current_generation(),
             identity: ProcessIdentityEvidence::Available,
             endpoint: EndpointDecision::default(),
             binary: Some(PathBuf::from("/usr/bin/node")),
@@ -5764,7 +5759,7 @@ network_policies:
             .config
             .clone();
         let tunnel_engine = engine
-            .clone_engine_for_tunnel(route.generation)
+            .clone_engine_for_tunnel(route.l7_policy_generation)
             .expect("tunnel engine");
         let ctx = crate::l7::relay::L7EvalContext {
             host: host.to_string(),
@@ -9263,7 +9258,7 @@ network_policies:
     /// itself), binds to `current_exe()`, and never falls through to the
     /// whole-`/proc` scan — the environment-sensitive path that made a forked
     /// child flaky under a busy CI `/proc`. Callers gate on Linux;
-    /// `evaluate_opa_tcp` denies unconditionally without `/proc`.
+    /// `authorize_egress_intent` denies unconditionally without `/proc`.
     async fn drive_connect_through_handler(
         endpoint_yaml: &str,
         connect_target: &str,
@@ -9576,7 +9571,7 @@ network_policies:
             let decision = EgressDecision {
                 intent: EgressIntent::connect("203.0.113.10".to_string(), 443),
                 action,
-                generation,
+                l4_policy_generation: generation,
                 identity: ProcessIdentityEvidence::Available,
                 endpoint: EndpointDecision::default(),
                 binary: Some(input.binary_path),

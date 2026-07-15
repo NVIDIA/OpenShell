@@ -60,12 +60,16 @@ socket inode.
 
 CONNECT and absolute-form forward HTTP are explicit-proxy adapters over the same
 egress pipeline. Each adapter normalizes its request into an egress intent, and
-the shared authorization result carries the process evidence and endpoint state
-used by destination validation and relay selection. Destination validation
+the shared authorization result carries the process evidence used by destination
+validation and relay selection. During the compatibility migration, endpoint
+state is hydrated at the adapters' existing policy query points; it is not yet
+one atomic, generation-consistent authorization result. Destination validation
 returns an unopened connector so adapters retain their existing response and
-upstream-dial timing. CONNECT uses shared TLS-terminated HTTP, plaintext HTTP,
-and raw byte relay primitives. Forward HTTP retains its guarded single-request
-relay while sharing authorization, request context, and destination boundaries.
+upstream-dial timing. CONNECT prepares a generation-pinned relay context before
+entering shared TLS-terminated or plaintext HTTP relays; non-HTTP traffic uses
+the shared raw byte relay after the existing adapter gates. Forward HTTP retains
+its guarded single-request relay while sharing authorization, request context,
+policy-pinning, and destination boundaries.
 Adapter-specific response and OCSF event shapes remain at the protocol boundary.
 
 For inspected HTTP traffic, the proxy can enforce REST method/path rules,
