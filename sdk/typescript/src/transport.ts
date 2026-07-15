@@ -10,20 +10,20 @@
 // `gateway` at it. When the edge passes gRPC POST directly, the header mode
 // below suffices.
 
-import { createGrpcTransport } from '@connectrpc/connect-node'
-import type { Interceptor, Transport } from '@connectrpc/connect'
+import type { Interceptor, Transport } from '@connectrpc/connect';
+import { createGrpcTransport } from '@connectrpc/connect-node';
 
 export interface ConnectOptions {
   /** Gateway URL (`http://...` or `https://...`). */
-  gateway: string
+  gateway: string;
   /** CA certificate (PEM). Omit to use system roots. */
-  caCert?: Buffer
+  caCert?: Buffer;
   /** Bearer token for direct OIDC auth. Mutually exclusive with edgeToken. */
-  oidcToken?: string
+  oidcToken?: string;
   /** Cloudflare Access token. See the sidecar note above for CF-fronted gateways. */
-  edgeToken?: string
+  edgeToken?: string;
   /** Disable TLS verification (dev/debug only). */
-  insecureSkipVerify?: boolean
+  insecureSkipVerify?: boolean;
 }
 
 // OIDC bearer takes precedence; otherwise attach the Cloudflare Access header +
@@ -31,17 +31,17 @@ export interface ConnectOptions {
 function authInterceptor(opts: ConnectOptions): Interceptor {
   return (next) => async (req) => {
     if (opts.oidcToken) {
-      req.header.set('authorization', `Bearer ${opts.oidcToken}`)
+      req.header.set('authorization', `Bearer ${opts.oidcToken}`);
     } else if (opts.edgeToken) {
-      req.header.set('cf-access-jwt-assertion', opts.edgeToken)
-      req.header.set('cookie', `CF_Authorization=${opts.edgeToken}`)
+      req.header.set('cf-access-jwt-assertion', opts.edgeToken);
+      req.header.set('cookie', `CF_Authorization=${opts.edgeToken}`);
     }
-    return next(req)
-  }
+    return next(req);
+  };
 }
 
 export function buildTransport(opts: ConnectOptions): Transport {
-  const isTls = opts.gateway.startsWith('https://')
+  const isTls = opts.gateway.startsWith('https://');
   return createGrpcTransport({
     baseUrl: opts.gateway,
     interceptors: [authInterceptor(opts)],
@@ -53,5 +53,5 @@ export function buildTransport(opts: ConnectOptions): Transport {
           rejectUnauthorized: opts.insecureSkipVerify ? false : undefined,
         }
       : undefined,
-  })
+  });
 }

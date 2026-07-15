@@ -6,7 +6,7 @@
 // retired) napi binding exposed, kept stable so consumers migrating off it see
 // an identical contract.
 
-import { Code, ConnectError } from '@connectrpc/connect'
+import { Code, ConnectError } from '@connectrpc/connect';
 
 export type SdkErrorCode =
   | 'invalid_config'
@@ -16,39 +16,39 @@ export type SdkErrorCode =
   | 'io'
   | 'not_found'
   | 'already_exists'
-  | 'rpc'
+  | 'rpc';
 
 export class SdkError extends Error {
-  readonly code: SdkErrorCode
+  readonly code: SdkErrorCode;
   constructor(code: SdkErrorCode, message: string) {
     // Format `[code] message` so errorCode() can recover the code from any Error.
-    super(`[${code}] ${message}`)
-    this.name = 'SdkError'
-    this.code = code
+    super(`[${code}] ${message}`);
+    this.name = 'SdkError';
+    this.code = code;
   }
 }
 
 // Map a gRPC status (surfaced by connect-es as ConnectError) onto our codes.
 export function fromConnect(err: unknown): SdkError {
-  const ce = ConnectError.from(err)
+  const ce = ConnectError.from(err);
   switch (ce.code) {
     case Code.NotFound:
-      return new SdkError('not_found', ce.rawMessage)
+      return new SdkError('not_found', ce.rawMessage);
     case Code.AlreadyExists:
-      return new SdkError('already_exists', ce.rawMessage)
+      return new SdkError('already_exists', ce.rawMessage);
     case Code.InvalidArgument:
-      return new SdkError('invalid_config', ce.rawMessage)
+      return new SdkError('invalid_config', ce.rawMessage);
     case Code.Unauthenticated:
     case Code.PermissionDenied:
-      return new SdkError('auth', ce.rawMessage)
+      return new SdkError('auth', ce.rawMessage);
     default:
-      return new SdkError('rpc', ce.rawMessage)
+      return new SdkError('rpc', ce.rawMessage);
   }
 }
 
 // Extract the `[code]` prefix from any error message.
 export function errorCode(err: unknown): string | null {
-  const msg = err instanceof Error ? err.message : String(err)
-  const m = /^\[([a-z_]+)\]/.exec(msg)
-  return m ? m[1] : null
+  const msg = err instanceof Error ? err.message : String(err);
+  const m = /^\[([a-z_]+)\]/.exec(msg);
+  return m ? m[1] : null;
 }
