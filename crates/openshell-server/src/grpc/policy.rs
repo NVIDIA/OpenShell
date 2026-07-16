@@ -3374,7 +3374,10 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
     }
     if !policy.network_middlewares.is_empty() {
         hasher.update(b"network_middlewares");
-        for middleware in &policy.network_middlewares {
+        let mut entries: Vec<_> = policy.network_middlewares.iter().collect();
+        entries.sort_by_key(|(name, _)| name.as_str());
+        for (name, middleware) in entries {
+            hasher.update(name.as_bytes());
             let encoded = middleware.encode_to_vec();
             hasher.update(
                 u64::try_from(encoded.len())
@@ -5311,16 +5314,18 @@ mod tests {
             .unwrap();
 
         let policy = ProtoSandboxPolicy {
-            network_middlewares: vec![NetworkMiddlewareConfig {
-                name: "redactor".to_string(),
-                middleware: "openshell/regex".to_string(),
-                on_error: "fail_closed".to_string(),
-                endpoints: Some(MiddlewareEndpointSelector {
-                    include: vec!["api.example.com".to_string()],
-                    exclude: Vec::new(),
-                }),
-                ..Default::default()
-            }],
+            network_middlewares: HashMap::from([(
+                "redactor".to_string(),
+                NetworkMiddlewareConfig {
+                    middleware: "openshell/regex".to_string(),
+                    on_error: "fail_closed".to_string(),
+                    endpoints: Some(MiddlewareEndpointSelector {
+                        include: vec!["api.example.com".to_string()],
+                        exclude: Vec::new(),
+                    }),
+                    ..Default::default()
+                },
+            )]),
             ..Default::default()
         };
         state
@@ -10186,12 +10191,14 @@ mod tests {
     fn policy_hash_changes_when_network_middlewares_change() {
         let policy_a = ProtoSandboxPolicy::default();
         let policy_b = ProtoSandboxPolicy {
-            network_middlewares: vec![openshell_core::proto::NetworkMiddlewareConfig {
-                name: "regex-redactor".into(),
-                middleware: "openshell/regex".into(),
-                on_error: "fail_closed".into(),
-                ..Default::default()
-            }],
+            network_middlewares: HashMap::from([(
+                "regex-redactor".into(),
+                openshell_core::proto::NetworkMiddlewareConfig {
+                    middleware: "openshell/regex".into(),
+                    on_error: "fail_closed".into(),
+                    ..Default::default()
+                },
+            )]),
             ..Default::default()
         };
 

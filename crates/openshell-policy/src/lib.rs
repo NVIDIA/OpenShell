@@ -53,8 +53,8 @@ struct PolicyFile {
     process: Option<ProcessDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    network_middlewares: Vec<middleware::NetworkMiddlewareConfigDef>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    network_middlewares: BTreeMap<String, middleware::NetworkMiddlewareConfigDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1078,7 +1078,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
             run_as_group: "sandbox".into(),
         }),
         network_policies: HashMap::new(),
-        network_middlewares: vec![],
+        network_middlewares: HashMap::default(),
     }
 }
 
@@ -1138,10 +1138,14 @@ pub enum PolicyViolation {
     InvalidMiddlewareConfig { name: String, reason: String },
     /// Too many middleware configurations are attached to one policy.
     TooManyMiddlewareConfigs { count: usize },
+    /// Two middleware configurations use the same execution order.
+    DuplicateMiddlewareOrder {
+        order: i32,
+        first_name: String,
+        second_name: String,
+    },
     /// Too many include and exclude patterns are attached to one middleware.
     TooManyMiddlewareSelectorPatterns { name: String, count: usize },
-    /// Middleware configuration names must be unique.
-    DuplicateMiddlewareConfigName { name: String },
     /// A middleware selector conflicts with an endpoint that skips TLS inspection.
     MiddlewareTlsSkipConflict {
         middleware_name: String,
@@ -1222,15 +1226,22 @@ impl fmt::Display for PolicyViolation {
                     openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS
                 )
             }
+            Self::DuplicateMiddlewareOrder {
+                order,
+                first_name,
+                second_name,
+            } => {
+                write!(
+                    f,
+                    "middleware configs '{first_name}' and '{second_name}' use duplicate order {order}"
+                )
+            }
             Self::TooManyMiddlewareSelectorPatterns { name, count } => {
                 write!(
                     f,
                     "middleware config '{name}' has too many selector patterns ({count} > {})",
                     openshell_core::middleware::MAX_MIDDLEWARE_SELECTOR_PATTERNS
                 )
-            }
-            Self::DuplicateMiddlewareConfigName { name } => {
-                write!(f, "duplicate middleware config '{name}'")
             }
             Self::MiddlewareTlsSkipConflict {
                 middleware_name,
@@ -1508,7 +1519,8 @@ network_policies:
         let yaml = r#"
 version: 1
 network_middlewares:
-  - name: global-redactor
+  global-redactor:
+    name: Global redactor
     middleware: openshell/regex
     order: 20
     on_error: fail_open
@@ -1517,7 +1529,7 @@ network_middlewares:
       exclude: ["internal.example.com"]
     config:
       mode: redact
-  - name: secondary-redactor
+  secondary-redactor:
     middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
@@ -1533,28 +1545,21 @@ network_policies:
 "#;
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         assert_eq!(proto.network_middlewares.len(), 2);
-        assert_eq!(proto.network_middlewares[0].name, "global-redactor");
-        assert_eq!(proto.network_middlewares[0].middleware, "openshell/regex");
-        assert_eq!(proto.network_middlewares[0].order, 20);
-        assert_eq!(proto.network_middlewares[0].on_error, "fail_open");
+        let redactor = &proto.network_middlewares["global-redactor"];
+        assert_eq!(redactor.name, "Global redactor");
+        assert_eq!(redactor.middleware, "openshell/regex");
+        assert_eq!(redactor.order, 20);
+        assert_eq!(redactor.on_error, "fail_open");
         assert_eq!(
-            proto.network_middlewares[0]
-                .endpoints
-                .as_ref()
-                .expect("selector")
-                .include,
+            redactor.endpoints.as_ref().expect("selector").include,
             vec!["api.example.com", "*.service.test"]
         );
         assert_eq!(
-            proto.network_middlewares[0]
-                .endpoints
-                .as_ref()
-                .expect("selector")
-                .exclude,
+            redactor.endpoints.as_ref().expect("selector").exclude,
             vec!["internal.example.com"]
         );
         assert_eq!(
-            proto.network_middlewares[0]
+            redactor
                 .config
                 .as_ref()
                 .expect("config")
@@ -1562,6 +1567,10 @@ network_policies:
                 .get("mode")
                 .and_then(|value| value.kind.as_ref()),
             Some(&prost_types::value::Kind::StringValue("redact".into()))
+        );
+        assert_eq!(
+            proto.network_middlewares["secondary-redactor"].name,
+            "secondary-redactor"
         );
         let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
         let reparsed = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
@@ -1796,12 +1805,9 @@ network_policies:
 
     // ---- Policy validation tests ----
 
-    fn middleware_config(
-        name: &str,
-        implementation: &str,
-    ) -> openshell_core::proto::NetworkMiddlewareConfig {
+    fn middleware_config(implementation: &str) -> openshell_core::proto::NetworkMiddlewareConfig {
         openshell_core::proto::NetworkMiddlewareConfig {
-            name: name.into(),
+            name: String::new(),
             middleware: implementation.into(),
             order: 0,
             config: None,
@@ -1813,17 +1819,27 @@ network_policies:
         }
     }
 
+    fn add_middleware(
+        policy: &mut SandboxPolicy,
+        name: &str,
+        config: openshell_core::proto::NetworkMiddlewareConfig,
+    ) {
+        policy.network_middlewares.insert(name.into(), config);
+    }
+
     #[test]
     fn structural_validation_defers_implementation_owned_config() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("future", "openshell/future");
+        let mut middleware = middleware_config("openshell/future");
         middleware.config = Some(
             openshell_core::proto_struct::json_object_to_struct(
                 std::iter::once(("implementation_field".into(), serde_json::json!(42))).collect(),
             )
             .unwrap(),
         );
-        policy.network_middlewares.push(middleware);
+        policy
+            .network_middlewares
+            .insert("future".into(), middleware);
 
         validate_sandbox_policy(&policy)
             .expect("generic policy validation must not select installed implementations");
@@ -1832,12 +1848,13 @@ network_policies:
     #[test]
     fn json_validation_delegates_implementation_owned_config() {
         let data = serde_json::json!({
-            "network_middlewares": [{
-                "name": "future",
+            "network_middlewares": {
+              "future": {
                 "middleware": "openshell/future",
                 "config": {"implementation_field": 42},
                 "endpoints": {"include": ["api.example.com"]}
-            }]
+              }
+            }
         });
 
         let violations =
@@ -1854,13 +1871,16 @@ network_policies:
 
     #[test]
     fn json_validation_skips_config_callbacks_when_middleware_count_is_invalid() {
-        let configs: Vec<_> = (0..=openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS)
+        let configs: serde_json::Map<String, serde_json::Value> = (0
+            ..=openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS)
             .map(|index| {
-                serde_json::json!({
-                    "name": format!("middleware-{index}"),
-                    "middleware": "openshell/regex",
-                    "endpoints": {"include": ["api.example.com"]}
-                })
+                (
+                    format!("middleware-{index}"),
+                    serde_json::json!({
+                        "middleware": "openshell/regex",
+                        "endpoints": {"include": ["api.example.com"]}
+                    }),
+                )
             })
             .collect();
         let data = serde_json::json!({"network_middlewares": configs});
@@ -1912,32 +1932,37 @@ network_policies:
     fn validate_rejects_invalid_middleware_control_fields() {
         let cases = [
             (
-                middleware_config("", "openshell/regex"),
+                "",
+                middleware_config("openshell/regex"),
                 "name must not be empty",
             ),
             (
-                middleware_config("redactor", ""),
+                "redactor",
+                middleware_config(""),
                 "middleware must not be empty",
             ),
             (
+                "redactor",
                 {
-                    let mut middleware = middleware_config("redactor", "openshell/regex");
+                    let mut middleware = middleware_config("openshell/regex");
                     middleware.on_error = "maybe".into();
                     middleware
                 },
                 "invalid on_error",
             ),
             (
+                "redactor",
                 {
-                    let mut middleware = middleware_config("redactor", "openshell/regex");
+                    let mut middleware = middleware_config("openshell/regex");
                     middleware.endpoints = None;
                     middleware
                 },
                 "endpoint selector is required",
             ),
             (
+                "redactor",
                 {
-                    let mut middleware = middleware_config("redactor", "openshell/regex");
+                    let mut middleware = middleware_config("openshell/regex");
                     middleware.endpoints.as_mut().unwrap().include.clear();
                     middleware
                 },
@@ -1945,9 +1970,9 @@ network_policies:
             ),
         ];
 
-        for (middleware, expected) in cases {
+        for (name, middleware, expected) in cases {
             let mut policy = restrictive_default_policy();
-            policy.network_middlewares.push(middleware);
+            add_middleware(&mut policy, name, middleware);
             let errors = validate_sandbox_policy(&policy)
                 .expect_err("invalid middleware must be rejected")
                 .into_iter()
@@ -1962,19 +1987,23 @@ network_policies:
     }
 
     #[test]
-    fn validate_rejects_duplicate_middleware_config_names() {
+    fn validate_rejects_duplicate_middleware_orders() {
         let mut policy = restrictive_default_policy();
-        policy
-            .network_middlewares
-            .push(middleware_config("redactor", "openshell/regex"));
-        policy
-            .network_middlewares
-            .push(middleware_config("redactor", "openshell/regex"));
+        let mut alpha = middleware_config("openshell/regex");
+        alpha.order = 10;
+        add_middleware(&mut policy, "alpha", alpha);
+        let mut beta = middleware_config("openshell/regex");
+        beta.order = 10;
+        add_middleware(&mut policy, "beta", beta);
 
-        let violations = validate_sandbox_policy(&policy).expect_err("duplicate name");
+        let violations = validate_sandbox_policy(&policy).expect_err("duplicate order");
         assert!(violations.iter().any(|violation| matches!(
             violation,
-            PolicyViolation::DuplicateMiddlewareConfigName { name } if name == "redactor"
+            PolicyViolation::DuplicateMiddlewareOrder {
+                order: 10,
+                first_name,
+                second_name,
+            } if first_name == "alpha" && second_name == "beta"
         )));
     }
 
@@ -1982,10 +2011,10 @@ network_policies:
     fn validate_accepts_maximum_middleware_configs() {
         let mut policy = restrictive_default_policy();
         for index in 0..openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS {
-            policy.network_middlewares.push(middleware_config(
-                &format!("middleware-{index}"),
-                "openshell/regex",
-            ));
+            let name = format!("middleware-{index}");
+            let mut config = middleware_config("openshell/regex");
+            config.order = i32::try_from(index).unwrap();
+            add_middleware(&mut policy, &name, config);
         }
 
         validate_sandbox_policy(&policy).expect("maximum middleware config count");
@@ -1995,10 +2024,10 @@ network_policies:
     fn validate_rejects_middleware_config_over_capacity() {
         let mut policy = restrictive_default_policy();
         for index in 0..=openshell_core::middleware::MAX_MIDDLEWARE_CONFIGS {
-            policy.network_middlewares.push(middleware_config(
-                &format!("middleware-{index}"),
-                "openshell/regex",
-            ));
+            let name = format!("middleware-{index}");
+            let mut config = middleware_config("openshell/regex");
+            config.order = i32::try_from(index).unwrap();
+            add_middleware(&mut policy, &name, config);
         }
 
         let violations = validate_sandbox_policy(&policy).expect_err("config count over capacity");
@@ -2012,13 +2041,13 @@ network_policies:
     #[test]
     fn validate_accepts_maximum_middleware_selector_patterns() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redactor", "openshell/regex");
+        let mut middleware = middleware_config("openshell/regex");
         let selector = middleware.endpoints.as_mut().expect("selector");
         selector.exclude = vec![
             "excluded.example.com".into();
             openshell_core::middleware::MAX_MIDDLEWARE_SELECTOR_PATTERNS - 1
         ];
-        policy.network_middlewares.push(middleware);
+        add_middleware(&mut policy, "redactor", middleware);
 
         validate_sandbox_policy(&policy).expect("maximum selector pattern count");
     }
@@ -2026,13 +2055,13 @@ network_policies:
     #[test]
     fn validate_rejects_middleware_selector_patterns_over_capacity() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redactor", "openshell/regex");
+        let mut middleware = middleware_config("openshell/regex");
         let selector = middleware.endpoints.as_mut().expect("selector");
         selector.exclude = vec![
             "excluded.example.com".into();
             openshell_core::middleware::MAX_MIDDLEWARE_SELECTOR_PATTERNS
         ];
-        policy.network_middlewares.push(middleware);
+        add_middleware(&mut policy, "redactor", middleware);
 
         let violations =
             validate_sandbox_policy(&policy).expect_err("selector patterns over capacity");
@@ -2048,9 +2077,9 @@ network_policies:
     #[test]
     fn validate_rejects_malformed_middleware_selector_patterns() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redactor", "openshell/regex");
+        let mut middleware = middleware_config("openshell/regex");
         middleware.endpoints.as_mut().unwrap().include = vec!["api[.example.com".into()];
-        policy.network_middlewares.push(middleware);
+        add_middleware(&mut policy, "redactor", middleware);
 
         let errors = validate_sandbox_policy(&policy)
             .expect_err("malformed selector")
@@ -2073,9 +2102,11 @@ network_policies:
     #[test]
     fn validate_rejects_middleware_selector_matching_tls_skip_endpoint() {
         let mut policy = restrictive_default_policy();
-        policy
-            .network_middlewares
-            .push(middleware_config("redactor", "openshell/regex"));
+        add_middleware(
+            &mut policy,
+            "redactor",
+            middleware_config("openshell/regex"),
+        );
         policy.network_policies.insert(
             "api".into(),
             NetworkPolicyRule {
@@ -2104,9 +2135,9 @@ network_policies:
     #[test]
     fn validate_accepts_fail_open_middleware_selector_matching_tls_skip_endpoint() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redactor", "openshell/regex");
+        let mut middleware = middleware_config("openshell/regex");
         middleware.on_error = "fail_open".into();
-        policy.network_middlewares.push(middleware);
+        add_middleware(&mut policy, "redactor", middleware);
         policy.network_policies.insert(
             "api".into(),
             NetworkPolicyRule {
@@ -2128,9 +2159,9 @@ network_policies:
     #[test]
     fn validate_rejects_explicit_fail_closed_middleware_on_tls_skip_endpoint() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redactor", "openshell/regex");
+        let mut middleware = middleware_config("openshell/regex");
         middleware.on_error = "fail_closed".into();
-        policy.network_middlewares.push(middleware);
+        add_middleware(&mut policy, "redactor", middleware);
         policy.network_policies.insert(
             "api".into(),
             NetworkPolicyRule {
@@ -2156,9 +2187,9 @@ network_policies:
     #[test]
     fn validate_rejects_concrete_selector_overlapping_tls_skip_wildcard() {
         let mut policy = restrictive_default_policy();
-        let mut middleware = middleware_config("redactor", "openshell/regex");
+        let mut middleware = middleware_config("openshell/regex");
         middleware.endpoints.as_mut().unwrap().include = vec!["api.example.com".into()];
-        policy.network_middlewares.push(middleware);
+        add_middleware(&mut policy, "redactor", middleware);
         policy.network_policies.insert(
             "api".into(),
             NetworkPolicyRule {
@@ -2268,7 +2299,7 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
-            network_middlewares: Vec::new(),
+            network_middlewares: HashMap::default(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -2650,7 +2681,7 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
-            network_middlewares: Vec::new(),
+            network_middlewares: HashMap::default(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -2666,7 +2697,7 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
-            network_middlewares: Vec::new(),
+            network_middlewares: HashMap::default(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }
@@ -2745,7 +2776,7 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
-            network_middlewares: Vec::new(),
+            network_middlewares: HashMap::default(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }

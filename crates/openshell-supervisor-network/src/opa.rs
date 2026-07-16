@@ -872,9 +872,30 @@ fn query_middleware_chain_locked(
 fn parse_middleware_configs(value: &regorus::Value) -> Result<Vec<regorus::Value>> {
     match value {
         regorus::Value::Undefined => Ok(Vec::new()),
-        regorus::Value::Array(values) => Ok(values.to_vec()),
+        regorus::Value::Object(configs) => configs
+            .iter()
+            .map(|(name, config)| {
+                let regorus::Value::String(_) = name else {
+                    return Err(miette::miette!("network_middlewares keys must be strings"));
+                };
+                let regorus::Value::Object(fields) = config else {
+                    return Err(miette::miette!(
+                        "network middleware config {name:?} must be an object"
+                    ));
+                };
+                let fields = fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .chain(std::iter::once((
+                        regorus::Value::String("__openshell_policy_key".into()),
+                        name.clone(),
+                    )))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                Ok(fields.into())
+            })
+            .collect(),
         other => Err(miette::miette!(
-            "network_middlewares must be an array, got {other:?}"
+            "network_middlewares must be an object, got {other:?}"
         )),
     }
 }
@@ -907,7 +928,7 @@ fn middleware_selector_matches(config: &regorus::Value, host: &str) -> Result<bo
 }
 
 fn chain_entry_from_value(value: &regorus::Value) -> Result<ChainEntry> {
-    let name = get_str(value, "name").unwrap_or_default();
+    let name = get_str(value, "__openshell_policy_key").unwrap_or_default();
     let implementation = get_str(value, "middleware").unwrap_or_default();
     Ok(ChainEntry {
         name,
@@ -1666,15 +1687,18 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
         })
         .collect();
 
-    let network_middlewares: Vec<serde_json::Value> = proto
-        .network_middlewares
-        .iter()
-        .map(|mw| {
+    let mut middleware_entries: Vec<_> = proto.network_middlewares.iter().collect();
+    middleware_entries.sort_by_key(|(name, _)| name.as_str());
+    let network_middlewares: serde_json::Map<String, serde_json::Value> = middleware_entries
+        .into_iter()
+        .map(|(name, mw)| {
             let mut value = serde_json::json!({
-                "name": mw.name,
                 "middleware": mw.middleware,
                 "order": mw.order,
             });
+            if !mw.name.is_empty() {
+                value["name"] = mw.name.clone().into();
+            }
             if let Some(config) = &mw.config {
                 value["config"] = openshell_core::proto_struct::struct_to_json_value(config);
             }
@@ -1691,7 +1715,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 }
                 value["endpoints"] = endpoints;
             }
-            value
+            (name.clone(), value)
         })
         .collect();
 
@@ -1783,7 +1807,7 @@ mod tests {
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         }
     }
 
@@ -2701,7 +2725,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: Vec::new(),
+            network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto_with_pid_and_binary_identity_required(&proto, 0, false)
             .expect("engine from relaxed proto");
@@ -3244,7 +3268,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3316,7 +3340,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3389,7 +3413,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4266,7 +4290,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4324,7 +4348,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4383,7 +4407,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4444,7 +4468,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4504,7 +4528,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -5494,7 +5518,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
@@ -5549,7 +5573,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
@@ -5620,7 +5644,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
 
@@ -5851,7 +5875,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
         let engine = OpaEngine::from_proto(&proto).unwrap();
         // Port 443
@@ -6729,11 +6753,13 @@ network_policies:
             .expect("install last-known-good runtime");
 
         let mut invalid = proto;
-        invalid.network_middlewares.push(NetworkMiddlewareConfig {
-            name: String::new(),
-            middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
-            ..Default::default()
-        });
+        invalid.network_middlewares.insert(
+            String::new(),
+            NetworkMiddlewareConfig {
+                middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+                ..Default::default()
+            },
+        );
         let empty_registry = MiddlewareRegistry::connect_services(Vec::new(), Vec::new())
             .await
             .expect("empty registry");
@@ -6986,7 +7012,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         // Build engine with our PID (symlink resolution will work via /proc/self/root/)
@@ -7064,7 +7090,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            network_middlewares: vec![],
+            network_middlewares: std::collections::HashMap::default(),
         };
 
         // Initial load at pid=0 — no symlink expansion
@@ -7108,22 +7134,22 @@ network_policies:
     }
 
     #[test]
-    fn middleware_chain_uses_configured_order_and_name_tie_breaker() {
+    fn middleware_chain_uses_configured_order() {
         let data = r#"
 network_middlewares:
-  - name: global-redactor
+  global-redactor:
     middleware: openshell/regex
     order: 20
     endpoints:
       include: ["api.example.com"]
-  - name: policy-redactor
+  policy-redactor:
     middleware: openshell/regex
     order: 10
     endpoints:
       include: ["api.example.com"]
-  - name: endpoint-redactor
+  endpoint-redactor:
     middleware: openshell/regex
-    order: 10
+    order: 5
     endpoints:
       include: ["api.example.com"]
 network_policies:
@@ -7203,18 +7229,18 @@ network_policies:
     fn middleware_chain_uses_dns_label_glob_semantics() {
         let data = r#"
 network_middlewares:
-  - name: single-label
+  single-label:
     middleware: openshell/regex
     order: 10
     endpoints:
       include: ["*.Example.COM"]
       exclude: ["trusted.example.com"]
-  - name: recursive
+  recursive:
     middleware: openshell/regex
     order: 20
     endpoints:
       include: ["**.example.com"]
-  - name: intra-label
+  intra-label:
     middleware: openshell/regex
     order: 30
     endpoints:
@@ -7324,7 +7350,7 @@ host_match if {
                 "invalid on_error",
                 r#"
 network_middlewares:
-  - name: redactor
+  redactor:
     middleware: openshell/regex
     on_error: maybe
     endpoints:
@@ -7333,25 +7359,27 @@ network_middlewares:
                 "invalid on_error",
             ),
             (
-                "duplicate names",
+                "duplicate order",
                 r#"
 network_middlewares:
-  - name: redactor
+  alpha:
     middleware: openshell/regex
+    order: 10
     endpoints:
       include: ["api.example.com"]
-  - name: redactor
+  beta:
     middleware: openshell/regex
+    order: 10
     endpoints:
-      include: ["api.example.com"]
+      include: ["other.example.com"]
 "#,
-                "duplicate middleware config 'redactor'",
+                "duplicate order 10",
             ),
             (
                 "missing selector",
                 r#"
 network_middlewares:
-  - name: redactor
+  redactor:
     middleware: openshell/regex
 "#,
                 "endpoint selector is required",
@@ -7360,7 +7388,7 @@ network_middlewares:
                 "malformed selector",
                 r#"
 network_middlewares:
-  - name: redactor
+  redactor:
     middleware: openshell/regex
     endpoints:
       include: ["api[.example.com"]
@@ -7371,7 +7399,7 @@ network_middlewares:
                 "tls skip selector",
                 r#"
 network_middlewares:
-  - name: redactor
+  redactor:
     middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
@@ -7390,7 +7418,7 @@ network_policies:
                 "tls skip wildcard overlap",
                 r#"
 network_middlewares:
-  - name: redactor
+  redactor:
     middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]
@@ -7430,7 +7458,7 @@ network_policies:
                 "unknown built-in",
                 r#"
 network_middlewares:
-  - name: unknown
+  unknown:
     middleware: openshell/unknown
     endpoints:
       include: ["api.example.com"]
@@ -7441,7 +7469,7 @@ network_middlewares:
                 "invalid regex config",
                 r#"
 network_middlewares:
-  - name: redactor
+  redactor:
     middleware: openshell/regex
     config:
       mode: allow
@@ -7466,15 +7494,17 @@ network_middlewares:
     #[test]
     fn from_proto_revalidates_middleware_policy() {
         let mut policy = openshell_policy::restrictive_default_policy();
-        policy.network_middlewares.push(NetworkMiddlewareConfig {
-            name: "redactor".into(),
-            middleware: "openshell/regex".into(),
-            endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
-                include: vec!["api[.example.com".into()],
-                exclude: Vec::new(),
-            }),
-            ..Default::default()
-        });
+        policy.network_middlewares.insert(
+            "redactor".into(),
+            NetworkMiddlewareConfig {
+                middleware: "openshell/regex".into(),
+                endpoints: Some(openshell_core::proto::MiddlewareEndpointSelector {
+                    include: vec!["api[.example.com".into()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        );
 
         let error = OpaEngine::from_proto(&policy)
             .err()

@@ -870,7 +870,7 @@ matched_endpoint_config := _matching_endpoint_configs[0] if {
 
 # Expose middleware policy data to Rust. Selection and validation stay in Rust;
 # Rego does not evaluate middleware selectors.
-network_middlewares := object.get(data, "network_middlewares", [])
+network_middlewares := object.get(data, "network_middlewares", {})
 
 _policy_has_exact_declared_endpoint(policy) if {
 	some ep

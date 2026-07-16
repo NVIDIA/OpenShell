@@ -68,9 +68,10 @@ are relayed but are not currently parsed for policy enforcement.
 
 For admitted HTTP requests, the proxy can run an ordered supervisor middleware
 chain before credential injection. Host selectors choose the chain independently
-of the network rule that admitted the request. Policy entries use integer order
-values with stable name tie-breaking, and the gRPC contract represents operations
-and phases as enums. Built-ins run in-process;
+of the network rule that admitted the request. Policies key middleware configs by
+stable policy-local identities, allow optional human-readable names, and require
+unique integer order values. The gRPC contract represents operations and phases as enums. Built-ins run
+in-process;
 operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
 service capabilities and implementation-owned config before delivery.
@@ -122,8 +123,8 @@ patterns and selectors remain in `openshell-core::host_pattern`.
 which implementations are installed. The active middleware registry validates
 implementation-owned config before gateway admission. The supervisor's
 local-file path supplies its built-in catalog to the same JSON projection so it
-retains early config validation. Rego exposes the middleware list as policy
-data, but Rust performs selector validation, overlap detection, matching, chain
+retains early config validation. Rego exposes the keyed middleware configs as
+policy data, but Rust performs selector validation, overlap detection, matching, chain
 ordering, implementation discovery, and config validation. When provider layers
 are composed just in time, the gateway reruns structural validation on the
 complete effective policy before delivering it to a supervisor.

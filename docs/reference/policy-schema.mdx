@@ -20,7 +20,7 @@ filesystem_policy: { ... }
 landlock: { ... }
 process: { ... }
 network_policies: { ... }
-network_middlewares: [ ... ]
+network_middlewares: { ... }
 ```
 
 | Field | Type | Required | Category | Description |
@@ -30,7 +30,7 @@ network_middlewares: [ ... ]
 | `landlock` | object | No | Static | Configures Landlock LSM enforcement behavior. |
 | `process` | object | No | Static | Sets the user and group the agent process runs as. |
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
-| `network_middlewares` | list | No | Dynamic | Selects ordered HTTP request middleware by destination host. |
+| `network_middlewares` | map | No | Dynamic | Selects ordered HTTP request middleware by destination host. |
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
@@ -478,11 +478,12 @@ Identifies an executable that is permitted to use the associated endpoints.
 
 **Category:** Dynamic
 
-An ordered list of up to 10 middleware configs selected after network and L7 policy admit an HTTP request. Middleware selection is independent of the network policy entry that admitted the request. Every matching config runs once by ascending `order`, with the policy-local name breaking ties, before provider credential injection. Runtime selection also enforces the 10-stage maximum.
+A map of up to 10 middleware configs selected after network and L7 policy admit an HTTP request. Each map key is the stable policy-local config identity. Middleware selection is independent of the network policy entry that admitted the request. Every matching config runs once by ascending `order` before provider credential injection. Order values must be unique across the policy, and runtime selection also enforces the 10-stage maximum.
 
 ```yaml showLineNumbers={false}
 network_middlewares:
-  - name: regex-redactor
+  regex-redactor:
+    name: Redact API tokens
     middleware: openshell/regex
     order: 10
     config:
@@ -495,9 +496,9 @@ network_middlewares:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `name` | string | Yes | Policy-local config name. Names must be unique within the list. |
+| `name` | string | No | Human-readable name for the middleware config. Defaults to the map key, which remains its stable identity. |
 | `middleware` | string | Yes | Built-in middleware name or operator-owned registration name. `openshell/` is reserved for built-ins. |
-| `order` | integer | No | Execution priority. Lower values run first; names break ties. Defaults to `0`. |
+| `order` | integer | No | Execution priority. Lower values run first, and values must be unique across the policy. Defaults to `0`; therefore, policies with multiple configs normally specify it explicitly. |
 | `config` | object | No | Implementation-owned configuration validated by the selected middleware. |
 | `on_error` | string | No | `fail_closed` denies the request when the stage fails; `fail_open` skips the failed stage. Defaults to `fail_closed`. |
 | `endpoints` | object | Yes | Host selector with required non-empty `include` and optional `exclude` lists, limited to 32 combined patterns. Exclusions take precedence. |

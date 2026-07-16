@@ -4963,7 +4963,7 @@ mod tests {
         let policy = include_str!("../data/sandbox-policy.rego");
         let data = r#"
 network_middlewares:
-  - name: guard
+  guard:
     middleware: openshell/regex
     endpoints:
       include: ["api.example.com"]

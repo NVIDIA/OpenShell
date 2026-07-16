@@ -2326,7 +2326,7 @@ network_policies:
         let data = format!(
             r#"
 network_middlewares:
-  - name: request-middleware
+  request-middleware:
     middleware: {middleware_impl}
     on_error: {on_error}
     endpoints:
@@ -2968,7 +2968,7 @@ network_policies:
     async fn jsonrpc_middleware_fail_closed_does_not_reach_upstream() {
         let data = r#"
 network_middlewares:
-  - name: request-middleware
+  request-middleware:
     middleware: example/unavailable
     on_error: fail_closed
     endpoints:
@@ -3295,7 +3295,7 @@ network_policies:
         let data = format!(
             r#"
 network_middlewares:
-  - name: rewriter
+  rewriter:
     middleware: test/rewriter
     on_error: fail_closed
     endpoints:
@@ -3465,7 +3465,7 @@ network_policies:
         // rewrites the body into a denied mutation.
         let data = r#"
 network_middlewares:
-  - name: rewriter
+  rewriter:
     middleware: test/rewriter
     on_error: fail_closed
     endpoints:
@@ -3575,7 +3575,7 @@ network_policies:
         let data = format!(
             r#"
 network_middlewares:
-  - name: guard
+  guard:
     middleware: example/unavailable
     on_error: {on_error}
     endpoints:
@@ -4164,7 +4164,7 @@ network_policies:
         // host-selected middleware must still inspect and redact its body.
         let data = r#"
 network_middlewares:
-  - name: request-middleware
+  request-middleware:
     middleware: openshell/regex
     on_error: fail_closed
     endpoints:
@@ -4261,7 +4261,7 @@ network_policies:
         // forwarded.
         let data = r#"
 network_middlewares:
-  - name: request-middleware
+  request-middleware:
     middleware: example/unavailable
     on_error: fail_closed
     endpoints:

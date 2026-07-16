@@ -1660,16 +1660,18 @@ mod tests {
         use openshell_core::proto::{MiddlewareEndpointSelector, NetworkMiddlewareConfig};
 
         let mut policy = openshell_policy::restrictive_default_policy();
-        policy.network_middlewares.push(NetworkMiddlewareConfig {
-            name: "redactor".into(),
-            middleware: "openshell/regex".into(),
-            on_error: "maybe".into(),
-            endpoints: Some(MiddlewareEndpointSelector {
-                include: vec!["api[.example.com".into()],
-                exclude: Vec::new(),
-            }),
-            ..Default::default()
-        });
+        policy.network_middlewares.insert(
+            "redactor".into(),
+            NetworkMiddlewareConfig {
+                middleware: "openshell/regex".into(),
+                on_error: "maybe".into(),
+                endpoints: Some(MiddlewareEndpointSelector {
+                    include: vec!["api[.example.com".into()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        );
 
         let err = validate_policy_safety(&policy).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);

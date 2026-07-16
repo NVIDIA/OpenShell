@@ -49,7 +49,7 @@ pub enum ControlUpdate {
         provider_child_env: HashMap<String, String>,
     },
     PolicyUpdated {
-        policy_proto: openshell_core::proto::SandboxPolicy,
+        policy_proto: Box<openshell_core::proto::SandboxPolicy>,
         policy_hash: String,
         config_revision: u64,
     },
@@ -231,7 +231,7 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
                         .into_diagnostic()
                         .wrap_err("failed to decode sidecar policy update")?;
                 Ok(Self::PolicyUpdated {
-                    policy_proto,
+                    policy_proto: Box::new(policy_proto),
                     policy_hash,
                     config_revision,
                 })

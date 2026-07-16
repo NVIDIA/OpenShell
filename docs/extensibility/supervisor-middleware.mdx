@@ -18,7 +18,7 @@ For each inspected HTTP request, the supervisor:
 1. Evaluates network and L7 policy.
 2. Selects middleware whose host selectors match the admitted destination.
 3. Buffers the request body using the largest body limit in the selected chain.
-4. Runs matching middleware by ascending `order`, using the policy-local name to break ties.
+4. Runs matching middleware by ascending `order`. Policy validation rejects duplicate order values.
 5. Re-checks body-aware protocol policy (GraphQL, JSON-RPC, MCP) after each stage that replaces the body. Every middleware receives a payload the policy admits, and a transformation cannot smuggle a denied or unparseable operation to a later stage or the upstream.
 6. Applies allowed transformations, injects provider credentials, and forwards the request.
 
@@ -66,11 +66,12 @@ Registration is static. Restart the gateway after adding, removing, or changing 
 
 ## Apply Middleware with Policy
 
-Add middleware configs to the top-level `network_middlewares` list:
+Add middleware configs to the top-level `network_middlewares` map. Each key is the policy-local config name:
 
 ```yaml
 network_middlewares:
-  - name: regex-redactor
+  regex-redactor:
+    name: Redact API tokens
     middleware: openshell/regex
     order: 10
     config:
@@ -81,11 +82,11 @@ network_middlewares:
       exclude: ["trusted.example.com"]
 ```
 
-Each config has a policy-local `name`, a built-in or operator-owned registration name in `middleware`, an integer `order`, implementation-owned `config`, failure behavior, and host selectors. A policy accepts at most 10 middleware configs.
+Each config has a stable policy-local identity from its map key, an optional human-readable `name` that defaults to that key, a built-in or operator-owned registration name in `middleware`, an integer `order`, implementation-owned `config`, failure behavior, and host selectors. The optional name does not replace the map key for attachment or future keyed updates. A policy accepts at most 10 middleware configs.
 
 `include` selects destination hosts. `exclude` takes precedence and removes hosts from that selection. Each config accepts at most 32 combined include and exclude patterns. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints: `*` matches exactly one DNS label, `**` matches one or more labels, and intra-label patterns like `*-api.example.com` work. Brace alternates such as `{prod,staging}` are rejected at validation; list each host pattern separately.
 
-Matching configs run once each by ascending `order`; lower values run first and policy-local names break ties. The default order is `0`. Different config names may attach the same middleware and run as separate stages. Config names must be unique. Runtime selection defensively rejects chains with more than 10 stages.
+Matching configs run once each by ascending `order`; lower values run first. Order values must be unique across the complete policy, even when endpoint selectors do not overlap. The default order is `0`, so policies with multiple configs normally set explicit values. Different map keys may attach the same middleware and run as separate stages. Map keys are structurally unique. Runtime selection defensively rejects chains with more than 10 stages.
 
 See [Policy Schema](/reference/policy-schema#network-middleware) for the complete field reference.
 

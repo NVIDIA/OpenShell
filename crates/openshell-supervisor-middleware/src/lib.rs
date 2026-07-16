@@ -109,21 +109,21 @@ pub struct ChainEntry {
     pub on_error: OnError,
 }
 
-impl TryFrom<&NetworkMiddlewareConfig> for ChainEntry {
+impl TryFrom<(&str, &NetworkMiddlewareConfig)> for ChainEntry {
     type Error = miette::Report;
 
-    fn try_from(value: &NetworkMiddlewareConfig) -> Result<Self> {
-        if value.name.is_empty() {
+    fn try_from((name, value): (&str, &NetworkMiddlewareConfig)) -> Result<Self> {
+        if name.is_empty() {
             return Err(miette!("middleware config name cannot be empty"));
         }
         if value.middleware.is_empty() {
             return Err(miette!(
                 "middleware config '{}' must reference a middleware",
-                value.name
+                name
             ));
         }
         Ok(Self {
-            name: value.name.clone(),
+            name: name.to_string(),
             implementation: value.middleware.clone(),
             order: value.order,
             config: value.config.clone().unwrap_or_default(),
@@ -740,7 +740,7 @@ impl MiddlewareRegistry {
     pub async fn validate_policy_configs(&self, policy: &SandboxPolicy) -> Result<()> {
         ensure_config_capacity(policy.network_middlewares.len())?;
         let runner = ChainRunner::from_registry(self.clone());
-        for config in &policy.network_middlewares {
+        for (name, config) in &policy.network_middlewares {
             runner
                 .validate_config(
                     &config.middleware,
@@ -750,7 +750,7 @@ impl MiddlewareRegistry {
                 .map_err(|error| {
                     miette!(
                         "middleware config '{}' is invalid: {}",
-                        config.name,
+                        name,
                         safe_reason(&error.to_string())
                     )
                 })?;
@@ -761,12 +761,12 @@ impl MiddlewareRegistry {
     /// Check that every policy attachment still belongs to the current static
     /// registry without making a network call.
     pub fn ensure_policy_middlewares_registered(&self, policy: &SandboxPolicy) -> Result<()> {
-        for config in &policy.network_middlewares {
+        for (name, config) in &policy.network_middlewares {
             if !self.middleware_names.contains(&config.middleware) {
                 return Err(miette!(
                     "middleware '{}' used by config '{}' is not registered",
                     config.middleware,
-                    config.name
+                    name
                 ));
             }
         }
@@ -783,7 +783,7 @@ impl MiddlewareRegistry {
         };
         let selected: HashSet<&str> = policy
             .network_middlewares
-            .iter()
+            .values()
             .map(|config| config.middleware.as_str())
             .collect();
         self.registered_services
@@ -1277,7 +1277,8 @@ impl ChainRunner {
     }
 }
 
-/// Sort middleware using the policy-defined priority and a stable name tie-breaker.
+/// Sort middleware by policy-defined priority. Valid policies have unique order
+/// values; the name comparison only keeps direct internal callers deterministic.
 pub fn sort_chain_entries(entries: &mut [ChainEntry]) {
     entries.sort_by(|left, right| {
         left.order
@@ -1562,11 +1563,13 @@ mod tests {
             .await
             .expect("connect built-in service");
         let policy = SandboxPolicy {
-            network_middlewares: vec![NetworkMiddlewareConfig {
-                name: "redactor".into(),
-                middleware: BUILTIN_REGEX.into(),
-                ..Default::default()
-            }],
+            network_middlewares: HashMap::from([(
+                "redactor".into(),
+                NetworkMiddlewareConfig {
+                    middleware: BUILTIN_REGEX.into(),
+                    ..Default::default()
+                },
+            )]),
             ..Default::default()
         };
         registry
@@ -2741,14 +2744,17 @@ mod tests {
         .await
         .expect("connect the same external middleware binding under two names");
         let policy = SandboxPolicy {
-            network_middlewares: vec![NetworkMiddlewareConfig {
-                name: "guard".into(),
-                middleware: "local-guard-service".into(),
-                order: 0,
-                config: Some(prost_types::Struct::default()),
-                on_error: "fail_closed".into(),
-                endpoints: None,
-            }],
+            network_middlewares: HashMap::from([(
+                "guard".into(),
+                NetworkMiddlewareConfig {
+                    name: String::new(),
+                    middleware: "local-guard-service".into(),
+                    order: 0,
+                    config: Some(prost_types::Struct::default()),
+                    on_error: "fail_closed".into(),
+                    endpoints: None,
+                },
+            )]),
             ..Default::default()
         };
 

@@ -26,11 +26,13 @@ mod tests {
     #[tokio::test]
     async fn unregistered_external_middleware_is_rejected_before_admission() {
         let policy = SandboxPolicy {
-            network_middlewares: vec![NetworkMiddlewareConfig {
-                name: "guard".into(),
-                middleware: "example/content-guard".into(),
-                ..Default::default()
-            }],
+            network_middlewares: std::collections::HashMap::from([(
+                "guard".into(),
+                NetworkMiddlewareConfig {
+                    middleware: "example/content-guard".into(),
+                    ..Default::default()
+                },
+            )]),
             ..Default::default()
         };
 
@@ -50,20 +52,22 @@ mod tests {
         .await
         .expect("built-in registry");
         let policy = SandboxPolicy {
-            network_middlewares: vec![NetworkMiddlewareConfig {
-                name: "redactor".into(),
-                middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
-                config: Some(prost_types::Struct {
-                    fields: std::iter::once((
-                        "mode".into(),
-                        prost_types::Value {
-                            kind: Some(prost_types::value::Kind::StringValue("allow".into())),
-                        },
-                    ))
-                    .collect(),
-                }),
-                ..Default::default()
-            }],
+            network_middlewares: std::collections::HashMap::from([(
+                "redactor".into(),
+                NetworkMiddlewareConfig {
+                    middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+                    config: Some(prost_types::Struct {
+                        fields: std::iter::once((
+                            "mode".into(),
+                            prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue("allow".into())),
+                            },
+                        ))
+                        .collect(),
+                    }),
+                    ..Default::default()
+                },
+            )]),
             ..Default::default()
         };
 
