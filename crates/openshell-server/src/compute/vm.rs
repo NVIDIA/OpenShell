@@ -234,9 +234,9 @@ fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
                 push_unique_path(&mut dirs, prefix.join("libexec"));
                 push_unique_path(&mut dirs, prefix.join("libexec").join("openshell"));
             }
-            for dir in VmComputeConfig::default_driver_search_dirs(
-                std::env::var_os("HOME").map(PathBuf::from),
-            ) {
+            for dir in
+                VmComputeConfig::default_driver_search_dirs(openshell_core::paths::home_dir().ok())
+            {
                 push_unique_path(&mut dirs, dir);
             }
             dirs

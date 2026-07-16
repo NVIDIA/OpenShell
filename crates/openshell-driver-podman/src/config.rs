@@ -227,8 +227,8 @@ impl PodmanComputeConfig {
     pub fn default_socket_path() -> PathBuf {
         #[cfg(target_os = "macos")]
         {
-            let home = std::env::var("HOME").expect("HOME must be set on macOS");
-            PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
+            let home = home::home_dir().expect("home directory must be resolvable on macOS");
+            home.join(".local/share/containers/podman/machine/podman.sock")
         }
         #[cfg(target_os = "linux")]
         {

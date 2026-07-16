@@ -1454,10 +1454,8 @@ fn openshell_ssh_config_path() -> Result<PathBuf> {
 }
 
 fn user_ssh_config_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME")
-        .into_diagnostic()
-        .wrap_err("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".ssh").join("config"))
+    let home = openshell_core::paths::home_dir()?;
+    Ok(home.join(".ssh").join("config"))
 }
 
 fn render_include_line(path: &Path) -> String {
