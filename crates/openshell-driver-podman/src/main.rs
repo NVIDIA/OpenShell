@@ -114,12 +114,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let socket_path = args
-        .podman_socket
-        .unwrap_or_else(PodmanComputeConfig::default_socket_path);
-
     let driver = PodmanComputeDriver::new(PodmanComputeConfig {
-        socket_path,
+        socket_path: args.podman_socket,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),

@@ -163,16 +163,32 @@ impl PodmanComputeDriver {
         const MAX_PING_RETRIES: u32 = 5;
         const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
 
-        if !config.socket_path.exists() {
+        // Explicit configuration wins; otherwise probe for a responsive socket.
+        // Unlike Docker, Podman has no single well-known default path, so
+        // there is no further fallback if neither resolves.
+        let socket_path = config
+            .socket_path
+            .clone()
+            .or_else(openshell_core::config::detect_podman_socket)
+            .ok_or_else(|| {
+                PodmanApiError::InvalidInput(
+                    "no responsive Podman API socket found; set OPENSHELL_PODMAN_SOCKET \
+                     or configure socket_path"
+                        .to_string(),
+                )
+            })?;
+        config.socket_path = Some(socket_path.clone());
+
+        if !socket_path.exists() {
             if cfg!(target_os = "macos") {
                 warn!(
-                    path = %config.socket_path.display(),
+                    path = %socket_path.display(),
                     "Podman socket not found; is podman machine running? \
                      Try `podman machine start` or set OPENSHELL_PODMAN_SOCKET to override."
                 );
             } else {
                 warn!(
-                    path = %config.socket_path.display(),
+                    path = %socket_path.display(),
                     "Podman socket not found; is the Podman service running? \
                      Set OPENSHELL_PODMAN_SOCKET or XDG_RUNTIME_DIR to override."
                 );
@@ -186,7 +202,7 @@ impl PodmanComputeDriver {
         config.validate_runtime_limits()?;
         config.validate_host_gateway_ip()?;
 
-        let client = PodmanClient::new(config.socket_path.clone());
+        let client = PodmanClient::new(socket_path);
 
         // Verify connectivity, retrying briefly to tolerate transient socket
         // unavailability (e.g. podman.socket restarting after a package
@@ -774,7 +790,7 @@ impl PodmanComputeDriver {
         gpu_inventory: CdiGpuInventory,
         allow_all_default_gpu: bool,
     ) -> Self {
-        let client = PodmanClient::new(config.socket_path.clone());
+        let client = PodmanClient::new(config.socket_path.clone().unwrap_or_default());
         let refresh_inventory = gpu_inventory.clone();
         Self {
             client,
@@ -849,6 +865,59 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+
+    // ── socket resolution ───────────────────────────────────────────────
+
+    /// Restores env vars on drop, even if the test body panics.
+    struct EnvVarGuard(Vec<(&'static str, Option<String>)>);
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)] // std::env::set_var requires unsafe in Rust 2024
+        fn set(vars: &[(&'static str, &str)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(name, value)| {
+                    let previous = std::env::var(name).ok();
+                    unsafe { std::env::set_var(name, value) };
+                    (*name, previous)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)] // std::env::set_var/remove_var require unsafe in Rust 2024
+        fn drop(&mut self) {
+            for (name, previous) in &self.0 {
+                unsafe {
+                    match previous {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn new_returns_config_error_when_no_socket_is_configured_or_detected() {
+        let _guard = EnvVarGuard::set(&[
+            ("OPENSHELL_PODMAN_SOCKET", "/nonexistent/podman.sock"),
+            ("XDG_RUNTIME_DIR", "/nonexistent/xdg"),
+            ("HOME", "/nonexistent/home"),
+        ]);
+
+        let config = PodmanComputeConfig {
+            socket_path: None,
+            ..PodmanComputeConfig::default()
+        };
+        let err = PodmanComputeDriver::new(config)
+            .await
+            .expect_err("no socket is configured or reachable");
+
+        assert!(err.to_string().contains("no responsive Podman API socket"));
+    }
 
     fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
         prost_types::Struct {
@@ -1245,7 +1314,7 @@ mod tests {
 
     fn test_driver(socket_path: PathBuf) -> PodmanComputeDriver {
         let config = PodmanComputeConfig {
-            socket_path,
+            socket_path: Some(socket_path),
             stop_timeout_secs: 10,
             ..PodmanComputeConfig::default()
         };
@@ -1453,7 +1522,7 @@ mod tests {
             )],
         );
         let config = PodmanComputeConfig {
-            socket_path: socket_path.clone(),
+            socket_path: Some(socket_path.clone()),
             enable_bind_mounts: true,
             ..PodmanComputeConfig::default()
         };

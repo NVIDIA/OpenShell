@@ -179,7 +179,7 @@ mod tests {
 
     fn test_service(socket_path: PathBuf) -> ComputeDriverService {
         let config = PodmanComputeConfig {
-            socket_path,
+            socket_path: Some(socket_path),
             stop_timeout_secs: 10,
             ..PodmanComputeConfig::default()
         };

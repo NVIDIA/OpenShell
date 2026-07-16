@@ -3270,10 +3270,9 @@ async fn connect_local_container_engine() -> Option<Docker> {
         return Some(docker);
     }
 
-    let podman_socket = podman_socket_path();
-    if podman_socket.exists()
-        && let Ok(docker) =
-            Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
+    let podman_socket = openshell_core::config::detect_podman_socket()?;
+    if let Ok(docker) =
+        Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
         && docker.ping().await.is_ok()
     {
         info!(
@@ -3284,25 +3283,6 @@ async fn connect_local_container_engine() -> Option<Docker> {
     }
 
     None
-}
-
-/// Podman user socket path for the current platform.
-fn podman_socket_path() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var("XDG_RUNTIME_DIR").map_or_else(
-            |_| {
-                let uid = nix::unistd::getuid();
-                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
-            },
-            |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
-        )
-    }
 }
 
 fn is_openshell_local_build_image_ref(image_ref: &str) -> bool {

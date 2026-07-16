@@ -195,7 +195,7 @@ fn apply_vm_runtime_defaults(cfg: &mut VmComputeConfig, context: DriverStartupCo
 
 fn apply_podman_env_overrides(podman: &mut PodmanComputeConfig) {
     if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
-        podman.socket_path = PathBuf::from(p);
+        podman.socket_path = Some(PathBuf::from(p));
     }
     if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
         podman.host_gateway_ip = ip;

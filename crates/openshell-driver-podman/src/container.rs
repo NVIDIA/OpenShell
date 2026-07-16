@@ -1808,7 +1808,7 @@ mod tests {
 
     fn test_config() -> PodmanComputeConfig {
         PodmanComputeConfig {
-            socket_path: std::path::PathBuf::from("/tmp/test.sock"),
+            socket_path: Some(std::path::PathBuf::from("/tmp/test.sock")),
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
             host_gateway_ip: String::new(),
