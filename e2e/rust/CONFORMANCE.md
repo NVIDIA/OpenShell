@@ -27,8 +27,12 @@ The capabilities scenario remains deferred until the gateway exposes driver
 capabilities through its public API. It is not included as a known-failing CI
 scenario.
 
-The `e2e-api-conformance` profile invokes the scenario engine directly against
-every gateway driver.
+The test profiles separate the surface being validated:
+
+- `e2e-api-conformance` invokes the scenario engine directly against every
+  gateway driver.
+- `e2e-cli-conformance` validates portable CLI behavior against the canonical
+  Docker-backed gateway.
 
 Gateway provisioners export the endpoint and any mTLS paths through
 `OPENSHELL_GATEWAY_ENDPOINT` and the `OPENSHELL_CONFORMANCE_TLS_*` variables.

@@ -63,9 +63,9 @@ run = "uv run pytest python/"
 hide = true
 
 ["e2e:rust"]
-description = "Run Rust e2e and API conformance tests against a Docker-backed gateway"
+description = "Run Rust e2e, API conformance, and CLI conformance tests against a Docker-backed gateway"
 run = [
-  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker,e2e-api-conformance",
+  "e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker,e2e-api-conformance,e2e-cli-conformance",
 ]
 
 ["e2e:websocket-conformance"]
