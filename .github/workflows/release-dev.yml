@@ -292,7 +292,7 @@ jobs:
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ matrix.target }}
-        run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli --features bundled-z3
+        run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli
 
       - name: sccache stats
         if: always()

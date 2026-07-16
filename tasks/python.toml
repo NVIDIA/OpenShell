@@ -76,7 +76,7 @@ fi
 rm -rf "$WHEEL_OUTPUT_DIR"
 mkdir -p "$WHEEL_OUTPUT_DIR"
 
-uv run maturin build --release --features bundled-z3 --out "$WHEEL_OUTPUT_DIR"
+uv run maturin build --release --out "$WHEEL_OUTPUT_DIR"
 
 ls -la "$WHEEL_OUTPUT_DIR"/*.whl
 '''
