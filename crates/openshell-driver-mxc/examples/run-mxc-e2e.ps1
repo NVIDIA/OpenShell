@@ -60,11 +60,12 @@ $here = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 # --- Results bundle -----------------------------------------------------------
 # Collect every log + the exact rendered config per scenario into a timestamped
 # results\ folder, then zip it (mirrors the sibling run-*.ps1 scripts). Created up
-# front so the transcript captures the whole run, including pre-flight failures.
+# front so the transcript (started inside the guarded region below) captures the
+# whole run, including pre-flight failures.
 $stamp     = Get-Date -Format "yyyyMMdd-HHmmss"
 $resultDir = Join-Path $here "results-e2e-$stamp"
 New-Item -ItemType Directory -Force $resultDir | Out-Null
-Start-Transcript -Path (Join-Path $resultDir "transcript.txt") -Force | Out-Null
+$transcriptStarted = $false
 
 function Step([string]$m)  { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 function Info([string]$m)  { Write-Host "    $m" }
@@ -276,6 +277,12 @@ $backendProbe = @{ Live = $false; Reason = "not probed" }
 $runId = Get-Date -Format 'yyyyMMddHHmmss'
 
 try {
+    # Start the transcript inside the guarded region so a Start-Transcript failure
+    # is caught and the results bundle is still produced. Pre-flight runs
+    # immediately below, so the transcript still captures the whole run.
+    Start-Transcript -Path (Join-Path $resultDir "transcript.txt") -Force | Out-Null
+    $transcriptStarted = $true
+
     # --- Pre-flight -----------------------------------------------------------
 
     if (-not $Mock) {
@@ -283,6 +290,14 @@ try {
             throw "OPENSHELL_MXC_MOCK_WXC=1 is set but -Mock was not passed. " +
                   "Unset OPENSHELL_MXC_MOCK_WXC or pass -Mock."
         }
+    }
+
+    # -KeepRunning leaves the gateway up and breaks after the FIRST scenario (so the
+    # next one cannot collide on the port). A full-suite run would therefore execute
+    # only one scenario yet still report the suite as PASS. Require a single,
+    # explicitly-selected scenario so a partial run can never be mislabeled complete.
+    if ($KeepRunning -and -not $Scenario) {
+        throw "-KeepRunning requires -Scenario: it stops after the first scenario, so a full-suite run would report PASS on partial results. Re-run with e.g. -Scenario fs-rw-positive-negative -KeepRunning."
     }
 
     foreach ($f in @($gateway, $cli, $toml)) {
@@ -372,7 +387,10 @@ try {
     )
 
     if ($Scenario) {
-        $filtered = $allScenarios | Where-Object { $_.Name -eq $Scenario }
+        # Wrap in @() so an exact single match stays an array: without it a lone
+        # match is a bare hashtable, its .Count is unreliable on PS 5.1, and
+        # $allScenarios would no longer be an array for the loop below.
+        $filtered = @($allScenarios | Where-Object { $_.Name -eq $Scenario })
         if ($filtered.Count -eq 0) {
             throw "Scenario '$Scenario' not found. Available: $(($allScenarios | ForEach-Object { $_.Name }) -join ', ')"
         }
@@ -603,7 +621,7 @@ proving the agent ran), and the network-reject scenario was refused by policy.
     Set-Content -Path (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
     Write-Host $summary -ForegroundColor ($(if ($verdict -eq "PASS") { "Green" } else { "Red" }))
 
-    try { Stop-Transcript | Out-Null } catch {}
+    if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch {} }
 
     # Zip the bundle for easy return (defensive; never throw out of finally).
     try {
