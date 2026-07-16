@@ -2,15 +2,15 @@
 
 > This is an appendix to the [RFC](../README.md). Please familiarize yourself with the RFC before reading this.
 
-This appendix records why the first version of supervisor middleware uses an externally managed network service endpoint and what deployment modes remain open for later evaluation. Supporting multiple deployment modes is an explicit non-goal of the main RFC; this document preserves the analysis so the decision is not lost.
+This appendix records why the first version of supervisor middleware supports in-process built-ins plus externally managed network service endpoints, and what deployment modes remain open for later evaluation. Supporting every deployment mode is an explicit non-goal of the main RFC; this document preserves the analysis so the decision is not lost.
 
-## Decision: an externally managed service endpoint
+## Decision: built-ins and externally managed service endpoints
 
-The first version routes selected egress evaluations to a middleware service reachable by the supervisor, operated by the user. OpenShell holds only the connection details (endpoint, transport, and any auth material) and the operation-specific evaluation/result contract. It does not package, deploy, or manage the lifecycle of the middleware.
+The first version runs first-party built-ins inside the supervisor and routes selected external evaluations to operator-run services reachable by the gateway and supervisors. Built-ins need no registration or network transport. For external services, OpenShell holds only the connection details, body limit, transport settings, and operation-specific evaluation/result contract. It does not package, deploy, or manage the service lifecycle.
 
 Rationale:
 
-- **Minimal new infrastructure.** OpenShell does not have to build image packaging, process supervision, or a runtime for the middleware. The first iteration can focus on the contract, failure behavior, and the supervisor integration.
+- **Minimal new infrastructure.** Built-ins reuse the supervisor process. External middleware does not require OpenShell to build image packaging, process supervision, or a new runtime. The first iteration can focus on the contract, failure behavior, and supervisor integration.
 - **Portable across compute drivers.** A network endpoint is reachable from supervisors regardless of whether the sandbox workload runs as a container, a VM, or a local process. Other endpoint shapes do not have a universal way to be shared with every relevant supervisor environment yet, so a network endpoint is the portable choice that works the same way everywhere.
 - **Independent iteration.** The middleware is an integration point with another team. An external service lets them deploy, scale, and update it on their own cadence, without coupling releases to OpenShell.
 - **Heavy compute friendly.** Detection work may need GPUs or significant memory. An external service can live wherever those resources are, and can be scaled separately from the sandbox fleet.

@@ -38,20 +38,20 @@ A service would advertise chunked-transport support (and limits) in `Describe`. 
 
 The streaming method should have its own messages instead of reusing `HttpRequestEvaluation` directly. Within a single streamed request, the first message would carry the request context plus the first body bytes, and subsequent messages would carry only further body chunks that the middleware appends; stream close would mark end of request. This keeps the v1 unary messages flat and gives streaming its own cleaner shape.
 
-A cleaner phased design -- a `oneof` over `context` and `body_chunk`, in the style of Envoy `ext_proc` - is available for a future streaming operation because it would not need to preserve the unary v1 message shape. V1 keeps the flat unary request because it is simpler for bounded bodies and avoids making every middleware implement streaming mechanics before the need is proven.
+A cleaner phased design using a `oneof` over `context` and `body_chunk`, in the style of Envoy `ext_proc`, is available for a future streaming operation because it would not need to preserve the unary v1 message shape. V1 keeps the flat unary request because it is simpler for bounded bodies and avoids making every middleware implement streaming mechanics before the need is proven.
 
 ## Additional operation phases
 
-v1 defines a single operation, `method=HttpRequest, phase=pre_credentials`, which runs after network/L7 policy admits a request and before credential injection. The same service interface can host more operations, each advertised through the `Describe` manifest and invoked through an operation-specific method such as `EvaluateHttpRequest`. Each method/phase pair encodes a different position in the proxy flow:
+V1 defines a single typed operation, `HTTP_REQUEST/PRE_CREDENTIALS`, which runs after network and L7 policy admit a request and before credential injection. The same service interface can host more operations, each advertised through the `Describe` manifest and invoked through an operation-specific method such as `EvaluateHttpRequest`. Each operation and phase pair encodes a different position in the proxy flow:
 
 - `Connection/before_policy` / `HttpRequest/before_policy` - *before* network/L7 policy admits the request, for earlier classification. Riskier, because request content reaches a service before policy has allowed the request.
-- `HttpRequest/pre_credentials` (v1) - after policy admits the request, before credential injection.
+- `HTTP_REQUEST/PRE_CREDENTIALS` (v1) - after policy admits the request, before credential injection.
 - `HttpRequest/post_credentials` - after credential injection, immediately before the relay writes the request upstream. This hook is credential-visible, so it is built-in-only: OpenShell marks it as a restricted hook and rejects any externally registered middleware that advertises it during manifest validation. The motivating use is request signing that must run after credentials are injected - for example a built-in `openshell/sigv4` that strips placeholder-signed AWS headers and signs the finalized request with supervisor-resolved credentials just before it is sent upstream.
 - `HttpResponse/completed` - after an upstream request completes, emit metadata such as status, content length, selected route, selected model, and model usage if available. This is notification-only: no body, no transformation, and no allow/deny verdict. It would let reservation-style budget middleware reconcile a pre-dispatch decision without introducing response-body inspection.
 - `HttpResponse/before_return` - on the return path, after the upstream responds and before the response reaches the sandbox; inspect or redact upstream responses.
 - `WebSocketMessage/before_forward` / `WebSocketMessage/before_return` - after a WebSocket or streaming protocol upgrade, on each forwarded or returned message, well past the one-shot request path.
 
-Pre-policy phases run earliest, the two request phases (`pre_credentials` and `post_credentials`) bracket credential injection, response notifications and response phases run after the upstream call, and message phases run later - some on a different path entirely. Of these, only `HttpRequest/pre_credentials` is part of v1. `HttpRequest/post_credentials` is the nearest planned request-path follow-up and is kept built-in-only because it sees injected credentials; `HttpResponse/completed` is a separate future notification hook for metadata-only post-call reconciliation.
+Pre-policy phases run earliest, the two request phases bracket credential injection, response notifications and response phases run after the upstream call, and message phases run later, sometimes on a different path entirely. Of these, only `HTTP_REQUEST/PRE_CREDENTIALS` is part of v1. `HttpRequest/post_credentials` is the nearest planned request-path follow-up and is kept built-in-only because it sees injected credentials; `HttpResponse/completed` is a separate future notification hook for metadata-only post-call reconciliation.
 
 ## Semantic context
 
@@ -63,22 +63,24 @@ ICAP-style previewing: send only the first N bytes so the service can decide whe
 
 ## Portable feature contracts and binding
 
-A future version can introduce named feature contracts (a portable contract a policy targets, for example `pii-redaction`) with a binding from that contract to a concrete registered service. Policy would then stay portable across interchangeable implementations. v1 references middleware by name directly and defers this indirection.
+A future version can introduce named feature contracts, such as `pii-redaction`, with a mapping from that portable contract to a concrete service binding. Policy would then stay portable across interchangeable implementations. V1 references a service-owned binding ID directly and defers this additional indirection.
 
 ## Header mutation rules
 
-v1 lets a middleware append a constrained set of request headers, subject to an OpenShell safe-header allow-list. Credential-bearing headers, OpenShell placeholder headers, `Host`, and AWS SigV4 headers are not in scope for external middleware mutation. Future work can expand this only for restricted built-in hooks whose host capabilities make the credential boundary explicit.
+V1 preserves duplicate request headers and their wire order. Before an external invocation, OpenShell omits credential-bearing, routing, framing, hop-by-hop, and `Connection`-nominated headers. Results return ordered `write` and `remove` mutations. Writes support append, overwrite, and skip modes but may target only `x-openshell-middleware-*`. Removes may target other visible headers except the protected categories. OpenShell validates and applies a stage's mutations atomically, so one invalid mutation discards the whole set and follows that config's `on_error` behavior.
 
 ## Middleware authentication
 
-Supervisor middleware exposes gRPC services over network endpoints and authenticates with mTLS, bearer invocation tokens, or an explicit insecure mode for local research preview use. The stable middleware contract should make endpoint declaration, identity binding, credential material, and rotation explicit rather than leaving them as deployment-specific conventions.
+Supervisor middleware exposes gRPC services over network endpoints. The stable transport contract requires confidentiality and authentication of the intended middleware service. Endpoint declaration, identity binding, credential material, and rotation must be explicit rather than left as deployment-specific conventions.
 
-The initial implementation may support unauthenticated plaintext gRPC only when the operator explicitly enables an insecure mode on the middleware entry (for example `allow_insecure = true`). A plaintext `http://` endpoint without this opt-in is rejected, so insecure operation is always a deliberate, auditable choice rather than an implicit consequence of the URL scheme.
+Phase 1 may temporarily support unauthenticated plaintext gRPC only when the operator explicitly sets `allow_insecure = true` on the middleware entry. A plaintext `http://` endpoint without this opt-in is rejected. OpenShell emits a prominent warning and records auditable configuration state whenever the exception is enabled, so insecure operation is always deliberate and visible.
 
 This mode is suitable only for trusted local development, loopback services, or isolated research environments where the middleware endpoint is not reachable by untrusted clients. It is not suitable for shared clusters, multi-tenant deployments, public networks, or any environment where inspected request content needs transport confidentiality.
 
 Without middleware authentication and transport security, network observers can read inspected request content, active attackers can impersonate the middleware service, and unauthorized clients can call the middleware directly if it is reachable. Because the middleware can allow, deny, or transform egress, service impersonation is a policy-enforcement bypass, not just an observability risk.
 
-The v1 protocol shape should not bake unauthenticated plaintext into the stable contract. The auth design should define TLS trust configuration, optional mTLS, gateway-signed invocation tokens or equivalent bearer metadata, certificate or key rotation, middleware identity binding, and how the supervisor receives auth material from gateway configuration.
+Phase 2 removes plaintext endpoint support and removes `allow_insecure`. Every external middleware connection must then provide authenticated encrypted transport. This is an intentional research-preview breaking change, so phase 1 plaintext configurations have no long-term compatibility guarantee and must migrate before phase 2.
 
-Even in the insecure research-preview mode, the hook should stay before provider credential injection, and OpenShell should not forward original `Authorization`, `Cookie`, or credential-bearing headers to middleware by default. That preserves the intended separation between content inspection and upstream credential injection while production middleware auth is deferred.
+The exact phase 2 mechanism is deferred. Follow-up protocol work should choose and specify mTLS, TLS plus explicit caller authentication, or an equivalent design, including trust roots, client identity, credential delivery, certificate or key rotation, middleware identity binding, and how supervisors receive authentication material.
+
+Even during the phase 1 plaintext exception, the hook stays before provider credential injection, and OpenShell does not forward original `Authorization`, `Cookie`, or other protected headers to middleware. This preserves the separation between content inspection and upstream credential injection while authenticated transport is completed.
