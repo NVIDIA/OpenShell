@@ -96,7 +96,7 @@ jobs:
             cli)
               binary_component=cli
               binary_name=openshell
-              features="bundled-z3"
+              features=""
               has_image=false
               ;;
             *)
