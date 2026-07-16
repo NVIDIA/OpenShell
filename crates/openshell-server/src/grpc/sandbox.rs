@@ -1284,6 +1284,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
+    let request_tty = req.tty;
     let timeout_seconds = req.timeout_seconds;
     let cols = if req.cols == 0 { 80 } else { req.cols };
     let rows = if req.rows == 0 { 24 } else { req.rows };
@@ -1311,6 +1312,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
             relay_stream,
             &command_str,
             input_stream,
+            request_tty,
             timeout_seconds,
             cols,
             rows,
@@ -1631,6 +1633,7 @@ async fn stream_interactive_exec_over_relay(
     relay_stream: tokio::io::DuplexStream,
     command: &str,
     input_stream: tonic::Streaming<ExecSandboxInput>,
+    request_tty: bool,
     timeout_seconds: u32,
     cols: u32,
     rows: u32,
@@ -1656,6 +1659,7 @@ async fn stream_interactive_exec_over_relay(
         local_proxy_port,
         command,
         input_stream,
+        request_tty,
         cols,
         rows,
         tx.clone(),
@@ -1707,6 +1711,7 @@ async fn run_interactive_exec_with_russh(
     local_proxy_port: u16,
     command: &str,
     mut input_stream: tonic::Streaming<ExecSandboxInput>,
+    request_tty: bool,
     cols: u32,
     rows: u32,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
@@ -1752,10 +1757,12 @@ async fn run_interactive_exec_with_russh(
         .await
         .map_err(|e| Status::internal(format!("failed to open ssh channel: {e}")))?;
 
-    channel
-        .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
-        .await
-        .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
+    if request_tty {
+        channel
+            .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
+            .await
+            .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
+    }
 
     channel
         .exec(true, command.as_bytes())
@@ -1773,9 +1780,11 @@ async fn run_interactive_exec_with_russh(
                     }
                 }
                 Some(Payload::Resize(resize)) => {
-                    let _ = write_half
-                        .window_change(resize.cols, resize.rows, 0, 0)
-                        .await;
+                    if request_tty {
+                        let _ = write_half
+                            .window_change(resize.cols, resize.rows, 0, 0)
+                            .await;
+                    }
                 }
                 Some(Payload::Start(_)) | None => {}
             }

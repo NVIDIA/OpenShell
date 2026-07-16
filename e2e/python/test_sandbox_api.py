@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
+
+from openshell._proto import openshell_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -58,6 +61,55 @@ def test_sandbox_api_crud_and_exec(
         )
         assert verify_file.exit_code == 0
         assert verify_file.stdout.strip() == "ok"
+
+
+def test_sandbox_interactive_exec_honors_tty(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    def exec_interactive(sandbox_id: str, *, tty: bool) -> bytes:
+        request = openshell_pb2.ExecSandboxInput(
+            start=openshell_pb2.ExecSandboxRequest(
+                sandbox_id=sandbox_id,
+                command=[
+                    "/bin/sh",
+                    "-c",
+                    "[ -t 0 ] && printf T || printf N; "
+                    "[ -t 1 ] && printf T || printf N; "
+                    "[ -t 2 ] && printf T || printf N; printf '\\n'",
+                ],
+                tty=tty,
+                timeout_seconds=20,
+            )
+        )
+
+        done = threading.Event()
+
+        def requests():
+            yield request
+            done.wait(timeout=30)
+
+        output: list[bytes] = []
+        exit_code: int | None = None
+        try:
+            events = sandbox_client._stub.ExecSandboxInteractive(requests(), timeout=30)
+            for event in events:
+                payload = event.WhichOneof("payload")
+                if payload == "stdout":
+                    output.append(bytes(event.stdout.data))
+                elif payload == "stderr":
+                    output.append(bytes(event.stderr.data))
+                elif payload == "exit":
+                    exit_code = int(event.exit.exit_code)
+        finally:
+            done.set()
+
+        assert exit_code == 0
+        return b"".join(output)
+
+    with sandbox(delete_on_exit=True) as sb:
+        assert b"NNN" in exec_interactive(sb.id, tty=False)
+        assert b"TTT" in exec_interactive(sb.id, tty=True)
 
 
 def test_sandbox_labels_and_selectors(sandbox_client: SandboxClient) -> None:
