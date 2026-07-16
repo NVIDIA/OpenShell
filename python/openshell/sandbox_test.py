@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import pytest
 
+from openshell import sandbox as sandbox_mod
 from openshell._proto import openshell_pb2
 from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
@@ -28,10 +29,12 @@ from openshell.sandbox import (
     SandboxStatusRef,
     TlsConfig,
     _BearerAuthInterceptor,
+    _env_flag,
     _load_cluster_bearer_token,
     _make_cluster_bearer_provider,
     _normalize_bearer,
     _OidcRefresher,
+    _parse_env_endpoint,
     _read_oidc_token_bundle,
     _sandbox_ref,
 )
@@ -1860,3 +1863,271 @@ def test_sandbox_session_delete_passes_workspace() -> None:
 
     assert stub.delete_request is not None
     assert stub.delete_request.workspace == "staging"
+
+
+# ---------------------------------------------------------------------------
+# from_env(): environment-variable-driven configuration. Complements the
+# on-disk `from_active_cluster` discovery for CI/container/serverless callers.
+# ---------------------------------------------------------------------------
+
+
+_FROM_ENV_VARS = (
+    "OPENSHELL_ENDPOINT",
+    "OPENSHELL_TOKEN",
+    "OPENSHELL_TLS",
+    "OPENSHELL_TLS_CA",
+    "OPENSHELL_TLS_CERT",
+    "OPENSHELL_TLS_KEY",
+    "OPENSHELL_TIMEOUT",
+    "OPENSHELL_CLUSTER_NAME",
+)
+
+
+def _clear_from_env(monkeypatch: Any) -> None:
+    """Start each from_env test from a clean OPENSHELL_* slate so ambient
+    values in the developer's shell can't leak into assertions."""
+    for name in _FROM_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
+def _spy_transport(monkeypatch: Any) -> dict[str, int]:
+    """Count secure vs plaintext channel construction without stubbing gRPC.
+
+    Wraps (not replaces) the real constructors so the returned channel is a
+    genuine grpc channel — `SandboxClient` builds a real stub and the bearer
+    interceptor wraps a real channel — while still recording which transport
+    path `from_env` selected."""
+    counts = {"secure": 0, "insecure": 0}
+    real_ssl = sandbox_mod.grpc.ssl_channel_credentials
+    real_insecure = sandbox_mod.grpc.insecure_channel
+
+    def spy_ssl(*args: Any, **kwargs: Any) -> Any:
+        counts["secure"] += 1
+        return real_ssl(*args, **kwargs)
+
+    def spy_insecure(*args: Any, **kwargs: Any) -> Any:
+        counts["insecure"] += 1
+        return real_insecure(*args, **kwargs)
+
+    monkeypatch.setattr(sandbox_mod.grpc, "ssl_channel_credentials", spy_ssl)
+    monkeypatch.setattr(sandbox_mod.grpc, "insecure_channel", spy_insecure)
+    return counts
+
+
+def test_parse_env_endpoint_passes_through_host_port() -> None:
+    assert _parse_env_endpoint("127.0.0.1:8080") == ("127.0.0.1:8080", False)
+
+
+def test_parse_env_endpoint_https_url_defaults_port_443() -> None:
+    assert _parse_env_endpoint("https://gateway.example") == (
+        "gateway.example:443",
+        True,
+    )
+
+
+def test_parse_env_endpoint_http_url_defaults_port_80() -> None:
+    assert _parse_env_endpoint("http://gateway.example") == (
+        "gateway.example:80",
+        False,
+    )
+
+
+def test_parse_env_endpoint_url_keeps_explicit_port() -> None:
+    assert _parse_env_endpoint("https://gateway.example:8443") == (
+        "gateway.example:8443",
+        True,
+    )
+
+
+def test_env_flag_parses_truthy_and_falsy(monkeypatch: Any) -> None:
+    for value in ("1", "true", "YES", "On"):
+        monkeypatch.setenv("OPENSHELL_TLS", value)
+        assert _env_flag("OPENSHELL_TLS") is True
+    for value in ("0", "false", "No", "OFF"):
+        monkeypatch.setenv("OPENSHELL_TLS", value)
+        assert _env_flag("OPENSHELL_TLS") is False
+
+
+def test_env_flag_returns_none_when_unset(monkeypatch: Any) -> None:
+    monkeypatch.delenv("OPENSHELL_TLS", raising=False)
+    assert _env_flag("OPENSHELL_TLS") is None
+
+
+def test_env_flag_rejects_garbage(monkeypatch: Any) -> None:
+    monkeypatch.setenv("OPENSHELL_TLS", "maybe")
+    with pytest.raises(SandboxError, match="must be a boolean"):
+        _env_flag("OPENSHELL_TLS")
+
+
+def test_from_env_requires_endpoint(monkeypatch: Any) -> None:
+    _clear_from_env(monkeypatch)
+    with pytest.raises(SandboxError, match="OPENSHELL_ENDPOINT is not set"):
+        SandboxClient.from_env()
+
+
+def test_from_env_plaintext_host_port(monkeypatch: Any) -> None:
+    _clear_from_env(monkeypatch)
+    counts = _spy_transport(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "127.0.0.1:8080")
+
+    client = SandboxClient.from_env()
+    try:
+        assert client._endpoint == "127.0.0.1:8080"
+        assert client._timeout == 30.0
+        assert counts == {"secure": 0, "insecure": 1}
+        # No token -> no bearer interceptor wrapping the channel.
+        assert not _channel_is_intercepted(client._channel)
+    finally:
+        client.close()
+
+
+def test_from_env_https_scheme_selects_tls(monkeypatch: Any) -> None:
+    _clear_from_env(monkeypatch)
+    counts = _spy_transport(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "https://gateway.example:8443")
+
+    client = SandboxClient.from_env()
+    try:
+        assert client._endpoint == "gateway.example:8443"
+        assert counts == {"secure": 1, "insecure": 0}
+    finally:
+        client.close()
+
+
+def test_from_env_tls_flag_forces_system_roots(monkeypatch: Any) -> None:
+    """A bare host:port with OPENSHELL_TLS=1 must build a system-roots TLS
+    channel (no cert material), mirroring from_active_cluster's fallback for
+    OIDC gateways behind a public CA."""
+    _clear_from_env(monkeypatch)
+    counts = _spy_transport(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "gateway.example:443")
+    monkeypatch.setenv("OPENSHELL_TLS", "true")
+
+    client = SandboxClient.from_env()
+    try:
+        assert counts == {"secure": 1, "insecure": 0}
+    finally:
+        client.close()
+
+
+def test_from_env_tls_flag_false_overrides_https_scheme(monkeypatch: Any) -> None:
+    """An explicit OPENSHELL_TLS=0 wins over an https scheme, matching the
+    documented precedence (explicit flag overrides scheme inference)."""
+    _clear_from_env(monkeypatch)
+    counts = _spy_transport(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "https://gateway.example:8443")
+    monkeypatch.setenv("OPENSHELL_TLS", "0")
+
+    client = SandboxClient.from_env()
+    try:
+        assert counts == {"secure": 0, "insecure": 1}
+    finally:
+        client.close()
+
+
+def test_from_env_cert_material_implies_tls(monkeypatch: Any, tmp_path: Path) -> None:
+    ca = tmp_path / "ca.crt"
+    cert = tmp_path / "tls.crt"
+    key = tmp_path / "tls.key"
+    ca.write_text("ca")
+    cert.write_text("cert")
+    key.write_text("key")
+
+    _clear_from_env(monkeypatch)
+    counts = _spy_transport(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "gateway.example:8443")
+    monkeypatch.setenv("OPENSHELL_TLS_CA", str(ca))
+    monkeypatch.setenv("OPENSHELL_TLS_CERT", str(cert))
+    monkeypatch.setenv("OPENSHELL_TLS_KEY", str(key))
+
+    client = SandboxClient.from_env()
+    try:
+        assert counts == {"secure": 1, "insecure": 0}
+    finally:
+        client.close()
+
+
+def test_from_env_partial_mtls_material_rejected(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    """A cert without its key is a misconfiguration; TlsConfig surfaces it."""
+    cert = tmp_path / "tls.crt"
+    cert.write_text("cert")
+
+    _clear_from_env(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "gateway.example:8443")
+    monkeypatch.setenv("OPENSHELL_TLS_CERT", str(cert))
+
+    with pytest.raises(ValueError, match="cert_path and key_path"):
+        SandboxClient.from_env()
+
+
+def test_from_env_attaches_bearer_token(monkeypatch: Any) -> None:
+    _clear_from_env(monkeypatch)
+    _spy_transport(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "127.0.0.1:8080")
+    monkeypatch.setenv("OPENSHELL_TOKEN", "jwt-from-env")
+
+    client = SandboxClient.from_env()
+    try:
+        # A bearer token wraps the channel in an intercepting channel.
+        assert _channel_is_intercepted(client._channel)
+    finally:
+        client.close()
+
+
+def test_from_env_timeout_override(monkeypatch: Any) -> None:
+    _clear_from_env(monkeypatch)
+    _spy_transport(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "127.0.0.1:8080")
+    monkeypatch.setenv("OPENSHELL_TIMEOUT", "12.5")
+
+    client = SandboxClient.from_env(timeout=99.0)
+    try:
+        # The env var wins over the constructor default.
+        assert client._timeout == 12.5
+    finally:
+        client.close()
+
+
+def test_from_env_timeout_falls_back_to_argument(monkeypatch: Any) -> None:
+    _clear_from_env(monkeypatch)
+    _spy_transport(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "127.0.0.1:8080")
+
+    client = SandboxClient.from_env(timeout=7.0)
+    try:
+        assert client._timeout == 7.0
+    finally:
+        client.close()
+
+
+def test_from_env_rejects_non_numeric_timeout(monkeypatch: Any) -> None:
+    _clear_from_env(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "127.0.0.1:8080")
+    monkeypatch.setenv("OPENSHELL_TIMEOUT", "soon")
+
+    with pytest.raises(SandboxError, match="OPENSHELL_TIMEOUT must be a number"):
+        SandboxClient.from_env()
+
+
+def test_from_env_sets_cluster_name(monkeypatch: Any) -> None:
+    _clear_from_env(monkeypatch)
+    _spy_transport(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "127.0.0.1:8080")
+    monkeypatch.setenv("OPENSHELL_CLUSTER_NAME", "ci-gateway")
+
+    client = SandboxClient.from_env()
+    try:
+        assert client._cluster_name == "ci-gateway"
+    finally:
+        client.close()
+
+
+def test_from_env_rejects_invalid_tls_flag(monkeypatch: Any) -> None:
+    _clear_from_env(monkeypatch)
+    monkeypatch.setenv("OPENSHELL_ENDPOINT", "127.0.0.1:8080")
+    monkeypatch.setenv("OPENSHELL_TLS", "sometimes")
+
+    with pytest.raises(SandboxError, match="must be a boolean"):
+        SandboxClient.from_env()

@@ -242,6 +242,44 @@ with SandboxClient.from_active_cluster() as client:
     assert sandbox.id in {s.id for s in matches}
 ```
 
+## Configure the Python Client from the Environment
+
+`SandboxClient.from_active_cluster()` reads the CLI's on-disk gateway
+directory (selected by `$OPENSHELL_GATEWAY` or the active gateway). When that
+directory is not available — CI runners, containers, serverless functions —
+use `SandboxClient.from_env()` to build a client entirely from environment
+variables:
+
+```python
+from openshell import SandboxClient
+
+# OPENSHELL_ENDPOINT=https://gateway.example:8443
+# OPENSHELL_TOKEN=<oidc-access-token>
+with SandboxClient.from_env() as client:
+    client.health()
+```
+
+`from_env()` reads the following variables, all following the `OPENSHELL_`
+convention:
+
+| Variable                 | Purpose                                                                                                                  |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `OPENSHELL_ENDPOINT`     | Gateway gRPC endpoint. Required. Either a bare `host:port` or a URL (`https://host`, `http://host:port`); an `https` scheme selects a TLS channel and defaults the port to 443. |
+| `OPENSHELL_TOKEN`        | OIDC access token attached as `Bearer` to every RPC.                                                                     |
+| `OPENSHELL_TLS`          | Force TLS on/off (`1/0/true/false/yes/no/on/off`). Overrides scheme inference; use it to enable system-root TLS for a bare `host:port` endpoint with no certificate material. |
+| `OPENSHELL_TLS_CA`       | Path to a CA certificate (custom trust root).                                                                            |
+| `OPENSHELL_TLS_CERT`     | Path to a client certificate for mTLS. Requires `OPENSHELL_TLS_KEY`.                                                      |
+| `OPENSHELL_TLS_KEY`      | Path to a client private key for mTLS. Requires `OPENSHELL_TLS_CERT`.                                                     |
+| `OPENSHELL_TIMEOUT`      | Per-call gRPC timeout in seconds. Overrides the `timeout` argument when set.                                             |
+| `OPENSHELL_CLUSTER_NAME` | Friendly name used in error messages.                                                                                    |
+
+The TLS trust profile matches `from_active_cluster`: supply CA + cert + key
+for full mTLS, CA alone for custom-CA trust, or neither (with an `https`
+endpoint or `OPENSHELL_TLS=1`) for the OS trust store. Unlike
+`from_active_cluster`, the bearer token is read once from `OPENSHELL_TOKEN`
+and never refreshed — use `from_active_cluster` with a gateway directory when
+you need lazy OIDC token refresh.
+
 ## Expose Long Running Services
 
 Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.

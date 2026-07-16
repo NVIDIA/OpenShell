@@ -404,6 +404,109 @@ class SandboxClient:
             _bearer_close=bearer_close,
         )
 
+    @classmethod
+    def from_env(cls, *, timeout: float = 30.0) -> SandboxClient:
+        """Construct a `SandboxClient` entirely from environment variables.
+
+        A disk-free alternative to `from_active_cluster` for environments
+        that inject configuration through the process environment rather
+        than the CLI's on-disk gateway directory — CI runners, containers,
+        and serverless functions. It complements the existing
+        `$OPENSHELL_GATEWAY` + XDG gateway-directory discovery: reach for
+        `from_active_cluster` when the CLI has already logged in and
+        written a gateway directory, and for `from_env` when the only
+        configuration available is a set of environment variables.
+
+        All variables follow the `OPENSHELL_*` convention:
+
+        | Variable                 | Purpose                                       |
+        | ------------------------ | --------------------------------------------- |
+        | `OPENSHELL_ENDPOINT`     | Gateway gRPC endpoint. Required. Either a     |
+        |                          | bare `host:port` or a URL (`https://host` /   |
+        |                          | `http://host:port`); an `https` scheme        |
+        |                          | selects a TLS channel and defaults the port   |
+        |                          | to 443.                                       |
+        | `OPENSHELL_TOKEN`        | OIDC access token attached as `Bearer` to     |
+        |                          | every RPC.                                    |
+        | `OPENSHELL_TLS`          | Force TLS on/off (`1/0/true/false/yes/no`).   |
+        |                          | Overrides scheme inference; use it to enable  |
+        |                          | system-root TLS for a bare `host:port`        |
+        |                          | endpoint with no certificate material.        |
+        | `OPENSHELL_TLS_CA`       | Path to a CA certificate (custom trust root). |
+        | `OPENSHELL_TLS_CERT`     | Path to a client certificate (mTLS; requires  |
+        |                          | `OPENSHELL_TLS_KEY`).                          |
+        | `OPENSHELL_TLS_KEY`      | Path to a client private key (mTLS; requires  |
+        |                          | `OPENSHELL_TLS_CERT`).                         |
+        | `OPENSHELL_TIMEOUT`      | Per-call gRPC timeout in seconds. Overrides   |
+        |                          | the `timeout` argument when set.              |
+        | `OPENSHELL_CLUSTER_NAME` | Friendly name used in error messages.         |
+
+        The TLS trust profile mirrors `from_active_cluster`: supply CA +
+        cert + key for full mTLS, CA alone for custom-CA trust, or neither
+        (with an `https` endpoint or `OPENSHELL_TLS=1`) for the OS trust
+        store. Unlike `from_active_cluster`, the bearer token is read once
+        from `OPENSHELL_TOKEN` and never refreshed — supply a gateway
+        directory and use `from_active_cluster` when you need lazy OIDC
+        refresh.
+
+        Args:
+            timeout: default per-call gRPC timeout in seconds, used when
+                `OPENSHELL_TIMEOUT` is not set.
+
+        Raises:
+            SandboxError: when `OPENSHELL_ENDPOINT` is unset, or a numeric
+                or boolean variable is malformed.
+            ValueError: when the mTLS material is partially specified
+                (`OPENSHELL_TLS_CERT` without `OPENSHELL_TLS_KEY`, or vice
+                versa), surfaced by `TlsConfig`.
+        """
+        raw_endpoint = os.environ.get("OPENSHELL_ENDPOINT")
+        if not raw_endpoint:
+            raise SandboxError(
+                "OPENSHELL_ENDPOINT is not set; export it (host:port or a "
+                "URL) or use SandboxClient.from_active_cluster()"
+            )
+        endpoint, scheme_is_https = _parse_env_endpoint(raw_endpoint)
+
+        ca = os.environ.get("OPENSHELL_TLS_CA")
+        cert = os.environ.get("OPENSHELL_TLS_CERT")
+        key = os.environ.get("OPENSHELL_TLS_KEY")
+        tls_material = any((ca, cert, key))
+        tls_override = _env_flag("OPENSHELL_TLS")
+        use_tls = (
+            tls_override
+            if tls_override is not None
+            else (scheme_is_https or tls_material)
+        )
+
+        tls: TlsConfig | None = None
+        if use_tls:
+            # TlsConfig validates that cert/key are set together and treats
+            # all-None as the system-roots profile.
+            tls = TlsConfig(
+                ca_path=pathlib.Path(ca) if ca else None,
+                cert_path=pathlib.Path(cert) if cert else None,
+                key_path=pathlib.Path(key) if key else None,
+            )
+
+        resolved_timeout = timeout
+        raw_timeout = os.environ.get("OPENSHELL_TIMEOUT")
+        if raw_timeout is not None:
+            try:
+                resolved_timeout = float(raw_timeout)
+            except ValueError:
+                raise SandboxError(
+                    f"OPENSHELL_TIMEOUT must be a number, got {raw_timeout!r}"
+                ) from None
+
+        return cls(
+            endpoint,
+            tls=tls,
+            bearer_token=os.environ.get("OPENSHELL_TOKEN") or None,
+            timeout=resolved_timeout,
+            cluster_name=os.environ.get("OPENSHELL_CLUSTER_NAME") or None,
+        )
+
     def close(self) -> None:
         """Release the gRPC channel and any bearer-auth resources.
 
@@ -1058,6 +1161,55 @@ def _xdg_config_home() -> pathlib.Path:
     if configured:
         return pathlib.Path(configured)
     return pathlib.Path.home() / ".config"
+
+
+# Truthy/falsy spellings accepted for boolean OPENSHELL_* variables, matching
+# the env parsing used elsewhere in the toolchain (Rust CLI `--insecure`
+# plumbing and friends).
+_ENV_TRUE = frozenset({"1", "true", "yes", "on"})
+_ENV_FALSE = frozenset({"0", "false", "no", "off"})
+
+
+def _env_flag(name: str) -> bool | None:
+    """Parse a boolean-ish environment variable used by `from_env`.
+
+    Returns `None` when the variable is unset so callers can distinguish
+    "unset" (fall back to inference) from an explicit `true`/`false`.
+    Accepts `1/true/yes/on` and `0/false/no/off` (case-insensitive) and
+    raises `SandboxError` on anything else.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in _ENV_TRUE:
+        return True
+    if value in _ENV_FALSE:
+        return False
+    raise SandboxError(
+        f"environment variable {name} must be a boolean "
+        f"(1/0/true/false/yes/no/on/off), got {raw!r}"
+    )
+
+
+def _parse_env_endpoint(raw: str) -> tuple[str, bool]:
+    """Normalize `OPENSHELL_ENDPOINT` to `host:port` and report TLS intent.
+
+    Accepts either a bare `host:port` or a URL. A URL's scheme selects the
+    transport: `https` implies TLS (default port 443); any other scheme
+    (`http`, `grpc`, ...) implies plaintext (default port 80). This mirrors
+    `from_active_cluster`'s parsing of the gateway metadata
+    `gateway_endpoint`. A bare `host:port` is returned unchanged with no TLS
+    intent, leaving the TLS decision to `OPENSHELL_TLS` / cert material.
+    Returns `(endpoint, scheme_is_https)`.
+    """
+    if "://" not in raw:
+        return raw, False
+    parsed = urlparse(raw)
+    scheme_is_https = parsed.scheme == "https"
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if scheme_is_https else 80)
+    return f"{host}:{port}", scheme_is_https
 
 
 # Re-check the cached token roughly 30 seconds before the issuer's
