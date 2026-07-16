@@ -5116,12 +5116,27 @@ mod tests {
             "github provider policy should include read-only GraphQL endpoint"
         );
         assert!(
-            layers[0]
-                .rule
-                .endpoints
-                .iter()
-                .all(|endpoint| endpoint.access == "read-only"),
-            "github provider policy should be read-only by default"
+            layers[0].rule.endpoints.iter().all(|endpoint| {
+                // API endpoints stay read-only; the github.com git transport
+                // carries explicit rules so clone/fetch works (see #1769).
+                if endpoint.host == "github.com" {
+                    endpoint.access.is_empty()
+                } else {
+                    endpoint.access == "read-only"
+                }
+            }),
+            "github API endpoints should be read-only; git transport uses explicit rules"
+        );
+        assert!(
+            layers[0].rule.endpoints.iter().any(|endpoint| {
+                endpoint.host == "github.com"
+                    && endpoint.rules.iter().any(|rule| {
+                        rule.allow.as_ref().is_some_and(|allow| {
+                            allow.method == "POST" && allow.path.contains("git-upload-pack")
+                        })
+                    })
+            }),
+            "github git transport should allow POST git-upload-pack for clone/fetch"
         );
     }
 

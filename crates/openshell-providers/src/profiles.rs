@@ -1763,13 +1763,51 @@ mod tests {
             "github profile should include read-only GraphQL endpoint"
         );
         assert!(
-            proto
-                .endpoints
-                .iter()
-                .all(|endpoint| endpoint.access == "read-only"),
-            "github profile endpoints should all be read-only"
+            proto.endpoints.iter().all(|endpoint| {
+                // The REST/GraphQL API endpoints stay read-only. The git
+                // transport endpoint (github.com) carries explicit rules
+                // instead so it can allow clone/fetch while blocking push.
+                if endpoint.host == "github.com" {
+                    endpoint.access.is_empty()
+                } else {
+                    endpoint.access == "read-only"
+                }
+            }),
+            "github API endpoints should be read-only; git transport uses explicit rules"
         );
         assert_eq!(proto.binaries.len(), 4);
+    }
+
+    #[test]
+    fn github_git_transport_allows_clone_but_not_push() {
+        let profile = builtin_profile("github");
+        let proto = profile.to_proto();
+
+        let git_transport = proto
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.host == "github.com" && endpoint.port == 443)
+            .expect("github.com git transport endpoint");
+
+        // Clone/fetch over git smart HTTP issues POST to */git-upload-pack.
+        assert!(
+            git_transport.rules.iter().any(|rule| {
+                rule.allow.as_ref().is_some_and(|allow| {
+                    allow.method == "POST" && allow.path.contains("git-upload-pack")
+                })
+            }),
+            "git transport must allow POST to */git-upload-pack for clone/fetch"
+        );
+
+        // Push uses git-receive-pack and must stay blocked by default.
+        assert!(
+            !git_transport.rules.iter().any(|rule| {
+                rule.allow
+                    .as_ref()
+                    .is_some_and(|allow| allow.path.contains("git-receive-pack"))
+            }),
+            "git transport must not allow git-receive-pack (push)"
+        );
     }
 
     #[test]

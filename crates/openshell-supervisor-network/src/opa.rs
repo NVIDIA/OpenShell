@@ -3443,6 +3443,61 @@ network_policies:
         assert!(!eval_l7(&engine, &get_with_method));
     }
 
+    // Mirrors the default GitHub provider's github.com git-transport endpoint
+    // (providers/github.yaml). Git smart HTTP clone/fetch performs a GET on
+    // */info/refs followed by a POST to */git-upload-pack; push uses
+    // */git-receive-pack, which must stay blocked. Regression test for #1769.
+    #[test]
+    fn l7_github_git_transport_allows_clone_blocks_push() {
+        let data = r#"
+network_policies:
+  github:
+    name: github
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "**" }
+          - allow: { method: HEAD, path: "**" }
+          - allow: { method: OPTIONS, path: "**" }
+          - allow: { method: POST, path: "/**/git-upload-pack" }
+    binaries:
+      # l7_input() issues requests as /usr/bin/curl.
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        // Reference discovery (GET) is allowed.
+        let refs = l7_input("github.com", 443, "GET", "/NVIDIA/OpenShell.git/info/refs");
+        assert!(eval_l7(&engine, &refs), "GET info/refs should be allowed");
+
+        // Clone/fetch (POST git-upload-pack) is allowed.
+        let upload_pack = l7_input(
+            "github.com",
+            443,
+            "POST",
+            "/NVIDIA/OpenShell.git/git-upload-pack",
+        );
+        assert!(
+            eval_l7(&engine, &upload_pack),
+            "POST git-upload-pack should be allowed for clone/fetch"
+        );
+
+        // Push (POST git-receive-pack) is denied.
+        let receive_pack = l7_input(
+            "github.com",
+            443,
+            "POST",
+            "/NVIDIA/OpenShell.git/git-receive-pack",
+        );
+        assert!(
+            !eval_l7(&engine, &receive_pack),
+            "POST git-receive-pack (push) must be denied"
+        );
+    }
+
     #[test]
     fn l7_jsonrpc_request_params_do_not_affect_method_policy() {
         let data = r#"
