@@ -446,9 +446,25 @@ try {
 
         # Evaluate.
         if ($sc.Kind -eq "create-fail") {
-            if ($createExitCode -ne 0) {
-                Ok "$($sc.Name): create correctly failed (exit $createExitCode)"
-                $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "create failed as expected" }
+            # A non-zero exit alone is NOT sufficient: gateway-registration,
+            # transport, or malformed-fixture errors also exit non-zero and would
+            # false-pass this scenario. Require a genuine policy-rejection signal
+            # and confirm it is not an infrastructure failure.
+            $rejected = ($createOutStr -match '(?i)network' `
+                -or $createOutStr -match '(?i)invalid[_ -]?argument' `
+                -or $createOutStr -match '(?i)policy' `
+                -or $gwText -match '(?i)network_policies')
+            $infraFail = ($createOutStr -match '(?i)connection refused' `
+                -or $createOutStr -match '(?i)not registered' `
+                -or $createOutStr -match '(?i)transport error' `
+                -or $createOutStr -match '(?i)failed to connect')
+            if ($createExitCode -ne 0 -and $rejected -and -not $infraFail) {
+                Ok "$($sc.Name): create correctly rejected by policy (exit $createExitCode)"
+                $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "policy rejection" }
+            } elseif ($createExitCode -ne 0) {
+                Bad "$($sc.Name): create failed but not with a policy-rejection signal (possible harness/infra error)"
+                Info "output: $createOutStr"
+                $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "non-rejection failure" }
             } else {
                 Bad "$($sc.Name): create succeeded but should have failed"
                 Info "output: $createOutStr"
@@ -466,6 +482,8 @@ try {
             }
         } else {
             $controlPresent = Wait-File $sc.ControlTarget 30
+            # Snapshot the deny target only after the control artifact lands so a
+            # late denied write cannot be recorded as a pass.
             $denyPresent = Test-Path $sc.DenyTarget
             if ($controlPresent -and -not $denyPresent) {
                 Ok "$($sc.Name): control write succeeded; denied write correctly blocked"
