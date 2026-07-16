@@ -52,7 +52,7 @@ GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
 DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
-E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
+E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm,e2e-api-conformance}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
@@ -319,6 +319,9 @@ e2e_register_mtls_gateway \
   "${PKI_DIR}"
 
 export OPENSHELL_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+export OPENSHELL_CONFORMANCE_TLS_CA="${PKI_DIR}/ca.crt"
+export OPENSHELL_CONFORMANCE_TLS_CERT="${PKI_DIR}/client/tls.crt"
+export OPENSHELL_CONFORMANCE_TLS_KEY="${PKI_DIR}/client/tls.key"
 export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
 export OPENSHELL_E2E_DRIVER="vm"
 export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
@@ -354,4 +357,8 @@ else
   run_e2e_test smoke
   run_e2e_test host_gateway_alias
   run_e2e_test vm_gateway_resume
+fi
+
+if [ "${E2E_TEST_OVERRIDE}" != "conformance" ]; then
+  run_e2e_test conformance
 fi

@@ -467,6 +467,10 @@ e2e_register_mtls_gateway \
   "${PKI_DIR}"
 
 export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
+export OPENSHELL_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+export OPENSHELL_CONFORMANCE_TLS_CA="${PKI_DIR}/ca.crt"
+export OPENSHELL_CONFORMANCE_TLS_CERT="${PKI_DIR}/client/tls.crt"
+export OPENSHELL_CONFORMANCE_TLS_KEY="${PKI_DIR}/client/tls.key"
 export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
 echo "Waiting for gateway to become healthy..."
