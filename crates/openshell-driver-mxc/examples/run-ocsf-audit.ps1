@@ -26,7 +26,9 @@
 # By default the per-sandbox egress proxy is ON so the full event set (including
 # SandboxProxyConfigured) is produced. Pass -NoProxy to omit only that one event.
 #
-# Hand the produced results-*.zip back for evaluation.
+# The deliverable is the OCSF audit log (openshell-ocsf.<date>.log) inside the
+# results-*.zip the script produces. Pass -ShareOut '\\server\share' to also copy
+# the bundle to a shared location (off by default).
 
 [CmdletBinding()]
 param(
@@ -43,9 +45,9 @@ param(
   [string] $GatewayName  = "openshell-mxc-ocsf",
   # Internal driver ETW session name (used to clean up a leaked session).
   [string] $SessionName  = "OpenShell-MXC-ETW",
-  # Shared drive the results bundle is auto-copied to for pickup/analysis.
-  # Set to "" to disable the push.
-  [string] $ShareOut     = "\\nvsw-dump\users\jamiek\prashant",
+  # Optional: copy the results bundle to this path (e.g. a shared drive) for
+  # pickup. Empty by default (no copy); pass -ShareOut '\\server\share' to enable.
+  [string] $ShareOut     = "",
   # Leave the gateway running afterward (for inspection).
   [switch] $KeepRunning
 )
@@ -255,26 +257,40 @@ finally {
     $hosts = @($hosts | Select-Object -Unique)
   }
 
-  # Named-event checklist (detected from the human-readable shorthand lines).
+  # Event-type coverage (detected from the human-readable shorthand lines).
   function Seen([string]$pat) { [bool]($logText | Select-String -Pattern $pat -Quiet) }
-  $events = [ordered]@{
-    "Sandbox created (lifecycle)" = Seen "(?i)ocsf:.*LIFECYCLE:"
-    "OS policy enforced"          = Seen "(?i)ocsf:.*OS policy enforced"
-    "OS policy configured"        = Seen "(?i)ocsf:.*OS policy configured"
-    "win32k lockdown applied"     = Seen "(?i)ocsf:.*win32k lockdown"
-    "UI restrictions applied"     = Seen "(?i)ocsf:.*UI restrictions"
-    "console reference plumbed"   = Seen "(?i)ocsf:.*console reference plumbed"
-    "proxy configured"            = Seen "(?i)ocsf:.*proxy configured"
-    "process launch (cmd line)"   = Seen "(?i)ocsf:.*PROC:LAUNCH"
-    "ActivityError finding"       = Seen "(?i)ocsf:.*ActivityError"
-    "FallbackError finding"       = Seen "(?i)ocsf:.*FallbackError"
-  }
-  $classesSeen = @($classCounts.Keys | Where-Object { $classCounts[$_] -gt 0 }).Count
-  if ($passed) { $passed = $consumerStarted -and ($jsonlCount -gt 0) -and ($jsonlBad -eq 0) -and ($classesSeen -ge 3) }
 
-  $verdict = if ($passed) { "PASS" } else { "FAIL" }
-  $classLines = foreach ($uid in @(6002, 5019, 1007, 2004)) { "  [{0}] {1,-28} : {2}" -f $uid, $classNames[$uid], $classCounts[$uid] }
-  $eventLines = foreach ($k in $events.Keys) { "  {0} {1}" -f $(if ($events[$k]) { "[x]" } else { "[ ]" }), $k }
+  # Expected happy-path ETW->OCSF event types for THIS run. The egress-proxy
+  # event only fires when the proxy is enabled, so it only counts toward the
+  # expected total when -NoProxy was NOT passed.
+  $coreEvents = [ordered]@{
+    "sandbox lifecycle (start)"     = Seen "(?i)ocsf:.*LIFECYCLE:"
+    "OS policy enforced"            = Seen "(?i)ocsf:.*OS policy enforced"
+    "OS policy configured"          = Seen "(?i)ocsf:.*OS policy configured"
+    "win32k lockdown applied"       = Seen "(?i)ocsf:.*win32k lockdown"
+    "UI restrictions applied"       = Seen "(?i)ocsf:.*UI restrictions"
+    "console reference plumbed"     = Seen "(?i)ocsf:.*console reference plumbed"
+    "process launch (command line)" = Seen "(?i)ocsf:.*PROC:LAUNCH"
+  }
+  if ($proxyOn) { $coreEvents["egress proxy configured"] = Seen "(?i)ocsf:.*proxy configured" }
+
+  # Findings are anomaly / fallback signals - reported separately, NOT part of
+  # the expected-coverage denominator (a clean run may emit none).
+  $findingEvents = [ordered]@{
+    "ActivityError finding" = Seen "(?i)ocsf:.*ActivityError"
+    "FallbackError finding" = Seen "(?i)ocsf:.*FallbackError"
+  }
+
+  $coreExpected     = $coreEvents.Count
+  $coreObserved     = @($coreEvents.Values   | Where-Object { $_ }).Count
+  $findingsObserved = @($findingEvents.Values | Where-Object { $_ }).Count
+  $classesSeen      = @($classCounts.Keys | Where-Object { $classCounts[$_] -gt 0 }).Count
+  if ($passed) { $passed = $consumerStarted -and ($jsonlCount -gt 0) -and ($jsonlBad -eq 0) -and ($coreObserved -eq $coreExpected) }
+
+  $verdict      = if ($passed) { "PASS" } else { "FAIL" }
+  $classLines   = foreach ($uid in @(6002, 5019, 1007, 2004)) { "  [{0}] {1,-28} : {2}" -f $uid, $classNames[$uid], $classCounts[$uid] }
+  $coreLines    = foreach ($k in $coreEvents.Keys)    { "  {0} {1}" -f $(if ($coreEvents[$k])    { "[x]" } else { "[ ]" }), $k }
+  $findingLines = foreach ($k in $findingEvents.Keys) { "  {0} {1}" -f $(if ($findingEvents[$k]) { "[x]" } else { "[ ]" }), $k }
 
   Step "RESULT"
   $summary = @"
@@ -284,34 +300,38 @@ timestamp        : $stamp
 machine          : $env:COMPUTERNAME
 user             : $env:USERNAME   (admin=$admin  perfLogUsers=$plu)
 verdict          : $verdict
-proxy            : $(if ($proxyOn) { 'on (full event set)' } else { 'off (-NoProxy; omits SandboxProxyConfigured)' })
+event coverage   : $coreObserved of $coreExpected expected event types fired   (+ $findingsObserved anomaly finding(s))
+proxy            : $(if ($proxyOn) { 'on (full event set)' } else { 'off (-NoProxy; omits egress proxy event)' })
 wxc_exec         : $WxcExecPath
 backend          : process_container
 gateway_port     : $Port
 sandboxes        : $SandboxCount   (distinct sandbox_ids in log: $($sids.Count))
 
-OCSF audit log (durable JSONL, one event per line):
-  file   : $(if ($jsonlPath) { Split-Path $jsonlPath -Leaf } else { '(none written)' })
-  events : $jsonlCount   invalid-json: $jsonlBad   host: $($hosts -join ',')
+Event-type coverage - $coreObserved of $coreExpected expected event types fired:
+$($coreLines -join "`r`n")
 
-OCSF classes captured:
+Anomaly findings emitted (not counted toward coverage; a clean run may emit none): $findingsObserved
+$($findingLines -join "`r`n")
+
+OCSF events written : $jsonlCount total   ($jsonlBad invalid-json)   across $classesSeen OCSF class(es)
 $($classLines -join "`r`n")
 
-Event coverage (from the human-readable shorthand):
-$($eventLines -join "`r`n")
+>> YOUR OCSF AUDIT LOG (the deliverable - durable JSONL, one OCSF event per line):
+     $(if ($jsonlPath) { $jsonlPath } else { '(none written - see gateway.log)' })
 
-Files in this bundle:
-  transcript.txt              full console transcript
-  gateway.log / .err.log      gateway stdout/stderr (OCSF shorthand lines live here)
+Files in this bundle ($resultDir):
   openshell-ocsf.<date>.log   THE DELIVERABLE: durable OCSF audit trail (JSONL)
   summary.txt                 this summary
+  transcript.txt              full console transcript
+  gateway.log / .err.log      gateway stdout/stderr (OCSF shorthand lines live here)
   mxc-ocsf-audit.used.toml    the exact gateway config used (wxc path patched)
   ocsf-audit.used.yaml        the exact sandbox policy used
 
 What PASS means: the gateway launched sandbox(es), the in-process ETW consumer
 started, decoded the Sandboxing provider, attributed each event to a sandbox_id,
-mapped them to OCSF, and wrote a durable JSONL audit log spanning $classesSeen event classes -
-the full Windows OCSF path end-to-end, at parity with the Linux pipeline.
+mapped them to OCSF, and wrote a durable JSONL audit log covering all $coreExpected
+expected event types across $classesSeen OCSF class(es) - the full Windows OCSF path
+end-to-end, at parity with the Linux pipeline.
 "@
   Set-Content -Path (Join-Path $resultDir "summary.txt") -Value $summary -Encoding UTF8
   Write-Host $summary -ForegroundColor ($(if ($passed) { "Green" } else { "Red" }))
@@ -323,8 +343,7 @@ the full Windows OCSF path end-to-end, at parity with the Linux pipeline.
     $zip = Join-Path $here "results-$stamp.zip"
     if (Test-Path $zip) { Remove-Item $zip -Force }
     Compress-Archive -Path (Join-Path $resultDir "*") -DestinationPath $zip -Force
-    Write-Host "`nBUNDLE: $zip" -ForegroundColor Yellow
-    Write-Host "Hand that zip back for evaluation." -ForegroundColor Yellow
+    Write-Host "`nResults bundle: $zip" -ForegroundColor Yellow
   } catch { Write-Host "zip failed: $($_.Exception.Message)" -ForegroundColor Red }
 
   # Auto-push the bundle to the shared drive for pickup/analysis (skip if we
