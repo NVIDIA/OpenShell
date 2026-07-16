@@ -613,8 +613,16 @@ impl ProcessHandle {
         // runs as the sandbox UID, so inaccessible paths are unavailable to
         // the workload and best-effort compatibility skips them.
         #[cfg(target_os = "linux")]
-        let prepared_sandbox = prepare_child_sandbox(policy, workdir, enforcement_mode)
+        let mut prepared_sandbox = prepare_child_sandbox(policy, workdir, enforcement_mode)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+        // In permissive mode, skip filesystem (Landlock) restrictions so the
+        // workload can run unimpeded while network policy denials are logged.
+        #[cfg(target_os = "linux")]
+        if policy.network.proxy.as_ref().is_some_and(|p| p.permissive)
+            && let Some(prepared) = prepared_sandbox.as_mut()
+        {
+            prepared.skip_landlock();
+        }
         #[cfg(target_os = "linux")]
         let supervisor_identity_mount = if enforcement_mode.uses_privileged_process_setup() {
             supervisor_identity_mount_from_env().map_err(|err| {

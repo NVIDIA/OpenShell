@@ -479,6 +479,7 @@ mod tests {
                 mode,
                 proxy: http_addr.map(|http_addr| ProxyPolicy {
                     http_addr: Some(http_addr),
+                    permissive: false,
                 }),
             },
             landlock: LandlockPolicy::default(),

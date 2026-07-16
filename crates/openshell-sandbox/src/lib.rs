@@ -960,7 +960,10 @@ fn process_policy_for_topology(
         let proxy = process_policy
             .network
             .proxy
-            .get_or_insert(ProxyPolicy { http_addr: None });
+            .get_or_insert(ProxyPolicy {
+                http_addr: None,
+                permissive: false,
+            });
         if proxy.http_addr.is_none() {
             proxy.http_addr = Some(SIDECAR_PROCESS_PROXY_ADDR.parse().into_diagnostic()?);
         }
@@ -1656,7 +1659,10 @@ mod baseline_tests {
             },
             network: NetworkPolicy {
                 mode: NetworkMode::Proxy,
-                proxy: Some(ProxyPolicy { http_addr: None }),
+                proxy: Some(ProxyPolicy {
+                    http_addr: None,
+                    permissive: false,
+                }),
             },
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
@@ -1811,7 +1817,10 @@ async fn load_policy(
             filesystem: config.filesystem,
             network: NetworkPolicy {
                 mode: NetworkMode::Proxy,
-                proxy: Some(ProxyPolicy { http_addr: None }),
+                proxy: Some(ProxyPolicy {
+                    http_addr: None,
+                    permissive: false,
+                }),
             },
             landlock: config.landlock,
             process: config.process,
@@ -1943,7 +1952,7 @@ async fn load_policy(
             }
         };
 
-        let policy = match SandboxPolicy::try_from(proto_policy.clone()) {
+        let mut policy = match SandboxPolicy::try_from(proto_policy.clone()) {
             Ok(policy) => policy,
             Err(e) => {
                 report_initial_policy_failure(endpoint, id, loaded_policy_revision.as_ref(), &e)
@@ -1951,6 +1960,14 @@ async fn load_policy(
                 return Err(e);
             }
         };
+        if snapshot.permissive {
+            if let Some(ref mut proxy) = policy.network.proxy {
+                proxy.permissive = true;
+            }
+            info!(
+                "Sandbox running in permissive mode: policy denials will be logged but not enforced"
+            );
+        }
         return Ok((
             policy,
             opa_engine,
@@ -2761,7 +2778,10 @@ mod tests {
             filesystem: FilesystemPolicy::default(),
             network: NetworkPolicy {
                 mode: NetworkMode::Proxy,
-                proxy: Some(ProxyPolicy { http_addr }),
+                proxy: Some(ProxyPolicy {
+                    http_addr,
+                    permissive: false,
+                }),
             },
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
@@ -3008,6 +3028,7 @@ filesystem_policy:
             settings: std::collections::HashMap::new(),
             global_policy_version: 0,
             provider_env_revision: 0,
+            permissive: false,
         }
     }
 

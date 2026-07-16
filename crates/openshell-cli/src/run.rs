@@ -1959,6 +1959,7 @@ pub struct SandboxCreateConfig<'a> {
     pub labels: HashMap<String, String>,
     pub environment: HashMap<String, String>,
     pub approval_mode: &'a str,
+    pub permissive: bool,
 }
 
 impl Default for SandboxCreateConfig<'_> {
@@ -1982,6 +1983,7 @@ impl Default for SandboxCreateConfig<'_> {
             labels: HashMap::new(),
             environment: HashMap::new(),
             approval_mode: "manual",
+            permissive: false,
         }
     }
 }
@@ -2012,6 +2014,7 @@ pub async fn sandbox_create(
         labels,
         environment,
         approval_mode,
+        permissive,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -2069,6 +2072,27 @@ pub async fn sandbox_create(
     .await?;
 
     let policy = load_sandbox_policy(policy)?;
+
+    if permissive {
+        let has_protocol_endpoints = policy.as_ref().is_some_and(|p| {
+            p.network_policies
+                .values()
+                .any(|rule| rule.endpoints.iter().any(|ep| !ep.protocol.is_empty()))
+        });
+        if !has_protocol_endpoints {
+            eprintln!(
+                "\n{} Permissive mode: no HTTP endpoints declared in policy.\n  \
+                 L7 audit will be limited to host:port only.\n  \
+                 To capture HTTP method/path detail, add endpoint protocol hints:\n\n    \
+                 endpoints:\n      \
+                 - host: api.example.com\n        \
+                 port: 443\n        \
+                 protocol: rest\n",
+                "⚠".yellow(),
+            );
+        }
+    }
+
     let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
     let driver_config = driver_config_json
         .map(parse_driver_config_json)
@@ -2094,6 +2118,7 @@ pub async fn sandbox_create(
             policy,
             providers: configured_providers,
             template,
+            permissive,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
