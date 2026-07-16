@@ -6358,6 +6358,56 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
     Ok(SandboxUploadPlan::Regular)
 }
 
+/// Upload a local path to a sandbox.
+///
+/// Symlink sources, including dangling links, bypass Git-aware filtering so
+/// the tar upload preserves the link instead of dereferencing its target.
+pub async fn sandbox_upload(
+    server: &str,
+    name: &str,
+    local_path: &Path,
+    sandbox_path: Option<&str>,
+    git_ignore: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let upload_plan = sandbox_upload_plan(local_path, git_ignore)?;
+    let dest_display = sandbox_path.unwrap_or("~");
+    eprintln!(
+        "Uploading {} -> sandbox:{}",
+        local_path.display(),
+        dest_display
+    );
+
+    match upload_plan {
+        SandboxUploadPlan::GitAware { base_dir, files } => {
+            sandbox_sync_up_files(
+                server,
+                name,
+                &base_dir,
+                &files,
+                local_path,
+                sandbox_path,
+                tls,
+            )
+            .await?;
+        }
+        SandboxUploadPlan::GitFilteredEmpty => {
+            eprintln!(
+                "{} .gitignore filtering excluded all files in {}; uploading unfiltered",
+                "⚠".yellow().bold(),
+                local_path.display(),
+            );
+            sandbox_sync_up(server, name, local_path, sandbox_path, tls).await?;
+        }
+        SandboxUploadPlan::Regular => {
+            sandbox_sync_up(server, name, local_path, sandbox_path, tls).await?;
+        }
+    }
+
+    eprintln!("{} Upload complete", "✓".green().bold());
+    Ok(())
+}
+
 fn scrub_git_env(command: &mut Command) -> &mut Command {
     for key in [
         "GIT_DIR",
@@ -9005,6 +9055,19 @@ mod tests {
 
         let plan = sandbox_upload_plan(&repo.join("link-dir"), true)
             .expect("symlink upload should be planned");
+
+        assert_eq!(plan, super::SandboxUploadPlan::Regular);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_upload_plan_accepts_dangling_symlinks() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let link = tmpdir.path().join("dangling-link");
+        std::os::unix::fs::symlink("missing-target", &link).expect("create symlink");
+
+        let plan =
+            sandbox_upload_plan(&link, true).expect("dangling symlink upload should be planned");
 
         assert_eq!(plan, super::SandboxUploadPlan::Regular);
     }
