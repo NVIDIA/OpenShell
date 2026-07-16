@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Standalone crate — the empty [workspace] table prevents Cargo from
-# treating this as part of the root workspace, avoiding Dockerfile
-# and Cargo.lock coupling.
+# Standalone crate — the empty [workspace] table keeps e2e targets and its
+# lockfile out of the root workspace. The internal conformance runner
+# intentionally reuses openshell-core protocol types through a path dependency.
 [workspace]
 
 [package]
@@ -21,6 +21,7 @@ e2e = []
 # existing E2E test targets; membership is defined by the e2e:cli-conformance
 # task so adding the feature does not remove tests from existing E2E suites.
 e2e-cli-conformance = ["e2e"]
+e2e-api-conformance = ["e2e"]
 # Selects tests that rely on `host.openshell.internal` (the sandbox's stable
 # alias to the host running test fixtures). docker, podman, and vm wire the
 # alias unconditionally; the kube driver only does so when the chart's
@@ -64,6 +65,11 @@ required-features = ["e2e-cli-conformance"]
 name = "vm_overlay"
 path = "tests/vm_overlay.rs"
 required-features = ["e2e-vm"]
+
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+required-features = ["e2e-api-conformance"]
 
 [[test]]
 name = "custom_image"
@@ -199,13 +205,17 @@ required-features = ["e2e-gpu"]
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
 futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.14"
+miette = "7"
+openshell-core = { path = "../../crates/openshell-core", default-features = false }
 tokio = { version = "1.43", features = ["full"] }
 tempfile = "3"
+tonic = { version = "0.14", features = ["tls-native-roots"] }
 sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
