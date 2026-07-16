@@ -77,6 +77,7 @@ const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
+const DEFAULT_SANDBOX_UID: u32 = 10_001;
 
 /// Queried by the Docker driver to decide when a sandbox's supervisor
 /// relay is live. Implementations return `true` once a sandbox has an
@@ -136,6 +137,14 @@ pub struct DockerComputeConfig {
     /// Set to `0` to leave Docker's runtime/default PID limit unchanged.
     pub sandbox_pids_limit: i64,
 
+    /// Numeric identity used for the agent process. The root supervisor
+    /// retains UID 0 while preparing the sandbox.
+    pub sandbox_uid: Option<u32>,
+
+    /// Numeric group used for the agent process. Defaults to the resolved
+    /// sandbox UID when unset.
+    pub sandbox_gid: Option<u32>,
+
     /// Allow sandbox requests to attach host bind mounts through
     /// `template.driver_config`.
     #[serde(default)]
@@ -158,6 +167,8 @@ impl Default for DockerComputeConfig {
             host_gateway_ip: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+            sandbox_uid: None,
+            sandbox_gid: None,
             enable_bind_mounts: false,
         }
     }
@@ -187,6 +198,8 @@ struct DockerDriverRuntimeConfig {
     supports_gpu: bool,
     allow_all_default_gpu: bool,
     sandbox_pids_limit: i64,
+    sandbox_uid: u32,
+    sandbox_gid: u32,
     enable_bind_mounts: bool,
 }
 
@@ -307,6 +320,7 @@ impl DockerComputeDriver {
         docker_config: &DockerComputeConfig,
         supervisor_readiness: Arc<dyn SupervisorReadiness>,
     ) -> CoreResult<Self> {
+        let sandbox_identity = resolve_sandbox_identity(docker_config)?;
         let docker = Docker::connect_with_local_defaults()
             .map_err(|err| Error::execution(format!("failed to create Docker client: {err}")))?;
         let version = docker.version().await.map_err(|err| {
@@ -370,6 +384,8 @@ impl DockerComputeDriver {
                 supports_gpu,
                 allow_all_default_gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
+                sandbox_uid: sandbox_identity.0,
+                sandbox_gid: sandbox_identity.1,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
@@ -2162,6 +2178,14 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
+    environment.insert(
+        openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+        config.sandbox_uid.to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+        config.sandbox_gid.to_string(),
+    );
     // The root supervisor executes namespace helpers during bootstrap; keep
     // their search path driver-owned even when the template/spec set PATH.
     environment.insert("PATH".to_string(), SUPERVISOR_PATH.to_string());
@@ -2617,6 +2641,22 @@ fn validate_sandbox_pids_limit(value: i64) -> CoreResult<()> {
         ));
     }
     Ok(())
+}
+
+fn resolve_sandbox_identity(config: &DockerComputeConfig) -> CoreResult<(u32, u32)> {
+    let uid = config.sandbox_uid.unwrap_or(DEFAULT_SANDBOX_UID);
+    let gid = config.sandbox_gid.unwrap_or(uid);
+    for (field, value) in [("sandbox_uid", uid), ("sandbox_gid", gid)] {
+        if !(openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID).contains(&value)
+        {
+            return Err(Error::config(format!(
+                "docker {field} must be in [{}, {}]",
+                openshell_policy::MIN_SANDBOX_UID,
+                openshell_policy::MAX_SANDBOX_UID,
+            )));
+        }
+    }
+    Ok((uid, gid))
 }
 
 fn docker_pids_limit(value: i64) -> Result<Option<i64>, Status> {

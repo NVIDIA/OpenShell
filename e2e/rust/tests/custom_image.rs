@@ -6,69 +6,98 @@
 //! E2E test: build a custom container image and run a sandbox with it.
 //!
 //! Prerequisites:
-//! - A running Docker-backed openshell gateway (`mise run gateway:docker`)
-//! - Docker daemon running (for image build)
+//! - A running Docker- or Podman-backed OpenShell gateway
+//! - Docker or Podman runtime running (for image build)
 //! - The `openshell` binary (built automatically from the workspace)
-
-use std::io::Write;
 
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
-const DOCKERFILE_CONTENT: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim
+const MARKER: &str = "userless-image-e2e-marker";
 
-# iproute2 is required for sandbox network namespace isolation.
-RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
-    && rm -rf /var/lib/apt/lists/*
+fn assert_userless_output(output: &str) {
+    let lines = output.lines().map(str::trim).collect::<Vec<_>>();
+    assert!(
+        lines.contains(&MARKER),
+        "expected marker '{MARKER}' in sandbox output:\n{output}"
+    );
+    assert!(
+        lines.iter().filter(|line| **line == "10001").count() >= 2,
+        "expected UID and GID 10001:\n{output}"
+    );
+    assert!(
+        lines.contains(&"/sandbox"),
+        "expected sandbox home:\n{output}"
+    );
+}
 
-# Create the sandbox user/group so the supervisor can switch to it.
-# Use a high UID range to avoid conflicts with host users when running without
-# user namespace remapping (UID in container = UID on host).
-RUN groupadd -g 1000660000 sandbox && \
-    useradd -m -u 1000660000 -g sandbox sandbox
+#[cfg(all(feature = "e2e-podman", not(feature = "e2e-docker")))]
+async fn assert_userless_image(image: &str) {
+    let mut guard = SandboxGuard::create(&[
+        "--from",
+        image,
+        "--",
+        "sh",
+        "-lc",
+        "cat /etc/marker.txt; id -u; id -g; printf \"%s\\n\" \"$HOME\"; touch \"$HOME/userless-e2e\"",
+    ])
+    .await
+    .expect("sandbox create from userless image");
 
-# Write a marker file so we can verify this is our custom image.
-# Place under /etc (Landlock baseline read-only path) so the sandbox
-# can read it when filesystem restrictions are properly enforced.
-RUN echo "custom-image-e2e-marker" > /etc/marker.txt
+    let clean_output = strip_ansi(&guard.create_output);
+    assert_userless_output(&clean_output);
+    guard.cleanup().await;
+}
 
-CMD ["sleep", "infinity"]
-"#;
-
-const MARKER: &str = "custom-image-e2e-marker";
-
-/// Build a custom Docker image from a Dockerfile and verify that a sandbox
-/// created from it contains the expected marker file.
+/// Docker's local Dockerfile builder provides the image directly to a Docker
+/// gateway, so this path uses the CLI's standard `--from Dockerfile` flow.
+#[cfg(feature = "e2e-docker")]
 #[tokio::test]
-async fn sandbox_from_custom_dockerfile() {
-    // Step 1: Write a temporary Dockerfile.
-    let tmpdir = tempfile::tempdir().expect("create tmpdir");
-    let dockerfile_path = tmpdir.path().join("Dockerfile");
-    {
-        let mut f = std::fs::File::create(&dockerfile_path).expect("create Dockerfile");
-        f.write_all(DOCKERFILE_CONTENT.as_bytes())
-            .expect("write Dockerfile");
-    }
-
-    // Step 2: Create a sandbox from the Dockerfile.
+async fn docker_sandbox_from_userless_dockerfile() {
+    let dockerfile_path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/userless/Dockerfile");
     let dockerfile_str = dockerfile_path.to_str().expect("Dockerfile path is UTF-8");
     let mut guard = SandboxGuard::create(&[
         "--from",
         dockerfile_str,
         "--",
-        "cat",
-        "/etc/marker.txt",
+        "sh",
+        "-lc",
+        "cat /etc/marker.txt; id -u; id -g; printf \"%s\\n\" \"$HOME\"; touch \"$HOME/userless-e2e\"",
     ])
     .await
     .expect("sandbox create from Dockerfile");
 
-    // Step 3: Verify the marker file content appears in the output.
     let clean_output = strip_ansi(&guard.create_output);
-    assert!(
-        clean_output.contains(MARKER),
-        "expected marker '{MARKER}' in sandbox output:\n{clean_output}"
-    );
+    assert_userless_output(&clean_output);
 
     // Explicit cleanup (also happens in Drop, but explicit is clearer in tests).
     guard.cleanup().await;
+}
+
+/// Podman has its own local image store, so build the shared fixture with the
+/// selected engine instead of relying on Docker's `--from Dockerfile` path.
+#[cfg(all(feature = "e2e-podman", not(feature = "e2e-docker")))]
+#[tokio::test]
+async fn podman_sandbox_from_userless_image() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/userless");
+    let image = format!("openshell/e2e-userless:{}", std::process::id());
+    let status = tokio::process::Command::new("podman")
+        .args([
+            "build",
+            "--tag",
+            &image,
+            fixture.to_str().expect("fixture path is UTF-8"),
+        ])
+        .status()
+        .await
+        .expect("run podman build");
+    assert!(status.success(), "build userless fixture with podman");
+
+    assert_userless_image(&image).await;
+
+    let _ = tokio::process::Command::new("podman")
+        .args(["image", "rm", "--force", &image])
+        .status()
+        .await;
 }

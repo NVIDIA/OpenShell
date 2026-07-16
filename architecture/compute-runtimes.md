@@ -38,6 +38,12 @@ when a sandbox create request asks for GPU resources.
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
+
+Docker and Podman operators can configure `sandbox_uid` and `sandbox_gid` in
+their driver tables. When unset, the drivers resolve `10001:10001` and inject
+it for the agent child; the root supervisor remains the container entry process.
+Rootless Podman requires that the chosen values are available in its subordinate
+UID/GID mappings.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
 but currently ignores them.
 

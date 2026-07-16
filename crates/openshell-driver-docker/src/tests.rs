@@ -113,6 +113,8 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         supports_gpu: false,
         allow_all_default_gpu: false,
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+        sandbox_uid: 10_001,
+        sandbox_gid: 10_001,
         enable_bind_mounts: false,
     }
 }
@@ -552,6 +554,50 @@ fn docker_compute_config_disables_bind_mounts_by_default() {
 }
 
 #[test]
+fn docker_sandbox_identity_defaults_to_10001() {
+    assert_eq!(
+        resolve_sandbox_identity(&DockerComputeConfig::default()).unwrap(),
+        (10_001, 10_001)
+    );
+}
+
+#[test]
+fn docker_sandbox_identity_uses_resolved_uid_for_default_gid() {
+    let config = DockerComputeConfig {
+        sandbox_uid: Some(12_345),
+        ..DockerComputeConfig::default()
+    };
+    assert_eq!(resolve_sandbox_identity(&config).unwrap(), (12_345, 12_345));
+}
+
+#[test]
+fn docker_sandbox_identity_allows_configured_gid_without_uid() {
+    let config = DockerComputeConfig {
+        sandbox_gid: Some(12_346),
+        ..DockerComputeConfig::default()
+    };
+    assert_eq!(resolve_sandbox_identity(&config).unwrap(), (10_001, 12_346));
+}
+
+#[test]
+fn docker_sandbox_identity_rejects_system_uid() {
+    let config = DockerComputeConfig {
+        sandbox_uid: Some(999),
+        ..DockerComputeConfig::default()
+    };
+    assert!(resolve_sandbox_identity(&config).is_err());
+}
+
+#[test]
+fn docker_sandbox_identity_rejects_gid_above_policy_range() {
+    let config = DockerComputeConfig {
+        sandbox_gid: Some(openshell_policy::MAX_SANDBOX_UID + 1),
+        ..DockerComputeConfig::default()
+    };
+    assert!(resolve_sandbox_identity(&config).is_err());
+}
+
+#[test]
 fn container_create_body_sets_driver_owned_pids_limit() {
     let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
     let host_config = body.host_config.expect("host config");
@@ -567,6 +613,28 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
     assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
+    assert!(env.contains(&"OPENSHELL_SANDBOX_UID=10001".to_string()));
+    assert!(env.contains(&"OPENSHELL_SANDBOX_GID=10001".to_string()));
+}
+
+#[test]
+fn build_environment_keeps_sandbox_identity_driver_controlled() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.environment.insert(
+        openshell_core::sandbox_env::SANDBOX_UID.to_string(),
+        "1234".to_string(),
+    );
+    spec.template.as_mut().unwrap().environment.insert(
+        openshell_core::sandbox_env::SANDBOX_GID.to_string(),
+        "1234".to_string(),
+    );
+
+    let env = build_environment(&sandbox, &runtime_config());
+    assert!(env.contains(&"OPENSHELL_SANDBOX_UID=10001".to_string()));
+    assert!(env.contains(&"OPENSHELL_SANDBOX_GID=10001".to_string()));
+    assert!(!env.contains(&"OPENSHELL_SANDBOX_UID=1234".to_string()));
+    assert!(!env.contains(&"OPENSHELL_SANDBOX_GID=1234".to_string()));
 }
 
 #[test]

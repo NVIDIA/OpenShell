@@ -49,3 +49,7 @@ sandbox_namespace = "openshell"
 # The gateway must be published on port 8080 on the Docker host so that
 # host.openshell.internal:8080 resolves to the gateway container.
 grpc_endpoint     = "http://host.openshell.internal:8080"
+# The supervisor starts as root, then launches the agent with this numeric
+# identity. Defaults are sandbox_uid=10001 and sandbox_gid=sandbox_uid.
+# sandbox_uid       = 10001
+# sandbox_gid       = 10001

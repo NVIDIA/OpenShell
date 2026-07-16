@@ -103,7 +103,7 @@ pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET: &str =
 /// Resolved sandbox UID used to override `run_as_user` when the policy
 /// specifies a numeric value instead of the hardcoded "sandbox" user name.
 ///
-/// Set by compute drivers (Kubernetes, Docker, VM) from resolved config or
+/// Set by compute drivers (Kubernetes, Docker, Podman, and VM) from resolved config or
 /// cluster autodetection. The supervisor reads this at startup and uses it
 /// directly with `setuid()` / `chown()` without requiring an `/etc/passwd`
 /// entry in the sandbox image.

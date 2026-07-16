@@ -50,6 +50,12 @@ The container spec in `container.rs` sets these security-critical fields:
 
 The restricted agent child does not retain these supervisor privileges.
 
+The gateway operator may set `[openshell.drivers.podman].sandbox_uid` and
+`sandbox_gid` for the agent child. The supervisor remains `0:0` during setup;
+the UID defaults to `10001` and the GID defaults to the resolved UID. In
+rootless mode, configure values that are available in Podman's subordinate
+UID/GID mapping.
+
 ## Driver Config Mounts
 
 The gateway forwards the `podman` block from `--driver-config-json` to this

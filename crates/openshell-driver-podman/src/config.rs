@@ -9,6 +9,7 @@ use std::str::FromStr;
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 pub const MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP: &str = "192.168.127.254";
+pub const DEFAULT_SANDBOX_UID: u32 = 10_001;
 
 // Re-export the shared default so existing imports inside this crate keep working.
 pub use openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT;
@@ -122,6 +123,11 @@ pub struct PodmanComputeConfig {
     ///
     /// Set to `0` to leave Podman's runtime/default PID limit unchanged.
     pub sandbox_pids_limit: i64,
+    /// Numeric identity used for the agent process. The supervisor remains
+    /// root while it prepares the sandbox.
+    pub sandbox_uid: Option<u32>,
+    /// Numeric group used for the agent process. Defaults to the resolved UID.
+    pub sandbox_gid: Option<u32>,
     /// Allow sandbox requests to attach host bind mounts through
     /// `template.driver_config`.
     #[serde(default)]
@@ -187,6 +193,24 @@ impl PodmanComputeConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Resolve and validate the numeric identity injected into the supervisor.
+    pub fn resolve_sandbox_identity(&self) -> Result<(u32, u32), crate::client::PodmanApiError> {
+        let uid = self.sandbox_uid.unwrap_or(DEFAULT_SANDBOX_UID);
+        let gid = self.sandbox_gid.unwrap_or(uid);
+        for (field, value) in [("sandbox_uid", uid), ("sandbox_gid", gid)] {
+            if !(openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID)
+                .contains(&value)
+            {
+                return Err(crate::client::PodmanApiError::InvalidInput(format!(
+                    "{field} must be in [{}, {}]",
+                    openshell_policy::MIN_SANDBOX_UID,
+                    openshell_policy::MAX_SANDBOX_UID,
+                )));
+            }
+        }
+        Ok((uid, gid))
     }
 
     /// Validate optional host gateway override.
@@ -260,6 +284,8 @@ impl Default for PodmanComputeConfig {
             guest_tls_cert: None,
             guest_tls_key: None,
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+            sandbox_uid: None,
+            sandbox_gid: None,
             enable_bind_mounts: false,
             health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
         }
@@ -283,6 +309,8 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("guest_tls_cert", &self.guest_tls_cert)
             .field("guest_tls_key", &self.guest_tls_key)
             .field("sandbox_pids_limit", &self.sandbox_pids_limit)
+            .field("sandbox_uid", &self.sandbox_uid)
+            .field("sandbox_gid", &self.sandbox_gid)
             .field("enable_bind_mounts", &self.enable_bind_mounts)
             .field(
                 "health_check_interval_secs",
@@ -380,6 +408,52 @@ mod tests {
         };
         let err = cfg.validate_runtime_limits().unwrap_err();
         assert!(err.to_string().contains("sandbox_pids_limit"));
+    }
+
+    #[test]
+    fn sandbox_identity_defaults_to_10001() {
+        assert_eq!(
+            PodmanComputeConfig::default()
+                .resolve_sandbox_identity()
+                .unwrap(),
+            (10_001, 10_001)
+        );
+    }
+
+    #[test]
+    fn sandbox_identity_uses_uid_for_default_gid() {
+        let cfg = PodmanComputeConfig {
+            sandbox_uid: Some(12_345),
+            ..PodmanComputeConfig::default()
+        };
+        assert_eq!(cfg.resolve_sandbox_identity().unwrap(), (12_345, 12_345));
+    }
+
+    #[test]
+    fn sandbox_identity_allows_configured_gid_without_uid() {
+        let cfg = PodmanComputeConfig {
+            sandbox_gid: Some(12_346),
+            ..PodmanComputeConfig::default()
+        };
+        assert_eq!(cfg.resolve_sandbox_identity().unwrap(), (10_001, 12_346));
+    }
+
+    #[test]
+    fn sandbox_identity_rejects_system_uid() {
+        let cfg = PodmanComputeConfig {
+            sandbox_uid: Some(999),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.resolve_sandbox_identity().is_err());
+    }
+
+    #[test]
+    fn sandbox_identity_rejects_gid_above_policy_range() {
+        let cfg = PodmanComputeConfig {
+            sandbox_gid: Some(openshell_policy::MAX_SANDBOX_UID + 1),
+            ..PodmanComputeConfig::default()
+        };
+        assert!(cfg.resolve_sandbox_identity().is_err());
     }
 
     #[test]

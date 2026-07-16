@@ -562,6 +562,11 @@ impl ProcessHandle {
         // supervisor credentials from its inherited environment.
         strip_supervisor_only_env(&mut cmd);
 
+        let (child_user, child_home) = child_user_and_home(policy);
+        cmd.env("HOME", child_home)
+            .env("USER", &child_user)
+            .env("LOGNAME", child_user);
+
         inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
@@ -713,6 +718,11 @@ impl ProcessHandle {
         // inherited environment.
         strip_supervisor_only_env(&mut cmd);
 
+        let (child_user, child_home) = child_user_and_home(policy);
+        cmd.env("HOME", child_home)
+            .env("USER", &child_user)
+            .env("LOGNAME", child_user);
+
         inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
@@ -845,6 +855,26 @@ impl ProcessHandle {
         }
 
         Ok(())
+    }
+}
+
+/// Derive the presentation identity and home directory for an agent child.
+///
+/// Numeric identities intentionally do not require an NSS entry, so they use
+/// `/sandbox` as their stable home while retaining the numeric UID as USER.
+pub(crate) fn child_user_and_home(policy: &SandboxPolicy) -> (String, String) {
+    match policy.process.run_as_user.as_deref() {
+        Some(user) if !user.is_empty() && user.parse::<u32>().is_ok() => {
+            (user.to_string(), "/sandbox".to_string())
+        }
+        Some(user) if !user.is_empty() => {
+            let home = User::from_name(user).ok().flatten().map_or_else(
+                || format!("/home/{user}"),
+                |u| u.dir.to_string_lossy().into_owned(),
+            );
+            (user.to_string(), home)
+        }
+        _ => ("sandbox".to_string(), "/sandbox".to_string()),
     }
 }
 

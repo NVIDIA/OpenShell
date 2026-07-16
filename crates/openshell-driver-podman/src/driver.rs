@@ -184,6 +184,7 @@ impl PodmanComputeDriver {
         // get a clear error instead of a silent fallback to plaintext HTTP.
         config.validate_tls_config()?;
         config.validate_runtime_limits()?;
+        config.resolve_sandbox_identity()?;
         config.validate_host_gateway_ip()?;
 
         let client = PodmanClient::new(config.socket_path.clone());

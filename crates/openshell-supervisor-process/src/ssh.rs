@@ -690,24 +690,7 @@ impl Default for PtyRequest {
 /// `("{uid}", "/sandbox")` so the agent session still has a meaningful
 /// USER identifier.
 fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
-    match policy.process.run_as_user.as_deref() {
-        Some(user) if !user.is_empty() => {
-            // Numeric UID — no passwd entry expected; use default HOME.
-            if user.parse::<u32>().is_ok() {
-                return (user.to_string(), "/sandbox".to_string());
-            }
-            // Name-based identity — look up home from /etc/passwd.
-            let home = nix::unistd::User::from_name(user)
-                .ok()
-                .flatten()
-                .map_or_else(
-                    || format!("/home/{user}"),
-                    |u| u.dir.to_string_lossy().into_owned(),
-                );
-            (user.to_string(), home)
-        }
-        _ => ("sandbox".to_string(), "/sandbox".to_string()),
-    }
+    crate::process::child_user_and_home(policy)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -727,6 +710,7 @@ fn apply_child_env(
         .env(openshell_core::sandbox_env::SANDBOX, "1")
         .env("HOME", session_home)
         .env("USER", session_user)
+        .env("LOGNAME", session_user)
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
         .env("TERM", term);

@@ -407,6 +407,17 @@ fn build_env(
         openshell_core::sandbox_env::SANDBOX_COMMAND.into(),
         "sleep infinity".into(),
     );
+    let sandbox_identity = config
+        .resolve_sandbox_identity()
+        .expect("Podman configuration is validated before build_env");
+    env.insert(
+        openshell_core::sandbox_env::SANDBOX_UID.into(),
+        sandbox_identity.0.to_string(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::SANDBOX_GID.into(),
+        sandbox_identity.1.to_string(),
+    );
     env.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
         openshell_core::telemetry::enabled_env_value().into(),
@@ -1610,6 +1621,8 @@ mod tests {
             "OPENSHELL_SSH_SOCKET_PATH".to_string(),
             "/tmp/evil.sock".to_string(),
         );
+        env_overrides.insert("OPENSHELL_SANDBOX_UID".to_string(), "1234".to_string());
+        env_overrides.insert("OPENSHELL_SANDBOX_GID".to_string(), "1234".to_string());
         sandbox.spec = Some(DriverSandboxSpec {
             environment: env_overrides,
             template: Some(DriverSandboxTemplate::default()),
@@ -1630,6 +1643,20 @@ mod tests {
             env_map.get("OPENSHELL_SANDBOX_ID").and_then(|v| v.as_str()),
             Some("test-id"),
             "OPENSHELL_SANDBOX_ID must not be overridden by user env"
+        );
+        assert_eq!(
+            env_map
+                .get(openshell_core::sandbox_env::SANDBOX_UID)
+                .and_then(|v| v.as_str()),
+            Some("10001"),
+            "OPENSHELL_SANDBOX_UID must not be overridden by user env"
+        );
+        assert_eq!(
+            env_map
+                .get(openshell_core::sandbox_env::SANDBOX_GID)
+                .and_then(|v| v.as_str()),
+            Some("10001"),
+            "OPENSHELL_SANDBOX_GID must not be overridden by user env"
         );
         assert_eq!(
             env_map

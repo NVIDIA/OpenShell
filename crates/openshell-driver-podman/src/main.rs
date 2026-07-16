@@ -88,6 +88,14 @@ struct Args {
     )]
     sandbox_pids_limit: i64,
 
+    /// Numeric UID for the agent process. Defaults to 10001.
+    #[arg(long, env = "OPENSHELL_PODMAN_SANDBOX_UID")]
+    sandbox_uid: Option<u32>,
+
+    /// Numeric GID for the agent process. Defaults to the resolved UID.
+    #[arg(long, env = "OPENSHELL_PODMAN_SANDBOX_GID")]
+    sandbox_gid: Option<u32>,
+
     /// OCI image containing the openshell-sandbox supervisor binary.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
     supervisor_image: Option<String>,
@@ -137,6 +145,8 @@ async fn main() -> Result<()> {
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,
         sandbox_pids_limit: args.sandbox_pids_limit,
+        sandbox_uid: args.sandbox_uid,
+        sandbox_gid: args.sandbox_gid,
         ..PodmanComputeConfig::default()
     })
     .await

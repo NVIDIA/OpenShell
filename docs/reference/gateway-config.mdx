@@ -257,6 +257,11 @@ ssh_socket_path    = "/run/openshell/ssh.sock"
 enable_bind_mounts = false
 # Set to 0 to leave Docker's runtime default unchanged.
 sandbox_pids_limit = 2048
+# Agent identity is selected by the gateway operator, not the sandbox creator.
+# The root supervisor starts the container and drops the agent to this identity.
+# sandbox_uid defaults to 10001; sandbox_gid defaults to the resolved UID.
+# sandbox_uid = 10001
+# sandbox_gid = 10001
 ```
 
 ### Podman
@@ -297,6 +302,12 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 enable_bind_mounts      = false
 # Set to 0 to leave Podman's runtime default unchanged.
 sandbox_pids_limit      = 2048
+# Agent identity is selected by the gateway operator, not the sandbox creator.
+# Values must be in OpenShell's non-root identity range. The UID defaults to
+# 10001 and the GID defaults to the resolved UID. Rootless Podman must map
+# these values through its subordinate UID/GID ranges.
+# sandbox_uid            = 10001
+# sandbox_gid            = 10001
 # Health check interval in seconds. Lower values detect readiness faster
 # but increase process churn (each check spawns a conmon subprocess).
 # Set to 0 to disable health checks entirely. Default: 10.
