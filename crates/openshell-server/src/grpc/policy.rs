@@ -1351,7 +1351,7 @@ pub(super) async fn handle_get_sandbox_config(
     if let Some(policy) = policy.as_ref() {
         state
             .middleware_registry
-            .ensure_policy_bindings_registered(policy)
+            .ensure_policy_middlewares_registered(policy)
             .map_err(|error| {
                 Status::failed_precondition(format!(
                     "effective policy middleware registration is invalid: {error}"

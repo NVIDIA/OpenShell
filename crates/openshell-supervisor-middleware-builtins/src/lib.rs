@@ -15,7 +15,7 @@ use openshell_core::proto::{
 };
 use tonic::{Request, Response, Status};
 
-pub use regex::{BINDING_ID as BUILTIN_REGEX, RegexConfig, RegexMode};
+pub use regex::{NAME as BUILTIN_REGEX, RegexConfig, RegexMode};
 
 /// Return the first-party services that the gateway and supervisor install.
 pub fn services() -> Vec<Arc<dyn SupervisorMiddleware>> {
@@ -33,7 +33,7 @@ pub fn validate_config(implementation: &str, config: &prost_types::Struct) -> Re
 }
 
 fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpRequestResult> {
-    match evaluation.binding_id.as_str() {
+    match evaluation.middleware_name.as_str() {
         BUILTIN_REGEX => regex::evaluate_http_request(evaluation),
         other => Err(miette!(
             "middleware implementation '{other}' is not a registered OpenShell built-in"
@@ -41,8 +41,7 @@ fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpReque
     }
 }
 
-/// Aggregate service exposing all first-party bindings through the standard
-/// supervisor middleware contract.
+/// Built-in regex service exposed through the standard middleware contract.
 #[derive(Debug, Default)]
 pub struct BuiltinMiddlewareService;
 
@@ -53,7 +52,7 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
         _request: Request<()>,
     ) -> Result<Response<MiddlewareManifest>, Status> {
         Ok(Response::new(MiddlewareManifest {
-            name: "openshell/builtins".into(),
+            name: BUILTIN_REGEX.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![regex::describe()],
         }))
@@ -66,7 +65,7 @@ impl SupervisorMiddleware for BuiltinMiddlewareService {
         let request = request.into_inner();
         let config = request.config.unwrap_or_default();
         Ok(Response::new(
-            match validate_config(&request.binding_id, &config) {
+            match validate_config(&request.middleware_name, &config) {
                 Ok(()) => ValidateConfigResponse {
                     valid: true,
                     reason: String::new(),
@@ -116,7 +115,6 @@ mod tests {
             .expect("describe")
             .into_inner();
         assert_eq!(manifest.bindings.len(), 1);
-        assert_eq!(manifest.bindings[0].id, BUILTIN_REGEX);
         assert_eq!(
             manifest.bindings[0].operation,
             SupervisorMiddlewareOperation::HttpRequest as i32
@@ -162,7 +160,7 @@ mod tests {
     #[test]
     fn regex_replacement_evaluates_through_binding() {
         let result = evaluate_http_request(&HttpRequestEvaluation {
-            binding_id: BUILTIN_REGEX.into(),
+            middleware_name: BUILTIN_REGEX.into(),
             body: br#"{"password":"top-secret","token":"sk-ABCDEFGHIJKLMNOP"}"#.to_vec(),
             config: Some(prost_types::Struct::default()),
             ..Default::default()
@@ -189,7 +187,7 @@ mod tests {
             "\npassword=alpha\nnotpassword=omega"
         );
         let result = evaluate_http_request(&HttpRequestEvaluation {
-            binding_id: BUILTIN_REGEX.into(),
+            middleware_name: BUILTIN_REGEX.into(),
             body: body.as_bytes().to_vec(),
             config: Some(prost_types::Struct::default()),
             ..Default::default()

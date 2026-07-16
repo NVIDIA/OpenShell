@@ -90,7 +90,7 @@ network_middlewares:
 
 Matching entries run once each by ascending `order`; lower values run first and policy-local names break ties. The default order is `0`. Config names must be unique. Different config names may use the same implementation and run as distinct stages. `exclude` takes precedence over `include`.
 
-`openshell/regex` is an example built into the supervisor. It applies fixed regular expressions as a best-effort UTF-8 text transformation, without guarantees that sensitive values will be detected or fully removed. Custom expressions are not configurable yet. Operator-provided binding IDs must be registered before a policy can reference them. The gateway validates implementation-owned config before accepting the policy.
+`openshell/regex` is an example built into the supervisor. It applies fixed regular expressions as a best-effort UTF-8 text transformation, without guarantees that sensitive values will be detected or fully removed. Custom expressions are not configurable yet. Operator-run middleware must be registered by name before a policy can reference it. The gateway validates implementation-owned config before accepting the policy.
 
 `on_error` defaults to `fail_closed`. Use `fail_open` only when skipping a failed middleware is acceptable. Middleware applies only to HTTP traffic the supervisor can parse and inspect. Policy validation rejects a fail-closed selector that can cover a `tls: skip` endpoint. An all-`fail_open` match may cover the endpoint; the supervisor bypasses the middleware and emits a detection finding.
 

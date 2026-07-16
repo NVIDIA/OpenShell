@@ -1917,7 +1917,7 @@ network_policies:
             ),
             (
                 middleware_config("redactor", ""),
-                "implementation must not be empty",
+                "middleware must not be empty",
             ),
             (
                 {

@@ -24,7 +24,7 @@ mod tests {
     use openshell_core::proto::NetworkMiddlewareConfig;
 
     #[tokio::test]
-    async fn unregistered_external_binding_is_rejected_before_admission() {
+    async fn unregistered_external_middleware_is_rejected_before_admission() {
         let policy = SandboxPolicy {
             network_middlewares: vec![NetworkMiddlewareConfig {
                 name: "guard".into(),
@@ -36,7 +36,7 @@ mod tests {
 
         let error = validate_policy(&MiddlewareRegistry::default(), &policy)
             .await
-            .expect_err("unregistered binding must fail");
+            .expect_err("unregistered middleware must fail");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(error.message().contains("not registered"));
     }

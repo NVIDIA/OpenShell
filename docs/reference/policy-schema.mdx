@@ -496,7 +496,7 @@ network_middlewares:
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | Yes | Policy-local config name. Names must be unique within the list. |
-| `middleware` | string | Yes | Built-in or operator-registered binding ID. `openshell/` is reserved for built-ins. |
+| `middleware` | string | Yes | Built-in middleware name or operator-owned registration name. `openshell/` is reserved for built-ins. |
 | `order` | integer | No | Execution priority. Lower values run first; names break ties. Defaults to `0`. |
 | `config` | object | No | Implementation-owned configuration validated by the selected middleware. |
 | `on_error` | string | No | `fail_closed` denies the request when the stage fails; `fail_open` skips the failed stage. Defaults to `fail_closed`. |

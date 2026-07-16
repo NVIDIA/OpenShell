@@ -167,7 +167,7 @@ OCSF CONFIG:LOADED [INFO] Policy reloaded successfully [policy_hash:0cc0c2b52557
 
 Denied `NET:` and `HTTP:` events carry a `[reason:...]` suffix that surfaces the decision detail from the event's `status_detail` field. The reason helps distinguish between policy misses, SSRF hardening, and L7 enforcement without inspecting the full OCSF JSONL record.
 
-For supervisor middleware denials, `status_detail` contains an audit-safe reason. Built-in middleware can provide that reason directly. Operator-run denial reasons are derived from the validated binding ID, and operator-run failure details use platform-owned error codes; OpenShell does not copy per-request service text into logs.
+For supervisor middleware denials, `status_detail` contains an audit-safe reason. Built-in middleware can provide that reason directly. Operator-run denial reasons are derived from the operator-owned registration name, and operator-run failure details use platform-owned error codes; OpenShell does not copy per-request service text into logs.
 
 Common reason phrases emitted by the sandbox include:
 

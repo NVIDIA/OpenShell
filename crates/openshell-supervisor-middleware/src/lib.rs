@@ -118,7 +118,7 @@ impl TryFrom<&NetworkMiddlewareConfig> for ChainEntry {
         }
         if value.middleware.is_empty() {
             return Err(miette!(
-                "middleware config '{}' must name an implementation",
+                "middleware config '{}' must reference a middleware",
                 value.name
             ));
         }
@@ -283,6 +283,10 @@ pub struct ChainRunner {
 }
 
 struct MiddlewareServiceState {
+    /// Policy-facing built-in name or operator-owned registration name. The
+    /// single-service test constructor leaves this empty and uses the manifest
+    /// name after Describe.
+    attachment_name: Option<String>,
     service: Arc<dyn SupervisorMiddleware>,
     manifest: OnceCell<MiddlewareManifest>,
     diagnostic_policy: MiddlewareDiagnosticPolicy,
@@ -297,12 +301,7 @@ impl MiddlewareServiceState {
         } else {
             parse_middleware_timeout(&binding.timeout)
                 .map(|binding_timeout| binding_timeout.min(self.operator_timeout))
-                .map_err(|reason| {
-                    miette!(
-                        "middleware binding '{}' has invalid timeout: {reason}",
-                        binding.id
-                    )
-                })
+                .map_err(|reason| miette!("middleware binding has invalid timeout: {reason}"))
         }
     }
 }
@@ -333,11 +332,11 @@ impl MiddlewareDiagnosticPolicy {
 
     fn process_result(
         self,
-        binding: &MiddlewareBinding,
+        middleware_name: &str,
         result: &mut openshell_core::proto::HttpRequestResult,
     ) {
         if self == Self::Normalize {
-            normalize_untrusted_diagnostics(binding, result);
+            normalize_untrusted_diagnostics(middleware_name, result);
         }
     }
 
@@ -359,7 +358,7 @@ impl MiddlewareDiagnosticPolicy {
 pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
-    binding_ids: Arc<HashSet<String>>,
+    middleware_names: Arc<HashSet<String>>,
 }
 
 impl std::fmt::Debug for MiddlewareRegistry {
@@ -368,7 +367,7 @@ impl std::fmt::Debug for MiddlewareRegistry {
             .debug_struct("MiddlewareRegistry")
             .field("service_count", &self.services.len())
             .field("registered_service_count", &self.registered_services.len())
-            .field("binding_count", &self.binding_ids.len())
+            .field("middleware_count", &self.middleware_names.len())
             .finish()
     }
 }
@@ -376,7 +375,6 @@ impl std::fmt::Debug for MiddlewareRegistry {
 #[derive(Clone)]
 struct RegisteredMiddlewareService {
     registration: SupervisorMiddlewareService,
-    binding_ids: Vec<String>,
 }
 
 impl Default for MiddlewareRegistry {
@@ -384,15 +382,21 @@ impl Default for MiddlewareRegistry {
         Self {
             services: Arc::new(Vec::new()),
             registered_services: Arc::new(Vec::new()),
-            binding_ids: Arc::new(HashSet::new()),
+            middleware_names: Arc::new(HashSet::new()),
         }
     }
 }
 
 fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<Duration> {
-    if registration.name.trim().is_empty() {
+    if !is_stable_identifier(&registration.name) {
         return Err(miette!(
-            "supervisor middleware registration name cannot be empty"
+            "supervisor middleware registration names must be 1-{MAX_STABLE_IDENTIFIER_BYTES} bytes and contain only ASCII letters, digits, '.', '_', '-', or '/'"
+        ));
+    }
+    if registration.name.starts_with("openshell/") {
+        return Err(miette!(
+            "middleware registration '{}' cannot claim the reserved openshell/ namespace",
+            registration.name
         ));
     }
     if !registration.grpc_endpoint.starts_with("http://")
@@ -433,108 +437,76 @@ fn is_stable_identifier(value: &str) -> bool {
 
 fn validate_body_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
     if binding.max_body_bytes == 0 {
-        return Err(miette!(
-            "middleware binding '{}' must advertise a non-zero body limit",
-            binding.id
-        ));
+        return Err(miette!("{source} must advertise a non-zero body limit"));
     }
     if binding.max_body_bytes > MAX_MIDDLEWARE_BODY_BYTES as u64 {
         return Err(miette!(
-            "{source} binding '{}' body limit exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}",
-            binding.id
+            "{source} body limit exceeds the platform maximum of {MAX_MIDDLEWARE_BODY_BYTES}"
         ));
     }
-    usize::try_from(binding.max_body_bytes).map_err(|_| {
-        miette!(
-            "middleware binding '{}' reports a body limit too large for this platform",
-            binding.id
-        )
-    })
+    usize::try_from(binding.max_body_bytes)
+        .map_err(|_| miette!("{source} reports a body limit too large for this platform"))
 }
 
 fn validate_manifest_bindings(
     source: &str,
     manifest: &MiddlewareManifest,
     operator_max_body_bytes: Option<usize>,
-    allow_reserved_bindings: bool,
-    known_binding_ids: &mut HashSet<String>,
-) -> Result<Vec<String>> {
+) -> Result<()> {
     if manifest.bindings.is_empty() {
         return Err(miette!("{source} describes no bindings"));
     }
 
-    let mut described_ids = Vec::with_capacity(manifest.bindings.len());
+    let mut described_pairs = HashSet::with_capacity(manifest.bindings.len());
     for binding in &manifest.bindings {
-        if !is_stable_identifier(&binding.id) {
-            return Err(miette!(
-                "{source} binding ids must be 1-{MAX_STABLE_IDENTIFIER_BYTES} bytes and contain only ASCII letters, digits, '.', '_', '-', or '/'"
-            ));
-        }
-        if !allow_reserved_bindings && binding.id.starts_with("openshell/") {
-            return Err(miette!(
-                "{source} cannot claim reserved binding '{}'",
-                binding.id
-            ));
-        }
         if binding.operation != HTTP_REQUEST_OPERATION as i32
             || binding.phase != PRE_CREDENTIALS_PHASE as i32
         {
             return Err(miette!(
-                "middleware binding '{}' must support HTTP_REQUEST/PRE_CREDENTIALS",
-                binding.id,
+                "{source} must support HTTP_REQUEST/PRE_CREDENTIALS"
+            ));
+        }
+        if !described_pairs.insert((binding.operation, binding.phase)) {
+            return Err(miette!(
+                "{source} describes more than one binding for HTTP_REQUEST/PRE_CREDENTIALS"
             ));
         }
         let advertised = validate_body_limit(source, binding)?;
         if !binding.timeout.trim().is_empty() {
-            parse_middleware_timeout(&binding.timeout).map_err(|reason| {
-                miette!(
-                    "{source} binding '{}' has invalid timeout: {reason}",
-                    binding.id
-                )
-            })?;
+            parse_middleware_timeout(&binding.timeout)
+                .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
         }
         if operator_max_body_bytes.is_some_and(|limit| limit > advertised) {
             return Err(miette!(
-                "{source} max_body_bytes ({}) exceeds binding '{}' capability ({advertised})",
-                operator_max_body_bytes.expect("operator limit checked above"),
-                binding.id
+                "{source} max_body_bytes ({}) exceeds the binding capability ({advertised})",
+                operator_max_body_bytes.expect("operator limit checked above")
             ));
         }
-        if !known_binding_ids.insert(binding.id.clone()) {
-            return Err(miette!(
-                "middleware binding '{}' is described by more than one service",
-                binding.id
-            ));
-        }
-        described_ids.push(binding.id.clone());
     }
-    Ok(described_ids)
+    Ok(())
 }
 
 fn validate_external_manifest(
     registration: &SupervisorMiddlewareService,
     manifest: &MiddlewareManifest,
     operator_max_body_bytes: usize,
-    known_binding_ids: &mut HashSet<String>,
-) -> Result<Vec<String>> {
+) -> Result<()> {
     validate_manifest_bindings(
         &format!("external middleware registration '{}'", registration.name),
         manifest,
         Some(operator_max_body_bytes),
-        false,
-        known_binding_ids,
     )
 }
 
 /// External diagnostic text is untrusted and may contain request data. Keep
-/// only values derived from the validated, startup-time binding identifier and
-/// numeric finding counts; do not carry per-request free-form text into logs.
+/// only values derived from the validated, operator-owned registration name
+/// and numeric finding counts; do not carry per-request free-form text into
+/// logs.
 fn normalize_untrusted_diagnostics(
-    binding: &MiddlewareBinding,
+    middleware_name: &str,
     result: &mut openshell_core::proto::HttpRequestResult,
 ) {
-    let reason_id: String = binding
-        .id
+    let reason_id: String = middleware_name
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
@@ -547,7 +519,7 @@ fn normalize_untrusted_diagnostics(
     result.reason = format!("middleware_denied:{reason_id}");
     result.metadata.clear();
     for finding in &mut result.findings {
-        finding.r#type = format!("{}.finding", binding.id);
+        finding.r#type = format!("{middleware_name}.finding");
         finding.label = EXTERNAL_FINDING_LABEL.to_string();
         finding.confidence.clear();
         finding.severity = match finding.severity.as_str() {
@@ -656,8 +628,7 @@ impl MiddlewareRegistry {
     ) -> Result<Self> {
         let mut services = Vec::with_capacity(in_process_services.len() + registrations.len());
         let mut registered_services = Vec::with_capacity(registrations.len());
-        let mut registration_names = HashSet::new();
-        let mut binding_ids = HashSet::new();
+        let mut middleware_names = HashSet::new();
 
         for service in in_process_services {
             let manifest = call_with_timeout(
@@ -678,12 +649,25 @@ impl MiddlewareRegistry {
             } else {
                 format!("in-process middleware service '{}'", manifest.name)
             };
-            validate_manifest_bindings(&source, &manifest, None, true, &mut binding_ids)?;
+            if !is_stable_identifier(&manifest.name) {
+                return Err(miette!(
+                    "in-process middleware names must be 1-{MAX_STABLE_IDENTIFIER_BYTES} bytes and contain only ASCII letters, digits, '.', '_', '-', or '/'"
+                ));
+            }
+            if !middleware_names.insert(manifest.name.clone()) {
+                return Err(miette!(
+                    "duplicate supervisor middleware name '{}'",
+                    manifest.name
+                ));
+            }
+            validate_manifest_bindings(&source, &manifest, None)?;
+            let attachment_name = manifest.name.clone();
             let manifest_cell = OnceCell::new();
             manifest_cell
                 .set(manifest)
                 .map_err(|_| miette!("middleware manifest cache initialized twice"))?;
             services.push(Arc::new(MiddlewareServiceState {
+                attachment_name: Some(attachment_name),
                 service,
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
@@ -694,7 +678,7 @@ impl MiddlewareRegistry {
 
         for registration in registrations {
             let operator_timeout = validate_registration(&registration)?;
-            if !registration_names.insert(registration.name.clone()) {
+            if !middleware_names.insert(registration.name.clone()) {
                 return Err(miette!(
                     "duplicate supervisor middleware registration name '{}'",
                     registration.name
@@ -729,33 +713,26 @@ impl MiddlewareRegistry {
                     safe_reason(&error.to_string())
                 )
             })?;
-            let described_ids = validate_external_manifest(
-                &registration,
-                &manifest,
-                operator_max_body_bytes,
-                &mut binding_ids,
-            )?;
+            validate_external_manifest(&registration, &manifest, operator_max_body_bytes)?;
             let manifest_cell = OnceCell::new();
             manifest_cell
                 .set(manifest)
                 .map_err(|_| miette!("middleware manifest cache initialized twice"))?;
             services.push(Arc::new(MiddlewareServiceState {
+                attachment_name: Some(registration.name.clone()),
                 service,
                 manifest: manifest_cell,
                 diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
                 operator_max_body_bytes: Some(operator_max_body_bytes),
                 operator_timeout,
             }));
-            registered_services.push(RegisteredMiddlewareService {
-                registration,
-                binding_ids: described_ids,
-            });
+            registered_services.push(RegisteredMiddlewareService { registration });
         }
 
         Ok(Self {
             services: Arc::new(services),
             registered_services: Arc::new(registered_services),
-            binding_ids: Arc::new(binding_ids),
+            middleware_names: Arc::new(middleware_names),
         })
     }
 
@@ -781,13 +758,13 @@ impl MiddlewareRegistry {
         Ok(())
     }
 
-    /// Check that every policy binding still belongs to the current static
+    /// Check that every policy attachment still belongs to the current static
     /// registry without making a network call.
-    pub fn ensure_policy_bindings_registered(&self, policy: &SandboxPolicy) -> Result<()> {
+    pub fn ensure_policy_middlewares_registered(&self, policy: &SandboxPolicy) -> Result<()> {
         for config in &policy.network_middlewares {
-            if !self.binding_ids.contains(&config.middleware) {
+            if !self.middleware_names.contains(&config.middleware) {
                 return Err(miette!(
-                    "middleware binding '{}' used by config '{}' is not registered",
+                    "middleware '{}' used by config '{}' is not registered",
                     config.middleware,
                     config.name
                 ));
@@ -811,12 +788,7 @@ impl MiddlewareRegistry {
             .collect();
         self.registered_services
             .iter()
-            .filter(|service| {
-                service
-                    .binding_ids
-                    .iter()
-                    .any(|binding| selected.contains(binding.as_str()))
-            })
+            .filter(|service| selected.contains(service.registration.name.as_str()))
             .map(|service| service.registration.clone())
             .collect()
     }
@@ -833,6 +805,7 @@ impl ChainRunner {
         Self {
             registry: Arc::new(MiddlewareRegistry {
                 services: Arc::new(vec![Arc::new(MiddlewareServiceState {
+                    attachment_name: None,
                     service,
                     manifest: OnceCell::new(),
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
@@ -840,7 +813,7 @@ impl ChainRunner {
                     operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 })]),
                 registered_services: Arc::new(Vec::new()),
-                binding_ids: Arc::new(HashSet::new()),
+                middleware_names: Arc::new(HashSet::new()),
             }),
         }
     }
@@ -877,6 +850,23 @@ impl ChainRunner {
         Ok(manifests)
     }
 
+    fn attachment_name<'a>(
+        state: &'a MiddlewareServiceState,
+        manifest: &'a MiddlewareManifest,
+    ) -> &'a str {
+        state
+            .attachment_name
+            .as_deref()
+            .unwrap_or(manifest.name.as_str())
+    }
+
+    fn http_pre_credentials_binding(manifest: &MiddlewareManifest) -> Option<&MiddlewareBinding> {
+        manifest.bindings.iter().find(|binding| {
+            binding.operation == HTTP_REQUEST_OPERATION as i32
+                && binding.phase == PRE_CREDENTIALS_PHASE as i32
+        })
+    }
+
     pub async fn describe_chain(&self, entries: &[ChainEntry]) -> Result<Vec<DescribedChainEntry>> {
         ensure_chain_capacity(entries.len())?;
         let manifests = self.manifests().await?;
@@ -885,14 +875,16 @@ impl ChainRunner {
         entries
             .iter()
             .map(|entry| {
-                let described = manifests.iter().find_map(|(state, manifest)| {
-                    manifest
-                        .bindings
-                        .iter()
-                        .find(|binding| binding.id == entry.implementation)
-                        .cloned()
-                        .map(|binding| (Arc::clone(state), binding))
-                });
+                let described = manifests
+                    .iter()
+                    .find(|(state, manifest)| {
+                        Self::attachment_name(state, manifest) == entry.implementation
+                    })
+                    .and_then(|(state, manifest)| {
+                        Self::http_pre_credentials_binding(manifest)
+                            .cloned()
+                            .map(|binding| (Arc::clone(state), binding))
+                    });
                 let (service, binding) = described.map_or((None, None), |(service, binding)| {
                     (Some(service), Some(binding))
                 });
@@ -928,7 +920,7 @@ impl ChainRunner {
 
     pub async fn validate_config(
         &self,
-        implementation: &str,
+        middleware_name: &str,
         config: prost_types::Struct,
     ) -> Result<()> {
         if config.encoded_len() > MAX_MIDDLEWARE_CONFIG_BYTES {
@@ -938,15 +930,12 @@ impl ChainRunner {
         }
         let manifests = self.manifests().await?;
         let Some((state, binding)) = manifests.iter().find_map(|(state, manifest)| {
-            manifest
-                .bindings
-                .iter()
-                .find(|binding| binding.id == implementation)
+            (Self::attachment_name(state, manifest) == middleware_name)
+                .then(|| Self::http_pre_credentials_binding(manifest))
+                .flatten()
                 .map(|binding| (state, binding))
         }) else {
-            return Err(miette!(
-                "middleware binding '{implementation}' is not registered"
-            ));
+            return Err(miette!("middleware '{middleware_name}' is not registered"));
         };
         let response = call_with_timeout(
             state.timeout_for_binding(binding)?,
@@ -954,8 +943,8 @@ impl ChainRunner {
             state
                 .service
                 .validate_config(Request::new(ValidateConfigRequest {
-                    binding_id: implementation.into(),
                     config: Some(config),
+                    middleware_name: middleware_name.into(),
                 })),
         )
         .await
@@ -1121,7 +1110,7 @@ impl ChainRunner {
 
             service
                 .diagnostic_policy
-                .process_result(binding, &mut result);
+                .process_result(&entry.entry.implementation, &mut result);
 
             let decision = match Decision::try_from(result.decision) {
                 Ok(decision @ (Decision::Allow | Decision::Deny)) => decision,
@@ -1323,7 +1312,6 @@ fn build_evaluation(
     body: &[u8],
 ) -> HttpRequestEvaluation {
     HttpRequestEvaluation {
-        binding_id: binding.id.clone(),
         phase: binding.phase,
         context: Some(RequestContext {
             request_id: input.request_id.clone(),
@@ -1347,6 +1335,7 @@ fn build_evaluation(
             })
             .collect(),
         body: body.to_vec(),
+        middleware_name: entry.entry.implementation.clone(),
     }
 }
 
@@ -1568,7 +1557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn injected_service_bindings_drive_registration_checks() {
+    async fn injected_service_names_drive_registration_checks() {
         let registry = MiddlewareRegistry::connect_services(services(), Vec::new())
             .await
             .expect("connect built-in service");
@@ -1581,48 +1570,38 @@ mod tests {
             ..Default::default()
         };
         registry
-            .ensure_policy_bindings_registered(&policy)
-            .expect("described binding is registered");
-
-        let unknown = SandboxPolicy {
-            network_middlewares: vec![NetworkMiddlewareConfig {
-                name: "unknown".into(),
-                middleware: "openshell/unknown".into(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        assert!(
-            registry
-                .ensure_policy_bindings_registered(&unknown)
-                .is_err()
-        );
+            .ensure_policy_middlewares_registered(&policy)
+            .expect("described middleware is registered");
     }
 
     #[tokio::test]
-    async fn injected_services_cannot_duplicate_binding_ids() {
+    async fn injected_services_cannot_duplicate_middleware_names() {
         let first: Arc<dyn SupervisorMiddleware> = Arc::new(ScriptedService {
-            binding_id: "openshell/test".into(),
+            manifest_name: "openshell/test".into(),
             max_body_bytes: 1024,
             result: allow_result(),
         });
         let second: Arc<dyn SupervisorMiddleware> = Arc::new(ScriptedService {
-            binding_id: "openshell/test".into(),
+            manifest_name: "openshell/test".into(),
             max_body_bytes: 1024,
             result: allow_result(),
         });
 
         let error = MiddlewareRegistry::connect_services(vec![first, second], Vec::new())
             .await
-            .expect_err("duplicate injected binding must fail registry construction");
-        assert!(error.to_string().contains("more than one service"));
+            .expect_err("duplicate injected middleware name must fail registry construction");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate supervisor middleware name")
+        );
     }
 
     /// A mock middleware that returns a fixed, caller-supplied result for every
     /// evaluation. Used to exercise chain behavior the built-in cannot produce
     /// (explicit deny, metadata, findings, unsafe header mutations).
     struct ScriptedService {
-        binding_id: String,
+        manifest_name: String,
         max_body_bytes: u64,
         result: openshell_core::proto::HttpRequestResult,
     }
@@ -1634,10 +1613,9 @@ mod tests {
             _request: Request<()>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
-                name: "test/middleware".into(),
+                name: self.manifest_name.clone(),
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
-                    id: self.binding_id.clone(),
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: self.max_body_bytes,
@@ -1687,7 +1665,6 @@ mod tests {
                 name: "test/slow".into(),
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
-                    id: "example/slow".into(),
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
@@ -1724,8 +1701,9 @@ mod tests {
         }
     }
 
-    /// A two-binding service for exercising per-stage validation: `test/transform`
-    /// replaces the body, `test/second` records that it ran and allows.
+    /// A middleware attached twice for exercising per-stage validation. The
+    /// first policy config requests a body transformation; the second records
+    /// that it ran and allows.
     struct TwoStageService {
         second_ran: Arc<std::sync::atomic::AtomicBool>,
     }
@@ -1736,17 +1714,15 @@ mod tests {
             &self,
             _request: Request<()>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
-            let binding = |id: &str| MiddlewareBinding {
-                id: id.into(),
-                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
-                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                max_body_bytes: 256 * 1024,
-                timeout: String::new(),
-            };
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/two-stage".into(),
                 service_version: "test".into(),
-                bindings: vec![binding("test/transform"), binding("test/second")],
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: 256 * 1024,
+                    timeout: String::new(),
+                }],
             }))
         }
 
@@ -1774,7 +1750,14 @@ mod tests {
         > {
             let evaluation = request.into_inner();
             let mut result = allow_result();
-            if evaluation.binding_id == "test/transform" {
+            if evaluation.config.as_ref().is_some_and(|config| {
+                config.fields.get("transform").is_some_and(|value| {
+                    matches!(
+                        value.kind.as_ref(),
+                        Some(prost_types::value::Kind::BoolValue(true))
+                    )
+                })
+            }) {
                 result.body = b"TRANSFORMED".to_vec();
                 result.has_body = true;
             } else {
@@ -1797,14 +1780,22 @@ mod tests {
         let runner = ChainRunner::new(service);
         let transform = ChainEntry {
             name: "transform".into(),
-            implementation: "test/transform".into(),
+            implementation: "test/two-stage".into(),
             order: 0,
-            config: prost_types::Struct::default(),
+            config: prost_types::Struct {
+                fields: std::iter::once((
+                    "transform".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::BoolValue(true)),
+                    },
+                ))
+                .collect(),
+            },
             on_error: OnError::FailClosed,
         };
         let second = ChainEntry {
             name: "second".into(),
-            implementation: "test/second".into(),
+            implementation: "test/two-stage".into(),
             order: 10,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -1851,14 +1842,22 @@ mod tests {
         let runner = ChainRunner::new(service);
         let transform = ChainEntry {
             name: "transform".into(),
-            implementation: "test/transform".into(),
+            implementation: "test/two-stage".into(),
             order: 0,
-            config: prost_types::Struct::default(),
+            config: prost_types::Struct {
+                fields: std::iter::once((
+                    "transform".into(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::BoolValue(true)),
+                    },
+                ))
+                .collect(),
+            },
             on_error: OnError::FailClosed,
         };
         let second = ChainEntry {
             name: "second".into(),
-            implementation: "test/second".into(),
+            implementation: "test/two-stage".into(),
             order: 10,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -1896,14 +1895,22 @@ mod tests {
         let entries = [
             ChainEntry {
                 name: "transform".into(),
-                implementation: "test/transform".into(),
+                implementation: "test/two-stage".into(),
                 order: 0,
-                config: prost_types::Struct::default(),
+                config: prost_types::Struct {
+                    fields: std::iter::once((
+                        "transform".into(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::BoolValue(true)),
+                        },
+                    ))
+                    .collect(),
+                },
                 on_error: OnError::FailClosed,
             },
             ChainEntry {
                 name: "second".into(),
-                implementation: "test/second".into(),
+                implementation: "test/two-stage".into(),
                 order: 10,
                 config: prost_types::Struct::default(),
                 on_error: OnError::FailClosed,
@@ -1939,7 +1946,7 @@ mod tests {
 
     fn scripted_service(result: openshell_core::proto::HttpRequestResult) -> ScriptedService {
         ScriptedService {
-            binding_id: BUILTIN_REGEX.into(),
+            manifest_name: BUILTIN_REGEX.into(),
             max_body_bytes: 256 * 1024,
             result,
         }
@@ -1960,6 +1967,7 @@ mod tests {
     /// A middleware that records every evaluation it receives and allows the
     /// request, for asserting what the supervisor actually sends to services.
     struct RecordingService {
+        validated: std::sync::Mutex<Vec<ValidateConfigRequest>>,
         received: std::sync::Mutex<Vec<HttpRequestEvaluation>>,
     }
 
@@ -1973,7 +1981,6 @@ mod tests {
                 name: "test/recorder".into(),
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
-                    id: "example/recorder".into(),
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
@@ -1984,11 +1991,15 @@ mod tests {
 
         async fn validate_config(
             &self,
-            _request: Request<ValidateConfigRequest>,
+            request: Request<ValidateConfigRequest>,
         ) -> std::result::Result<
             tonic::Response<openshell_core::proto::ValidateConfigResponse>,
             tonic::Status,
         > {
+            self.validated
+                .lock()
+                .expect("validated config lock")
+                .push(request.into_inner());
             Ok(tonic::Response::new(
                 openshell_core::proto::ValidateConfigResponse {
                     valid: true,
@@ -2029,7 +2040,6 @@ mod tests {
                 name: "test/header-chain".into(),
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
-                    id: "example/header-chain".into(),
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_body_bytes: 4096,
@@ -2100,21 +2110,21 @@ mod tests {
             let entries = [
                 ChainEntry {
                     name: "first".into(),
-                    implementation: "example/header-chain".into(),
+                    implementation: "test/header-chain".into(),
                     order: 0,
                     config: prost_types::Struct::default(),
                     on_error: OnError::FailClosed,
                 },
                 ChainEntry {
                     name: "second".into(),
-                    implementation: "example/header-chain".into(),
+                    implementation: "test/header-chain".into(),
                     order: 10,
                     config: prost_types::Struct::default(),
                     on_error: OnError::FailClosed,
                 },
                 ChainEntry {
                     name: "observer".into(),
-                    implementation: "example/header-chain".into(),
+                    implementation: "test/header-chain".into(),
                     order: 20,
                     config: prost_types::Struct::default(),
                     on_error: OnError::FailClosed,
@@ -2144,13 +2154,18 @@ mod tests {
         // inspection differential. The service must see each entry in wire
         // order.
         let service = Arc::new(RecordingService {
+            validated: std::sync::Mutex::new(Vec::new()),
             received: std::sync::Mutex::new(Vec::new()),
         });
         let recorder: Arc<dyn SupervisorMiddleware> = service.clone();
         let runner = ChainRunner::new(recorder);
+        runner
+            .validate_config("test/recorder", prost_types::Struct::default())
+            .await
+            .expect("validate recorder config");
         let recorder_entry = ChainEntry {
             name: "recorder".into(),
-            implementation: "example/recorder".into(),
+            implementation: "test/recorder".into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -2168,8 +2183,14 @@ mod tests {
             .expect("evaluate recording chain");
         assert!(outcome.allowed);
 
+        let validated = service.validated.lock().expect("validated configs");
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0].middleware_name, "test/recorder");
+        drop(validated);
+
         let received = service.received.lock().expect("recorded evaluations");
         assert_eq!(received.len(), 1);
+        assert_eq!(received[0].middleware_name, "test/recorder");
         let headers: Vec<(&str, &str)> = received[0]
             .headers
             .iter()
@@ -2207,15 +2228,9 @@ mod tests {
             .await
             .expect("describe built-in service")
             .into_inner();
-        let mut known = HashSet::new();
-        validate_manifest_bindings(
-            "test built-in service",
-            &builtin_manifest,
-            None,
-            true,
-            &mut known,
-        )
-        .expect("valid built-in manifest");
+        validate_manifest_bindings("test built-in service", &builtin_manifest, None)
+            .expect("valid built-in manifest");
+        let builtin_name = builtin_manifest.name.clone();
         let builtin_manifest_cell = OnceCell::new();
         builtin_manifest_cell
             .set(builtin_manifest)
@@ -2228,18 +2243,15 @@ mod tests {
             .into_inner();
         let operator_max_body_bytes = usize::try_from(registration.max_body_bytes).unwrap();
         let operator_timeout = validate_registration(&registration).expect("valid registration");
-        let binding_ids = validate_external_manifest(
-            &registration,
-            &manifest,
-            operator_max_body_bytes,
-            &mut known,
-        )
-        .expect("valid external manifest");
+        validate_external_manifest(&registration, &manifest, operator_max_body_bytes)
+            .expect("valid external manifest");
         let manifest_cell = OnceCell::new();
         manifest_cell.set(manifest).expect("manifest cache");
+        let registration_name = registration.name.clone();
         MiddlewareRegistry {
             services: Arc::new(vec![
                 Arc::new(MiddlewareServiceState {
+                    attachment_name: Some(builtin_name.clone()),
                     service: builtin_service,
                     manifest: builtin_manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Preserve,
@@ -2247,6 +2259,7 @@ mod tests {
                     operator_timeout: DEFAULT_MIDDLEWARE_TIMEOUT,
                 }),
                 Arc::new(MiddlewareServiceState {
+                    attachment_name: Some(registration_name.clone()),
                     service,
                     manifest: manifest_cell,
                     diagnostic_policy: MiddlewareDiagnosticPolicy::Normalize,
@@ -2254,11 +2267,8 @@ mod tests {
                     operator_timeout,
                 }),
             ]),
-            registered_services: Arc::new(vec![RegisteredMiddlewareService {
-                registration,
-                binding_ids,
-            }]),
-            binding_ids: Arc::new(known),
+            registered_services: Arc::new(vec![RegisteredMiddlewareService { registration }]),
+            middleware_names: Arc::new(HashSet::from([builtin_name, registration_name])),
         }
     }
 
@@ -2285,13 +2295,13 @@ mod tests {
     #[tokio::test]
     async fn descriptors_are_resolved_from_any_middleware_service() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: "example/redactor".into(),
+            manifest_name: "test/middleware".into(),
             max_body_bytes: 4096,
             result: allow_result(),
         }));
         let entry = ChainEntry {
             name: "external".into(),
-            implementation: "example/redactor".into(),
+            implementation: "test/middleware".into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -2321,7 +2331,7 @@ mod tests {
     #[tokio::test]
     async fn mixed_builtin_and_external_chain_uses_operator_limit() {
         let external = Arc::new(ScriptedService {
-            binding_id: "example/content-guard".into(),
+            manifest_name: "test/middleware".into(),
             max_body_bytes: 4096,
             result: allow_result(),
         });
@@ -2329,7 +2339,7 @@ mod tests {
         let runner = ChainRunner::from_registry(registry);
         let external_entry = ChainEntry {
             name: "external".into(),
-            implementation: "example/content-guard".into(),
+            implementation: "local-guard-service".into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -2361,7 +2371,7 @@ mod tests {
         // own `on_error`, not the whole chain: the 1 KiB fail-open guard is
         // skipped while the 256 KiB fail-closed redactor still runs.
         let external = Arc::new(ScriptedService {
-            binding_id: "example/content-guard".into(),
+            manifest_name: "test/middleware".into(),
             max_body_bytes: 4096,
             result: allow_result(),
         });
@@ -2369,7 +2379,7 @@ mod tests {
         let runner = ChainRunner::from_registry(registry);
         let guard_entry = ChainEntry {
             name: "guard".into(),
-            implementation: "example/content-guard".into(),
+            implementation: "local-guard-service".into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailOpen,
@@ -2404,7 +2414,7 @@ mod tests {
         // replacement is still over the 1 KiB guard limit, so the fail-closed
         // guard denies through its own `on_error` after the redactor ran.
         let external = Arc::new(ScriptedService {
-            binding_id: "example/content-guard".into(),
+            manifest_name: "test/middleware".into(),
             max_body_bytes: 4096,
             result: allow_result(),
         });
@@ -2412,7 +2422,7 @@ mod tests {
         let runner = ChainRunner::from_registry(registry);
         let guard_entry = ChainEntry {
             name: "guard".into(),
-            implementation: "example/content-guard".into(),
+            implementation: "local-guard-service".into(),
             order: 10,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -2445,14 +2455,13 @@ mod tests {
             name: "example/service".into(),
             service_version: "test".into(),
             bindings: vec![MiddlewareBinding {
-                id: "example/content-guard".into(),
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: 4096,
                 timeout: String::new(),
             }],
         };
-        let error = validate_external_manifest(&registration, &manifest, 4097, &mut HashSet::new())
+        let error = validate_external_manifest(&registration, &manifest, 4097)
             .expect_err("operator limit must fit capability");
         assert!(error.to_string().contains("exceeds"));
     }
@@ -2472,54 +2481,39 @@ mod tests {
             name: "example/service".into(),
             service_version: "test".into(),
             bindings: vec![MiddlewareBinding {
-                id: "example/content-guard".into(),
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_body_bytes: u64::MAX,
                 timeout: String::new(),
             }],
         };
-        let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
+        let error = validate_external_manifest(&registration, &manifest, 4096)
             .expect_err("extreme advertised body limit must be rejected");
         assert!(error.to_string().contains("platform maximum"));
     }
 
     #[test]
-    fn manifest_rejects_unstable_binding_identifier() {
+    fn manifest_rejects_duplicate_operation_phase_pairs() {
         let registration = external_registration(4096);
+        let binding = || MiddlewareBinding {
+            operation: HTTP_REQUEST_OPERATION as i32,
+            phase: PRE_CREDENTIALS_PHASE as i32,
+            max_body_bytes: 4096,
+            timeout: String::new(),
+        };
         let manifest = MiddlewareManifest {
             name: "example/service".into(),
             service_version: "test".into(),
-            bindings: vec![MiddlewareBinding {
-                id: "example/content-guard\nforged".into(),
-                operation: HTTP_REQUEST_OPERATION as i32,
-                phase: PRE_CREDENTIALS_PHASE as i32,
-                max_body_bytes: 4096,
-                timeout: String::new(),
-            }],
+            bindings: vec![binding(), binding()],
         };
-        let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
-            .expect_err("control characters must be rejected in binding ids");
-        assert!(error.to_string().contains("binding ids must be"));
-    }
 
-    #[test]
-    fn external_manifest_cannot_claim_reserved_binding() {
-        let registration = external_registration(4096);
-        let manifest = MiddlewareManifest {
-            name: "example/service".into(),
-            service_version: "test".into(),
-            bindings: vec![MiddlewareBinding {
-                id: "openshell/regex".into(),
-                operation: HTTP_REQUEST_OPERATION as i32,
-                phase: PRE_CREDENTIALS_PHASE as i32,
-                max_body_bytes: 4096,
-                timeout: String::new(),
-            }],
-        };
-        let error = validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
-            .expect_err("external service cannot claim reserved namespace");
-        assert!(error.to_string().contains("reserved binding"));
+        let error = validate_external_manifest(&registration, &manifest, 4096)
+            .expect_err("one service cannot advertise two bindings for the same pair");
+        assert!(
+            error
+                .to_string()
+                .contains("more than one binding for HTTP_REQUEST/PRE_CREDENTIALS")
+        );
     }
 
     #[test]
@@ -2540,6 +2534,18 @@ mod tests {
         registration.grpc_endpoint = "ftp://middleware.example.com".into();
         let error = validate_registration(&registration).expect_err("unsupported scheme");
         assert!(error.to_string().contains("http:// or https://"));
+    }
+
+    #[test]
+    fn external_registration_name_is_stable_and_cannot_shadow_builtins() {
+        for name in ["", "guard\nforged", "openshell/regex"] {
+            let mut registration = external_registration(4096);
+            registration.name = name.into();
+            assert!(
+                validate_registration(&registration).is_err(),
+                "registration name {name:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -2571,16 +2577,14 @@ mod tests {
                 name: "example/service".into(),
                 service_version: "test".into(),
                 bindings: vec![MiddlewareBinding {
-                    id: "example/content-guard".into(),
                     operation: HTTP_REQUEST_OPERATION as i32,
                     phase: PRE_CREDENTIALS_PHASE as i32,
                     max_body_bytes: 4096,
                     timeout: timeout.into(),
                 }],
             };
-            let error =
-                validate_external_manifest(&registration, &manifest, 4096, &mut HashSet::new())
-                    .expect_err("out-of-bounds binding timeout must be rejected");
+            let error = validate_external_manifest(&registration, &manifest, 4096)
+                .expect_err("out-of-bounds binding timeout must be rejected");
             assert!(error.to_string().contains("invalid timeout"));
         }
     }
@@ -2600,7 +2604,7 @@ mod tests {
         let runner = ChainRunner::from_registry(registry);
         let slow_entry = |on_error| ChainEntry {
             name: "slow".into(),
-            implementation: "example/slow".into(),
+            implementation: "local-guard-service".into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error,
@@ -2642,7 +2646,7 @@ mod tests {
         let runner = ChainRunner::from_registry(registry);
         let slow_entry = ChainEntry {
             name: "slow".into(),
-            implementation: "example/slow".into(),
+            implementation: "local-guard-service".into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -2677,7 +2681,7 @@ mod tests {
         let runner = ChainRunner::from_registry(registry);
         let slow_entry = ChainEntry {
             name: "slow".into(),
-            implementation: "example/slow".into(),
+            implementation: "local-guard-service".into(),
             order: 0,
             config: prost_types::Struct::default(),
             on_error: OnError::FailClosed,
@@ -2690,7 +2694,7 @@ mod tests {
         assert_eq!(described[0].timeout(), Duration::from_millis(10));
 
         let validation_error = runner
-            .validate_config("example/slow", prost_types::Struct::default())
+            .validate_config("local-guard-service", prost_types::Struct::default())
             .await
             .expect_err("operator timeout must cap ValidateConfig");
         assert!(
@@ -2709,7 +2713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_registry_invokes_remote_service_over_grpc() {
+    async fn external_registry_attaches_same_service_under_multiple_names() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test middleware");
@@ -2717,7 +2721,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server = tonic::transport::Server::builder()
             .add_service(SupervisorMiddlewareServer::new(ScriptedService {
-                binding_id: "example/content-guard".into(),
+                manifest_name: "test/middleware".into(),
                 max_body_bytes: 4096,
                 result: allow_result(),
             }))
@@ -2728,13 +2732,18 @@ mod tests {
 
         let mut registration = external_registration(1024);
         registration.grpc_endpoint = format!("http://{address}");
-        let registry = MiddlewareRegistry::connect_services(Vec::new(), vec![registration.clone()])
-            .await
-            .expect("connect external middleware");
+        let mut second_registration = registration.clone();
+        second_registration.name = "secondary-guard-service".into();
+        let registry = MiddlewareRegistry::connect_services(
+            Vec::new(),
+            vec![registration.clone(), second_registration.clone()],
+        )
+        .await
+        .expect("connect the same external middleware binding under two names");
         let policy = SandboxPolicy {
             network_middlewares: vec![NetworkMiddlewareConfig {
                 name: "guard".into(),
-                middleware: "example/content-guard".into(),
+                middleware: "local-guard-service".into(),
                 order: 0,
                 config: Some(prost_types::Struct::default()),
                 on_error: "fail_closed".into(),
@@ -2749,23 +2758,35 @@ mod tests {
             .expect("remote config validates");
         assert_eq!(
             registry.required_services(Some(&policy)),
-            vec![registration]
+            vec![registration.clone()]
         );
 
         let outcome = ChainRunner::from_registry(registry)
             .evaluate(
-                &[ChainEntry {
-                    name: "guard".into(),
-                    implementation: "example/content-guard".into(),
-                    order: 0,
-                    config: prost_types::Struct::default(),
-                    on_error: OnError::FailClosed,
-                }],
+                &[
+                    ChainEntry {
+                        name: "primary".into(),
+                        implementation: "local-guard-service".into(),
+                        order: 0,
+                        config: prost_types::Struct::default(),
+                        on_error: OnError::FailClosed,
+                    },
+                    ChainEntry {
+                        name: "secondary".into(),
+                        implementation: "secondary-guard-service".into(),
+                        order: 10,
+                        config: prost_types::Struct::default(),
+                        on_error: OnError::FailClosed,
+                    },
+                ],
                 input("hello"),
             )
             .await
             .expect("remote evaluation");
         assert!(outcome.allowed);
+        assert_eq!(outcome.applied.len(), 2);
+        assert_eq!(outcome.applied[0].implementation, registration.name);
+        assert_eq!(outcome.applied[1].implementation, second_registration.name);
 
         let _ = shutdown_tx.send(());
         server_task
@@ -2793,7 +2814,7 @@ mod tests {
         let server = tonic::transport::Server::builder()
             .add_service(
                 SupervisorMiddlewareServer::new(ScriptedService {
-                    binding_id: "example/content-guard".into(),
+                    manifest_name: "test/middleware".into(),
                     max_body_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
                     result: openshell_core::proto::HttpRequestResult {
                         reason: "r".repeat(MAX_MIDDLEWARE_REASON_BYTES - 128),
@@ -2850,7 +2871,7 @@ mod tests {
             .evaluate(
                 &[ChainEntry {
                     name: "guard".into(),
-                    implementation: "example/content-guard".into(),
+                    implementation: "local-guard-service".into(),
                     order: 0,
                     config,
                     on_error: OnError::FailClosed,
@@ -2885,7 +2906,7 @@ mod tests {
         let secret = "sk-secret-request-value";
         let registration = external_registration(4096);
         let service = Arc::new(ScriptedService {
-            binding_id: "example/content-guard".into(),
+            manifest_name: "test/middleware".into(),
             max_body_bytes: 4096,
             result: openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
@@ -2906,7 +2927,7 @@ mod tests {
             .evaluate(
                 &[ChainEntry {
                     name: "guard".into(),
-                    implementation: "example/content-guard".into(),
+                    implementation: "local-guard-service".into(),
                     order: 0,
                     config: prost_types::Struct::default(),
                     on_error: OnError::FailClosed,
@@ -2916,10 +2937,10 @@ mod tests {
             .await
             .expect("evaluate external middleware");
 
-        assert_eq!(outcome.reason, "middleware_denied:example_content-guard");
+        assert_eq!(outcome.reason, "middleware_denied:local-guard-service");
         assert_eq!(
             outcome.findings[0].finding.r#type,
-            "example/content-guard.finding"
+            "local-guard-service.finding"
         );
         assert_eq!(outcome.findings[0].finding.label, EXTERNAL_FINDING_LABEL);
         assert_eq!(outcome.findings[0].finding.severity, "medium");
@@ -2933,7 +2954,7 @@ mod tests {
         let secret = "sk-secret-request-value";
         let registration = external_registration(4096);
         let service = Arc::new(ScriptedService {
-            binding_id: "example/content-guard".into(),
+            manifest_name: "test/middleware".into(),
             max_body_bytes: 4096,
             result: openshell_core::proto::HttpRequestResult {
                 header_mutations: vec![write_header(
@@ -2949,7 +2970,7 @@ mod tests {
             .evaluate(
                 &[ChainEntry {
                     name: "guard".into(),
-                    implementation: "example/content-guard".into(),
+                    implementation: "local-guard-service".into(),
                     order: 0,
                     config: prost_types::Struct::default(),
                     on_error: OnError::FailClosed,
@@ -2987,7 +3008,7 @@ mod tests {
 
         for mutation in mutations {
             let service = Arc::new(ScriptedService {
-                binding_id: "example/content-guard".into(),
+                manifest_name: "test/middleware".into(),
                 max_body_bytes: 4096,
                 result: openshell_core::proto::HttpRequestResult {
                     header_mutations: vec![mutation],
@@ -3002,7 +3023,7 @@ mod tests {
                 .evaluate(
                     &[ChainEntry {
                         name: "guard".into(),
-                        implementation: "example/content-guard".into(),
+                        implementation: "local-guard-service".into(),
                         order: 0,
                         config: prost_types::Struct::default(),
                         on_error: OnError::FailClosed,
@@ -3024,7 +3045,7 @@ mod tests {
     async fn finding_overflow_is_an_invalid_response_governed_by_on_error() {
         let registration = external_registration(4096);
         let service = Arc::new(ScriptedService {
-            binding_id: "example/content-guard".into(),
+            manifest_name: "test/middleware".into(),
             max_body_bytes: 4096,
             result: openshell_core::proto::HttpRequestResult {
                 findings: vec![Finding::default(); MAX_MIDDLEWARE_FINDINGS_PER_STAGE + 1],
@@ -3039,7 +3060,7 @@ mod tests {
                 .evaluate(
                     &[ChainEntry {
                         name: "guard".into(),
-                        implementation: "example/content-guard".into(),
+                        implementation: "local-guard-service".into(),
                         order: 0,
                         config: prost_types::Struct::default(),
                         on_error,
@@ -3065,7 +3086,7 @@ mod tests {
     #[tokio::test]
     async fn maximum_chain_retains_findings_from_every_stage() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: "example/content-guard".into(),
+            manifest_name: "test/middleware".into(),
             max_body_bytes: 4096,
             result: openshell_core::proto::HttpRequestResult {
                 findings: vec![
@@ -3084,7 +3105,7 @@ mod tests {
         let entries: Vec<_> = (0..MAX_MIDDLEWARE_CHAIN_STAGES)
             .map(|index| ChainEntry {
                 name: format!("guard-{index}"),
-                implementation: "example/content-guard".into(),
+                implementation: "test/middleware".into(),
                 order: i32::try_from(index).expect("bounded stage index"),
                 config: prost_types::Struct::default(),
                 on_error: OnError::FailClosed,
@@ -3170,7 +3191,7 @@ mod tests {
     #[tokio::test]
     async fn deny_decision_ignores_oversized_replacement_under_fail_open() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: BUILTIN_REGEX.into(),
+            manifest_name: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
@@ -3291,7 +3312,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_replacement_body_honors_on_error() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: BUILTIN_REGEX.into(),
+            manifest_name: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: openshell_core::proto::HttpRequestResult {
                 body: b"too large".to_vec(),
@@ -3326,7 +3347,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_request_body_honors_on_error() {
         let runner = ChainRunner::new(Arc::new(ScriptedService {
-            binding_id: BUILTIN_REGEX.into(),
+            manifest_name: BUILTIN_REGEX.into(),
             max_body_bytes: 4,
             result: allow_result(),
         }));

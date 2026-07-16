@@ -209,7 +209,7 @@ pub fn validate(policy: &SandboxPolicy) -> Vec<PolicyViolation> {
         if middleware.middleware.is_empty() {
             violations.push(PolicyViolation::InvalidMiddlewareConfig {
                 name: middleware.name.clone(),
-                reason: "implementation must not be empty".to_string(),
+                reason: "middleware must not be empty".to_string(),
             });
         }
 

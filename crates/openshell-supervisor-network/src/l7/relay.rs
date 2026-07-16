@@ -3244,7 +3244,6 @@ network_policies:
                     name: "test/rewriter".into(),
                     service_version: "test".into(),
                     bindings: vec![openshell_core::proto::MiddlewareBinding {
-                        id: "example/rewriter".into(),
                         operation: openshell_core::proto::SupervisorMiddlewareOperation::HttpRequest
                             as i32,
                         phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials
@@ -3297,7 +3296,7 @@ network_policies:
             r#"
 network_middlewares:
   - name: rewriter
-    middleware: example/rewriter
+    middleware: test/rewriter
     on_error: fail_closed
     endpoints:
       include: ["api.example.test"]
@@ -3467,7 +3466,7 @@ network_policies:
         let data = r#"
 network_middlewares:
   - name: rewriter
-    middleware: example/rewriter
+    middleware: test/rewriter
     on_error: fail_closed
     endpoints:
       include: ["api.example.test"]
@@ -3726,14 +3725,17 @@ network_policies:
         );
     }
 
-    /// A middleware service advertising two bindings with different body
-    /// limits, for exercising mixed-limit chain buffering at the relay level.
-    /// The redactor binding replaces the body; the guard binding allows as-is.
-    struct TwoLimitService;
+    /// One named middleware with one HTTP/pre-credentials binding. Two
+    /// instances exercise mixed-limit chain buffering at the relay level.
+    struct LimitService {
+        name: &'static str,
+        max_body_bytes: u64,
+        replacement: Option<&'static [u8]>,
+    }
 
     #[tonic::async_trait]
     impl openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware
-        for TwoLimitService
+        for LimitService
     {
         async fn describe(
             &self,
@@ -3746,17 +3748,15 @@ network_policies:
                 MiddlewareBinding, MiddlewareManifest, SupervisorMiddlewareOperation,
                 SupervisorMiddlewarePhase,
             };
-            let binding = |id: &str, max_body_bytes: u64| MiddlewareBinding {
-                id: id.into(),
-                operation: SupervisorMiddlewareOperation::HttpRequest as i32,
-                phase: SupervisorMiddlewarePhase::PreCredentials as i32,
-                max_body_bytes,
-                timeout: String::new(),
-            };
             Ok(tonic::Response::new(MiddlewareManifest {
-                name: "test/two-limits".into(),
+                name: self.name.into(),
                 service_version: "test".into(),
-                bindings: vec![binding("test/redactor", 8192), binding("test/guard", 16)],
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_body_bytes: self.max_body_bytes,
+                    timeout: String::new(),
+                }],
             }))
         }
 
@@ -3782,13 +3782,13 @@ network_policies:
             tonic::Response<openshell_core::proto::HttpRequestResult>,
             tonic::Status,
         > {
-            let evaluation = request.into_inner();
+            let _evaluation = request.into_inner();
             let mut result = openshell_core::proto::HttpRequestResult {
                 decision: openshell_core::proto::Decision::Allow as i32,
                 ..Default::default()
             };
-            if evaluation.binding_id == "test/redactor" {
-                result.body = b"[SCRUBBED BY TEST REDACTOR]".to_vec();
+            if let Some(replacement) = self.replacement {
+                result.body = replacement.to_vec();
                 result.has_body = true;
             }
             Ok(tonic::Response::new(result))
@@ -3806,7 +3806,24 @@ network_policies:
         // chain taking the unbuffered over-capacity path.
         let (_config, tunnel_engine, ctx) =
             middleware_relay_context("openshell/regex", "fail_closed");
-        let runner = ChainRunner::new(Arc::new(TwoLimitService));
+        let registry = openshell_supervisor_middleware::MiddlewareRegistry::connect_services(
+            vec![
+                Arc::new(LimitService {
+                    name: "test/redactor",
+                    max_body_bytes: 8192,
+                    replacement: Some(b"[SCRUBBED BY TEST REDACTOR]"),
+                }),
+                Arc::new(LimitService {
+                    name: "test/guard",
+                    max_body_bytes: 16,
+                    replacement: None,
+                }),
+            ],
+            Vec::new(),
+        )
+        .await
+        .expect("connect named middleware services");
+        let runner = ChainRunner::from_registry(registry);
         let chain = vec![
             ChainEntry {
                 name: "redact".into(),

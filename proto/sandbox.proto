@@ -70,7 +70,7 @@ message NetworkPolicyRule {
 message NetworkMiddlewareConfig {
   // Policy-local config name.
   string name = 1;
-  // Built-in or registered middleware implementation name.
+  // Built-in middleware name or operator-owned registration name.
   string middleware = 2;
   // Service-specific configuration.
   google.protobuf.Struct config = 3;
@@ -368,7 +368,7 @@ message GetSandboxConfigResponse {
 // Connection details for one operator-registered supervisor middleware service.
 // V1 supports plaintext and server-authenticated TLS gRPC.
 message SupervisorMiddlewareService {
-  // Operator-facing registration name used for diagnostics.
+  // Operator-owned registration name used by policy attachments and diagnostics.
   string name = 1;
   // gRPC endpoint reachable from the sandbox supervisor.
   string grpc_endpoint = 2;

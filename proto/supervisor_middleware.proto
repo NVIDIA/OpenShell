@@ -26,7 +26,8 @@ service SupervisorMiddleware {
 // exposes. The service is the operator-run gRPC server implementing
 // SupervisorMiddleware.
 message MiddlewareManifest {
-  // Human-readable middleware service name used for diagnostics.
+  // Human-readable middleware service name used only for diagnostics. This is
+  // not required to match an operator-owned registration name.
   string name = 1;
   // Release version of the middleware service implementation, used for
   // diagnostics.
@@ -37,28 +38,26 @@ message MiddlewareManifest {
 
 // MiddlewareBinding declares one operation and phase supported by a service.
 message MiddlewareBinding {
-  // Stable binding id used by policy configuration and audit logs.
-  string id = 1;
   // Supported operation. V1 supports HTTP_REQUEST.
-  SupervisorMiddlewareOperation operation = 2;
+  SupervisorMiddlewareOperation operation = 1;
   // Supported evaluation phase. V1 supports PRE_CREDENTIALS.
-  SupervisorMiddlewarePhase phase = 3;
+  SupervisorMiddlewarePhase phase = 2;
   // Maximum request or replacement body this binding can process.
-  uint64 max_body_bytes = 4;
+  uint64 max_body_bytes = 3;
   // Optional binding-specific RPC timeout. Empty uses the operator-configured
   // service timeout, or the 500ms platform default when that is also omitted.
   // A non-empty value may shorten but cannot extend the operator timeout.
   // Values use an integer with an `ms` or `s` suffix and must be between
   // 10ms and 30s.
-  string timeout = 5;
+  string timeout = 4;
 }
 
 // ValidateConfigRequest contains one policy configuration to validate.
 message ValidateConfigRequest {
-  // Manifest binding id associated with this configuration.
-  string binding_id = 1;
   // Service-specific policy configuration.
-  google.protobuf.Struct config = 2;
+  google.protobuf.Struct config = 1;
+  // Built-in middleware name or operator-owned registration name.
+  string middleware_name = 2;
 }
 
 // ValidateConfigResponse reports whether a policy configuration is accepted.
@@ -71,26 +70,26 @@ message ValidateConfigResponse {
 
 // HttpRequestEvaluation contains one buffered HTTP request to evaluate.
 message HttpRequestEvaluation {
-  // Manifest binding id selected for this evaluation.
-  string binding_id = 1;
   // Evaluation phase selected for this request.
-  SupervisorMiddlewarePhase phase = 2;
+  SupervisorMiddlewarePhase phase = 1;
   // Sandbox and request identity available to the supervisor.
   // The encoded context is limited to 4 KiB.
-  RequestContext context = 3;
+  RequestContext context = 2;
   // Validated service-specific policy configuration.
   // The encoded configuration is limited to 64 KiB.
-  google.protobuf.Struct config = 4;
+  google.protobuf.Struct config = 3;
   // Destination and HTTP request target.
   // The encoded target is limited to 32 KiB.
-  HttpRequestTarget target = 5;
+  HttpRequestTarget target = 4;
   // HTTP request headers before OpenShell injects credentials, in wire
   // order. Repeated header names are preserved as separate entries. Protected
   // credential, routing, framing, and hop-by-hop headers are omitted.
   // At most 128 lines and 64 KiB of encoded headers are included.
-  repeated HttpHeader headers = 6;
+  repeated HttpHeader headers = 5;
   // Buffered request body, limited to 4 MiB. Empty for a bodyless request.
-  bytes body = 7;
+  bytes body = 6;
+  // Built-in middleware name or operator-owned registration name.
+  string middleware_name = 7;
 }
 
 // HttpHeader is one request header line.
@@ -227,8 +226,9 @@ message HttpRequestResult {
   // validated name/value data, and 64 KiB encoded are accepted.
   repeated HeaderMutation header_mutations = 5;
   // Audit-safe findings produced during evaluation. For operator-run services,
-  // OpenShell logs platform-owned fields derived from the validated binding id
-  // rather than service-provided type, label, confidence, or metadata text.
+  // OpenShell logs platform-owned fields derived from the operator-owned
+  // registration name rather than service-provided type, label, confidence,
+  // or metadata text.
   // At most 32 findings of at most 4 KiB encoded each are accepted per stage.
   // A policy selects at most 10 stages, so one chain retains at most 320.
   repeated Finding findings = 6;

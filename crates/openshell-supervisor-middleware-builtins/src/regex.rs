@@ -19,7 +19,7 @@ use openshell_core::proto::{
 use regex::Regex;
 use serde::Deserialize;
 
-pub const BINDING_ID: &str = "openshell/regex";
+pub const NAME: &str = "openshell/regex";
 const MAX_BODY_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -40,9 +40,7 @@ impl RegexConfig {
     pub fn from_struct(config: &prost_types::Struct) -> Result<Self> {
         serde_json::from_value(openshell_core::proto_struct::struct_to_json_value(config)).map_err(
             |error| {
-                miette!(
-                    "invalid {BINDING_ID} config: {error}; this example supports only mode: redact"
-                )
+                miette!("invalid {NAME} config: {error}; this example supports only mode: redact")
             },
         )
     }
@@ -50,7 +48,6 @@ impl RegexConfig {
 
 pub fn describe() -> MiddlewareBinding {
     MiddlewareBinding {
-        id: BINDING_ID.into(),
         operation: SupervisorMiddlewareOperation::HttpRequest as i32,
         phase: SupervisorMiddlewarePhase::PreCredentials as i32,
         max_body_bytes: MAX_BODY_BYTES,
@@ -86,7 +83,7 @@ pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpR
     let default_config = prost_types::Struct::default();
     validate_config(evaluation.config.as_ref().unwrap_or(&default_config))?;
     let text = String::from_utf8(evaluation.body.clone())
-        .map_err(|_| miette!("{} requires UTF-8 request bodies", BINDING_ID))?;
+        .map_err(|_| miette!("{NAME} requires UTF-8 request bodies"))?;
     let (body, matches) = apply_replacements(&text);
     let total: u32 = matches
         .iter()

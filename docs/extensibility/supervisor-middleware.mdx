@@ -37,7 +37,7 @@ Middleware receives the request before credential injection. Operator-run servic
 
 `openshell/regex` is an example built-in middleware. It replaces only simple, self-contained token patterns in UTF-8 request bodies; the initial pattern recognizes `sk-` tokens. It does not infer values from keyword assignments such as JSON `password` fields. This best-effort text transformation is not parser-aware and does not guarantee that it will detect or fully remove sensitive values. Its `config` accepts one field, `mode: redact`, which is also the default when the field is omitted. Unknown config fields and non-string values are rejected at policy validation. Custom expressions are not configurable yet.
 
-Operator-run services expose one or more binding IDs. Policies reference a binding ID, such as `example/content-guard`, rather than the gateway registration name.
+Operator-run services expose bindings for supported operation and phase pairs. A binding is identified by its operation and phase; V1 supports only `HttpRequest/pre_credentials`. Policies attach the complete middleware by its operator-owned gateway registration name.
 
 ## Register a Middleware Service
 
@@ -53,14 +53,14 @@ timeout = "500ms"
 
 | Field | Description |
 | --- | --- |
-| `name` | Operator-facing registration name used in diagnostics. Policies do not reference this value. |
+| `name` | Operator-owned registration name used by policy attachments and diagnostics. Names must be unique, and `openshell/` is reserved for built-ins. |
 | `grpc_endpoint` | Service address reachable from both the gateway and sandbox supervisors. Supports plaintext `http://` and TLS `https://` with platform trust roots. |
 | `max_body_bytes` | Operator limit applied to every binding exposed by the service, up to the 4 MiB platform maximum. |
 | `timeout` | Optional service-wide RPC timeout using an integer with an `ms` or `s` suffix. Defaults to `500ms`; valid values range from `10ms` through `30s`. |
 
 Each binding returned by `Describe` may advertise a shorter `timeout` using the same syntax and bounds. The operator-configured service timeout is a ceiling: OpenShell uses the smaller of the binding and service values. An omitted binding timeout inherits the service setting, and an omitted service setting uses the 500 ms platform default. OpenShell rejects an invalid timeout before accepting the manifest. The service timeout applies to `Describe`, while the effective binding timeout applies to `ValidateConfig` and `EvaluateHttpRequest`.
 
-The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes a binding ID already owned by another service. Operator-run services cannot claim the reserved `openshell/` namespace.
+The gateway connects to every registered service and verifies its capabilities before accepting traffic. Gateway startup fails when a service is unavailable, reports an invalid capability, or exposes more than one binding for the same operation and phase. The manifest `name` is diagnostic metadata and does not need to match the operator registration name. Operator-run registration names cannot claim the reserved `openshell/` namespace.
 
 Registration is static. Restart the gateway after adding, removing, or changing a service. See [Gateway Configuration](/reference/gateway-config#supervisor-middleware-services) for the complete gateway TOML context.
 
@@ -81,11 +81,11 @@ network_middlewares:
       exclude: ["trusted.example.com"]
 ```
 
-Each config has a policy-local `name`, a built-in or operator-provided binding ID in `middleware`, an integer `order`, implementation-owned `config`, failure behavior, and host selectors. A policy accepts at most 10 middleware configs.
+Each config has a policy-local `name`, a built-in or operator-owned registration name in `middleware`, an integer `order`, implementation-owned `config`, failure behavior, and host selectors. A policy accepts at most 10 middleware configs.
 
 `include` selects destination hosts. `exclude` takes precedence and removes hosts from that selection. Each config accepts at most 32 combined include and exclude patterns. Matching is case-insensitive and uses the same exact-host and DNS glob behavior as network policy endpoints: `*` matches exactly one DNS label, `**` matches one or more labels, and intra-label patterns like `*-api.example.com` work. Brace alternates such as `{prod,staging}` are rejected at validation; list each host pattern separately.
 
-Matching configs run once each by ascending `order`; lower values run first and policy-local names break ties. The default order is `0`. Different config names may reference the same binding and run as separate stages. Config names must be unique. Runtime selection defensively rejects chains with more than 10 stages.
+Matching configs run once each by ascending `order`; lower values run first and policy-local names break ties. The default order is `0`. Different config names may attach the same middleware and run as separate stages. Config names must be unique. Runtime selection defensively rejects chains with more than 10 stages.
 
 See [Policy Schema](/reference/policy-schema#network-middleware) for the complete field reference.
 
@@ -147,11 +147,11 @@ When the effective sandbox configuration changes, a running supervisor validates
 
 Middleware activity is emitted through OpenShell's OCSF logging:
 
-- Each invocation records its policy-local middleware name, binding, decision, transformation state, and failure state.
-- A denied built-in invocation records its audit-safe reason. For operator-run services, OpenShell records a stable reason derived from the validated binding ID instead of service-provided per-request text.
+- Each invocation records its policy-local config name, attached middleware name, decision, transformation state, and failure state.
+- A denied built-in invocation records its audit-safe reason. For operator-run services, OpenShell records a stable reason derived from the operator-owned registration name instead of service-provided per-request text.
 - A bypass under `fail_open` emits a detection finding.
 - A required stage that fails closed emits a high-severity detection finding.
-- Built-in findings include their type, label, and aggregate count. Operator-run findings use the validated binding ID and a platform label plus the aggregate count; OpenShell does not log service-provided finding text or diagnostic metadata. A stage can return at most 32 findings. Exceeding the per-stage cap is an invalid response handled through `on_error`. A maximum 10-stage chain retains and emits up to 320 findings without silently dropping findings from later stages.
+- Built-in findings include their type, label, and aggregate count. Operator-run findings use the operator-owned registration name and a platform label plus the aggregate count; OpenShell does not log service-provided finding text or diagnostic metadata. A stage can return at most 32 findings. Exceeding the per-stage cap is an invalid response handled through `on_error`. A maximum 10-stage chain retains and emits up to 320 findings without silently dropping findings from later stages.
 - Registry reload success and failure are emitted as configuration state changes.
 
 See [Logging](/observability/logging) for log access and [OCSF JSON Export](/observability/ocsf-json-export) for structured export.

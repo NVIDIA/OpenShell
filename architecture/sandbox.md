@@ -74,6 +74,10 @@ and phases as enums. Built-ins run in-process;
 operator-registered services are called directly from the supervisor
 over the common middleware gRPC contract. The gateway validates external
 service capabilities and implementation-owned config before delivery.
+Policy entries resolve built-ins by their platform name and external middleware
+by the operator-owned registration name. Each attachment selects the binding
+for the active operation and phase. A manifest cannot declare two bindings for
+the same operation and phase pair.
 The platform caps middleware bodies at 4 MiB and derives the gRPC transport
 limit from bounded request and response components, reserving 292 KiB for the
 largest valid protobuf envelope. Config, context, target, headers, mutations,
@@ -90,7 +94,8 @@ because bindings have not been discovered yet.
 Registration and manifest body limits above the platform boundary fail before
 request-body allocation. External per-request reason, finding text, mutation
 errors, and diagnostic metadata are untrusted: the supervisor maps logged
-findings to the validated binding ID and uses platform-owned failure codes.
+findings to the validated operator registration name and uses platform-owned
+failure codes.
 At startup, the supervisor installs the in-process registry before connecting
 to external services, so an external outage cannot remove built-in bindings.
 For a gateway policy snapshot, the supervisor prepares replacements off to the
@@ -109,8 +114,8 @@ implementation is only a best-effort example for simple, self-contained token
 patterns; it does not infer values from keyword assignments, is not a
 parser-aware secret scanner, and makes no redaction guarantee. The
 gateway and supervisor inject
-those services explicitly and discover their binding IDs through the same
-`Describe` contract used by external services. Reusable compiled DNS host
+those services explicitly and discover their operation/phase capabilities
+through the same `Describe` contract used by external services. Reusable compiled DNS host
 patterns and selectors remain in `openshell-core::host_pattern`.
 
 `openshell-policy` validates policy-owned middleware structure without knowing
