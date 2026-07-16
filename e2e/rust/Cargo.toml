@@ -18,6 +18,7 @@ publish = false
 [features]
 e2e = []
 e2e-api-conformance = ["e2e"]
+e2e-cli-conformance = ["e2e"]
 # Selects tests that rely on `host.openshell.internal` (the sandbox's stable
 # alias to the host running test fixtures). docker, podman, and vm wire the
 # alias unconditionally; the kube driver only does so when the chart's
@@ -46,6 +47,16 @@ required-features = ["e2e-oidc-pkce"]
 name = "conformance"
 path = "tests/conformance.rs"
 required-features = ["e2e-api-conformance"]
+
+[[test]]
+name = "sandbox_labels"
+path = "tests/sandbox_labels.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
+name = "sandbox_lifecycle"
+path = "tests/sandbox_lifecycle.rs"
+required-features = ["e2e-cli-conformance"]
 
 [[test]]
 name = "custom_image"
