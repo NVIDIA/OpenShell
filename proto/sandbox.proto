@@ -59,7 +59,7 @@ message ProcessPolicy {
 
 // A named network access policy rule.
 message NetworkPolicyRule {
-  // Human-readable name for this middleware config.
+  // Human-readable name for this policy rule.
   string name = 1;
   // Allowed endpoint (host:port) pairs.
   repeated NetworkEndpoint endpoints = 2;
