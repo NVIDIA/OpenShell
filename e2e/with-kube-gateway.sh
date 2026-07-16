@@ -463,6 +463,7 @@ run_scenario() {
     "${LOCAL_PORT}"
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
+  export OPENSHELL_GATEWAY_ENDPOINT="${GATEWAY_ENDPOINT}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
   # Kubernetes e2e runs against k3d/kind-style Docker-backed clusters. Host
   # fixture containers must use the same Docker host so published ports and
@@ -886,6 +887,7 @@ else
     "${LOCAL_PORT}"
 
   export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
+  export OPENSHELL_GATEWAY_ENDPOINT="${GATEWAY_ENDPOINT}"
   export OPENSHELL_E2E_DRIVER="kubernetes"
   # Kubernetes e2e runs against k3d/kind-style Docker-backed clusters. Host
   # fixture containers must use the same Docker host so published ports and
