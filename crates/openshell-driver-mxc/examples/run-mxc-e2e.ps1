@@ -128,7 +128,7 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
             process     = @{
                 commandLine = "C:\Windows\System32\cmd.exe /c exit 0"
                 cwd         = $probeDir
-                timeout     = 10
+                timeout     = 30000 # MXC process.timeout is milliseconds
             }
             filesystem  = @{ readwritePaths = @($probeDir) }
             processContainer = @{ leastPrivilege = $false }
