@@ -130,6 +130,23 @@ Project requirements:
 - Docker (running)
 - Z3 solver library (for the policy prover crate)
 
+### Windows build tools
+
+The Windows MSVC build lane (`mise run windows:*`) requires a specific set of native toolchain components. Run the bootstrap script once to install everything:
+
+```powershell
+.\scripts\windows-bootstrap-deps.ps1
+```
+
+The script is idempotent — safe to run again if the environment changes. It installs:
+
+- Visual Studio 2022 Build Tools (VC x64 + ARM64, Windows 11 SDK, Clang toolset, CMake)
+- rustup + Rust MSVC toolchain with x64 and ARM64 targets, rustfmt, and clippy
+- `mise`, `protoc`, and a PATH-discoverable `cmake`
+- Python 3 (required by the Z3 CMake codegen step in `bundled-z3`)
+
+After the script completes, open a new shell so the updated `PATH` takes effect.
+
 ### macOS build tools
 
 Install Apple Command Line Tools before building locally:
@@ -208,6 +225,26 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run docs`      | Validate Fern docs locally                              |
 | `mise run helm:docs` | Regenerate the Helm chart README                        |
 | `mise run clean`     | Clean build artifacts                                   |
+
+## Windows Build
+
+Use `scripts/windows-build.ps1` to run the full Windows MSVC build pipeline and verify that the MXC compute driver is compiled into the gateway:
+
+```powershell
+# Build both x64 and ARM64 (default)
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-build.ps1
+
+# Build a single target
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-build.ps1 -Target x64
+
+# Skip cargo check, just do the release build
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-build.ps1 -SkipCheck
+
+# Also run runtime verification (requires wxc-exec; blocked by Smart App Control on some hosts)
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-build.ps1 -RunVerify
+```
+
+The script wraps `mise run windows:*` tasks, auto-discovers `LIBCLANG_PATH` from Visual Studio, and asserts that `openshell-driver-mxc` appears in the gateway dependency graph. Exit code 0 means all requested steps passed.
 
 ## Project Structure
 
