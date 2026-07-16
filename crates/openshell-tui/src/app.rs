@@ -1213,7 +1213,7 @@ impl App {
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.gateway_selected > 0 {
+                if !self.gateways.is_empty() && self.gateway_selected > 0 {
                     self.gateway_selected -= 1;
                 } else {
                     self.overflow_focus_up();
@@ -1262,7 +1262,7 @@ impl App {
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.provider_selected > 0 {
+                if self.provider_count > 0 && self.provider_selected > 0 {
                     self.provider_selected -= 1;
                 } else {
                     self.overflow_focus_up();
@@ -1308,7 +1308,7 @@ impl App {
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.global_settings_selected > 0 {
+                if !self.global_settings.is_empty() && self.global_settings_selected > 0 {
                     self.global_settings_selected -= 1;
                 } else {
                     self.overflow_focus_up();
@@ -1456,7 +1456,7 @@ impl App {
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                if self.sandbox_selected > 0 {
+                if self.sandbox_count > 0 && self.sandbox_selected > 0 {
                     self.sandbox_selected -= 1;
                 } else {
                     self.overflow_focus_up();
