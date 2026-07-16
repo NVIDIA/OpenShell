@@ -6,6 +6,11 @@
 from __future__ import annotations
 
 from .sandbox import (
+    AsyncInferenceRouteClient,
+    AsyncSandbox,
+    AsyncSandboxClient,
+    AsyncSandboxSession,
+    AsyncWorkspaceClient,
     ExecChunk,
     ExecResult,
     InferenceRouteClient,
@@ -29,6 +34,11 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
+    "AsyncInferenceRouteClient",
+    "AsyncSandbox",
+    "AsyncSandboxClient",
+    "AsyncSandboxSession",
+    "AsyncWorkspaceClient",
     "ExecChunk",
     "ExecResult",
     "InferenceRouteClient",
