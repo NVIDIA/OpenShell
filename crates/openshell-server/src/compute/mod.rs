@@ -827,25 +827,31 @@ impl ComputeRuntime {
             if phase == SandboxPhase::Deleting {
                 continue;
             }
-            let sandbox_error = phase == SandboxPhase::Error;
+            let recoverable_error = phase == SandboxPhase::Error
+                && is_recoverable_error_reason(&sandbox);
+            if phase == SandboxPhase::Error && !recoverable_error {
+                continue;
+            }
 
             match resume
                 .resume_sandbox(sandbox.object_id(), sandbox.object_name())
                 .await
             {
                 Ok(true) => {
-                    if sandbox_error {
-                        self.clear_sandbox_error(&sandbox).await;
-                    }
+                    let did_recover = if recoverable_error {
+                        self.clear_recoverable_error(&sandbox).await
+                    } else {
+                        false
+                    };
                     info!(
                         sandbox_id = %sandbox.object_id(),
                         sandbox_name = %sandbox.object_name(),
                         ?phase,
-                        recovered = sandbox_error,
+                        recovered = did_recover,
                         "Resumed sandbox during gateway startup"
                     );
                     resumed += 1;
-                    if sandbox_error {
+                    if did_recover {
                         recovered += 1;
                     }
                 }
@@ -855,7 +861,7 @@ impl ComputeRuntime {
                         sandbox_name = %sandbox.object_name(),
                         "Cannot resume sandbox: backend resource is missing"
                     );
-                    if !sandbox_error {
+                    if !recoverable_error {
                         self.mark_sandbox_error(
                             &sandbox,
                             "BackendResourceMissing",
@@ -872,7 +878,7 @@ impl ComputeRuntime {
                         error = %err,
                         "Failed to resume sandbox during gateway startup"
                     );
-                    if !sandbox_error {
+                    if !recoverable_error {
                         self.mark_sandbox_error(
                             &sandbox,
                             "ResumeFailed",
@@ -935,7 +941,7 @@ impl ComputeRuntime {
         }
     }
 
-    async fn clear_sandbox_error(&self, sandbox: &Sandbox) {
+    async fn clear_recoverable_error(&self, sandbox: &Sandbox) -> bool {
         let _guard = self.sync_lock.lock().await;
         let sandbox_id = sandbox.object_id().to_string();
         match self
@@ -960,6 +966,7 @@ impl ComputeRuntime {
             Ok(updated) => {
                 self.sandbox_index.update_from_sandbox(&updated);
                 self.sandbox_watch_bus.notify(&sandbox_id);
+                true
             }
             Err(err) => {
                 warn!(
@@ -967,6 +974,7 @@ impl ComputeRuntime {
                     error = %err,
                     "Failed to clear sandbox error state during startup resume"
                 );
+                false
             }
         }
     }
@@ -2126,6 +2134,19 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
     }
 }
 
+/// Error-phase sandboxes are only eligible for startup recovery when
+/// their Ready condition reason indicates a container exit or stop —
+/// i.e. the runtime went away (machine restart, daemon restart) rather
+/// than a genuine application or infrastructure failure.
+fn is_recoverable_error_reason(sandbox: &Sandbox) -> bool {
+    use openshell_core::driver_utils::{CONDITION_EXITED, CONDITION_STOPPED};
+    sandbox
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.iter().find(|c| c.r#type == "Ready"))
+        .is_some_and(|c| c.reason == CONDITION_EXITED || c.reason == CONDITION_STOPPED)
+}
+
 fn is_terminal_failure_reason(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
     let transient_reasons = [
@@ -2542,6 +2563,19 @@ mod tests {
             ..Default::default()
         };
         sandbox.set_phase(phase as i32);
+        sandbox
+    }
+
+    fn error_sandbox_record(id: &str, name: &str, reason: &str) -> Sandbox {
+        let mut sandbox = sandbox_record(id, name, SandboxPhase::Error);
+        let status = sandbox.status.get_or_insert_with(Default::default);
+        status.conditions.push(SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: reason.to_string(),
+            message: String::new(),
+            last_transition_time: String::new(),
+        });
         sandbox
     }
 
@@ -3494,11 +3528,12 @@ mod tests {
             ("sb-ready", "ready", SandboxPhase::Ready),
             ("sb-unknown", "unknown", SandboxPhase::Unknown),
             ("sb-deleting", "deleting", SandboxPhase::Deleting),
-            ("sb-error", "error", SandboxPhase::Error),
         ] {
             let sandbox = sandbox_record(id, name, phase);
             runtime.store.put_message(&sandbox).await.unwrap();
         }
+        let error_sb = error_sandbox_record("sb-error", "error", "ContainerExited");
+        runtime.store.put_message(&error_sb).await.unwrap();
 
         runtime.resume_persisted_sandboxes().await.unwrap();
 
@@ -3611,7 +3646,7 @@ mod tests {
         let runtime =
             test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
 
-        let sandbox = sandbox_record("sb-err-recover", "recover", SandboxPhase::Error);
+        let sandbox = error_sandbox_record("sb-err-recover", "recover", "ContainerExited");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime.resume_persisted_sandboxes().await.unwrap();
@@ -3643,7 +3678,7 @@ mod tests {
         let runtime =
             test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
 
-        let sandbox = sandbox_record("sb-err-gone", "gone", SandboxPhase::Error);
+        let sandbox = error_sandbox_record("sb-err-gone", "gone", "ContainerExited");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime.resume_persisted_sandboxes().await.unwrap();
@@ -3671,7 +3706,7 @@ mod tests {
         let runtime =
             test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
 
-        let sandbox = sandbox_record("sb-err-fail", "fail", SandboxPhase::Error);
+        let sandbox = error_sandbox_record("sb-err-fail", "fail", "ContainerExited");
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime.resume_persisted_sandboxes().await.unwrap();
@@ -3681,6 +3716,32 @@ mod tests {
         let stored = runtime
             .store
             .get_message::<Sandbox>("sb-err-fail")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_persisted_sandboxes_skips_non_recoverable_error() {
+        let resume = Arc::new(RecordingResume::default());
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+
+        let sandbox =
+            error_sandbox_record("sb-err-perm", "perm", "BackendResourceMissing");
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.resume_persisted_sandboxes().await.unwrap();
+
+        assert!(resume.calls().await.is_empty());
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-err-perm")
             .await
             .unwrap()
             .unwrap();
