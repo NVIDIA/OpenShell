@@ -336,6 +336,8 @@ openshell term
 
 Use the terminal to spot blocked connections marked `action=deny` and inference-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy. Refer to [Policies](/sandboxes/policies) for the workflow.
 
+The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
+
 ## Port Forwarding
 
 Forward a local port to a running sandbox to access services inside it, such as a web server or database:
