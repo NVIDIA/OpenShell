@@ -25,7 +25,7 @@ url = { workspace = true }
 ipnet = "2"
 base64 = { workspace = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
-reqwest = { workspace = true, features = ["blocking", "rustls-tls-webpki-roots"], optional = true }
+reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots"], optional = true }
 
 [features]
 default = ["telemetry"]

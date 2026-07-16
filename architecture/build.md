@@ -39,6 +39,21 @@ are no-ops, so the data-model types stay available and dependent crates compile
 unchanged. The runtime `OPENSHELL_TELEMETRY_ENABLED` switch remains the way to
 disable telemetry in a default (telemetry-enabled) build.
 
+Supervisor upstream TLS root-store selection is controlled by mutually
+exclusive Cargo features. Default builds enable `bundled-ca-roots`, which
+preserves upstream behavior by using Mozilla roots through `webpki-roots` plus
+locally-installed CAs from the system bundle. Linux distribution builds should
+use `--no-default-features --features system-ca-roots` so supervisor upstream
+TLS uses the native trust store and the workspace dependency graph excludes
+bundled Mozilla root crates such as `webpki-roots` and `webpki-root-certs`.
+Other Rustls clients use native roots directly because that already satisfies
+Linux distribution trust-store policy.
+
+The workspace uses `z3` versions whose `z3-sys` dependency keeps downloader
+HTTP/TLS support behind explicit build features, so default system-Z3 builds do
+not reintroduce bundled Mozilla roots. Release builds that need bundled Z3
+continue to opt in with `bundled-z3`.
+
 ## Linux Runtime Environments
 
 OpenShell uses different Linux libc environments for different host artifacts.
