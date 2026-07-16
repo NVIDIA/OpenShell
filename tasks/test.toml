@@ -125,7 +125,7 @@ env = { OPENSHELL_E2E_KUBE_DB_SCENARIOS = "1" }
 run = "e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:vm"]
-description = "Start openshell-gateway with the VM compute driver and run the cluster-agnostic smoke e2e"
+description = "Start openshell-gateway with the VM compute driver and run VM e2e tests"
 run = "e2e/rust/e2e-vm.sh"
 
 ["e2e:docker"]

@@ -259,7 +259,10 @@ state, SSH sessions, policy revisions, settings, inference configuration, and
 deployment records. Provider refresh material is stored as a separate object
 scoped to the provider instance through `objects.scope`; the provider record
 keeps only the current injectable credential values and optional per-credential
-expiry timestamps.
+expiry timestamps. A refresh normally mints one credential, but a strategy may
+co-mint several (AWS STS mints the access key, secret key, and session token in
+one call); the refresh state pins the resolved set of env keys it owns so
+collision checks reserve all of them before the first mint.
 
 ### Optimistic Concurrency (CAS)
 

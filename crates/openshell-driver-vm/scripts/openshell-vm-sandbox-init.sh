@@ -9,6 +9,10 @@
 
 set -euo pipefail
 
+# libkrun consumes this driver-owned switch before exec'ing this script as
+# PID 1. Do not leak the runtime control into the supervisor or workloads.
+unset KRUN_INIT_PID1
+
 BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
 # gvisor-tap-vsock subnet layout:
 #   192.168.127.1   — gateway: gvproxy's DNS / DHCP / HTTP API. Does NOT

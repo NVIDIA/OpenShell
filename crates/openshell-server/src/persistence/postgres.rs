@@ -164,17 +164,16 @@ RETURNING resource_version, created_at_ms, updated_at_ms
                         updated_at_ms: row.get("updated_at_ms"),
                     })
                 } else {
-                    // Check if object exists to distinguish NotFound from Conflict
+                    // The version-matched UPDATE matched no row. Distinguish a
+                    // version mismatch (row present, different version) from an
+                    // absent row (deleted / never existed). Both are CAS
+                    // precondition failures, so report them as typed `Conflict`
+                    // rather than a backend-dependent error string: absent rows
+                    // carry `current_resource_version: None`.
                     let existing = self.get(object_type, id).await?;
-                    if let Some(record) = existing {
-                        Err(PersistenceError::Conflict {
-                            current_resource_version: Some(record.resource_version),
-                        })
-                    } else {
-                        Err(PersistenceError::Database(format!(
-                            "object not found: {object_type}/{id}"
-                        )))
-                    }
+                    Err(PersistenceError::Conflict {
+                        current_resource_version: existing.map(|record| record.resource_version),
+                    })
                 }
             }
             WriteCondition::Unconditional => {

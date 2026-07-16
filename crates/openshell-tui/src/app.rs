@@ -751,6 +751,9 @@ fn refresh_strategy_label(strategy: i32) -> &'static str {
         openshell_core::proto::ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
             "google_service_account_jwt"
         }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
+            "aws_sts_assume_role"
+        }
         openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -1140,6 +1143,70 @@ impl App {
         }
     }
 
+    const DASHBOARD_PANELS: [Focus; 3] = [Focus::Gateways, Focus::Providers, Focus::Sandboxes];
+
+    fn panel_item_count(&self, focus: Focus) -> usize {
+        match focus {
+            Focus::Gateways => self.gateways.len(),
+            Focus::Providers => {
+                if self.middle_pane_tab == MiddlePaneTab::GlobalSettings {
+                    self.global_settings.len()
+                } else {
+                    self.provider_count
+                }
+            }
+            Focus::Sandboxes => self.sandbox_count,
+            _ => 0,
+        }
+    }
+
+    fn set_panel_cursor(&mut self, focus: Focus, index: usize) {
+        match focus {
+            Focus::Gateways => self.gateway_selected = index,
+            Focus::Providers => {
+                if self.middle_pane_tab == MiddlePaneTab::GlobalSettings {
+                    self.global_settings_selected = index;
+                } else {
+                    self.provider_selected = index;
+                }
+            }
+            Focus::Sandboxes => self.sandbox_selected = index,
+            _ => {}
+        }
+    }
+
+    fn overflow_focus_down(&mut self) {
+        let cur_idx = Self::DASHBOARD_PANELS
+            .iter()
+            .position(|&f| f == self.focus)
+            .unwrap_or(0);
+        for offset in 1..=Self::DASHBOARD_PANELS.len() {
+            let next = Self::DASHBOARD_PANELS[(cur_idx + offset) % Self::DASHBOARD_PANELS.len()];
+            if self.panel_item_count(next) > 0 {
+                self.focus = next;
+                self.set_panel_cursor(next, 0);
+                return;
+            }
+        }
+    }
+
+    fn overflow_focus_up(&mut self) {
+        let cur_idx = Self::DASHBOARD_PANELS
+            .iter()
+            .position(|&f| f == self.focus)
+            .unwrap_or(0);
+        for offset in 1..=Self::DASHBOARD_PANELS.len() {
+            let prev = Self::DASHBOARD_PANELS
+                [(cur_idx + Self::DASHBOARD_PANELS.len() - offset) % Self::DASHBOARD_PANELS.len()];
+            let count = self.panel_item_count(prev);
+            if count > 0 {
+                self.focus = prev;
+                self.set_panel_cursor(prev, count - 1);
+                return;
+            }
+        }
+    }
+
     fn handle_gateways_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.running = false,
@@ -1149,11 +1216,19 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down if !self.gateways.is_empty() => {
-                self.gateway_selected = (self.gateway_selected + 1).min(self.gateways.len() - 1);
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.gateways.is_empty() && self.gateway_selected < self.gateways.len() - 1 {
+                    self.gateway_selected += 1;
+                } else {
+                    self.overflow_focus_down();
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.gateway_selected = self.gateway_selected.saturating_sub(1);
+                if !self.gateways.is_empty() && self.gateway_selected > 0 {
+                    self.gateway_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
             KeyCode::Enter => {
                 if let Some(entry) = self.gateways.get(self.gateway_selected) {
@@ -1190,11 +1265,19 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down if self.provider_count > 0 => {
-                self.provider_selected = (self.provider_selected + 1).min(self.provider_count - 1);
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.provider_count > 0 && self.provider_selected < self.provider_count - 1 {
+                    self.provider_selected += 1;
+                } else {
+                    self.overflow_focus_down();
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.provider_selected = self.provider_selected.saturating_sub(1);
+                if self.provider_count > 0 && self.provider_selected > 0 {
+                    self.provider_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
             KeyCode::Char('c') if !self.providers_v2_enabled => {
                 self.open_create_provider_form();
@@ -1226,12 +1309,21 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down if !self.global_settings.is_empty() => {
-                self.global_settings_selected =
-                    (self.global_settings_selected + 1).min(self.global_settings.len() - 1);
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.global_settings.is_empty()
+                    && self.global_settings_selected < self.global_settings.len() - 1
+                {
+                    self.global_settings_selected += 1;
+                } else {
+                    self.overflow_focus_down();
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.global_settings_selected = self.global_settings_selected.saturating_sub(1);
+                if !self.global_settings.is_empty() && self.global_settings_selected > 0 {
+                    self.global_settings_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
             KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
                 self.middle_pane_tab = self.middle_pane_tab.next();
@@ -1367,11 +1459,19 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down if self.sandbox_count > 0 => {
-                self.sandbox_selected = (self.sandbox_selected + 1).min(self.sandbox_count - 1);
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.sandbox_count > 0 && self.sandbox_selected < self.sandbox_count - 1 {
+                    self.sandbox_selected += 1;
+                } else {
+                    self.overflow_focus_down();
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.sandbox_selected = self.sandbox_selected.saturating_sub(1);
+                if self.sandbox_count > 0 && self.sandbox_selected > 0 {
+                    self.sandbox_selected -= 1;
+                } else {
+                    self.overflow_focus_up();
+                }
             }
             KeyCode::Char('c') => {
                 self.open_create_form();

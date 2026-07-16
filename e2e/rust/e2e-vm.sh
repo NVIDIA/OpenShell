@@ -31,7 +31,7 @@
 #   4. Writes a per-run gateway config with `[openshell.drivers.vm]`
 #      settings, starts the gateway with `--config <run-state>/gateway.toml`
 #      on a random free port, waits for `Server listening`, then runs the
-#      selected Rust e2e test (`smoke` by default).
+#      selected Rust e2e tests.
 #   5. Tears the gateway down and (on failure) preserves the gateway
 #      log and every VM serial console log for post-mortem.
 #
@@ -47,7 +47,7 @@ source "${ROOT}/e2e/support/gateway-common.sh"
 COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 DRIVER_BIN="${ROOT}/target/debug/openshell-driver-vm"
-E2E_TEST="${OPENSHELL_E2E_VM_TEST:-smoke}"
+E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
@@ -296,11 +296,23 @@ e2e_export_gateway_restart_metadata \
 # preparation; allow 180s for slower CI runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
-echo "==> Running e2e ${E2E_TEST} test (features: ${E2E_FEATURES}, endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"
-cargo test \
-  --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
-  --features "${E2E_FEATURES}" \
-  --test "${E2E_TEST}" \
-  -- --nocapture
+run_e2e_test() {
+  local test_target="$1"
+  shift
 
-echo "==> ${E2E_TEST} test passed."
+  echo "==> Running e2e ${test_target} test (features: ${E2E_FEATURES}, endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"
+  cargo test \
+    --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
+    --features "${E2E_FEATURES}" \
+    --test "${test_target}" \
+    "$@" \
+    -- --nocapture
+  echo "==> ${test_target} test passed."
+}
+
+if [ -n "${E2E_TEST_OVERRIDE}" ]; then
+  run_e2e_test "${E2E_TEST_OVERRIDE}"
+else
+  run_e2e_test smoke
+  run_e2e_test host_gateway_alias
+fi

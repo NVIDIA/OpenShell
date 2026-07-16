@@ -142,17 +142,18 @@ smoke check.
 
 ## CI and E2E
 
-Required checks run on GitHub Actions. Workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run.
+Required checks run on GitHub Actions. Workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run. `main` also uses GitHub merge queue so the final queued integration commit is validated before it merges.
 
 The high-level CI model:
 
 1. PR-context gate jobs publish required statuses for the PR head commit.
 2. Standard branch checks run from trusted mirror branches.
 3. Label-gated E2E, GPU, and Kubernetes checks run from trusted mirror branches.
-4. Gate jobs verify that the mirror branch matches the PR head and that the expected non-gate workflow actually ran.
-5. Release workflows rebuild and publish binaries, wheels, images, and docs.
+4. Merge-group checks run against GitHub's temporary queue branch for the final integration state.
+5. Gate jobs verify that the mirror branch matches the PR head, or that the merge-group workflow ran for the queued SHA, and that the expected non-gate workflow actually ran.
+6. Release workflows rebuild and publish binaries, wheels, images, and docs.
 
-See `CI.md` for the contributor workflow and labels.
+See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 
 ## Docs Site
 

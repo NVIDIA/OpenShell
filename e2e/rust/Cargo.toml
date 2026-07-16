@@ -18,8 +18,8 @@ publish = false
 [features]
 e2e = []
 # Selects tests that rely on `host.openshell.internal` (the sandbox's stable
-# alias to the host running test fixtures). docker and podman wire the alias
-# unconditionally; the kube driver only does so when the chart's
+# alias to the host running test fixtures). docker, podman, and vm wire the
+# alias unconditionally; the kube driver only does so when the chart's
 # `server.hostGatewayIP` is set, so `e2e-kubernetes` does NOT imply this and
 # the helm wrapper opts in explicitly when it has resolved an IP.
 e2e-host-gateway = ["e2e"]
@@ -30,7 +30,7 @@ e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
-e2e-vm = ["e2e"]
+e2e-vm = ["e2e", "e2e-host-gateway"]
 
 [[test]]
 name = "custom_image"

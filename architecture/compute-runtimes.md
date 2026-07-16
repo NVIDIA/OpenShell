@@ -26,6 +26,10 @@ The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated
 when a sandbox create request asks for GPU resources.
 
+The gateway records driver identity and version from the startup capability
+response. Elevated gateway info reports that initialized driver snapshot instead
+of re-querying drivers on each request.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |
@@ -72,6 +76,10 @@ Runtime-specific implementation notes belong in the driver crate README:
 - `crates/openshell-driver-podman/README.md`
 - `crates/openshell-driver-kubernetes/README.md`
 - `crates/openshell-driver-vm/README.md`
+
+The combined VM topology runs `openshell-sandbox` as guest PID 1. libkrun
+executes the driver-owned guest bootstrap as PID 1, and the bootstrap preserves
+that identity when it execs the supervisor after mounting and network setup.
 
 ## Supervisor Delivery
 

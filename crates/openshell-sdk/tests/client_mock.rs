@@ -87,6 +87,17 @@ impl OpenShell for TestOpenShell {
         }))
     }
 
+    async fn get_gateway_info(
+        &self,
+        _: tonic::Request<proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<proto::GetGatewayInfoResponse>, Status> {
+        Ok(Response::new(proto::GetGatewayInfoResponse {
+            status: proto::ServiceStatus::Healthy.into(),
+            gateway_version: "test-1.2.3".to_string(),
+            compute_drivers: Vec::new(),
+        }))
+    }
+
     async fn update_provider_profiles(
         &self,
         _: tonic::Request<proto::UpdateProviderProfilesRequest>,
