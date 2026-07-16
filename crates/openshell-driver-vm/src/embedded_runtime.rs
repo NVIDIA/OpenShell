@@ -11,8 +11,13 @@ mod resources {
     pub const LIBKRUN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrun.dylib.zst"));
     pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.5.dylib.zst"));
     pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
+    pub const CONTAINERD_SHIM: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/libopenshell_containerd_shim.dylib.zst"
+    ));
     pub const LIBKRUN_NAME: &str = "libkrun.dylib";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.5.dylib";
+    pub const CONTAINERD_SHIM_NAME: &str = "libopenshell_containerd_shim.dylib";
 }
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
@@ -20,8 +25,13 @@ mod resources {
     pub const LIBKRUN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrun.so.zst"));
     pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.so.5.zst"));
     pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
+    pub const CONTAINERD_SHIM: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/libopenshell_containerd_shim.so.zst"
+    ));
     pub const LIBKRUN_NAME: &str = "libkrun.so";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.so.5";
+    pub const CONTAINERD_SHIM_NAME: &str = "libopenshell_containerd_shim.so";
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -29,8 +39,13 @@ mod resources {
     pub const LIBKRUN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrun.so.zst"));
     pub const LIBKRUNFW: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libkrunfw.so.5.zst"));
     pub const GVPROXY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gvproxy.zst"));
+    pub const CONTAINERD_SHIM: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/libopenshell_containerd_shim.so.zst"
+    ));
     pub const LIBKRUN_NAME: &str = "libkrun.so";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw.so.5";
+    pub const CONTAINERD_SHIM_NAME: &str = "libopenshell_containerd_shim.so";
 }
 
 #[cfg(not(any(
@@ -42,8 +57,10 @@ mod resources {
     pub const LIBKRUN: &[u8] = &[];
     pub const LIBKRUNFW: &[u8] = &[];
     pub const GVPROXY: &[u8] = &[];
+    pub const CONTAINERD_SHIM: &[u8] = &[];
     pub const LIBKRUN_NAME: &str = "libkrun";
     pub const LIBKRUNFW_NAME: &str = "libkrunfw";
+    pub const CONTAINERD_SHIM_NAME: &str = "libopenshell_containerd_shim";
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -83,6 +100,10 @@ pub fn ensure_runtime_extracted() -> Result<PathBuf, String> {
         &cache_dir.join(resources::LIBKRUNFW_NAME),
     )?;
     extract_resource(resources::GVPROXY, &cache_dir.join("gvproxy"))?;
+    extract_resource(
+        resources::CONTAINERD_SHIM,
+        &cache_dir.join(resources::CONTAINERD_SHIM_NAME),
+    )?;
 
     #[cfg(target_os = "macos")]
     {
@@ -110,8 +131,9 @@ pub fn validate_runtime_dir(dir: &Path) -> Result<(), String> {
     let libkrun = dir.join(resources::LIBKRUN_NAME);
     let libkrunfw = dir.join(resources::LIBKRUNFW_NAME);
     let gvproxy = dir.join("gvproxy");
+    let containerd_shim = dir.join(resources::CONTAINERD_SHIM_NAME);
 
-    for path in [&libkrun, &libkrunfw, &gvproxy] {
+    for path in [&libkrun, &libkrunfw, &gvproxy, &containerd_shim] {
         if !path.is_file() {
             return Err(format!("missing runtime file: {}", path.display()));
         }
@@ -129,6 +151,7 @@ fn runtime_cache_key() -> String {
     for (index, chunk) in [resources::LIBKRUN, resources::LIBKRUNFW]
         .into_iter()
         .chain(std::iter::once(resources::GVPROXY))
+        .chain(std::iter::once(resources::CONTAINERD_SHIM))
         .enumerate()
     {
         let sample = &chunk[..chunk.len().min(64)];

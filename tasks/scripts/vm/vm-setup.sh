@@ -93,6 +93,10 @@ else
     "${ROOT}/tasks/scripts/vm/download-kernel-runtime.sh"
 fi
 
+echo ""
+echo "==> Building openshell-containerd-shim from source..."
+"${ROOT}/tasks/scripts/vm/build-containerd-shim.sh"
+
 # ── Validate ────────────────────────────────────────────────────────────
 
 OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
@@ -101,7 +105,7 @@ OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-com
 missing=0
 case "$PLATFORM" in
     darwin-aarch64)
-        for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst umoci.zst; do
+        for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst umoci.zst libopenshell_containerd_shim.dylib.zst; do
             if [ ! -f "${OUTPUT_DIR}/${f}" ]; then
                 echo "ERROR: Missing ${OUTPUT_DIR}/${f}" >&2
                 missing=1
@@ -109,7 +113,7 @@ case "$PLATFORM" in
         done
         ;;
     linux-aarch64|linux-x86_64)
-        for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst; do
+        for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst libopenshell_containerd_shim.so.zst; do
             if [ ! -f "${OUTPUT_DIR}/${f}" ]; then
                 echo "ERROR: Missing ${OUTPUT_DIR}/${f}" >&2
                 missing=1

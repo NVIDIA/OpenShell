@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::containerd_shim;
 use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
@@ -13,22 +14,15 @@ use crate::rootfs::{
     extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
     set_rootfs_image_file_mode, write_rootfs_image_file,
 };
-use crate::runtime::VmBackend;
+use crate::runtime::{VmBackend, configured_runtime_dir};
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::ContainerCreateBody;
 use bollard::query_parameters::{CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder};
-use flate2::read::GzDecoder;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use oci_client::client::{Client as OciClient, ClientConfig};
-use oci_client::manifest::{
-    ImageIndexEntry, OCI_IMAGE_MEDIA_TYPE, OciDescriptor, OciImageManifest,
-};
-use oci_client::secrets::RegistryAuth;
-use oci_client::{Reference, RegistryOperation};
 use openshell_core::gpu::{
     driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
@@ -52,10 +46,8 @@ use openshell_core::proto_struct::{
 };
 use openshell_vfio::SysfsRoot;
 use prost::Message;
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
 use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -79,8 +71,6 @@ const WATCH_BUFFER: usize = 256;
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
 const DEFAULT_OVERLAY_DISK_MIB: u64 = 4096;
-const DEFAULT_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 4;
-const MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -164,7 +154,11 @@ const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
 const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
 const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
-const GUEST_IMAGE_OCI_REF: &str = "openshell";
+// The "org.opencontainers.image.ref.name" annotation the goshim pull writes
+// into index.json (see goshim/pull.go's `ociLayoutRefName`) and the guest
+// init script reads back via `umoci raw unpack --image "$dir:openshell"`
+// (scripts/openshell-vm-sandbox-init.sh). Kept here only as documentation;
+// update all three together if it ever changes.
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
 const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v3";
 const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v3";
@@ -1805,28 +1799,7 @@ impl VmDriver {
         }
 
         info!(image_ref = %image_ref, "vm driver: ensuring cached root disk image (registry)");
-        let reference = parse_registry_reference(image_ref)?;
-        let client = registry_client();
-        let auth = registry_auth(image_ref)?;
-        info!(image_ref = %image_ref, "vm driver: authenticating with registry");
-        self.publish_vm_progress(
-            sandbox_id,
-            "AuthenticatingRegistry",
-            format!("Authenticating registry access for image \"{image_ref}\""),
-            HashMap::from([
-                ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "registry".to_string()),
-            ]),
-        );
-        client
-            .auth(&reference, &auth, RegistryOperation::Pull)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
-        info!(image_ref = %image_ref, "vm driver: fetching manifest digest");
+        info!(image_ref = %image_ref, "vm driver: resolving manifest digest via containerd shim");
         self.publish_vm_progress(
             sandbox_id,
             "FetchingManifest",
@@ -1836,14 +1809,7 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        let source_image_identity = client
-            .fetch_manifest_digest(&reference, &auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to resolve vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
+        let source_image_identity = self.resolve_registry_image_digest(image_ref).await?;
         info!(
             image_ref = %image_ref,
             image_identity = %source_image_identity,
@@ -1936,18 +1902,80 @@ impl VmDriver {
             return Ok(image_identity);
         }
 
-        self.build_cached_registry_image_rootfs_image(
-            sandbox_id,
-            &client,
-            &reference,
-            &auth,
-            image_ref,
-            &image_identity,
-        )
-        .await?;
+        self.build_cached_registry_image_rootfs_image(sandbox_id, image_ref, &image_identity)
+            .await?;
         self.publish_pulled_event(sandbox_id, image_ref, &image_path)
             .await;
         Ok(image_identity)
+    }
+
+    /// Resolve `image_ref`'s manifest digest for the guest platform via the
+    /// containerd shim, without downloading any layer content.
+    async fn resolve_registry_image_digest(&self, image_ref: &str) -> Result<String, Status> {
+        let runtime_dir = configured_runtime_dir()
+            .map_err(|err| Status::internal(format!("resolve VM runtime dir failed: {err}")))?;
+        let image_ref_owned = image_ref.to_string();
+        tokio::task::spawn_blocking(move || {
+            containerd_shim::resolve_image_digest(&runtime_dir, &image_ref_owned, linux_oci_arch())
+        })
+        .await
+        .map_err(|err| Status::internal(format!("image digest resolution panicked: {err}")))?
+        .map_err(Status::failed_precondition)
+    }
+
+    /// Pull `image_ref`'s manifest/config/layer blobs for the guest platform
+    /// into a standard OCI Image Layout at `layout_dir` via the containerd
+    /// shim. Digest verification happens inside the shim.
+    async fn pull_registry_image_to_layout(
+        &self,
+        image_ref: &str,
+        layout_dir: &Path,
+    ) -> Result<(), Status> {
+        let runtime_dir = configured_runtime_dir()
+            .map_err(|err| Status::internal(format!("resolve VM runtime dir failed: {err}")))?;
+        let image_ref_owned = image_ref.to_string();
+        let layout_dir_owned = layout_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            containerd_shim::pull_image_to_oci_layout(
+                &runtime_dir,
+                &image_ref_owned,
+                &layout_dir_owned,
+                linux_oci_arch(),
+            )
+        })
+        .await
+        .map_err(|err| Status::internal(format!("image pull panicked: {err}")))?
+        .map_err(Status::failed_precondition)
+    }
+
+    /// Pull `image_ref` into `layout_dir` and apply every layer onto
+    /// `rootfs_dir`, both via the containerd shim. Used for the bootstrap
+    /// root disk, which is unpacked directly on the host rather than inside
+    /// a guest VM (unlike `ensure_prepared_registry_image_disk`'s
+    /// umoci-in-guest path).
+    async fn pull_and_unpack_registry_image(
+        &self,
+        image_ref: &str,
+        layout_dir: &Path,
+        rootfs_dir: &Path,
+    ) -> Result<(), Status> {
+        self.pull_registry_image_to_layout(image_ref, layout_dir)
+            .await?;
+
+        let runtime_dir = configured_runtime_dir()
+            .map_err(|err| Status::internal(format!("resolve VM runtime dir failed: {err}")))?;
+        let layout_dir_owned = layout_dir.to_path_buf();
+        let rootfs_dir_owned = rootfs_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            containerd_shim::unpack_oci_layout_to_dir(
+                &runtime_dir,
+                &layout_dir_owned,
+                &rootfs_dir_owned,
+            )
+        })
+        .await
+        .map_err(|err| Status::internal(format!("image unpack panicked: {err}")))?
+        .map_err(Status::failed_precondition)
     }
 
     async fn resolve_local_container_image(
@@ -2207,28 +2235,6 @@ impl VmDriver {
         image_ref: &str,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
-        let reference = parse_registry_reference(image_ref)?;
-        let client = registry_client();
-        let auth = registry_auth(image_ref)?;
-
-        self.publish_vm_progress(
-            sandbox_id,
-            "AuthenticatingRegistry",
-            format!("Authenticating registry access for image \"{image_ref}\""),
-            HashMap::from([
-                ("image_ref".to_string(), image_ref.to_string()),
-                ("image_source".to_string(), "registry".to_string()),
-            ]),
-        );
-        client
-            .auth(&reference, &auth, RegistryOperation::Pull)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
-
         self.publish_vm_progress(
             sandbox_id,
             "FetchingManifest",
@@ -2238,14 +2244,7 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        let source_image_identity = client
-            .fetch_manifest_digest(&reference, &auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to resolve vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
+        let source_image_identity = self.resolve_registry_image_digest(image_ref).await?;
         let cache_identity = prepared_image_cache_identity(&source_image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
@@ -2271,61 +2270,17 @@ impl VmDriver {
         self.reset_image_staging_dir(&staging_dir).await?;
         let layout_dir = staging_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR);
 
-        let (manifest, _) = client
-            .pull_image_manifest(&reference, &auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to pull vm sandbox image manifest '{image_ref}': {err}"
-                ))
-            })?;
-        tokio::fs::create_dir_all(oci_layout_blobs_dir(&layout_dir))
-            .await
-            .map_err(|err| Status::internal(format!("create guest OCI layout failed: {err}")))?;
-
-        download_registry_descriptor_blob_file(
-            &client,
-            &reference,
-            image_ref,
-            &layout_dir,
-            &manifest.config,
-            "config",
-        )
-        .await?;
-
-        let total_layers = manifest.layers.len();
-        let total_bytes: i64 = manifest.layers.iter().map(|layer| layer.size.max(0)).sum();
-        futures::stream::iter(manifest.layers.iter().cloned().enumerate())
-            .map(|(index, layer)| {
-                let client = client.clone();
-                let reference = reference.clone();
-                let layout_dir = layout_dir.clone();
-                async move {
-                    self.publish_registry_layer_progress(
-                        sandbox_id,
-                        image_ref,
-                        &layer,
-                        index,
-                        total_layers,
-                        total_bytes,
-                    );
-                    download_registry_descriptor_blob_file(
-                        &client,
-                        &reference,
-                        image_ref,
-                        &layout_dir,
-                        &layer,
-                        &format!("layer {}", index + 1),
-                    )
-                    .await
-                }
-            })
-            .buffer_unordered(registry_layer_download_concurrency())
-            .try_collect::<Vec<_>>()
+        self.publish_vm_progress(
+            sandbox_id,
+            "PullingImage",
+            format!("Pulling image \"{image_ref}\""),
+            HashMap::from([
+                ("image_ref".to_string(), image_ref.to_string()),
+                ("image_source".to_string(), "registry".to_string()),
+            ]),
+        );
+        self.pull_registry_image_to_layout(image_ref, &layout_dir)
             .await?;
-
-        write_oci_layout_for_manifest(&layout_dir, GUEST_IMAGE_OCI_REF, &manifest)
-            .map_err(|err| Status::internal(format!("write OCI layout failed: {err}")))?;
 
         let payload = GuestImagePayload {
             image_ref: image_ref.to_string(),
@@ -2667,15 +2622,13 @@ impl VmDriver {
     async fn build_cached_registry_image_rootfs_image(
         &self,
         sandbox_id: &str,
-        client: &OciClient,
-        reference: &Reference,
-        auth: &RegistryAuth,
         image_ref: &str,
         image_identity: &str,
     ) -> Result<(), Status> {
         let cache_dir = image_cache_dir(&self.config.state_dir, image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
         let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
+        let layout_dir = staging_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR);
         let prepared_rootfs = staging_dir.join("rootfs");
         let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
 
@@ -2704,24 +2657,25 @@ impl VmDriver {
         info!(
             image_ref = %image_ref,
             staging_dir = %staging_dir.display(),
-            "vm driver: pulling registry image layers"
+            "vm driver: pulling registry image via containerd shim"
+        );
+        self.publish_vm_progress(
+            sandbox_id,
+            "PullingImage",
+            format!("Pulling image \"{image_ref}\""),
+            HashMap::from([
+                ("image_ref".to_string(), image_ref.to_string()),
+                ("image_source".to_string(), "registry".to_string()),
+            ]),
         );
         if let Err(err) = self
-            .pull_registry_image_rootfs(
-                sandbox_id,
-                client,
-                reference,
-                auth,
-                image_ref,
-                &staging_dir,
-                &prepared_rootfs,
-            )
+            .pull_and_unpack_registry_image(image_ref, &layout_dir, &prepared_rootfs)
             .await
         {
             warn!(
                 image_ref = %image_ref,
                 error = %err.message(),
-                "vm driver: pull_registry_image_rootfs failed"
+                "vm driver: containerd shim pull/unpack failed"
             );
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(err);
@@ -2730,6 +2684,23 @@ impl VmDriver {
             image_ref = %image_ref,
             "vm driver: image layers pulled, preparing rootfs image"
         );
+
+        // The OCI layout's pulled blobs are no longer needed once the layers
+        // have been unpacked onto `prepared_rootfs`. Remove them before
+        // formatting the rootfs image to avoid holding both the compressed
+        // layers and the merged rootfs on disk at the same time.
+        if let Err(err) = tokio::fs::remove_dir_all(&layout_dir).await {
+            warn!(
+                image_ref = %image_ref,
+                error = %err,
+                "vm driver: failed to remove registry image layout staging dir"
+            );
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            return Err(Status::internal(format!(
+                "remove registry image layout staging dir '{}' failed: {err}",
+                layout_dir.display()
+            )));
+        }
 
         let image_ref_owned = image_ref.to_string();
         let image_identity_owned = image_identity.to_string();
@@ -3249,15 +3220,6 @@ fn validate_sandbox_id(sandbox_id: &str) -> Result<(), Status> {
     Ok(())
 }
 
-#[allow(clippy::result_large_err)]
-fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
-    Reference::try_from(image_ref).map_err(|err| {
-        Status::failed_precondition(format!(
-            "invalid vm sandbox image reference '{image_ref}': {err}"
-        ))
-    })
-}
-
 /// Try to connect to a local container engine (Docker or Podman).
 ///
 /// Tries Docker first (`connect_with_local_defaults`, which respects
@@ -3392,31 +3354,10 @@ async fn export_local_image_rootfs_to_path(
     }
 }
 
-fn registry_client() -> OciClient {
-    OciClient::new(ClientConfig {
-        platform_resolver: Some(Box::new(linux_platform_resolver)),
-        ..Default::default()
-    })
-}
-
-fn linux_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
-    let expected_arch = linux_oci_arch();
-    manifests
-        .iter()
-        .find_map(|entry| {
-            let platform = entry.platform.as_ref()?;
-            (platform.os.to_string() == "linux"
-                && platform.architecture.to_string() == expected_arch)
-                .then(|| entry.digest.clone())
-        })
-        .or_else(|| {
-            manifests.iter().find_map(|entry| {
-                let platform = entry.platform.as_ref()?;
-                (platform.os.to_string() == "linux").then(|| entry.digest.clone())
-            })
-        })
-}
-
+/// Registry auth for the containerd shim is configured entirely via the
+/// `OPENSHELL_REGISTRY_USERNAME`/`OPENSHELL_REGISTRY_TOKEN` environment
+/// variables read directly by goshim/auth.go; the driver process does not
+/// need to construct or pass credentials itself.
 fn linux_oci_arch() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "amd64",
@@ -3426,157 +3367,7 @@ fn linux_oci_arch() -> &'static str {
     }
 }
 
-#[allow(clippy::result_large_err)]
-fn registry_auth(image_ref: &str) -> Result<RegistryAuth, Status> {
-    let username = env_non_empty("OPENSHELL_REGISTRY_USERNAME");
-    let token = env_non_empty("OPENSHELL_REGISTRY_TOKEN");
-
-    match token {
-        Some(token) => {
-            let username = match username {
-                Some(username) => username,
-                None if image_reference_registry_host(image_ref)
-                    .eq_ignore_ascii_case("ghcr.io") =>
-                {
-                    "__token__".to_string()
-                }
-                None => {
-                    return Err(Status::failed_precondition(
-                        "OPENSHELL_REGISTRY_USERNAME is required when OPENSHELL_REGISTRY_TOKEN is set for non-GHCR registries",
-                    ));
-                }
-            };
-            Ok(RegistryAuth::Basic(username, token))
-        }
-        None => Ok(RegistryAuth::Anonymous),
-    }
-}
-
-fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn image_reference_registry_host(image_ref: &str) -> &str {
-    let mut parts = image_ref.splitn(2, '/');
-    let first = parts.next().unwrap_or(image_ref);
-    let has_path = parts.next().is_some();
-    if has_path
-        && (first.contains('.') || first.contains(':') || first.eq_ignore_ascii_case("localhost"))
-    {
-        first
-    } else {
-        "docker.io"
-    }
-}
-
 impl VmDriver {
-    #[allow(clippy::too_many_arguments)]
-    async fn pull_registry_image_rootfs(
-        &self,
-        sandbox_id: &str,
-        client: &OciClient,
-        reference: &Reference,
-        auth: &RegistryAuth,
-        image_ref: &str,
-        staging_dir: &Path,
-        rootfs: &Path,
-    ) -> Result<(), Status> {
-        client
-            .auth(reference, auth, RegistryOperation::Pull)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to authenticate registry access for vm sandbox image '{image_ref}': {err}"
-                ))
-            })?;
-        let (manifest, _) = client
-            .pull_image_manifest(reference, auth)
-            .await
-            .map_err(|err| {
-                Status::failed_precondition(format!(
-                    "failed to pull vm sandbox image manifest '{image_ref}': {err}"
-                ))
-            })?;
-
-        tokio::fs::create_dir_all(rootfs)
-            .await
-            .map_err(|err| Status::internal(format!("create rootfs dir failed: {err}")))?;
-        tokio::fs::create_dir_all(staging_dir.join("layers"))
-            .await
-            .map_err(|err| Status::internal(format!("create layer staging dir failed: {err}")))?;
-
-        let total_layers = manifest.layers.len();
-        let total_bytes: i64 = manifest.layers.iter().map(|layer| layer.size.max(0)).sum();
-        let mut layers = futures::stream::iter(manifest.layers.iter().cloned().enumerate())
-            .map(|(index, layer)| async move {
-                self.publish_registry_layer_progress(
-                    sandbox_id,
-                    image_ref,
-                    &layer,
-                    index,
-                    total_layers,
-                    total_bytes,
-                );
-                download_registry_layer_blob(
-                    client,
-                    reference,
-                    image_ref,
-                    staging_dir,
-                    layer,
-                    index,
-                )
-                .await
-            })
-            .buffer_unordered(registry_layer_download_concurrency())
-            .try_collect::<Vec<_>>()
-            .await?;
-        layers.sort_by_key(|layer| layer.index);
-
-        for layer in &layers {
-            apply_registry_layer_blob(image_ref, rootfs, layer).await?;
-        }
-
-        remove_registry_layer_staging(staging_dir).await?;
-
-        Ok(())
-    }
-
-    fn publish_registry_layer_progress(
-        &self,
-        sandbox_id: &str,
-        image_ref: &str,
-        layer: &OciDescriptor,
-        index: usize,
-        total_layers: usize,
-        total_bytes: i64,
-    ) {
-        let mut metadata = HashMap::new();
-        metadata.insert("layer_index".to_string(), (index + 1).to_string());
-        metadata.insert("layer_total".to_string(), total_layers.to_string());
-        metadata.insert("layer_digest".to_string(), layer.digest.clone());
-        metadata.insert("layer_size_bytes".to_string(), layer.size.to_string());
-        metadata.insert("image_ref".to_string(), image_ref.to_string());
-        if total_bytes > 0 {
-            metadata.insert("image_size_bytes".to_string(), total_bytes.to_string());
-        }
-        let mut event = platform_event(
-            "vm",
-            "Normal",
-            "PullingLayer",
-            format!(
-                "Pulling layer {}/{} ({} bytes) for image \"{image_ref}\"",
-                index + 1,
-                total_layers,
-                layer.size
-            ),
-        );
-        event.metadata = metadata;
-        attach_vm_progress_metadata(&mut event);
-        self.publish_platform_event(sandbox_id.to_string(), event);
-    }
-
     /// Emit a `Pulled` platform event with progress metadata for the CLI.
     async fn publish_pulled_event(&self, sandbox_id: &str, image_ref: &str, image_path: &Path) {
         let mut metadata = HashMap::from([("image_ref".to_string(), image_ref.to_string())]);
@@ -3594,390 +3385,6 @@ impl VmDriver {
             metadata,
         );
     }
-}
-
-struct DownloadedRegistryLayer {
-    index: usize,
-    digest: String,
-    layer_root: PathBuf,
-}
-
-async fn download_registry_layer_blob(
-    client: &OciClient,
-    reference: &Reference,
-    image_ref: &str,
-    staging_dir: &Path,
-    layer: OciDescriptor,
-    index: usize,
-) -> Result<DownloadedRegistryLayer, Status> {
-    let digest_component = sanitize_image_identity(&layer.digest);
-    let blob_path = staging_dir
-        .join("layers")
-        .join(format!("{index:02}-{digest_component}.blob"));
-    let layer_root = staging_dir
-        .join("layers")
-        .join(format!("{index:02}-{digest_component}.root"));
-
-    let mut file = tokio::fs::File::create(&blob_path)
-        .await
-        .map_err(|err| Status::internal(format!("create layer blob failed: {err}")))?;
-    client
-        .pull_blob(reference, &layer, &mut file)
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to download layer '{}' for vm sandbox image '{image_ref}': {err}",
-                layer.digest
-            ))
-        })?;
-    file.flush()
-        .await
-        .map_err(|err| Status::internal(format!("flush layer blob failed: {err}")))?;
-
-    let blob_path_for_digest = blob_path.clone();
-    let expected_digest = layer.digest.clone();
-    tokio::task::spawn_blocking(move || {
-        verify_descriptor_digest(&blob_path_for_digest, &expected_digest)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("layer digest verification panicked: {err}")))?
-    .map_err(|err| {
-        Status::failed_precondition(format!(
-            "vm sandbox image layer verification failed for '{}': {err}",
-            layer.digest
-        ))
-    })?;
-
-    let blob_path_for_unpack = blob_path.clone();
-    let layer_root_for_unpack = layer_root.clone();
-    let media_type = layer.media_type.clone();
-    tokio::task::spawn_blocking(move || {
-        extract_layer_blob_to_dir(&blob_path_for_unpack, &media_type, &layer_root_for_unpack)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("layer extraction panicked: {err}")))?
-    .map_err(|err| {
-        Status::failed_precondition(format!(
-            "failed to extract layer '{}' for vm sandbox image '{image_ref}': {err}",
-            layer.digest
-        ))
-    })?;
-
-    Ok(DownloadedRegistryLayer {
-        index,
-        digest: layer.digest,
-        layer_root,
-    })
-}
-
-async fn apply_registry_layer_blob(
-    image_ref: &str,
-    rootfs: &Path,
-    layer: &DownloadedRegistryLayer,
-) -> Result<(), Status> {
-    let layer_root_for_unpack = layer.layer_root.clone();
-    let rootfs_for_unpack = rootfs.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        apply_layer_dir_to_rootfs(&layer_root_for_unpack, &rootfs_for_unpack)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("layer application panicked: {err}")))?
-    .map_err(|err| {
-        Status::failed_precondition(format!(
-            "failed to apply layer '{}' for vm sandbox image '{image_ref}': {err}",
-            layer.digest
-        ))
-    })
-}
-
-async fn remove_registry_layer_staging(staging_dir: &Path) -> Result<(), Status> {
-    let layers_dir = staging_dir.join("layers");
-    tokio::fs::remove_dir_all(&layers_dir).await.map_err(|err| {
-        Status::internal(format!(
-            "remove registry layer staging dir '{}' failed: {err}",
-            layers_dir.display()
-        ))
-    })
-}
-
-async fn download_registry_descriptor_blob_file(
-    client: &OciClient,
-    reference: &Reference,
-    image_ref: &str,
-    layout_dir: &Path,
-    descriptor: &OciDescriptor,
-    kind: &str,
-) -> Result<(), Status> {
-    let blob_path = oci_layout_blob_path(layout_dir, &descriptor.digest)
-        .map_err(|err| Status::failed_precondition(format!("invalid {kind} digest: {err}")))?;
-    if let Some(parent) = blob_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|err| Status::internal(format!("create OCI blob dir failed: {err}")))?;
-    }
-
-    let mut file = tokio::fs::File::create(&blob_path)
-        .await
-        .map_err(|err| Status::internal(format!("create OCI {kind} blob failed: {err}")))?;
-    client
-        .pull_blob(reference, descriptor, &mut file)
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to download {kind} '{}' for vm sandbox image '{image_ref}': {err}",
-                descriptor.digest
-            ))
-        })?;
-    file.flush()
-        .await
-        .map_err(|err| Status::internal(format!("flush OCI {kind} blob failed: {err}")))?;
-
-    let blob_path_for_digest = blob_path.clone();
-    let expected_digest = descriptor.digest.clone();
-    tokio::task::spawn_blocking(move || {
-        verify_descriptor_digest(&blob_path_for_digest, &expected_digest)
-    })
-    .await
-    .map_err(|err| Status::internal(format!("OCI {kind} digest verification panicked: {err}")))?
-    .map_err(|err| {
-        Status::failed_precondition(format!(
-            "vm sandbox image {kind} verification failed for '{}': {err}",
-            descriptor.digest
-        ))
-    })
-}
-
-fn verify_descriptor_digest(path: &Path, expected_digest: &str) -> Result<(), String> {
-    let expected = expected_digest
-        .strip_prefix("sha256:")
-        .ok_or_else(|| format!("unsupported layer digest '{expected_digest}'"))?;
-    let actual = compute_file_sha256_hex(path)?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(format!(
-            "digest mismatch for {}: expected sha256:{expected}, got sha256:{actual}",
-            path.display()
-        ))
-    }
-}
-
-fn compute_file_sha256_hex(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|err| format!("open {}: {err}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|err| format!("read {}: {err}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn compute_bytes_sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
-}
-
-fn extract_layer_blob_to_dir(
-    blob_path: &Path,
-    media_type: &str,
-    dest: &Path,
-) -> Result<(), String> {
-    if dest.exists() {
-        fs::remove_dir_all(dest).map_err(|err| format!("remove {}: {err}", dest.display()))?;
-    }
-    fs::create_dir_all(dest).map_err(|err| format!("create {}: {err}", dest.display()))?;
-
-    let file =
-        fs::File::open(blob_path).map_err(|err| format!("open {}: {err}", blob_path.display()))?;
-    match layer_compression_from_media_type(media_type)? {
-        LayerCompression::None => extract_tar_reader_to_dir(file, dest),
-        LayerCompression::Gzip => extract_tar_reader_to_dir(GzDecoder::new(file), dest),
-        LayerCompression::Zstd => {
-            let decoder = zstd::stream::read::Decoder::new(file)
-                .map_err(|err| format!("decompress {}: {err}", blob_path.display()))?;
-            extract_tar_reader_to_dir(decoder, dest)
-        }
-    }
-}
-
-fn extract_tar_reader_to_dir(reader: impl Read, dest: &Path) -> Result<(), String> {
-    let mut archive = tar::Archive::new(reader);
-    archive
-        .unpack(dest)
-        .map_err(|err| format!("extract layer into {}: {err}", dest.display()))
-}
-
-// `media_type` is an OCI media type string (e.g. `application/vnd.oci.image.layer.v1.tar+gzip`),
-// not a filesystem path, so case-sensitive comparison is correct.
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
-fn layer_compression_from_media_type(media_type: &str) -> Result<LayerCompression, String> {
-    if media_type.is_empty() {
-        return Err("layer media type is missing".to_string());
-    }
-    if media_type.ends_with("+zstd") {
-        return Ok(LayerCompression::Zstd);
-    }
-    if media_type.ends_with("+gzip") || media_type.ends_with(".gzip") {
-        return Ok(LayerCompression::Gzip);
-    }
-    if media_type.ends_with(".tar")
-        || media_type.ends_with("tar")
-        || media_type == "application/vnd.oci.image.layer.v1.tar"
-        || media_type == "application/vnd.oci.image.layer.nondistributable.v1.tar"
-    {
-        return Ok(LayerCompression::None);
-    }
-    Err(format!("unsupported layer media type '{media_type}'"))
-}
-
-fn apply_layer_dir_to_rootfs(layer_root: &Path, rootfs: &Path) -> Result<(), String> {
-    merge_layer_directory(layer_root, rootfs)
-}
-
-fn merge_layer_directory(source_dir: &Path, target_dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(target_dir)
-        .map_err(|err| format!("create {}: {err}", target_dir.display()))?;
-
-    let mut entries = fs::read_dir(source_dir)
-        .map_err(|err| format!("read {}: {err}", source_dir.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| format!("read {}: {err}", source_dir.display()))?;
-    entries.sort_by_key(fs::DirEntry::file_name);
-
-    if entries
-        .iter()
-        .any(|entry| entry.file_name().to_string_lossy() == ".wh..wh..opq")
-    {
-        clear_directory_contents(target_dir)?;
-    }
-
-    for entry in entries {
-        let file_name = entry.file_name();
-        let name = file_name.to_string_lossy();
-        if name == ".wh..wh..opq" {
-            continue;
-        }
-        if let Some(hidden_name) = name.strip_prefix(".wh.") {
-            remove_path_if_exists(&target_dir.join(hidden_name))?;
-            continue;
-        }
-
-        let source_path = entry.path();
-        let dest_path = target_dir.join(&file_name);
-        let metadata = fs::symlink_metadata(&source_path)
-            .map_err(|err| format!("stat {}: {err}", source_path.display()))?;
-        let file_type = metadata.file_type();
-
-        if file_type.is_dir() {
-            if let Ok(dest_metadata) = fs::symlink_metadata(&dest_path)
-                && !dest_metadata.file_type().is_dir()
-                && !path_is_dir_or_symlink_to_dir(&dest_path)?
-            {
-                remove_path_if_exists(&dest_path)?;
-            }
-            fs::create_dir_all(&dest_path)
-                .map_err(|err| format!("create {}: {err}", dest_path.display()))?;
-            merge_layer_directory(&source_path, &dest_path)?;
-            if fs::symlink_metadata(&dest_path)
-                .map_err(|err| format!("stat {}: {err}", dest_path.display()))?
-                .file_type()
-                .is_dir()
-            {
-                fs::set_permissions(&dest_path, metadata.permissions())
-                    .map_err(|err| format!("chmod {}: {err}", dest_path.display()))?;
-            }
-        } else if file_type.is_file() {
-            remove_path_if_exists(&dest_path)?;
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|err| format!("create {}: {err}", parent.display()))?;
-            }
-            fs::copy(&source_path, &dest_path).map_err(|err| {
-                format!(
-                    "copy {} to {}: {err}",
-                    source_path.display(),
-                    dest_path.display()
-                )
-            })?;
-            fs::set_permissions(&dest_path, metadata.permissions())
-                .map_err(|err| format!("chmod {}: {err}", dest_path.display()))?;
-        } else if file_type.is_symlink() {
-            copy_symlink(&source_path, &dest_path)?;
-        } else {
-            return Err(format!(
-                "unsupported layer entry type at {}",
-                source_path.display()
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn path_is_dir_or_symlink_to_dir(path: &Path) -> Result<bool, String> {
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.file_type().is_dir()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(format!("stat {}: {err}", path.display())),
-    }
-}
-
-fn clear_directory_contents(dir: &Path) -> Result<(), String> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir).map_err(|err| format!("read {}: {err}", dir.display()))? {
-        let entry = entry.map_err(|err| format!("read {}: {err}", dir.display()))?;
-        remove_path_if_exists(&entry.path())?;
-    }
-    Ok(())
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<(), String> {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Ok(());
-    };
-    if metadata.file_type().is_dir() {
-        fs::remove_dir_all(path).map_err(|err| format!("remove {}: {err}", path.display()))
-    } else {
-        fs::remove_file(path).map_err(|err| format!("remove {}: {err}", path.display()))
-    }
-}
-
-#[cfg(unix)]
-fn copy_symlink(source_path: &Path, dest_path: &Path) -> Result<(), String> {
-    let target = fs::read_link(source_path)
-        .map_err(|err| format!("readlink {}: {err}", source_path.display()))?;
-    remove_path_if_exists(dest_path)?;
-    if let Some(parent) = dest_path.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("create {}: {err}", parent.display()))?;
-    }
-    std::os::unix::fs::symlink(&target, dest_path).map_err(|err| {
-        format!(
-            "symlink {} to {}: {err}",
-            target.display(),
-            dest_path.display()
-        )
-    })
-}
-
-#[cfg(not(unix))]
-fn copy_symlink(_source_path: &Path, _dest_path: &Path) -> Result<(), String> {
-    Err("symlink layers are only supported on Unix hosts".to_string())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LayerCompression {
-    None,
-    Gzip,
-    Zstd,
 }
 
 fn requested_sandbox_image(sandbox: &Sandbox) -> Option<&str> {
@@ -4282,75 +3689,6 @@ fn image_cache_staging_dir(root: &Path, image_identity: &str) -> PathBuf {
     ))
 }
 
-fn oci_layout_blobs_dir(layout_dir: &Path) -> PathBuf {
-    layout_dir.join("blobs").join("sha256")
-}
-
-fn oci_layout_blob_path(layout_dir: &Path, digest: &str) -> Result<PathBuf, String> {
-    let hex = sha256_digest_hex(digest)?;
-    Ok(oci_layout_blobs_dir(layout_dir).join(hex))
-}
-
-fn sha256_digest_hex(digest: &str) -> Result<&str, String> {
-    let Some((algorithm, hex)) = digest.split_once(':') else {
-        return Err(format!("digest '{digest}' is missing an algorithm"));
-    };
-    if algorithm != "sha256" {
-        return Err(format!("unsupported digest algorithm '{algorithm}'"));
-    }
-    if hex.is_empty() || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(format!("digest '{digest}' is not a valid sha256 digest"));
-    }
-    Ok(hex)
-}
-
-fn write_oci_layout_for_manifest(
-    layout_dir: &Path,
-    ref_name: &str,
-    manifest: &OciImageManifest,
-) -> Result<(), String> {
-    fs::create_dir_all(oci_layout_blobs_dir(layout_dir))
-        .map_err(|err| format!("create OCI layout blobs dir failed: {err}"))?;
-
-    fs::write(
-        layout_dir.join("oci-layout"),
-        br#"{"imageLayoutVersion":"1.0.0"}"#,
-    )
-    .map_err(|err| format!("write OCI layout marker failed: {err}"))?;
-
-    let manifest_bytes = serde_json::to_vec(manifest)
-        .map_err(|err| format!("serialize OCI manifest failed: {err}"))?;
-    let manifest_digest = format!("sha256:{}", compute_bytes_sha256_hex(&manifest_bytes));
-    let manifest_blob = oci_layout_blob_path(layout_dir, &manifest_digest)
-        .map_err(|err| format!("compute OCI manifest blob path failed: {err}"))?;
-    fs::write(&manifest_blob, &manifest_bytes)
-        .map_err(|err| format!("write OCI manifest blob failed: {err}"))?;
-
-    let media_type = manifest
-        .media_type
-        .clone()
-        .unwrap_or_else(|| OCI_IMAGE_MEDIA_TYPE.to_string());
-    let index = serde_json::json!({
-        "schemaVersion": 2,
-        "manifests": [
-            {
-                "mediaType": media_type,
-                "digest": manifest_digest,
-                "size": manifest_bytes.len(),
-                "annotations": {
-                    "org.opencontainers.image.ref.name": ref_name
-                }
-            }
-        ]
-    });
-    let index_bytes = serde_json::to_vec_pretty(&index)
-        .map_err(|err| format!("serialize OCI index failed: {err}"))?;
-    fs::write(layout_dir.join("index.json"), index_bytes)
-        .map_err(|err| format!("write OCI index failed: {err}"))?;
-
-    Ok(())
-}
-
 fn bootstrap_image_cache_identity(image_identity: &str) -> String {
     format!(
         "{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:{image_identity}",
@@ -4363,20 +3701,6 @@ fn prepared_image_cache_identity(image_identity: &str) -> String {
         "{PREPARED_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:{image_identity}",
         openshell_core::VERSION
     )
-}
-
-fn registry_layer_download_concurrency() -> usize {
-    let value = std::env::var("OPENSHELL_VM_IMAGE_PULL_CONCURRENCY").ok();
-    registry_layer_download_concurrency_value(value.as_deref())
-}
-
-fn registry_layer_download_concurrency_value(value: Option<&str>) -> usize {
-    value
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .map_or(DEFAULT_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY, |value| {
-            value.min(MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY)
-        })
 }
 
 fn sanitize_image_identity(image_identity: &str) -> String {
@@ -5077,6 +4401,7 @@ fn attach_vm_progress_metadata(event: &mut PlatformEvent) {
                 mark_progress_detail(&mut event.metadata, detail);
             }
         }
+        "PullingImage" => mark_progress_detail(&mut event.metadata, "Pulling image"),
         "ResolvingImage" => mark_progress_detail(&mut event.metadata, "Resolving image"),
         "AuthenticatingRegistry" => {
             mark_progress_detail(&mut event.metadata, "Authenticating registry");
@@ -6125,27 +5450,6 @@ mod tests {
     }
 
     #[test]
-    fn image_reference_registry_host_defaults_to_docker_hub() {
-        assert_eq!(image_reference_registry_host("ubuntu:24.04"), "docker.io");
-        assert_eq!(
-            image_reference_registry_host("library/ubuntu:24.04"),
-            "docker.io"
-        );
-        assert_eq!(
-            image_reference_registry_host("ghcr.io/nvidia/openshell/base:latest"),
-            "ghcr.io"
-        );
-        assert_eq!(
-            image_reference_registry_host("localhost/example:dev"),
-            "localhost"
-        );
-        assert_eq!(
-            image_reference_registry_host("localhost:5000/example/sandbox:dev"),
-            "localhost:5000"
-        );
-    }
-
-    #[test]
     fn openshell_local_build_image_ref_matches_cli_tags() {
         assert!(is_openshell_local_build_image_ref(
             "openshell/sandbox-from:123"
@@ -6179,85 +5483,6 @@ mod tests {
         let err = local_image_platform_mismatch("openshell/sandbox-from:123", None, None)
             .expect("unknown platform should be reported");
         assert!(err.contains("unknown/unknown"));
-    }
-
-    #[test]
-    fn apply_layer_dir_to_rootfs_honors_whiteouts() {
-        let base = unique_temp_dir();
-        let rootfs = base.join("rootfs");
-        let layer = base.join("layer");
-
-        fs::create_dir_all(rootfs.join("dir")).unwrap();
-        fs::write(rootfs.join("removed.txt"), "old").unwrap();
-        fs::write(rootfs.join("dir/old.txt"), "old").unwrap();
-
-        fs::create_dir_all(layer.join("dir")).unwrap();
-        fs::write(layer.join(".wh.removed.txt"), "").unwrap();
-        fs::write(layer.join("dir/.wh..wh..opq"), "").unwrap();
-        fs::write(layer.join("dir/new.txt"), "new").unwrap();
-
-        apply_layer_dir_to_rootfs(&layer, &rootfs).unwrap();
-
-        assert!(!rootfs.join("removed.txt").exists());
-        assert!(!rootfs.join("dir/old.txt").exists());
-        assert_eq!(
-            fs::read_to_string(rootfs.join("dir/new.txt")).unwrap(),
-            "new"
-        );
-
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn apply_layer_dir_to_rootfs_preserves_lower_symlink_dirs() {
-        let base = unique_temp_dir();
-        let rootfs = base.join("rootfs");
-        let layer = base.join("layer");
-
-        fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
-        fs::write(rootfs.join("usr/bin/bash"), "bash").unwrap();
-        std::os::unix::fs::symlink("usr/bin", rootfs.join("bin")).unwrap();
-
-        fs::create_dir_all(layer.join("bin")).unwrap();
-        fs::write(layer.join("bin/foo"), "foo").unwrap();
-
-        apply_layer_dir_to_rootfs(&layer, &rootfs).unwrap();
-
-        assert!(
-            fs::symlink_metadata(rootfs.join("bin"))
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "lower /bin symlink should be preserved"
-        );
-        assert_eq!(
-            fs::read_to_string(rootfs.join("usr/bin/bash")).unwrap(),
-            "bash"
-        );
-        assert_eq!(
-            fs::read_to_string(rootfs.join("usr/bin/foo")).unwrap(),
-            "foo"
-        );
-
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn layer_compression_from_media_type_supports_common_formats() {
-        assert_eq!(
-            layer_compression_from_media_type("application/vnd.oci.image.layer.v1.tar").unwrap(),
-            LayerCompression::None
-        );
-        assert_eq!(
-            layer_compression_from_media_type("application/vnd.oci.image.layer.v1.tar+gzip")
-                .unwrap(),
-            LayerCompression::Gzip
-        );
-        assert_eq!(
-            layer_compression_from_media_type("application/vnd.oci.image.layer.v1.tar+zstd")
-                .unwrap(),
-            LayerCompression::Zstd
-        );
     }
 
     #[test]
@@ -6608,46 +5833,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn registry_layer_download_concurrency_is_bounded() {
-        assert_eq!(
-            registry_layer_download_concurrency_value(None),
-            DEFAULT_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY
-        );
-        assert_eq!(
-            registry_layer_download_concurrency_value(Some("0")),
-            DEFAULT_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY
-        );
-        assert_eq!(registry_layer_download_concurrency_value(Some("8")), 8);
-        assert_eq!(
-            registry_layer_download_concurrency_value(Some("999")),
-            MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY
-        );
-    }
-
-    #[tokio::test]
-    async fn remove_registry_layer_staging_preserves_merged_rootfs() {
-        let base = unique_temp_dir();
-        let layers_dir = base.join("layers");
-        let rootfs_dir = base.join("rootfs");
-        fs::create_dir_all(&layers_dir).unwrap();
-        fs::create_dir_all(&rootfs_dir).unwrap();
-        fs::write(layers_dir.join("layer.blob"), b"compressed layer").unwrap();
-        fs::write(rootfs_dir.join("merged.txt"), b"merged rootfs").unwrap();
-
-        remove_registry_layer_staging(&base)
-            .await
-            .expect("remove layer staging");
-
-        assert!(!layers_dir.exists());
-        assert_eq!(
-            fs::read(rootfs_dir.join("merged.txt")).unwrap(),
-            b"merged rootfs"
-        );
-
-        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
