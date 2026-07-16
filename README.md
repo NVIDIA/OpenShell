@@ -16,7 +16,7 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 
 ### Prerequisites
 
-- **A supported host** — macOS, Windows with WSL 2, or Linux.
+- **A supported host** — Linux, macOS (Apple Silicon), or Windows with WSL 2 (experimental).
 - **A local runtime** — Docker, Podman, or host virtualization enabled for MicroVM-backed sandboxes.
 
 ### Install
@@ -198,7 +198,7 @@ openshell sandbox create --from ./my-sandbox-dir   # local Dockerfile
 openshell sandbox create --from registry.io/img:v1 # container image
 ```
 
-See the [community sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/community-sandboxes) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
+See the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
 
 ## Explore with Your Agent
 
@@ -234,7 +234,7 @@ All implementation work is human-gated — agents propose plans, humans approve,
 
 - [Full Documentation](https://docs.nvidia.com/openshell/latest/index.html) — overview, architecture, tutorials, and reference
 - [Quickstart](https://docs.nvidia.com/openshell/latest/get-started/quickstart) — detailed install and first sandbox walkthrough
-- [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
+- [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/get-started/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
 - [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
 - [Roadmap](https://github.com/orgs/NVIDIA/projects/233) — planned work and project priorities
 - [RFC Board](https://github.com/orgs/NVIDIA/projects/233/views/6) — RFC proposals tracked on the OpenShell Roadmap with the `rfc` label
