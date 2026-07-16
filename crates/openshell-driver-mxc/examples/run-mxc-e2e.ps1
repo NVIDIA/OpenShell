@@ -3,10 +3,14 @@
 #
 # run-mxc-e2e.ps1 - MXC e2e scenario runner.
 #
-# Starts the gateway ONCE, runs a table of policy scenarios, emits per-scenario
-# PASS/FAIL/SKIP(reason), prints a summary table, and exits non-zero only on
-# FAIL.  Reuses the gateway-start / CLI-register / teardown pattern from
-# run-demo.ps1.
+# Starts one gateway and passes each scenario's command and working directory as
+# create-time driver inputs. Emits per-scenario PASS/FAIL/SKIP(reason), prints a
+# summary table, and exits non-zero only on FAIL.
+#
+# Scoring does not rely on `sandbox create` succeeding: the interactive attach
+# can return non-zero after a healthy one-shot workload. Positive scenarios
+# require their artifact, while deny scenarios require a successful control
+# write and an absent denied write.
 #
 # PowerShell 5.1-compatible (no && / || / ternary operators).
 #
@@ -22,17 +26,11 @@
 #   .\run-mxc-e2e.ps1 -Backend process_container -Scenario fs-rw
 #
 # Scenarios & expected verdicts:
-#   fs-rw  - rw grant on DemoDir; in-policy write succeeds.
-#                              Both backends; skipped when backend not live (non-mock).
-#   fs-readonly              - ro grant on a source dir + rw on DemoDir;
-#                              write to ro dir should be denied.
-#                              Both backends; skipped when backend not live.
-#   fs-default-deny    - empty filesystem policy; every write denied.
-#                              processcontainer only (isolation_session has no deny
-#                              primitive); skipped on isolation_session.
-#   network-reject  - rw grant + network_policies rule;
-#                              sandbox create must FAIL (invalid_argument).
-#                              Runs on ANY backend including mock — never skips.
+#   fs-rw            - in-policy write to DemoDir succeeds.
+#   fs-readonly      - write to read-only dir is denied; control write succeeds.
+#   fs-default-deny  - ungranted write is denied; control write succeeds.
+#                      processcontainer only.
+#   network-reject   - network_policies rule makes sandbox create fail.
 
 [CmdletBinding()]
 param(
@@ -50,6 +48,9 @@ param(
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+$OutputEncoding = [System.Text.Encoding]::UTF8
+
 $here = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 
 function Step([string]$m)  { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
@@ -58,6 +59,24 @@ function Ok([string]$m)    { Write-Host "[OK]   $m" -ForegroundColor Green }
 function Bad([string]$m)   { Write-Host "[FAIL] $m" -ForegroundColor Red }
 function Skip([string]$m)  { Write-Host "[SKIP] $m" -ForegroundColor Yellow }
 function Warn([string]$m)  { Write-Host "[WARN] $m" -ForegroundColor Yellow }
+
+function Wait-File([string]$path, [int]$seconds) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    while ((Get-Date) -lt $deadline -and -not (Test-Path $path)) {
+        Start-Sleep -Milliseconds 400
+    }
+    return (Test-Path $path)
+}
+
+function Launch-Failed([string]$gwText) {
+    if ($null -eq $gwText) { return $false }
+    return ($gwText -match 'CreateProcessW failed error:2' `
+        -or $gwText -match 'error:2' `
+        -or $gwText -match 'exited -1' `
+        -or $gwText -match 'The system cannot find the file' `
+        -or $gwText -match 'E_NOTIMPL' `
+        -or $gwText -match 'velocity')
+}
 
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 
@@ -98,16 +117,20 @@ function Probe-Backend([string] $backendName, [string] $wxc) {
     }
 
     if ($backendName -eq "process_container") {
+        # wxc-exec treats config paths literally and does not expand %TEMP%.
+        # Use a real user-owned directory and an absolute executable path.
+        $probeDir = Join-Path $env:TEMP "mxc-e2e-probe"
+        New-Item -ItemType Directory -Force $probeDir | Out-Null
         $config = @{
             version     = "0.6.0-alpha"
             containerId = "e2e-probe-pc"
             containment = "processcontainer"
             process     = @{
-                commandLine = "cmd /c exit 0"
-                cwd         = "%TEMP%"
+                commandLine = "C:\Windows\System32\cmd.exe /c exit 0"
+                cwd         = $probeDir
                 timeout     = 10
             }
-            filesystem  = @{ readwritePaths = @("%TEMP%") }
+            filesystem  = @{ readwritePaths = @($probeDir) }
             processContainer = @{ leastPrivilege = $false }
         }
         $json = $config | ConvertTo-Json -Depth 20 -Compress
@@ -237,11 +260,14 @@ Ok "port $Port free"
 # ── Prepare DemoDir ───────────────────────────────────────────────────────────
 
 Step "Prepare DemoDir $DemoDir"
-New-Item -ItemType Directory -Force $DemoDir | Out-Null
+$roSrc = "$DemoDir-ro-src"
+$denyProbe = "$DemoDir-deny-probe"
+New-Item -ItemType Directory -Force $DemoDir, $roSrc, $denyProbe | Out-Null
 Ok "DemoDir ready"
 
 $env:OPENSHELL_DRIVERS       = "mxc"
 $env:OPENSHELL_MXC_SHARE_DIR = $DemoDir
+$cmdExe = "C:\Windows\System32\cmd.exe"
 
 # ── Start gateway ─────────────────────────────────────────────────────────────
 
@@ -251,13 +277,14 @@ $gwErrLog = "$gwLog.err"
 Remove-Item $gwLog, $gwErrLog -Force -ErrorAction SilentlyContinue
 
 $gw = Start-Process -FilePath $gateway `
-    -ArgumentList @("--disable-tls", "--config", $toml, "--log-level", "info") `
+    -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--config", $toml, "--log-level", "info") `
     -WorkingDirectory $here -PassThru -NoNewWindow `
     -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
 
 Info "gateway pid $($gw.Id); logs: $gwLog"
 
 $results = @()
+$runId = Get-Date -Format 'yyyyMMddHHmmss'
 
 try {
     # Wait for listening
@@ -288,44 +315,42 @@ try {
 
     # ── Scenario definitions ──────────────────────────────────────────────────
     #
-    # Each scenario is a hashtable:
-    #   Name        - unique identifier
-    #   PolicyFile  - path to the policy YAML fixture
-    #   Backends    - list: "both" / "process_container" / "isolation_session"
-    #   ExpectFail  - $true means `sandbox create` itself must fail (invalid_argument)
-    #   ExpectArtifact - whether the workload should create its target file
-    #   Description - human-readable label
+    # Each scenario is positive, deny, or create-fail. Deny scenarios require
+    # both a successful write to a granted control path and an absent denied
+    # target, so an agent launch failure cannot be mistaken for enforcement.
 
     $allScenarios = @(
         @{
             Name        = "fs-rw"
             PolicyFile  = Join-Path $policyDir "fs-rw.yaml"
             Backends    = "both"
-            ExpectFail  = $false
-            ExpectArtifact = $true
+            Kind        = "positive"
+            PosTarget   = Join-Path $DemoDir "fs-rw-result.txt"
             Description = "rw grant on DemoDir; in-policy write should succeed"
         },
         @{
             Name        = "fs-readonly"
             PolicyFile  = Join-Path $policyDir "fs-readonly.yaml"
             Backends    = "both"
-            ExpectFail  = $false
-            ExpectArtifact = $true
-            Description = "ro grant + rw share; write to ro dir should be denied"
+            Kind        = "deny"
+            ControlTarget = Join-Path $DemoDir "fs-readonly-control.txt"
+            DenyTarget    = Join-Path $roSrc "fs-readonly-deny.txt"
+            Description = "write to read-only dir denied; control write to rw dir succeeds"
         },
         @{
             Name        = "fs-default-deny"
             PolicyFile  = Join-Path $policyDir "fs-empty.yaml"
             Backends    = "process_container"
-            ExpectFail  = $false
-            ExpectArtifact = $false
-            Description = "empty filesystem policy; all writes denied (process_container only)"
+            Kind        = "deny"
+            ControlTarget = Join-Path $DemoDir "fs-default-deny-control.txt"
+            DenyTarget    = Join-Path $denyProbe "fs-default-deny-denied.txt"
+            Description = "empty policy; ungranted write denied; share control write succeeds"
         },
         @{
             Name        = "network-reject"
             PolicyFile  = Join-Path $policyDir "network-reject.yaml"
             Backends    = "both"
-            ExpectFail  = $true
+            Kind        = "create-fail"
             Description = "network_policies rule causes sandbox create to fail (no live backend needed)"
         }
     )
@@ -345,9 +370,10 @@ try {
         Step "Scenario: $($sc.Name)"
         Info $sc.Description
 
-        # Backend gate: skip enforcement scenarios when backend not live (and not mock and not ExpectFail).
+        # Backend gate: create-fail validates translation and does not need a
+        # live backend. Enforcement scenarios do.
         $skipReason = $null
-        if (-not $sc.ExpectFail) {
+        if ($sc.Kind -ne "create-fail") {
             $backendMatches = ($sc.Backends -eq "both") -or ($sc.Backends -eq $Backend)
             if (-not $backendMatches) {
                 $skipReason = "scenario requires backend=$($sc.Backends); current backend=$Backend"
@@ -369,15 +395,24 @@ try {
             continue
         }
 
-        # Build per-sandbox MXC workload config. Commands and working directories
-        # are create-time inputs, not gateway-wide settings.
-        $target = Join-Path $DemoDir "$($sc.Name)-result.txt"
-        Remove-Item $target -Force -ErrorAction SilentlyContinue
-        $targetFwd = $target.Replace('\', '/')
+        # Build the per-sandbox command. Commands and working directories are
+        # create-time inputs, so the gateway does not restart between scenarios.
+        if ($sc.Kind -eq "positive") {
+            Remove-Item $sc.PosTarget -Force -ErrorAction SilentlyContinue
+            $command = @($cmdExe, "/c", "echo ok 1> $($sc.PosTarget.Replace('\', '/'))")
+        } elseif ($sc.Kind -eq "deny") {
+            Remove-Item $sc.ControlTarget, $sc.DenyTarget -Force -ErrorAction SilentlyContinue
+            $control = $sc.ControlTarget.Replace('\', '/')
+            $denied = $sc.DenyTarget.Replace('\', '/')
+            $command = @($cmdExe, "/c", "echo ok 1> $control & echo denied 1> $denied")
+        } else {
+            $command = @($cmdExe, "/c", "exit 0")
+        }
+
         $demoDirFwd = $DemoDir.Replace('\', '/')
         $driverConfig = @{
             mxc = @{
-                command = @("cmd", "/c", "echo.ok>$targetFwd")
+                command = $command
                 cwd = $demoDirFwd
             }
         } | ConvertTo-Json -Compress -Depth 4
@@ -388,68 +423,61 @@ try {
         } else {
             $driverConfig
         }
-        # Run sandbox create.
+        $sandboxName = "$($sc.Name)-$runId"
+        try { & $cli sandbox delete $sandboxName 2>&1 | Out-Null } catch {}
+
+        # Run sandbox create. Its exit status is only authoritative for the
+        # create-fail scenario; artifacts score workload scenarios.
         $createOut = $null
         $createExitCode = 0
         try {
-            $createOut = & $cli sandbox create --name $sc.Name --policy $sc.PolicyFile --driver-config-json $driverConfigArg --no-tty 2>&1
+            $createOut = & $cli sandbox create --name $sandboxName --policy $sc.PolicyFile --driver-config-json $driverConfigArg --no-tty 2>&1
             $createExitCode = $LASTEXITCODE
         } catch {
             $createOut = $_.Exception.Message
             $createExitCode = 1
         }
         $createOutStr = ($createOut -join "`n")
-        Info "create exit: $createExitCode"
+        Info "create exit: $createExitCode (not used for workload scoring)"
 
         # Delete sandbox (best-effort; no-op if create failed).
-        try { & $cli sandbox delete $sc.Name 2>&1 | Out-Null } catch {}
+        try { & $cli sandbox delete $sandboxName 2>&1 | Out-Null } catch {}
+        $gwText = (Get-Content $gwLog, $gwErrLog -Raw -ErrorAction SilentlyContinue) -join [Environment]::NewLine
 
         # Evaluate.
-        if ($sc.ExpectFail) {
-            # network-reject: create must fail.
+        if ($sc.Kind -eq "create-fail") {
             if ($createExitCode -ne 0) {
                 Ok "$($sc.Name): create correctly failed (exit $createExitCode)"
-                Info "output: $createOutStr"
                 $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "create failed as expected" }
             } else {
                 Bad "$($sc.Name): create succeeded but should have failed"
                 Info "output: $createOutStr"
                 $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "create succeeded unexpectedly" }
             }
-        } else {
-            # Wiring check in mock mode: the artifact must match the policy's
-            # expected outcome. In particular, default-deny passes only when
-            # the workload cannot create its target file.
-            if ($Mock) {
-                if ($sc.ExpectArtifact) {
-                    $deadline = (Get-Date).AddSeconds(10)
-                    while ((Get-Date) -lt $deadline -and -not (Test-Path $target)) {
-                        Start-Sleep -Milliseconds 300
-                    }
-                }
-                $artifactExists = Test-Path $target
-                if ($artifactExists -eq $sc.ExpectArtifact) {
-                    $outcome = if ($artifactExists) { "present" } else { "absent" }
-                    Ok "$($sc.Name): artifact $outcome as expected (mock wiring OK)"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "mock wiring: artifact $outcome as expected" }
-                } else {
-                    Bad "$($sc.Name): artifact outcome did not match policy (present=$artifactExists, expected=$($sc.ExpectArtifact))"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "mock wiring: artifact present=$artifactExists, expected=$($sc.ExpectArtifact)" }
-                }
+        } elseif ($sc.Kind -eq "positive") {
+            if (Wait-File $sc.PosTarget 30) {
+                Ok "$($sc.Name): in-policy write produced artifact"
+                $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "artifact present" }
             } else {
-                # Real mode: artifact presence == enforcement worked.
-                $deadline = (Get-Date).AddSeconds(30)
-                while ((Get-Date) -lt $deadline -and -not (Test-Path $target)) {
-                    Start-Sleep -Milliseconds 500
-                }
-                if ($createExitCode -eq 0 -and (Test-Path $target)) {
-                    Ok "$($sc.Name): in-policy write succeeded"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "in-policy write produced artifact" }
-                } else {
-                    Bad "$($sc.Name): FAIL (create=$createExitCode, artifact=$(Test-Path $target))"
-                    Info "createOut: $createOutStr"
-                    $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "create=$createExitCode, artifact=$(Test-Path $target)" }
-                }
+                Bad "$($sc.Name): artifact absent ($($sc.PosTarget))"
+                Info "createOut: $createOutStr"
+                if (Launch-Failed $gwText) { Info "gateway log shows an agent-launch failure" }
+                $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "artifact absent" }
+            }
+        } else {
+            $controlPresent = Wait-File $sc.ControlTarget 30
+            $denyPresent = Test-Path $sc.DenyTarget
+            if ($controlPresent -and -not $denyPresent) {
+                Ok "$($sc.Name): control write succeeded; denied write correctly blocked"
+                $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "PASS"; Reason = "control present, deny absent" }
+            } elseif (-not $controlPresent) {
+                Bad "$($sc.Name): control write absent; denial result is inconclusive"
+                Info "createOut: $createOutStr"
+                if (Launch-Failed $gwText) { Info "gateway log shows an agent-launch failure" }
+                $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "control absent (agent did not run)" }
+            } else {
+                Bad "$($sc.Name): denied write was not blocked"
+                $results += [pscustomobject]@{ Scenario = $sc.Name; Result = "FAIL"; Reason = "deny target present" }
             }
         }
     }
@@ -469,9 +497,9 @@ try {
 Step "Summary"
 $results | Format-Table -AutoSize
 
-$failCount = ($results | Where-Object { $_.Result -eq "FAIL" }).Count
-$passCount = ($results | Where-Object { $_.Result -eq "PASS" }).Count
-$skipCount = ($results | Where-Object { $_.Result -eq "SKIP" }).Count
+$failCount = @($results | Where-Object { $_.Result -eq "FAIL" }).Count
+$passCount = @($results | Where-Object { $_.Result -eq "PASS" }).Count
+$skipCount = @($results | Where-Object { $_.Result -eq "SKIP" }).Count
 
 Write-Host "PASS=$passCount  FAIL=$failCount  SKIP=$skipCount"
 
