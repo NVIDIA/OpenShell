@@ -47,6 +47,7 @@
           pkg-config
           # Coverage.
           lcov
+          uv
         ];
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";

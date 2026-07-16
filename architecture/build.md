@@ -11,7 +11,8 @@ OpenShell builds these main artifacts:
 | Artifact | Source |
 |---|---|
 | Gateway binary | `crates/openshell-server` |
-| CLI package and Python SDK | `python/openshell` plus Rust binaries where packaged |
+| CLI binaries and system packages | `crates/openshell-cli` plus release packaging |
+| Python SDK wheel | `python/openshell` |
 | TypeScript SDK package | `sdk/typescript` |
 | Gateway container image | `deploy/docker/Dockerfile.gateway` |
 | Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
@@ -205,14 +206,18 @@ for explicit publication.
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
-build outputs of `mise run python:proto`. The task uses `uv run --frozen` to
-synchronize the current worktree's `.venv` from `uv.lock` before generation.
-maturin honors `.gitignore` when collecting `python-source` files, so native
-builds (Linux CI, local `pip install .`) would drop them and ship an unimportable
-wheel. `pyproject.toml`
-pins them back in with `[tool.maturin].include` globs. The release workflows
-install each Linux wheel in a clean image and import `openshell.sandbox` as a
-smoke check.
+build outputs of `mise run python:proto`. Setuptools includes them through the
+package-data configuration in `pyproject.toml`. Release workflows build the
+wheel directly and do not produce a source distribution. Setuptools SCM derives
+local versions from Git and accepts the release workflow's computed version
+through its distribution-specific override.
+
+The build produces one platform-independent `py3-none-any` wheel. A verifier
+checks its tag, metadata, version, required package files, and the absence of
+native files or an `openshell` executable entry point. Release workflows build
+the wheel once, install it in a clean virtual environment, import the public
+package modules, and confirm that installation did not create an `openshell`
+command.
 
 ## TypeScript SDK Packaging
 
