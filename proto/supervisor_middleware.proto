@@ -209,9 +209,8 @@ message HeaderMutation {
 message HttpRequestResult {
   // Allow or deny decision for this request.
   Decision decision = 1;
-  // Audit-safe human-readable reason. OpenShell does not relay text from an
-  // operator-run service into denied responses or security logs. Limited to
-  // 4 KiB before normalization.
+  // Free-form service diagnostic. OpenShell does not relay this text into
+  // denied responses or security logs. Limited to 4 KiB before discarding.
   string reason = 2;
   // Replacement request body when has_body is true. Limited to 4 MiB.
   bytes body = 3;
@@ -235,4 +234,9 @@ message HttpRequestResult {
   // Non-secret service-defined metadata included in diagnostics. At most 64
   // entries and 32 KiB of combined key/value data are accepted.
   map<string, string> metadata = 7;
+  // Optional stable machine-readable code for a deny decision. Codes must
+  // start with a lowercase ASCII letter and contain only lowercase ASCII
+  // letters, digits, and underscores, with a maximum length of 64 bytes.
+  // OpenShell may return this code to the requester, unlike free-form reason.
+  string reason_code = 8;
 }

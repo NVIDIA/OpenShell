@@ -167,7 +167,7 @@ OCSF CONFIG:LOADED [INFO] Policy reloaded successfully [policy_hash:0cc0c2b52557
 
 Denied `NET:` and `HTTP:` events carry a `[reason:...]` suffix that surfaces the decision detail from the event's `status_detail` field. The reason helps distinguish between policy misses, SSRF hardening, and L7 enforcement without inspecting the full OCSF JSONL record.
 
-For supervisor middleware denials, `status_detail` contains an audit-safe reason. Built-in middleware can provide that reason directly. Operator-run denial reasons are derived from the operator-owned registration name, and operator-run failure details use platform-owned error codes; OpenShell does not copy per-request service text into logs.
+For supervisor middleware denials, `status_detail` contains a platform-owned reason derived from the policy-local middleware config name and optional validated reason code. Middleware failure details also use platform-owned error codes. OpenShell does not copy per-request service text into logs.
 
 Common reason phrases emitted by the sandbox include:
 
@@ -205,9 +205,9 @@ An upstream that the proxy cannot reach returns `502 Bad Gateway`:
 }
 ```
 
-The `error` field is a short machine-readable code (`policy_denied`, `ssrf_denied`, `upstream_unreachable`). The `detail` field is a human-readable explanation suitable for display in an agent transcript.
+The `error` field is a short machine-readable code (`policy_denied`, `middleware_denied`, `ssrf_denied`, `upstream_unreachable`). The `detail` field is a human-readable explanation suitable for display in an agent transcript.
 
-For L7 REST denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When policy advisor is enabled, it also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/openshell/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry.
+For L7 REST policy denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When policy advisor is enabled, it also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/openshell/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry. A middleware denial instead identifies the policy-local config in `middleware`, optionally includes a validated `reason_code`, and omits `rule_missing`, `next_steps`, and `agent_guidance` because no policy rule is missing.
 
 ## Filesystem Sandbox Logs
 

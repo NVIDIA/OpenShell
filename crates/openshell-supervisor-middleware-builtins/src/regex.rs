@@ -96,6 +96,7 @@ pub fn evaluate_http_request(evaluation: &HttpRequestEvaluation) -> Result<HttpR
         header_mutations: Vec::new(),
         findings: Vec::new(),
         metadata: HashMap::new(),
+        reason_code: String::new(),
     };
     for (kind, count) in &matches {
         result.findings.push(Finding {

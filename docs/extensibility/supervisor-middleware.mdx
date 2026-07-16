@@ -101,7 +101,17 @@ See [Policy Schema](/reference/policy-schema#network-middleware) for the complet
 
 Use `fail_open` only when bypassing the middleware preserves the intended security policy. OpenShell emits a detection finding when a failed stage is bypassed.
 
-An explicit deny decision always stops the chain and denies the request, regardless of `on_error`.
+An explicit deny decision always stops the chain and denies the request, regardless of `on_error`. The HTTP response uses `error: middleware_denied`, identifies the policy-local middleware config, and omits policy-advisor remediation because the network and L7 allow rules already matched. OpenShell never copies the free-form middleware `reason` into the response or security logs. A service can instead return an optional stable `reason_code`: 1–64 bytes, starting with a lowercase ASCII letter and containing only lowercase ASCII letters, digits, and underscores. Invalid codes make the result a middleware failure governed by `on_error`.
+
+```json
+{
+  "error": "middleware_denied",
+  "detail": "Request rejected by configured middleware",
+  "policy": "api-policy",
+  "middleware": "prototype-content-guard",
+  "reason_code": "content_match"
+}
+```
 
 Middleware decisions are enforced regardless of the endpoint's `enforcement` mode. `enforcement: audit` applies to an endpoint's network and L7 policy rules and does not bypass middleware: a middleware deny, or a failed `fail_closed` stage, blocks the request even on an audit endpoint. A middleware service that needs to observe traffic without blocking should return an allow decision with findings, which OpenShell emits as detection findings.
 
@@ -114,7 +124,7 @@ Every middleware binding declares the largest request or replacement body it sup
 - A selected chain buffers using its largest stage limit, so every stage that can process the body receives it.
 - The same per-stage limit applies to request bodies and replacement bodies.
 
-The gateway rejects a registration whose operator limit exceeds the service capability or the 4 MiB platform maximum instead of silently clamping it. OpenShell also bounds the non-body protobuf components: 64 KiB for service config, 4 KiB for request context, 32 KiB for the target, and 128 request header lines totaling at most 64 KiB encoded. Results allow a 4 KiB reason, 64 header mutations totaling at most 64 KiB encoded, 32 findings of at most 4 KiB encoded each, and 64 metadata entries totaling at most 32 KiB. Middleware gRPC servers should configure request and response message limits to at least 4 MiB plus 292 KiB so every platform-valid envelope fits.
+The gateway rejects a registration whose operator limit exceeds the service capability or the 4 MiB platform maximum instead of silently clamping it. OpenShell also bounds the non-body protobuf components: 64 KiB for service config, 4 KiB for request context, 32 KiB for the target, and 128 request header lines totaling at most 64 KiB encoded. Results allow a 4 KiB discarded free-form reason, a 64-byte validated reason code, 64 header mutations totaling at most 64 KiB encoded, 32 findings of at most 4 KiB encoded each, and 64 metadata entries totaling at most 32 KiB. Middleware gRPC servers should configure request and response message limits to at least 4 MiB plus 293 KiB so every platform-valid envelope fits.
 
 At request time, exceeding a selected stage's limit is a middleware failure for that stage alone and follows that config's `on_error` behavior; other stages in the chain still run against their own limits. OpenShell can apply `fail_open` to an oversized `Content-Length` before consuming body bytes. A chunked body can cross the limit only after bytes have been consumed, so OpenShell denies that request because it cannot safely resume the original stream.
 
@@ -149,7 +159,7 @@ When the effective sandbox configuration changes, a running supervisor validates
 Middleware activity is emitted through OpenShell's OCSF logging:
 
 - Each invocation records its policy-local config name, attached middleware name, decision, transformation state, and failure state.
-- A denied built-in invocation records its audit-safe reason. For operator-run services, OpenShell records a stable reason derived from the operator-owned registration name instead of service-provided per-request text.
+- A denied invocation records a platform-owned reason derived from the policy-local config name and optional validated reason code. OpenShell does not record service-provided free-form reason text.
 - A bypass under `fail_open` emits a detection finding.
 - A required stage that fails closed emits a high-severity detection finding.
 - Built-in findings include their type, label, and aggregate count. Operator-run findings use the operator-owned registration name and a platform label plus the aggregate count; OpenShell does not log service-provided finding text or diagnostic metadata. A stage can return at most 32 findings. Exceeding the per-stage cap is an invalid response handled through `on_error`. A maximum 10-stage chain retains and emits up to 320 findings without silently dropping findings from later stages.

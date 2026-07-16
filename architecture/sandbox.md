@@ -80,7 +80,7 @@ by the operator-owned registration name. Each attachment selects the binding
 for the active operation and phase. A manifest cannot declare two bindings for
 the same operation and phase pair.
 The platform caps middleware bodies at 4 MiB and derives the gRPC transport
-limit from bounded request and response components, reserving 292 KiB for the
+limit from bounded request and response components, reserving 293 KiB for the
 largest valid protobuf envelope. Config, context, target, headers, mutations,
 reasons, findings, and metadata each have explicit size or cardinality limits.
 Policies contain at most 10 middleware configs with 32 combined host selector
@@ -93,10 +93,12 @@ timeout for each binding in its `Describe` manifest. Both use integer `ms` or
 so binding calls use the smaller value; `Describe` uses the service value
 because bindings have not been discovered yet.
 Registration and manifest body limits above the platform boundary fail before
-request-body allocation. External per-request reason, finding text, mutation
-errors, and diagnostic metadata are untrusted: the supervisor maps logged
-findings to the validated operator registration name and uses platform-owned
-failure codes.
+request-body allocation. Per-request free-form reason text, external finding
+text, mutation errors, and external diagnostic metadata are untrusted. Direct
+denials identify the policy-local config and may expose only a tightly validated
+stable reason code; responses and logs use platform-owned text. The supervisor
+maps logged external findings to the validated operator registration name and
+uses platform-owned failure codes.
 At startup, the supervisor installs the in-process registry before connecting
 to external services, so an external outage cannot remove built-in bindings.
 For a gateway policy snapshot, the supervisor prepares replacements off to the

@@ -2161,6 +2161,30 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
     context: Option<DenyResponseContext<'_>>,
 ) -> Result<()> {
     let body = deny_response_body(req, policy_name, reason, redacted_target, context);
+    send_forbidden_json(policy_name, body, client).await
+}
+
+/// Send a middleware-specific 403 response without policy-advisor guidance.
+///
+/// The policy config identity and optional reason code are validated platform
+/// inputs. Free-form middleware reason text is intentionally absent.
+pub(crate) async fn send_middleware_deny_response<C: AsyncWrite + Unpin>(
+    req: &L7Request,
+    policy_name: &str,
+    denial: &openshell_supervisor_middleware::MiddlewareDenial,
+    client: &mut C,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> Result<()> {
+    let body = middleware_deny_response_body(req, policy_name, denial, redacted_target, context);
+    send_forbidden_json(policy_name, body, client).await
+}
+
+async fn send_forbidden_json<C: AsyncWrite + Unpin>(
+    policy_name: &str,
+    body: serde_json::Value,
+    client: &mut C,
+) -> Result<()> {
     let body_bytes = body.to_string();
     let response = format!(
         "HTTP/1.1 403 Forbidden\r\n\
@@ -2180,6 +2204,45 @@ async fn send_deny_response<C: AsyncWrite + Unpin>(
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
     Ok(())
+}
+
+fn middleware_deny_response_body(
+    req: &L7Request,
+    policy_name: &str,
+    denial: &openshell_supervisor_middleware::MiddlewareDenial,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> serde_json::Value {
+    let target = redacted_target.unwrap_or(&req.target);
+    let context = context.unwrap_or_default();
+    let mut body = serde_json::Map::new();
+    body.insert("error".to_string(), serde_json::json!("middleware_denied"));
+    body.insert(
+        "detail".to_string(),
+        serde_json::json!("Request rejected by configured middleware"),
+    );
+    body.insert("policy".to_string(), serde_json::json!(policy_name));
+    body.insert(
+        "middleware".to_string(),
+        serde_json::json!(denial.config_name),
+    );
+    if let Some(reason_code) = &denial.reason_code {
+        body.insert("reason_code".to_string(), serde_json::json!(reason_code));
+    }
+    body.insert("layer".to_string(), serde_json::json!("l7"));
+    body.insert("method".to_string(), serde_json::json!(req.action));
+    body.insert("path".to_string(), serde_json::json!(target));
+    if let Some(host) = non_empty(context.host) {
+        body.insert("host".to_string(), serde_json::json!(host));
+    }
+    if let Some(port) = context.port {
+        body.insert("port".to_string(), serde_json::json!(port));
+    }
+    if let Some(binary) = non_empty(context.binary) {
+        body.insert("binary".to_string(), serde_json::json!(binary));
+    }
+
+    serde_json::Value::Object(body)
 }
 
 fn deny_response_body(
@@ -3540,6 +3603,47 @@ mod tests {
             body.get("agent_guidance").is_none(),
             "agent_guidance must only be present when the policy advisor is enabled"
         );
+    }
+
+    #[test]
+    fn middleware_deny_response_identifies_config_without_policy_remediation() {
+        let _proposals =
+            openshell_core::proposals::test_helpers::ProposalsFlagGuard::set_blocking(true);
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/v1/messages?token=secret-token".to_string(),
+            query_params: HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: BodyLength::ContentLength(64),
+        };
+        let denial = openshell_supervisor_middleware::MiddlewareDenial {
+            config_name: "prototype-content-guard".into(),
+            reason_code: Some("content_match".into()),
+        };
+
+        let body = middleware_deny_response_body(
+            &req,
+            "api-policy",
+            &denial,
+            Some("/v1/messages"),
+            Some(DenyResponseContext {
+                host: Some("api.example.com"),
+                port: Some(443),
+                binary: Some("/usr/bin/curl"),
+            }),
+        );
+
+        assert_eq!(body["error"], "middleware_denied");
+        assert_eq!(body["detail"], "Request rejected by configured middleware");
+        assert_eq!(body["middleware"], "prototype-content-guard");
+        assert_eq!(body["reason_code"], "content_match");
+        assert_eq!(body["policy"], "api-policy");
+        assert_eq!(body["path"], "/v1/messages");
+        assert!(body.get("rule").is_none());
+        assert!(body.get("rule_missing").is_none());
+        assert!(body.get("next_steps").is_none());
+        assert!(body.get("agent_guidance").is_none());
+        assert!(!body.to_string().contains("secret-token"));
     }
 
     #[tokio::test]

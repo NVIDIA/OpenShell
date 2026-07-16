@@ -4664,18 +4664,22 @@ async fn handle_forward_proxy(
         };
         forward_request_bytes = match pipeline.apply(request, client, chain).await? {
             crate::l7::middleware::MiddlewareApplyResult::Allowed(request) => request.raw_header,
-            crate::l7::middleware::MiddlewareApplyResult::Denied(reason) => {
+            crate::l7::middleware::MiddlewareApplyResult::Denied { reason, denial } => {
                 emit_activity_simple(activity_tx, true, "middleware");
-                respond(
-                    client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "middleware_denied",
-                        &format!("{method} {host_lc}:{port}{path} denied by middleware: {reason}"),
-                    ),
-                )
-                .await?;
+                let response = denial.as_ref().map_or_else(
+                    || {
+                        build_json_error_response(
+                            403,
+                            "Forbidden",
+                            "middleware_denied",
+                            &format!(
+                                "{method} {host_lc}:{port}{path} denied by middleware: {reason}"
+                            ),
+                        )
+                    },
+                    |denial| build_middleware_deny_response(&l7_ctx.policy_name, denial),
+                );
+                respond(client, &response).await?;
                 return Ok(());
             }
         };
@@ -4872,6 +4876,38 @@ fn build_json_error_response(status: u16, status_text: &str, error: &str, detail
     let body_str = body.to_string();
     format!(
         "HTTP/1.1 {status} {status_text}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body_str.len(),
+        body_str,
+    )
+    .into_bytes()
+}
+
+fn build_middleware_deny_response(
+    policy_name: &str,
+    denial: &openshell_supervisor_middleware::MiddlewareDenial,
+) -> Vec<u8> {
+    let mut body = serde_json::Map::new();
+    body.insert("error".to_string(), serde_json::json!("middleware_denied"));
+    body.insert(
+        "detail".to_string(),
+        serde_json::json!("Request rejected by configured middleware"),
+    );
+    body.insert("policy".to_string(), serde_json::json!(policy_name));
+    body.insert(
+        "middleware".to_string(),
+        serde_json::json!(denial.config_name),
+    );
+    if let Some(reason_code) = &denial.reason_code {
+        body.insert("reason_code".to_string(), serde_json::json!(reason_code));
+    }
+    let body_str = serde_json::Value::Object(body).to_string();
+    format!(
+        "HTTP/1.1 403 Forbidden\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\
@@ -5489,10 +5525,13 @@ network_policies:
             .expect("forward middleware pipeline");
 
         match outcome {
-            crate::l7::middleware::MiddlewareApplyResult::Denied(reason) => assert!(
-                reason.contains("middleware transformation denied by policy"),
-                "{reason}"
-            ),
+            crate::l7::middleware::MiddlewareApplyResult::Denied { reason, denial } => {
+                assert!(
+                    reason.contains("middleware transformation denied by policy"),
+                    "{reason}"
+                );
+                assert!(denial.is_none());
+            }
             crate::l7::middleware::MiddlewareApplyResult::Allowed(_) => {
                 panic!("policy-invalid transformed request must be denied")
             }
@@ -9082,6 +9121,28 @@ network_policies:
         let body: serde_json::Value = serde_json::from_str(&resp_str[body_start..]).unwrap();
         assert_eq!(body["error"], "upstream_unreachable");
         assert_eq!(body["detail"], "connection to api.example.com:443 failed");
+    }
+
+    #[test]
+    fn middleware_deny_response_uses_policy_config_identity() {
+        let resp = build_middleware_deny_response(
+            "api-policy",
+            &openshell_supervisor_middleware::MiddlewareDenial {
+                config_name: "prototype-content-guard".into(),
+                reason_code: Some("content_match".into()),
+            },
+        );
+        let resp_str = String::from_utf8(resp).unwrap();
+        let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
+        let body: serde_json::Value = serde_json::from_str(&resp_str[body_start..]).unwrap();
+
+        assert_eq!(body["error"], "middleware_denied");
+        assert_eq!(body["detail"], "Request rejected by configured middleware");
+        assert_eq!(body["middleware"], "prototype-content-guard");
+        assert_eq!(body["reason_code"], "content_match");
+        assert_eq!(body["policy"], "api-policy");
+        assert!(body.get("rule_missing").is_none());
+        assert!(body.get("next_steps").is_none());
     }
 
     /// Locks the fail-closed response the CONNECT handler sends when TLS is

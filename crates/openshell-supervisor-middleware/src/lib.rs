@@ -47,6 +47,8 @@ pub const MAX_MIDDLEWARE_HEADERS: usize = 128;
 pub const MAX_MIDDLEWARE_HEADER_BYTES: usize = 64 * 1024;
 /// Largest operator-provided reason accepted in one middleware result.
 pub const MAX_MIDDLEWARE_REASON_BYTES: usize = 4 * 1024;
+/// Largest stable reason code accepted in one middleware result.
+pub const MAX_MIDDLEWARE_REASON_CODE_BYTES: usize = 64;
 /// Largest encoded individual finding accepted from one middleware stage.
 pub const MAX_MIDDLEWARE_FINDING_BYTES: usize = 4 * 1024;
 /// Largest number of metadata entries accepted from one middleware stage.
@@ -62,6 +64,7 @@ const MAX_MIDDLEWARE_REQUEST_ENVELOPE_BYTES: usize = MAX_MIDDLEWARE_CONFIG_BYTES
     + MAX_MIDDLEWARE_HEADER_BYTES
     + MAX_MIDDLEWARE_PROTOBUF_OVERHEAD_BYTES;
 const MAX_MIDDLEWARE_RESPONSE_ENVELOPE_BYTES: usize = MAX_MIDDLEWARE_REASON_BYTES
+    + MAX_MIDDLEWARE_REASON_CODE_BYTES
     + MAX_MIDDLEWARE_HEADER_MUTATION_WIRE_BYTES
     + MAX_MIDDLEWARE_FINDINGS_PER_STAGE * MAX_MIDDLEWARE_FINDING_BYTES
     + MAX_MIDDLEWARE_METADATA_BYTES
@@ -219,6 +222,19 @@ pub struct ChainOutcome {
     pub findings: Vec<NamespacedFinding>,
     pub metadata: BTreeMap<String, BTreeMap<String, String>>,
     pub applied: Vec<MiddlewareInvocation>,
+    /// Present only when a middleware completed successfully and explicitly
+    /// denied the request. Fail-closed service errors and transformed-body
+    /// policy denials are not represented as middleware decisions.
+    pub denial: Option<MiddlewareDenial>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MiddlewareDenial {
+    /// Stable policy-local middleware config identity.
+    pub config_name: String,
+    /// Validated service-defined code. Free-form service reason text is never
+    /// carried into client responses or security logs.
+    pub reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,6 +451,32 @@ fn is_stable_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
 }
 
+fn is_stable_reason_code(value: &str) -> bool {
+    value.len() <= MAX_MIDDLEWARE_REASON_CODE_BYTES
+        && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn middleware_denial_reason(config_name: &str, reason_code: Option<&str>) -> String {
+    let config_id: String = config_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(MAX_STABLE_IDENTIFIER_BYTES)
+        .collect();
+    reason_code.map_or_else(
+        || format!("middleware_denied:{config_id}"),
+        |code| format!("middleware_denied:{config_id}:{code}"),
+    )
+}
+
 fn validate_body_limit(source: &str, binding: &MiddlewareBinding) -> Result<usize> {
     if binding.max_body_bytes == 0 {
         return Err(miette!("{source} must advertise a non-zero body limit"));
@@ -581,6 +623,9 @@ fn validate_response_envelope(
     }
     if result.reason.len() > MAX_MIDDLEWARE_REASON_BYTES {
         return Err("response_reason_over_capacity");
+    }
+    if !result.reason_code.is_empty() && !is_stable_reason_code(&result.reason_code) {
+        return Err("response_reason_code_invalid");
     }
     if result.header_mutations.len() > headers::MAX_HEADER_MUTATIONS {
         return Err("header_mutation_count_over_capacity");
@@ -1018,6 +1063,7 @@ impl ChainRunner {
                             findings,
                             metadata,
                             applied,
+                            denial: None,
                         });
                     }
                 }
@@ -1034,6 +1080,7 @@ impl ChainRunner {
                             findings,
                             metadata,
                             applied,
+                            denial: None,
                         });
                     }
                 }
@@ -1051,6 +1098,7 @@ impl ChainRunner {
                             findings,
                             metadata,
                             applied,
+                            denial: None,
                         });
                     }
                 }
@@ -1085,6 +1133,7 @@ impl ChainRunner {
                                 findings,
                                 metadata,
                                 applied,
+                                denial: None,
                             });
                         }
                     }
@@ -1103,6 +1152,7 @@ impl ChainRunner {
                             findings,
                             metadata,
                             applied,
+                            denial: None,
                         });
                     }
                 }
@@ -1126,6 +1176,7 @@ impl ChainRunner {
                                 findings,
                                 metadata,
                                 applied,
+                                denial: None,
                             });
                         }
                     }
@@ -1133,6 +1184,12 @@ impl ChainRunner {
             };
 
             if decision == Decision::Deny {
+                let reason_code =
+                    (!result.reason_code.is_empty()).then(|| result.reason_code.clone());
+                let denial = MiddlewareDenial {
+                    config_name: entry.entry.name.clone(),
+                    reason_code,
+                };
                 for finding in result.findings {
                     findings.push(NamespacedFinding {
                         middleware: entry.entry.name.clone(),
@@ -1154,12 +1211,16 @@ impl ChainRunner {
                 });
                 return Ok(ChainOutcome {
                     allowed: false,
-                    reason: safe_reason(&result.reason),
+                    reason: middleware_denial_reason(
+                        &denial.config_name,
+                        denial.reason_code.as_deref(),
+                    ),
                     body,
                     header_mutations,
                     findings,
                     metadata,
                     applied,
+                    denial: Some(denial),
                 });
             }
 
@@ -1175,6 +1236,7 @@ impl ChainRunner {
                             findings,
                             metadata,
                             applied,
+                            denial: None,
                         });
                     }
                 }
@@ -1204,6 +1266,7 @@ impl ChainRunner {
                                 findings,
                                 metadata,
                                 applied,
+                                denial: None,
                             });
                         }
                     }
@@ -1260,6 +1323,7 @@ impl ChainRunner {
                         findings,
                         metadata,
                         applied,
+                        denial: None,
                     });
                 }
             }
@@ -1273,6 +1337,7 @@ impl ChainRunner {
             findings,
             metadata,
             applied,
+            denial: None,
         })
     }
 }
@@ -1964,6 +2029,7 @@ mod tests {
             header_mutations: Vec::new(),
             findings: Vec::new(),
             metadata: HashMap::new(),
+            reason_code: String::new(),
         }
     }
 
@@ -2824,6 +2890,7 @@ mod tests {
                     max_body_bytes: MAX_MIDDLEWARE_BODY_BYTES as u64,
                     result: openshell_core::proto::HttpRequestResult {
                         reason: "r".repeat(MAX_MIDDLEWARE_REASON_BYTES - 128),
+                        reason_code: "r".repeat(MAX_MIDDLEWARE_REASON_CODE_BYTES),
                         body: vec![b'x'; MAX_MIDDLEWARE_BODY_BYTES],
                         has_body: true,
                         header_mutations: vec![write_header(
@@ -2900,10 +2967,10 @@ mod tests {
 
     #[test]
     fn grpc_envelope_headroom_matches_bounded_components() {
-        assert_eq!(MIDDLEWARE_GRPC_ENVELOPE_BYTES, 292 * 1024);
+        assert_eq!(MIDDLEWARE_GRPC_ENVELOPE_BYTES, 292 * 1024 + 64);
         assert_eq!(
             MIDDLEWARE_GRPC_MESSAGE_BYTES,
-            MAX_MIDDLEWARE_BODY_BYTES + 292 * 1024
+            MAX_MIDDLEWARE_BODY_BYTES + 292 * 1024 + 64
         );
     }
 
@@ -2917,6 +2984,7 @@ mod tests {
             result: openshell_core::proto::HttpRequestResult {
                 decision: Decision::Deny as i32,
                 reason: format!("denied body={secret}\nFINDING:FORGED"),
+                reason_code: "content_match".into(),
                 findings: vec![Finding {
                     r#type: format!("secret.{secret}\nforged"),
                     label: format!("matched {secret}\nFINDING:FORGED"),
@@ -2943,7 +3011,14 @@ mod tests {
             .await
             .expect("evaluate external middleware");
 
-        assert_eq!(outcome.reason, "middleware_denied:local-guard-service");
+        assert_eq!(outcome.reason, "middleware_denied:guard:content_match");
+        assert_eq!(
+            outcome.denial,
+            Some(MiddlewareDenial {
+                config_name: "guard".into(),
+                reason_code: Some("content_match".into()),
+            })
+        );
         assert_eq!(
             outcome.findings[0].finding.r#type,
             "local-guard-service.finding"
@@ -2953,6 +3028,32 @@ mod tests {
         assert!(outcome.metadata.is_empty());
         assert!(!format!("{outcome:?}").contains(secret));
         assert!(!format!("{outcome:?}").contains("FINDING:FORGED"));
+    }
+
+    #[tokio::test]
+    async fn invalid_reason_code_is_a_middleware_failure() {
+        let runner = ChainRunner::new(Arc::new(scripted_service(
+            openshell_core::proto::HttpRequestResult {
+                decision: Decision::Deny as i32,
+                reason_code: "Secret value!".into(),
+                ..allow_result()
+            },
+        )));
+        let outcome = runner
+            .evaluate(
+                &[entry("content-guard", OnError::FailClosed)],
+                input("hello"),
+            )
+            .await
+            .expect("evaluate invalid reason code");
+
+        assert!(!outcome.allowed);
+        assert_eq!(
+            outcome.reason,
+            "middleware_failed: response_reason_code_invalid"
+        );
+        assert!(outcome.denial.is_none());
+        assert!(outcome.applied[0].failed);
     }
 
     #[tokio::test]
@@ -3159,7 +3260,15 @@ mod tests {
             .await
             .expect("evaluate");
         assert!(!outcome.allowed);
-        assert_eq!(outcome.reason, "blocked_by_policy");
+        assert_eq!(outcome.reason, "middleware_denied:first");
+        assert_eq!(
+            outcome.denial,
+            Some(MiddlewareDenial {
+                config_name: "first".into(),
+                reason_code: None,
+            })
+        );
+        assert!(!format!("{outcome:?}").contains("blocked_by_policy"));
         // The deny short-circuits the chain: the second middleware never runs.
         assert_eq!(outcome.applied.len(), 1);
         assert_eq!(outcome.applied[0].decision, Decision::Deny);
@@ -3187,7 +3296,7 @@ mod tests {
             .expect("evaluate");
 
         assert!(!outcome.allowed);
-        assert_eq!(outcome.reason, "blocked_by_policy");
+        assert_eq!(outcome.reason, "middleware_denied:guard");
         assert!(outcome.header_mutations.is_empty());
         assert_eq!(outcome.applied.len(), 1);
         assert_eq!(outcome.applied[0].decision, Decision::Deny);
@@ -3214,7 +3323,7 @@ mod tests {
             .expect("evaluate");
 
         assert!(!outcome.allowed);
-        assert_eq!(outcome.reason, "blocked_by_policy");
+        assert_eq!(outcome.reason, "middleware_denied:guard");
         assert_eq!(outcome.body, b"safe");
         assert_eq!(outcome.applied.len(), 1);
         assert_eq!(outcome.applied[0].decision, Decision::Deny);

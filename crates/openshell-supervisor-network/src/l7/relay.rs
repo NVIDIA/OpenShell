@@ -484,27 +484,23 @@ where
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Denied(reason) => {
-                    crate::l7::rest::RestProvider::default()
-                        .deny_with_redacted_target(
-                            &crate::l7::provider::L7Request {
-                                action: request_info.action.clone(),
-                                target: redacted_target.clone(),
-                                query_params: request_info.query_params.clone(),
-                                raw_header: Vec::new(),
-                                body_length: crate::l7::provider::BodyLength::None,
-                            },
-                            &ctx.policy_name,
-                            &reason,
-                            client,
-                            Some(&redacted_target),
-                            Some(crate::l7::rest::DenyResponseContext {
-                                host: Some(&ctx.host),
-                                port: Some(ctx.port),
-                                binary: Some(&ctx.binary_path),
-                            }),
-                        )
-                        .await?;
+                MiddlewareApplyResult::Denied { reason, denial } => {
+                    let denied_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_rejection_response(
+                        &denied_request,
+                        client,
+                        ctx,
+                        &reason,
+                        denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
@@ -981,27 +977,23 @@ where
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Denied(reason) => {
-                    provider
-                        .deny_with_redacted_target(
-                            &crate::l7::provider::L7Request {
-                                action: request_info.action.clone(),
-                                target: redacted_target.clone(),
-                                query_params: request_info.query_params.clone(),
-                                raw_header: Vec::new(),
-                                body_length: crate::l7::provider::BodyLength::None,
-                            },
-                            &ctx.policy_name,
-                            &reason,
-                            client,
-                            Some(&redacted_target),
-                            Some(crate::l7::rest::DenyResponseContext {
-                                host: Some(&ctx.host),
-                                port: Some(ctx.port),
-                                binary: Some(&ctx.binary_path),
-                            }),
-                        )
-                        .await?;
+                MiddlewareApplyResult::Denied { reason, denial } => {
+                    let denied_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_rejection_response(
+                        &denied_request,
+                        client,
+                        ctx,
+                        &reason,
+                        denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
@@ -1255,27 +1247,23 @@ where
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Denied(reason) => {
-                    crate::l7::rest::RestProvider::default()
-                        .deny_with_redacted_target(
-                            &crate::l7::provider::L7Request {
-                                action: request_info.action.clone(),
-                                target: redacted_target.clone(),
-                                query_params: request_info.query_params.clone(),
-                                raw_header: Vec::new(),
-                                body_length: crate::l7::provider::BodyLength::None,
-                            },
-                            &ctx.policy_name,
-                            &reason,
-                            client,
-                            Some(&redacted_target),
-                            Some(crate::l7::rest::DenyResponseContext {
-                                host: Some(&ctx.host),
-                                port: Some(ctx.port),
-                                binary: Some(&ctx.binary_path),
-                            }),
-                        )
-                        .await?;
+                MiddlewareApplyResult::Denied { reason, denial } => {
+                    let denied_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_rejection_response(
+                        &denied_request,
+                        client,
+                        ctx,
+                        &reason,
+                        denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
@@ -1488,27 +1476,23 @@ where
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Denied(reason) => {
-                    crate::l7::rest::RestProvider::default()
-                        .deny_with_redacted_target(
-                            &crate::l7::provider::L7Request {
-                                action: request_info.action.clone(),
-                                target: redacted_target.clone(),
-                                query_params: request_info.query_params.clone(),
-                                raw_header: Vec::new(),
-                                body_length: crate::l7::provider::BodyLength::None,
-                            },
-                            &ctx.policy_name,
-                            &reason,
-                            client,
-                            Some(&redacted_target),
-                            Some(crate::l7::rest::DenyResponseContext {
-                                host: Some(&ctx.host),
-                                port: Some(ctx.port),
-                                binary: Some(&ctx.binary_path),
-                            }),
-                        )
-                        .await?;
+                MiddlewareApplyResult::Denied { reason, denial } => {
+                    let denied_request = crate::l7::provider::L7Request {
+                        action: request_info.action.clone(),
+                        target: redacted_target.clone(),
+                        query_params: request_info.query_params.clone(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_rejection_response(
+                        &denied_request,
+                        client,
+                        ctx,
+                        &reason,
+                        denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
@@ -2129,27 +2113,23 @@ where
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Denied(reason) => {
-                    crate::l7::rest::RestProvider::default()
-                        .deny_with_redacted_target(
-                            &crate::l7::provider::L7Request {
-                                action: "HTTP".into(),
-                                target: redacted_target.clone(),
-                                query_params: std::collections::HashMap::new(),
-                                raw_header: Vec::new(),
-                                body_length: crate::l7::provider::BodyLength::None,
-                            },
-                            &ctx.policy_name,
-                            &reason,
-                            client,
-                            Some(&redacted_target),
-                            Some(crate::l7::rest::DenyResponseContext {
-                                host: Some(&ctx.host),
-                                port: Some(ctx.port),
-                                binary: Some(&ctx.binary_path),
-                            }),
-                        )
-                        .await?;
+                MiddlewareApplyResult::Denied { reason, denial } => {
+                    let denied_request = crate::l7::provider::L7Request {
+                        action: "HTTP".into(),
+                        target: redacted_target.clone(),
+                        query_params: std::collections::HashMap::new(),
+                        raw_header: Vec::new(),
+                        body_length: crate::l7::provider::BodyLength::None,
+                    };
+                    crate::l7::middleware::send_middleware_rejection_response(
+                        &denied_request,
+                        client,
+                        ctx,
+                        &reason,
+                        denial.as_ref(),
+                        &redacted_target,
+                    )
+                    .await?;
                     return Ok(());
                 }
             }
@@ -3170,13 +3150,13 @@ network_policies:
         // Any fail-closed entry -> deny.
         assert!(matches!(
             resolve_unbuffered_body(&ctx, req(), &mixed_chain, true),
-            MiddlewareApplyResult::Denied(_)
+            MiddlewareApplyResult::Denied { .. }
         ));
         // Not recoverable (chunked overflow already consumed bytes) -> deny even
         // when every entry is fail-open.
         assert!(matches!(
             resolve_unbuffered_body(&ctx, req(), &open_chain, false),
-            MiddlewareApplyResult::Denied(_)
+            MiddlewareApplyResult::Denied { .. }
         ));
     }
 
@@ -3879,7 +3859,7 @@ network_policies:
                     "redactor must replace the body: {raw}"
                 );
             }
-            MiddlewareApplyResult::Denied(reason) => {
+            MiddlewareApplyResult::Denied { reason, .. } => {
                 panic!("body within the largest stage limit must not fail the chain: {reason}")
             }
         }
@@ -4043,6 +4023,7 @@ network_policies:
                 transformed: true,
                 failed: false,
             }],
+            denial: None,
         };
 
         // Build the events directly rather than routing through the global
@@ -4112,7 +4093,7 @@ network_policies:
 
         let denied_outcome = ChainOutcome {
             allowed: false,
-            reason: "request matched configured policy".into(),
+            reason: "middleware_denied:content-guard:content_match".into(),
             body: Vec::new(),
             header_mutations: Vec::new(),
             findings: Vec::new(),
@@ -4124,6 +4105,10 @@ network_policies:
                 transformed: false,
                 failed: false,
             }],
+            denial: Some(openshell_supervisor_middleware::MiddlewareDenial {
+                config_name: "content-guard".into(),
+                reason_code: Some("content_match".into()),
+            }),
         };
         let denied_events = middleware_events(&ctx, &req, &denied_outcome);
         let denied_http = denied_events
@@ -4132,7 +4117,7 @@ network_policies:
             .expect("expected denied HTTP Activity event");
         assert_eq!(
             denied_http.base().status_detail.as_deref(),
-            Some("request matched configured policy")
+            Some("middleware_denied:content-guard:content_match")
         );
         let denied_json = denied_http.to_json().expect("serialize denied event");
         assert_eq!(denied_json["unmapped"]["transformed"], false);
@@ -4141,11 +4126,13 @@ network_policies:
             denied_http.format_shorthand(),
             "HTTP:POST [MED] DENIED POST http://api.example.test:443/v1/messages \
              [policy:rest_api engine:middleware] \
-             [failed:false transformed:false reason:request matched configured policy]"
+             [failed:false transformed:false \
+             reason:middleware_denied:content-guard:content_match]"
         );
 
         let external_failure_outcome = ChainOutcome {
             reason: "middleware_failed: header_mutation_invalid_name".into(),
+            denial: None,
             applied: vec![MiddlewareInvocation {
                 failed: true,
                 ..denied_outcome.applied[0].clone()
