@@ -35,12 +35,13 @@ HOW TO RUN
         ... -File .\run-ocsf-audit.ps1 -WxcExecPath "D:\path\to\wxc-exec.exe"
 
 WHAT YOU GET BACK
-  The script prints PASS/FAIL + a class/event breakdown and creates:
+  The script prints PASS/FAIL + an event-type coverage count and class breakdown,
+  points you at the OCSF audit log, and creates:
         results-<timestamp>.zip
-  Hand that zip back. It contains the OCSF audit log (openshell-ocsf.<date>.log),
-  the full transcript, the gateway logs (with the human-readable OCSF shorthand),
-  a summary, and the exact config + policy used. The bundle is also auto-copied
-  to the shared drive for pickup (pass -ShareOut "" to disable that).
+  It contains the OCSF audit log (openshell-ocsf.<date>.log), the full transcript,
+  the gateway logs (with the human-readable OCSF shorthand), a summary, and the
+  exact config + policy used. To auto-copy the bundle to a shared location, pass
+  -ShareOut '\\server\share' (off by default; results stay local otherwise).
 
 FILES IN THIS PACKAGE
   openshell-gateway.exe    the gateway (self-contained; needs only VC++ runtime)
@@ -57,7 +58,8 @@ USEFUL OPTIONS
                       SandboxProxyConfigured config event; everything else is
                       still produced. (Default is proxy ON for the full set.)
   -WxcExecPath <path> Path to wxc-exec.exe on this box.
-  -ShareOut ""        Disable the auto-copy of the results bundle to the share.
+  -ShareOut <path>    Copy the results bundle to a shared location
+                      (e.g. \\server\share). Off by default (results stay local).
   -KeepRunning        Leave the gateway running afterward for inspection.
 
 NOTES
