@@ -248,4 +248,56 @@ mod tests {
 
         assert_eq!(denial.kind, DestinationDenialKind::TrustedGateway);
     }
+
+    #[test]
+    fn phase0_validation_mode_precedence_is_explicit_and_stable() {
+        let trusted_ip = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let trusted = build_validation_plan(
+            "host.openshell.internal",
+            "host.openshell.internal",
+            Some(trusted_ip),
+            &["10.0.0.0/8".to_string()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            trusted.address_authorization,
+            AddressAuthorization::TrustedGatewayAlias {
+                expected_ip: trusted_ip
+            }
+        );
+
+        let explicit = build_validation_plan(
+            "10.2.3.4",
+            "10.2.3.4",
+            None,
+            &["10.0.0.0/8".to_string()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.address_authorization,
+            AddressAuthorization::ExplicitAllowedIps(vec!["10.0.0.0/8".parse().unwrap()])
+        );
+
+        let implicit = build_validation_plan("10.2.3.4", "10.2.3.4", None, &[], true).unwrap();
+        assert_eq!(
+            implicit.address_authorization,
+            AddressAuthorization::ImplicitIpLiteral("10.2.3.4".parse().unwrap())
+        );
+
+        let declared =
+            build_validation_plan("private.example", "private.example", None, &[], true).unwrap();
+        assert_eq!(
+            declared.address_authorization,
+            AddressAuthorization::ExactDeclaredHost
+        );
+
+        let default =
+            build_validation_plan("*.example.com", "*.example.com", None, &[], false).unwrap();
+        assert_eq!(
+            default.address_authorization,
+            AddressAuthorization::DefaultPublicOnly
+        );
+    }
 }

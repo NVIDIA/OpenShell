@@ -808,6 +808,68 @@ fn emit_denial_simple(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn build_connect_allow_ocsf_event(
+    peer_addr: SocketAddr,
+    host: &str,
+    port: u16,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    policy: &str,
+    l7_inspection: bool,
+) -> openshell_ocsf::OcsfEvent {
+    let connect_msg = if l7_inspection {
+        "CONNECT_L7"
+    } else {
+        "CONNECT"
+    };
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule(policy, "opa")
+        .message(format!("{connect_msg} allowed {host}:{port}"))
+        .build()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_forward_allow_ocsf_event(
+    peer_addr: SocketAddr,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    policy: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new("http", host, path, port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule(policy, "opa")
+        .message(format!("FORWARD allowed {method} {host}:{port}{path}"))
+        .build()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn deny_connect_destination(
     client: &mut TcpStream,
     denial: &DestinationDenial,
@@ -1313,29 +1375,17 @@ async fn handle_tcp_connection(
 
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
     // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
-    let connect_msg = if should_inspect_l7 {
-        "CONNECT_L7"
-    } else {
-        "CONNECT"
-    };
-    {
-        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
-            .firewall_rule(policy_str, "opa")
-            .message(format!("{connect_msg} allowed {host_lc}:{port}"))
-            .build();
-        ocsf_emit!(event);
-    }
+    ocsf_emit!(build_connect_allow_ocsf_event(
+        workload_addr,
+        &host_lc,
+        port,
+        &binary_str,
+        &pid_str,
+        &ancestors_str,
+        &cmdline_str,
+        policy_str,
+        should_inspect_l7,
+    ));
     emit_connect_activity_if_l4_only(&activity_tx, l7_route);
 
     // `effective_tls_skip` was resolved before the `200` above (the fail-closed
@@ -3530,9 +3580,13 @@ fn rewrite_forward_request(
     output.extend_from_slice(b"\r\n");
     let rewritten_header_end = output.len();
 
-    // Append any overflow body bytes from the original buffer
+    // Append only bytes that belong to the first request body. The initial
+    // proxy read can also contain a pipelined follow-on request; forwarding
+    // that as body overflow would bypass its own policy evaluation.
     if header_end < used {
-        output.extend_from_slice(&raw[header_end..used]);
+        let overflow = &raw[header_end..used];
+        let body_prefix_len = initial_forward_body_prefix_len(&header_str, overflow);
+        output.extend_from_slice(&overflow[..body_prefix_len]);
     }
 
     // Fail-closed: scan for any remaining unresolved placeholders
@@ -3551,6 +3605,66 @@ fn rewrite_forward_request(
     }
 
     Ok(output)
+}
+
+fn initial_forward_body_prefix_len(header_str: &str, overflow: &[u8]) -> usize {
+    match crate::l7::rest::parse_body_length(header_str) {
+        Ok(crate::l7::provider::BodyLength::None) => 0,
+        Ok(crate::l7::provider::BodyLength::ContentLength(len)) => usize::try_from(len)
+            .unwrap_or(usize::MAX)
+            .min(overflow.len()),
+        Ok(crate::l7::provider::BodyLength::Chunked) => {
+            complete_chunked_body_prefix_len(overflow).unwrap_or(overflow.len())
+        }
+        // Invalid framing is rejected by the guarded relay before an upstream
+        // body write. Keep the bytes available so that parser sees the same
+        // malformed request instead of blocking while trying to re-read them.
+        Err(_) => overflow.len(),
+    }
+}
+
+/// Return the complete chunked body length when its terminator is already in
+/// the initial read. `None` means more body bytes are required.
+fn complete_chunked_body_prefix_len(bytes: &[u8]) -> Option<usize> {
+    let mut pos = 0usize;
+    loop {
+        let line_end = bytes[pos..]
+            .windows(2)
+            .position(|window| window == b"\r\n")?
+            + pos;
+        let size_line = std::str::from_utf8(&bytes[pos..line_end]).ok()?;
+        let size = usize::from_str_radix(
+            size_line
+                .split(';')
+                .next()
+                .map(str::trim)
+                .unwrap_or_default(),
+            16,
+        )
+        .ok()?;
+        pos = line_end.checked_add(2)?;
+
+        if size == 0 {
+            loop {
+                let trailer_end = bytes[pos..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")?
+                    + pos;
+                let empty = trailer_end == pos;
+                pos = trailer_end.checked_add(2)?;
+                if empty {
+                    return Some(pos);
+                }
+            }
+        }
+
+        let chunk_end = pos.checked_add(size)?;
+        let framed_end = chunk_end.checked_add(2)?;
+        if framed_end > bytes.len() || &bytes[chunk_end..framed_end] != b"\r\n" {
+            return None;
+        }
+        pos = framed_end;
+    }
 }
 
 struct ForwardRelayOptions<'a> {
@@ -4559,7 +4673,6 @@ async fn handle_forward_proxy(
             }
         };
     }
-
     forward_request_bytes = match inject_token_grant_for_forward_request(
         method,
         &upstream_target,
@@ -10239,4 +10352,6 @@ network_policies:
         assert_eq!(res, 3);
         assert_eq!(unk, 2);
     }
+    #[path = "phase0.rs"]
+    mod phase0;
 }

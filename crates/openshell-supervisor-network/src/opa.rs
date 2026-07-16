@@ -125,6 +125,24 @@ pub struct OpaEngine {
     middleware_runner: RwLock<ChainRunner>,
 }
 
+#[cfg(test)]
+static TEST_OPA_QUERY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn record_test_opa_query() {
+    TEST_OPA_QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_opa_query_count() {
+    TEST_OPA_QUERY_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn test_opa_query_count() -> u64 {
+    TEST_OPA_QUERY_COUNT.load(Ordering::SeqCst)
+}
+
 /// Generation guard captured when an HTTP tunnel or request path starts.
 #[derive(Clone)]
 pub struct PolicyGenerationGuard {
@@ -201,6 +219,15 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    #[cfg(test)]
+    pub(crate) fn poison_lock_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.engine.lock().expect("test engine lock");
+            panic!("poison OPA engine lock for compatibility fallback test");
+        }));
+        assert!(self.engine.is_poisoned());
+    }
+
     /// Load policy from a `.rego` rules file and data from a YAML file.
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
@@ -429,6 +456,9 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
+        #[cfg(test)]
+        record_test_opa_query();
+
         let input_json = network_input_json(input);
 
         let mut engine = self
@@ -665,6 +695,9 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(Vec<regorus::Value>, u64)> {
+        #[cfg(test)]
+        record_test_opa_query();
+
         let input_json = network_input_json(input);
 
         let mut engine = self
@@ -723,6 +756,9 @@ impl OpaEngine {
     /// denial while preserving separate handling for `allowed_ips` and advisor
     /// proposals.
     pub fn query_exact_declared_endpoint_host(&self, input: &NetworkInput) -> Result<bool> {
+        #[cfg(test)]
+        record_test_opa_query();
+
         let input_json = network_input_json(input);
 
         let mut engine = self
@@ -5003,6 +5039,7 @@ network_policies:
         port: 8567
         protocol: rest
         enforcement: enforce
+        tls: skip
         allowed_ips:
           - 192.168.1.100
         rules:
@@ -5041,7 +5078,7 @@ process:
     }
 
     #[test]
-    fn overlapping_policies_endpoint_config_returns_result() {
+    fn phase0_overlapping_policy_outputs_are_snapshotted_independently() {
         let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_L7_TEST_DATA)
             .expect("engine should load overlapping data");
         let input = NetworkInput {
@@ -5052,12 +5089,29 @@ process:
             ancestors: vec![],
             cmdline_paths: vec![],
         };
-        // Should return config from one of the entries without error.
-        let config = engine.query_endpoint_config(&input).unwrap();
-        assert!(
-            config.is_some(),
-            "Expected endpoint config for overlapping policies"
+        assert_eq!(
+            engine.evaluate_network_action(&input).unwrap(),
+            NetworkAction::Allow {
+                matched_policy: Some("allow_192_168_1_100_8567".to_string())
+            }
         );
+
+        let (configs, generation) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        assert_eq!(generation, engine.current_generation());
+        assert_eq!(configs.len(), 2);
+        assert_eq!(get_str(&configs[0], "tls").as_deref(), Some("skip"));
+        assert_eq!(get_str_array(&configs[0], "allowed_ips"), ["192.168.1.100"]);
+        assert_eq!(get_str(&configs[1], "tls"), None);
+
+        let selected = engine.query_endpoint_config(&input).unwrap().unwrap();
+        assert_eq!(
+            crate::l7::parse_tls_mode(&selected),
+            crate::l7::TlsMode::Skip
+        );
+        assert_eq!(engine.query_allowed_ips(&input).unwrap(), ["192.168.1.100"]);
+        assert!(engine.query_exact_declared_endpoint_host(&input).unwrap());
     }
 
     // ========================================================================
