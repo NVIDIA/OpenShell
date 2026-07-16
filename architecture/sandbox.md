@@ -67,95 +67,29 @@ JSON-RPC responses and server-to-client MCP messages on response or SSE streams
 are relayed but are not currently parsed for policy enforcement.
 
 For admitted HTTP requests, the proxy can run an ordered supervisor middleware
-chain before credential injection. Host selectors choose the chain independently
-of the network rule that admitted the request. Policies key middleware configs by
-stable policy-local identities, allow optional human-readable names, and require
-unique integer order values. The gRPC contract represents operations and phases as enums. Built-ins run
-in-process;
-operator-registered services are called directly from the supervisor
-over the common middleware gRPC contract. The gateway validates external
-service capabilities and implementation-owned config before delivery.
-Policy entries resolve built-ins by their platform name and external middleware
-by the operator-owned registration name. Each attachment selects the binding
-for the active operation and phase. A manifest cannot declare two bindings for
-the same operation and phase pair.
-The platform caps middleware bodies at 4 MiB and derives the gRPC transport
-limit from bounded request and response components, reserving 293 KiB for the
-largest valid protobuf envelope. Config, context, target, headers, mutations,
-reasons, findings, and metadata each have explicit size or cardinality limits.
-Policies contain at most 10 middleware configs with 32 combined host selector
-patterns each. Runtime selection defensively allows at most 10 stages, each of
-which can return 32 findings, for a derived chain maximum of 320 findings.
-Middleware RPCs default to a 500 ms deadline. Operators can set a service-wide
-`timeout` in gateway configuration, and a service can advertise a shorter
-timeout for each binding in its `Describe` manifest. Both use integer `ms` or
-`s` values bounded from 10 ms through 30 s. The operator value is a ceiling,
-so binding calls use the smaller value; `Describe` uses the service value
-because bindings have not been discovered yet.
-Registration and manifest body limits above the platform boundary fail before
-request-body allocation. Per-request free-form reason text, external finding
-text, mutation errors, and external diagnostic metadata are untrusted. Direct
-denials identify the policy-local config and may expose only a tightly validated
-stable reason code; responses and logs use platform-owned text. The supervisor
-maps logged external findings to the validated operator registration name and
-uses platform-owned failure codes.
-At startup, the supervisor installs the in-process registry before connecting
-to external services, so an external outage cannot remove built-in bindings.
-For a gateway policy snapshot, the supervisor prepares replacements off to the
-side and installs them as one runtime generation. A policy-only change swaps
-the policy engine alone and reuses the connected registry, so middleware
-reachability cannot block it. The registry is rebuilt, reconnecting every
-delivered service, only when the delivered service set changes or the installed
-registry is degraded; that rebuild commits together with the policy engine.
-A failure preserves the complete last-known-good runtime and leaves its applied
-hash and registrations unchanged so the snapshot is retried. The generic
-registry and chain runner live in
-`openshell-supervisor-middleware`;
-first-party implementations and their config schemas live in
-`openshell-supervisor-middleware-builtins`. The initial `openshell/regex`
-implementation is only a best-effort example for simple, self-contained token
-patterns; it does not infer values from keyword assignments, is not a
-parser-aware secret scanner, and makes no redaction guarantee. The
-gateway and supervisor inject
-those services explicitly and discover their operation/phase capabilities
-through the same `Describe` contract used by external services. Reusable compiled DNS host
-patterns and selectors remain in `openshell-core::host_pattern`.
+chain after L7 policy evaluation and before credential injection. Destination
+host selectors choose the chain independently of the network rule that admitted
+the request. Policy-local map keys identify configs, while built-in names or
+operator-owned registration names identify implementations.
 
-`openshell-policy` validates policy-owned middleware structure without knowing
-which implementations are installed. The active middleware registry validates
-implementation-owned config before gateway admission. The supervisor's
-local-file path supplies its built-in catalog to the same JSON projection so it
-retains early config validation. Rego exposes the keyed middleware configs as
-policy data, but Rust performs selector validation, overlap detection, matching, chain
-ordering, implementation discovery, and config validation. When provider layers
-are composed just in time, the gateway reruns structural validation on the
-complete effective policy before delivering it to a supervisor.
+Built-ins run in-process; operator services use the same bounded gRPC contract.
+`openshell-policy` validates policy-owned structure, and the active middleware
+registry validates implementation-owned config. The generic registry and chain
+runner live in `openshell-supervisor-middleware`; first-party implementations
+live in `openshell-supervisor-middleware-builtins`.
 
-The Rust HTTP pipeline makes transformed-body handling explicit for every
-middleware invocation: body-independent protocols select a no-recheck mode,
-while GraphQL, JSON-RPC, and MCP carry a policy evaluator bound to the captured
-policy generation. Each replacement is reclassified and evaluated before the
-next stage runs. Hard-deny classification is shared by CONNECT relays,
-route-selected relays, and forward proxying; evaluator failures become
-structured fail-closed outcomes instead of escaping the middleware pipeline.
-The shared HTTP/1 request parser validates raw headers at ingress and rejects
-obsolete folded continuations, colonless fields, whitespace before field-name
-colons, invalid field-name tokens, invalid UTF-8, and control bytes in field
-values before policy evaluation, middleware projection, or forwarding. Request
-framing accepts either `Content-Length` or exactly one `chunked` transfer coding;
-unsupported transfer codings and every CL/TE combination fail closed.
-Each middleware stage can also return ordered header write and remove
-operations. Rust validates and applies a stage atomically to the logical header
-state before the next stage runs, then replays the validated operations against
-the raw request before credential injection. Credential, routing, framing, and
-hop-by-hop headers remain supervisor-owned and cannot be mutated.
-Names dynamically nominated by the original request's `Connection` header are
-carried separately after header filtering so write and remove mutations cannot
-reintroduce them. The proxy also removes nominated fields before forwarding;
-only a validated WebSocket handshake preserves a canonical `Connection:
-Upgrade` and `Upgrade: websocket` pair. When middleware buffers a request body,
-the proxy consumes `Expect: 100-continue` locally, acknowledges it only if more
-client bytes are required, and never forwards it with the normalized body.
+The supervisor installs policy and middleware registry changes as one runtime
+generation and preserves the last-known-good generation if preparation fails.
+Policy-only updates reuse the connected registry, so an external middleware
+outage cannot block unrelated policy changes.
+
+Middleware cannot observe injected credentials or mutate supervisor-owned
+credential, routing, or framing headers. Body transformations are re-evaluated
+against body-aware L7 policy before later stages or the upstream can observe
+them. Requests, results, chain length, execution time, and diagnostics are
+bounded; external free-form diagnostic text is not exposed in responses or
+security logs. See [Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx)
+for configuration and protocol details.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
