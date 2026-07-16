@@ -16,7 +16,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub enum MiddlewareApplyResult {
     Allowed(crate::l7::provider::L7Request),
     Denied {
-        reason: String,
         denial: Option<openshell_supervisor_middleware::MiddlewareDenial>,
     },
 }
@@ -160,7 +159,6 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
             MiddlewareApplyResult::Allowed(req)
         } else {
             MiddlewareApplyResult::Denied {
-                reason: outcome.reason,
                 denial: outcome.denial,
             }
         });
@@ -198,7 +196,6 @@ pub async fn apply_middleware_chain_for_scheme<C: AsyncRead + AsyncWrite + Unpin
     emit_middleware_events(ctx, &req, &outcome);
     if !outcome.allowed {
         return Ok(MiddlewareApplyResult::Denied {
-            reason: outcome.reason,
             denial: outcome.denial,
         });
     }
@@ -215,7 +212,6 @@ pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpi
     req: &crate::l7::provider::L7Request,
     client: &mut C,
     ctx: &L7EvalContext,
-    reason: &str,
     denial: Option<&openshell_supervisor_middleware::MiddlewareDenial>,
     redacted_target: &str,
 ) -> Result<()> {
@@ -235,16 +231,14 @@ pub async fn send_middleware_rejection_response<C: AsyncRead + AsyncWrite + Unpi
         )
         .await
     } else {
-        crate::l7::rest::RestProvider::default()
-            .deny_with_redacted_target(
-                req,
-                &ctx.policy_name,
-                reason,
-                client,
-                Some(redacted_target),
-                context,
-            )
-            .await
+        crate::l7::rest::send_middleware_failure_response(
+            req,
+            &ctx.policy_name,
+            client,
+            Some(redacted_target),
+            context,
+        )
+        .await
     }
 }
 
@@ -304,10 +298,7 @@ pub(super) fn resolve_unbuffered_body(
         return MiddlewareApplyResult::Allowed(req);
     }
     emit_middleware_body_unavailable(ctx, true);
-    MiddlewareApplyResult::Denied {
-        reason: "middleware_failed: request_body_over_capacity".into(),
-        denial: None,
-    }
+    MiddlewareApplyResult::Denied { denial: None }
 }
 
 fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
@@ -588,16 +579,9 @@ mod tests {
         };
         let (mut client, mut server) = tokio::io::duplex(4096);
 
-        send_middleware_rejection_response(
-            &req,
-            &mut server,
-            &ctx,
-            "request body matched configured content secret-value",
-            Some(&denial),
-            "/v1/messages",
-        )
-        .await
-        .expect("send denial");
+        send_middleware_rejection_response(&req, &mut server, &ctx, Some(&denial), "/v1/messages")
+            .await
+            .expect("send denial");
         drop(server);
 
         let mut response = Vec::new();
@@ -614,6 +598,55 @@ mod tests {
         assert!(body.get("rule_missing").is_none());
         assert!(body.get("next_steps").is_none());
         assert!(!body.to_string().contains("secret-value"));
+    }
+
+    #[tokio::test]
+    async fn middleware_failure_uses_platform_response_without_policy_guidance() {
+        let _proposals =
+            openshell_core::proposals::test_helpers::ProposalsFlagGuard::set(true).await;
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "api-policy".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/v1/messages".into(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let (mut client, mut server) = tokio::io::duplex(4096);
+
+        send_middleware_rejection_response(&req, &mut server, &ctx, None, "/v1/messages")
+            .await
+            .expect("send failure");
+        drop(server);
+
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("read failure");
+        let response = String::from_utf8(response).expect("UTF-8 response");
+        let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+        assert_eq!(body["error"], "middleware_failed");
+        assert_eq!(
+            body["detail"],
+            "Request could not be processed by configured middleware"
+        );
+        assert!(body.get("rule").is_none());
+        assert!(body.get("rule_missing").is_none());
+        assert!(body.get("next_steps").is_none());
+        assert!(body.get("agent_guidance").is_none());
     }
 
     #[test]

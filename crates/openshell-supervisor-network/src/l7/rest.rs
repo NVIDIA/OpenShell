@@ -2180,6 +2180,22 @@ pub(crate) async fn send_middleware_deny_response<C: AsyncWrite + Unpin>(
     send_forbidden_json(policy_name, body, client).await
 }
 
+/// Send a platform-owned response for fail-closed middleware failures.
+///
+/// Unlike an L7 policy denial, a middleware failure does not indicate a
+/// missing policy rule. The response therefore omits policy-advisor guidance
+/// and does not include the middleware runtime's diagnostic text.
+pub(crate) async fn send_middleware_failure_response<C: AsyncWrite + Unpin>(
+    req: &L7Request,
+    policy_name: &str,
+    client: &mut C,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> Result<()> {
+    let body = middleware_failure_response_body(req, policy_name, redacted_target, context);
+    send_forbidden_json(policy_name, body, client).await
+}
+
 async fn send_forbidden_json<C: AsyncWrite + Unpin>(
     policy_name: &str,
     body: serde_json::Value,
@@ -2229,6 +2245,37 @@ fn middleware_deny_response_body(
     if let Some(reason_code) = &denial.reason_code {
         body.insert("reason_code".to_string(), serde_json::json!(reason_code));
     }
+    body.insert("layer".to_string(), serde_json::json!("l7"));
+    body.insert("method".to_string(), serde_json::json!(req.action));
+    body.insert("path".to_string(), serde_json::json!(target));
+    if let Some(host) = non_empty(context.host) {
+        body.insert("host".to_string(), serde_json::json!(host));
+    }
+    if let Some(port) = context.port {
+        body.insert("port".to_string(), serde_json::json!(port));
+    }
+    if let Some(binary) = non_empty(context.binary) {
+        body.insert("binary".to_string(), serde_json::json!(binary));
+    }
+
+    serde_json::Value::Object(body)
+}
+
+fn middleware_failure_response_body(
+    req: &L7Request,
+    policy_name: &str,
+    redacted_target: Option<&str>,
+    context: Option<DenyResponseContext<'_>>,
+) -> serde_json::Value {
+    let target = redacted_target.unwrap_or(&req.target);
+    let context = context.unwrap_or_default();
+    let mut body = serde_json::Map::new();
+    body.insert("error".to_string(), serde_json::json!("middleware_failed"));
+    body.insert(
+        "detail".to_string(),
+        serde_json::json!("Request could not be processed by configured middleware"),
+    );
+    body.insert("policy".to_string(), serde_json::json!(policy_name));
     body.insert("layer".to_string(), serde_json::json!("l7"));
     body.insert("method".to_string(), serde_json::json!(req.action));
     body.insert("path".to_string(), serde_json::json!(target));

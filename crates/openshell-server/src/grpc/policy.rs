@@ -10210,6 +10210,63 @@ mod tests {
     }
 
     #[test]
+    fn policy_hash_is_stable_across_middleware_config_field_insertion_order() {
+        use prost_types::{Struct, Value, value::Kind};
+        use std::collections::BTreeMap;
+
+        fn string_value(value: &str) -> Value {
+            Value {
+                kind: Some(Kind::StringValue(value.into())),
+            }
+        }
+
+        fn middleware_config(reverse: bool) -> Struct {
+            let mut nested = BTreeMap::new();
+            let mut fields = BTreeMap::new();
+            if reverse {
+                nested.insert("second".into(), string_value("two"));
+                nested.insert("first".into(), string_value("one"));
+                fields.insert(
+                    "nested".into(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct { fields: nested })),
+                    },
+                );
+                fields.insert("mode".into(), string_value("redact"));
+            } else {
+                nested.insert("first".into(), string_value("one"));
+                nested.insert("second".into(), string_value("two"));
+                fields.insert("mode".into(), string_value("redact"));
+                fields.insert(
+                    "nested".into(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct { fields: nested })),
+                    },
+                );
+            }
+            Struct { fields }
+        }
+
+        let policy = |reverse| ProtoSandboxPolicy {
+            network_middlewares: HashMap::from([(
+                "regex-redactor".into(),
+                openshell_core::proto::NetworkMiddlewareConfig {
+                    middleware: "openshell/regex".into(),
+                    config: Some(middleware_config(reverse)),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            deterministic_policy_hash(&policy(false)),
+            deterministic_policy_hash(&policy(true)),
+            "equivalent middleware configs must hash identically regardless of field insertion order"
+        );
+    }
+
+    #[test]
     fn config_revision_changes_when_policy_source_changes() {
         let policy = ProtoSandboxPolicy::default();
         let settings = HashMap::new();

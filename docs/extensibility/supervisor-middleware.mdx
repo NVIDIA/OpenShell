@@ -113,6 +113,8 @@ An explicit deny decision always stops the chain and denies the request, regardl
 }
 ```
 
+A failed `fail_closed` stage uses `error: middleware_failed` and a platform-owned `detail`. It also omits `rule_missing`, `next_steps`, and `agent_guidance`: the failure did not result from a missing network or L7 policy rule, and changing policy cannot repair it. Runtime diagnostic text is available only through sanitized operator telemetry.
+
 Middleware decisions are enforced regardless of the endpoint's `enforcement` mode. `enforcement: audit` applies to an endpoint's network and L7 policy rules and does not bypass middleware: a middleware deny, or a failed `fail_closed` stage, blocks the request even on an audit endpoint. A middleware service that needs to observe traffic without blocking should return an allow decision with findings, which OpenShell emits as detection findings.
 
 ## Set Body Limits

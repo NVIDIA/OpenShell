@@ -484,7 +484,7 @@ where
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Denied { reason, denial } => {
+                MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -496,7 +496,6 @@ where
                         &denied_request,
                         client,
                         ctx,
-                        &reason,
                         denial.as_ref(),
                         &redacted_target,
                     )
@@ -977,7 +976,7 @@ where
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Denied { reason, denial } => {
+                MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -989,7 +988,6 @@ where
                         &denied_request,
                         client,
                         ctx,
-                        &reason,
                         denial.as_ref(),
                         &redacted_target,
                     )
@@ -1247,7 +1245,7 @@ where
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Denied { reason, denial } => {
+                MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -1259,7 +1257,6 @@ where
                         &denied_request,
                         client,
                         ctx,
-                        &reason,
                         denial.as_ref(),
                         &redacted_target,
                     )
@@ -1476,7 +1473,7 @@ where
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Denied { reason, denial } => {
+                MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -1488,7 +1485,6 @@ where
                         &denied_request,
                         client,
                         ctx,
-                        &reason,
                         denial.as_ref(),
                         &redacted_target,
                     )
@@ -2113,7 +2109,7 @@ where
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
-                MiddlewareApplyResult::Denied { reason, denial } => {
+                MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
                         action: "HTTP".into(),
                         target: redacted_target.clone(),
@@ -2125,7 +2121,6 @@ where
                         &denied_request,
                         client,
                         ctx,
-                        &reason,
                         denial.as_ref(),
                         &redacted_target,
                     )
@@ -2220,6 +2215,22 @@ mod tests {
                 .next()
                 .expect("built-in middleware service"),
         ));
+    }
+
+    fn assert_middleware_failure_response(response: &str, policy_name: &str) {
+        assert!(response.contains("403 Forbidden"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+        assert_eq!(body["error"], "middleware_failed");
+        assert_eq!(
+            body["detail"],
+            "Request could not be processed by configured middleware"
+        );
+        assert_eq!(body["policy"], policy_name);
+        assert!(body.get("rule").is_none());
+        assert!(body.get("rule_missing").is_none());
+        assert!(body.get("next_steps").is_none());
+        assert!(body.get("agent_guidance").is_none());
     }
 
     fn rest_token_grant_relay_context(
@@ -2808,7 +2819,18 @@ network_policies:
             .unwrap();
         let response = String::from_utf8_lossy(&response[..n]);
         assert!(response.contains("403 Forbidden"));
-        assert!(response.contains("middleware_failed"));
+        let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+        assert_eq!(body["error"], "middleware_failed");
+        assert_eq!(
+            body["detail"],
+            "Request could not be processed by configured middleware"
+        );
+        assert_eq!(body["policy"], "rest_api");
+        assert!(body.get("rule").is_none());
+        assert!(body.get("rule_missing").is_none());
+        assert!(body.get("next_steps").is_none());
+        assert!(body.get("agent_guidance").is_none());
 
         let mut upstream_request = [0u8; 32];
         let result = tokio::time::timeout(
@@ -3074,8 +3096,7 @@ network_policies:
             .expect("denial should reach client")
             .unwrap();
         let response = String::from_utf8_lossy(&response[..n]);
-        assert!(response.contains("403 Forbidden"));
-        assert!(response.contains("request_body_over_capacity"));
+        assert_middleware_failure_response(&response, "rest_api");
 
         let mut upstream_request = [0u8; 32];
         let result = tokio::time::timeout(
@@ -3403,11 +3424,7 @@ network_policies:
             br#"{"jsonrpc":"2.0","id":1,"method":"admin.delete"}"#,
         )
         .await;
-        assert!(response.contains("403 Forbidden"), "{response}");
-        assert!(
-            response.contains("middleware transformation denied by policy"),
-            "{response}"
-        );
+        assert_middleware_failure_response(&response, "jsonrpc_api");
         assert!(upstream_seen.is_none(), "upstream must not see the request");
     }
 
@@ -3431,11 +3448,7 @@ network_policies:
         // An unparseable replacement mirrors force_deny for original parse
         // errors: denied even on an audit endpoint.
         let (response, upstream_seen) = run_jsonrpc_transform_case("audit", b"not json").await;
-        assert!(response.contains("403 Forbidden"), "{response}");
-        assert!(
-            response.contains("middleware transformation rejected"),
-            "{response}"
-        );
+        assert_middleware_failure_response(&response, "jsonrpc_api");
         assert!(upstream_seen.is_none(), "upstream must not see the request");
     }
 
@@ -3524,11 +3537,7 @@ network_policies:
             .expect("denial should reach client")
             .unwrap();
         let response = String::from_utf8_lossy(&response[..n]);
-        assert!(response.contains("403 Forbidden"), "{response}");
-        assert!(
-            response.contains("middleware transformation denied by policy"),
-            "{response}"
-        );
+        assert_middleware_failure_response(&response, "graphql_api");
 
         let mut upstream_request = [0u8; 32];
         let result = tokio::time::timeout(
@@ -3859,8 +3868,8 @@ network_policies:
                     "redactor must replace the body: {raw}"
                 );
             }
-            MiddlewareApplyResult::Denied { reason, .. } => {
-                panic!("body within the largest stage limit must not fail the chain: {reason}")
+            MiddlewareApplyResult::Denied { .. } => {
+                panic!("body within the largest stage limit must not fail the chain")
             }
         }
     }
