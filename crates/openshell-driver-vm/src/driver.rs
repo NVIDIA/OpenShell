@@ -786,6 +786,8 @@ impl VmDriver {
                 .to_string_lossy()
                 .into_owned(),
             rootfs_tar_max_bytes: self.config.rootfs_tar_max_bytes(),
+            supports_warm_supervisor_bootstrap: false,
+            supports_sandbox_template_reconciliation: false,
         }
     }
 
@@ -6817,6 +6819,7 @@ mod tests {
             client
                 .create_sandbox(request_with_traceparent(CreateSandboxRequest {
                     sandbox: None,
+                    sandbox_template: None,
                 }))
                 .await
                 .is_err()
@@ -6924,6 +6927,7 @@ mod tests {
         };
         let request = request_with_traceparent(CreateSandboxRequest {
             sandbox: Some(sandbox),
+            sandbox_template: None,
         });
 
         let mut client = traced_driver_client(driver.clone()).await;

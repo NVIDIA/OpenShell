@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::proto::compute::v1::DriverSandbox;
+use crate::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
 
 // ---------------------------------------------------------------------------
 // Sandbox container/pod label keys (openshell.ai/ namespace)
@@ -696,6 +696,46 @@ pub fn sandbox_token_path(
         path = path.join(ns.replace(['/', '\\'], "-"));
     }
     Ok(path.join(sandbox_id).join("sandbox.jwt"))
+}
+
+/// Build a [`GetCapabilitiesResponse`] from the common driver capability fields.
+///
+/// Every compute driver constructs this response with the same fields. Shared
+/// here to avoid repeating the struct literal in each driver crate.
+pub fn build_capabilities_response(
+    driver_name: &str,
+    driver_version: impl Into<String>,
+    default_image: impl Into<String>,
+) -> GetCapabilitiesResponse {
+    build_capabilities_response_with_template_reconciliation(
+        driver_name,
+        driver_version,
+        default_image,
+        false,
+    )
+}
+
+/// Build a [`GetCapabilitiesResponse`] and configure authoritative
+/// sandbox-template reconciliation.
+pub fn build_capabilities_response_with_template_reconciliation(
+    driver_name: &str,
+    driver_version: impl Into<String>,
+    default_image: impl Into<String>,
+    supports_sandbox_template_reconciliation: bool,
+) -> GetCapabilitiesResponse {
+    GetCapabilitiesResponse {
+        driver_name: driver_name.to_string(),
+        driver_version: driver_version.into(),
+        default_image: default_image.into(),
+        gateway_manages_lifecycle: false,
+        supports_sandbox_authentication: false,
+        driver_reports_runtime_readiness: false,
+        supports_sandbox_template_reconciliation,
+        supports_warm_supervisor_bootstrap: false,
+        resource_capabilities: None,
+        rootfs_tar_staging_dir: String::new(),
+        rootfs_tar_max_bytes: 0,
+    }
 }
 
 /// Return the effective log level for a sandbox.

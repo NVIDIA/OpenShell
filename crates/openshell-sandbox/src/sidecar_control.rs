@@ -17,12 +17,20 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tracing::{debug, info, warn};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivatedSandboxIdentity {
+    pub sandbox_id: String,
+    pub sandbox_name: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct BootstrapData {
     pub policy_proto: openshell_core::proto::SandboxPolicy,
+    pub main_process_config: Option<openshell_core::sandbox_env::MainProcessConfig>,
+    pub sandbox_identity: Option<ActivatedSandboxIdentity>,
     pub provider_env_revision: u64,
     pub provider_env_generation: u64,
     pub provider_child_env: HashMap<String, String>,
@@ -70,13 +78,16 @@ pub enum ControlUpdate {
 
 #[derive(Clone)]
 pub struct Publisher {
-    state: Arc<RwLock<BootstrapData>>,
+    state: Arc<RwLock<Option<BootstrapData>>>,
     updates: broadcast::Sender<WireServerMessage>,
 }
 
 impl Publisher {
     pub fn publish_provider_env(&self, revision: u64, provider_child_env: HashMap<String, String>) {
         let mut state = self.state.write().expect("sidecar control state poisoned");
+        let state = state
+            .as_mut()
+            .expect("sidecar control bootstrap must be activated before publishing updates");
         if revision == state.provider_env_revision {
             return;
         }
@@ -104,6 +115,9 @@ impl Publisher {
     ) {
         {
             let mut state = self.state.write().expect("sidecar control state poisoned");
+            let state = state
+                .as_mut()
+                .expect("sidecar control bootstrap must be activated before publishing updates");
             state.policy_proto = policy_proto.clone();
         }
 
@@ -117,6 +131,9 @@ impl Publisher {
     pub fn publish_agent_proposals(&self, enabled: bool, config_revision: u64) {
         {
             let mut state = self.state.write().expect("sidecar control state poisoned");
+            let state = state
+                .as_mut()
+                .expect("sidecar control bootstrap must be activated before publishing updates");
             if state.agent_proposals_enabled == enabled {
                 return;
             }
@@ -140,11 +157,41 @@ impl Publisher {
 pub struct ServerHandle {
     publisher: Publisher,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    bootstrap_ready: watch::Sender<bool>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    connection_closed: watch::Receiver<bool>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     entrypoint_rx: mpsc::Receiver<EntrypointStarted>,
     connection_task: tokio::task::JoinHandle<()>,
 }
 
 impl ServerHandle {
+    /// Release the authenticated process supervisor with one complete,
+    /// activation-bound bootstrap snapshot.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn activate(&self, bootstrap: BootstrapData) -> Result<()> {
+        let mut state = self
+            .publisher
+            .state
+            .write()
+            .expect("sidecar control state poisoned");
+        if state.is_some() {
+            return Err(miette::miette!(
+                "sidecar control bootstrap was activated more than once"
+            ));
+        }
+        *state = Some(bootstrap);
+        drop(state);
+        self.bootstrap_ready.send_replace(true);
+        Ok(())
+    }
+
+    /// Observe termination of the sole authoritative control connection.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn connection_closed(&self) -> watch::Receiver<bool> {
+        self.connection_closed.clone()
+    }
+
     pub fn publisher(&self) -> Publisher {
         self.publisher.clone()
     }
@@ -185,6 +232,10 @@ enum WireClientMessage {
 enum WireServerMessage {
     BootstrapResponse {
         policy_proto: Vec<u8>,
+        #[serde(default)]
+        main_process_config: Option<openshell_core::sandbox_env::MainProcessConfig>,
+        #[serde(default)]
+        sandbox_identity: Option<ActivatedSandboxIdentity>,
         provider_env_revision: u64,
         provider_env_generation: u64,
         provider_child_env: HashMap<String, String>,
@@ -216,6 +267,8 @@ impl BootstrapData {
     fn to_wire(&self) -> WireServerMessage {
         WireServerMessage::BootstrapResponse {
             policy_proto: self.policy_proto.encode_to_vec(),
+            main_process_config: self.main_process_config.clone(),
+            sandbox_identity: self.sandbox_identity.clone(),
             provider_env_revision: self.provider_env_revision,
             provider_env_generation: self.provider_env_generation,
             provider_child_env: self.provider_child_env.clone(),
@@ -238,6 +291,8 @@ impl TryFrom<WireServerMessage> for BootstrapData {
     fn try_from(message: WireServerMessage) -> Result<Self> {
         let WireServerMessage::BootstrapResponse {
             policy_proto,
+            main_process_config,
+            sandbox_identity,
             provider_env_revision,
             provider_env_generation,
             provider_child_env,
@@ -261,6 +316,8 @@ impl TryFrom<WireServerMessage> for BootstrapData {
 
         Ok(Self {
             policy_proto,
+            main_process_config,
+            sandbox_identity,
             provider_env_revision,
             provider_env_generation,
             provider_child_env,
@@ -321,12 +378,24 @@ impl TryFrom<WireServerMessage> for ControlUpdate {
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(test)]
 pub fn spawn_server(
     path: &Path,
     bootstrap: BootstrapData,
     expected_peer: ExpectedPeer,
 ) -> Result<ServerHandle> {
+    let server = spawn_pending_server(path, expected_peer)?;
+    server.activate(bootstrap)?;
+    Ok(server)
+}
+
+/// Bind the sidecar control socket before gateway activation is available.
+///
+/// The process supervisor may connect and authenticate immediately, but it
+/// receives no bootstrap response until [`ServerHandle::activate`] supplies a
+/// complete activation-bound snapshot.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn spawn_pending_server(path: &Path, expected_peer: ExpectedPeer) -> Result<ServerHandle> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .into_diagnostic()
@@ -367,26 +436,36 @@ pub fn spawn_server(
             })?;
     }
 
-    let state = Arc::new(RwLock::new(bootstrap));
+    let state = Arc::new(RwLock::new(None));
+    let (bootstrap_ready, bootstrap_ready_rx) = watch::channel(false);
+    let (connection_closed_tx, connection_closed) = watch::channel(false);
     let (updates, _) = broadcast::channel(32);
     let (entrypoint_tx, entrypoint_rx) = mpsc::channel(8);
     let publisher = Publisher {
         state: state.clone(),
         updates: updates.clone(),
     };
+    let socket_path = path.to_path_buf();
 
-    let connection_task = tokio::spawn(accept_authoritative_connection(
-        listener,
-        path.to_path_buf(),
-        expected_peer,
-        state,
-        updates,
-        entrypoint_tx,
-    ));
-    info!(path = %path.display(), "Sidecar control socket listening");
+    let connection_task = tokio::spawn(async move {
+        accept_authoritative_connection(
+            listener,
+            socket_path,
+            expected_peer,
+            state,
+            bootstrap_ready_rx,
+            updates,
+            entrypoint_tx,
+        )
+        .await;
+        connection_closed_tx.send_replace(true);
+    });
+    info!(path = %path.display(), "Sidecar control socket listening for activation");
 
     Ok(ServerHandle {
         publisher,
+        bootstrap_ready,
+        connection_closed,
         entrypoint_rx,
         connection_task,
     })
@@ -397,7 +476,8 @@ async fn accept_authoritative_connection(
     listener: UnixListener,
     socket_path: PathBuf,
     expected_peer: ExpectedPeer,
-    state: Arc<RwLock<BootstrapData>>,
+    state: Arc<RwLock<Option<BootstrapData>>>,
+    bootstrap_ready: watch::Receiver<bool>,
     updates: broadcast::Sender<WireServerMessage>,
     entrypoint_tx: mpsc::Sender<EntrypointStarted>,
 ) {
@@ -424,7 +504,15 @@ async fn accept_authoritative_connection(
         );
     }
 
-    if let Err(err) = handle_connection(stream, expected_peer, state, updates, entrypoint_tx).await
+    if let Err(err) = handle_connection(
+        stream,
+        expected_peer,
+        state,
+        bootstrap_ready,
+        updates,
+        entrypoint_tx,
+    )
+    .await
     {
         warn!(error = %err, "Authoritative sidecar control connection closed");
     }
@@ -434,7 +522,8 @@ async fn accept_authoritative_connection(
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     expected_peer: ExpectedPeer,
-    state: Arc<RwLock<BootstrapData>>,
+    state: Arc<RwLock<Option<BootstrapData>>>,
+    mut bootstrap_ready: watch::Receiver<bool>,
     updates: broadcast::Sender<WireServerMessage>,
     entrypoint_tx: mpsc::Sender<EntrypointStarted>,
 ) -> Result<()> {
@@ -494,9 +583,40 @@ async fn handle_connection(
     // be missed between the snapshot and the live update stream nor omitted
     // from the snapshot itself.
     let mut update_rx = updates.subscribe();
-    let bootstrap = {
-        let state = state.read().expect("sidecar control state poisoned");
-        state.to_wire()
+    let bootstrap = loop {
+        let pending_bootstrap = state
+            .read()
+            .expect("sidecar control state poisoned")
+            .as_ref()
+            .map(BootstrapData::to_wire);
+        if let Some(bootstrap) = pending_bootstrap {
+            break bootstrap;
+        }
+
+        tokio::select! {
+            result = bootstrap_ready.changed() => {
+                result.map_err(|_| {
+                    miette::miette!("sidecar control bootstrap sender closed before activation")
+                })?;
+            }
+            line = lines.next_line() => {
+                let Some(line) = line.into_diagnostic()? else {
+                    return Ok(());
+                };
+                match decode_client_message(&line)? {
+                    WireClientMessage::BootstrapRequest { .. } => {
+                        debug!("Ignoring duplicate sidecar bootstrap request before activation");
+                    }
+                    WireClientMessage::EntrypointStarted { .. }
+                    | WireClientMessage::MainProcessExited { .. }
+                    | WireClientMessage::MainProcessFinalized { .. } => {
+                        return Err(miette::miette!(
+                            "sidecar control client sent entrypoint event before activation"
+                        ));
+                    }
+                }
+            }
+        }
     };
     write_json_line(&mut writer, &bootstrap).await?;
 
@@ -753,6 +873,8 @@ mod tests {
     fn bootstrap_message(policy: &SandboxPolicy) -> WireServerMessage {
         WireServerMessage::BootstrapResponse {
             policy_proto: policy.encode_to_vec(),
+            main_process_config: None,
+            sandbox_identity: None,
             provider_env_revision: 0,
             provider_env_generation: 0,
             provider_child_env: HashMap::new(),
@@ -830,6 +952,16 @@ mod tests {
                 version: 7,
                 ..SandboxPolicy::default()
             },
+            main_process_config: Some(openshell_core::sandbox_env::MainProcessConfig {
+                version: openshell_core::sandbox_env::MainProcessConfig::VERSION,
+                command: vec!["echo".to_string(), "hello world".to_string()],
+                tty: true,
+                await_main_process_attachment: true,
+            }),
+            sandbox_identity: Some(ActivatedSandboxIdentity {
+                sandbox_id: "019cafe0-1234-7890-abcd-0123456789ab".to_string(),
+                sandbox_name: "warm-sidecar".to_string(),
+            }),
             provider_env_revision: 3,
             provider_env_generation: 0,
             provider_child_env: env.clone(),
@@ -844,9 +976,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(received.policy_proto.version, 7);
+        assert_eq!(
+            received.main_process_config,
+            Some(openshell_core::sandbox_env::MainProcessConfig {
+                version: openshell_core::sandbox_env::MainProcessConfig::VERSION,
+                command: vec!["echo".to_string(), "hello world".to_string()],
+                tty: true,
+                await_main_process_attachment: true,
+            })
+        );
         assert_eq!(received.provider_env_revision, 3);
         assert_eq!(received.provider_env_generation, 0);
         assert_eq!(received.provider_child_env, env);
+        assert_eq!(
+            received.sandbox_identity,
+            Some(ActivatedSandboxIdentity {
+                sandbox_id: "019cafe0-1234-7890-abcd-0123456789ab".to_string(),
+                sandbox_name: "warm-sidecar".to_string(),
+            })
+        );
         assert!(received.agent_proposals_enabled);
         assert_eq!(
             received.proxy_ca_cert_path,
@@ -859,6 +1007,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_server_withholds_bootstrap_until_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let server = spawn_pending_server(&socket, current_peer()).unwrap();
+        assert!(socket.exists(), "pending server must bind immediately");
+
+        let client_socket = socket.clone();
+        let mut client = tokio::spawn(async move {
+            connect_process_client(&client_socket, Duration::from_secs(1)).await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while socket.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending server must accept and authenticate the process supervisor");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut client)
+                .await
+                .is_err(),
+            "process supervisor must remain blocked before activation"
+        );
+
+        server
+            .activate(BootstrapData {
+                policy_proto: SandboxPolicy {
+                    version: 9,
+                    ..SandboxPolicy::default()
+                },
+                main_process_config: None,
+                sandbox_identity: Some(ActivatedSandboxIdentity {
+                    sandbox_id: "sandbox-warm".to_string(),
+                    sandbox_name: "warm".to_string(),
+                }),
+                provider_env_revision: 0,
+                provider_env_generation: 0,
+                provider_child_env: HashMap::new(),
+                agent_proposals_enabled: false,
+                proxy_ca_cert_path: None,
+                proxy_ca_bundle_path: None,
+            })
+            .unwrap();
+
+        let (bootstrap, _connection) = tokio::time::timeout(Duration::from_secs(1), client)
+            .await
+            .expect("activation must release the process supervisor")
+            .expect("process client task must not panic")
+            .unwrap();
+        assert_eq!(bootstrap.policy_proto.version, 9);
+        assert_eq!(
+            bootstrap.sandbox_identity,
+            Some(ActivatedSandboxIdentity {
+                sandbox_id: "sandbox-warm".to_string(),
+                sandbox_name: "warm".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_server_reports_process_disconnect_before_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("control.sock");
+        let server = spawn_pending_server(&socket, current_peer()).unwrap();
+        let mut connection_closed = server.connection_closed();
+
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        write_json_line(
+            &mut stream,
+            &WireClientMessage::BootstrapRequest {
+                supervisor_pid: std::process::id(),
+            },
+        )
+        .await
+        .unwrap();
+        drop(stream);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            connection_closed.wait_for(|closed| *closed),
+        )
+        .await
+        .expect("network sidecar must observe a pre-activation disconnect")
+        .expect("disconnect monitor must remain live");
+    }
+
+    #[test]
+    fn bootstrap_without_identity_remains_wire_compatible() {
+        let message = decode_server_message(
+            r#"{"type":"bootstrap_response","policy_proto":[],"main_process_config":null,"provider_env_revision":0,"provider_env_generation":0,"provider_child_env":{},"agent_proposals_enabled":false,"proxy_ca_cert_path":null,"proxy_ca_bundle_path":null}"#,
+        )
+        .unwrap();
+
+        let bootstrap = BootstrapData::try_from(message).unwrap();
+        assert!(bootstrap.sandbox_identity.is_none());
+    }
+
+    #[tokio::test]
     async fn provider_env_updates_use_generation_not_fingerprint_order() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("control.sock");
@@ -866,6 +1112,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                main_process_config: None,
+                sandbox_identity: None,
                 provider_env_revision: u64::MAX,
                 provider_env_generation: 7,
                 provider_child_env: HashMap::from([("TOKEN".to_string(), "first".to_string())]),
@@ -950,6 +1198,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                main_process_config: None,
+                sandbox_identity: None,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -991,6 +1241,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                main_process_config: None,
+                sandbox_identity: None,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -1072,6 +1324,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                main_process_config: None,
+                sandbox_identity: None,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -1107,6 +1361,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                main_process_config: None,
+                sandbox_identity: None,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -1137,6 +1393,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                main_process_config: None,
+                sandbox_identity: None,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),
@@ -1168,6 +1426,8 @@ mod tests {
             &socket,
             BootstrapData {
                 policy_proto: SandboxPolicy::default(),
+                main_process_config: None,
+                sandbox_identity: None,
                 provider_env_revision: 0,
                 provider_env_generation: 0,
                 provider_child_env: HashMap::new(),

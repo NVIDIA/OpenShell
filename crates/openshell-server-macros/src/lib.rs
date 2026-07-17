@@ -54,6 +54,7 @@ struct RpcAuth {
 enum AuthMode {
     Unauthenticated,
     Sandbox,
+    SupervisorRegistration,
     Bearer,
     Dual,
 }
@@ -116,11 +117,11 @@ impl RpcAuth {
         };
 
         match mode {
-            AuthMode::Unauthenticated | AuthMode::Sandbox => {
+            AuthMode::Unauthenticated | AuthMode::Sandbox | AuthMode::SupervisorRegistration => {
                 if let Some(ref s) = scope {
                     return Err(Error::new(
                         s.span(),
-                        "`scope` is only valid for `auth = \"bearer\"` or `auth = \"dual\"` (sandbox principals don't carry scopes)",
+                        "`scope` is only valid for `auth = \"bearer\"` or `auth = \"dual\"` (sandbox and supervisor-registration principals don't carry scopes)",
                     ));
                 }
                 if role.is_some() {
@@ -154,12 +155,13 @@ fn parse_auth_mode(value: &LitStr) -> Result<AuthMode> {
     match value.value().as_str() {
         "unauthenticated" => Ok(AuthMode::Unauthenticated),
         "sandbox" => Ok(AuthMode::Sandbox),
+        "supervisor_registration" => Ok(AuthMode::SupervisorRegistration),
         "bearer" => Ok(AuthMode::Bearer),
         "dual" => Ok(AuthMode::Dual),
         other => Err(Error::new(
             value.span(),
             format!(
-                "invalid auth mode `{other}`; expected one of `unauthenticated`, `sandbox`, `bearer`, `dual`"
+                "invalid auth mode `{other}`; expected one of `unauthenticated`, `sandbox`, `supervisor_registration`, `bearer`, `dual`"
             ),
         )),
     }
@@ -287,6 +289,9 @@ fn expand(args: &AuthzArgs, item: &mut ItemImpl) -> Result<proc_macro2::TokenStr
             }
             AuthMode::Sandbox => {
                 quote! { crate::auth::method_authz::AuthMode::Sandbox }
+            }
+            AuthMode::SupervisorRegistration => {
+                quote! { crate::auth::method_authz::AuthMode::SupervisorRegistration }
             }
             AuthMode::Bearer => quote! { crate::auth::method_authz::AuthMode::Bearer },
             AuthMode::Dual => quote! { crate::auth::method_authz::AuthMode::Dual },

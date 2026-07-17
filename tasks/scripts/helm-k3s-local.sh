@@ -167,6 +167,12 @@ apply_base_manifests() {
   local base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
   echo "Applying agent-sandbox manifest (${AGENT_SANDBOX_VERSION})..."
   kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${base}/manifest.yaml"
+  if [[ "${AGENT_SANDBOX_VERSION}" != v0.4.* ]]; then
+    echo "Applying agent-sandbox extensions (${AGENT_SANDBOX_VERSION})..."
+    kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${base}/extensions.yaml"
+  else
+    echo "Agent Sandbox ${AGENT_SANDBOX_VERSION} has no extension APIs; warm pooling must be disabled."
+  fi
 }
 
 install_trace_collector() {

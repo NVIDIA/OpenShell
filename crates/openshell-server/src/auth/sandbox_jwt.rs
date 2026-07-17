@@ -8,7 +8,7 @@
 //! supervisor-to-gateway gRPC calls. This module implements both sides of the
 //! gateway-controlled token:
 //! - [`SandboxJwtIssuer`] mints fresh tokens (called from
-//!   `handle_create_sandbox` and the `IssueSandboxToken` RPC).
+//!   `handle_create_sandbox` and the Kubernetes bootstrap RPCs).
 //! - [`SandboxJwtAuthenticator`] validates tokens on inbound requests and
 //!   produces a [`Principal::Sandbox`] with [`SandboxIdentitySource::BootstrapJwt`].
 //!

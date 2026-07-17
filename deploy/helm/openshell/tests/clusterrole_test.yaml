@@ -9,6 +9,17 @@ release:
   namespace: my-namespace
 
 tests:
+  - it: grants pod lookup and selector fallback in multi-namespace mode
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["pods"]
+            verbs: ["get", "list"]
+
   - it: grants managed namespace NetworkPolicy apply permissions
     set:
       server.drivers.kubernetes.workspaceMode: managed

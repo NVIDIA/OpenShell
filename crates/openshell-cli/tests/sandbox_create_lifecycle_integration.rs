@@ -895,6 +895,17 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    type RegisterSupervisorStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::SupervisorActivationMessage, Status>,
+    >;
+
+    async fn register_supervisor(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn refresh_sandbox_token(
         &self,
         _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,

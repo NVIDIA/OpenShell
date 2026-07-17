@@ -127,39 +127,39 @@ pub async fn run_sandbox(
     network_enabled: bool,
     process_enabled: bool,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    log_push_activation: Option<openshell_supervisor_process::log_push::LogPushActivation>,
 ) -> Result<i32> {
-    let (program, args) = command
-        .split_first()
-        .ok_or_else(|| miette::miette!("No command specified"))?;
-
-    // Initialize the process-wide OCSF context early so that events emitted
-    // during policy loading (filesystem config, validation) have a context.
-    // Proxy IP/port use defaults here; they are only significant for network
-    // events which happen after the netns is created.
-    {
-        let hostname = std::fs::read_to_string("/etc/hostname").map_or_else(
-            |_| "openshell-sandbox".to_string(),
-            |s| s.trim().to_string(),
-        );
-
-        if !openshell_ocsf::ctx::set_ctx(SandboxContext {
-            sandbox_id: sandbox_id.clone().unwrap_or_default(),
-            sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
-            container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
-            hostname,
-            product_version: openshell_core::VERSION.to_string(),
-            proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
-            proxy_port: 3128,
-        }) {
-            debug!("OCSF context already initialized, keeping existing");
-        }
-    }
+    let mut command = command;
+    let mut interactive = interactive;
+    let mut await_main_process_attachment = await_main_process_attachment;
+    #[cfg(target_os = "linux")]
+    let mut activation_main_process_config = None;
+    let mut sandbox_id = sandbox_id;
+    let mut sandbox = sandbox;
 
     let sidecar_network_enforcement = sidecar_network_enforcement_enabled();
     let process_enforcement_mode = process_enforcement_mode();
     let process_uses_sidecar_control =
         process_enabled && !network_enabled && sidecar_network_enforcement;
     let mut process_control_connection = None;
+    #[cfg(target_os = "linux")]
+    let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
+        let socket = sidecar_control_socket().ok_or_else(|| {
+            miette::miette!(
+                "{} is required for sidecar topology",
+                openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET
+            )
+        })?;
+        Some(sidecar_control::spawn_pending_server(
+            &socket,
+            sidecar_expected_peer()?,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let sidecar_control_server: Option<sidecar_control::ServerHandle> = None;
+
     let sidecar_bootstrap = if process_uses_sidecar_control {
         let socket = sidecar_control_socket().ok_or_else(|| {
             miette::miette!(
@@ -178,6 +178,23 @@ pub async fn run_sandbox(
         None
     };
 
+    if let Some(bootstrap) = sidecar_bootstrap.as_ref() {
+        apply_sidecar_bootstrap_identity(
+            &mut sandbox_id,
+            &mut sandbox,
+            bootstrap.sandbox_identity.as_ref(),
+        )?;
+    }
+
+    if let Some(config) = sidecar_bootstrap
+        .as_ref()
+        .and_then(|bootstrap| bootstrap.main_process_config.as_ref())
+    {
+        command.clone_from(&config.command);
+        interactive = config.tty;
+        await_main_process_attachment = config.await_main_process_attachment;
+    }
+
     // Extension credentials are owned by this supervisor and shared by every
     // gateway connection it opens, so the middleware registry's bearer slots
     // and the policy poll loop that rotates them stay the same objects.
@@ -185,6 +202,106 @@ pub async fn run_sandbox(
 
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
+    if sidecar_bootstrap.is_none()
+        && sandbox_id.is_none()
+        && let Some(endpoint) = openshell_endpoint.as_deref()
+        && std::env::var(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE)
+            .ok()
+            .is_some_and(|path| !path.is_empty())
+    {
+        #[cfg(target_os = "linux")]
+        let activation = if let Some(server) = sidecar_control_server.as_ref() {
+            let mut connection_closed = server.connection_closed();
+            tokio::select! {
+                activation = openshell_core::grpc_client::register_supervisor(endpoint) => {
+                    activation?
+                }
+                result = connection_closed.wait_for(|closed| *closed) => {
+                    result.map_err(|_| {
+                        miette::miette!(
+                            "sidecar control connection monitor closed before activation"
+                        )
+                    })?;
+                    return Err(miette::miette!(
+                        "process supervisor disconnected before sandbox activation"
+                    ));
+                }
+            }
+        } else {
+            openshell_core::grpc_client::register_supervisor(endpoint).await?
+        };
+        #[cfg(not(target_os = "linux"))]
+        let activation = openshell_core::grpc_client::register_supervisor(endpoint).await?;
+        if sandbox.is_none() && !activation.sandbox_name.is_empty() {
+            sandbox = Some(activation.sandbox_name);
+        }
+        sandbox_id = Some(activation.sandbox_id);
+        if let Some(main_process_spec) = activation
+            .startup_metadata
+            .get(openshell_core::sandbox_env::MAIN_PROCESS_SPEC)
+        {
+            let config = openshell_core::sandbox_env::MainProcessConfig::decode(main_process_spec)
+                .map_err(|error| miette::miette!("{error}"))?;
+            command.clone_from(&config.command);
+            interactive = config.tty;
+            await_main_process_attachment = config.await_main_process_attachment;
+            #[cfg(target_os = "linux")]
+            {
+                activation_main_process_config = Some(config);
+            }
+        }
+    }
+
+    // Warm supervisors can receive their identity either directly from the
+    // gateway or from the network sidecar. Release log push only after either
+    // bootstrap path has populated the authoritative sandbox ID.
+    if let (Some(log_push_activation), Some(sandbox_id)) =
+        (log_push_activation.as_ref(), sandbox_id.as_ref())
+    {
+        log_push_activation.activate(sandbox_id.clone());
+    }
+
+    if command.is_empty() {
+        let shell = openshell_core::shell::detect_login_shell();
+        info!(shell = %shell, "no command specified; resolved default login shell");
+        command = vec![shell, "-l".to_string()];
+    }
+
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| miette::miette!("No command specified"))?;
+
+    #[cfg(target_os = "linux")]
+    let sidecar_server_identity = if network_enabled && sidecar_network_enforcement {
+        Some(required_sidecar_sandbox_identity(
+            sandbox_id.as_deref(),
+            sandbox.as_deref(),
+        )?)
+    } else {
+        None
+    };
+
+    // Initialize the process-wide OCSF context before policy loading emits
+    // structured events, but after Kubernetes supervisor registration can fill
+    // in the sandbox identity for warm-pool pods.
+    {
+        let hostname = std::fs::read_to_string("/etc/hostname").map_or_else(
+            |_| "openshell-sandbox".to_string(),
+            |s| s.trim().to_string(),
+        );
+
+        if !openshell_ocsf::ctx::set_ctx(SandboxContext {
+            sandbox_id: sandbox_id.clone().unwrap_or_default(),
+            sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
+            container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+            hostname,
+            product_version: openshell_core::VERSION.to_string(),
+            proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+            proxy_port: 3128,
+        }) {
+            debug!("OCSF context already initialized, keeping existing");
+        }
+    }
     let sandbox_name_for_agg = sandbox.clone();
     let (
         mut policy,
@@ -562,42 +679,30 @@ pub async fn run_sandbox(
     };
 
     #[cfg(target_os = "linux")]
-    let sidecar_control_server = if network_enabled && sidecar_network_enforcement {
+    if let Some(server) = sidecar_control_server.as_ref() {
         if !matches!(policy.network.mode, NetworkMode::Proxy) {
             return Err(miette::miette!(
                 "sidecar network enforcement requires proxy network mode"
             ));
         }
-        let socket = sidecar_control_socket().ok_or_else(|| {
-            miette::miette!(
-                "{} is required for sidecar topology",
-                openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET
-            )
-        })?;
         let proto = retained_proto.as_ref().ok_or_else(|| {
             miette::miette!(
                 "sidecar topology requires gateway policy data for the process supervisor"
             )
         })?;
         let ca_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
-        Some(sidecar_control::spawn_server(
-            &socket,
-            sidecar_control::BootstrapData {
-                policy_proto: proto.clone(),
-                provider_env_revision: provider_credentials.snapshot().revision,
-                provider_env_generation: 0,
-                provider_child_env: provider_env.clone(),
-                agent_proposals_enabled: agent_proposals.enabled(),
-                proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
-                proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
-            },
-            sidecar_expected_peer()?,
-        )?)
-    } else {
-        None
-    };
-    #[cfg(not(target_os = "linux"))]
-    let sidecar_control_server: Option<sidecar_control::ServerHandle> = None;
+        server.activate(sidecar_control::BootstrapData {
+            policy_proto: proto.clone(),
+            main_process_config: activation_main_process_config.clone(),
+            sandbox_identity: sidecar_server_identity,
+            provider_env_revision: provider_credentials.snapshot().revision,
+            provider_env_generation: 0,
+            provider_child_env: provider_env.clone(),
+            agent_proposals_enabled: agent_proposals.enabled(),
+            proxy_ca_cert_path: ca_paths.as_ref().map(|paths| paths.0.clone()),
+            proxy_ca_bundle_path: ca_paths.as_ref().map(|paths| paths.1.clone()),
+        })?;
+    }
 
     let sidecar_control_publisher = sidecar_control_server
         .as_ref()
@@ -1225,6 +1330,67 @@ type LoadedPolicyBundle = (
 
 type MainProcessExitAckWaiter =
     Arc<tokio::sync::Mutex<Option<(String, tokio::sync::oneshot::Sender<()>)>>>;
+
+#[cfg(target_os = "linux")]
+fn required_sidecar_sandbox_identity(
+    sandbox_id: Option<&str>,
+    sandbox_name: Option<&str>,
+) -> Result<sidecar_control::ActivatedSandboxIdentity> {
+    let sandbox_id = sandbox_id
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            miette::miette!("sidecar topology requires an activated sandbox identity")
+        })?;
+
+    Ok(sidecar_control::ActivatedSandboxIdentity {
+        sandbox_id: sandbox_id.to_string(),
+        sandbox_name: sandbox_name.unwrap_or_default().to_string(),
+    })
+}
+
+fn apply_sidecar_bootstrap_identity(
+    sandbox_id: &mut Option<String>,
+    sandbox_name: &mut Option<String>,
+    bootstrap_identity: Option<&sidecar_control::ActivatedSandboxIdentity>,
+) -> Result<()> {
+    if let Some(identity) = bootstrap_identity {
+        if identity.sandbox_id.is_empty() {
+            return Err(miette::miette!(
+                "sidecar bootstrap contained an empty sandbox ID"
+            ));
+        }
+
+        if let Some(local_id) = sandbox_id.as_deref().filter(|value| !value.is_empty())
+            && local_id != identity.sandbox_id.as_str()
+        {
+            return Err(miette::miette!(
+                "sidecar bootstrap sandbox ID does not match the local sandbox identity"
+            ));
+        }
+
+        if !identity.sandbox_name.is_empty()
+            && let Some(local_name) = sandbox_name.as_deref().filter(|value| !value.is_empty())
+            && local_name != identity.sandbox_name.as_str()
+        {
+            return Err(miette::miette!(
+                "sidecar bootstrap sandbox name does not match the local sandbox identity"
+            ));
+        }
+
+        *sandbox_id = Some(identity.sandbox_id.clone());
+        if !identity.sandbox_name.is_empty() {
+            *sandbox_name = Some(identity.sandbox_name.clone());
+        }
+    }
+
+    if sandbox_id.as_deref().is_none_or(str::is_empty) {
+        return Err(miette::miette!(
+            "process sidecar requires sandbox identity from its environment or bootstrap"
+        ));
+    }
+
+    Ok(())
+}
 
 fn load_policy_from_sidecar_bootstrap(
     bootstrap: &sidecar_control::BootstrapData,
@@ -2602,7 +2768,8 @@ async fn load_policy(
     Err(miette::miette!(
         "Sandbox policy required. Provide one of:\n\
          - --policy-rules and --policy-data (or OPENSHELL_POLICY_RULES and OPENSHELL_POLICY_DATA env vars)\n\
-         - --sandbox-id and --openshell-endpoint (or OPENSHELL_SANDBOX_ID and OPENSHELL_ENDPOINT env vars)"
+         - --sandbox-id and --openshell-endpoint (or OPENSHELL_SANDBOX_ID and OPENSHELL_ENDPOINT env vars)\n\
+         - OPENSHELL_ENDPOINT and OPENSHELL_K8S_SA_TOKEN_FILE for Kubernetes supervisor registration"
     ))
 }
 
@@ -4510,6 +4677,80 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 )]
 mod tests {
     use super::*;
+
+    fn sidecar_identity(id: &str, name: &str) -> sidecar_control::ActivatedSandboxIdentity {
+        sidecar_control::ActivatedSandboxIdentity {
+            sandbox_id: id.to_string(),
+            sandbox_name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn sidecar_bootstrap_identity_populates_warm_process_supervisor() {
+        let mut sandbox_id = None;
+        let mut sandbox_name = None;
+        let identity = sidecar_identity("sandbox-id", "warm-sandbox");
+
+        apply_sidecar_bootstrap_identity(&mut sandbox_id, &mut sandbox_name, Some(&identity))
+            .unwrap();
+
+        assert_eq!(sandbox_id.as_deref(), Some("sandbox-id"));
+        assert_eq!(sandbox_name.as_deref(), Some("warm-sandbox"));
+    }
+
+    #[test]
+    fn sidecar_bootstrap_identity_accepts_matching_cold_identity() {
+        let mut sandbox_id = Some("sandbox-id".to_string());
+        let mut sandbox_name = Some("cold-sandbox".to_string());
+        let identity = sidecar_identity("sandbox-id", "cold-sandbox");
+
+        apply_sidecar_bootstrap_identity(&mut sandbox_id, &mut sandbox_name, Some(&identity))
+            .unwrap();
+
+        assert_eq!(sandbox_id.as_deref(), Some("sandbox-id"));
+        assert_eq!(sandbox_name.as_deref(), Some("cold-sandbox"));
+    }
+
+    #[test]
+    fn sidecar_bootstrap_identity_rejects_mismatched_local_identity() {
+        let mut sandbox_id = Some("local-id".to_string());
+        let mut sandbox_name = Some("local-name".to_string());
+        let identity = sidecar_identity("bootstrap-id", "bootstrap-name");
+
+        let error =
+            apply_sidecar_bootstrap_identity(&mut sandbox_id, &mut sandbox_name, Some(&identity))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("sandbox ID does not match"));
+        assert_eq!(sandbox_id.as_deref(), Some("local-id"));
+        assert_eq!(sandbox_name.as_deref(), Some("local-name"));
+    }
+
+    #[test]
+    fn sidecar_bootstrap_identity_rejects_mismatched_local_name() {
+        let mut sandbox_id = Some("sandbox-id".to_string());
+        let mut sandbox_name = Some("local-name".to_string());
+        let identity = sidecar_identity("sandbox-id", "bootstrap-name");
+
+        let error =
+            apply_sidecar_bootstrap_identity(&mut sandbox_id, &mut sandbox_name, Some(&identity))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("sandbox name does not match"));
+        assert_eq!(sandbox_id.as_deref(), Some("sandbox-id"));
+        assert_eq!(sandbox_name.as_deref(), Some("local-name"));
+    }
+
+    #[test]
+    fn sidecar_bootstrap_identity_rejects_unattributed_warm_supervisor() {
+        let mut sandbox_id = None;
+        let mut sandbox_name = None;
+
+        let error =
+            apply_sidecar_bootstrap_identity(&mut sandbox_id, &mut sandbox_name, None).unwrap_err();
+
+        assert!(error.to_string().contains("requires sandbox identity"));
+    }
 
     #[test]
     fn transparent_tcp_capability_requires_exact_driver_marker() {

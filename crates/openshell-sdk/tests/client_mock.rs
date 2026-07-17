@@ -400,6 +400,16 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::CreateSshSessionResponse::default()))
     }
 
+    type RegisterSupervisorStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::SupervisorActivationMessage, Status>>;
+
+    async fn register_supervisor(
+        &self,
+        _: tonic::Request<proto::RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn expose_service(
         &self,
         _: tonic::Request<proto::ExposeServiceRequest>,

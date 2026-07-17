@@ -32,7 +32,6 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 		result.Workspace = m.GetWorkspace()
 		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
 	}
-
 	if provenance := s.GetCreatedFromWorkloadTemplate(); provenance != nil {
 		result.CreatedFromWorkloadTemplate = &types.SandboxWorkloadTemplateProvenance{
 			Name:            provenance.GetName(),

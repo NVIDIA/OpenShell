@@ -108,6 +108,20 @@ func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
 	assertAllFieldsCovered(t, (&pb.SandboxStartup{}).ProtoReflect().Descriptor(), handled, nil)
 }
 
+func TestConverterCoversAllProtoFields_SandboxWorkloadTemplateProvenance(t *testing.T) {
+	handled := fieldSet{
+		"name":             true,
+		"resource_version": true,
+	}
+
+	assertAllFieldsCovered(
+		t,
+		(&pb.SandboxWorkloadTemplateProvenance{}).ProtoReflect().Descriptor(),
+		handled,
+		nil,
+	)
+}
+
 func TestConverterCoversAllProtoFields_SandboxStatus(t *testing.T) {
 	handled := fieldSet{
 		"sandbox_name":           true,

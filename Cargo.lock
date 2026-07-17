@@ -4095,6 +4095,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "temp-env",
  "thiserror 2.0.18",
  "tokio",
@@ -4266,6 +4267,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "hyper-util",
+ "kube",
  "miette",
  "nix 0.29.0",
  "openshell-core",

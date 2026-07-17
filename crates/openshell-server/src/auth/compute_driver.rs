@@ -9,8 +9,9 @@ use crate::compute::ComputeRuntime;
 use async_trait::async_trait;
 use tonic::Status;
 
-/// The only public gateway method on which driver-native credentials apply.
+/// Public gateway methods on which driver-native credentials apply.
 pub const ISSUE_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/IssueSandboxToken";
+pub const REGISTER_SUPERVISOR_POD_PATH: &str = "/openshell.v1.OpenShell/RegisterSupervisorPod";
 
 #[derive(Clone, Debug)]
 pub struct ComputeDriverAuthenticator {
@@ -30,7 +31,10 @@ impl Authenticator for ComputeDriverAuthenticator {
         headers: &http::HeaderMap,
         path: &str,
     ) -> Result<Option<Principal>, Status> {
-        if path != ISSUE_SANDBOX_TOKEN_PATH {
+        if !matches!(
+            path,
+            ISSUE_SANDBOX_TOKEN_PATH | REGISTER_SUPERVISOR_POD_PATH
+        ) {
             return Ok(None);
         }
 
@@ -109,7 +113,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticator_is_scoped_to_issue_path() {
+    async fn authenticator_is_scoped_to_bootstrap_paths() {
+        let auth = authenticator(NoopTestDriver::authenticating_sandbox("sandbox-a")).await;
+
+        let principal = auth
+            .authenticate(
+                &bearer_headers("driver-credential"),
+                REGISTER_SUPERVISOR_POD_PATH,
+            )
+            .await
+            .unwrap()
+            .expect("driver credential should authenticate");
+
+        assert!(matches!(principal, Principal::Sandbox(_)));
+    }
+
+    #[tokio::test]
+    async fn authenticator_ignores_non_bootstrap_paths() {
         let auth = authenticator(NoopTestDriver::failing_sandbox_authentication(
             Code::Unavailable,
             "driver must not be called",

@@ -212,10 +212,49 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
+        let sandbox_claim_activation = driver
+            .capabilities()
+            .map_err(openshell_core::Error::execution)?
+            .supports_warm_supervisor_bootstrap
+            .then(|| kubernetes_sandbox_claim_activation(&driver));
         let driver = openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver);
-        Ok(openshell_server::ComputeDriverInstance::InProcess(
-            std::sync::Arc::new(driver),
-        ))
+        let sandbox_template_reconciler = std::sync::Arc::new(driver.clone());
+        Ok(
+            openshell_server::ComputeDriverInstance::InProcessWithSupervisorBootstrap {
+                driver: std::sync::Arc::new(driver),
+                supervisor_bootstrap_identity: None,
+                sandbox_claim_activation,
+                sandbox_template_reconciler: Some(sandbox_template_reconciler),
+            },
+        )
+    }
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+fn kubernetes_sandbox_claim_activation(
+    driver: &openshell_driver_kubernetes::KubernetesComputeDriver,
+) -> std::sync::Arc<dyn openshell_server::SandboxClaimActivationSpawner> {
+    let activation =
+        openshell_driver_kubernetes::SandboxClaimActivationController::from_driver(driver);
+    std::sync::Arc::new(KubernetesSandboxClaimActivationSpawner(activation))
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+struct KubernetesSandboxClaimActivationSpawner(
+    openshell_driver_kubernetes::SandboxClaimActivationController,
+);
+
+#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
+impl openshell_server::SandboxClaimActivationSpawner for KubernetesSandboxClaimActivationSpawner {
+    fn spawn(
+        &self,
+        activator: std::sync::Arc<
+            dyn openshell_core::supervisor_bootstrap::SupervisorBootstrapActivator,
+        >,
+        registration_rx: tokio::sync::watch::Receiver<u64>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        self.0.spawn(activator, registration_rx, shutdown_rx);
     }
 }
 

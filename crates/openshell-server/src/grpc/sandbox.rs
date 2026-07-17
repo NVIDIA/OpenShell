@@ -16,6 +16,7 @@ use crate::auth::workspace_authz::{
 use crate::persistence::{ObjectLabels, ObjectType, WriteCondition, generate_name};
 use futures::future;
 use openshell_core::net::set_tcp_nodelay_best_effort;
+use openshell_core::proto::compute::v1::DriverSandboxTemplateRef;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
@@ -342,30 +343,37 @@ async fn handle_create_sandbox_inner(
         .await?
         .ensure_active()?;
 
-    let (mut spec, created_from_workload_template) = if workload_template_name.is_empty() {
-        let spec = request
-            .spec
-            .ok_or_else(|| Status::invalid_argument("spec is required"))?;
-        (spec, None)
-    } else {
-        let governance_spec = request.spec.unwrap_or_default();
-        let template = state
-            .store
-            .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &workload_template_name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox template not found"))?;
-        let provenance = SandboxWorkloadTemplateProvenance {
-            name: template.object_name().to_string(),
-            resource_version: template.get_resource_version().to_string(),
+    let (mut spec, created_from_workload_template, driver_sandbox_template) =
+        if workload_template_name.is_empty() {
+            let spec = request
+                .spec
+                .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+            (spec, None, None)
+        } else {
+            let governance_spec = request.spec.unwrap_or_default();
+            let template = state
+                .store
+                .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &workload_template_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox template not found"))?;
+            let provenance = SandboxWorkloadTemplateProvenance {
+                name: template.object_name().to_string(),
+                resource_version: template.get_resource_version().to_string(),
+            };
+            let driver_template_ref = DriverSandboxTemplateRef {
+                id: template.object_id().to_string(),
+                name: template.object_name().to_string(),
+                workspace: template.object_workspace().to_string(),
+                resource_version: template.get_resource_version(),
+            };
+            let mut resolved = sandbox_spec_from_stored_workload_template(&template)?;
+            resolved.policy = governance_spec.policy;
+            resolved.providers = governance_spec.providers;
+            resolved.command = governance_spec.command;
+            resolved.tty = governance_spec.tty;
+            (resolved, Some(provenance), Some(driver_template_ref))
         };
-        let mut resolved = sandbox_spec_from_stored_workload_template(&template)?;
-        resolved.policy = governance_spec.policy;
-        resolved.providers = governance_spec.providers;
-        resolved.command = governance_spec.command;
-        resolved.tty = governance_spec.tty;
-        (resolved, Some(provenance))
-    };
 
     // Leave an omitted command empty rather than persisting a concrete shell:
     // the supervisor resolves the default login shell against the sandbox image
@@ -454,6 +462,16 @@ async fn handle_create_sandbox_inner(
     };
 
     let now_ms = current_time_ms();
+    let main_process_spec = openshell_core::sandbox_env::MainProcessConfig::encode_public_spec(
+        Some(&spec),
+        await_main_process_attachment,
+    )
+    .map_err(|err| Status::internal(format!("encode main process spec failed: {err}")))?;
+    let mut annotations = request.annotations.clone();
+    annotations.insert(
+        openshell_core::sandbox_env::MAIN_PROCESS_SPEC_ANNOTATION.to_string(),
+        main_process_spec,
+    );
 
     let mut sandbox = Sandbox {
         metadata: Some(ObjectMeta {
@@ -462,7 +480,7 @@ async fn handle_create_sandbox_inner(
             created_at_ms: now_ms,
             labels: request.labels.clone(),
             resource_version: 0,
-            annotations: request.annotations.clone(),
+            annotations,
             workspace,
             deletion_timestamp_ms: 0,
         }),
@@ -495,8 +513,11 @@ async fn handle_create_sandbox_inner(
             status
         })?;
 
-    // Mint a gateway JWT whenever the issuer is configured. Compute runtimes
-    // that bootstrap through another authentication mechanism may ignore it.
+    // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
+    // this mint and bootstrap via `RegisterSupervisor` at supervisor
+    // startup; identifying "is this K8s?" lives in the compute layer, so
+    // we mint unconditionally here when the issuer is configured and let
+    // the K8s driver simply ignore the field.
     let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
         issuer.mint(&id).map(|minted| {
             tracing::info!(
@@ -514,7 +535,12 @@ async fn handle_create_sandbox_inner(
 
     let sandbox = state
         .compute
-        .create_sandbox(sandbox, sandbox_token, await_main_process_attachment)
+        .create_sandbox(
+            sandbox,
+            sandbox_token,
+            await_main_process_attachment,
+            driver_sandbox_template,
+        )
         .await?;
 
     info!(
@@ -537,6 +563,15 @@ fn validate_create_sandbox_request_pre_io(
         crate::grpc::validation::validate_label_value(value)?;
     }
     crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
+    if request
+        .annotations
+        .contains_key(openshell_core::sandbox_env::MAIN_PROCESS_SPEC_ANNOTATION)
+    {
+        return Err(Status::invalid_argument(format!(
+            "{} is reserved",
+            openshell_core::sandbox_env::MAIN_PROCESS_SPEC_ANNOTATION
+        )));
+    }
 
     if workload_template_name.is_empty() {
         let spec = request
@@ -800,6 +835,12 @@ pub(super) async fn handle_create_sandbox_template(
         deletion_timestamp_ms: 0,
     });
     validate_sandbox_workload_template(&resolved)?;
+    if let Some(metadata) = resolved.metadata.as_mut() {
+        // New object inserts always start at resource version one. Set it before
+        // preparing the outbox payload so both records describe the same
+        // authoritative template version inside the atomic transaction.
+        metadata.resource_version = 1;
+    }
 
     let labels_map = resolved.object_labels();
     let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
@@ -841,6 +882,8 @@ pub(super) async fn handle_create_sandbox_template(
     if let Some(metadata) = resolved.metadata.as_mut() {
         metadata.resource_version = write.resource_version;
     }
+
+    crate::template_reconciliation::notify_after_create(state);
 
     Ok(Response::new(SandboxTemplateResponse {
         template: Some(resolved),
@@ -967,15 +1010,28 @@ pub(super) async fn handle_delete_sandbox_template(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    let existing = state
+        .store
+        .get_message_by_name::<SandboxWorkloadTemplate>(&workspace, &req.name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?;
+    let Some(template) = existing else {
+        return Ok(Response::new(DeleteSandboxTemplateResponse {
+            deleted: false,
+        }));
+    };
     let deleted = state
         .store
-        .delete_by_name(
+        .delete_if(
             SandboxWorkloadTemplate::object_type(),
-            &workspace,
-            &req.name,
+            template.object_id(),
+            template.get_resource_version(),
         )
         .await
-        .map_err(|e| Status::internal(format!("delete sandbox template failed: {e}")))?;
+        .map_err(|error| super::persistence_error_to_status(error, "delete sandbox template"))?;
+    if deleted {
+        crate::template_reconciliation::notify_after_delete(state);
+    }
     Ok(Response::new(DeleteSandboxTemplateResponse { deleted }))
 }
 
@@ -4551,6 +4607,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_sandbox_rejects_reserved_main_process_annotation() {
+        let state = test_server_state().await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                name: "reserved-main-process".to_string(),
+                spec: Some(SandboxSpec::default()),
+                labels: HashMap::new(),
+                annotations: HashMap::from([(
+                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC_ANNOTATION.to_string(),
+                    "user-supplied".to_string(),
+                )]),
+                workspace: String::new(),
+                await_main_process_attachment: false,
+                workload_template_name: String::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message()
+                .contains(openshell_core::sandbox_env::MAIN_PROCESS_SPEC_ANNOTATION)
+        );
+    }
+
+    #[tokio::test]
     async fn create_sandbox_persists_long_metadata_annotations() {
         let state = test_server_state().await;
         let annotation_key = "openshell.nvidia.com/policy-signature".to_string();
@@ -4804,7 +4889,6 @@ mod tests {
         assert_eq!(metadata.workspace, "default");
         assert!(!metadata.id.is_empty());
         assert_ne!(metadata.resource_version, 0);
-
         let fetched = handle_get_sandbox_template(
             &state,
             authed_request(GetSandboxTemplateRequest {

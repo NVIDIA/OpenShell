@@ -23,9 +23,10 @@ use openshell_core::proto::{
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     IssueSandboxTokenRequest, IssueSandboxTokenResponse, ListProvidersRequest,
     ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
-    SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
+    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RegisterSupervisorRequest, RelayFrame,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
+    ServiceStatus, SupervisorActivationMessage, SupervisorMessage, TcpForwardFrame,
+    UpdateProviderRequest, WatchSandboxRequest,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -523,6 +524,15 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<IssueSandboxTokenRequest>,
     ) -> Result<Response<IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type RegisterSupervisorStream = ReceiverStream<Result<SupervisorActivationMessage, Status>>;
+
+    async fn register_supervisor(
+        &self,
+        _request: tonic::Request<RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

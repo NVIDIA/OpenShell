@@ -293,6 +293,9 @@ impl MxcComputeBackend {
             driver_reports_runtime_readiness: true,
             resource_capabilities: None,
             rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
+            supports_warm_supervisor_bootstrap: false,
+            supports_sandbox_template_reconciliation: false,
         }
     }
 
