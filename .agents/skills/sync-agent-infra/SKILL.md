@@ -9,7 +9,7 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 
 | File | What it tracks |
 |------|---------------|
-| `AGENTS.md` | Project identity, workflow chains, architecture overview, issue/PR conventions |
+| `AGENTS.md` | Project identity, workflow chains, architecture overview, issue/PR conventions, skill maintenance map |
 | `CONTRIBUTING.md` | Skills table, workflow chains, "When to Open an Issue" guidance, skill references |
 | `README.md` | "Built With Agents" section, "Explore with your agent" skill references |
 | `.github/ISSUE_TEMPLATE/bug_report.yml` | Skill name references in diagnostic guidance |
@@ -25,6 +25,7 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 - After adding, removing, or renaming a skill in `.agents/skills/`
 - After adding, removing, or renaming a crate in `crates/`
 - After changing workflow chain relationships between skills
+- After changing which product or development areas a skill covers
 - After modifying issue or PR templates
 - Before opening a PR that touches any of the above
 
@@ -77,6 +78,7 @@ For each file in the table above, check for the following inconsistencies:
 1. **Architecture overview** — Every crate in `crates/` must appear in the architecture table. The `python/`, `proto/`, `deploy/`, `.agents/` rows must also be present.
 2. **Workflow chains** — Verify each skill named in a chain exists in `.agents/skills/`.
 3. **Issue/PR conventions** — Verify referenced skills (`create-github-issue`, `create-github-pr`, `build-from-issue`) exist.
+4. **Skill maintenance map** — Verify each named skill exists and the mapped change areas still match the skill descriptions and current repository boundaries.
 
 ### `README.md`
 
@@ -125,6 +127,7 @@ If any inconsistencies are found, report them in a structured format:
 ### Cross-References
 - <file>:<line> references non-existent skill <skill>
 - <file>:<line> references non-existent label <label>
+- AGENTS.md skill maintenance map has a stale or missing change-area mapping: <details>
 - OK: <count> references consistent
 ```
 
@@ -140,6 +143,7 @@ If drift is found, fix it by updating the affected files:
 4. **Added crate** — Add a row to the AGENTS.md architecture table.
 5. **Removed crate** — Remove the row from the AGENTS.md architecture table.
 6. **Changed workflow chain** — Update chains in both `AGENTS.md` and `CONTRIBUTING.md`. Update the "Built With Agents" section in `README.md` if the change is user-visible.
+7. **Changed skill coverage** — Update the `AGENTS.md` skill maintenance map and any affected cross-references or companion-skill tables.
 
 After fixing, re-run Step 2 to verify consistency.
 

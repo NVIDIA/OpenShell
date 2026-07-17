@@ -1,6 +1,6 @@
 ---
 name: openshell-cli
-description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration, policy iteration, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox connect, logs, provider create, policy set, policy get, image push, forward, port forward, BYOC, bring your own container, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
+description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, gateway registration, provider configuration and refresh, policy iteration, settings, service exposure, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox exec, sandbox connect, logs, provider create, provider profile, provider refresh, policy set, policy get, settings, service expose, forward, port forward, BYOC, bring your own container, inference, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway add, gateway select.
 ---
 
 # OpenShell CLI
@@ -9,7 +9,7 @@ Guide agents through using the `openshell` CLI for sandbox and platform manageme
 
 ## Overview
 
-The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, inference routes, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, Helm, or development tasks. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
+The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, settings, exposed services, inference routes, and gateway registrations. Gateway service lifecycle is handled outside the CLI by packages, systemd, Helm, or development tasks. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
 
 **Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
@@ -32,7 +32,7 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 
 ## Command Reference
 
-See [cli-reference.md](cli-reference.md) for the full command tree with all flags and options. Use it as a quick-reference to avoid round-tripping through `--help` for common commands.
+See [cli-reference.md](cli-reference.md) for the current command tree and commonly used flags. Use it as a quick-reference, then confirm uncommon or security-sensitive options with `--help`.
 
 ---
 
@@ -87,9 +87,12 @@ openshell sandbox delete <name>
 
 ## Workflow 2: Provider Management
 
-Providers supply credentials to sandboxes (API keys, tokens, etc.). Manage them before creating sandboxes that need them.
+Providers supply credentials and provider-specific configuration to sandboxes. Provider types come from built-in and custom profiles; do not rely on a hard-coded type list. Discover the profiles available on the selected gateway:
 
-Supported types: `claude`, `opencode`, `codex`, `generic`, `nvidia`, `gitlab`, `github`, `outlook`.
+```bash
+openshell provider list-profiles
+openshell provider list-profiles --output json
+```
 
 ### Create a provider from local credentials
 
@@ -103,24 +106,56 @@ The `--from-existing` flag discovers credentials from local state (e.g., `gh aut
 
 ```bash
 openshell provider create --name my-api --type generic \
-  --credential API_KEY=sk-abc123 \
+  --credential API_KEY \
   --config base_url=https://api.example.com
 ```
 
-Bare `KEY` (without `=VALUE`) reads the value from the environment variable of that name:
+Bare `KEY` reads the value from the environment variable of that name and avoids placing the secret in shell history. Use `KEY=VALUE` only when the user explicitly accepts that exposure.
+
+Other credential sources are `--from-gcloud-adc` for compatible profiles and `--runtime-credentials` when the gateway or sandbox resolves the required credentials at runtime.
+
+Profile-backed provider policy and composition are controlled by the gateway-global `providers_v2_enabled` setting:
 
 ```bash
-openshell provider create --name my-api --type generic --credential API_KEY
+openshell settings get --global
+openshell settings set --global --key providers_v2_enabled --value true
+```
+
+### Inspect and manage provider profiles
+
+```bash
+openshell provider profile export github --output yaml
+openshell provider profile lint --file ./my-profile.yaml
+openshell provider profile import --file ./my-profile.yaml
 ```
 
 ### List, inspect, update, delete
 
 ```bash
 openshell provider list
+openshell provider list --output json
 openshell provider get my-github
-openshell provider update my-github --type github --from-existing
+openshell provider update my-github --from-existing
 openshell provider delete my-github
 ```
+
+`provider update` does not take `--type`. It updates credentials, config, or credential expiry on the existing provider.
+
+### Configure credential refresh
+
+Use refresh commands only when the provider profile and gateway support refreshable credentials:
+
+```bash
+openshell provider refresh status my-outlook
+openshell provider refresh configure my-outlook \
+  --credential-key MS_GRAPH_ACCESS_TOKEN \
+  --strategy oauth2-refresh-token \
+  --secret-material-env REFRESH_TOKEN=MS_GRAPH_REFRESH_TOKEN \
+  --credential-expires-at 2026-07-16T00:00:00Z
+openshell provider refresh rotate my-outlook --credential-key MS_GRAPH_ACCESS_TOKEN
+```
+
+Prefer `--secret-material-env KEY[=ENVVAR]` for secret refresh material. `--material KEY=VALUE` is for non-secret material; `--secret-material-key` marks supplied material keys as secret.
 
 ---
 
@@ -134,29 +169,41 @@ openshell sandbox create \
   --provider my-github \
   --provider my-claude \
   --policy ./my-policy.yaml \
-  --upload .:/sandbox \
+  --upload .:/workspace \
+  --label team=agents \
   -- claude
 ```
 
 Key flags:
 - `--provider`: Attach one or more providers (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
+- `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
-- `--upload <PATH>[:<DEST>]`: Upload local files into the sandbox (default dest: `/sandbox`)
+- `--driver-config-json`: Pass experimental driver-specific sandbox configuration
+- `--label KEY=VALUE`: Add labels for later selection (repeatable)
+- `--env KEY=VALUE`: Inject sandbox environment variables (repeatable)
+- `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
+- `--upload <PATH>[:<DEST>]`: Upload local files into the container working directory or an explicit destination
+- `--no-git-ignore`: Disable `.gitignore` filtering for uploads
 - `--no-keep`: Delete the sandbox after the initial command or shell exits
-- `--forward <PORT>`: Forward a local port and keep the sandbox alive
+- `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
+- `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
 
 ### List and inspect sandboxes
 
 ```bash
 openshell sandbox list
+openshell sandbox list --selector team=agents --output json
 openshell sandbox get my-sandbox
 ```
+
+Most commands with an optional sandbox name use the last-used sandbox. Pass an explicit name in automation.
 
 ### Connect to a running sandbox
 
 ```bash
 openshell sandbox connect my-sandbox
+openshell sandbox connect my-sandbox --editor vscode
 ```
 
 Opens an interactive SSH shell. To configure VS Code Remote-SSH:
@@ -173,6 +220,25 @@ openshell sandbox upload my-sandbox ./src /sandbox/src
 
 # Download files from sandbox
 openshell sandbox download my-sandbox /sandbox/output ./local-output
+```
+
+Uploads honor `.gitignore` by default. Add `--no-git-ignore` only when ignored files are intentionally in scope.
+
+### Execute a non-interactive command
+
+```bash
+openshell sandbox exec --name my-sandbox --workdir /workspace -- ls -la
+openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
+```
+
+`sandbox exec` streams output and exits with the remote command's exit code. Use `sandbox connect` for an interactive shell.
+
+### Change attached providers
+
+```bash
+openshell sandbox provider list my-sandbox
+openshell sandbox provider attach my-sandbox my-github
+openshell sandbox provider detach my-sandbox my-github
 ```
 
 ### View logs
@@ -196,6 +262,7 @@ openshell logs my-sandbox --since 5m
 ```bash
 openshell sandbox delete my-sandbox
 openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
+openshell sandbox delete --all
 ```
 
 ---
@@ -256,13 +323,13 @@ Look for log lines with `action: deny` -- these indicate blocked network request
 openshell policy get dev --full > current-policy.yaml
 ```
 
-The `--full` flag outputs valid YAML that can be directly re-submitted. This is the round-trip format.
+The `--full` flag includes the effective policy, including provider-composed entries. Use `--base` instead when the editable base policy is needed without provider-composed entries. Before resubmitting a `--full` result, review composed entries and prefer incremental updates or the base policy when appropriate.
 
 ### Step 4: Modify the policy
 
 Edit `current-policy.yaml` to allow the blocked actions. **For policy content authoring, delegate to the `generate-sandbox-policy` skill.** That skill handles:
 - Network endpoint rule structure
-- L4 vs L7 policy decisions
+- L4 vs REST, WebSocket, JSON-RPC, MCP, and SQL L7 policy decisions
 - Access presets (`read-only`, `read-write`, `full`)
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
@@ -307,200 +374,37 @@ Fetch a specific historical revision:
 openshell policy get dev --rev 3 --full
 ```
 
----
-
-## Workflow 5: BYOC (Bring Your Own Container)
-
-Build a custom container image and run it as a sandbox.
-
-### Step 1: Create a sandbox from a Dockerfile
+Gateway-global policy commands use `--global` and require confirmation unless `--yes` is supplied:
 
 ```bash
-openshell sandbox create --from ./Dockerfile --name my-app
+openshell policy get --global --full
+openshell policy set --global --policy ./global-policy.yaml
+openshell policy list --global
+openshell policy delete --global
 ```
 
-The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile, a full image reference (e.g. `myregistry.com/img:tag`), or a community sandbox name (e.g. `openclaw`).
+Avoid `--yes` during interactive work. A global policy locks policy control for all sandboxes on the gateway.
 
-When given a Dockerfile or directory, the image is built locally via Docker and delivered through the selected compute driver. Docker and Podman-backed gateways can use local images directly. Kubernetes gateways usually need the image available to the cluster through a registry or driver-supported image push path.
+### Review agent-authored rule proposals
 
-When `--from` is specified, the CLI:
-- Clears default `run_as_user`/`run_as_group` (custom images may not have the `sandbox` user)
-- Uses a supervisor bootstrap pattern (init container copies the sandbox supervisor into a shared volume)
-
-### Step 2: Forward ports (if the container runs a service)
+Sandboxes created with `--approval-mode manual` place every proposal in the review inbox. `auto` approves only proposals with an empty prover delta; findings still require review.
 
 ```bash
-# Foreground (blocks)
-openshell forward start 8080 my-app
-
-# Background (returns immediately)
-openshell forward start 8080 my-app -d
+openshell rule get dev --status pending
+openshell rule approve dev --chunk-id <chunk-id>
+openshell rule reject dev --chunk-id <chunk-id> --reason "too broad"
+openshell rule history dev
 ```
 
-The service is now reachable at `localhost:8080`.
-
-### Step 3: Manage port forwards
-
-```bash
-# List active forwards
-openshell forward list
-
-# Stop a forward
-openshell forward stop 8080 my-app
-```
-
-### Step 4: Iterate
-
-To update the container:
-
-```bash
-openshell sandbox delete my-app
-openshell sandbox create --from ./Dockerfile --name my-app --forward 8080
-```
-
-### Shortcut: Create with port forward in one command
-
-```bash
-openshell sandbox create --from ./Dockerfile --forward 8080 -- ./start-server.sh
-```
-
-The `--forward` flag starts a background port forward before the command runs, so the service is reachable immediately.
-
-### Limitations
-
-- Distroless / `FROM scratch` images are not supported (the supervisor needs glibc, `/proc`, and a shell)
-- Missing `iproute2` or required capabilities blocks startup in proxy mode
+Review the proposed scope and prover findings before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
 
 ---
 
-## Workflow 6: Agent-Assisted Sandbox Session
+## Advanced Workflows
 
-This workflow supports a human working in a sandbox while an agent monitors activity and refines the policy in parallel.
-
-### Step 1: Create sandbox with providers and keep alive
-
-```bash
-openshell sandbox create \
-  --name work-session \
-  --provider github \
-  --provider claude \
-  --policy ./dev-policy.yaml \
-  # sandbox create keeps the sandbox alive by default
-```
-
-### Step 2: User connects in a separate shell
-
-Tell the user to run:
-
-```bash
-openshell sandbox connect work-session
-```
-
-Or for VS Code:
-
-```bash
-openshell sandbox ssh-config work-session >> ~/.ssh/config
-# Then connect via VS Code Remote-SSH to the host "work-session"
-```
-
-### Step 3: Agent monitors logs
-
-While the user works, monitor the sandbox logs:
-
-```bash
-openshell logs work-session --tail --source sandbox --level warn
-```
-
-Watch for `deny` actions that indicate the user's work is being blocked by policy.
-
-### Step 4: Agent refines policy
-
-When denied actions are observed:
-
-1. Prefer incremental updates for additive network changes:
-   `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
-   `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
-2. Use full YAML replacement when the change is broad or touches non-network fields:
-   `openshell policy get work-session --full > policy.yaml`
-   Modify the policy to allow the blocked actions (use `generate-sandbox-policy` skill for content)
-   `openshell policy set work-session --policy policy.yaml --wait`
-3. Verify: `openshell policy list work-session`
-
-The user does not need to disconnect -- policy updates are hot-reloaded within ~30 seconds (or immediately when using `--wait`, which polls for confirmation).
-
-### Step 5: Clean up when done
-
-```bash
-openshell sandbox delete work-session
-```
-
----
-
-## Workflow 7: Gateway Inference
-
-Configure the gateway's managed inference route for `inference.local`.
-
-### Set gateway inference
-
-First ensure the provider record exists:
-
-```bash
-openshell provider list
-```
-
-Then point gateway inference at that provider and model:
-
-```bash
-openshell inference set \
-  --provider nvidia \
-  --model nvidia/nemotron-3-nano-30b-a3b
-```
-
-This updates the gateway-managed `inference.local` route. There is no per-route create/list/update/delete workflow for sandbox inference.
-
-### Inspect current inference config
-
-```bash
-openshell inference get
-```
-
-### How sandboxes use it
-
-- Agents send HTTPS requests to `inference.local`.
-- The sandbox intercepts those requests locally and routes them through the gateway inference config.
-- Sandbox policy is separate from gateway inference configuration.
-
----
-
-## Workflow 8: Gateway Management
-
-### List and switch gateways
-
-```bash
-openshell gateway select            # See all gateways (no args shows list)
-openshell gateway select production # Switch active gateway
-openshell status                    # Verify connectivity
-```
-
-### Registration
-
-```bash
-openshell gateway add http://127.0.0.1:8080 --local --name local
-openshell gateway add https://gateway.example.com --name production
-openshell gateway remove local                         # Remove local registration
-```
-
-### Platform-specific deployment inspection
-
-```bash
-# Inspect a Kubernetes Helm release and gateway pod
-helm -n openshell status openshell
-kubectl -n openshell get deployment,statefulset,pods,svc
-kubectl -n openshell logs deployment/openshell -c openshell-gateway --tail=100
-kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=100
-```
-
-For Docker, Podman, and VM-backed gateways, inspect the gateway process or container logs and the selected runtime directly.
+Read [advanced-workflows.md](advanced-workflows.md) when the task involves BYOC,
+agent-assisted policy iteration, gateway inference, gateway registration or
+authentication, settings, or service exposure. Load only the relevant workflow.
 
 ---
 
@@ -518,7 +422,7 @@ The CLI help is always authoritative. If the help output contradicts this skill,
 
 ```bash
 $ openshell sandbox --help
-# Shows: create, get, list, delete, connect, upload, download, ssh-config, image
+# Shows: create, get, list, delete, exec, connect, upload, download, ssh-config, provider
 
 $ openshell sandbox upload --help
 # Shows: positional arguments (name, path, dest), usage examples
@@ -533,21 +437,30 @@ $ openshell sandbox upload --help
 | Register local port-forwarded gateway | `openshell gateway add http://127.0.0.1:8080 --local --name local` |
 | Check gateway health | `openshell status` |
 | List/switch gateways | `openshell gateway select [name]` |
+| Connect directly to a gateway | `openshell --gateway-endpoint <url> status` |
 | Create sandbox (interactive) | `openshell sandbox create` |
 | Create sandbox with tool | `openshell sandbox create -- claude` |
+| Create sandbox with GPUs | `openshell sandbox create --gpu 1` |
 | Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
+| Execute in sandbox | `openshell sandbox exec --name <name> -- <command>` |
 | Stream live logs | `openshell logs <name> --tail` |
 | Incremental policy update | `openshell policy update <name> --add-endpoint host:443:read-only:rest:enforce --binary /usr/bin/curl --wait` |
 | Pull current policy | `openshell policy get <name> --full > p.yaml` |
 | Push updated policy | `openshell policy set <name> --policy p.yaml --wait` |
 | Policy revision history | `openshell policy list <name>` |
+| View global policy | `openshell policy get --global --full` |
+| Review proposed rules | `openshell rule get <name> --status pending` |
 | Create sandbox from Dockerfile | `openshell sandbox create --from ./Dockerfile` |
 | Forward a port | `openshell forward start <port> <name> -d` |
+| Expose an HTTP service | `openshell service expose <name> <port> [service]` |
 | Upload files to sandbox | `openshell sandbox upload <name> <path>` |
 | Download files from sandbox | `openshell sandbox download <name> <path>` |
 | Create provider | `openshell provider create --name N --type T --from-existing` |
 | List providers | `openshell provider list` |
+| Discover provider profiles | `openshell provider list-profiles` |
+| List attached providers | `openshell sandbox provider list <name>` |
+| View settings | `openshell settings get [name]` |
 | Configure gateway inference | `openshell inference set --provider P --model M` |
 | View gateway inference | `openshell inference get` |
 | Delete sandbox | `openshell sandbox delete <name>` |

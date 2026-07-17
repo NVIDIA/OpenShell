@@ -197,6 +197,30 @@ ocsf_emit!(event);
 
 - If you change gateway deployment infrastructure (e.g., Helm values/templates, gateway image packaging, or deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agents/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
 
+## Skill Maintenance
+
+When behavior, commands, or development workflows change, review the related agent skills in the same branch. Update every affected skill rather than waiting for a separate documentation pass.
+
+| Change area | Skills to review |
+|---|---|
+| CLI commands, flags, defaults, or workflows | `openshell-cli` |
+| Sandbox policy schema, presets, or enforcement behavior | `generate-sandbox-policy`, `openshell-cli` |
+| Gateway deployment, Helm, runtime drivers, or health checks | `debug-openshell-cluster`, `helm-dev-environment` |
+| Inference routing, providers, or `inference.local` behavior | `debug-inference`, `openshell-cli` |
+| TUI architecture, navigation, data fetching, or UX | `tui-development` |
+| Release artifacts or post-publish smoke coverage | `test-release-canary` |
+| GitHub Actions workflows, required checks, or CI diagnostics | `watch-github-actions`; also `test-release-canary` for release smoke coverage |
+| Gator harness, sandbox image, supervision, or model overrides | `launch-openshell-gator` |
+| SBOM generation, dependency metadata, or license workflows | `sbom` |
+| Issue templates, labels, contribution gates, or spike/build workflow | `triage-issue`, `create-spike`, `build-from-issue`, `create-github-issue` |
+| PR template, review conventions, or vouch behavior | `create-github-pr`, `review-github-pr`, `build-from-issue` |
+| Security review or remediation workflow | `review-security-issue`, `fix-security-issue` |
+| RFC template, numbering, or lifecycle | `create-rfc` |
+| Documentation structure, navigation, or doc-update workflow | `update-docs` |
+| Skills, crates, workflow chains, issue/PR templates, or agent cross-references | `sync-agent-infra` |
+
+This table is a routing aid, not an exhaustive dependency list. Search `.agents/skills/` for the changed command, field, component, or workflow before concluding that no other skill needs an update.
+
 ## Documentation
 
 - When making changes, update the relevant documentation in the `architecture/` directory.
