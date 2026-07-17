@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-FROM public.ecr.aws/docker/library/python:3.13-slim
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
 
 # iproute2 is required for sandbox network namespace isolation.
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \

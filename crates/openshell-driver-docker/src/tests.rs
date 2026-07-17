@@ -555,23 +555,22 @@ fn docker_compute_config_disables_bind_mounts_by_default() {
 
 #[test]
 fn docker_sandbox_identity_defaults_to_10001() {
-    assert_eq!(
-        resolve_sandbox_identity(&DockerComputeConfig::default()).unwrap(),
-        (10_001, 10_001)
-    );
+    let config = DockerComputeConfig::default();
+    assert_eq!(config.sandbox_uid, DEFAULT_SANDBOX_UID);
+    assert_eq!(resolve_sandbox_identity(&config).unwrap(), (10_001, 10_001));
 }
 
 #[test]
 fn docker_sandbox_identity_uses_resolved_uid_for_default_gid() {
     let config = DockerComputeConfig {
-        sandbox_uid: Some(12_345),
+        sandbox_uid: 12_345,
         ..DockerComputeConfig::default()
     };
     assert_eq!(resolve_sandbox_identity(&config).unwrap(), (12_345, 12_345));
 }
 
 #[test]
-fn docker_sandbox_identity_allows_configured_gid_without_uid() {
+fn docker_sandbox_identity_uses_default_uid_with_configured_gid() {
     let config = DockerComputeConfig {
         sandbox_gid: Some(12_346),
         ..DockerComputeConfig::default()
@@ -582,7 +581,7 @@ fn docker_sandbox_identity_allows_configured_gid_without_uid() {
 #[test]
 fn docker_sandbox_identity_rejects_system_uid() {
     let config = DockerComputeConfig {
-        sandbox_uid: Some(999),
+        sandbox_uid: 999,
         ..DockerComputeConfig::default()
     };
     assert!(resolve_sandbox_identity(&config).is_err());

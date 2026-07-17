@@ -139,7 +139,7 @@ pub struct DockerComputeConfig {
 
     /// Numeric identity used for the agent process. The root supervisor
     /// retains UID 0 while preparing the sandbox.
-    pub sandbox_uid: Option<u32>,
+    pub sandbox_uid: u32,
 
     /// Numeric group used for the agent process. Defaults to the resolved
     /// sandbox UID when unset.
@@ -167,7 +167,7 @@ impl Default for DockerComputeConfig {
             host_gateway_ip: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
-            sandbox_uid: None,
+            sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: None,
             enable_bind_mounts: false,
         }
@@ -2644,7 +2644,7 @@ fn validate_sandbox_pids_limit(value: i64) -> CoreResult<()> {
 }
 
 fn resolve_sandbox_identity(config: &DockerComputeConfig) -> CoreResult<(u32, u32)> {
-    let uid = config.sandbox_uid.unwrap_or(DEFAULT_SANDBOX_UID);
+    let uid = config.sandbox_uid;
     let gid = config.sandbox_gid.unwrap_or(uid);
     for (field, value) in [("sandbox_uid", uid), ("sandbox_gid", gid)] {
         if !(openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID).contains(&value)

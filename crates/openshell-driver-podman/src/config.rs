@@ -125,7 +125,7 @@ pub struct PodmanComputeConfig {
     pub sandbox_pids_limit: i64,
     /// Numeric identity used for the agent process. The supervisor remains
     /// root while it prepares the sandbox.
-    pub sandbox_uid: Option<u32>,
+    pub sandbox_uid: u32,
     /// Numeric group used for the agent process. Defaults to the resolved UID.
     pub sandbox_gid: Option<u32>,
     /// Allow sandbox requests to attach host bind mounts through
@@ -197,7 +197,7 @@ impl PodmanComputeConfig {
 
     /// Resolve and validate the numeric identity injected into the supervisor.
     pub fn resolve_sandbox_identity(&self) -> Result<(u32, u32), crate::client::PodmanApiError> {
-        let uid = self.sandbox_uid.unwrap_or(DEFAULT_SANDBOX_UID);
+        let uid = self.sandbox_uid;
         let gid = self.sandbox_gid.unwrap_or(uid);
         for (field, value) in [("sandbox_uid", uid), ("sandbox_gid", gid)] {
             if !(openshell_policy::MIN_SANDBOX_UID..=openshell_policy::MAX_SANDBOX_UID)
@@ -284,7 +284,7 @@ impl Default for PodmanComputeConfig {
             guest_tls_cert: None,
             guest_tls_key: None,
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
-            sandbox_uid: None,
+            sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: None,
             enable_bind_mounts: false,
             health_check_interval_secs: DEFAULT_HEALTH_CHECK_INTERVAL_SECS,
@@ -412,25 +412,22 @@ mod tests {
 
     #[test]
     fn sandbox_identity_defaults_to_10001() {
-        assert_eq!(
-            PodmanComputeConfig::default()
-                .resolve_sandbox_identity()
-                .unwrap(),
-            (10_001, 10_001)
-        );
+        let cfg = PodmanComputeConfig::default();
+        assert_eq!(cfg.sandbox_uid, DEFAULT_SANDBOX_UID);
+        assert_eq!(cfg.resolve_sandbox_identity().unwrap(), (10_001, 10_001));
     }
 
     #[test]
     fn sandbox_identity_uses_uid_for_default_gid() {
         let cfg = PodmanComputeConfig {
-            sandbox_uid: Some(12_345),
+            sandbox_uid: 12_345,
             ..PodmanComputeConfig::default()
         };
         assert_eq!(cfg.resolve_sandbox_identity().unwrap(), (12_345, 12_345));
     }
 
     #[test]
-    fn sandbox_identity_allows_configured_gid_without_uid() {
+    fn sandbox_identity_uses_default_uid_with_configured_gid() {
         let cfg = PodmanComputeConfig {
             sandbox_gid: Some(12_346),
             ..PodmanComputeConfig::default()
@@ -441,7 +438,7 @@ mod tests {
     #[test]
     fn sandbox_identity_rejects_system_uid() {
         let cfg = PodmanComputeConfig {
-            sandbox_uid: Some(999),
+            sandbox_uid: 999,
             ..PodmanComputeConfig::default()
         };
         assert!(cfg.resolve_sandbox_identity().is_err());

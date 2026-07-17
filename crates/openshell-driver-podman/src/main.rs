@@ -12,7 +12,7 @@ use openshell_core::VERSION;
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_podman::config::{
-    DEFAULT_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, ImagePullPolicy,
+    DEFAULT_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_SANDBOX_UID, ImagePullPolicy,
 };
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
@@ -89,8 +89,12 @@ struct Args {
     sandbox_pids_limit: i64,
 
     /// Numeric UID for the agent process. Defaults to 10001.
-    #[arg(long, env = "OPENSHELL_PODMAN_SANDBOX_UID")]
-    sandbox_uid: Option<u32>,
+    #[arg(
+        long,
+        env = "OPENSHELL_PODMAN_SANDBOX_UID",
+        default_value_t = DEFAULT_SANDBOX_UID
+    )]
+    sandbox_uid: u32,
 
     /// Numeric GID for the agent process. Defaults to the resolved UID.
     #[arg(long, env = "OPENSHELL_PODMAN_SANDBOX_GID")]
