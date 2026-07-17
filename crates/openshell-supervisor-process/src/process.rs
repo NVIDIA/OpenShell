@@ -1196,6 +1196,11 @@ fn chown_recursive(path: &Path, uid: Option<Uid>, gid: Option<Gid>, root_dev: u6
 
     let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
 
+    if meta.file_type().is_symlink() {
+        debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
+        return Ok(());
+    }
+
     if meta.dev() != root_dev {
         debug!(path = %path.display(), "Skipping mount boundary during sandbox home chown");
         return Ok(());
@@ -1215,13 +1220,6 @@ fn chown_recursive(path: &Path, uid: Option<Uid>, gid: Option<Gid>, root_dev: u6
         for entry in entries {
             let entry = entry.into_diagnostic()?;
             let child = entry.path();
-            if child
-                .symlink_metadata()
-                .is_ok_and(|m| m.file_type().is_symlink())
-            {
-                debug!(path = %child.display(), "Skipping symlink during sandbox home chown");
-                continue;
-            }
             chown_recursive(&child, uid, gid, root_dev)?;
         }
     }
