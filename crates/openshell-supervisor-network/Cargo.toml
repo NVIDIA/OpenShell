@@ -15,6 +15,7 @@ openshell-core = { path = "../openshell-core" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }
+openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
 
 apollo-parser = { workspace = true }
 aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
@@ -28,6 +29,7 @@ glob = { workspace = true }
 hex = "0.4"
 ipnet = "2"
 miette = { workspace = true }
+prost-types = { workspace = true }
 rcgen = { workspace = true }
 regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
 reqwest = { workspace = true }
@@ -49,10 +51,13 @@ webpki-roots = { workspace = true }
 
 [dev-dependencies]
 openshell-core = { path = "../openshell-core", features = ["test-helpers"] }
+openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 tempfile = "3"
+tonic = { workspace = true }
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

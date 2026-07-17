@@ -19,6 +19,8 @@ openshell-core = { path = "../openshell-core", default-features = false }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-supervisor-network = { path = "../openshell-supervisor-network" }
+openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
+openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 # Async runtime
@@ -26,6 +28,7 @@ tokio = { workspace = true }
 
 # gRPC (tonic::Status downcast in error mapping)
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
+prost-types = { workspace = true }
 
 # CLI
 clap = { workspace = true }

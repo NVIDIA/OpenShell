@@ -573,6 +573,8 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
 ///
 /// Callers that must acknowledge the exact revision they loaded should retain
 /// this snapshot instead of re-fetching metadata after policy construction.
+/// The snapshot also carries the external middleware registrations required
+/// by the policy.
 pub async fn fetch_settings_snapshot(
     endpoint: &str,
     sandbox_id: &str,
@@ -735,6 +737,7 @@ pub struct SettingsPollResult {
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
     pub provider_env_revision: u64,
+    pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
 }
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
@@ -748,6 +751,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
         settings: inner.settings,
         global_policy_version: inner.global_policy_version,
         provider_env_revision: inner.provider_env_revision,
+        supervisor_middleware_services: inner.supervisor_middleware_services,
     }
 }
 
