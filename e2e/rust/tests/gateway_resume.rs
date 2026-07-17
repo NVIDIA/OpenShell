@@ -12,16 +12,11 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::{
-    sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
-};
 use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use openshell_e2e::harness::resume::{GatewayResumeHooks, run_gateway_resume_scenario};
 use tokio::time::sleep;
 
 const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.ai/managed-by=openshell";
-const READY_MARKER: &str = "gateway-resume-ready";
-const RESUME_FILE: &str = "/sandbox/gateway-resume-state";
 const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox-namespace";
 const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
 
@@ -116,6 +111,32 @@ async fn wait_for_container_running(
     }
 }
 
+struct DockerResumeHooks<'a> {
+    namespace: &'a str,
+}
+
+impl GatewayResumeHooks for DockerResumeHooks<'_> {
+    async fn before_gateway_stop(&self, sandbox_name: &str) -> Result<(), String> {
+        wait_for_container_running(self.namespace, sandbox_name, true, Duration::from_secs(60))
+            .await
+    }
+
+    async fn after_gateway_stop(&self, sandbox_name: &str) -> Result<(), String> {
+        wait_for_container_running(
+            self.namespace,
+            sandbox_name,
+            false,
+            Duration::from_secs(120),
+        )
+        .await
+    }
+
+    async fn after_gateway_start(&self, sandbox_name: &str) -> Result<(), String> {
+        wait_for_container_running(self.namespace, sandbox_name, true, Duration::from_secs(120))
+            .await
+    }
+}
+
 #[tokio::test]
 async fn docker_gateway_restart_resumes_running_sandbox() {
     let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
@@ -131,58 +152,12 @@ async fn docker_gateway_restart_resumes_running_sandbox() {
         return;
     };
 
-    wait_for_healthy(Duration::from_secs(30))
-        .await
-        .expect("gateway should start healthy");
-
-    let script = format!(
-        "echo before-restart > {RESUME_FILE}; echo {READY_MARKER}; while true; do sleep 1; done"
-    );
-    let mut sandbox = SandboxGuard::create_keep(&["sh", "-lc", &script], READY_MARKER)
-        .await
-        .expect("create long-running sandbox");
-
-    let before_restart = sandbox
-        .exec(&["cat", RESUME_FILE])
-        .await
-        .expect("read sandbox state before restart");
-    assert!(
-        before_restart.contains("before-restart"),
-        "sandbox state was not written before restart:\n{before_restart}"
-    );
-
-    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(60))
-        .await
-        .expect("sandbox container should be running before gateway restart");
-
-    gateway.stop().expect("stop e2e gateway");
-    wait_for_container_running(&namespace, &sandbox.name, false, Duration::from_secs(120))
-        .await
-        .expect("gateway shutdown should stop managed Docker sandboxes");
-
-    gateway.start().expect("restart e2e gateway");
-    wait_for_healthy(Duration::from_secs(120))
-        .await
-        .expect("gateway should become healthy after restart");
-    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(120))
-        .await
-        .expect("gateway startup should resume the Docker sandbox container");
-
-    let names = sandbox_names().await.expect("list sandboxes after restart");
-    assert!(
-        names.contains(&sandbox.name),
-        "sandbox '{}' should still be listed after gateway restart. Names: {names:?}",
-        sandbox.name
-    );
-
-    wait_for_sandbox_exec_contains(
-        &sandbox.name,
-        &["cat", RESUME_FILE],
-        "before-restart",
-        Duration::from_secs(240),
+    run_gateway_resume_scenario(
+        &gateway,
+        "Docker",
+        &DockerResumeHooks {
+            namespace: &namespace,
+        },
     )
-    .await
-    .expect("sandbox should become ready again with its state preserved");
-
-    sandbox.cleanup().await;
+    .await;
 }

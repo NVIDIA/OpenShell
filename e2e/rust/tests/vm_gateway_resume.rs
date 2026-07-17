@@ -9,16 +9,16 @@
 //! This test is gated behind the `e2e-vm` feature because it requires the VM
 //! driver runtime prepared by `e2e/rust/e2e-vm.sh`.
 
-use std::time::Duration;
-
-use openshell_e2e::harness::cli::{
-    sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
-};
 use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::sandbox::SandboxGuard;
+use openshell_e2e::harness::resume::{GatewayResumeHooks, run_gateway_resume_scenario};
 
-const READY_MARKER: &str = "vm-gateway-resume-ready";
-const RESUME_FILE: &str = "/sandbox/vm-gateway-resume-state";
+struct VmResumeHooks;
+
+impl GatewayResumeHooks for VmResumeHooks {
+    fn flush_state_before_ready(&self) -> bool {
+        true
+    }
+}
 
 #[tokio::test]
 async fn vm_gateway_restart_resumes_running_sandbox() {
@@ -32,50 +32,8 @@ async fn vm_gateway_restart_resumes_running_sandbox() {
         return;
     };
 
-    wait_for_healthy(Duration::from_secs(30))
-        .await
-        .expect("gateway should start healthy");
-
     // The gateway restart terminates the VM process before re-adopting its
-    // overlay. Flush the marker before reporting readiness so the assertion
-    // verifies durable overlay state rather than guest page-cache timing.
-    let script = format!(
-        "echo before-restart > {RESUME_FILE}; sync; echo {READY_MARKER}; while true; do sleep 1; done"
-    );
-    let mut sandbox = SandboxGuard::create_keep(&["sh", "-lc", &script], READY_MARKER)
-        .await
-        .expect("create long-running VM sandbox");
-
-    let before_restart = sandbox
-        .exec(&["cat", RESUME_FILE])
-        .await
-        .expect("read VM sandbox state before restart");
-    assert!(
-        before_restart.contains("before-restart"),
-        "VM sandbox state was not written before restart:\n{before_restart}"
-    );
-
-    gateway.stop().expect("stop e2e gateway");
-    gateway.start().expect("restart e2e gateway");
-    wait_for_healthy(Duration::from_secs(120))
-        .await
-        .expect("gateway should become healthy after restart");
-
-    let names = sandbox_names().await.expect("list sandboxes after restart");
-    assert!(
-        names.contains(&sandbox.name),
-        "sandbox '{}' should still be listed after gateway restart. Names: {names:?}",
-        sandbox.name
-    );
-
-    wait_for_sandbox_exec_contains(
-        &sandbox.name,
-        &["cat", RESUME_FILE],
-        "before-restart",
-        Duration::from_secs(240),
-    )
-    .await
-    .expect("VM sandbox should become ready again with its overlay state preserved");
-
-    sandbox.cleanup().await;
+    // overlay. The VM hook flushes the marker before reporting readiness so
+    // the assertion verifies durable overlay state rather than page-cache timing.
+    run_gateway_resume_scenario(&gateway, "VM", &VmResumeHooks).await;
 }

@@ -39,6 +39,10 @@ The test profiles separate the surface being validated:
 VM filesystem behavior is not driver-independent. The `vm_overlay` test remains
 under the `e2e-vm` profile and runs alongside API conformance in the VM lane.
 
+Gateway restart coverage uses a shared application-level resume scenario with
+driver-specific observation hooks. It remains outside the baseline conformance
+profiles because restarting a gateway requires control from its provisioner.
+
 Gateway provisioners export the endpoint and any mTLS paths through
 `OPENSHELL_GATEWAY_ENDPOINT` and the `OPENSHELL_CONFORMANCE_TLS_*` variables.
 Set `OPENSHELL_CONFORMANCE_TIMEOUT` to change the per-scenario timeout.
