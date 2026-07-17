@@ -166,10 +166,16 @@ The Windows build path is additive. Keep the repository's Linux `mise run ci`, d
 | `mise run --skip-tools windows:build:x64` | Builds release `openshell-gateway.exe` and `openshell.exe` for x64 |
 | `mise run --skip-tools windows:build:arm64` | Builds release `openshell-gateway.exe` and `openshell.exe` for ARM64 |
 | `mise run --skip-tools windows:test:x64` | Runs native x64 workspace tests |
+| `mise run --skip-tools windows:test:arm64` | Runs workspace tests on a native ARM64 Windows host |
 | `mise run --skip-tools windows:test:unsupported:x64` | Verifies unsupported driver contracts through server/runtime tests without building standalone driver binaries |
+| `mise run --skip-tools windows:test:unsupported:arm64` | Verifies the same contracts on a native ARM64 Windows host |
 | `mise run --skip-tools windows:ci` | Runs the full Windows lane in order |
 
 Use `--skip-tools` for Windows CI and automation. Rust must come from rustup with MSVC targets, and Visual Studio Build Tools must provide the linker and SDK. Because `--skip-tools` does not provision mise-managed tools, the Windows wrapper clears inherited `RUSTC_WRAPPER=sccache` before invoking Cargo. The wrapper excludes unsupported driver packages as top-level workspace targets for Windows check/test, but those library stubs still compile when the gateway depends on them. The wrapper may discover `VsDevCmd.bat`, but it must not install Visual Studio, Rust, Docker, Kubernetes, Podman, VM tooling, WSL, or Hyper-V.
+
+ARM64 validation requires the Visual Studio ARM64 C++ tools, host-native
+`libclang.dll`, CMake tools for bundled Z3, and an ARM64-capable Windows SDK.
+Test tasks reject a target that does not match the Windows host architecture.
 
 ## What NOT to do in this skill
 

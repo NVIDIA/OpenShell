@@ -18,7 +18,7 @@ In scope:
 - Audit and cfg-gate Unix-only dependencies in `openshell-server` and shared crates so the workspace compiles to Windows MSVC
 - Keep Docker, Kubernetes, Podman, and VM compute crates in the Windows build graph as stubs that return "unsupported" at runtime
 - Add a Windows-specific mise task lane (`windows:*`) that wraps MSVC builds without changing the Linux `mise run ci` path
-- `cargo test` compiles and passes on Windows for non-Linux-gated tests
+- `cargo test` compiles and passes on a native x64 or ARM64 Windows host for non-Linux-gated tests
 - Scaffold an ARM64 CI workflow (job definition only; runner provisioning is operator work)
 
 Out of scope (defer to follow-on skills):
@@ -39,7 +39,8 @@ The skill targets a **Windows 11 host with CurrentBuild ≥ 26100**. Because the
 | Requirement | Check | Install hint |
 |---|---|---|
 | Windows 11 build ≥ 26100 | `[System.Environment]::OSVersion.Version` | OS update |
-| Visual Studio 2022 Build Tools with **MSVC v143** + **Windows 11 SDK** | `where cl.exe` from a VS Developer PowerShell | https://visualstudio.microsoft.com/downloads/ |
+| Visual Studio 2022 or newer with **MSVC v143** + **Windows 11 SDK** | `where.exe cl.exe` from a VS Developer PowerShell | Include the x64/x86 and ARM64 C++ tools. |
+| Visual C++ Clang and CMake tools | `where.exe clang.exe`; `where.exe cmake.exe` | `bindgen` needs host-native `libclang.dll`; bundled Z3 uses CMake and MSBuild. |
 | Rust ≥ 1.88 via rustup with MSVC targets | `rustc --version` | `winget install Rustlang.Rustup` |
 | mise CLI for task orchestration only | `mise --version` | https://mise.jdx.dev/installing-mise.html |
 | Git ≥ 2.40 | `git --version` | `winget install Git.Git` |
@@ -72,7 +73,7 @@ The skill runs the following checklist top-to-bottom. Each step is idempotent; r
 [ ] Step 6: mise check on x86_64-pc-windows-msvc
 [ ] Step 7: mise check on aarch64-pc-windows-msvc
 [ ] Step 8: mise build --release (both targets)
-[ ] Step 9: mise test on x86_64-pc-windows-msvc (native run)
+[ ] Step 9: mise test on the host's native MSVC target
 [ ] Step 10: Validate $env:OPENSHELL_WXC_EXEC_PATH (informational)
 [ ] Step 11: Scaffold ARM64 CI workflow
 [ ] Step 12: Commit and report artifacts
@@ -176,7 +177,9 @@ The task file must expose these commands:
 | `windows:build:x64` | Release-build `openshell-gateway` and `openshell` for x64 |
 | `windows:build:arm64` | Release-build `openshell-gateway` and `openshell` for ARM64 |
 | `windows:test:x64` | Native x64 `cargo test --workspace --no-fail-fast`, excluding unsupported driver packages as top-level workspace targets |
+| `windows:test:arm64` | Native ARM64 `cargo test --workspace --no-fail-fast` with the same exclusions |
 | `windows:test:unsupported:x64` | Focused server/runtime tests that assert unsupported Windows driver contracts without building standalone driver binaries |
+| `windows:test:unsupported:arm64` | The same focused contracts on a native ARM64 host |
 | `windows:ci` | Ordered Windows check/build/test/unsupported-contract/artifact lane |
 
 The PowerShell wrapper must:
@@ -231,12 +234,21 @@ dumpbin /HEADERS "$fork\target\x86_64-pc-windows-msvc\release\openshell-gateway.
 
 Expected machine values: `x64` for `x86_64-pc-windows-msvc`, `ARM64` for `aarch64-pc-windows-msvc`.
 
-### Step 9: mise test on x86_64-pc-windows-msvc (native run)
+### Step 9: mise test on the native Windows architecture
 
 ```powershell
-mise run --skip-tools windows:test:x64
-mise run --skip-tools windows:test:unsupported:x64
+$arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+if ($arch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
+    mise run --skip-tools windows:test:arm64
+    mise run --skip-tools windows:test:unsupported:arm64
+} else {
+    mise run --skip-tools windows:test:x64
+    mise run --skip-tools windows:test:unsupported:x64
+}
 ```
+
+The wrapper rejects test targets that do not match the host architecture. This
+keeps ARM64 results native and avoids reporting x64 emulation as ARM64 coverage.
 
 Failures fall into three buckets:
 

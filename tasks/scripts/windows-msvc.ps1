@@ -43,7 +43,7 @@ $BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-pro
 $Z3WorkspaceFeatures = $BundledZ3WorkspaceFeatures
 $Z3ServerFeatures = $BundledZ3ServerFeatures
 
-function Resolve-VsDevCmd {
+function Resolve-VsDevCmd([string] $RustTarget) {
     if ($env:OPENSHELL_VSDEVCMD -and (Test-Path $env:OPENSHELL_VSDEVCMD)) {
         return (Resolve-Path $env:OPENSHELL_VSDEVCMD).Path
     }
@@ -55,7 +55,12 @@ function Resolve-VsDevCmd {
         $vswhere = $null
     }
     if ($vswhere -and (Test-Path $vswhere)) {
-        $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "Common7\Tools\VsDevCmd.bat" | Select-Object -First 1
+        $requiredComponent = switch ($RustTarget) {
+            "x86_64-pc-windows-msvc" { "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" }
+            "aarch64-pc-windows-msvc" { "Microsoft.VisualStudio.Component.VC.Tools.ARM64" }
+            default { throw "Unsupported target: $RustTarget" }
+        }
+        $found = & $vswhere -latest -products * -requires $requiredComponent -find "Common7\Tools\VsDevCmd.bat" | Select-Object -First 1
         if ($found -and (Test-Path $found)) {
             return (Resolve-Path $found).Path
         }
@@ -65,7 +70,7 @@ function Resolve-VsDevCmd {
         [Environment]::GetEnvironmentVariable("ProgramFiles"),
         [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
     ) | Where-Object { $_ }
-    $versions = @("18", "17")
+    $versions = @("18", "2022", "17")
     $editions = @("Enterprise", "Professional", "Community", "BuildTools")
     foreach ($root in $programFiles) {
         foreach ($version in $versions) {
@@ -150,6 +155,14 @@ function Get-VsTargetArch([string] $RustTarget) {
     }
 }
 
+function Assert-NativeTestTarget([string] $RustTarget) {
+    $targetArch = Get-VsTargetArch $RustTarget
+    $hostArch = Get-HostArch
+    if ($targetArch -ne $hostArch) {
+        throw "Windows tests require a native runner. Target $RustTarget maps to $targetArch, but the host is $hostArch."
+    }
+}
+
 function Get-SelectedTargets([string] $RequestedTarget) {
     if ($RequestedTarget -eq "all") {
         $targets = @("x86_64-pc-windows-msvc")
@@ -224,7 +237,7 @@ function Invoke-VsCargo {
         throw "rustup target add $RustTarget failed"
     }
 
-    $vsDevCmd = Resolve-VsDevCmd
+    $vsDevCmd = Resolve-VsDevCmd $RustTarget
     $targetArch = Get-VsTargetArch $RustTarget
     $hostArch = Get-HostArch
     $logPath = Join-Path $LogDir $LogName
@@ -260,9 +273,7 @@ function Invoke-Build([string] $RustTarget) {
 }
 
 function Invoke-Test([string] $RustTarget) {
-    if ($RustTarget -ne "x86_64-pc-windows-msvc") {
-        throw "Windows ARM64 tests require a native ARM64 runner and are not part of this build-only lane."
-    }
+    Assert-NativeTestTarget $RustTarget
     Invoke-VsCargo `
         -RustTarget $RustTarget `
         -CargoArgs "cargo test --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --no-fail-fast $Z3WorkspaceFeatures" `
@@ -270,9 +281,7 @@ function Invoke-Test([string] $RustTarget) {
 }
 
 function Invoke-UnsupportedContractTests([string] $RustTarget) {
-    if ($RustTarget -ne "x86_64-pc-windows-msvc") {
-        throw "Unsupported-driver contract tests run only on the native x64 Windows lane."
-    }
+    Assert-NativeTestTarget $RustTarget
 
     $tests = @(
         "windows_compute_driver_stubs_report_unsupported",
@@ -286,6 +295,20 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     }
 }
 
+function Get-Sha256([string] $Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return [BitConverter]::ToString($sha256.ComputeHash($stream)).Replace("-", "")
+        } finally {
+            $sha256.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
 function Show-Artifacts([string[]] $RustTargets) {
     $rows = @()
     foreach ($rustTarget in $RustTargets) {
@@ -295,12 +318,11 @@ function Show-Artifacts([string[]] $RustTargets) {
                 continue
             }
             $item = Get-Item $path
-            $hash = Get-FileHash $path -Algorithm SHA256
             $rows += [pscustomobject]@{
                 Target = $rustTarget
                 Binary = $binary
                 Size = $item.Length
-                SHA256 = $hash.Hash
+                SHA256 = Get-Sha256 $item.FullName
                 Path = $item.FullName
             }
         }

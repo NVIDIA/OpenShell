@@ -48,13 +48,17 @@ Windows validation is exposed through `tasks/windows.toml`:
 | `windows:check:arm64` | Check the ARM64 MSVC gateway/CLI build graph. |
 | `windows:build:x64` | Build release x64 `openshell-gateway.exe` and `openshell.exe`. |
 | `windows:build:arm64` | Build release ARM64 `openshell-gateway.exe` and `openshell.exe`. |
-| `windows:test:x64` | Run native x64 workspace tests, excluding unsupported driver packages as top-level test targets. |
+| `windows:test:x64` | Run native x64 workspace tests, excluding unsupported Windows packages as top-level test targets. |
+| `windows:test:arm64` | Run native ARM64 workspace tests with the same package exclusions. |
 | `windows:test:unsupported:x64` | Run focused server/runtime tests for unsupported driver contracts. |
+| `windows:test:unsupported:arm64` | Run the same focused contracts natively on ARM64. |
 | `windows:ci` | Run check, build, test, unsupported-contract tests, and artifact reporting. |
 
 The Windows tasks call `tasks/scripts/windows-msvc.ps1`. The wrapper discovers
 Visual Studio's `VsDevCmd.bat`, adds rustup MSVC targets, clears inherited
 `RUSTC_WRAPPER`, and keeps build artifacts under the normal Cargo target tree.
+Test tasks require the Rust target architecture to match the Windows host, so
+an ARM64 test result is native coverage rather than x64 emulation coverage.
 By default it enables bundled Z3 for reproducible Windows builds. When
 `Z3_LIBRARY_PATH_OVERRIDE` points at a directory containing `libz3.lib`, the
 wrapper uses that system Z3 instead and requires `Z3_SYS_Z3_HEADER` to point at
@@ -63,6 +67,11 @@ the full path to `z3.h`.
 The lane uses `mise run --skip-tools windows:*` because Windows Rust comes from
 rustup and linking comes from Visual Studio Build Tools. Mise orchestrates the
 tasks; it does not own the Windows toolchain.
+
+ARM64 validation requires the Visual Studio ARM64 MSVC tools, host-native Clang
+tools for `libclang.dll`, CMake tools for bundled Z3, and an ARM64-capable
+Windows SDK. Artifact hashing uses .NET SHA256 directly because module
+autoloading in the mise-launched Windows PowerShell process is not guaranteed.
 
 ## CI Shape
 
@@ -76,9 +85,9 @@ mise run --skip-tools windows:test:unsupported:x64
 ```
 
 The ARM64 job is scaffolded but disabled until a Windows ARM64 runner is
-available. Once enabled, it should run check and release build for
-`aarch64-pc-windows-msvc`. Native ARM64 tests require an ARM64 runner and are
-not part of the current build-only lane.
+available. Once enabled, it should run check, release build, native workspace
+tests, and the focused unsupported-driver contracts for
+`aarch64-pc-windows-msvc`.
 
 ## Validation Contract
 
@@ -87,6 +96,7 @@ A successful Windows build report should include:
 - x64 and ARM64 `cargo check` status.
 - x64 and ARM64 release build status for `openshell-gateway.exe` and `openshell.exe`.
 - x64 test summary.
+- Native ARM64 test summary when validation runs on an ARM64 host.
 - Focused unsupported-driver contract test status.
 - Artifact size and SHA256 for each Windows binary.
 

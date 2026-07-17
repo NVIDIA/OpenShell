@@ -39,10 +39,20 @@ description = "Run Windows x64 MSVC workspace tests"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test x86_64-pc-windows-msvc"
 
+["windows:test:arm64"]
+description = "Run Windows ARM64 MSVC workspace tests on a native ARM64 host"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test aarch64-pc-windows-msvc"
+
 ["windows:test:unsupported:x64"]
 description = "Run focused Windows unsupported compute-driver contract tests"
 run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-unsupported x86_64-pc-windows-msvc"
+
+["windows:test:unsupported:arm64"]
+description = "Run focused Windows unsupported compute-driver contract tests on a native ARM64 host"
+run = "echo 'windows:* tasks require a Windows MSVC host' && exit 1"
+run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-unsupported aarch64-pc-windows-msvc"
 
 ["windows:artifacts"]
 description = "Report Windows release artifact sizes and SHA256 hashes"
