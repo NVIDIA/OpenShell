@@ -32,3 +32,15 @@ network_policies:
               path: /anything
     binaries:
       - path: /usr/bin/curl
+  httpbingo:
+    name: httpbingo
+    endpoints:
+      - host: httpbingo.org
+        port: 443
+        protocol: rest
+        rules:
+          - allow:
+              method: POST
+              path: /anything
+    binaries:
+      - path: /usr/bin/curl

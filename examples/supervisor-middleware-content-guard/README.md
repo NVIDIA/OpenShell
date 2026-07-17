@@ -13,7 +13,29 @@ Supervisor middleware is a research preview. Its policy and service contracts ma
 
 This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies for configured literal strings, then either replaces every match or denies the request. Findings report only aggregate counts and never include configured terms or request content.
 
-## Run the service
+## Run the smoke example
+
+Run the end-to-end smoke suite to build and start a local gateway, start the content-guard service, create a sandbox, and send the same request body to two destinations:
+
+```shell
+./examples/supervisor-middleware-content-guard/smoke.sh --test-suite
+```
+
+The first request goes to `httpbin.org`, which matches the middleware endpoint selector. The response contains `[FILTERED]` instead of `prototype-secret`. The second request goes to `httpbingo.org`, which is allowed by network policy but does not match the middleware selector. Its response contains the original `prototype-secret` value. The smoke suite asserts both results and cleans up the sandbox, gateway, and middleware processes.
+
+Run the script without flags to leave the local stack running for interactive use:
+
+```shell
+./examples/supervisor-middleware-content-guard/smoke.sh
+```
+
+The script creates the sandbox and prints the guarded and unguarded request commands. Press Ctrl-C to clean up. The middleware service must be reachable from both the host gateway and sandbox containers. The script detects a non-loopback host address automatically; override it when necessary:
+
+```shell
+CONTENT_GUARD_SMOKE_HOST=192.168.1.10 ./examples/supervisor-middleware-content-guard/smoke.sh --test-suite
+```
+
+## Run manually
 
 Start the service before starting the gateway. Bind to all host interfaces so a local containerized gateway and sandbox supervisor can reach it:
 
@@ -42,7 +64,7 @@ The `network_middlewares` map key `prototype-content-guard` is the stable policy
 
 ## Apply the example policy
 
-The included policy allows `curl` to POST to `https://httpbin.org/anything` and replaces `prototype-secret` or `internal-only` in the request body:
+The included policy allows `curl` to POST to `https://httpbin.org/anything` and `https://httpbingo.org/anything`. Only `httpbin.org` matches the middleware selector, where the content guard replaces `prototype-secret` or `internal-only` in the request body:
 
 ```shell
 openshell sandbox create --policy examples/supervisor-middleware-content-guard/policy.yaml
