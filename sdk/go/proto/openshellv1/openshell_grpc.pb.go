@@ -85,6 +85,7 @@ const (
 	OpenShell_ClearDraftChunks_FullMethodName              = "/openshell.v1.OpenShell/ClearDraftChunks"
 	OpenShell_GetDraftHistory_FullMethodName               = "/openshell.v1.OpenShell/GetDraftHistory"
 	OpenShell_IssueSandboxToken_FullMethodName             = "/openshell.v1.OpenShell/IssueSandboxToken"
+	OpenShell_RegisterSupervisorPod_FullMethodName         = "/openshell.v1.OpenShell/RegisterSupervisorPod"
 	OpenShell_RefreshSandboxToken_FullMethodName           = "/openshell.v1.OpenShell/RefreshSandboxToken"
 	OpenShell_CreateWorkspace_FullMethodName               = "/openshell.v1.OpenShell/CreateWorkspace"
 	OpenShell_GetWorkspace_FullMethodName                  = "/openshell.v1.OpenShell/GetWorkspace"
@@ -266,6 +267,12 @@ type OpenShellClient interface {
 	// drivers receive the gateway JWT directly from the create-sandbox flow
 	// and never call this RPC.
 	IssueSandboxToken(ctx context.Context, in *IssueSandboxTokenRequest, opts ...grpc.CallOption) (*IssueSandboxTokenResponse, error)
+	// Register a Kubernetes supervisor pod and wait for gateway activation.
+	//
+	// The initial trial activates already-bound cold pods immediately. Later
+	// warm-pool stages keep this stream pending until a SandboxClaim adopts the
+	// registered pod.
+	RegisterSupervisorPod(ctx context.Context, in *RegisterSupervisorPodRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PodActivationMessage], error)
 	// Renew the calling sandbox's gateway JWT. Older tokens remain valid
 	// until their own expiry; deployments should keep token TTLs short to
 	// bound replay exposure. The supervisor calls this from a background
@@ -950,6 +957,25 @@ func (c *openShellClient) IssueSandboxToken(ctx context.Context, in *IssueSandbo
 	return out, nil
 }
 
+func (c *openShellClient) RegisterSupervisorPod(ctx context.Context, in *RegisterSupervisorPodRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PodActivationMessage], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &OpenShell_ServiceDesc.Streams[7], OpenShell_RegisterSupervisorPod_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[RegisterSupervisorPodRequest, PodActivationMessage]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_RegisterSupervisorPodClient = grpc.ServerStreamingClient[PodActivationMessage]
+
 func (c *openShellClient) RefreshSandboxToken(ctx context.Context, in *RefreshSandboxTokenRequest, opts ...grpc.CallOption) (*RefreshSandboxTokenResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RefreshSandboxTokenResponse)
@@ -1201,6 +1227,12 @@ type OpenShellServer interface {
 	// drivers receive the gateway JWT directly from the create-sandbox flow
 	// and never call this RPC.
 	IssueSandboxToken(context.Context, *IssueSandboxTokenRequest) (*IssueSandboxTokenResponse, error)
+	// Register a Kubernetes supervisor pod and wait for gateway activation.
+	//
+	// The initial trial activates already-bound cold pods immediately. Later
+	// warm-pool stages keep this stream pending until a SandboxClaim adopts the
+	// registered pod.
+	RegisterSupervisorPod(*RegisterSupervisorPodRequest, grpc.ServerStreamingServer[PodActivationMessage]) error
 	// Renew the calling sandbox's gateway JWT. Older tokens remain valid
 	// until their own expiry; deployments should keep token TTLs short to
 	// bound replay exposure. The supervisor calls this from a background
@@ -1417,6 +1449,9 @@ func (UnimplementedOpenShellServer) GetDraftHistory(context.Context, *GetDraftHi
 }
 func (UnimplementedOpenShellServer) IssueSandboxToken(context.Context, *IssueSandboxTokenRequest) (*IssueSandboxTokenResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method IssueSandboxToken not implemented")
+}
+func (UnimplementedOpenShellServer) RegisterSupervisorPod(*RegisterSupervisorPodRequest, grpc.ServerStreamingServer[PodActivationMessage]) error {
+	return status.Error(codes.Unimplemented, "method RegisterSupervisorPod not implemented")
 }
 func (UnimplementedOpenShellServer) RefreshSandboxToken(context.Context, *RefreshSandboxTokenRequest) (*RefreshSandboxTokenResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RefreshSandboxToken not implemented")
@@ -2510,6 +2545,17 @@ func _OpenShell_IssueSandboxToken_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_RegisterSupervisorPod_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(RegisterSupervisorPodRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(OpenShellServer).RegisterSupervisorPod(m, &grpc.GenericServerStream[RegisterSupervisorPodRequest, PodActivationMessage]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type OpenShell_RegisterSupervisorPodServer = grpc.ServerStreamingServer[PodActivationMessage]
+
 func _OpenShell_RefreshSandboxToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RefreshSandboxTokenRequest)
 	if err := dec(in); err != nil {
@@ -2952,6 +2998,11 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "WatchSandbox",
 			Handler:       _OpenShell_WatchSandbox_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "RegisterSupervisorPod",
+			Handler:       _OpenShell_RegisterSupervisorPod_Handler,
 			ServerStreams: true,
 		},
 	},

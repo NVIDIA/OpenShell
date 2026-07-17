@@ -365,9 +365,9 @@ pub struct KubernetesComputeConfig {
     /// Empty string (default) = omit the field, using the cluster default.
     pub default_runtime_class_name: String,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
-    /// writes into each sandbox pod. Used only for the one-shot
-    /// `IssueSandboxToken` bootstrap exchange — the gateway-minted JWT
-    /// that follows has its own TTL set via `gateway_jwt.ttl_secs`.
+    /// writes into each sandbox pod. Used only for the
+    /// `RegisterSupervisorPod` bootstrap stream — the gateway-minted JWT that
+    /// follows has its own TTL set via `gateway_jwt.ttl_secs`.
     ///
     /// Kubelet enforces a minimum of 600 seconds; the supervisor uses
     /// this token within a few seconds of pod start, so any value at
