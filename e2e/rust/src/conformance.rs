@@ -134,6 +134,11 @@ fn all_scenarios() -> &'static [Scenario] {
             description: "A command executes in a ready sandbox and streams its output and exit status",
             sandbox_name_stems: &["exec"],
         },
+        Scenario {
+            name: "process-hardening",
+            description: "Sandbox processes start with core dumps disabled",
+            sandbox_name_stems: &["process-hardening"],
+        },
     ]
 }
 
@@ -310,6 +315,7 @@ async fn run_scenario(name: &str, client: &mut GrpcClient, run_id: &str) -> Resu
         "concurrent" => scenario_concurrent(client, run_id).await,
         "labels" => scenario_labels(client, run_id).await,
         "exec" => scenario_exec(client, run_id).await,
+        "process-hardening" => scenario_process_hardening(client, run_id).await,
         _ => Err(miette::miette!("scenario '{name}' is not yet implemented")),
     }
 }
@@ -833,17 +839,56 @@ async fn scenario_labels(client: &mut GrpcClient, run_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Scenario: execute a command in a ready sandbox through the gateway API.
-///
-/// Verifies stdout and the final exit status independently, then deletes the
-/// sandbox regardless of whether command execution succeeds.
-async fn scenario_exec(client: &mut GrpcClient, run_id: &str) -> Result<()> {
-    const OUTPUT_MARKER: &str = "conformance-exec-ok";
+struct ExecResult {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+}
 
-    let sandbox_name = format!("conformance-exec-{run_id}");
+async fn exec_command(
+    client: &mut GrpcClient,
+    sandbox_id: &str,
+    command: Vec<String>,
+) -> Result<ExecResult> {
+    let mut stream = client
+        .exec_sandbox(ExecSandboxRequest {
+            sandbox_id: sandbox_id.to_string(),
+            command,
+            ..Default::default()
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("exec_sandbox failed")?
+        .into_inner();
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut exit_code = None;
+
+    while let Some(event) = stream.next().await {
+        match event
+            .into_diagnostic()
+            .wrap_err("exec_sandbox stream error")?
+            .payload
+        {
+            Some(exec_sandbox_event::Payload::Stdout(chunk)) => stdout.extend(chunk.data),
+            Some(exec_sandbox_event::Payload::Stderr(chunk)) => stderr.extend(chunk.data),
+            Some(exec_sandbox_event::Payload::Exit(exit)) => exit_code = Some(exit.exit_code),
+            None => {}
+        }
+    }
+
+    Ok(ExecResult {
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        exit_code,
+    })
+}
+
+async fn create_ready_sandbox(client: &mut GrpcClient, sandbox_name: &str) -> Result<String> {
     let response = client
         .create_sandbox(CreateSandboxRequest {
-            name: sandbox_name.clone(),
+            name: sandbox_name.to_string(),
             spec: Some(SandboxSpec::default()),
             labels: HashMap::default(),
             annotations: HashMap::default(),
@@ -859,59 +904,53 @@ async fn scenario_exec(client: &mut GrpcClient, run_id: &str) -> Result<()> {
         .ok_or_else(|| miette::miette!("create_sandbox response missing sandbox"))?;
     let sandbox_id = sandbox.object_id().to_string();
 
-    if let Err(error) = wait_for_ready(client, &sandbox_id, &sandbox_name).await {
+    if let Err(error) = wait_for_ready(client, &sandbox_id, sandbox_name).await {
         let _ = client
             .delete_sandbox(DeleteSandboxRequest {
-                name: sandbox_name,
+                name: sandbox_name.to_string(),
                 workspace: String::new(),
             })
             .await;
         return Err(error);
     }
 
+    Ok(sandbox_id)
+}
+
+/// Scenario: execute a command in a ready sandbox through the gateway API.
+///
+/// Verifies stdout and the final exit status independently, then deletes the
+/// sandbox regardless of whether command execution succeeds.
+async fn scenario_exec(client: &mut GrpcClient, run_id: &str) -> Result<()> {
+    const OUTPUT_MARKER: &str = "conformance-exec-ok";
+
+    let sandbox_name = format!("conformance-exec-{run_id}");
+    let sandbox_id = create_ready_sandbox(client, &sandbox_name).await?;
+
     let exec_result = async {
-        let mut stream = client
-            .exec_sandbox(ExecSandboxRequest {
-                sandbox_id,
-                command: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("printf {OUTPUT_MARKER}"),
-                ],
-                ..Default::default()
-            })
-            .await
-            .into_diagnostic()
-            .wrap_err("exec_sandbox failed")?
-            .into_inner();
-
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut exit_code = None;
-
-        while let Some(event) = stream.next().await {
-            match event
-                .into_diagnostic()
-                .wrap_err("exec_sandbox stream error")?
-                .payload
-            {
-                Some(exec_sandbox_event::Payload::Stdout(chunk)) => stdout.extend(chunk.data),
-                Some(exec_sandbox_event::Payload::Stderr(chunk)) => stderr.extend(chunk.data),
-                Some(exec_sandbox_event::Payload::Exit(exit)) => exit_code = Some(exit.exit_code),
-                None => {}
-            }
-        }
-
-        let stdout = String::from_utf8_lossy(&stdout);
-        let stderr = String::from_utf8_lossy(&stderr);
-        if !stdout.contains(OUTPUT_MARKER) {
+        let result = exec_command(
+            client,
+            &sandbox_id,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("printf {OUTPUT_MARKER}"),
+            ],
+        )
+        .await?;
+        if !result.stdout.contains(OUTPUT_MARKER) {
             return Err(miette::miette!(
-                "exec_sandbox stdout did not contain '{OUTPUT_MARKER}'; stdout={stdout:?}, stderr={stderr:?}"
+                "exec_sandbox stdout did not contain '{OUTPUT_MARKER}'; stdout={:?}, stderr={:?}",
+                result.stdout,
+                result.stderr,
             ));
         }
-        if exit_code != Some(0) {
+        if result.exit_code != Some(0) {
             return Err(miette::miette!(
-                "exec_sandbox returned exit code {exit_code:?}; stdout={stdout:?}, stderr={stderr:?}"
+                "exec_sandbox returned exit code {:?}; stdout={:?}, stderr={:?}",
+                result.exit_code,
+                result.stdout,
+                result.stderr,
             ));
         }
 
@@ -930,6 +969,46 @@ async fn scenario_exec(client: &mut GrpcClient, run_id: &str) -> Result<()> {
 
     exec_result?;
     cleanup_result?;
+    Ok(())
+}
+
+/// Scenario: sandbox processes start with core dumps disabled.
+async fn scenario_process_hardening(client: &mut GrpcClient, run_id: &str) -> Result<()> {
+    const OUTPUT_MARKER: &str = "core-limit-ok";
+
+    let sandbox_name = format!("conformance-process-hardening-{run_id}");
+    let sandbox_id = create_ready_sandbox(client, &sandbox_name).await?;
+    let command_result = exec_command(
+        client,
+        &sandbox_id,
+        vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            format!("test \"$(ulimit -c)\" = 0 && printf {OUTPUT_MARKER}"),
+        ],
+    )
+    .await;
+
+    let cleanup_result = client
+        .delete_sandbox(DeleteSandboxRequest {
+            name: sandbox_name,
+            workspace: String::new(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("delete_sandbox after process hardening check failed");
+
+    let result = command_result?;
+    cleanup_result?;
+    if result.exit_code != Some(0) || !result.stdout.contains(OUTPUT_MARKER) {
+        return Err(miette::miette!(
+            "sandbox process core-dump check failed with exit code {:?}; stdout={:?}, stderr={:?}",
+            result.exit_code,
+            result.stdout,
+            result.stderr,
+        ));
+    }
+
     Ok(())
 }
 
@@ -996,6 +1075,7 @@ mod tests {
                 "concurrent",
                 "labels",
                 "exec",
+                "process-hardening",
             ]
         );
     }
@@ -1029,6 +1109,7 @@ mod tests {
                 "conformance-labels-a-deadbeef",
                 "conformance-labels-b-deadbeef",
                 "conformance-exec-deadbeef",
+                "conformance-process-hardening-deadbeef",
             ]
         );
     }

@@ -31,7 +31,7 @@ The test profiles separate the surface being validated:
 
 - `e2e-api-conformance` invokes the scenario engine directly against every
   gateway driver. This includes command execution through the streaming
-  `ExecSandbox` API.
+  `ExecSandbox` API and process-hardening checks.
 - `e2e-cli-conformance` validates portable CLI behavior against the canonical
   Docker-backed gateway, including the gateway smoke test.
 
