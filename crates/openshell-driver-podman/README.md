@@ -331,7 +331,7 @@ Podman resources after out-of-band container removal or label drift.
 
 | Environment Variable | CLI Flag | Default | Description |
 |---|---|---|---|
-| `OPENSHELL_PODMAN_SOCKET` | `--podman-socket` | Auto-detected if unset: probes `$XDG_RUNTIME_DIR/podman/podman.sock` (Linux), the macOS Podman machine socket under `$HOME`, and this variable itself, using the first one that responds. Fails to start if none respond. | Podman API Unix socket path. |
+| `OPENSHELL_PODMAN_SOCKET` | `--podman-socket` | Probes known local Podman API sockets and uses the first responsive socket. Fails to start if none respond. | Podman API Unix socket path. |
 | `OPENSHELL_SANDBOX_IMAGE` | `--sandbox-image` | From gateway config | Default OCI image for sandboxes. |
 | `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `--sandbox-image-pull-policy` | `missing` | Pull policy: `always`, `missing`, `never`, or `newer`. |
 | `OPENSHELL_GRPC_ENDPOINT` | `--grpc-endpoint` | Auto-detected via `host.containers.internal` | Gateway gRPC endpoint for sandbox callbacks. |
