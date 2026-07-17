@@ -30,6 +30,30 @@ The gateway records driver identity and version from the startup capability
 response. Elevated gateway info reports that initialized driver snapshot instead
 of re-querying drivers on each request.
 
+## Deletion Lifecycle
+
+Delete requests use per-sandbox gates to serialize duplicate driver calls. A
+request resolves the name once and remains bound to that stable ID. The only
+combined lock order is delete gate, then the gateway-wide state guard; external
+driver calls run without the global guard.
+
+Watcher events do not acquire delete gates. Exact resource-version checks allow
+them to interleave safely: status snapshots are no-ops for `Deleting` rows,
+deleted events are idempotent, and snapshots for absent rows are ignored.
+
+An accepted delete (`deleted = true`) is finalized by the watcher. If the
+backend is already absent (`deleted = false`), the request removes gateway state
+synchronously. Sandbox rows and name-scoped settings are removed atomically;
+SSH sessions, indexes, and watch/log buses are cleaned only after confirmed
+removal.
+
+The request workflow runs in an owned task so client cancellation cannot strand
+a mutation. A gateway restart does not resume or reissue a persisted `Deleting`
+operation. If the backend completed the delete, watcher or reconciliation
+cleanup removes the row. If the backend never accepted the call, the row can
+remain `Deleting`; crash-safe retries require a durable operation generation
+that the compute driver honors.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |

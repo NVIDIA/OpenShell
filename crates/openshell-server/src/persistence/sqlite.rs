@@ -265,6 +265,88 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
         }
     }
 
+    pub async fn delete_with_name_scoped_if_version(
+        &self,
+        parent_type: &str,
+        parent_id: &str,
+        expected_resource_version: u64,
+        scoped_type: &str,
+    ) -> PersistenceResult<bool> {
+        // SQLite serializes writers. Materializing the matching parent inside
+        // this DELETE captures its name before either row is removed, while
+        // keeping both removals in the same write statement.
+        let result = sqlx::query(
+            r#"
+WITH "parent"("name") AS MATERIALIZED (
+    SELECT "name"
+    FROM "objects"
+    WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+)
+DELETE FROM "objects"
+WHERE (
+    "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+)
+OR (
+    "object_type" = ?4
+    AND "name" IN (SELECT "name" FROM "parent")
+)
+"#,
+        )
+        .bind(parent_type)
+        .bind(parent_id)
+        .bind(i64::try_from(expected_resource_version).unwrap_or(i64::MAX))
+        .bind(scoped_type)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        if result.rows_affected() > 0 {
+            Ok(true)
+        } else {
+            let existing = self.get(parent_type, parent_id).await?;
+            if let Some(record) = existing {
+                Err(PersistenceError::Conflict {
+                    current_resource_version: Some(record.resource_version),
+                })
+            } else {
+                Ok(false)
+            }
+        }
+    }
+
+    pub async fn delete_with_name_scoped(
+        &self,
+        parent_type: &str,
+        parent_id: &str,
+        scoped_type: &str,
+    ) -> PersistenceResult<bool> {
+        let result = sqlx::query(
+            r#"
+WITH "parent"("name") AS MATERIALIZED (
+    SELECT "name"
+    FROM "objects"
+    WHERE "object_type" = ?1 AND "id" = ?2
+)
+DELETE FROM "objects"
+WHERE (
+    "object_type" = ?1 AND "id" = ?2
+)
+OR (
+    "object_type" = ?3
+    AND "name" IN (SELECT "name" FROM "parent")
+)
+"#,
+        )
+        .bind(parent_type)
+        .bind(parent_id)
+        .bind(scoped_type)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn put_scoped(
         &self,
         object_type: &str,

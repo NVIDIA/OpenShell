@@ -261,6 +261,46 @@ impl Store {
         store_dispatch!(self.delete_if(object_type, id, expected_resource_version))
     }
 
+    /// Atomically delete an object and the object of `scoped_type` that has
+    /// the same name, subject to an exact parent resource-version match.
+    ///
+    /// The parent name is captured by the same database statement that
+    /// removes the records. This prevents a concurrent name reuse from
+    /// causing the newly-created name-scoped object to be removed.
+    ///
+    /// # Returns
+    /// * `Ok(true)` - The parent and any matching name-scoped object were deleted
+    /// * `Ok(false)` - The parent was not found
+    /// * `Err(Conflict)` - The parent exists with a different resource version
+    pub async fn delete_with_name_scoped_if_version(
+        &self,
+        parent_type: &str,
+        parent_id: &str,
+        expected_resource_version: u64,
+        scoped_type: &str,
+    ) -> PersistenceResult<bool> {
+        store_dispatch!(self.delete_with_name_scoped_if_version(
+            parent_type,
+            parent_id,
+            expected_resource_version,
+            scoped_type
+        ))
+    }
+
+    /// Atomically delete an object and the object of `scoped_type` that has
+    /// the same name.
+    ///
+    /// The parent name is captured by the same database statement that
+    /// removes the records, preventing cleanup from racing with name reuse.
+    pub async fn delete_with_name_scoped(
+        &self,
+        parent_type: &str,
+        parent_id: &str,
+        scoped_type: &str,
+    ) -> PersistenceResult<bool> {
+        store_dispatch!(self.delete_with_name_scoped(parent_type, parent_id, scoped_type))
+    }
+
     /// Insert or update a generic named object with an application-owned scope.
     pub async fn put_scoped(
         &self,
