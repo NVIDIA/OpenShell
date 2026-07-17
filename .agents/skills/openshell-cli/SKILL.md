@@ -66,6 +66,8 @@ openshell sandbox create
 
 This creates a sandbox with defaults and drops you into an interactive shell.
 
+When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
+
 **Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
 
 ```bash
@@ -224,6 +226,8 @@ openshell sandbox download my-sandbox /sandbox/output ./local-output
 
 Uploads honor `.gitignore` by default. Add `--no-git-ignore` only when ignored files are intentionally in scope.
 
+Uploads preserve symlinks, including dangling symlinks, instead of dereferencing their targets. A symlink source bypasses Git-aware filtering so the link itself is archived.
+
 ### Execute a non-interactive command
 
 ```bash
@@ -271,7 +275,7 @@ openshell sandbox delete --all
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and one dynamic field (`network_policies`). Only `network_policies` can be updated without recreating the sandbox.
+**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and two dynamic fields: `network_policies` and `network_middlewares`. Both dynamic fields can be updated without recreating the sandbox.
 
 ```
 Create sandbox with initial policy
@@ -334,8 +338,9 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - TLS termination configuration
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
+- Ordered `network_middlewares`, host selection, and `fail_open` or `fail_closed` behavior
 
-Only `network_policies` can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated.
+`network_policies` and `network_middlewares` can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 ### Step 5: Push the updated policy
 
@@ -646,7 +651,7 @@ $ openshell sandbox upload --help
 
 | Skill | When to use |
 |-------|------------|
-| `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration) |
+| `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration, and network middleware) |
 | `debug-openshell-cluster` | Diagnosing gateway deployment, runtime, or health failures |
 | `debug-inference` | Diagnosing `inference.local`, host-backed local inference, and provider base URL issues |
 | `tui-development` | Developing features for the OpenShell TUI (`openshell term`) |

@@ -40,6 +40,7 @@ Use this map when product behavior, commands, or development workflows change. I
 |---|---|
 | CLI commands, flags, defaults, or workflows | `openshell-cli` |
 | Sandbox policy schema, presets, or enforcement behavior | `generate-sandbox-policy`, `openshell-cli` |
+| Supervisor middleware policy, registrations, runtime, or failure behavior | `generate-sandbox-policy`, `openshell-cli`, `debug-openshell-cluster` |
 | Gateway deployment, Helm, runtime drivers, or health checks | `debug-openshell-cluster`, `helm-dev-environment` |
 | Inference routing, providers, or `inference.local` behavior | `debug-inference`, `openshell-cli` |
 | TUI architecture, navigation, data fetching, or UX | `tui-development` |

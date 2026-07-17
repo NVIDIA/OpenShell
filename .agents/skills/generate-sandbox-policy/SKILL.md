@@ -1,17 +1,17 @@
 ---
 name: generate-sandbox-policy
-description: Generate sandbox security policies from plain-language requirements and optional REST API documentation. At minimum, takes API host:port endpoints and intent to produce preset-based or L4 policies. With full API docs (OpenAPI, Swagger, markdown), generates fine-grained per-endpoint L7 rules. Trigger keywords - generate policy, create policy, update policy, change policy, sandbox policy, network policy, API policy, security policy, allow API, restrict API.
+description: Generate sandbox security policies from plain-language requirements and optional REST API documentation. Produces L4 or fine-grained L7 network policies and ordered network middleware configuration. Use for API access rules, middleware host selection, failure behavior, or built-in and operator-run middleware attachment. Trigger keywords - generate policy, create policy, update policy, change policy, sandbox policy, network policy, API policy, security policy, allow API, restrict API, network middleware, supervisor middleware.
 ---
 
 # Generate Sandbox Policy
 
-Generate YAML sandbox network policies from REST API documentation and natural-language user requirements.
+Generate YAML sandbox network policies and network middleware configuration from API documentation and natural-language user requirements.
 
 ## Overview
 
 This skill translates a user's plain-language policy intent into a valid sandbox policy. The amount of detail the user provides determines the granularity of the generated policy — from broad L4 or preset-based policies (just a host:port) up to fine-grained per-endpoint L7 rules (full API docs).
 
-The output is a `network_policies` YAML block (and optionally a full policy file) that conforms to the sandbox policy schema.
+The output is a `network_policies` YAML block, an optional `network_middlewares` block, and optionally a full policy file that conforms to the sandbox policy schema.
 
 ## Step 1: Gather Inputs
 
@@ -79,6 +79,7 @@ Regardless of tier, extract (or infer) these from the user's description:
 | **Paths** | Specific URL paths or patterns | Only for custom/fine-grained |
 | **Enforcement** | `enforce` or `audit`? Default to `enforce`. | No — has a default |
 | **Binary** | Which binary/process should have access | Yes — ask if not stated |
+| **Middleware** | Whether admitted HTTP requests need an ordered built-in or operator-run processing stage | No |
 
 If the host and access level are clear but binaries are not specified, ask the user which binary or process will be making the requests. Suggest common defaults like `/usr/bin/curl`, `/usr/local/bin/claude`, etc.
 
@@ -165,7 +166,14 @@ Key sections to reference:
 - **`L7Rule` / `L7Allow`** — method + path matching
 - **Access Presets** — `read-only`, `read-write`, `full`
 - **Private IP Access via `allowed_ips`** — CIDR allowlist for private IP space
+- **Network Middleware** - top-level middleware configs, ordering, host selection, and failure behavior
 - **Validation Rules** — what combinations are valid/invalid
+
+When middleware is requested, also read the full operational reference:
+
+```
+Read docs/extensibility/supervisor-middleware.mdx
+```
 
 Also read the architecture overview for enforcement context. The default policy is baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`). For reference, consult:
 
@@ -205,6 +213,17 @@ Is L7 inspection needed?
 | Non-443 (HTTP) | Omit `tls` |
 
 **Critical**: `protocol: rest` on port 443 without `tls: terminate` will not work — the proxy cannot inspect encrypted traffic. Always set `tls: terminate` when combining port 443 with L7 rules.
+
+### Middleware Decision
+
+Add `network_middlewares` only when the user asks to inspect, transform, redact, or independently authorize admitted HTTP requests. Middleware runs after network and L7 policy admission and before provider credential injection.
+
+- Use a built-in name such as `openshell/regex` without gateway registration.
+- Use an operator-owned middleware name only when it is already registered under `[[openshell.supervisor.middleware]]` and reachable from both the gateway and sandbox supervisors.
+- Default `on_error` to `fail_closed`. Use `fail_open` only when bypassing the stage preserves the user's stated security requirement.
+- Assign unique `order` values across the complete policy. Lower values run first, and at most 10 configs may be selected.
+- Match the narrowest destination hosts possible with `endpoints.include`; use `exclude` when a broad selector has trusted exceptions.
+- Do not select fail-closed middleware for `tls: skip` endpoints because the supervisor cannot inspect that traffic.
 
 ### Mapping Paths to Glob Patterns (when building explicit rules)
 
@@ -265,6 +284,23 @@ network_policies:
     binaries:
       - { path: <binary_path> }
 ```
+
+When middleware is requested, add it as a separate top-level map rather than nesting it under a network policy:
+
+```yaml
+network_middlewares:
+  <config_key>:
+    name: <human_readable_name>
+    middleware: <built_in_or_registered_name>
+    order: 10
+    config: {}
+    on_error: fail_closed
+    endpoints:
+      include: ["<api_host>"]
+      # exclude: ["<trusted_host>"]
+```
+
+The map key is the stable policy-local identity. Middleware selection is independent of the network policy entry that admitted the request.
 
 ### Deny Rules
 
@@ -337,6 +373,9 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] If `tls: terminate` is set, `protocol` is also set
 - [ ] `rules` list is not empty when present
 - [ ] If `protocol: sql`, `enforcement` is not `enforce`
+- [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
+- [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
+- [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
 
 ### Schema Warnings (log-only, but should be fixed)
 
@@ -349,6 +388,7 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 - [ ] Every endpoint has `host` and `port`
 - [ ] Every binary has `path`
 - [ ] Policy key matches `name` field
+- [ ] Every middleware selector has at most 32 combined `include` and `exclude` patterns
 
 ### Breadth Warnings
 
@@ -365,6 +405,8 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 | **Multiple broad endpoints** in one policy | "This policy grants the same broad access to N different hosts. If any of these hosts needs tighter restrictions later, you'll need to split the policy." |
 | **Hostless `allowed_ips`** (no `host` field) | "This endpoint has no `host` — any domain resolving to the allowed IP range on this port will be permitted. Consider adding a `host` field to restrict which domains can use this allowlist." |
 | **Broad CIDR** in `allowed_ips` (e.g., `10.0.0.0/8`) | "This `allowed_ips` entry covers a very broad range. Consider narrowing to a specific subnet (e.g., `10.0.5.0/24`) to minimize exposure." |
+| **`on_error: fail_open`** | "This middleware can be bypassed when it is unavailable, rejects configuration, returns an invalid result, or exceeds its body limit. Use `fail_closed` unless availability is more important than this control." |
+| **Broad middleware host selector** | "This middleware applies independently of the admitting network rule to every matching HTTP destination. Narrow `endpoints.include` or add exclusions if the stage is not required for every matching host." |
 
 Format breadth warnings clearly in the output, e.g.:
 

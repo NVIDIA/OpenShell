@@ -1,6 +1,6 @@
 ---
 name: debug-openshell-cluster
-description: Debug why an OpenShell gateway deployment is unhealthy, unreachable, or unable to create sandboxes. Use when the user has a gateway health failure, Docker/Podman runtime issue, Helm install failure, Kubernetes scheduling issue, TLS or auth issue, interceptor startup failure, external compute-driver socket issue, VM driver issue, or sandbox startup problem. Trigger keywords - debug gateway, gateway failing, deployment failing, helm install failing, cluster health, gateway health, gateway not starting, health check failed, sandbox pending, docker driver, podman driver, kubernetes driver, external driver, compute driver socket, gateway interceptor, vm driver.
+description: Debug why an OpenShell gateway deployment is unhealthy, unreachable, or unable to create sandboxes. Use for gateway health failures, Docker/Podman runtime issues, Helm failures, Kubernetes scheduling, TLS or auth, gateway interceptors, supervisor middleware startup or runtime failures, external compute-driver sockets, VM drivers, or sandbox startup. Trigger keywords - debug gateway, gateway failing, deployment failing, helm install failing, cluster health, gateway health, gateway not starting, health check failed, sandbox pending, docker driver, podman driver, kubernetes driver, external driver, compute driver socket, gateway interceptor, supervisor middleware, middleware failed, vm driver.
 ---
 
 # Debug OpenShell Gateway Deployment
@@ -92,6 +92,19 @@ journalctl -u openshell-gateway --no-pager --lines=200
 ```
 
 The gateway calls each interceptor's `Describe` RPC and validates its manifest at startup. Check for unreachable endpoints, invalid RPC/phase bindings, strict `allowlist` or `exact` mismatches, and `post_commit` bindings that resolve to `fail_closed`. If `provider_profile_sources` names an interceptor, that interceptor must advertise provider-profile capability and return a valid, duplicate-free catalog. A selected interceptor-only source is authoritative; include `builtin` or `user` sources explicitly when composition is intended.
+
+For operator-run supervisor middleware, inspect `[[openshell.supervisor.middleware]]`, service reachability, and both gateway and supervisor logs:
+
+```bash
+rg -n 'supervisor|middleware|grpc_endpoint|max_body_bytes|timeout' /etc/openshell/gateway.toml
+journalctl -u <middleware-service> --no-pager --lines=200
+journalctl -u openshell-gateway --no-pager --lines=200
+openshell logs <sandbox-name> --tail --source sandbox
+```
+
+The middleware service must start before the gateway and be reachable from both the gateway and sandbox supervisors. Gateway startup fails if `Describe` is unavailable, a manifest exposes duplicate `HttpRequest/pre_credentials` bindings, the registration claims the reserved `openshell/` namespace, or body and timeout limits are invalid. Changing a registration requires a gateway restart. A policy update can also fail before persistence if the selected implementation rejects its `network_middlewares` config.
+
+At request time, distinguish an explicit `middleware_denied` result from `middleware_failed`. A denial is always enforced. A failure follows the policy-local `on_error`: `fail_closed` blocks the request, while `fail_open` bypasses only that stage and emits a detection finding. If a running supervisor cannot install a new registry, it preserves its last-known-good generation and emits a configuration failure event.
 
 ### Step 4: Check Docker-Backed Gateways
 
@@ -385,6 +398,9 @@ openshell logs <sandbox-name>
 | Edge or OIDC gateway returns `Unauthenticated` | Stored login expired, audience/scopes mismatch, or gateway auth configuration changed | `openshell gateway info`, `openshell gateway login <name>`, gateway auth logs |
 | Gateway fails before serving health after enabling an interceptor | Interceptor endpoint unavailable or manifest/binding validation failed | Gateway and interceptor logs; interceptor socket; `binding_policy`, phases, and failure policy |
 | Provider profiles disappear after enabling an interceptor catalog | `provider_profile_sources` selected only an authoritative interceptor or returned invalid/duplicate IDs | Inspect source list and interceptor `Describe`/catalog logs; include `builtin` and `user` when intended |
+| Gateway fails after registering supervisor middleware | Service unavailable, invalid manifest, duplicate binding, reserved name, or invalid body/timeout limit | Middleware service and gateway logs; `[[openshell.supervisor.middleware]]`; `Describe` response |
+| Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, or fail-closed coverage of `tls: skip` | Policy error, gateway logs, middleware `ValidateConfig`, selector and order fields |
+| HTTP request returns `middleware_failed` or `middleware_denied` | Selected stage failed or explicitly denied the admitted request | Sandbox OCSF logs; policy-local middleware config; service availability; `on_error` |
 | Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or configured with a reserved/mismatched name | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |

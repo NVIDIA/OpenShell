@@ -123,11 +123,11 @@ pr_number="<digits-only>"
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 ```
 
-Use a restricted sandbox-name character set:
+Use the portable Kubernetes DNS-1123 sandbox-name format even when the selected gateway currently uses another driver:
 
 ```bash
 sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 ```
 
 For local image contexts passed to `--from`, use an agent-created path such as `mktemp -d`; do not pass raw user-supplied paths without validating that they are expected local Dockerfile contexts.
@@ -144,7 +144,7 @@ pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -165,7 +165,7 @@ issue_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$issue_number" =~ ^[0-9]+$ ]] || { echo "invalid issue number" >&2; exit 1; }
 sandbox_name="gator-issue-${issue_number}-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -186,7 +186,7 @@ issue_number="<digits-only>"
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 [[ "$issue_number" =~ ^[0-9]+$ ]] || { echo "invalid issue number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -207,7 +207,7 @@ pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 ./scripts/agents/run.sh \
   --agent gator \
@@ -228,7 +228,7 @@ pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 CODEX_MODEL=gpt-5.6-sol \
 ./scripts/agents/run.sh \
@@ -250,7 +250,7 @@ pr_number="<digits-only>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
 [[ "$pr_number" =~ ^[0-9]+$ ]] || { echo "invalid PR number" >&2; exit 1; }
 sandbox_name="gator-pr-${pr_number}-gpt56sol-supervised"
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 tmp_context="$(mktemp -d "${TMPDIR:-/tmp}/gator-codex-XXXXXX")"
 cp -R scripts/agents/gator/. "$tmp_context"/
 
@@ -290,7 +290,7 @@ Read that file directly. Important markers:
 gateway_name="<selected-gateway-name>"
 sandbox_name="<safe-sandbox-name>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 openshell --gateway "$gateway_name" sandbox list
 openshell --gateway "$gateway_name" sandbox get "$sandbox_name"
@@ -318,7 +318,7 @@ Before deleting, check that the sandbox is truly stale or that the operator aske
 gateway_name="<selected-gateway-name>"
 sandbox_name="<safe-sandbox-name>"
 [[ "$gateway_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid gateway name" >&2; exit 1; }
-[[ "$sandbox_name" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
+[[ "$sandbox_name" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || { echo "invalid sandbox name" >&2; exit 1; }
 
 openshell --gateway "$gateway_name" sandbox delete "$sandbox_name"
 ./scripts/agents/run.sh \
