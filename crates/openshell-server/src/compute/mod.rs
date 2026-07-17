@@ -870,10 +870,11 @@ impl ComputeRuntime {
         false
     }
 
-    /// Atomically removes the sandbox and its name-scoped settings only when
-    /// the expected resource version still owns the row. The caller holds
-    /// `sync_lock`; successful or already-completed durable removal also
-    /// clears this replica's index, sessions, and watch/log buses.
+    /// Removes the sandbox by stable ID only when the expected resource
+    /// version still owns the row. The caller holds `sync_lock`; a successful
+    /// delete also performs best-effort settings cleanup, while successful or
+    /// already-completed removal clears this replica's index, sessions, and
+    /// watch/log buses.
     async fn remove_sandbox_record_if_version_locked(
         &self,
         sandbox_id: &str,
@@ -901,28 +902,21 @@ impl ComputeRuntime {
 
         match self
             .store
-            .delete_with_name_scoped_if_version(
+            .delete_if(
                 Sandbox::object_type(),
                 sandbox_id,
                 expected_resource_version,
-                SANDBOX_SETTINGS_OBJECT_TYPE,
             )
             .await
         {
             Ok(true) => {
+                self.cleanup_sandbox_settings(sandbox_id, &record.name)
+                    .await;
                 self.cleanup_removed_sandbox_state(sandbox_id).await;
                 Ok(true)
             }
             Ok(false) => {
-                if self
-                    .store
-                    .get(Sandbox::object_type(), sandbox_id)
-                    .await
-                    .map_err(|err| err.to_string())?
-                    .is_none()
-                {
-                    self.cleanup_removed_sandbox_state(sandbox_id).await;
-                }
+                self.cleanup_removed_sandbox_state(sandbox_id).await;
                 Ok(false)
             }
             Err(crate::persistence::PersistenceError::Conflict {
@@ -1649,14 +1643,20 @@ impl ComputeRuntime {
     }
 
     async fn apply_deleted_locked(&self, sandbox_id: &str) -> Result<(), String> {
-        self.store
-            .delete_with_name_scoped(
-                Sandbox::object_type(),
-                sandbox_id,
-                SANDBOX_SETTINGS_OBJECT_TYPE,
-            )
+        let sandbox = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
             .await
             .map_err(|e| e.to_string())?;
+        let removed = self
+            .store
+            .delete(Sandbox::object_type(), sandbox_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if removed && let Some(sandbox) = sandbox.as_ref() {
+            self.cleanup_sandbox_settings(sandbox_id, sandbox.object_name())
+                .await;
+        }
         self.cleanup_removed_sandbox_state(sandbox_id).await;
         Ok(())
     }
@@ -1670,6 +1670,21 @@ impl ComputeRuntime {
         self.remove_sandbox_record_if_version_locked(sandbox_id, expected_resource_version)
             .await?;
         Ok(())
+    }
+
+    async fn cleanup_sandbox_settings(&self, sandbox_id: &str, sandbox_name: &str) {
+        if let Err(err) = self
+            .store
+            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_name)
+            .await
+        {
+            warn!(
+                sandbox_id,
+                sandbox_name,
+                error = %err,
+                "Failed to delete sandbox settings during cleanup"
+            );
+        }
     }
 
     async fn cleanup_sandbox_ssh_sessions(&self, sandbox_id: &str) {
@@ -3081,6 +3096,19 @@ mod tests {
         session
     }
 
+    async fn remove_sandbox_owned_records_from_store(runtime: &ComputeRuntime, sandbox: &Sandbox) {
+        runtime
+            .store
+            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
+            .await
+            .unwrap();
+        runtime
+            .store
+            .delete(Sandbox::object_type(), sandbox.object_id())
+            .await
+            .unwrap();
+    }
+
     async fn assert_sandbox_owned_records(
         runtime: &ComputeRuntime,
         sandbox: &Sandbox,
@@ -4086,17 +4114,7 @@ mod tests {
             .expect("deleting notification was not sent")
             .expect("watch bus closed before the deleting notification");
 
-        assert!(
-            runtime
-                .store
-                .delete_with_name_scoped(
-                    Sandbox::object_type(),
-                    "sb-1",
-                    SANDBOX_SETTINGS_OBJECT_TYPE,
-                )
-                .await
-                .unwrap()
-        );
+        remove_sandbox_owned_records_from_store(&runtime, &sandbox).await;
         driver.release_delete();
 
         assert!(
@@ -4142,17 +4160,7 @@ mod tests {
             .expect("deleting notification was not sent")
             .expect("watch bus closed before the deleting notification");
 
-        assert!(
-            runtime
-                .store
-                .delete_with_name_scoped(
-                    Sandbox::object_type(),
-                    "sb-1",
-                    SANDBOX_SETTINGS_OBJECT_TYPE,
-                )
-                .await
-                .unwrap()
-        );
+        remove_sandbox_owned_records_from_store(&runtime, &sandbox).await;
         driver.release_delete();
 
         assert!(
@@ -4220,17 +4228,7 @@ mod tests {
             .expect("deleting notification was not sent")
             .expect("watch bus closed before the deleting notification");
 
-        assert!(
-            runtime
-                .store
-                .delete_with_name_scoped(
-                    Sandbox::object_type(),
-                    "sb-1",
-                    SANDBOX_SETTINGS_OBJECT_TYPE,
-                )
-                .await
-                .unwrap()
-        );
+        remove_sandbox_owned_records_from_store(&runtime, &sandbox).await;
         driver.release_delete();
 
         tokio::time::timeout(Duration::from_secs(1), delete)
@@ -4276,17 +4274,7 @@ mod tests {
             .expect("deleting notification was not sent")
             .expect("watch bus closed before the deleting notification");
 
-        assert!(
-            runtime
-                .store
-                .delete_with_name_scoped(
-                    Sandbox::object_type(),
-                    "sb-1",
-                    SANDBOX_SETTINGS_OBJECT_TYPE,
-                )
-                .await
-                .unwrap()
-        );
+        remove_sandbox_owned_records_from_store(&runtime, &sandbox).await;
         driver.release_get();
 
         tokio::time::timeout(Duration::from_secs(1), delete)

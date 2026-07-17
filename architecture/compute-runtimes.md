@@ -43,9 +43,9 @@ deleted events are idempotent, and snapshots for absent rows are ignored.
 
 An accepted delete (`deleted = true`) is finalized by the watcher. If the
 backend is already absent (`deleted = false`), the request removes gateway state
-synchronously. Sandbox rows and name-scoped settings are removed atomically;
-SSH sessions, indexes, and watch/log buses are cleaned only after confirmed
-removal.
+synchronously. Sandbox row removal remains bound to the stable ID and resource
+version. Settings retain their existing best-effort name-based cleanup; SSH
+sessions, indexes, and watch/log buses are cleaned after confirmed removal.
 
 The request workflow runs in an owned task so client cancellation cannot strand
 a mutation. A gateway restart does not resume or reissue a persisted `Deleting`
