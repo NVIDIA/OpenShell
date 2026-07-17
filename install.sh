@@ -51,10 +51,6 @@ OPTIONS:
 ENVIRONMENT VARIABLES:
     OPENSHELL_VERSION   Release tag to install (default: latest tagged release).
                         Set OPENSHELL_VERSION=dev to install the rolling dev build.
-    OPENSHELL_INSTALL_METHOD
-                        Force a specific install method. Supported values:
-                        deb, rpm, snap, homebrew. When unset, the script
-                        auto-detects the host package manager.
     OPENSHELL_ACK_BREAKING_UPGRADE
                         Set to 1 only after backing up and cleaning up a
                         pre-v0.0.37 installation.
@@ -481,30 +477,6 @@ detect_platform() {
 }
 
 linux_package_method() {
-  case "${OPENSHELL_INSTALL_METHOD:-}" in
-    "")
-      ;;
-    snap)
-      echo "snap"
-      return 0
-      ;;
-    deb|apt)
-      echo "deb"
-      return 0
-      ;;
-    rpm|dnf|yum|zypper)
-      echo "rpm"
-      return 0
-      ;;
-    homebrew|brew)
-      echo "homebrew"
-      return 0
-      ;;
-    *)
-      error "OPENSHELL_INSTALL_METHOD='${OPENSHELL_INSTALL_METHOD}' is not supported; use one of: deb, rpm, snap, homebrew"
-      ;;
-  esac
-
   if has_snapd && ! has_native_docker; then
     echo "snap"
   elif has_cmd dpkg; then
@@ -512,7 +484,7 @@ linux_package_method() {
   elif has_cmd rpm; then
     echo "rpm"
   else
-    error "Linux installs require either dpkg or rpm"
+    error "Linux installs require either snapd, dpkg, or rpm"
   fi
 }
 
@@ -1153,24 +1125,12 @@ main() {
           require_linux_package_glibc
           install_linux_rpm
           ;;
-        homebrew)
-          # TODO: implement install_linux_homebrew for Linuxbrew hosts
-          # (e.g. Universal Blue/Bazzite). Homebrew is accepted as a method
-          # value but not yet wired to an installer on Linux.
-          error "the 'homebrew' install method is not yet supported on Linux"
-          ;;
         *)
           error "unsupported Linux package method"
           ;;
       esac
       ;;
     darwin)
-      case "${OPENSHELL_INSTALL_METHOD:-}" in
-        ""|homebrew|brew) ;;
-        *)
-          error "only the 'homebrew' install method is supported on macOS"
-          ;;
-      esac
       install_macos_homebrew
       ;;
     *)
