@@ -4,8 +4,10 @@
 version: 1
 
 network_middlewares:
-  - name: prototype-content-guard
-    middleware: example/content-guard
+  prototype-content-guard:
+    name: Prototype content guard
+    middleware: content-guard-example
+    order: 10
     config:
       mode: redact
       terms:

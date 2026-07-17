@@ -11,7 +11,7 @@ Supervisor middleware is a research preview. Its policy and service contracts ma
 </Warning>
 <!-- markdownlint-enable MD033 -->
 
-This example implements the `example/content-guard` supervisor middleware binding. It scans UTF-8 HTTP request bodies for configured literal strings, then either replaces every match or denies the request. Findings report only aggregate counts and never include configured terms or request content.
+This example implements an operator-run supervisor middleware service. It scans UTF-8 HTTP request bodies for configured literal strings, then either replaces every match or denies the request. Findings report only aggregate counts and never include configured terms or request content.
 
 ## Run the service
 
@@ -25,15 +25,20 @@ cargo run -- --bind 0.0.0.0:50051
 Add the service registration to your local gateway TOML:
 
 ```toml
-[[openshell.gateway.middleware]]
+[[openshell.supervisor.middleware]]
 name = "content-guard-example"
 grpc_endpoint = "http://host.openshell.internal:50051"
 max_body_bytes = 262144
+timeout = "500ms"
 ```
 
 The gateway calls `Describe` during startup and fails to start if the service is unavailable. Both the gateway and sandbox supervisors must resolve and reach the configured endpoint. Change the hostname when `host.openshell.internal` is not the shared host address for your local driver.
 
 The `http://` gRPC endpoint uses plaintext without peer authentication.
+
+The service manifest describes its supported operation and phase. The policy attaches the complete service by the operator-owned `content-guard-example` registration name, not by the diagnostic manifest name.
+
+The `network_middlewares` map key `prototype-content-guard` is the stable policy-local identity. The optional `name` field is a human-readable label, and `order` must be unique across every middleware config in the policy.
 
 ## Apply the example policy
 
@@ -70,4 +75,4 @@ config:
     - prototype-secret
 ```
 
-The implementation supports only `HttpRequest/pre_credentials` and advertises a 256 KiB body limit. The gateway registration may set a smaller operator limit.
+The implementation supports only `HttpRequest/pre_credentials`, advertises a 256 KiB body limit, and inherits the service-wide RPC timeout. The gateway registration may set a smaller body limit. A binding can advertise a shorter timeout, but it cannot extend the operator-configured timeout.

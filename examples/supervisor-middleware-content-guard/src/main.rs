@@ -18,8 +18,7 @@ use prost_types::value::Kind;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-const API_VERSION: &str = "openshell.middleware.v1";
-const BINDING_ID: &str = "example/content-guard";
+const MANIFEST_NAME: &str = "example/content-guard-service";
 const OPERATION: SupervisorMiddlewareOperation = SupervisorMiddlewareOperation::HttpRequest;
 const PHASE: SupervisorMiddlewarePhase = SupervisorMiddlewarePhase::PreCredentials;
 const MAX_BODY_BYTES: u64 = 256 * 1024;
@@ -120,14 +119,13 @@ impl SupervisorMiddleware for ContentGuard {
         _request: Request<()>,
     ) -> Result<Response<MiddlewareManifest>, Status> {
         Ok(Response::new(MiddlewareManifest {
-            api_version: API_VERSION.into(),
-            name: "example/content-guard-service".into(),
+            name: MANIFEST_NAME.into(),
             service_version: env!("CARGO_PKG_VERSION").into(),
             bindings: vec![MiddlewareBinding {
-                id: BINDING_ID.into(),
                 operation: OPERATION as i32,
                 phase: PHASE as i32,
                 max_body_bytes: MAX_BODY_BYTES,
+                timeout: String::new(),
             }],
         }))
     }
@@ -137,8 +135,7 @@ impl SupervisorMiddleware for ContentGuard {
         request: Request<ValidateConfigRequest>,
     ) -> Result<Response<ValidateConfigResponse>, Status> {
         let request = request.into_inner();
-        let validation = validate_envelope(&request.api_version, &request.binding_id, None)
-            .and_then(|()| GuardConfig::parse(request.config.as_ref()));
+        let validation = GuardConfig::parse(request.config.as_ref());
         Ok(Response::new(match validation {
             Ok(_) => ValidateConfigResponse {
                 valid: true,
@@ -156,12 +153,7 @@ impl SupervisorMiddleware for ContentGuard {
         request: Request<HttpRequestEvaluation>,
     ) -> Result<Response<HttpRequestResult>, Status> {
         let request = request.into_inner();
-        validate_envelope(
-            &request.api_version,
-            &request.binding_id,
-            Some(&request.phase),
-        )
-        .map_err(Status::invalid_argument)?;
+        validate_phase(request.phase).map_err(Status::invalid_argument)?;
         let config =
             GuardConfig::parse(request.config.as_ref()).map_err(Status::invalid_argument)?;
         let body = String::from_utf8(request.body)
@@ -170,20 +162,8 @@ impl SupervisorMiddleware for ContentGuard {
     }
 }
 
-fn validate_envelope(
-    api_version: &str,
-    binding_id: &str,
-    phase: Option<&i32>,
-) -> Result<(), String> {
-    if api_version != API_VERSION {
-        return Err(format!("unsupported api_version '{api_version}'"));
-    }
-    if binding_id != BINDING_ID {
-        return Err(format!("unsupported binding_id '{binding_id}'"));
-    }
-    if let Some(phase) = phase
-        && *phase != PHASE as i32
-    {
+fn validate_phase(phase: i32) -> Result<(), String> {
+    if phase != PHASE as i32 {
         return Err(format!("unsupported phase '{phase}'"));
     }
     Ok(())
@@ -234,18 +214,20 @@ fn evaluate(config: &GuardConfig, body: &str) -> HttpRequestResult {
             reason: String::new(),
             body: transformed.into_bytes(),
             has_body: true,
-            add_headers: HashMap::new(),
+            header_mutations: Vec::new(),
             findings: vec![finding],
             metadata,
+            reason_code: String::new(),
         },
         Mode::Deny => HttpRequestResult {
             decision: Decision::Deny as i32,
             reason: "request body matched configured content".into(),
             body: Vec::new(),
             has_body: false,
-            add_headers: HashMap::new(),
+            header_mutations: Vec::new(),
             findings: vec![finding],
             metadata,
+            reason_code: "content_match".into(),
         },
     }
 }
@@ -256,16 +238,17 @@ fn allow_result() -> HttpRequestResult {
         reason: String::new(),
         body: Vec::new(),
         has_body: false,
-        add_headers: HashMap::new(),
+        header_mutations: Vec::new(),
         findings: Vec::new(),
         metadata: HashMap::new(),
+        reason_code: String::new(),
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    println!("serving {BINDING_ID} on http://{}", cli.bind);
+    println!("serving {MANIFEST_NAME} on http://{}", cli.bind);
     Server::builder()
         .add_service(SupervisorMiddlewareServer::new(ContentGuard))
         .serve(cli.bind)
@@ -333,6 +316,7 @@ mod tests {
 
         assert_eq!(result.decision, Decision::Deny as i32);
         assert!(!result.reason.contains("prototype-secret"));
+        assert_eq!(result.reason_code, "content_match");
         assert!(!result.has_body);
     }
 
