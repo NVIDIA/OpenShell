@@ -66,7 +66,11 @@ All comments posted by this skill must begin with this marker:
 > **gator-agent**
 ```
 
-Use one canonical gator comment per issue or PR head SHA for baseline state summaries when possible. Edit it only for housekeeping updates that do not respond to new human activity.
+Use one canonical gator disposition per issue or PR head SHA for baseline state summaries. A disposition may be one issue comment or one submitted GitHub review. A submitted review, including its summary body and every inline comment in its `comments` array, counts as one disposition for the head SHA; do not count its inline comments separately.
+
+For a PR review with any actionable line-specific finding that can be anchored to the current diff, use one batched GitHub review rather than an issue comment or standalone inline-comment requests. Begin the review summary and every inline comment body with the gator marker. Include the head SHA in the review summary so the wrapper can enforce the one-disposition rule. Do not post line comments individually through `POST /pulls/<pr>/comments`; a partially submitted set is not an acceptable baseline disposition.
+
+Edit a canonical issue comment only for housekeeping updates that do not respond to new human activity. GitHub reviews and their inline comments are immutable after submission; correct them only through a new-head review or an explicit same-SHA maintainer override.
 
 When gator is continuing a conversation after a human comment, review, or requested change, post a new marked comment only if the PR head SHA changed or no marked gator comment/review exists for the current head SHA. If a marked gator comment or PR review already exists for the current head SHA, do not post another public comment; record the state in the supervised result sentinel and wait for a new commit, maintainer override, merge, or closure.
 
@@ -531,15 +535,47 @@ Use the `principal-engineer-reviewer` sub-agent. Include:
 - Full diff or enough chunked diff context to review all changes
 - Instruction to focus on correctness, regressions, security, maintainability, and missing tests
 - Instruction to check whether direct UX changes update the Fern docs under `docs/` and navigation when needed
+- Instruction to classify each actionable finding as either line-specific or general
+- For each line-specific finding, instruction to return the exact repository path, current-head diff line, side (`RIGHT` for an added/context line or `LEFT` for a deleted line), severity, and concise comment body
 - Instruction not to rely on local test execution
 
 When running inside the `scripts/agents/gator` sandbox launcher, invoke the reviewer command specified in the sandbox prompt. Use `task.md` for the subagent input. Put the PR metadata, linked issue context, and diff/file context in `task.md`, save the reviewer output, and use it as the independent review result. The main gator process remains responsible for labels, comments, docs gates, and CI monitoring. If the reviewer command exits nonzero or the saved reviewer output is absent or unusable, stop the cycle with the `reviewer_subagent_failed` transient result described above without changing GitHub labels or posting a public disposition.
 
-Post findings as a gator comment or a GitHub PR review:
+Post findings using these rules:
 
-- Use inline comments for line-specific defects
-- Use a general comment for design concerns, missing tests, or summary feedback
-- Do not nitpick style unless it affects maintainability or project conventions
+- For every actionable line-specific defect that can be anchored to the current diff, post an inline comment. Do not move an anchorable finding into the summary merely for convenience.
+- Submit all inline comments for a head SHA together in one `COMMENT` review. The review summary plus its complete inline-comment batch is the single gator disposition for that SHA.
+- Begin the review summary and each inline body with `> **gator-agent**`. Put the current head SHA in the summary using the canonical `Head SHA: <sha>` field.
+- Use the review summary for design concerns, missing tests, cross-file findings, and findings that cannot be anchored because the relevant line is outside the current diff. For an unanchored line-specific finding, retain the `path:line` reference and state why it is in the summary.
+- If there are no inline-eligible findings, use one general marked review or issue comment as the disposition.
+- Do not submit standalone inline comments before or after the batch review. Do not post a separate PR Review Status issue comment for the same SHA after submitting the review.
+- Do not nitpick style unless it affects maintainability or project conventions.
+
+Build the batch as one REST request. Verify every requested line appears in the current diff before submission; GitHub rejects comments on lines that are not part of the diff. Use `RIGHT` for an added or context line in the current head and `LEFT` for a deleted line. Example request shape:
+
+```json
+{
+  "commit_id": "<head-sha>",
+  "event": "COMMENT",
+  "body": "> **gator-agent**\n\n## PR Review Status\n\nHead SHA: `<head-sha>`\n\n<summary and general findings>",
+  "comments": [
+    {
+      "path": "crates/example/src/lib.rs",
+      "line": 123,
+      "side": "RIGHT",
+      "body": "> **gator-agent**\n\n**Warning:** <actionable finding and concrete fix>"
+    }
+  ]
+}
+```
+
+```bash
+gh api --method POST \
+  repos/NVIDIA/OpenShell/pulls/<pr-number>/reviews \
+  --input review.json
+```
+
+The root `body` is what the gator `gh` wrapper checks for the marker and current head SHA. Therefore one accepted request reserves exactly one same-SHA disposition even when `comments` contains multiple inline findings. If GitHub rejects any inline coordinate, fix the batch and retry before any disposition is accepted; do not fall back to a partial set of standalone comments.
 
 If findings require author changes, remain in `gator:in-review` or move to `gator:follow-up-needed` if the author must clarify the proposal before code review can continue.
 
