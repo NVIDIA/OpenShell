@@ -114,6 +114,12 @@ struct SandboxDeleteGuard {
 }
 
 #[derive(Debug)]
+struct SandboxDeleteTarget {
+    sandbox_id: String,
+    sandbox_name: String,
+}
+
+#[derive(Debug)]
 struct DeleteTransition {
     /// Snapshot restored if the driver result is ambiguous and no newer write
     /// has replaced the exact `Deleting` version.
@@ -675,12 +681,26 @@ impl ComputeRuntime {
     }
 
     pub async fn delete_sandbox(&self, name: &str) -> Result<bool, Status> {
+        // Resolve the request to a stable identity before spawning the owned
+        // worker. Cancellation before this lookup completes is harmless
+        // because no mutation has occurred; after the lookup, the worker can
+        // never retarget a replacement sandbox that reuses the name.
+        let candidate = self
+            .store
+            .get_message_by_name::<Sandbox>(name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let target = SandboxDeleteTarget {
+            sandbox_id: candidate.object_id().to_string(),
+            sandbox_name: candidate.object_name().to_string(),
+        };
+
         // The owned task keeps the delete workflow running if the client drops
         // its request after the gateway has durably persisted `Deleting`. We
         // still await it here so the API remains synchronous for live clients.
         let runtime = self.clone();
-        let name = name.to_string();
-        tokio::spawn(async move { runtime.delete_sandbox_inner(&name).await })
+        tokio::spawn(async move { runtime.delete_sandbox_inner(target).await })
             .await
             .map_err(|err| {
                 Status::internal(format!(
@@ -689,33 +709,23 @@ impl ComputeRuntime {
             })?
     }
 
-    async fn delete_sandbox_inner(&self, name: &str) -> Result<bool, Status> {
-        // Resolve the name once. Everything after this point is bound to the
-        // resulting stable ID, so name reuse cannot redirect this request to a
-        // newly-created sandbox.
-        let candidate = self
-            .store
-            .get_message_by_name::<Sandbox>(name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
-        let candidate_id = candidate.object_id().to_string();
-        let delete_guard = self.delete_gates.lock_for(&candidate_id).await;
+    async fn delete_sandbox_inner(&self, target: SandboxDeleteTarget) -> Result<bool, Status> {
+        let delete_guard = self.delete_gates.lock_for(&target.sandbox_id).await;
 
         let guard = self.lock_global_for_delete(&delete_guard).await;
         let current = self
             .store
-            .get_message::<Sandbox>(&candidate_id)
+            .get_message::<Sandbox>(&target.sandbox_id)
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
         let Some(current) = current else {
             // A delete that owned this ID's gate completed while this request
             // waited. A different sandbox may now use the old name; this
             // request acknowledges only the disappearance of its original ID.
-            self.cleanup_removed_sandbox_state(&candidate_id).await;
+            self.cleanup_removed_sandbox_state(&target.sandbox_id).await;
             return Ok(true);
         };
-        if current.object_name() != name {
+        if current.object_name() != target.sandbox_name {
             return Err(Status::aborted(
                 "sandbox name changed while the delete request was waiting; retry explicitly",
             ));
@@ -725,7 +735,7 @@ impl ComputeRuntime {
         // `Deleting` row used to fence recovery, and the prior row used only
         // for exact-version rollback after an ambiguous driver failure.
         let transition = match self
-            .begin_sandbox_delete_with_initial_snapshot(&candidate_id, Some(current))
+            .begin_sandbox_delete_with_initial_snapshot(&target.sandbox_id, Some(current))
             .await?
         {
             BeginDelete::AlreadyDeleting => return Ok(true),
@@ -733,7 +743,7 @@ impl ComputeRuntime {
         };
 
         self.sandbox_index.update_from_sandbox(&transition.deleting);
-        self.sandbox_watch_bus.notify(&candidate_id);
+        self.sandbox_watch_bus.notify(&target.sandbox_id);
         drop(guard);
 
         let result = self
@@ -748,10 +758,10 @@ impl ComputeRuntime {
             Ok(response) => {
                 let deleted = response.into_inner().deleted;
                 if deleted {
-                    self.cleanup_local_state_if_sandbox_absent(&delete_guard, &candidate_id)
+                    self.cleanup_local_state_if_sandbox_absent(&delete_guard, &target.sandbox_id)
                         .await?;
                 } else if !self
-                    .remove_deleting_sandbox_record(&delete_guard, &candidate_id)
+                    .remove_deleting_sandbox_record(&delete_guard, &target.sandbox_id)
                     .await
                 {
                     return Err(Status::internal(
@@ -3899,6 +3909,65 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(driver.delete_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn waiting_delete_retries_after_leader_failure_recovery() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        driver.set_get_outcome(ControlledGetOutcome::Error("lookup failed"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete_gate = runtime.delete_gates.gate_for(sandbox.object_id());
+        let first_runtime = runtime.clone();
+        let first = tokio::spawn(async move { first_runtime.delete_sandbox("sandbox-a").await });
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("first delete did not reach the driver");
+
+        let second_runtime = runtime.clone();
+        let second = tokio::spawn(async move { second_runtime.delete_sandbox("sandbox-a").await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&delete_gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second delete did not start waiting on the sandbox gate");
+
+        driver.release_delete();
+        let first_error = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first delete did not finish")
+            .unwrap()
+            .unwrap_err();
+        assert!(first_error.message().contains("delete failed"));
+
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("waiting delete did not retry the driver call");
+        driver.set_delete_outcome(ControlledDeleteOutcome::Ok(false));
+        driver.release_delete();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .expect("second delete did not finish")
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(driver.delete_calls(), 2);
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

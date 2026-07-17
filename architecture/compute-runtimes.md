@@ -32,10 +32,15 @@ of re-querying drivers on each request.
 
 ## Deletion Lifecycle
 
-Delete requests use per-sandbox gates to serialize duplicate driver calls. A
-request resolves the name once and remains bound to that stable ID. The only
+Delete requests use per-sandbox gates to serialize delete attempts. A request
+resolves the name once and remains bound to that stable ID. The only
 combined lock order is delete gate, then the gateway-wide state guard; external
 driver calls run without the global guard.
+
+Delete gates are process-local and do not coordinate gateway replicas. They
+serialize attempts rather than share results: if one attempt fails and recovery
+restores a deletable state, a request waiting on the gate may retry the driver.
+Persisted resource-version checks remain the cross-replica safety boundary.
 
 Watcher events do not acquire delete gates. Exact resource-version checks allow
 them to interleave safely: status snapshots are no-ops for `Deleting` rows,
