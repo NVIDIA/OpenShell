@@ -4,21 +4,6 @@ Quick-reference for the `openshell` command-line interface. For workflow guidanc
 
 > **Self-teaching**: If a command or flag is not listed here, use `openshell <command> --help` to discover it. The CLI has comprehensive built-in help at every level.
 
-## Contents
-
-- [Global options](#global-options)
-- [Environment variables](#environment-variables)
-- [Complete command tree](#complete-command-tree)
-- [Gateway commands](#gateway-commands)
-- [Doctor and status commands](#doctor-commands)
-- [Sandbox commands](#sandbox-commands)
-- [Port forwarding and service commands](#port-forwarding-commands)
-- [Logs](#logs-command)
-- [Policy and settings commands](#policy-commands)
-- [Provider commands](#provider-commands)
-- [Inference commands](#inference-commands)
-- [Other commands](#other-commands)
-
 ## Global Options
 
 | Flag | Description |

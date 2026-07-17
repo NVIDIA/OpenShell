@@ -1,6 +1,6 @@
 ---
 name: debug-inference
-description: Debug why inference.local, supervisor-only system inference, or direct external inference is failing. Use when the user cannot reach a local model server, has provider base URL issues, sees inference verification failures, hits protocol mismatches, or needs to diagnose inference on local vs remote gateways. Trigger keywords - debug inference, inference.local, system inference, sandbox-system, local inference, ollama, vllm, sglang, trtllm, NIM, inference failing, model server unreachable, failed to verify inference endpoint, host.openshell.internal.
+description: Debug why inference.local, direct external inference, or supervisor-only system inference is failing. Use when the user cannot reach a local model server, has provider base URL issues, sees inference verification failures, hits protocol mismatches, or needs to diagnose inference on local vs remote gateways. Trigger keywords - debug inference, inference.local, system inference, sandbox-system, local inference, ollama, vllm, sglang, trtllm, NIM, inference failing, model server unreachable, failed to verify inference endpoint, host.openshell.internal.
 ---
 
 # Debug Inference
@@ -17,14 +17,14 @@ OpenShell supports three inference paths. Diagnose the correct one first.
    - Configured by `openshell inference set`
    - Shared by every sandbox on the active gateway
    - Credentials and model are injected by OpenShell
-2. **System inference** for platform functions such as the agent harness
-   - Configured by `openshell inference set --system`
-   - Uses the `sandbox-system` route
-   - Consumed in-process by the sandbox supervisor and not exposed to sandbox user code through `inference.local`
-3. **Direct external inference** to hosts like `api.openai.com`
+2. **Direct external inference** to hosts like `api.openai.com`
    - Controlled by `network_policies`
    - Requires the application to call the external host directly
    - Requires provider attachment and network access to be configured separately
+3. **System inference** used by platform functions
+   - Configured by `openshell inference set --system`
+   - Uses the `sandbox-system` route
+   - Consumed in-process by the sandbox supervisor and not exposed to sandbox user code through `inference.local`
 
 For local or self-hosted engines such as Ollama, vLLM, SGLang, TRT-LLM, and many NIM deployments, the most common managed inference pattern is an `openai` provider with `OPENAI_BASE_URL` pointing at a host the gateway can reach.
 
@@ -66,7 +66,7 @@ When the user asks to debug inference, run diagnostics automatically in this ord
 
 Establish these facts first:
 
-1. Is sandbox code calling `https://inference.local`, is a platform function using system inference, or is the application calling a direct external host?
+1. Is sandbox code calling `https://inference.local`, is the application calling a direct external host, or is a platform function using system inference?
 2. Which gateway is active, and is it local, remote, or cloud?
 3. Which provider, model, and timeout are configured for the relevant route?
 4. Is the upstream local to the gateway host, or somewhere else?
@@ -101,8 +101,8 @@ openshell inference get --system
 
 Interpretation:
 
-- `openshell inference get` shows both **Gateway inference** (`inference.local`) and **System inference** (`sandbox-system`). `--system` isolates the system route.
-- **Gateway inference is `Not configured`**: `inference.local` has no backend. Configure it without `--system`:
+- `openshell inference get` shows both the user-facing `inference.local` route and the system route. `--system` isolates the system route.
+- **The `inference.local` route is `Not configured`**: managed inference has no backend. Configure it without `--system`:
 
   ```bash
   openshell inference set --provider <name> --model <id>
@@ -346,7 +346,7 @@ Both commands should return the upstream model list.
 | Local engine works only when gateway is local | Gateway moved to remote host | Run the engine on the gateway host, add a tunnel, or use direct external access |
 | `connection not allowed by policy` on `inference.local` | Unsupported path or method | Use a supported inference API path |
 | `no compatible route` | Provider type does not match request shape | Create or select a provider of the matching type, or change the client API |
-| `inference.local` works but an agent-harness/platform call fails | User route is configured but `sandbox-system` is missing or wrong | `openshell inference get --system`; configure or update with `--system`; inspect supervisor logs |
+| `inference.local` works but a platform function fails | User route is configured but `sandbox-system` is missing or wrong | `openshell inference get --system`; configure or update with `--system`; inspect supervisor logs |
 | Direct call to external host is denied | Missing policy or provider attachment | Update `network_policies` and launch sandbox with the right provider |
 | SDK fails on empty auth token | Client requires a non-empty API key even though OpenShell injects the real one | Use any placeholder token such as `test` |
 | Upstream timeout from container to host-local backend | Host firewall or network config blocks container-to-host traffic | Allow the Docker bridge subnet to reach the inference port on the host gateway IP (see firewall fix section above) |
@@ -380,7 +380,7 @@ openshell sandbox create -- curl https://inference.local/v1/chat/completions --j
 
 When you report back, state:
 
-1. Which inference path is failing (`inference.local`, system inference, or direct external)
+1. Which inference path is failing (`inference.local`, direct external, or system inference)
 2. Whether gateway topology is part of the problem
 3. The most likely root cause
 4. The exact fix commands the user should run

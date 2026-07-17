@@ -444,6 +444,8 @@ same branch. If the change affects user-facing compute-driver setup, also
 update `docs/reference/sandbox-compute-drivers.mdx` or the relevant deployment
 page.
 
+Use the `sync-agent-infra` skill's maintenance map to identify related skill updates when the implementation changes behavior, commands, or development workflows. Run its full consistency check when the implementation adds, removes, or renames skills or crates; changes workflow relationships or skill coverage; modifies issue or PR templates; or changes agent cross-references. Fix any drift before committing.
+
 ### Step 12: Commit and Push
 
 Commit all changes using conventional commit format. The `<type>` comes from the issue type in the plan:

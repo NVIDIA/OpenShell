@@ -35,6 +35,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
 | `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
+| `crates/openshell-gateway-interceptors/` | Gateway interceptors | Intercepts and transforms configured gRPC requests at the gateway routing boundary |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.7.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-sdk/` | Shared client SDK | Async Rust gateway client (gRPC transport, TLS, OIDC refresh, edge tunnel); consumed by CLI, TUI, and `@openshell/sdk` |
@@ -199,27 +200,7 @@ ocsf_emit!(event);
 
 ## Skill Maintenance
 
-When behavior, commands, or development workflows change, review the related agent skills in the same branch. Update every affected skill rather than waiting for a separate documentation pass.
-
-| Change area | Skills to review |
-|---|---|
-| CLI commands, flags, defaults, or workflows | `openshell-cli` |
-| Sandbox policy schema, presets, or enforcement behavior | `generate-sandbox-policy`, `openshell-cli` |
-| Gateway deployment, Helm, runtime drivers, or health checks | `debug-openshell-cluster`, `helm-dev-environment` |
-| Inference routing, providers, or `inference.local` behavior | `debug-inference`, `openshell-cli` |
-| TUI architecture, navigation, data fetching, or UX | `tui-development` |
-| Release artifacts or post-publish smoke coverage | `test-release-canary` |
-| GitHub Actions workflows, required checks, or CI diagnostics | `watch-github-actions`; also `test-release-canary` for release smoke coverage |
-| Gator harness, sandbox image, supervision, or model overrides | `launch-openshell-gator` |
-| SBOM generation, dependency metadata, or license workflows | `sbom` |
-| Issue templates, labels, contribution gates, or spike/build workflow | `triage-issue`, `create-spike`, `build-from-issue`, `create-github-issue` |
-| PR template, review conventions, or vouch behavior | `create-github-pr`, `review-github-pr`, `build-from-issue` |
-| Security review or remediation workflow | `review-security-issue`, `fix-security-issue` |
-| RFC template, numbering, or lifecycle | `create-rfc` |
-| Documentation structure, navigation, or doc-update workflow | `update-docs` |
-| Skills, crates, workflow chains, issue/PR templates, or agent cross-references | `sync-agent-infra` |
-
-This table is a routing aid, not an exhaustive dependency list. Search `.agents/skills/` for the changed command, field, component, or workflow before concluding that no other skill needs an update.
+When behavior, commands, or development workflows change, review the related agent skills in the same branch. Use the `sync-agent-infra` skill for the maintenance map and consistency checks.
 
 ## Documentation
 
