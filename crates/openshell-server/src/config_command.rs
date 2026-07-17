@@ -84,7 +84,8 @@ pub fn run(args: ConfigArgs, explicit_path: Option<PathBuf>) -> Result<()> {
 }
 
 fn set(path: &Path, settings: &SetArgs) -> Result<()> {
-    let original = match fs::read_to_string(path) {
+    let write_path = resolve_write_path(path)?;
+    let original = match fs::read_to_string(&write_path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => {
@@ -114,7 +115,25 @@ fn set(path: &Path, settings: &SetArgs) -> Result<()> {
 
     let rendered = document.to_string();
     config_file::parse(&rendered, path).map_err(|err| miette::miette!("{err}"))?;
-    write_atomically(path, rendered.as_bytes())
+    write_atomically(&write_path, rendered.as_bytes())
+}
+
+fn resolve_write_path(path: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::canonicalize(path).into_diagnostic().wrap_err_with(|| {
+                format!(
+                    "failed to resolve gateway config symlink '{}'",
+                    path.display()
+                )
+            })
+        }
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(err) => Err(err)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to inspect gateway config '{}'", path.display())),
+    }
 }
 
 fn parse_assignment_value(raw: &str) -> Item {
@@ -135,7 +154,15 @@ fn apply_assignment(document: &mut DocumentMut, assignment: &Assignment) -> Resu
     for parent in parents {
         table = ensure_table(table, parent)?;
     }
-    table.insert(key, assignment.value.clone());
+    let existing_decor = table
+        .get(key)
+        .and_then(Item::as_value)
+        .map(|existing| existing.decor().clone());
+    let mut replacement = assignment.value.clone();
+    if let (Some(decor), Some(value)) = (existing_decor, replacement.as_value_mut()) {
+        *value.decor_mut() = decor;
+    }
+    table.insert(key, replacement);
     Ok(())
 }
 
@@ -248,19 +275,78 @@ mod tests {
         let path = temp.path().join("gateway.toml");
         fs::write(
             &path,
-            "# keep this comment\n[openshell]\nversion = 1\n\n[openshell.gateway]\nlog_level = \"debug\"\ncompute_drivers = [\"docker\"]\n",
+            "# keep this comment\n[openshell]\nversion = 1\n\n[openshell.gateway]\nlog_level = \"info\" # keep this inline comment\ncompute_drivers = [\"docker\"]\n",
         )
         .unwrap();
 
         set(
             &path,
-            &settings(&["openshell.gateway.compute_drivers=[\"podman\"]"]),
+            &settings(&[
+                "openshell.gateway.log_level=debug",
+                "openshell.gateway.compute_drivers=[\"podman\"]",
+            ]),
         )
         .unwrap();
 
         let updated = fs::read_to_string(&path).unwrap();
         assert!(updated.contains("# keep this comment"));
-        assert!(updated.contains("log_level = \"debug\""));
+        assert!(updated.contains("log_level = \"debug\" # keep this inline comment"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_updates_a_symlink_target_without_replacing_the_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("managed-gateway.toml");
+        let path = temp.path().join("gateway.toml");
+        fs::write(
+            &target,
+            "[openshell]\nversion = 1\n\n[openshell.gateway]\nlog_level = \"info\"\n",
+        )
+        .unwrap();
+        symlink("managed-gateway.toml", &path).unwrap();
+
+        set(&path, &settings(&["openshell.gateway.log_level=debug"])).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let loaded = config_file::load(&target).unwrap();
+        assert_eq!(loaded.openshell.gateway.log_level.as_deref(), Some("debug"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            fs::read_to_string(&target).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_rejects_a_dangling_config_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("missing-gateway.toml");
+        let path = temp.path().join("gateway.toml");
+        symlink("missing-gateway.toml", &path).unwrap();
+
+        let error = set(&path, &settings(&["openshell.gateway.log_level=debug"])).unwrap_err();
+
+        assert!(
+            format!("{error:?}").contains("failed to resolve gateway config symlink"),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!target.exists());
     }
 
     #[test]
