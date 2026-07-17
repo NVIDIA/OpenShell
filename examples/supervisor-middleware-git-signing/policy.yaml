@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /etc]
+  read_write: [/sandbox, /tmp, /dev/null]
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_middlewares:
+  sign-git-commits:
+    name: Sign outgoing Git commits
+    middleware: local-git-signer
+    order: 10
+    config: {}
+    on_error: fail_closed
+    endpoints:
+      include: [github.com]
+
+network_policies:
+  github_git:
+    name: github-git
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/<org>/<repo>.git/info/refs*"
+          - allow:
+              method: POST
+              path: "/<org>/<repo>.git/git-upload-pack"
+          - allow:
+              method: POST
+              path: "/<org>/<repo>.git/git-receive-pack"
+    binaries:
+      - { path: /usr/bin/git }
+      - { path: /usr/lib/git-core/git-remote-http }
