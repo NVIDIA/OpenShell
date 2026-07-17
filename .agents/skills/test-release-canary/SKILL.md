@@ -14,9 +14,11 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 | Job | Runner | Verifies |
 |---|---|---|
 | `macos` | `macos-latest-xlarge` | Installs the dev Homebrew artifacts, reaches the VM gateway, and creates, executes in, and deletes a sandbox. |
-| `ubuntu` | `ubuntu-latest` | Installs the dev Debian package, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
-| `fedora` | `fedora:latest` container | Installs the dev RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-deb` | `ubuntu-latest` | Installs the dev Debian package (since snapd is not installed), reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-deb-native-docker` | `ubuntu-latest` | Installs the dev Debian package (since native Docker is preinstalled), reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
 | `ubuntu-snap` | `ubuntu-latest` | Installs the Release Dev Snap, connects its interfaces, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-snap-without-docker` | `ubuntu-latest` | Installs the Docker and Openshell snap packages from the Snap Store, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `fedora` | `fedora:latest` container | Installs the dev RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
 | `kubernetes` | `ubuntu-latest` + kind | Installs the dev Helm chart, reaches the in-cluster gateway, and creates, executes in, and deletes a sandbox using the published runtime images. |
 
 All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
@@ -136,9 +138,9 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
-| `macos`/`ubuntu`/`fedora` job fails on `install.sh` | Dev release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
+| `macos`/`ubuntu-deb`/`ubuntu-deb-native-docker`/`ubuntu-snap`/`fedora` job fails on `install.sh` | Dev release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
 | Sandbox create or exec fails | Published sandbox and supervisor artifacts are missing, incompatible, or cannot establish the protected runtime channel. | Gateway logs plus Docker, Podman, VM, Snap, or Kubernetes runtime diagnostics for the job. |
-| `macos`/`ubuntu`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_COMPUTE_DRIVER` env in the "Ensure …" step. |
+| `macos`/`ubuntu-deb`/`ubuntu-deb-native-docker`/`ubuntu-snap`/`ubuntu-snap-without-docker`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_COMPUTE_DRIVER` env in the "Ensure …" step. |
 | `ubuntu-snap` fails after interface connection | The gateway did not recover after Docker became available, or did not become reachable within the 30-second bound. | Failure diagnostics dump Snap service/connection/change state, gateway and snapd journals, Snap logs, and port 17670 listeners. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
 | `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
