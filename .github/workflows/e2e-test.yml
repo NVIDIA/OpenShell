@@ -205,3 +205,67 @@ jobs:
       - name: Print AppArmor denials
         if: always()
         run: sudo dmesg | grep -E 'apparmor=.*DENIED|profile="unprivileged_userns"' | tail -100 || true
+
+  e2e-vm:
+    name: E2E (rust-vm)
+    # libkrun needs KVM, so this job must run directly on a GitHub-hosted
+    # Linux VM. GitHub-hosted macOS runners do not support nested
+    # virtualization, and a job container would hide the host KVM device.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
+          persist-credentials: false
+
+      - name: Enable KVM access
+        run: |
+          set -euo pipefail
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::The GitHub-hosted runner did not expose /dev/kvm"
+            lscpu
+            grep -m1 -E '^(flags|Features)' /proc/cpuinfo || true
+            ls -la /dev
+            exit 1
+          fi
+          sudo chmod 0666 /dev/kvm
+          ls -l /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            libz3-dev \
+            openssh-client \
+            pkg-config \
+            socat \
+            zstd
+
+      - name: Install mise
+        run: |
+          curl https://mise.run | MISE_VERSION=v2026.4.25 sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: e2e-vm-linux-amd64
+          cache-on-failure: "true"
+
+      - name: Run VM E2E
+        run: mise run --no-deps --skip-deps e2e:vm

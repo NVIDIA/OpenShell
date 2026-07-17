@@ -14,7 +14,8 @@ Merge queue validation is a second integration gate for `main`. After a PR has p
 
 Three opt-in labels enable the long-running E2E suites:
 
-- `test:e2e` runs the standard E2E suite in `Branch E2E Checks`
+- `test:e2e` runs the standard Docker, rootless Podman, Kubernetes, and VM E2E
+  suites in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
   (`replicaCount: 2` and bundled PostgreSQL) in `Branch E2E Checks`
