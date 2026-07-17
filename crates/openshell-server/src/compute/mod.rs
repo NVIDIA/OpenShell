@@ -71,6 +71,13 @@ struct DeleteGateRegistry {
 }
 
 impl DeleteGateRegistry {
+    async fn lock_for(&self, sandbox_id: &str) -> SandboxDeleteGuard {
+        let gate = self.gate_for(sandbox_id);
+        SandboxDeleteGuard {
+            _guard: gate.lock_owned().await,
+        }
+    }
+
     fn gate_for(&self, sandbox_id: &str) -> Arc<Mutex<()>> {
         let mut gates = self
             .gates
@@ -94,6 +101,16 @@ impl DeleteGateRegistry {
             .expect("sandbox delete gate registry lock poisoned")
             .len()
     }
+}
+
+/// Proof that the current delete operation holds its sandbox-ID gate.
+///
+/// Delete code must acquire this guard before taking `ComputeRuntime::sync_lock`.
+/// Passing it to `lock_global_for_delete` makes that ordering visible at every
+/// global-lock acquisition in the delete path.
+#[derive(Debug)]
+struct SandboxDeleteGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
 #[derive(Debug)]
@@ -407,6 +424,16 @@ impl ComputeRuntime {
         self.sync_lock.clone().lock_owned().await
     }
 
+    /// Acquires the process-wide lock for code that already holds the
+    /// sandbox-ID delete gate. The guard parameter documents and enforces that
+    /// delete-path callers acquire locks in delete-gate -> global-lock order.
+    async fn lock_global_for_delete(
+        &self,
+        _delete_guard: &SandboxDeleteGuard,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.sync_lock.clone().lock_owned().await
+    }
+
     pub async fn new_docker(
         config: openshell_core::Config,
         docker_config: DockerComputeConfig,
@@ -673,10 +700,9 @@ impl ComputeRuntime {
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         let candidate_id = candidate.object_id().to_string();
-        let delete_gate = self.delete_gates.gate_for(&candidate_id);
-        let _delete_guard = delete_gate.lock().await;
+        let delete_guard = self.delete_gates.lock_for(&candidate_id).await;
 
-        let guard = self.sync_lock.lock().await;
+        let guard = self.lock_global_for_delete(&delete_guard).await;
         let current = self
             .store
             .get_message::<Sandbox>(&candidate_id)
@@ -722,9 +748,12 @@ impl ComputeRuntime {
             Ok(response) => {
                 let deleted = response.into_inner().deleted;
                 if deleted {
-                    self.cleanup_local_state_if_sandbox_absent(&candidate_id)
+                    self.cleanup_local_state_if_sandbox_absent(&delete_guard, &candidate_id)
                         .await?;
-                } else if !self.remove_deleting_sandbox_record(&candidate_id).await {
+                } else if !self
+                    .remove_deleting_sandbox_record(&delete_guard, &candidate_id)
+                    .await
+                {
                     return Err(Status::internal(
                         "compute resource was absent, but gateway cleanup did not complete",
                     ));
@@ -732,7 +761,7 @@ impl ComputeRuntime {
                 Ok(deleted)
             }
             Err(err) => {
-                self.recover_failed_delete(&transition).await;
+                self.recover_failed_delete(&delete_guard, &transition).await;
                 Err(Status::internal(format!(
                     "delete sandbox failed: {}",
                     err.message()
@@ -812,8 +841,12 @@ impl ComputeRuntime {
     ///
     /// Benign resource-version changes are retried, but cleanup stops if the
     /// row leaves `Deleting`; that state belongs to a concurrent writer.
-    async fn remove_deleting_sandbox_record(&self, sandbox_id: &str) -> bool {
-        let _guard = self.sync_lock.lock().await;
+    async fn remove_deleting_sandbox_record(
+        &self,
+        delete_guard: &SandboxDeleteGuard,
+        sandbox_id: &str,
+    ) -> bool {
+        let _guard = self.lock_global_for_delete(delete_guard).await;
         for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
             let record = match self.store.get(Sandbox::object_type(), sandbox_id).await {
                 Ok(Some(record)) => record,
@@ -941,14 +974,18 @@ impl ComputeRuntime {
     /// exact `Deleting` resource version to apply one of three outcomes:
     /// reconcile an observed backend snapshot, remove a confirmed-absent
     /// backend, or restore the pre-delete snapshot when lookup is inconclusive.
-    async fn recover_failed_delete(&self, transition: &DeleteTransition) {
+    async fn recover_failed_delete(
+        &self,
+        delete_guard: &SandboxDeleteGuard,
+        transition: &DeleteTransition,
+    ) {
         let sandbox_id = transition.deleting.object_id();
         let sandbox_name = transition.deleting.object_name();
         let deleting_resource_version = sandbox_resource_version(&transition.deleting);
 
         // The driver lookup is deliberately outside the process-wide guard.
         let observed = self.get_driver_sandbox(sandbox_id, sandbox_name).await;
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_global_for_delete(delete_guard).await;
 
         match observed {
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
@@ -1708,8 +1745,12 @@ impl ComputeRuntime {
         }
     }
 
-    async fn cleanup_local_state_if_sandbox_absent(&self, sandbox_id: &str) -> Result<(), Status> {
-        let _guard = self.sync_lock.lock().await;
+    async fn cleanup_local_state_if_sandbox_absent(
+        &self,
+        delete_guard: &SandboxDeleteGuard,
+        sandbox_id: &str,
+    ) -> Result<(), Status> {
+        let _guard = self.lock_global_for_delete(delete_guard).await;
         let record = self
             .store
             .get(Sandbox::object_type(), sandbox_id)
