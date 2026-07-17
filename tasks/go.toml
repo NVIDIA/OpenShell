@@ -181,7 +181,6 @@ protoc \
 # Diff against committed files
 DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "$PROTO_DIR" \
   --exclude="*.proto" \
-  --exclude="UPSTREAM_VERSION" \
   2>&1) || true
 
 if [ -n "$DIFF_OUTPUT" ]; then
