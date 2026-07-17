@@ -96,7 +96,7 @@ class JupyterSandbox(AbstractContextManager["JupyterSandbox"]):
         if Path(image_reference).expanduser().exists():
             raise ValueError(
                 "the Python SDK requires an OCI image reference; build the "
-                "Dockerfile before launching the fleet"
+                "Dockerfile before launching the sandbox"
             )
 
         self.client = client
