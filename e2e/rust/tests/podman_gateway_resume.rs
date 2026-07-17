@@ -14,7 +14,9 @@
 
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::{sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains};
+use openshell_e2e::harness::cli::{
+    sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
+};
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 

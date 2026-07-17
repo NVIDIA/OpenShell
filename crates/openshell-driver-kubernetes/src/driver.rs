@@ -781,6 +781,11 @@ impl KubernetesComputeDriver {
         validate_gpu_request(gpu_requirements).map_err(|status| {
             KubernetesDriverError::InvalidArgument(status.message().to_string())
         })?;
+
+        // Validate sandbox name against Kubernetes naming requirements
+        validate_kubernetes_dns1123_label(&sandbox.name, "sandbox name")
+            .map_err(KubernetesDriverError::InvalidArgument)?;
+
         let name = sandbox.name.as_str();
         info!(
             sandbox_id = %sandbox.id,
@@ -3010,38 +3015,11 @@ mod tests {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     fn json_struct(value: serde_json::Value) -> Struct {
-        match json_value(value).kind {
-            Some(Kind::StructValue(value)) => value,
-            _ => panic!("expected JSON object"),
-        }
-    }
-
-    fn json_value(value: serde_json::Value) -> Value {
-        match value {
-            serde_json::Value::Null => Value { kind: None },
-            serde_json::Value::Bool(value) => Value {
-                kind: Some(Kind::BoolValue(value)),
-            },
-            serde_json::Value::Number(value) => Value {
-                kind: value.as_f64().map(Kind::NumberValue),
-            },
-            serde_json::Value::String(value) => Value {
-                kind: Some(Kind::StringValue(value)),
-            },
-            serde_json::Value::Array(values) => Value {
-                kind: Some(Kind::ListValue(prost_types::ListValue {
-                    values: values.into_iter().map(json_value).collect(),
-                })),
-            },
-            serde_json::Value::Object(values) => Value {
-                kind: Some(Kind::StructValue(Struct {
-                    fields: values
-                        .into_iter()
-                        .map(|(key, value)| (key, json_value(value)))
-                        .collect(),
-                })),
-            },
-        }
+        let serde_json::Value::Object(object) = value else {
+            panic!("expected JSON object");
+        };
+        openshell_core::proto_struct::json_object_to_struct(object)
+            .expect("test JSON must convert to a protobuf Struct")
     }
 
     fn sandbox_to_k8s_spec_for_test(
@@ -5624,5 +5602,19 @@ mod tests {
         let vct = default_workspace_volume_claim_templates("");
         let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
         assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn sandbox_name_validation_accepts_valid_dns_labels() {
+        assert!(validate_kubernetes_dns1123_label("my-sandbox", "sandbox name").is_ok());
+        assert!(validate_kubernetes_dns1123_label("test123", "sandbox name").is_ok());
+        assert!(validate_kubernetes_dns1123_label("123abc", "sandbox name").is_ok());
+    }
+
+    #[test]
+    fn sandbox_name_validation_rejects_invalid_dns_labels() {
+        assert!(validate_kubernetes_dns1123_label("my_sandbox", "sandbox name").is_err());
+        assert!(validate_kubernetes_dns1123_label("MySandbox", "sandbox name").is_err());
+        assert!(validate_kubernetes_dns1123_label("dotted.name", "sandbox name").is_err());
     }
 }

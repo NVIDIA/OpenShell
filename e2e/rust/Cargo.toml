@@ -11,15 +11,15 @@ name = "openshell-e2e"
 description = "End-to-end tests for the OpenShell CLI"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 license = "Apache-2.0"
 publish = false
 
 [features]
 e2e = []
 # Selects tests that rely on `host.openshell.internal` (the sandbox's stable
-# alias to the host running test fixtures). docker and podman wire the alias
-# unconditionally; the kube driver only does so when the chart's
+# alias to the host running test fixtures). docker, podman, and vm wire the
+# alias unconditionally; the kube driver only does so when the chart's
 # `server.hostGatewayIP` is set, so `e2e-kubernetes` does NOT imply this and
 # the helm wrapper opts in explicitly when it has resolved an IP.
 e2e-host-gateway = ["e2e"]
@@ -30,7 +30,7 @@ e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
 e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
-e2e-vm = ["e2e"]
+e2e-vm = ["e2e", "e2e-host-gateway"]
 
 [[test]]
 name = "custom_image"
@@ -115,7 +115,7 @@ futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-prost = "0.13"
+prost = "0.14"
 tokio = { version = "1.43", features = ["full"] }
 tempfile = "3"
 sha1 = "0.10"

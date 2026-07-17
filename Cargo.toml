@@ -22,6 +22,7 @@ tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 prost = "0.14"
 prost-types = "0.14"
+prost-reflect = { version = "0.16.5", features = ["serde"] }
 
 # HTTP server
 axum = { version = "0.8", features = ["ws"] }
@@ -74,9 +75,14 @@ serde_yml = "0.0.12"
 toml = "0.8"
 apollo-parser = "0.8.5"
 tower-mcp-types = "0.12.0"
+regex = "1"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+
+# AWS SDK
+aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }

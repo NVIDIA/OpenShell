@@ -20,8 +20,7 @@ use super::output::{extract_field, strip_ansi};
 /// The CLI prints `Created sandbox: <name>` (current format). Falls back to
 /// `Name: <name>` for compatibility with older output formats.
 fn extract_sandbox_name(output: &str) -> Option<String> {
-    extract_field(output, "Created sandbox")
-        .or_else(|| extract_field(output, "Name"))
+    extract_field(output, "Created sandbox").or_else(|| extract_field(output, "Name"))
 }
 
 /// Default timeout for waiting for a sandbox to become ready.
@@ -76,9 +75,7 @@ impl SandboxGuard {
 
         let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
-            .map_err(|_| {
-                format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}")
-            })?
+            .map_err(|_| format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}"))?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -123,10 +120,7 @@ impl SandboxGuard {
     /// Returns an error if the process exits prematurely, the ready marker is
     /// not seen within [`SANDBOX_READY_TIMEOUT`], or the sandbox name cannot
     /// be parsed.
-    pub async fn create_keep(
-        command: &[&str],
-        ready_marker: &str,
-    ) -> Result<Self, String> {
+    pub async fn create_keep(command: &[&str], ready_marker: &str) -> Result<Self, String> {
         Self::create_keep_with_args(&[], command, ready_marker).await
     }
 
@@ -255,9 +249,7 @@ impl SandboxGuard {
         let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
             .map_err(|_| {
-                format!(
-                    "sandbox create --upload timed out after {SANDBOX_READY_TIMEOUT:?}"
-                )
+                format!("sandbox create --upload timed out after {SANDBOX_READY_TIMEOUT:?}")
             })?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
@@ -429,11 +421,7 @@ impl SandboxGuard {
     /// # Errors
     ///
     /// Returns an error if the download command fails.
-    pub async fn download(
-        &self,
-        sandbox_path: &str,
-        local_dest: &str,
-    ) -> Result<String, String> {
+    pub async fn download(&self, sandbox_path: &str, local_dest: &str) -> Result<String, String> {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox")
             .arg("download")

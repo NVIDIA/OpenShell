@@ -240,7 +240,7 @@ const HELP_TEMPLATE: &str = "\
   provider:    Manage provider configuration
 
 \x1b[1mGATEWAY COMMANDS\x1b[0m
-  gateway:     Manage gateway registrations
+  gateway:     Manage gateways
   status:      Show gateway status and information
   inference:   Manage inference configuration
   doctor:      Diagnose gateway issues
@@ -524,7 +524,7 @@ enum Commands {
     // ===================================================================
     // GATEWAY COMMANDS
     // ===================================================================
-    /// Manage gateway registrations.
+    /// Manage gateways.
     #[command(alias = "gw", after_help = GATEWAY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Gateway {
         #[command(subcommand)]
@@ -692,6 +692,7 @@ enum CliProviderRefreshStrategy {
     Oauth2RefreshToken,
     Oauth2ClientCredentials,
     GoogleServiceAccountJwt,
+    AwsStsAssumeRole,
 }
 
 impl CliProviderRefreshStrategy {
@@ -700,6 +701,7 @@ impl CliProviderRefreshStrategy {
             Self::Oauth2RefreshToken => "oauth2_refresh_token",
             Self::Oauth2ClientCredentials => "oauth2_client_credentials",
             Self::GoogleServiceAccountJwt => "google_service_account_jwt",
+            Self::AwsStsAssumeRole => "aws_sts_assume_role",
         }
     }
 }
@@ -1105,18 +1107,19 @@ enum GatewayCommands {
         name: Option<String>,
     },
 
-    /// Show gateway registration details.
+    /// Show elevated live gateway runtime information.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Info {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
-        name: Option<String>,
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List registered gateways.
     ///
-    /// Prints a table of all registered gateways with their endpoint, type,
-    /// and authentication mode. The active gateway is marked with `*`.
+    /// Prints all registered gateways with their endpoint, type,
+    /// authentication mode, source, and remote registration details.
+    /// The active gateway is marked with `*`.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
         /// Output format.
@@ -1742,30 +1745,6 @@ enum PolicyCommands {
         #[arg(long)]
         yes: bool,
     },
-
-    /// Prove properties of a sandbox policy — or find counterexamples.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Prove {
-        /// Path to `OpenShell` sandbox policy YAML.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        policy: String,
-
-        /// Path to credential descriptor YAML.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        credentials: String,
-
-        /// Path to capability registry directory (default: bundled).
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        registry: Option<String>,
-
-        /// Path to accepted risks YAML.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        accepted_risks: Option<String>,
-
-        /// One-line-per-finding output (for demos and CI).
-        #[arg(long)]
-        compact: bool,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2056,11 +2035,14 @@ async fn main() -> Result<()> {
             GatewayCommands::Select { name } => {
                 run::gateway_select(name.as_deref(), &cli.gateway)?;
             }
-            GatewayCommands::Info { name } => {
-                let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
-                    .unwrap_or_else(|| "openshell".to_string());
-                run::gateway_admin_info(&name)?;
+            GatewayCommands::Info { output } => {
+                if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                    let mut tls = tls.with_gateway_name(&ctx.name);
+                    apply_auth(&mut tls, &ctx.name);
+                    run::gateway_info(&ctx.name, &ctx.endpoint, &tls, output.as_str()).await?;
+                } else {
+                    run::gateway_info_not_configured()?;
+                }
             }
             GatewayCommands::List { output } => {
                 run::gateway_list(&cli.gateway, output.as_str())?;
@@ -2294,28 +2276,6 @@ async fn main() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
-            command:
-                Some(PolicyCommands::Prove {
-                    policy,
-                    credentials,
-                    registry,
-                    accepted_risks,
-                    compact,
-                }),
-        }) => {
-            // Prove runs locally — no gateway needed.
-            let exit_code = openshell_prover::prove(
-                &policy,
-                &credentials,
-                registry.as_deref(),
-                accepted_risks.as_deref(),
-                compact,
-            )?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
-        }
-        Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
@@ -2434,7 +2394,6 @@ async fn main() -> Result<()> {
                     }
                     run::gateway_setting_delete(&ctx.endpoint, "policy", yes, &tls).await?;
                 }
-                PolicyCommands::Prove { .. } => unreachable!(),
             }
         }
 
@@ -2725,37 +2684,15 @@ async fn main() -> Result<()> {
                     apply_auth(&mut tls, &ctx.name);
                     let sandbox_dest = dest.as_deref();
                     let local = std::path::Path::new(&local_path);
-                    if !local.exists() {
-                        return Err(miette::miette!(
-                            "local path does not exist: {}",
-                            local.display()
-                        ));
-                    }
-                    let dest_display = sandbox_dest.unwrap_or("~");
-                    eprintln!("Uploading {} -> sandbox:{}", local.display(), dest_display);
-                    if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
-                        if !files.is_empty() {
-                            run::sandbox_sync_up_files(
-                                &ctx.endpoint,
-                                &name,
-                                &base_dir,
-                                &files,
-                                local,
-                                sandbox_dest,
-                                &tls,
-                            )
-                            .await?;
-                            eprintln!("{} Upload complete", "✓".green().bold());
-                            return Ok(());
-                        }
-                        eprintln!(
-                            "{} .gitignore filtering excluded all files in {}; uploading unfiltered",
-                            "⚠".yellow().bold(),
-                            local.display(),
-                        );
-                    }
-                    run::sandbox_sync_up(&ctx.endpoint, &name, local, sandbox_dest, &tls).await?;
-                    eprintln!("{} Upload complete", "✓".green().bold());
+                    run::sandbox_upload(
+                        &ctx.endpoint,
+                        &name,
+                        local,
+                        sandbox_dest,
+                        !no_git_ignore,
+                        &tls,
+                    )
+                    .await?;
                 }
                 SandboxCommands::Download {
                     name,
@@ -3445,7 +3382,7 @@ mod tests {
             for (raw_args, index) in [
                 (vec!["openshell", "--gateway", "a"], 2),
                 (vec!["openshell", "gateway", "select", "a"], 3),
-                (vec!["openshell", "gateway", "info", "--name", "a"], 4),
+                (vec!["openshell", "gateway", "remove", "a"], 3),
             ] {
                 let mut cmd = Cli::command();
                 let args: Vec<OsString> = raw_args.iter().copied().map(Into::into).collect();
@@ -3471,6 +3408,26 @@ mod tests {
 
         assert_eq!(cli.gateway.as_deref(), Some("demo"));
         assert!(matches!(cli.command, Some(Commands::Status)));
+    }
+
+    #[test]
+    fn gateway_info_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "info", "-o", "json"])
+            .expect("gateway info -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::Info {
+                    output: OutputFormat::Json
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn top_level_info_is_not_a_command() {
+        assert!(Cli::try_parse_from(["openshell", "info"]).is_err());
     }
 
     #[test]

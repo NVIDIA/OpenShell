@@ -27,7 +27,6 @@ description: |
          sudo snap connect openshell:docker docker:docker-daemon
          sudo snap connect openshell:log-observe
          sudo snap connect openshell:system-observe
-         sudo snap connect openshell:ssh-keys
          sudo snap start openshell.gateway
 
     3. Verify the gateway and register it locally:
@@ -69,7 +68,6 @@ apps:
     plugs:
       - home
       - network
-      - ssh-keys
       - system-observe
   term:
     command: bin/openshell term
@@ -81,7 +79,6 @@ apps:
     plugs:
       - home
       - network
-      - ssh-keys
       - system-observe
   gateway:
     command: bin/openshell-gateway-wrapper
@@ -104,7 +101,6 @@ apps:
       - log-observe
       - network
       - network-bind
-      - ssh-keys
       - system-observe
 
 parts:
@@ -150,3 +146,14 @@ parts:
         "$CRAFT_PART_INSTALL/usr/share/doc/openshell/LICENSE"
       install -D -m 0644 "$CRAFT_PART_SRC/README.md" \
         "$CRAFT_PART_INSTALL/usr/share/doc/openshell/README.md"
+
+  ssh:
+    # Vendor the openssh-client `ssh` binary into the snap so the CLI/TUI
+    # can spawn `ssh` for sandbox connect/exec/forward without relying on
+    # the host's ssh-keys interface. The binary lands at
+    # $SNAP/usr/bin/ssh and is found via the snap runtime PATH.
+    plugin: nil
+    stage-packages:
+      - openssh-client
+    prime:
+      - usr/bin/ssh

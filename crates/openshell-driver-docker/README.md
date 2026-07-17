@@ -6,6 +6,12 @@ The driver manages sandbox containers through the local Docker daemon with the
 `bollard` client. It is intended for developer environments where Docker is
 already available and running Kubernetes would be unnecessary.
 
+The driver connects to `[openshell.drivers.docker].socket_path` when configured.
+Otherwise, it uses the first standard local Docker socket that responds to an
+API ping, which is the same selection mechanism used by gateway auto-detection.
+An explicitly selected Docker driver falls back to `/var/run/docker.sock` when
+no candidate responds.
+
 ## Runtime Model
 
 The gateway runs as a host process. The Docker driver creates one container per

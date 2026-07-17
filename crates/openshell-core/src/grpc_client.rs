@@ -444,16 +444,7 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
 /// Returns the expiry in milliseconds since the Unix epoch, or `None` if
 /// the token is not a parseable JWT.
 fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
-    use base64::Engine;
-    let mut parts = jwt.splitn(3, '.');
-    let _header = parts.next()?;
-    let payload_b64 = parts.next()?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    let exp_secs = value.get("exp")?.as_i64()?;
-    exp_secs.checked_mul(1000)
+    crate::jwt::parse_exp_secs(jwt)?.checked_mul(1000)
 }
 
 #[cfg(test)]
@@ -582,6 +573,8 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
 ///
 /// Callers that must acknowledge the exact revision they loaded should retain
 /// this snapshot instead of re-fetching metadata after policy construction.
+/// The snapshot also carries the external middleware registrations required
+/// by the policy.
 pub async fn fetch_settings_snapshot(
     endpoint: &str,
     sandbox_id: &str,
@@ -632,12 +625,7 @@ async fn sync_policy_with_client(
         .update_config(UpdateConfigRequest {
             name: sandbox.to_string(),
             policy: Some(policy.clone()),
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()
@@ -749,6 +737,7 @@ pub struct SettingsPollResult {
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
     pub provider_env_revision: u64,
+    pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
 }
 
 fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
@@ -762,6 +751,7 @@ fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> Settin
         settings: inner.settings,
         global_policy_version: inner.global_policy_version,
         provider_env_revision: inner.provider_env_revision,
+        supervisor_middleware_services: inner.supervisor_middleware_services,
     }
 }
 

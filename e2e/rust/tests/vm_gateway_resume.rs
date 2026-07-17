@@ -11,7 +11,9 @@
 
 use std::time::Duration;
 
-use openshell_e2e::harness::cli::{sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains};
+use openshell_e2e::harness::cli::{
+    sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
+};
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
@@ -34,8 +36,11 @@ async fn vm_gateway_restart_resumes_running_sandbox() {
         .await
         .expect("gateway should start healthy");
 
+    // The gateway restart terminates the VM process before re-adopting its
+    // overlay. Flush the marker before reporting readiness so the assertion
+    // verifies durable overlay state rather than guest page-cache timing.
     let script = format!(
-        "echo before-restart > {RESUME_FILE}; echo {READY_MARKER}; while true; do sleep 1; done"
+        "echo before-restart > {RESUME_FILE}; sync; echo {READY_MARKER}; while true; do sleep 1; done"
     );
     let mut sandbox = SandboxGuard::create_keep(&["sh", "-lc", &script], READY_MARKER)
         .await
