@@ -70,7 +70,7 @@ pub enum SandboxIdentitySource {
     /// Per-sandbox client certificate. Reserved for channel-bound sandbox
     /// identity.
     BootstrapCert { fingerprint: String },
-    /// K8s `ServiceAccount` token used to bootstrap a gateway-minted JWT
-    /// via `IssueSandboxToken`. Populated only on that one RPC path.
+    /// K8s `ServiceAccount` token used to bootstrap a gateway-minted JWT.
+    /// Populated only on Kubernetes bootstrap RPC paths.
     K8sServiceAccount { pod_name: String, pod_uid: String },
 }

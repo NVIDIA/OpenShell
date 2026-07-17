@@ -694,10 +694,10 @@ where
 /// Assemble the authenticator chain for the gateway.
 ///
 /// Chain order (first-match-wins):
-/// 1. `K8sServiceAccountAuthenticator` (path-scoped to `IssueSandboxToken`)
-///    — exchanges a projected SA token for a `Principal::Sandbox` so the
-///    `IssueSandboxToken` handler can mint a gateway JWT. No-op on every
-///    other path; only present when the gateway runs in-cluster.
+/// 1. `K8sServiceAccountAuthenticator` (path-scoped to Kubernetes bootstrap
+///    RPCs) — resolves a projected SA token to a `Principal::Sandbox` so the
+///    bootstrap handler can mint a gateway JWT. No-op on every other path;
+///    only present when the gateway runs in-cluster.
 /// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
 /// 3. `OidcAuthenticator` — validates user Bearer tokens against the
@@ -2131,6 +2131,7 @@ mod tests {
                 "/openshell.v1.OpenShell/ConnectSupervisor",
                 "/openshell.v1.OpenShell/RelayStream",
                 "/openshell.v1.OpenShell/IssueSandboxToken",
+                "/openshell.v1.OpenShell/RegisterSupervisorPod",
                 "/openshell.v1.OpenShell/RefreshSandboxToken",
                 "/openshell.inference.v1.Inference/GetInferenceBundle",
             ] {

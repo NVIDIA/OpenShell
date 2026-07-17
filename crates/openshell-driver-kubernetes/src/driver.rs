@@ -2189,7 +2189,7 @@ struct SandboxPodParams<'a> {
     workspace_storage_class: &'a str,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
-    /// for the bootstrap `IssueSandboxToken` exchange.
+    /// for the bootstrap `RegisterSupervisorPod` stream.
     sa_token_ttl_secs: i64,
     provider_spiffe_enabled: bool,
     provider_spiffe_workload_api_socket_path: &'a str,
@@ -2419,7 +2419,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     }
     // Carry the sandbox UUID as a pod annotation so the gateway can resolve
     // a projected SA token claim (pod name + uid) back to a sandbox identity
-    // when the supervisor calls `IssueSandboxToken` at startup. The gateway
+    // when the supervisor calls `RegisterSupervisorPod` at startup. The gateway
     // also verifies the pod's controlling Sandbox ownerReference against the
     // live CR before accepting this annotation. Its K8s Role does NOT grant
     // `patch pods`, so this annotation is effectively immutable post-create.
@@ -2627,9 +2627,10 @@ fn sandbox_template_to_k8s_with_validated_config(
     }
     // Projected ServiceAccountToken volume — kubelet writes a short-lived
     // audience-bound JWT into /var/run/secrets/openshell/token and rotates
-    // it automatically. The supervisor exchanges this for a gateway-minted
-    // JWT via `IssueSandboxToken` once at startup. In sidecar topology both
-    // supervisor containers run with the sandbox GID and need group-read access.
+    // it automatically. The supervisor presents this to `RegisterSupervisorPod`
+    // and receives a gateway-minted JWT on the activation stream. In sidecar
+    // topology both supervisor containers run with the sandbox GID and need
+    // group-read access.
     let sa_token_default_mode = match params.topology {
         SupervisorTopology::Combined => 0o400,
         SupervisorTopology::Sidecar => 0o440,
@@ -2969,7 +2970,7 @@ fn apply_required_env(
     }
     // Projected ServiceAccount token written by kubelet (see the volume
     // definition in `sandbox_template_to_k8s`). The supervisor reads this
-    // and exchanges it for a gateway-minted JWT via `IssueSandboxToken`.
+    // and receives a gateway-minted JWT via `RegisterSupervisorPod`.
     upsert_env(
         env,
         openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,

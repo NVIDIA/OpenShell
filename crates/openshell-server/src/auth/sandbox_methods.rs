@@ -27,6 +27,9 @@ mod tests {
         ));
         assert!(is_sandbox_callable("/openshell.v1.OpenShell/RelayStream"));
         assert!(is_sandbox_callable(
+            "/openshell.v1.OpenShell/RegisterSupervisorPod"
+        ));
+        assert!(is_sandbox_callable(
             "/openshell.v1.OpenShell/GetSandboxConfig"
         ));
         assert!(is_sandbox_callable(

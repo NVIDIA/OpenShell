@@ -203,6 +203,15 @@ identity is absent, malformed, unknown, ambiguous, or resolves to UID/GID 0.
 The supervisor itself remains root so it can establish isolation before
 starting unprivileged children.
 
+Kubernetes supervisors authenticate to the gateway in two stages. They first
+call `RegisterSupervisorPod` with the projected ServiceAccount token; the
+gateway validates the pod-bound token and live Agent Sandbox owner state, then
+activates already-bound cold pods by streaming back a gateway-minted sandbox
+JWT. The supervisor installs that JWT in memory and starts the normal
+`ConnectSupervisor` session as the activated sandbox. The gateway does not dial
+pod IPs or require an inbound activation port; activation is supervisor
+initiated over the existing outbound gRPC connection.
+
 Kubernetes can run the supervisor in the default combined topology or in a
 sidecar topology. Combined mode keeps network and process supervision in the
 agent container. Sidecar mode runs network enforcement, the proxy, and gateway

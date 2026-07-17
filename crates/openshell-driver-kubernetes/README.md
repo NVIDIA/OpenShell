@@ -55,8 +55,9 @@ values must override image-provided environment variables.
 Sandbox pods run as `service_account_name` and keep
 `automountServiceAccountToken: false`. The only Kubernetes token exposed to the
 supervisor is an explicit, audience-bound projected token mounted at
-`/var/run/secrets/openshell/token` for the one-shot `IssueSandboxToken`
-bootstrap exchange.
+`/var/run/secrets/openshell/token` for the `RegisterSupervisorPod` bootstrap
+stream. The gateway validates the pod-bound token and activates already-bound
+cold pods by returning a gateway-minted sandbox JWT on that stream.
 
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.
