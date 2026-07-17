@@ -218,5 +218,5 @@ hide = true
 
 ["python:proto"]
 description = "Generate Python protobuf stubs from .proto files"
-run = "uv run --frozen python tasks/scripts/generate_python_proto.py"
+run = "uv run --frozen --group dev python tasks/scripts/generate_python_proto.py"
 hide = true
