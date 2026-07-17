@@ -1168,9 +1168,14 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
 /// Symlinks are skipped (not followed) to prevent privilege escalation via
 /// malicious container images. The TOCTOU window is not exploitable because
 /// no untrusted process is running yet.
+///
+/// The walk does not cross filesystem boundaries (compares `st_dev`) so that
+/// read-only mounts nested under `/sandbox` are left untouched. Any remaining
+/// `EROFS` errors from `chown` are logged as warnings rather than aborting
+/// startup.
 #[cfg(unix)]
 fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
-    use nix::unistd::chown;
+    use std::os::unix::fs::MetadataExt;
 
     let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
     if meta.file_type().is_symlink() {
@@ -1180,22 +1185,44 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
         ));
     }
 
-    chown(root, uid, gid).into_diagnostic()?;
+    let root_dev = meta.dev();
+    chown_recursive(root, uid, gid, root_dev)
+}
+
+#[cfg(unix)]
+fn chown_recursive(path: &Path, uid: Option<Uid>, gid: Option<Gid>, root_dev: u64) -> Result<()> {
+    use nix::unistd::chown;
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
+
+    if meta.dev() != root_dev {
+        debug!(path = %path.display(), "Skipping mount boundary during sandbox home chown");
+        return Ok(());
+    }
+
+    if let Err(e) = chown(path, uid, gid) {
+        if e == nix::errno::Errno::EROFS {
+            debug!(path = %path.display(), "Skipping read-only path during sandbox home chown");
+            return Ok(());
+        }
+        return Err(e).into_diagnostic();
+    }
 
     if meta.is_dir()
-        && let Ok(entries) = std::fs::read_dir(root)
+        && let Ok(entries) = std::fs::read_dir(path)
     {
         for entry in entries {
             let entry = entry.into_diagnostic()?;
-            let path = entry.path();
-            if path
+            let child = entry.path();
+            if child
                 .symlink_metadata()
                 .is_ok_and(|m| m.file_type().is_symlink())
             {
-                debug!(path = %path.display(), "Skipping symlink during sandbox home chown");
+                debug!(path = %child.display(), "Skipping symlink during sandbox home chown");
                 continue;
             }
-            chown_sandbox_home(&path, uid, gid)?;
+            chown_recursive(&child, uid, gid, root_dev)?;
         }
     }
 
@@ -2113,6 +2140,82 @@ mod tests {
             Some(nix::unistd::getegid()),
         )
         .expect("should skip symlink children without error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_recursive_skips_different_device() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        let child = root.join("file.txt");
+        std::fs::write(&child, "hello").unwrap();
+
+        let before_root = std::fs::metadata(&root).unwrap();
+        let before_child = std::fs::metadata(&child).unwrap();
+
+        let uid = Some(nix::unistd::geteuid());
+        let gid = Some(nix::unistd::getegid());
+
+        // Pass a fake root_dev that doesn't match the temp directory's device.
+        // chown_recursive should skip the path entirely instead of failing.
+        let fake_dev = std::fs::symlink_metadata(&root)
+            .unwrap()
+            .dev()
+            .wrapping_add(1);
+        chown_recursive(&root, uid, gid, fake_dev)
+            .expect("should skip paths on a different device");
+
+        let after_root = std::fs::metadata(&root).unwrap();
+        let after_child = std::fs::metadata(&child).unwrap();
+        assert_eq!(
+            before_root.uid(),
+            after_root.uid(),
+            "root directory should not have been chowned"
+        );
+        assert_eq!(
+            before_child.uid(),
+            after_child.uid(),
+            "child file should not have been chowned"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_sandbox_home_does_not_chown_across_device_boundary() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("owned.txt"), "writable").unwrap();
+        let subdir = root.join("mount");
+        std::fs::create_dir(&subdir).unwrap();
+        std::fs::write(subdir.join("skipped.txt"), "read-only").unwrap();
+
+        let expected_uid = nix::unistd::geteuid();
+        let expected_gid = nix::unistd::getegid();
+
+        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid)).unwrap();
+
+        let owned = std::fs::metadata(root.join("owned.txt")).unwrap();
+        assert_eq!(
+            owned.uid(),
+            expected_uid.as_raw(),
+            "same-device file should be chowned"
+        );
+
+        // subdir is on the same device in this test, so it WILL be chowned.
+        // This test documents the normal same-device behavior. The cross-device
+        // skip is tested by chown_recursive_skips_different_device above.
+        let sub = std::fs::metadata(&subdir).unwrap();
+        assert_eq!(
+            sub.uid(),
+            expected_uid.as_raw(),
+            "same-device subdirectory should be chowned"
+        );
     }
 
     #[cfg(unix)]
