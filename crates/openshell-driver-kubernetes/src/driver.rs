@@ -3010,38 +3010,11 @@ mod tests {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     fn json_struct(value: serde_json::Value) -> Struct {
-        match json_value(value).kind {
-            Some(Kind::StructValue(value)) => value,
-            _ => panic!("expected JSON object"),
-        }
-    }
-
-    fn json_value(value: serde_json::Value) -> Value {
-        match value {
-            serde_json::Value::Null => Value { kind: None },
-            serde_json::Value::Bool(value) => Value {
-                kind: Some(Kind::BoolValue(value)),
-            },
-            serde_json::Value::Number(value) => Value {
-                kind: value.as_f64().map(Kind::NumberValue),
-            },
-            serde_json::Value::String(value) => Value {
-                kind: Some(Kind::StringValue(value)),
-            },
-            serde_json::Value::Array(values) => Value {
-                kind: Some(Kind::ListValue(prost_types::ListValue {
-                    values: values.into_iter().map(json_value).collect(),
-                })),
-            },
-            serde_json::Value::Object(values) => Value {
-                kind: Some(Kind::StructValue(Struct {
-                    fields: values
-                        .into_iter()
-                        .map(|(key, value)| (key, json_value(value)))
-                        .collect(),
-                })),
-            },
-        }
+        let serde_json::Value::Object(object) = value else {
+            panic!("expected JSON object");
+        };
+        openshell_core::proto_struct::json_object_to_struct(object)
+            .expect("test JSON must convert to a protobuf Struct")
     }
 
     fn sandbox_to_k8s_spec_for_test(

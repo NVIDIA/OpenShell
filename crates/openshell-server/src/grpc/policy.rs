@@ -1337,13 +1337,37 @@ pub(super) async fn handle_get_sandbox_config(
         .await?;
         if !provider_layers.is_empty() {
             let effective_policy = compose_effective_policy(source_policy, &provider_layers);
+            validate_policy_safety(&effective_policy).map_err(|error| {
+                Status::failed_precondition(format!(
+                    "provider composition produced an invalid effective policy: {}",
+                    error.message()
+                ))
+            })?;
             policy_hash = deterministic_policy_hash(&effective_policy);
             policy = Some(effective_policy);
         }
     }
 
+    if let Some(policy) = policy.as_ref() {
+        state
+            .middleware_registry
+            .ensure_policy_middlewares_registered(policy)
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "effective policy middleware registration is invalid: {error}"
+                ))
+            })?;
+    }
+
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
-    let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
+    let supervisor_middleware_services =
+        state.middleware_registry.required_services(policy.as_ref());
+    let config_revision = compute_config_revision(
+        policy.as_ref(),
+        &settings,
+        policy_source,
+        &supervisor_middleware_services,
+    );
     let provider_env_revision = compute_provider_env_revision_with_catalog(
         state.store.as_ref(),
         &provider_profile_catalog,
@@ -1360,6 +1384,7 @@ pub(super) async fn handle_get_sandbox_config(
         policy_source: policy_source.into(),
         global_policy_version,
         provider_env_revision,
+        supervisor_middleware_services,
     }))
 }
 
@@ -1481,7 +1506,7 @@ async fn profile_provider_policy_layers_with_catalog(
     Ok(layers)
 }
 
-fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
+pub(super) fn bool_setting_enabled(settings: &StoredSettings, key: &str) -> Result<bool, Status> {
     match settings.settings.get(key) {
         None => Ok(false),
         Some(StoredSettingValue::Bool(value)) => Ok(*value),
@@ -1641,6 +1666,8 @@ async fn handle_update_config_inner(
             openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             validate_policy_safety(&new_policy)?;
+            crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy)
+                .await?;
 
             let payload = new_policy.encode_to_vec();
             let hash = deterministic_policy_hash(&new_policy);
@@ -2004,11 +2031,14 @@ async fn handle_update_config_inner(
 
     let backfill_policy = if let Some(baseline_policy) = spec.policy.as_ref() {
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
-        validate_policy_safety(&new_policy)?;
         None
     } else {
         Some(new_policy.clone())
     };
+
+    validate_policy_safety(&new_policy)?;
+    crate::middleware::validate_policy(state.middleware_registry.as_ref(), &new_policy).await?;
+
     let _sandbox_sync_guard = if backfill_policy.is_some() {
         Some(state.compute.sandbox_sync_guard().await)
     } else {
@@ -3342,6 +3372,21 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
         hasher.update(key.as_bytes());
         hasher.update(value.encode_to_vec());
     }
+    if !policy.network_middlewares.is_empty() {
+        hasher.update(b"network_middlewares");
+        let mut entries: Vec<_> = policy.network_middlewares.iter().collect();
+        entries.sort_by_key(|(name, _)| name.as_str());
+        for (name, middleware) in entries {
+            hasher.update(name.as_bytes());
+            let encoded = middleware.encode_to_vec();
+            hasher.update(
+                u64::try_from(encoded.len())
+                    .expect("protobuf payload length fits in u64")
+                    .to_le_bytes(),
+            );
+            hasher.update(encoded);
+        }
+    }
     hex::encode(hasher.finalize())
 }
 
@@ -3350,6 +3395,7 @@ fn compute_config_revision(
     policy: Option<&ProtoSandboxPolicy>,
     settings: &HashMap<String, EffectiveSetting>,
     policy_source: PolicySource,
+    supervisor_middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
 ) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update((policy_source as i32).to_le_bytes());
@@ -3381,6 +3427,11 @@ fn compute_config_revision(
                 }
             }
         }
+    }
+    let mut middleware = supervisor_middleware_services.iter().collect::<Vec<_>>();
+    middleware.sort_by(|left, right| left.name.cmp(&right.name));
+    for service in middleware {
+        hasher.update(service.encode_to_vec());
     }
 
     let digest = hasher.finalize();
@@ -3979,6 +4030,30 @@ fn upsert_setting_value(
 
 pub(super) async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
     load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, GLOBAL_SETTINGS_NAME).await
+}
+
+/// Whether a boolean global setting is enabled, loading global settings from the
+/// store. Exposed to sibling modules that need a gate check without depending on
+/// the private `StoredSettings` type.
+pub async fn global_bool_setting_enabled(store: &Store, key: &str) -> Result<bool, Status> {
+    let global_settings = load_global_settings(store).await?;
+    bool_setting_enabled(&global_settings, key)
+}
+
+/// Test helper: set a boolean global setting, loading current settings first so
+/// the CAS write succeeds whether the record already exists or not. Available to
+/// sibling test modules without exposing the private `StoredSettings` type.
+#[cfg(test)]
+pub async fn set_global_bool_setting_for_test(
+    store: &Store,
+    key: &str,
+    value: bool,
+) -> Result<(), Status> {
+    let mut settings = load_global_settings(store).await?;
+    settings
+        .settings
+        .insert(key.to_string(), StoredSettingValue::Bool(value));
+    save_global_settings(store, &settings).await
 }
 
 pub(super) async fn save_global_settings(
@@ -5221,6 +5296,85 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.host == "api.github.com")
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_rejects_invalid_provider_composed_policy() {
+        use openshell_core::proto::{
+            MiddlewareEndpointSelector, NetworkMiddlewareConfig, ProviderProfile,
+            ProviderProfileCategory, StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+
+        let profile = StoredProviderProfile {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "profile-tls-skip".to_string(),
+                name: "tls-skip".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                resource_version: 0,
+            }),
+            profile: Some(ProviderProfile {
+                id: "tls-skip".to_string(),
+                display_name: "TLS skip".to_string(),
+                category: ProviderProfileCategory::Other as i32,
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    tls: "skip".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        };
+        state.store.put_message(&profile).await.unwrap();
+        state
+            .store
+            .put_message(&test_provider("work-tls-skip", "tls-skip"))
+            .await
+            .unwrap();
+
+        let policy = ProtoSandboxPolicy {
+            network_middlewares: HashMap::from([(
+                "redactor".to_string(),
+                NetworkMiddlewareConfig {
+                    middleware: "openshell/regex".to_string(),
+                    on_error: "fail_closed".to_string(),
+                    endpoints: Some(MiddlewareEndpointSelector {
+                        include: vec!["api.example.com".to_string()],
+                        exclude: Vec::new(),
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-invalid-composed-policy",
+                "invalid-composed-policy",
+                policy,
+                vec!["work-tls-skip".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let error = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-invalid-composed-policy".to_string(),
+            })),
+        )
+        .await
+        .expect_err("invalid composed policy must not be delivered");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("provider composition"));
+        assert!(error.message().contains("tls: skip"));
     }
 
     #[tokio::test]
@@ -9544,7 +9698,7 @@ mod tests {
                 allowed_ips: vec!["127.0.0.1".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -9565,7 +9719,7 @@ mod tests {
                 allowed_ips: vec!["169.254.169.254".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -9583,7 +9737,7 @@ mod tests {
                 port: 80,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -9601,7 +9755,7 @@ mod tests {
                 port: 8080,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -9619,7 +9773,7 @@ mod tests {
                 port: 80,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -9667,7 +9821,7 @@ mod tests {
                 allowed_ips: vec!["10.0.5.0/24".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());
@@ -9684,7 +9838,7 @@ mod tests {
                 port: 443,
                 ..Default::default()
             }],
-            binaries: vec![],
+            ..Default::default()
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());
@@ -9760,7 +9914,7 @@ mod tests {
             },
         );
 
-        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox);
+        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
         settings.insert(
             "mode".to_string(),
             EffectiveSetting {
@@ -9770,7 +9924,7 @@ mod tests {
                 scope: SettingScope::Sandbox.into(),
             },
         );
-        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox);
+        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
 
         assert_ne!(rev_a, rev_b);
     }
@@ -10035,8 +10189,8 @@ mod tests {
             },
         );
 
-        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox);
-        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox);
+        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
+        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
         assert_eq!(rev_a, rev_b);
     }
 
@@ -10052,9 +10206,88 @@ mod tests {
         };
         let settings = HashMap::new();
 
-        let rev_a = compute_config_revision(Some(&policy_a), &settings, PolicySource::Sandbox);
-        let rev_b = compute_config_revision(Some(&policy_b), &settings, PolicySource::Sandbox);
+        let rev_a = compute_config_revision(Some(&policy_a), &settings, PolicySource::Sandbox, &[]);
+        let rev_b = compute_config_revision(Some(&policy_b), &settings, PolicySource::Sandbox, &[]);
         assert_ne!(rev_a, rev_b);
+    }
+
+    #[test]
+    fn policy_hash_changes_when_network_middlewares_change() {
+        let policy_a = ProtoSandboxPolicy::default();
+        let policy_b = ProtoSandboxPolicy {
+            network_middlewares: HashMap::from([(
+                "regex-redactor".into(),
+                openshell_core::proto::NetworkMiddlewareConfig {
+                    middleware: "openshell/regex".into(),
+                    on_error: "fail_closed".into(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert_ne!(
+            deterministic_policy_hash(&policy_a),
+            deterministic_policy_hash(&policy_b),
+            "middleware-only policy changes must produce a new policy hash"
+        );
+    }
+
+    #[test]
+    fn policy_hash_is_stable_across_middleware_config_field_insertion_order() {
+        use prost_types::{Struct, Value, value::Kind};
+        use std::collections::BTreeMap;
+
+        fn string_value(value: &str) -> Value {
+            Value {
+                kind: Some(Kind::StringValue(value.into())),
+            }
+        }
+
+        fn middleware_config(reverse: bool) -> Struct {
+            let mut nested = BTreeMap::new();
+            let mut fields = BTreeMap::new();
+            if reverse {
+                nested.insert("second".into(), string_value("two"));
+                nested.insert("first".into(), string_value("one"));
+                fields.insert(
+                    "nested".into(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct { fields: nested })),
+                    },
+                );
+                fields.insert("mode".into(), string_value("redact"));
+            } else {
+                nested.insert("first".into(), string_value("one"));
+                nested.insert("second".into(), string_value("two"));
+                fields.insert("mode".into(), string_value("redact"));
+                fields.insert(
+                    "nested".into(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct { fields: nested })),
+                    },
+                );
+            }
+            Struct { fields }
+        }
+
+        let policy = |reverse| ProtoSandboxPolicy {
+            network_middlewares: HashMap::from([(
+                "regex-redactor".into(),
+                openshell_core::proto::NetworkMiddlewareConfig {
+                    middleware: "openshell/regex".into(),
+                    config: Some(middleware_config(reverse)),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            deterministic_policy_hash(&policy(false)),
+            deterministic_policy_hash(&policy(true)),
+            "equivalent middleware configs must hash identically regardless of field insertion order"
+        );
     }
 
     #[test]
@@ -10062,9 +10295,26 @@ mod tests {
         let policy = ProtoSandboxPolicy::default();
         let settings = HashMap::new();
 
-        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox);
-        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Global);
+        let rev_a = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
+        let rev_b = compute_config_revision(Some(&policy), &settings, PolicySource::Global, &[]);
         assert_ne!(rev_a, rev_b);
+    }
+
+    #[test]
+    fn config_revision_changes_when_supervisor_middleware_services_change() {
+        let policy = ProtoSandboxPolicy::default();
+        let settings = HashMap::new();
+        let service = openshell_core::proto::SupervisorMiddlewareService {
+            name: "local-guard".into(),
+            grpc_endpoint: "http://127.0.0.1:50051".into(),
+            max_body_bytes: 1024,
+            ..Default::default()
+        };
+
+        let without = compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[]);
+        let with =
+            compute_config_revision(Some(&policy), &settings, PolicySource::Sandbox, &[service]);
+        assert_ne!(without, with);
     }
 
     #[test]
@@ -10080,7 +10330,7 @@ mod tests {
             },
         );
 
-        let rev_a = compute_config_revision(None, &settings, PolicySource::Sandbox);
+        let rev_a = compute_config_revision(None, &settings, PolicySource::Sandbox, &[]);
 
         settings.insert(
             "log_level".to_string(),
@@ -10092,7 +10342,7 @@ mod tests {
             },
         );
 
-        let rev_b = compute_config_revision(None, &settings, PolicySource::Sandbox);
+        let rev_b = compute_config_revision(None, &settings, PolicySource::Sandbox, &[]);
         assert_ne!(rev_a, rev_b);
     }
 

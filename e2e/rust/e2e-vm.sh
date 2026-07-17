@@ -315,4 +315,5 @@ if [ -n "${E2E_TEST_OVERRIDE}" ]; then
 else
   run_e2e_test smoke
   run_e2e_test host_gateway_alias
+  run_e2e_test vm_gateway_resume
 fi

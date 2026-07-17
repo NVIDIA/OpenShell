@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package openshell.sandbox.v1;
 
+import "google/protobuf/struct.proto";
+
 // Sandbox-supervisor configuration and policy messages.
 //
 // Conventions:
@@ -25,6 +27,10 @@ message SandboxPolicy {
   ProcessPolicy process = 4;
   // Network access policies keyed by name (e.g. "claude_code", "gitlab").
   map<string, NetworkPolicyRule> network_policies = 5;
+  // Reusable supervisor middleware configs for network egress, keyed by their
+  // policy-local names. At most 10 configs are accepted, and at most 10 stages
+  // can be selected per request.
+  map<string, NetworkMiddlewareConfig> network_middlewares = 6;
 }
 
 // Filesystem access policy.
@@ -59,6 +65,32 @@ message NetworkPolicyRule {
   repeated NetworkEndpoint endpoints = 2;
   // Allowed binary identities.
   repeated NetworkBinary binaries = 3;
+}
+
+// A reusable middleware config selected for admitted egress by host.
+message NetworkMiddlewareConfig {
+  // Human-readable name for this middleware config.
+  string name = 1;
+  // Built-in middleware name or operator-owned registration name.
+  string middleware = 2;
+  // Service-specific configuration.
+  google.protobuf.Struct config = 3;
+  // Failure behavior: "fail_closed" (default) or "fail_open".
+  string on_error = 4;
+  // Host selector controlling which admitted destinations use this config.
+  MiddlewareEndpointSelector endpoints = 5;
+  // Execution order. Values must be unique within a policy; lower values run first.
+  int32 order = 6;
+}
+
+// Host selector controlling which admitted destinations use a middleware config.
+message MiddlewareEndpointSelector {
+  // Exact host or DNS glob patterns included in the selection. Include and
+  // exclude accept at most 32 combined patterns.
+  repeated string include = 1;
+  // Exact host or DNS glob patterns removed from the selection.
+  // Exclusions take precedence over inclusions.
+  repeated string exclude = 2;
 }
 
 // A network endpoint (host + port) with optional L7 inspection config.
@@ -329,4 +361,22 @@ message GetSandboxConfigResponse {
   // Fingerprint for provider credential inputs attached to this sandbox.
   // Changes when attached provider names or attached provider records change.
   uint64 provider_env_revision = 8;
+  // Operator-registered supervisor middleware services required by the
+  // effective policy. Built-in middleware is not included.
+  repeated SupervisorMiddlewareService supervisor_middleware_services = 9;
+}
+
+// Connection details for one operator-registered supervisor middleware service.
+// V1 supports plaintext and server-authenticated TLS gRPC.
+message SupervisorMiddlewareService {
+  // Operator-owned registration name used by policy attachments and diagnostics.
+  string name = 1;
+  // gRPC endpoint reachable from the sandbox supervisor.
+  string grpc_endpoint = 2;
+  // Operator-owned body limit applied to every binding exposed by the service.
+  uint64 max_body_bytes = 3;
+  // Default RPC timeout for this service. Empty uses the platform default of
+  // 500ms. Values use an integer with an `ms` or `s` suffix and must be
+  // between 10ms and 30s.
+  string timeout = 4;
 }

@@ -259,7 +259,10 @@ state, SSH sessions, policy revisions, settings, inference configuration, and
 deployment records. Provider refresh material is stored as a separate object
 scoped to the provider instance through `objects.scope`; the provider record
 keeps only the current injectable credential values and optional per-credential
-expiry timestamps.
+expiry timestamps. A refresh normally mints one credential, but a strategy may
+co-mint several (AWS STS mints the access key, secret key, and session token in
+one call); the refresh state pins the resolved set of env keys it owns so
+collision checks reserve all of them before the first mint.
 
 ### Optimistic Concurrency (CAS)
 
@@ -365,6 +368,17 @@ Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
 sandbox supervisor polls for config revisions and hot-reloads dynamic policy
 when the policy engine accepts the update.
+
+External supervisor middleware registration is operator-owned configuration
+under `[[openshell.supervisor.middleware]]`. At startup the gateway connects to
+each service and validates its described bindings and operator body limit.
+Policies attach a complete external middleware by its operator-owned registration
+name. Manifest bindings are identified by operation and phase, and each manifest
+may declare at most one binding for an operation and phase pair.
+Before persisting a policy, the gateway asks each selected implementation to
+validate its config. The effective sandbox config contains only the registered
+services required by that policy; supervisors invoke those services directly on
+the request path.
 
 Provider credential expiry is enforced during gateway-to-sandbox credential
 resolution and again by the sandbox placeholder resolver. This keeps expired

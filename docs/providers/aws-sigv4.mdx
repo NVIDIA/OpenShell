@@ -35,6 +35,12 @@ openshell provider create \
   --credential AWS_SESSION_TOKEN=FwoGZX...
 ```
 
+To have the gateway mint and rotate STS credentials for you instead of supplying
+them statically, use the `aws` or `aws-s3` profile with the `aws_sts_assume_role`
+refresh strategy. A single `sts:AssumeRole` mints all three env vars
+(`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`) that the
+signer reads. See [Manage Providers](/sandboxes/manage-providers#aws-sts).
+
 ## Policy Configuration
 
 Enable SigV4 signing on a per-endpoint basis using three policy fields:

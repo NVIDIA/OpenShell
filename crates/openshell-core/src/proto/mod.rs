@@ -94,6 +94,19 @@ pub mod inference {
     unused_qualifications,
     rust_2018_idioms
 )]
+pub mod middleware {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/openshell.middleware.v1.rs"));
+    }
+}
+
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    clippy::nursery,
+    unused_qualifications,
+    rust_2018_idioms
+)]
 pub mod gateway_interceptor {
     pub mod v1 {
         include!(concat!(
@@ -106,6 +119,7 @@ pub mod gateway_interceptor {
 pub use datamodel::v1::*;
 pub use gateway_interceptor::v1::*;
 pub use inference::v1::*;
+pub use middleware::v1::*;
 pub use openshell::*;
 pub use sandbox::v1::*;
 pub use test::ObjectForTest;

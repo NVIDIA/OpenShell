@@ -12,7 +12,7 @@ Use this page to apply and iterate policy changes on running sandboxes. For a fu
 
 ## Policy Structure
 
-A policy has static sections `filesystem_policy`, `landlock`, and `process` that are locked at sandbox creation, and a dynamic section `network_policies` that is hot-reloadable on a running sandbox.
+A policy has static sections `filesystem_policy`, `landlock`, and `process` that are locked at sandbox creation, and dynamic `network_policies` and `network_middlewares` sections that are hot-reloadable on a running sandbox.
 
 ```yaml wordWrap showLineNumbers={false}
 version: 1
@@ -44,6 +44,19 @@ network_policies:
     binaries:
       - path: /usr/bin/curl
 
+# Dynamic: ordered middleware selected independently by admitted host.
+network_middlewares:
+  regex-redactor:
+    name: Redact API tokens
+    middleware: openshell/regex
+    order: 10
+    config:
+      mode: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.com"]
+      exclude: []
+
 ```
 
 Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
@@ -57,6 +70,33 @@ Raw streams are connection-scoped and outside L7 live-reload guarantees. This in
 | `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). Refer to the [Policy Schema Reference](/reference/policy-schema#landlock) for the full behavior table. |
 | `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
 | `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the [policy engine](/about/how-it-works#core-components) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request can be checked against that endpoint's `rules` (method and path). For endpoints with `protocol: websocket`, the proxy validates the RFC 6455 upgrade and evaluates `GET` rules for the handshake plus either `WEBSOCKET_TEXT` rules for raw client text messages or GraphQL operation rules for GraphQL-over-WebSocket messages. Set `websocket_credential_rewrite: true` only when a WebSocket or REST compatibility endpoint must keep placeholder credentials in sandbox-owned text frames and resolve them at the OpenShell relay boundary. <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Inference Routing](/sandboxes/inference-routing). |
+| `network_middlewares` | Dynamic | Declares keyed HTTP request middleware configs. After network and L7 policy admit a request, OpenShell matches each config's host selectors independently and runs matching entries by their unique ascending `order` before credential injection. |
+
+## Supervisor Middleware
+
+Supervisor middleware can inspect, deny, or replace admitted HTTP request bodies before provider credentials are injected. Middleware selection is independent of the `network_policies` rule that admitted the request: each keyed `network_middlewares` entry matches the destination host through `endpoints.include` and `endpoints.exclude`.
+
+```yaml
+network_middlewares:
+  regex-redactor:
+    name: Redact API tokens
+    middleware: openshell/regex
+    order: 10
+    config:
+      mode: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["*.example.com"]
+      exclude: ["trusted.example.com"]
+```
+
+Matching entries run once each by ascending `order`; lower values run first, and duplicate order values are rejected. The default order is `0`, so policies with multiple entries normally set it explicitly. Map keys are structurally unique. An optional `name` provides a human-readable label, defaults to the map key, and does not change the key used as the config identity. Different keys may use the same implementation and run as distinct stages. `exclude` takes precedence over `include`.
+
+`openshell/regex` is an example built into the supervisor. It applies fixed regular expressions as a best-effort UTF-8 text transformation, without guarantees that sensitive values will be detected or fully removed. Custom expressions are not configurable yet. Operator-run middleware must be registered by name before a policy can reference it. The gateway validates implementation-owned config before accepting the policy.
+
+`on_error` defaults to `fail_closed`. Use `fail_open` only when skipping a failed middleware is acceptable. Middleware applies only to HTTP traffic the supervisor can parse and inspect. Policy validation rejects a fail-closed selector that can cover a `tls: skip` endpoint. An all-`fail_open` match may cover the endpoint; the supervisor bypasses the middleware and emits a detection finding.
+
+See [Supervisor Middleware](/extensibility/supervisor-middleware) for registration, chain ordering, body limits, failure behavior, and operations.
 
 ## Baseline Filesystem Paths
 
@@ -247,7 +287,7 @@ If you set `protocol: rest` or `protocol: websocket`, you also need an allow sha
 
 Use the `websocket-credential-rewrite` endpoint option with `protocol: websocket` when the sandbox should send credential placeholders in client text frames and have OpenShell resolve them after the allowed upgrade. The option can also be used with `protocol: rest` compatibility endpoints that perform a WebSocket upgrade. It is rejected for plain L4 or `protocol: sql` endpoints.
 
-Use the `request-body-credential-rewrite` endpoint option with `protocol: rest` when an API expects OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. OpenShell buffers up to 256 KiB, rewrites recognized credential placeholders, updates `Content-Length`, and rejects unresolved placeholders instead of forwarding them. The option is rejected for WebSocket, GraphQL, SQL, and plain L4 endpoints.
+Use the `request-body-credential-rewrite` endpoint option with `protocol: rest` when an API expects OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. OpenShell buffers up to 256 KiB, rewrites recognized credential placeholders, updates `Content-Length`, and rejects unresolved placeholders instead of forwarding them. For chunked requests, the 256 KiB limit counts the complete wire representation, including framing, extensions, and trailers. The option is rejected for WebSocket, GraphQL, SQL, and plain L4 endpoints.
 
 Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
 

@@ -25,6 +25,7 @@ pub struct HttpActivityBuilder<'a> {
     firewall_rule: Option<FirewallRule>,
     message: Option<String>,
     status_detail: Option<String>,
+    unmapped: serde_json::Map<String, serde_json::Value>,
 }
 
 impl<'a> HttpActivityBuilder<'a> {
@@ -45,6 +46,7 @@ impl<'a> HttpActivityBuilder<'a> {
             firewall_rule: None,
             message: None,
             status_detail: None,
+            unmapped: serde_json::Map::new(),
         }
     }
 
@@ -69,6 +71,13 @@ impl<'a> HttpActivityBuilder<'a> {
         self
     }
 
+    /// Add a source-specific attribute that is not defined by the OCSF class.
+    #[must_use]
+    pub fn unmapped(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+        self.unmapped.insert(key.to_string(), value.into());
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.http_label().to_string();
@@ -85,6 +94,9 @@ impl<'a> HttpActivityBuilder<'a> {
         );
         if let Some(detail) = self.status_detail {
             base.set_status_detail(detail);
+        }
+        if !self.unmapped.is_empty() {
+            base.unmapped = Some(serde_json::Value::Object(self.unmapped));
         }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
@@ -157,11 +169,15 @@ mod tests {
             .firewall_rule("aws_iam", "ssrf")
             .message("FORWARD blocked: allowed_ips check failed")
             .status_detail("resolves to always-blocked address")
+            .unmapped("attempt", 2)
+            .unmapped("cached", true)
             .build();
 
         let json = event.to_json().unwrap();
         assert_eq!(json["class_uid"], 4002);
         assert_eq!(json["status_detail"], "resolves to always-blocked address");
+        assert_eq!(json["unmapped"]["attempt"], 2);
+        assert_eq!(json["unmapped"]["cached"], true);
         assert_eq!(json["action_id"], 2); // Denied
     }
 }

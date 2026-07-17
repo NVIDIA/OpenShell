@@ -32,6 +32,7 @@ mod defaults;
 mod grpc;
 mod http;
 mod inference;
+mod middleware;
 mod multiplex;
 mod persistence;
 pub(crate) mod policy_store;
@@ -54,6 +55,7 @@ mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::{ComputeDriverKind, Config, Error, Result};
+use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -126,6 +128,9 @@ pub struct ServerState {
     /// can be constructed before `ServerState` and still
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
+
+    /// Validated built-in and operator-registered supervisor middleware.
+    pub middleware_registry: Arc<MiddlewareRegistry>,
 
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
@@ -201,6 +206,7 @@ impl ServerState {
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
+            middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
@@ -234,6 +240,26 @@ pub(crate) async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
+
+    let middleware_registrations = config_file
+        .as_ref()
+        .map(|file| {
+            file.openshell
+                .supervisor
+                .middleware
+                .iter()
+                .map(Into::into)
+                .collect()
+        })
+        .unwrap_or_default();
+    let middleware_registry = Arc::new(
+        MiddlewareRegistry::connect_services(
+            openshell_supervisor_middleware_builtins::services(),
+            middleware_registrations,
+        )
+        .await
+        .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
+    );
 
     let store = Arc::new(Store::connect(database_url).await?);
 
@@ -304,6 +330,7 @@ pub(crate) async fn run_server(
         supervisor_sessions,
         oidc_cache,
     );
+    state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;
 
