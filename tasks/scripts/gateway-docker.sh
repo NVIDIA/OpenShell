@@ -16,6 +16,7 @@
 #   OPENSHELL_DOCKER_GATEWAY_NAME=my-docker-gateway mise run gateway:docker
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:docker
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:docker
+#   mise run gateway:docker -- --set openshell.drivers.docker.network_name=my-network
 #
 # After the gateway is running, point the CLI at it with either:
 #   openshell --gateway docker-dev <command>
@@ -32,6 +33,54 @@ SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/san
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
+CONFIG_OVERRIDES=()
+
+usage() {
+  cat <<'EOF'
+Usage: mise run gateway:docker -- [--set KEY=VALUE]...
+
+Start a local OpenShell gateway backed by Docker.
+
+Options:
+  --set KEY=VALUE  Override a dotted key in the generated gateway TOML.
+                   Repeat to set multiple values; later values win.
+  -h, --help       Show this help.
+
+Example:
+  mise run gateway:docker -- \
+    --set openshell.drivers.docker.network_name=openshell-dev \
+    --set openshell.drivers.docker.image_pull_policy=Never
+EOF
+}
+
+while (( $# > 0 )); do
+  case "$1" in
+    --set)
+      if (( $# < 2 )); then
+        echo "ERROR: --set requires a KEY=VALUE argument" >&2
+        exit 2
+      fi
+      CONFIG_OVERRIDES+=("$2")
+      shift 2
+      ;;
+    --set=*)
+      CONFIG_OVERRIDES+=("${1#--set=}")
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      ;;
+    *)
+      echo "ERROR: unknown argument '$1'" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
 normalize_arch() {
   case "$1" in
@@ -190,6 +239,13 @@ sandbox_namespace = "${SANDBOX_NAMESPACE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
 supervisor_bin = "${SUPERVISOR_BIN}"
 EOF
+
+if (( ${#CONFIG_OVERRIDES[@]} > 0 )); then
+  echo "Applying gateway configuration overrides..."
+  "${GATEWAY_BIN}" config set \
+    --config "${CONFIG_PATH}" \
+    "${CONFIG_OVERRIDES[@]}" >/dev/null
+fi
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"

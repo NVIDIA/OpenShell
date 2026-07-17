@@ -14,6 +14,8 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
+**openshell-gateway config set** \[**--config** *PATH*\] *KEY=VALUE*...
+
 # DESCRIPTION
 
 **openshell-gateway** is the control-plane server for OpenShell. It
@@ -31,6 +33,10 @@ secured by mutual TLS (mTLS) by default unless the TOML config disables
 TLS.
 
 # OPTIONS
+
+**--config** *PATH*
+:   Read the gateway TOML configuration from *PATH*. Config subcommands
+    update this file. Environment: **OPENSHELL_GATEWAY_CONFIG**.
 
 **--bind-address** *IP*
 :   IP address to bind all listeners to. Default: **127.0.0.1**.
@@ -110,6 +116,15 @@ TLS.
 Compute driver settings such as sandbox image, callback endpoint, image
 pull policy, network name, VM state directory, and guest TLS material are
 configured in the TOML file passed with **--config**.
+
+# CONFIGURATION COMMANDS
+
+**config set** *KEY=VALUE*...
+:   Update one or more dotted keys in the gateway TOML file. The command
+    preserves comments, validates the resulting schema, and replaces the
+    file atomically. Later assignments to the same key win. Use
+    **--config** or **OPENSHELL_GATEWAY_CONFIG** to select a non-default
+    file.
 
 # SYSTEMD INTEGRATION
 

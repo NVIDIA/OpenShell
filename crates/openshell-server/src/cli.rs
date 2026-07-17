@@ -39,6 +39,8 @@ struct Cli {
 enum Commands {
     /// Generate mTLS PKI and write Kubernetes Secrets (Helm pre-install hook).
     GenerateCerts(certgen::CertgenArgs),
+    /// Update the gateway TOML configuration.
+    Config(crate::config_command::ConfigArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -49,7 +51,7 @@ struct RunArgs {
     /// When set, gateway-wide settings and per-driver tables are read from
     /// the file. Gateway command-line flags and `OPENSHELL_*` environment
     /// variables continue to take precedence over gateway file values.
-    #[arg(long, env = "OPENSHELL_GATEWAY_CONFIG")]
+    #[arg(long, env = "OPENSHELL_GATEWAY_CONFIG", global = true)]
     config: Option<PathBuf>,
 
     /// IP address to bind the server, health, and metrics listeners to.
@@ -228,6 +230,7 @@ pub async fn run_cli() -> Result<()> {
 
     match cli.command {
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
+        Some(Commands::Config(args)) => crate::config_command::run(args, cli.run.config),
         None => Box::pin(run_from_args(cli.run, matches)).await,
     }
 }
@@ -1084,6 +1087,68 @@ mod tests {
             cli.command,
             Some(super::Commands::GenerateCerts(_))
         ));
+    }
+
+    #[test]
+    fn config_set_uses_explicit_config_path() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("custom/gateway.toml");
+        let path_string = path.to_string_lossy().into_owned();
+
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "config",
+            "set",
+            "--config",
+            &path_string,
+            "openshell.gateway.compute_drivers=[\"podman\"]",
+            "openshell.gateway.bind_address=0.0.0.0:17670",
+        ])
+        .expect("config set should parse without runtime arguments");
+        let Cli { command, run } = cli;
+        let Some(super::Commands::Config(args)) = command else {
+            panic!("expected config subcommand");
+        };
+
+        crate::config_command::run(args, run.config).unwrap();
+
+        let loaded = crate::config_file::load(&path).unwrap();
+        assert_eq!(
+            loaded.openshell.gateway.compute_drivers,
+            Some(vec!["podman".to_string()])
+        );
+        assert_eq!(
+            loaded.openshell.gateway.bind_address,
+            Some("0.0.0.0:17670".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn config_set_requires_at_least_one_assignment() {
+        let error = Cli::try_parse_from(["openshell-gateway", "config", "set"])
+            .expect_err("config set without an assignment should fail");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn config_set_rejects_non_assignment_arguments() {
+        let error = Cli::try_parse_from([
+            "openshell-gateway",
+            "config",
+            "set",
+            "openshell.gateway.log_level",
+        ])
+        .expect_err("config set arguments must use KEY=VALUE syntax");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
