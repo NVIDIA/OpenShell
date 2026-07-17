@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: ""
+      vm-driver-artifact-name:
+        description: "Optional prebuilt VM driver artifact name"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   actions: read
@@ -256,6 +261,24 @@ jobs:
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           persist-credentials: false
+
+      - name: Use prebuilt OpenShell CLI
+        if: inputs.cli-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-cli
+        with:
+          artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell gateway
+        if: inputs.gateway-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell VM driver
+        if: inputs.vm-driver-artifact-name != ''
+        uses: ./.github/actions/setup-e2e-vm-driver
+        with:
+          artifact-name: ${{ inputs.vm-driver-artifact-name }}
 
       - name: Enable KVM access
         run: |

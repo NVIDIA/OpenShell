@@ -104,8 +104,22 @@ jobs:
       component: cli
       platform: linux/amd64,linux/arm64
 
+  build-driver-vm-linux:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/driver-vm-linux.yml
+    with:
+      image-tag: ${{ github.sha }}
+      checkout-ref: ${{ github.sha }}
+      runtime-platforms: linux-x86_64
+      driver-targets: >-
+        [{"arch":"amd64","runner":"linux-amd64-cpu8","target":"x86_64-unknown-linux-gnu","zig_target":"x86_64-unknown-linux-gnu.2.28","platform":"linux-x86_64","guest_arch":"x86_64"}]
+
   e2e:
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
+    needs: [pr_metadata, build-gateway, build-supervisor, build-cli, build-driver-vm-linux]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
@@ -117,6 +131,7 @@ jobs:
       runner: linux-arm64-cpu8
       cli-artifact-prefix: rust-binary-cli
       gateway-artifact-prefix: rust-binary-gateway
+      vm-driver-artifact-name: driver-vm-linux-amd64
 
   gpu-e2e:
     needs: [pr_metadata, build-gateway, build-supervisor, build-cli]
@@ -179,7 +194,7 @@ jobs:
 
   core-e2e-result:
     name: Core E2E result
-    needs: [pr_metadata, build-gateway, build-supervisor, build-cli, e2e, kubernetes-e2e]
+    needs: [pr_metadata, build-gateway, build-supervisor, build-cli, build-driver-vm-linux, e2e, kubernetes-e2e]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -188,6 +203,7 @@ jobs:
           BUILD_GATEWAY_RESULT: ${{ needs.build-gateway.result }}
           BUILD_SUPERVISOR_RESULT: ${{ needs.build-supervisor.result }}
           BUILD_CLI_RESULT: ${{ needs.build-cli.result }}
+          BUILD_DRIVER_VM_RESULT: ${{ needs.build-driver-vm-linux.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
           KUBERNETES_E2E_RESULT: ${{ needs.kubernetes-e2e.result }}
         run: |
@@ -197,6 +213,7 @@ jobs:
             "build-gateway:$BUILD_GATEWAY_RESULT" \
             "build-supervisor:$BUILD_SUPERVISOR_RESULT" \
             "build-cli:$BUILD_CLI_RESULT" \
+            "build-driver-vm-linux:$BUILD_DRIVER_VM_RESULT" \
             "e2e:$E2E_RESULT" \
             "kubernetes-e2e:$KUBERNETES_E2E_RESULT"; do
             name="${item%%:*}"
