@@ -190,13 +190,17 @@ in-process and external drivers. Older drivers omit the field and retain the
 conservative operator-managed behavior.
 
 Drivers that can verify a platform-native sandbox credential advertise
-`GetCapabilities.supports_sandbox_authentication`. On the path-scoped
-`IssueSandboxToken` exchange, the gateway forwards the opaque bearer credential
-to that selected driver through `AuthenticateSandbox`. The driver returns only
-the authenticated sandbox ID. The gateway then verifies that its durable
-sandbox record exists and mints the gateway JWT. The driver socket is therefore
-a sandbox-identity trust boundary, but it does not grant user or administrator
-authority.
+`GetCapabilities.supports_sandbox_authentication`. The gateway uses that
+capability to route supervisor `RegisterSupervisor` bootstrap credentials to
+the selected driver's `AuthenticateSandbox` RPC. Drivers that also advertise
+`GetCapabilities.supports_warm_supervisor_bootstrap` may return a warm-pending
+instance and opaque activation guard instead of a bound sandbox ID. Bound
+identities must still resolve to a durable gateway sandbox record before the
+gateway mints a sandbox JWT; warm-pending identities remain scoped to later
+activation. The legacy `IssueSandboxToken` compatibility path calls the same
+driver authentication RPC, but accepts only bound sandbox IDs. The driver
+boundary is therefore a sandbox-identity trust boundary, but it does not grant
+user or administrator authority.
 
 ## Deletion Lifecycle
 
@@ -249,7 +253,7 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 |---|---|---|---|
 | Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API and CDI GPU devices when available. Delivers the supervisor via OCI image volume by default; falls back to extracting the binary to a host-side cache and bind-mounting it when `userns` is configured (overlay does not support idmapped mounts). Advertises the combined-supervisor policy-DNS and transparent-TCP substrate. |
-| Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
+| Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, GPU resources, and optionally Agent Sandbox v1beta1 warm-pool claims. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
 | Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. A launch-time endpoint may use a canonical built-in name to preserve its driver-config key while replacing in-process construction. The gateway connects to an operator-provisioned UDS, snapshots `GetCapabilities`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
@@ -258,15 +262,20 @@ template resource limits. Docker and Podman apply them as runtime limits.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
 but currently ignores them.
 
-Reusable sandbox workload templates are resolved before the compute-driver
-boundary. Drivers do not receive a separate template resource; the gateway
-lowers the selected `SandboxWorkloadTemplate` into the existing sandbox spec
-and validates that spec before calling `ValidateSandboxCreate` or
-`CreateSandbox`. Template CPU and memory become the same typed resource limits
-described above. Template GPU settings become `ResourceRequirements`, preserving
-the driver's default GPU assignment when the count is omitted. Template
-`driver_config` remains a driver-keyed envelope until the compute layer selects
-the active driver block and forwards only that block to the driver.
+Reusable sandbox workload templates are resolved before the per-sandbox
+compute-driver boundary. The gateway lowers a selected
+`SandboxWorkloadTemplate` into the existing sandbox spec and validates that spec
+before calling `ValidateSandboxCreate` or `CreateSandbox`. Drivers that opt into
+template reconciliation implement the optional `SandboxTemplateReconciler`
+service and additionally receive the complete desired template set for backend
+pre-provisioning. The required `ComputeDriver` service does not include this
+method, so drivers without reusable backend resources need no reconciliation
+stub. Template CPU and memory become the same typed resource limits described
+above. Template GPU settings become
+`ResourceRequirements`, preserving the driver's default GPU assignment when the
+count is omitted. Template `driver_config` remains a driver-keyed envelope until
+the compute layer selects the active driver block and forwards only that block
+to the driver.
 
 Docker and Podman also accept per-sandbox driver-config mounts for existing
 runtime-managed named volumes and tmpfs mounts. Podman additionally accepts
@@ -391,6 +400,108 @@ identity is absent, malformed, unknown, ambiguous, or resolves to UID/GID 0.
 The supervisor itself remains root so it can establish isolation before
 starting unprivileged children.
 
+Kubernetes supervisors authenticate to the gateway in two stages. They first
+call `RegisterSupervisor` with the projected ServiceAccount token; the
+gateway validates the pod-bound token and live Agent Sandbox owner state, then
+activates already-bound cold pods by streaming back a gateway-minted sandbox
+JWT. The supervisor installs that JWT in memory and starts the normal
+`ConnectSupervisor` session as the activated sandbox. The gateway does not dial
+pod IPs or require an inbound activation port; activation is supervisor
+initiated over the existing outbound gRPC connection.
+
+When compatible OpenShell-generated Agent Sandbox warm pools exist, the
+Kubernetes driver can create a `SandboxClaim` instead of a direct `Sandbox`.
+OpenShell sets the claim's lifecycle shutdown policy to `Delete`.
+The driver watches warm pools and templates into a local cache so create
+requests do not list or fetch extension objects on the hot path. This remains
+behind the compute-driver boundary: other drivers and the driver-agnostic
+gateway lifecycle continue to operate on OpenShell sandbox identity and status.
+Lifecycle operations resolve a claim-backed OpenShell sandbox ID through the
+claim's selected `Sandbox` name and namespace before mutating the selected
+resource. The selected warm-pool `Sandbox` does not need to carry the OpenShell
+sandbox-ID label because the claim remains the identity mapping.
+Warm-pool activation uses the same trust boundary as direct Kubernetes
+activation. The direct path validates `pod token -> live pod -> owning Sandbox
+CR -> Sandbox sandbox-id metadata`; the warm path validates `pod token -> live
+pod -> owning Sandbox CR -> associated SandboxClaim -> SandboxClaim sandbox-id
+metadata`. In both paths, sandbox-id metadata is not cryptographic proof by
+itself. It is trusted because the gateway and Agent Sandbox controllers own the
+relevant Kubernetes objects, and RBAC must prevent sandbox workloads and
+untrusted users from creating or mutating trusted `Sandbox`, `SandboxClaim`, pod
+metadata, or sandbox service-account identity in the gateway-managed namespace.
+Under that model, warm pooling does not require a separate anti-spoofing token
+or gateway-side claim mapping beyond the same live Kubernetes ownership and
+metadata consistency checks used by the direct path. If an operator grants
+untrusted principals write access to those objects, both warm and direct
+activation require a broader common proof model.
+Claim activation is level-triggered rather than dependent on a single watch
+event. The controller periodically relists OpenShell-managed claims and retries
+failed watch streams, because a claim can become visible before its selected
+`Sandbox`, pod, or outbound supervisor registration. A newly authenticated
+warm-supervisor registration clears completed-claim hints and triggers an immediate
+relist, so both a restarted process with the same pod UID and a replacement pod
+with a new UID can reactivate against an existing claim. It reconciles different
+claims concurrently, deduplicates work by claim UID, and caps concurrency so
+one late registration or slow Kubernetes lookup cannot block activation for
+the namespace or create unbounded work.
+The gateway retains activated pod-UID tombstones for one hour to reject
+duplicate registration and activation races, then prunes them opportunistically
+on registry access so long-running gateways do not accumulate one entry per
+historical pod. A new authenticated registration supersedes its pod-UID
+tombstone and receives a new local session ID. Activation and failure delivery
+are conditional on that session ID, preventing work started for an old process
+from consuming or terminating its replacement stream.
+Warm claim creation is idempotent by the deterministic claim name. After a
+create timeout, transport failure, server error, or conflict, the driver reads
+that name back and retries the same claim create when it is not yet visible. It
+never switches to direct Sandbox creation after an ambiguous claim write. An
+existing claim is accepted only when its OpenShell identity, workspace,
+allocation marker, and warm-pool reference match the request. If Kubernetes
+still cannot determine whether the claim exists, the driver returns
+`Unavailable` and the gateway retains the durable `Provisioning` record. This
+prevents another create from assigning a new sandbox ID to the same name while
+the original Kubernetes write may still be live; the normal driver watcher can
+subsequently reconcile an accepted claim.
+Drivers opt into OpenShell `SandboxTemplate` desired-state reconciliation
+through the compute-driver capability snapshot. The gateway periodically sends
+the complete authoritative template set and also triggers a sweep after
+template mutations. The Kubernetes driver uses the desired set to generate Agent
+Sandbox `SandboxTemplate` and `SandboxWarmPool` resources for templates whose
+`desired_service_level.startup.ready_within` is strictly below the configured
+threshold. The generated pool size follows
+`desired_service_level.startup.max_burst` capped by the Kubernetes driver
+configuration. Generated resource names combine a source-template-ID hash with
+the rendered-spec fingerprint. They remain distinct when same-named templates
+from different workspaces share the configured namespace. Sandbox creation and
+template reconciliation share one workspace-to-namespace mapping boundary:
+shared mode uses the configured namespace, managed mode derives a gateway-owned
+workspace namespace, and operator mode requires the workspace namespace in the
+live allowlist. Generated resources carry the stable gateway identity. After
+applying the desired set, the driver prunes owned resources whose source
+template is absent, so retries and deletes need no per-template delivery state.
+Invalid templates are isolated during gateway translation and driver rendering:
+the reconciler logs and excludes each invalid template from the desired set,
+continues with the remaining templates, and prunes any generated resources for
+the invalid entry. Kubernetes API failures still abort the sweep before global
+pruning. The warm-pool cache runs on every replica so local create requests do
+not depend on a separate writer lease.
+
+Warm allocation requires both the extension APIs and a local claim-activation
+controller. In-process Kubernetes drivers install that controller for both
+in-cluster and inferred kubeconfig clients. Driver capabilities describe this
+structural support rather than a startup observation of CRD availability. The
+driver dynamically discovers `SandboxClaim`, `SandboxTemplate`, and
+`SandboxWarmPool`, caches successful discovery results for 30 seconds, and does
+not cache discovery failures. Resource absence suppresses extension calls;
+transient discovery and authorization failures do not become an authoritative
+empty claim inventory. This keeps existing claim lifecycle and cleanup active
+while allowing newly installed CRDs to take effect without a gateway restart.
+The standalone remote Kubernetes driver uses direct `Sandbox` creation until
+the remote compute-driver protocol gains an activation callback. Template
+reconciliation remains structurally available so disabling warm pooling, or
+running without local activation, prunes existing gateway-owned warm-pool
+resources when the APIs are present.
+
 Kubernetes can run the supervisor in the default combined topology or in a
 sidecar topology. Combined mode keeps network and process supervision in the
 agent container. Sidecar mode runs network enforcement, the proxy, and gateway
@@ -398,12 +509,17 @@ session in a dedicated sidecar, while the agent container runs only the
 process-supervision leaf and launches the user workload after the sidecar
 serves bootstrap state over a local control socket. The network sidecar owns
 gateway credentials and sends policy plus workload-facing provider environment
-state to the process leaf over that socket. It also streams provider
-environment updates after settings polls so future process sessions see
-updated provider env without giving the process leaf gateway access. The
-pre-workload process supervisor is the only accepted control client: the
-network sidecar verifies its UID, GID, and PID with peer credentials, removes
-the listener after accepting it, and ignores workload-supplied relay targets.
+state to the process leaf over that socket. It binds the control socket before
+waiting for gateway activation so a warm process leaf remains connected and
+idle instead of timing out. The sidecar authenticates that peer immediately but
+withholds the bootstrap response until the activated identity, main-process
+configuration, and policy are available as one complete snapshot. It also
+streams provider environment updates after settings polls so future process
+sessions see updated provider env without giving the process leaf gateway
+access. The pre-workload process supervisor is the only accepted control
+client: the network sidecar verifies its UID, GID, and PID with peer
+credentials, removes the listener after accepting it, and ignores
+workload-supplied relay targets.
 SSH relays use a Linux abstract socket and verify its peer PID against that
 authenticated process-supervisor connection, so workload filesystem access
 cannot replace the relay endpoint. Either supervisor exits when this control
@@ -514,12 +630,13 @@ externally. RBAC uses the same ClusterRole as managed mode but without namespace
 
 ### Watching and Querying
 
-Managed and operator modes set `is_multi_namespace() == true`, which switches
-sandbox CR watchers from namespace-scoped `Api::namespaced` to cluster-wide
-`Api::all_with`. In managed mode the driver scopes cluster-wide queries with a
-`LABEL_GATEWAY_ID` label selector to support multiple gateways on the same
-cluster. K8s Events are not watched in cluster-wide mode — the cluster-wide
-watcher emits only sandbox CR changes, not platform events.
+Managed and operator modes set `is_multi_namespace() == true` and use
+cluster-wide `Api::all_with` watchers for both `Sandbox` and `SandboxClaim`
+resources. The driver scopes both streams with a `LABEL_GATEWAY_ID` label
+selector to support multiple gateways on the same cluster. Claim events
+preserve the OpenShell identity of warm-pooled sandboxes as their allocation
+status changes. K8s Events are not watched in cluster-wide mode, so the watcher
+emits sandbox and claim resource changes but not platform events.
 
 ### SA Token Authentication
 

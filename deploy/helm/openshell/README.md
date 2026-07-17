@@ -32,6 +32,12 @@ supported Sandbox API (`agents.x-k8s.io/v1beta1` or
 `agentSandbox.preflight.enabled=false` for offline `helm template` rendering,
 where Helm cannot discover cluster APIs.
 
+The chart defaults Kubernetes warm pooling on. Install the Agent Sandbox extension APIs too, or set `server.warmPooling.enabled=false`:
+
+```shell
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/extensions.yaml
+```
+
 ## Install on Kubernetes
 
 ```shell
@@ -279,7 +285,7 @@ discovery endpoint or its TLS CA.
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
 | server.sandboxImagePullSecrets | list | `[]` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | server.sandboxJwt.gatewayId | string | `""` | Stable gateway identity embedded in iss/aud of every minted token. Defaults to the release name so HA replicas share identity. |
-| server.sandboxJwt.k8sSaTokenTtlSecs | int | `3600` | Lifetime (seconds) of the projected ServiceAccount token kubelet writes into each sandbox pod for the IssueSandboxToken bootstrap exchange. Kubelet enforces a minimum of 600s; the driver clamps values outside [600, 86400]. Default 3600 — generous, since the supervisor consumes the token within seconds of pod start. |
+| server.sandboxJwt.k8sSaTokenTtlSecs | int | `3600` | Lifetime (seconds) of the projected ServiceAccount token kubelet writes into each sandbox pod for RegisterSupervisor bootstrap. Kubelet enforces a minimum of 600s; the driver clamps values outside [600, 86400]. Default 3600 — generous, since the supervisor consumes the token within seconds of pod start. |
 | server.sandboxJwt.secretDefaultMode | string | `""` | File mode for the mounted JWT signing key Secret. Default 0400 (owner-read only). Override to 0440 or 0444 if the container UID does not match the volume file owner. |
 | server.sandboxJwt.signingSecretName | string | `""` | Name of the Opaque Secret holding the signing key material. Empty falls back to the chart fullname with "-jwt-keys" appended. |
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
@@ -288,6 +294,10 @@ discovery endpoint or its TLS CA.
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). Do not set to null; omit the key to use the default secret name above. |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |
+| server.warmPooling | object | `{"enabled":true,"templates":{"maxReplicas":20,"readyWithinThresholdSecs":5}}` | Enable transparent Kubernetes warm-pool allocation through Agent Sandbox v1beta1 SandboxClaim resources backed by compatible OpenShell-generated SandboxWarmPool resources in the target namespace. |
+| server.warmPooling.templates | object | `{"maxReplicas":20,"readyWithinThresholdSecs":5}` | Reconcile OpenShell SandboxTemplate lifecycle notifications into generated SandboxTemplate and SandboxWarmPool resources when the template asks for startup faster than readyWithinThresholdSecs. |
+| server.warmPooling.templates.maxReplicas | int | `20` | Maximum generated warm-pool replicas per template. |
+| server.warmPooling.templates.readyWithinThresholdSecs | int | `5` | Strict startup threshold in seconds. Templates with desired_service_level.startup.ready_within below this value get a warm pool. |
 | server.workspaceDefaultStorageSize | string | `""` | Default storage size for the workspace PVC in sandbox pods. Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi"). Empty = built-in default (2Gi). |
 | server.workspaceStorageClass | string | `""` | Kubernetes StorageClass for the workspace PVC in sandbox pods. Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the workspace PVC stays Pending and the sandbox never starts. |
 | service.healthPort | int | `8081` | Gateway health service port. |

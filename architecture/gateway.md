@@ -220,8 +220,9 @@ token is reported as connected but unauthenticated.
 Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
 does not grant sandbox identity. Kubernetes deployments use the
 gateway-minted JWT bootstrap path: the supervisor starts with a projected
-ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
-that JWT on subsequent gateway RPCs.
+ServiceAccount token, registers the pod with the gateway, receives a
+gateway-minted sandbox JWT after activation, and uses that JWT on subsequent
+gateway RPCs.
 User-facing RPCs are authorized by descriptor-declared role and scope policy
 when OIDC or edge identity is enabled. The OIDC admin role grants platform-wide
 access and bypasses workspace membership checks. Workspace Admin and Workspace
@@ -235,21 +236,42 @@ identity inspection without client-side token decoding.
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
 runtime material; Kubernetes supervisors exchange a projected ServiceAccount
-token through `IssueSandboxToken`. The gateway delegates that opaque credential
-to the selected compute driver's `AuthenticateSandbox` RPC. A capable driver is
-trusted to return the authenticated sandbox ID, while the gateway still requires
-a matching durable sandbox record before minting a JWT. The Kubernetes driver
-uses its own named configuration to run TokenReview and verify the live pod and
-controlling Sandbox CR. The bootstrap path accepts
-both `agents.x-k8s.io/v1beta1` ownerReferences from newer Agent Sandbox
-controllers and `agents.x-k8s.io/v1alpha1` ownerReferences from existing
-deployments. Supervisors renew gateway JWTs in memory before expiry only while
-the sandbox record still exists. Older tokens are not server-revoked; shared
-deployments bound replay exposure with short `gateway_jwt.ttl_secs` lifetimes.
+token through `RegisterSupervisor`. The gateway delegates that opaque
+credential to the selected compute driver's `AuthenticateSandbox` RPC. The
+driver verifies the credential and returns either a bound sandbox ID or a
+warm-pending supervisor instance with an opaque activation guard. For
+already-bound pods, the gateway still requires a matching durable sandbox record
+before sending an activation message with the gateway JWT. For warm-pooled
+Kubernetes sandboxes, the same check is re-anchored through the claim that
+adopted the warm pod: the live pod must still be controlled by a live
+`Sandbox`, that `Sandbox` must be associated with the live `SandboxClaim`, and
+the sandbox-id metadata on that claim must identify the same OpenShell sandbox
+record before activation can complete. Activation must present the same opaque
+guard returned during registration. Both paths depend on the same Kubernetes
+RBAC boundary: sandbox workloads and untrusted users must not be able to create
+or mutate trusted Agent Sandbox objects, pod metadata, or the configured
+sandbox ServiceAccount in the gateway-managed namespace. `IssueSandboxToken`
+remains as a compatibility shim for older supervisor images and mints through
+the same driver authentication path, but only for already-bound responses.
+Supervisors renew gateway JWTs in
+memory before expiry only while the sandbox record still exists. Older tokens
+are not server-revoked; shared deployments bound replay exposure with short
+`gateway_jwt.ttl_secs` lifetimes.
 The config default is
 `gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
 gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
 shared deployments should set a positive TTL.
+
+Warm supervisors begin capturing logs before activation but do not open the log
+stream until registration supplies the authoritative sandbox ID and installs
+the gateway JWT. A bounded pre-activation queue is rebound to that identity,
+which avoids both missing startup records and a second bootstrap race. In
+sidecar topology, the registering network supervisor also sends the activated
+sandbox ID and name together with the main-process command, TTY, and attachment
+state to the process supervisor over the authenticated local control socket.
+The process supervisor applies that identity before initializing its OCSF
+context and rejects conflicts with any identity already present in its
+environment.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key
@@ -375,6 +397,15 @@ created from a template resolves that resource once and persists an ordinary
 name, labels, annotations, provider attachments, and policy. The sandbox stores
 template provenance as the template name and resource version used for the
 snapshot, so later template edits or deletes do not mutate existing sandboxes.
+For drivers that opt into template reconciliation, a background worker reads
+the complete template set and sends it as authoritative desired state through
+the optional `SandboxTemplateReconciler` driver service. The required
+`ComputeDriver` service remains limited to common sandbox lifecycle operations.
+The worker runs at startup, after template mutations, and periodically, so a
+failed driver call or missed notification is retried from the source of truth.
+The driver applies the supplied set idempotently and prunes backend resources it
+owns for absent templates. Template create and delete therefore need no hidden
+delivery rows or tombstones.
 
 OAuth refresh failures retain a gateway-owned recovery classification alongside
 the refresh state. The gateway reads only a bounded error response and maps

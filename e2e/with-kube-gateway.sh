@@ -713,6 +713,11 @@ fi
 # every gateway K8s call 404s and CreateSandbox never produces a Pod.
 AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION}" \
   bash "${ROOT}/e2e/support/install-agent-sandbox.sh" --context "${KUBE_CONTEXT}"
+if [[ "${AGENT_SANDBOX_VERSION}" != v0.4.* ]]; then
+  echo "Installing agent-sandbox extension CRDs and controllers (${AGENT_SANDBOX_VERSION})..."
+  _agent_sandbox_base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
+  kctl apply -f "${_agent_sandbox_base}/extensions.yaml"
+fi
 
 ACTIVE_CREDENTIAL_DRIVER="${OPENSHELL_E2E_CREDENTIAL_DRIVER:-kubernetes-secrets}"
 if [ "${OPENSHELL_E2E_CREDENTIAL_DRIVERS:-0}" = "1" ] \
@@ -723,6 +728,9 @@ fi
 helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
+if [[ "${AGENT_SANDBOX_VERSION}" == v0.4.* ]]; then
+  helm_extra_args+=(--set "server.warmPooling.enabled=false")
+fi
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2

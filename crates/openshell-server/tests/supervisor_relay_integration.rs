@@ -23,7 +23,8 @@ use hyper_util::{
     server::conn::auto::Builder,
 };
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, SupervisorMessage, TcpForwardFrame,
+    GatewayMessage, RelayFrame, RelayInit, SupervisorActivationMessage, SupervisorMessage,
+    TcpForwardFrame,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -478,6 +479,13 @@ impl OpenShell for RelayGateway {
         &self,
         _: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
     ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    type RegisterSupervisorStream = ReceiverStream<Result<SupervisorActivationMessage, Status>>;
+    async fn register_supervisor(
+        &self,
+        _: tonic::Request<openshell_core::proto::RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
         Err(Status::unimplemented("unused"))
     }
     async fn refresh_sandbox_token(

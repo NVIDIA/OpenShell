@@ -34,13 +34,59 @@ rules:
   # Per-sandbox identity: TokenReview authenticates the projected token from
   # the configured sandbox service account, then the gateway resolves the
   # returned pod name and UID to the pod's `openshell.ai/sandbox-id`
-  # annotation. patch is intentionally NOT granted — the annotation is set
-  # once at pod create and must remain immutable for the lifetime of the
-  # sandbox.
+  # annotation. list supports the owner-validated status-selector fallback for
+  # claim-backed Sandboxes without the pod-name annotation. patch is
+  # intentionally NOT granted — the annotation is set once at pod create and
+  # must remain immutable for the lifetime of the sandbox.
   - apiGroups:
       - ""
     resources:
       - pods
     verbs:
       - get
+      - list
+  # Claim inventory, activation, and cleanup remain available when new warm
+  # allocation is disabled.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxclaims
+    verbs:
+      - get
+      - list
+      - watch
+      - delete
+  {{- if .Values.server.warmPooling.enabled }}
+  # Creating new claims is required only for warm-pool allocation.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxclaims
+    verbs:
+      - create
+  {{- end }}
+  # Keep generated-resource cleanup available when warm allocation is disabled
+  # so the driver can prune resources created by an earlier configuration.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxtemplates
+      - sandboxwarmpools
+    verbs:
+      - list
+      - delete
+  {{- if .Values.server.warmPooling.enabled }}
+  # Reconcile and watch generated resources while warm allocation is enabled.
+  - apiGroups:
+      - extensions.agents.x-k8s.io
+    resources:
+      - sandboxtemplates
+      - sandboxwarmpools
+    verbs:
+      - get
+      - watch
+      - create
+      - patch
+      - update
+  {{- end }}
 {{- end }}

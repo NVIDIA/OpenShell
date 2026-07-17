@@ -582,21 +582,21 @@ fn main() -> Result<()> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         // Set up optional log push layer (gRPC mode only).
-        let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
-            (&args.sandbox_id, &args.openshell_endpoint)
-        {
-            let (tx, handle) = openshell_supervisor_process::log_push::spawn_log_push_task(
-                endpoint.clone(),
-                sandbox_id.clone(),
-            );
-            let layer =
-                openshell_supervisor_process::log_push::LogPushLayer::new(sandbox_id.clone(), tx);
-            Some((layer, handle))
+        let log_push_state = if let Some(endpoint) = &args.openshell_endpoint {
+            let (layer, activation, handle) =
+                openshell_supervisor_process::log_push::spawn_log_push(
+                    endpoint.clone(),
+                    args.sandbox_id.clone(),
+                );
+            Some((layer, activation, handle))
         } else {
             None
         };
-        let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
-        let _log_push_handle = log_push_state.map(|(_, handle)| handle);
+        let push_layer = log_push_state.as_ref().map(|(layer, _, _)| layer.clone());
+        let log_push_activation = log_push_state
+            .as_ref()
+            .map(|(_, activation, _)| activation.clone());
+        let _log_push_handle = log_push_state.map(|(_, _, handle)| handle);
 
         // Shared flag: the sandbox poll loop toggles this when the
         // `ocsf_json_enabled` setting changes. The JSONL layer checks it
@@ -683,12 +683,6 @@ fn main() -> Result<()> {
             )
         };
 
-        // An omitted command (the gateway leaves the default empty rather than
-        // baking a shell it cannot verify) is resolved to a login shell here, in
-        // the supervisor, so it matches the sandbox image: bash when present,
-        // otherwise /bin/sh (e.g. Alpine). An explicit command is used verbatim.
-        let command = resolve_default_command(command);
-
         info!(command = ?command, "Starting sandbox");
         // Note: "Starting sandbox" stays as plain info!() since the OCSF context
         // is not yet initialized at this point (run_sandbox hasn't been called).
@@ -723,25 +717,12 @@ fn main() -> Result<()> {
             args.mode.network,
             args.mode.process,
             upstream_proxy_args,
+            log_push_activation,
         )
         .await
     })?;
 
     std::process::exit(exit_code);
-}
-
-/// Resolve an omitted canonical command to a login shell that exists in this
-/// sandbox image. Empty means "use the default": the gateway leaves an omitted
-/// command empty rather than persisting a shell it cannot verify, so the
-/// supervisor picks one here against the real sandbox filesystem (bash when
-/// present, otherwise `/bin/sh`). An explicit command is returned unchanged.
-fn resolve_default_command(command: Vec<String>) -> Vec<String> {
-    if !command.is_empty() {
-        return command;
-    }
-    let shell = openshell_core::shell::detect_login_shell();
-    info!(shell = %shell, "no command specified; resolved default login shell");
-    vec![shell, "-l".to_string()]
 }
 
 #[cfg(test)]

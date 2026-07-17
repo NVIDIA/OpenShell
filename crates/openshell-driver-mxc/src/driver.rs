@@ -292,6 +292,8 @@ impl MxcComputeBackend {
             supports_sandbox_authentication: false,
             driver_reports_runtime_readiness: true,
             resource_capabilities: None,
+            supports_warm_supervisor_bootstrap: false,
+            supports_sandbox_template_reconciliation: false,
         }
     }
 

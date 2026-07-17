@@ -36,8 +36,10 @@ mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
+mod supervisor_pod_registration;
 pub mod supervisor_session;
 mod telemetry;
+mod template_reconciliation;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod tls;
@@ -45,10 +47,12 @@ mod tls;
 pub(crate) mod tls_test_utils;
 pub mod tracing_bus;
 mod tracing_setup;
+pub(crate) mod warm_pod_activation;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
+use openshell_core::supervisor_bootstrap::SupervisorBootstrapIdentityProvider;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
 use openshell_extension_core::{
@@ -304,11 +308,19 @@ pub struct ServerState {
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
+    /// Pending supervisor registrations awaiting warm-pool
+    /// activation.
+    pub(crate) supervisor_pod_registrations:
+        Arc<supervisor_pod_registration::SupervisorPodRegistrationRegistry>,
+
+    /// Wakes durable sandbox-template lifecycle delivery after CRUD commits.
+    pub(crate) template_reconciliation_notify: Arc<tokio::sync::Notify>,
+
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
     /// Gateway-minted sandbox JWT issuer. `None` when `config.gateway_jwt`
-    /// is not configured; in that mode `IssueSandboxToken` returns
+    /// is not configured; in that mode Kubernetes bootstrap RPCs return
     /// `Status::unavailable`. Populated at startup from the on-disk key
     /// material that `certgen` writes.
     pub sandbox_jwt_issuer: Option<Arc<auth::sandbox_jwt::SandboxJwtIssuer>>,
@@ -317,10 +329,6 @@ pub struct ServerState {
     /// inbound request. Always set when `sandbox_jwt_issuer` is, so callers
     /// presenting a freshly minted token are recognized.
     pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
-
-    /// Optional selected-driver authenticator for the `IssueSandboxToken`
-    /// bootstrap path.
-    pub compute_driver_authenticator: Option<Arc<auth::compute_driver::ComputeDriverAuthenticator>>,
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
@@ -419,10 +427,13 @@ impl ServerState {
             gateway_shutting_down: AtomicBool::new(false),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
+            supervisor_pod_registrations: Arc::new(
+                supervisor_pod_registration::SupervisorPodRegistrationRegistry::new(),
+            ),
+            template_reconciliation_notify: template_reconciliation::new_notify(),
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
-            compute_driver_authenticator: None,
             grpc_rate_limiter,
             gateway_interceptors: None,
             provider_profile_sources:
@@ -667,16 +678,6 @@ pub(crate) async fn run_server(
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
 
-    if state.sandbox_jwt_issuer.is_some() && state.compute.supports_sandbox_authentication() {
-        state.compute_driver_authenticator = Some(Arc::new(
-            auth::compute_driver::ComputeDriverAuthenticator::new(state.compute.clone()),
-        ));
-        info!(
-            driver = state.compute.configured_driver_name(),
-            "compute-driver sandbox bootstrap authenticator enabled"
-        );
-    }
-
     let state = Arc::new(state);
 
     // Reconcile local-driver running intent before watchers spawn so their
@@ -698,11 +699,19 @@ pub(crate) async fn run_server(
     )
     .await?;
 
+    template_reconciliation::spawn_worker(state.clone(), shutdown_rx.clone());
+
     if let Err(err) = state.compute.start_persisted_sandboxes().await {
         warn!(error = %err, "Failed to start persisted sandboxes during startup");
     }
 
     state.compute.spawn_watchers(shutdown_rx.clone());
+    let supervisor_registration_rx = state.supervisor_pod_registrations.subscribe();
+    state.compute.spawn_sandbox_claim_activation(
+        Arc::new(warm_pod_activation::GatewaySupervisorBootstrapActivator::new(state.clone())),
+        supervisor_registration_rx,
+        shutdown_rx.clone(),
+    );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));
@@ -1044,13 +1053,21 @@ async fn terminate_signal() {
 }
 
 pub use compute::{
-    AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess, SharedComputeDriver,
+    AcquiredRemoteDriverEndpoint, DriverWatchStream, ManagedDriverProcess,
+    SandboxClaimActivationSpawner, SharedComputeDriver, SharedSandboxTemplateReconciler,
 };
 
 /// Driver instance returned by a compiled compute-driver factory.
 pub enum ComputeDriverInstance {
     /// A driver hosted in the gateway process.
     InProcess(SharedComputeDriver),
+    /// A driver hosted in the gateway process with supervisor bootstrap hooks.
+    InProcessWithSupervisorBootstrap {
+        driver: SharedComputeDriver,
+        supervisor_bootstrap_identity: Option<Arc<dyn SupervisorBootstrapIdentityProvider>>,
+        sandbox_claim_activation: Option<Arc<dyn SandboxClaimActivationSpawner>>,
+        sandbox_template_reconciler: Option<SharedSandboxTemplateReconciler>,
+    },
     /// A driver process launched and owned by the gateway.
     ManagedRemote(AcquiredRemoteDriverEndpoint),
 }
@@ -1410,6 +1427,31 @@ async fn build_compute_runtime(
                     sandbox_watch_bus,
                     tracing_log_bus,
                     supervisor_sessions,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|error| {
+                    Error::execution(format!("failed to create compute runtime: {error}"))
+                })?,
+                ComputeDriverInstance::InProcessWithSupervisorBootstrap {
+                    driver,
+                    supervisor_bootstrap_identity,
+                    sandbox_claim_activation,
+                    sandbox_template_reconciler,
+                } => ComputeRuntime::from_driver(
+                    registration.name,
+                    driver,
+                    None,
+                    store,
+                    sandbox_index,
+                    sandbox_watch_bus,
+                    tracing_log_bus,
+                    supervisor_sessions,
+                    supervisor_bootstrap_identity,
+                    sandbox_claim_activation,
+                    sandbox_template_reconciler,
                 )
                 .await
                 .map_err(|error| {

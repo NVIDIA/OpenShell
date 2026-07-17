@@ -57,6 +57,9 @@ mod tests {
             "/openshell.inference.v1.Inference/GetInferenceRoute"
         ));
         assert!(!is_sandbox_callable(
+            "/openshell.v1.OpenShell/RegisterSupervisor"
+        ));
+        assert!(!is_sandbox_callable(
             "/openshell.inference.v1.Inference/SetInferenceRoute"
         ));
     }

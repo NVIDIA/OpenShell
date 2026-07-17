@@ -32,6 +32,10 @@ pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 /// environment values may use the `base64url:`-prefixed representation.
 pub const MAIN_PROCESS_SPEC: &str = "OPENSHELL_MAIN_PROCESS_SPEC";
 
+/// Server-owned sandbox annotation that preserves create-time main-process
+/// launch intent for warm-pool activation.
+pub const MAIN_PROCESS_SPEC_ANNOTATION: &str = "openshell.ai/main-process-spec";
+
 const MAIN_PROCESS_SPEC_BASE64URL_PREFIX: &str = "base64url:";
 
 /// Lossless driver-to-supervisor representation of the canonical process.
@@ -77,6 +81,25 @@ impl MainProcessConfig {
         }
     }
 
+    #[must_use]
+    pub fn from_public_spec(
+        spec: Option<&crate::proto::SandboxSpec>,
+        await_main_process_attachment: bool,
+    ) -> Self {
+        match spec {
+            Some(spec) if !spec.command.is_empty() => Self {
+                version: Self::VERSION,
+                command: spec.command.clone(),
+                tty: spec.tty,
+                await_main_process_attachment,
+            },
+            None | Some(_) => Self {
+                await_main_process_attachment,
+                ..Self::scratch()
+            },
+        }
+    }
+
     /// Decode the versioned transport without shell interpretation.
     pub fn decode(encoded: &str) -> Result<Self, String> {
         let decoded;
@@ -114,6 +137,15 @@ impl MainProcessConfig {
         spec: Option<&crate::proto::compute::v1::DriverSandboxSpec>,
     ) -> Result<String, serde_json::Error> {
         serde_json::to_string(&Self::from_driver_spec(spec))
+    }
+
+    /// Encode the public API create-time process intent for activation-time
+    /// delivery to warm supervisors.
+    pub fn encode_public_spec(
+        spec: Option<&crate::proto::SandboxSpec>,
+        await_main_process_attachment: bool,
+    ) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&Self::from_public_spec(spec, await_main_process_attachment))
     }
 
     /// Encode the versioned transport without whitespace for constrained
@@ -196,9 +228,10 @@ pub const USER_ENVIRONMENT: &str = "OPENSHELL_USER_ENVIRONMENT";
 
 /// Path to the projected `ServiceAccount` JWT (Kubernetes driver).
 ///
-/// Used to bootstrap a gateway-minted JWT via `IssueSandboxToken`. Kubelet
-/// writes and rotates this file; the supervisor exchanges its contents
-/// for a gateway JWT at startup and on refresh.
+/// Used to register the supervisor pod and receive a gateway-minted JWT via
+/// `RegisterSupervisor`. Kubelet writes and rotates this file; the
+/// supervisor presents its contents at startup and when rebootstrap is needed
+/// after refresh authentication failure.
 pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
 
 /// Filesystem path to the SPIFFE Workload API UNIX socket used for provider
@@ -254,6 +287,22 @@ mod tests {
         };
         let encoded = MainProcessConfig::encode_driver_spec(Some(&spec)).unwrap();
         let decoded = MainProcessConfig::decode(&encoded).unwrap();
+        assert_eq!(decoded.command, spec.command);
+        assert!(!decoded.tty);
+        assert!(decoded.await_main_process_attachment);
+    }
+
+    #[test]
+    fn public_main_process_transport_preserves_attachment_hint() {
+        let spec = crate::proto::SandboxSpec {
+            command: vec!["date".into(), "-u".into()],
+            tty: false,
+            ..Default::default()
+        };
+
+        let encoded = MainProcessConfig::encode_public_spec(Some(&spec), true).unwrap();
+        let decoded = MainProcessConfig::decode(&encoded).unwrap();
+
         assert_eq!(decoded.command, spec.command);
         assert!(!decoded.tty);
         assert!(decoded.await_main_process_attachment);

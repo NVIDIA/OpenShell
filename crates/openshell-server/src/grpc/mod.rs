@@ -47,13 +47,14 @@ use openshell_core::proto::{
     ListWorkspaceMembersRequest, ListWorkspaceMembersResponse, ListWorkspacesRequest,
     ListWorkspacesResponse, MemoryResourceCapabilities, ProviderProfileResponse, ProviderResponse,
     PushSandboxLogsRequest, PushSandboxLogsResponse, RefreshSandboxTokenRequest,
-    RefreshSandboxTokenResponse, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
-    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest,
-    ReportMainProcessExitResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    ResourceCapabilities, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
-    SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
-    StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    RefreshSandboxTokenResponse, RegisterSupervisorRequest, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
+    RemoveWorkspaceMemberResponse, ReportMainProcessExitRequest, ReportMainProcessExitResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, ResourceCapabilities,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, SandboxResponse, SandboxTemplateResponse,
+    ServiceEndpointResponse, ServiceStatus, StartSandboxRequest, StopSandboxRequest,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorActivationMessage,
     SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
     UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
     UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
@@ -704,6 +705,21 @@ impl OpenShell for OpenShellService {
         request: Request<IssueSandboxTokenRequest>,
     ) -> Result<Response<IssueSandboxTokenResponse>, Status> {
         auth_rpc::handle_issue_sandbox_token(&self.state, request).await
+    }
+
+    type RegisterSupervisorStream = Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<SupervisorActivationMessage, Status>>
+                + Send
+                + 'static,
+        >,
+    >;
+
+    async fn register_supervisor(
+        &self,
+        request: Request<RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
+        auth_rpc::handle_register_supervisor(&self.state, request).await
     }
 
     async fn refresh_sandbox_token(

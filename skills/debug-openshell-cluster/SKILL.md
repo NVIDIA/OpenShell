@@ -522,13 +522,17 @@ container should not receive `OPENSHELL_ENDPOINT`, gateway TLS env vars, the
 sandbox token file, or those credential mounts. Instead, the network sidecar
 serves policy and provider environment state over the Unix control socket from
 `OPENSHELL_SIDECAR_CONTROL_SOCKET` (`/run/openshell-sidecar/control.sock` by
-default). The process supervisor must be the first and only client. After
+default). The network sidecar binds this socket before gateway activation so a
+warm process supervisor can connect and wait without timing out. It authenticates
+the process supervisor immediately but sends no bootstrap response until the
+gateway supplies the activated identity and the sidecar has a complete policy
+snapshot. The process supervisor must be the first and only client. After
 validating its peer UID, GID, and PID, the sidecar unlinks the listener. If the
-connection later closes, the network sidecar exits non-zero so Kubernetes can
-restart it with a fresh listener. If the process supervisor fails before
-launching the workload,
-inspect both containers for control-socket bind, connect, bootstrap, or update
-errors. If new SSH/exec sessions do not pick up refreshed provider environment,
+connection later closes, including before activation, the network sidecar exits
+non-zero so Kubernetes can restart it with a fresh listener. If the process
+supervisor fails before launching the workload, inspect both containers for
+control-socket bind, connect, activation-gated bootstrap, or update errors. If
+new SSH/exec sessions do not pick up refreshed provider environment,
 inspect the network sidecar settings-poll logs and the process container logs
 for provider environment update handling; the process container should consume
 newer provider-env revisions without receiving gateway credentials.
@@ -686,6 +690,9 @@ configuration — check that the gateway spawned the driver binary you expect
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
+| Kubernetes creates cold sandboxes and discovery reports missing Agent Sandbox extension APIs | Agent Sandbox was installed with `manifest.yaml` only while OpenShell warm pooling defaults are enabled | Run `kubectl api-resources --api-group=extensions.agents.x-k8s.io`. Apply Agent Sandbox `extensions.yaml`, or set `server.warmPooling.enabled=false`; the driver rediscovers `SandboxClaim`, `SandboxTemplate`, and `SandboxWarmPool` within 30 seconds without a gateway restart. With the APIs available, disabling warm pooling prunes generated resources owned by this gateway on the next desired-state sweep |
+| Gateway logs `Kubernetes RBAC configuration error for Agent Sandbox extension API` | The extension API is installed, but the gateway ServiceAccount cannot perform the logged operation and scope | Use `kubectl auth can-i <verb> <resource>.extensions.agents.x-k8s.io --as system:serviceaccount:<gateway-namespace>:<service-account> [-n <sandbox-namespace>]`, then correct the Role or ClusterRole binding. Do not treat this as a missing CRD; claim inventory and cleanup fail until authorization is restored |
+| External Kubernetes driver creates cold sandboxes even though extension APIs are installed | The remote compute-driver protocol has no claim-activation callback | Use the in-process Kubernetes driver for warm pooling; the external driver intentionally advertises warm bootstrap as unavailable |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Edge or OIDC gateway returns `Unauthenticated` | Stored login expired, audience/scopes mismatch, or gateway auth configuration changed | `openshell gateway info`, `openshell gateway login <name>`, gateway auth logs |
 | Gateway fails before serving health after enabling an interceptor | Interceptor endpoint unavailable or manifest/binding validation failed | Gateway and interceptor logs; interceptor socket; `binding_policy`, phases, and failure policy |

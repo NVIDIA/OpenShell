@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
+import "google/protobuf/duration.proto";
 import "options.proto";
 import "sandbox.proto";
 
@@ -70,6 +71,18 @@ service ComputeDriver {
   rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
+// Optional compute-driver capability for reusable sandbox-template desired
+// state. Drivers advertise and serve this API only when they support template
+// reconciliation.
+service SandboxTemplateReconciler {
+  // Reconcile the driver to the complete authoritative set of reusable sandbox
+  // templates currently stored by the gateway. The driver must apply the
+  // supplied templates idempotently and prune resources that it owns for
+  // templates absent from the request.
+  rpc ReconcileSandboxTemplates(ReconcileSandboxTemplatesRequest)
+      returns (ReconcileSandboxTemplatesResponse);
+}
+
 message GetCapabilitiesRequest {}
 
 message GetCapabilitiesResponse {
@@ -93,6 +106,10 @@ message GetCapabilitiesResponse {
   bool driver_reports_runtime_readiness = 8;
   // Static portable resource request forms supported by this configured driver.
   ResourceCapabilities resource_capabilities = 9;
+  // Whether the SandboxTemplateReconciler service is implemented.
+  bool supports_sandbox_template_reconciliation = 10;
+  // Whether AuthenticateSandbox may return a warm-pending supervisor instance.
+  bool supports_warm_supervisor_bootstrap = 11;
 }
 
 message AuthenticateSandboxRequest {
@@ -101,8 +118,21 @@ message AuthenticateSandboxRequest {
 }
 
 message AuthenticateSandboxResponse {
-  // Stable gateway-assigned sandbox ID authenticated by the driver.
-  string sandbox_id = 1;
+  oneof binding {
+    // Stable gateway-assigned sandbox ID authenticated by the driver.
+    string sandbox_id = 1;
+    // Driver-authenticated supervisor instance that is valid but not yet bound
+    // to a sandbox. The gateway keeps the registration stream pending until
+    // activation presents the same instance_id and activation_guard.
+    WarmPendingInstance warm_pending = 2;
+  }
+}
+
+message WarmPendingInstance {
+  // Driver-native stable instance ID, for example Kubernetes pod UID.
+  string instance_id = 1;
+  // Opaque driver-owned activation correlation value.
+  string activation_guard = 2 [(openshell.options.v1.secret) = true];
 }
 
 // Static portable resource request forms supported by a compute driver.
@@ -256,6 +286,43 @@ message DriverSandboxTemplate {
   optional bool user_namespaces = 13;
 }
 
+// Gateway-owned reusable template translated into the driver-native compute
+// contract. Drivers opt in to receiving this resource via capabilities.
+message DriverSandboxTemplateResource {
+  string id = 1;
+  string name = 2;
+  string workspace = 3;
+  uint64 resource_version = 4;
+  map<string, string> labels = 5;
+  map<string, string> annotations = 6;
+  int64 deletion_timestamp_ms = 7;
+  DriverSandboxTemplate template = 8;
+  DriverSandboxTemplateServiceLevel desired_service_level = 9;
+  ResourceRequirements resource_requirements = 10;
+}
+
+message DriverSandboxTemplateServiceLevel {
+  DriverSandboxTemplateStartup startup = 1;
+}
+
+message DriverSandboxTemplateStartup {
+  google.protobuf.Duration ready_within = 1;
+  uint32 max_burst = 2;
+}
+
+message ReconcileSandboxTemplatesRequest {
+  // Complete desired set. An empty list means the driver must remove every
+  // sandbox-template resource owned by this gateway.
+  repeated DriverSandboxTemplateResource templates = 1;
+}
+
+message ReconcileSandboxTemplatesResponse {
+  // Number of desired templates successfully evaluated by the driver.
+  uint32 reconciled = 1;
+  // Number of stale driver-owned template resources pruned from the backend.
+  uint32 pruned = 2;
+}
+
 // Typed compute-resource requirements.
 //
 // Values use Kubernetes-style quantity strings (e.g. "500m", "2", "4Gi")
@@ -354,9 +421,20 @@ message ListSandboxesResponse {
 message CreateSandboxRequest {
   // Sandbox configuration to provision on the compute platform.
   DriverSandbox sandbox = 1;
+  // Template provenance set only when the public CreateSandbox request used a
+  // named SandboxTemplate.
+  DriverSandboxTemplateRef sandbox_template = 2;
 }
 
 message CreateSandboxResponse {}
+
+// Stable source template identity for a template-created sandbox.
+message DriverSandboxTemplateRef {
+  string id = 1;
+  string name = 2;
+  string workspace = 3;
+  uint64 resource_version = 4;
+}
 
 message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.

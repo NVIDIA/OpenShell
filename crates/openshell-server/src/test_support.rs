@@ -4,18 +4,23 @@
 //! Test fixtures for exercising gateway integration points.
 
 use futures::{Stream, stream};
-#[cfg(unix)]
-use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverSandbox, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverSandbox, DriverSandboxTemplateRef,
+    DriverSandboxTemplateResource, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GatewayListenerRequirement, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    ReconcileSandboxTemplatesRequest, ReconcileSandboxTemplatesResponse, StartSandboxRequest,
+    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    sandbox_template_reconciler_server::SandboxTemplateReconciler,
+};
+#[cfg(unix)]
+use openshell_core::proto::compute::v1::{
+    compute_driver_server::ComputeDriverServer,
+    sandbox_template_reconciler_server::SandboxTemplateReconcilerServer,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -41,6 +46,9 @@ pub enum FakeComputeDriverCall {
     ValidateSandboxCreate {
         sandbox: Option<DriverSandbox>,
     },
+    ReconcileSandboxTemplates {
+        templates: Vec<DriverSandboxTemplateResource>,
+    },
     GetSandbox {
         sandbox_id: String,
         sandbox_name: String,
@@ -48,6 +56,7 @@ pub enum FakeComputeDriverCall {
     ListSandboxes,
     CreateSandbox {
         sandbox: Option<DriverSandbox>,
+        sandbox_template: Option<DriverSandboxTemplateRef>,
     },
     StopSandbox {
         sandbox_id: String,
@@ -98,6 +107,8 @@ impl FakeComputeDriver {
                     supports_sandbox_authentication: false,
                     driver_reports_runtime_readiness: false,
                     resource_capabilities: None,
+                    supports_warm_supervisor_bootstrap: false,
+                    supports_sandbox_template_reconciliation: false,
                 },
                 gateway_listener_requirements: Vec::new(),
                 gateway_listener_requirements_supported: true,
@@ -129,6 +140,14 @@ impl FakeComputeDriver {
     #[must_use]
     pub fn with_gateway_manages_lifecycle(self) -> Self {
         self.with_state(|state| state.capabilities.gateway_manages_lifecycle = true);
+        self
+    }
+
+    #[must_use]
+    pub fn with_sandbox_template_reconciliation(self) -> Self {
+        self.with_state(|state| {
+            state.capabilities.supports_sandbox_template_reconciliation = true;
+        });
         self
     }
 
@@ -177,9 +196,11 @@ impl FakeComputeDriver {
         let socket_path = socket_path.as_ref().to_path_buf();
         let listener = UnixListener::bind(&socket_path)?;
         let driver = self.clone();
+        let reconciler = self.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(ComputeDriverServer::new(driver))
+                .add_service(SandboxTemplateReconcilerServer::new(reconciler))
                 .serve_with_incoming(UnixIncoming { listener })
                 .await
         });
@@ -343,13 +364,15 @@ impl ComputeDriver for FakeComputeDriver {
         self.record_traceparent(request.metadata());
         let request = request.into_inner();
         let sandbox = request.sandbox;
+        let sandbox_template = request.sandbox_template;
         self.with_state(|state| {
             if let Some(sandbox) = sandbox.as_ref() {
                 state.sandboxes.insert(sandbox.id.clone(), sandbox.clone());
             }
-            state
-                .calls
-                .push(FakeComputeDriverCall::CreateSandbox { sandbox });
+            state.calls.push(FakeComputeDriverCall::CreateSandbox {
+                sandbox,
+                sandbox_template,
+            });
         });
         Ok(Response::new(CreateSandboxResponse {}))
     }
@@ -433,5 +456,28 @@ impl ComputeDriver for FakeComputeDriver {
         _request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
         Ok(Response::new(DeleteWorkspaceResponse {}))
+    }
+}
+
+#[tonic::async_trait]
+impl SandboxTemplateReconciler for FakeComputeDriver {
+    async fn reconcile_sandbox_templates(
+        &self,
+        request: Request<ReconcileSandboxTemplatesRequest>,
+    ) -> Result<Response<ReconcileSandboxTemplatesResponse>, Status> {
+        self.record_traceparent(request.metadata());
+        let request = request.into_inner();
+        let reconciled = u32::try_from(request.templates.len()).unwrap_or(u32::MAX);
+        self.with_state(|state| {
+            state
+                .calls
+                .push(FakeComputeDriverCall::ReconcileSandboxTemplates {
+                    templates: request.templates,
+                });
+        });
+        Ok(Response::new(ReconcileSandboxTemplatesResponse {
+            reconciled,
+            pruned: 0,
+        }))
     }
 }

@@ -121,6 +121,7 @@ impl DescriptorAuthTable {
                 let auth_mode = match auth_mode_str.as_str() {
                     "unauthenticated" => AuthMode::Unauthenticated,
                     "sandbox" => AuthMode::Sandbox,
+                    "supervisor_registration" => AuthMode::SupervisorRegistration,
                     "bearer" => AuthMode::Bearer,
                     "dual" => AuthMode::Dual,
                     other => {

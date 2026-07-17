@@ -529,6 +529,8 @@ impl PodmanComputeDriver {
                     count_selection_supported: true,
                 }),
             }),
+            supports_warm_supervisor_bootstrap: false,
+            supports_sandbox_template_reconciliation: false,
         })
     }
 

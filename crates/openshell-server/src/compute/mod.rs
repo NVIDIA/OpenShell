@@ -23,22 +23,32 @@ use openshell_core::proto::compute::v1::{
     AuthenticateSandboxRequest, CreateSandboxRequest, DeleteSandboxRequest, DeleteWorkspaceRequest,
     DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent, DriverResourceRequirements,
     DriverSandbox, DriverSandboxSpec, DriverSandboxStatus, DriverSandboxTemplate,
-    EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    DriverSandboxTemplateRef, DriverSandboxTemplateResource, DriverSandboxTemplateServiceLevel,
+    DriverSandboxTemplateStartup, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GatewayListenerRequirement as ProtoGatewayListenerRequirement, GetCapabilitiesRequest,
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GpuResourceRequirements as DriverGpuResourceRequirements,
-    ListSandboxesRequest, ResourceCapabilities as DriverResourceCapabilities,
+    ListSandboxesRequest, ReconcileSandboxTemplatesRequest, ReconcileSandboxTemplatesResponse,
+    ResourceCapabilities as DriverResourceCapabilities,
     ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
     StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    gateway_listener_requirement::Selector, watch_sandboxes_event,
+    authenticate_sandbox_response, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    sandbox_template_reconciler_client::SandboxTemplateReconcilerClient,
+    sandbox_template_reconciler_server::SandboxTemplateReconciler, watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxResources, SandboxServiceLevel,
+    SandboxSpec, SandboxStartup, SandboxStatus, SandboxTemplate, SandboxWorkloadConfig,
+    SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
+};
+use openshell_core::supervisor_bootstrap::{
+    SupervisorBootstrapActivator, SupervisorBootstrapBinding, SupervisorBootstrapIdentity,
+    SupervisorBootstrapIdentityProvider,
 };
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace};
+#[cfg(not(target_os = "windows"))]
 use prost::Message;
 use std::collections::HashMap;
 use std::fmt;
@@ -62,6 +72,7 @@ pub type DriverWatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+pub type SharedSandboxTemplateReconciler = Arc<dyn SandboxTemplateReconciler + Send + Sync>;
 
 use traced_driver::TracedDriver;
 
@@ -75,7 +86,7 @@ mod traced_driver {
     use tonic::Status;
     use tracing::Instrument as _;
 
-    use super::{DriverWatchStream, SharedComputeDriver};
+    use super::{DriverWatchStream, SharedComputeDriver, SharedSandboxTemplateReconciler};
 
     type TracedWatchStream = openshell_otel::TracedGrpcStream<DriverWatchStream>;
 
@@ -139,6 +150,30 @@ mod traced_driver {
                     Err(status) => {
                         openshell_otel::record_grpc_status(&current, status.code());
                     }
+                }
+                result
+            }
+            .instrument(span)
+            .await
+        }
+
+        pub(super) async fn call_reconciler<T, Fut>(
+            &self,
+            reconciler: SharedSandboxTemplateReconciler,
+            rpc: openshell_otel::ComputeDriverRpc,
+            call: impl FnOnce(SharedSandboxTemplateReconciler) -> Fut,
+        ) -> Result<T, Status>
+        where
+            Fut: Future<Output = Result<T, Status>>,
+        {
+            let span = self.span(rpc, None);
+            let future = call(reconciler);
+            async {
+                let result = future.await;
+                let current = tracing::Span::current();
+                match &result {
+                    Ok(_) => openshell_otel::record_grpc_status(&current, tonic::Code::Ok),
+                    Err(status) => openshell_otel::record_grpc_status(&current, status.code()),
                 }
                 result
             }
@@ -292,6 +327,7 @@ enum BeginDelete {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ComputeDriverInfoSnapshot {
     /// Gateway-selected driver name used for routing and `driver_config` keys.
     pub name: String,
@@ -307,8 +343,30 @@ pub struct ComputeDriverInfoSnapshot {
     pub driver_reports_runtime_readiness: bool,
     /// Static portable resource request forms from the startup capability snapshot.
     pub resource_capabilities: Option<DriverResourceCapabilities>,
+    /// Driver opted into authoritative sandbox-template reconciliation.
+    pub supports_sandbox_template_reconciliation: bool,
+    /// Driver may return warm-pending instances from `AuthenticateSandbox`.
+    pub supports_warm_supervisor_bootstrap: bool,
 }
 
+/// Start a single sandbox whose store record indicates it should be
+/// running. Implemented by drivers (currently only Docker) where compute
+/// resources do not auto-restart with the gateway. Returns `Ok(true)` if
+/// the backend resource was found and started (or was already running),
+/// `Ok(false)` if no backend resource exists.
+#[tonic::async_trait]
+trait LeaseScopedReconciler: Send + Sync {
+    async fn run(&self, cancel: watch::Receiver<bool>);
+}
+
+pub trait SandboxClaimActivationSpawner: Send + Sync {
+    fn spawn(
+        &self,
+        activator: Arc<dyn SupervisorBootstrapActivator>,
+        registration_rx: watch::Receiver<u64>,
+        shutdown_rx: watch::Receiver<bool>,
+    );
+}
 /// Interval between store-vs-backend reconciliation sweeps.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -448,6 +506,35 @@ impl AcquiredRemoteDriverEndpoint {
 #[derive(Debug, Clone)]
 struct RemoteComputeDriver {
     client: RemoteComputeDriverClient,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteSandboxTemplateReconciler {
+    client: SandboxTemplateReconcilerClient<
+        tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>,
+    >,
+}
+
+impl RemoteSandboxTemplateReconciler {
+    fn new(channel: Channel) -> Self {
+        Self {
+            client: SandboxTemplateReconcilerClient::with_interceptor(
+                channel,
+                TraceContextInterceptor,
+            ),
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl SandboxTemplateReconciler for RemoteSandboxTemplateReconciler {
+    async fn reconcile_sandbox_templates(
+        &self,
+        request: Request<ReconcileSandboxTemplatesRequest>,
+    ) -> Result<tonic::Response<ReconcileSandboxTemplatesResponse>, Status> {
+        let mut client = self.client.clone();
+        client.reconcile_sandbox_templates(request).await
+    }
 }
 
 type RemoteComputeDriverClient = ComputeDriverClient<
@@ -602,6 +689,10 @@ pub struct ComputeRuntime {
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    supervisor_bootstrap_identity: Option<Arc<dyn SupervisorBootstrapIdentityProvider>>,
+    sandbox_claim_activation: Option<Arc<dyn SandboxClaimActivationSpawner>>,
+    sandbox_template_reconciler: Option<SharedSandboxTemplateReconciler>,
+    lease_scoped_reconciler: Option<Arc<dyn LeaseScopedReconciler>>,
     sync_lock: Arc<Mutex<()>>,
     lifecycle_gates: Arc<LifecycleGateRegistry>,
     gateway_listener_requirements: Vec<GatewayListenerRequirement>,
@@ -611,6 +702,30 @@ pub struct ComputeRuntime {
 impl fmt::Debug for ComputeRuntime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ComputeRuntime").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct ComputeDriverBootstrapIdentityProvider {
+    compute: ComputeRuntime,
+}
+
+impl ComputeDriverBootstrapIdentityProvider {
+    fn new(compute: ComputeRuntime) -> Self {
+        Self { compute }
+    }
+}
+
+#[tonic::async_trait]
+impl SupervisorBootstrapIdentityProvider for ComputeDriverBootstrapIdentityProvider {
+    async fn authenticate_registration(
+        &self,
+        token: &str,
+    ) -> Result<Option<SupervisorBootstrapIdentity>, Status> {
+        self.compute
+            .authenticate_sandbox_for_registration(token)
+            .await
+            .map(Some)
     }
 }
 
@@ -634,6 +749,9 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
+        supervisor_bootstrap_identity: Option<Arc<dyn SupervisorBootstrapIdentityProvider>>,
+        sandbox_claim_activation: Option<Arc<dyn SandboxClaimActivationSpawner>>,
+        sandbox_template_reconciler: Option<SharedSandboxTemplateReconciler>,
     ) -> Result<Self, ComputeError> {
         let capabilities = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
@@ -643,6 +761,27 @@ impl ComputeRuntime {
                 compute_error_from_status(status)
             })?
             .into_inner();
+        if capabilities.supports_warm_supervisor_bootstrap && sandbox_claim_activation.is_none() {
+            return Err(ComputeError::Message(format!(
+                "compute driver '{driver_name}' advertises warm supervisor bootstrap without an activation controller"
+            )));
+        }
+        let sandbox_claim_activation = if capabilities.supports_warm_supervisor_bootstrap {
+            sandbox_claim_activation
+        } else {
+            None
+        };
+        if capabilities.supports_sandbox_template_reconciliation
+            && sandbox_template_reconciler.is_none()
+        {
+            return Err(ComputeError::Message(format!(
+                "compute driver '{driver_name}' advertises sandbox-template reconciliation without providing the optional reconciler service"
+            )));
+        }
+        let sandbox_template_reconciler = capabilities
+            .supports_sandbox_template_reconciliation
+            .then_some(sandbox_template_reconciler)
+            .flatten();
         info!(
             configured_driver = %driver_name,
             advertised_driver = %capabilities.driver_name,
@@ -656,6 +795,9 @@ impl ComputeRuntime {
             supports_sandbox_authentication: capabilities.supports_sandbox_authentication,
             driver_reports_runtime_readiness: capabilities.driver_reports_runtime_readiness,
             resource_capabilities: capabilities.resource_capabilities,
+            supports_sandbox_template_reconciliation: capabilities
+                .supports_sandbox_template_reconciliation,
+            supports_warm_supervisor_bootstrap: capabilities.supports_warm_supervisor_bootstrap,
         };
         let default_image = capabilities.default_image;
         let gateway_listener_requirements = match driver
@@ -722,6 +864,10 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            supervisor_bootstrap_identity,
+            sandbox_claim_activation,
+            sandbox_template_reconciler,
+            lease_scoped_reconciler: None,
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements,
@@ -762,6 +908,9 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
+        let sandbox_template_reconciler: SharedSandboxTemplateReconciler = Arc::new(
+            RemoteSandboxTemplateReconciler::new(endpoint.channel.clone()),
+        );
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(endpoint.channel));
         Self::from_driver(
             endpoint.name,
@@ -772,6 +921,9 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            None,
+            None,
+            Some(sandbox_template_reconciler),
         )
         .await
     }
@@ -786,36 +938,14 @@ impl ComputeRuntime {
         std::slice::from_ref(&self.driver_info)
     }
 
-    #[must_use]
     pub fn configured_driver_name(&self) -> &str {
         &self.driver_info.name
     }
 
-    #[must_use]
-    pub fn supports_sandbox_authentication(&self) -> bool {
-        self.driver_info.supports_sandbox_authentication
+    pub(crate) fn supports_sandbox_template_reconciliation(&self) -> bool {
+        self.driver_info.supports_sandbox_template_reconciliation
     }
 
-    pub(crate) async fn authenticate_sandbox(&self, credential: &str) -> Result<String, Status> {
-        if !self.supports_sandbox_authentication() {
-            return Err(Status::unimplemented(
-                "selected compute driver does not authenticate sandbox credentials",
-            ));
-        }
-        let request = AuthenticateSandboxRequest {
-            credential: credential.to_string(),
-        };
-        self.driver
-            .call(
-                openshell_otel::rpc::AUTHENTICATE_SANDBOX,
-                None,
-                |driver| async move { driver.authenticate_sandbox(Request::new(request)).await },
-            )
-            .await
-            .map(|response| response.into_inner().sandbox_id)
-    }
-
-    #[must_use]
     pub(crate) fn telemetry_compute_driver(&self) -> TelemetryComputeDriver {
         self.telemetry_compute_driver
     }
@@ -827,6 +957,101 @@ impl ComputeRuntime {
     ) -> Self {
         self.telemetry_compute_driver = telemetry_compute_driver;
         self
+    }
+
+    #[must_use]
+    pub fn supervisor_bootstrap_identity_provider(
+        &self,
+    ) -> Option<Arc<dyn SupervisorBootstrapIdentityProvider>> {
+        self.supervisor_bootstrap_identity.clone().or_else(|| {
+            if self.driver_info.supports_sandbox_authentication {
+                let provider: Arc<dyn SupervisorBootstrapIdentityProvider> =
+                    Arc::new(ComputeDriverBootstrapIdentityProvider::new(self.clone()));
+                Some(provider)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) async fn authenticate_sandbox_for_registration(
+        &self,
+        credential: &str,
+    ) -> Result<SupervisorBootstrapIdentity, Status> {
+        if !self.driver_info.supports_sandbox_authentication {
+            return Err(Status::failed_precondition(
+                "selected compute driver does not support supervisor bootstrap authentication",
+            ));
+        }
+        let response = self
+            .driver
+            .call(
+                openshell_otel::rpc::AUTHENTICATE_SANDBOX,
+                None,
+                |driver| async move {
+                    driver
+                        .authenticate_sandbox(Request::new(AuthenticateSandboxRequest {
+                            credential: credential.to_string(),
+                        }))
+                        .await
+                },
+            )
+            .await?
+            .into_inner();
+
+        let binding = response.binding.ok_or_else(|| {
+            Status::permission_denied("compute driver returned no sandbox binding")
+        })?;
+        match binding {
+            authenticate_sandbox_response::Binding::SandboxId(sandbox_id) => {
+                if sandbox_id.is_empty() {
+                    return Err(Status::permission_denied(
+                        "compute driver returned an empty sandbox identity",
+                    ));
+                }
+                Ok(SupervisorBootstrapIdentity {
+                    driver: self.driver_info.name.clone(),
+                    instance_id: String::new(),
+                    binding: SupervisorBootstrapBinding::BoundSandbox { sandbox_id },
+                })
+            }
+            authenticate_sandbox_response::Binding::WarmPending(warm_pending) => {
+                if !self.driver_info.supports_warm_supervisor_bootstrap {
+                    return Err(Status::permission_denied(
+                        "compute driver returned warm supervisor bootstrap without advertising support",
+                    ));
+                }
+                if warm_pending.instance_id.is_empty() {
+                    return Err(Status::permission_denied(
+                        "compute driver returned an empty supervisor instance ID",
+                    ));
+                }
+                if warm_pending.activation_guard.is_empty() {
+                    return Err(Status::permission_denied(
+                        "compute driver returned an empty activation guard",
+                    ));
+                }
+                Ok(SupervisorBootstrapIdentity {
+                    driver: self.driver_info.name.clone(),
+                    instance_id: warm_pending.instance_id,
+                    binding: SupervisorBootstrapBinding::WarmPending {
+                        activation_guard: warm_pending.activation_guard,
+                    },
+                })
+            }
+        }
+    }
+
+    pub(crate) fn spawn_sandbox_claim_activation(
+        &self,
+        activator: Arc<dyn SupervisorBootstrapActivator>,
+        registration_rx: watch::Receiver<u64>,
+        shutdown_rx: watch::Receiver<bool>,
+    ) {
+        if let Some(controller) = self.sandbox_claim_activation.clone() {
+            controller.spawn(activator, registration_rx, shutdown_rx);
+        }
     }
 
     #[must_use]
@@ -900,6 +1125,7 @@ impl ComputeRuntime {
         sandbox: Sandbox,
         sandbox_token: Option<String>,
         await_main_process_attachment: bool,
+        sandbox_template: Option<DriverSandboxTemplateRef>,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
@@ -960,6 +1186,7 @@ impl ComputeRuntime {
                     driver
                         .create_sandbox(Request::new(CreateSandboxRequest {
                             sandbox: Some(driver_sandbox),
+                            sandbox_template,
                         }))
                         .await
                 },
@@ -988,6 +1215,20 @@ impl ComputeRuntime {
                     .await;
                 self.sandbox_index.remove_sandbox(sandbox.object_id());
                 Err(Status::failed_precondition(status.message().to_string()))
+            }
+            Err(status) if status.code() == Code::Unavailable => {
+                // The driver may have committed the backend create. Keep the
+                // durable Provisioning row so its watcher can reconcile the
+                // accepted resource instead of allowing a new sandbox ID to
+                // reuse the same name. If no backend resource appears, the
+                // store-vs-backend reconciler prunes the stale Provisioning
+                // row after ORPHAN_GRACE_PERIOD and clears the name index.
+                warn!(
+                    sandbox_id = %sandbox.object_id(),
+                    error = %status,
+                    "sandbox create outcome is ambiguous; preserving provisioning state"
+                );
+                Err(Status::unavailable(status.message().to_string()))
             }
             Err(err) => {
                 let _ = self
@@ -2053,6 +2294,7 @@ impl ComputeRuntime {
     pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
         if self.store.is_single_replica() {
+            let _lease_scoped_handle = self.spawn_lease_scoped_reconciler(shutdown_rx.clone());
             let watch_runtime = runtime.clone();
             let watch_shutdown = shutdown_rx.clone();
             tokio::spawn(async move {
@@ -2066,6 +2308,17 @@ impl ComputeRuntime {
                 runtime.lease_coordinator(shutdown_rx).await;
             });
         }
+    }
+
+    fn spawn_lease_scoped_reconciler(
+        &self,
+        cancel: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        self.lease_scoped_reconciler.clone().map(|reconciler| {
+            tokio::spawn(async move {
+                reconciler.run(cancel).await;
+            })
+        })
     }
 
     pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
@@ -2187,17 +2440,64 @@ impl ComputeRuntime {
         }
     }
 
-    /// Reconcile running intent for local compute after a gateway restart.
-    ///
-    /// `StartSandbox` is idempotent, so call it for every persisted phase that
-    /// requires running compute for drivers that request gateway-managed
-    /// lifecycle. Stable stopped and deleting states are deliberately left
-    /// alone. Error-phase sandboxes are included only when their Ready
-    /// condition indicates the runtime went away underneath a running container
-    /// — a signal-kill from a machine/daemon restart or an explicit runtime
-    /// stop. If the container still exists it is restarted and the sandbox is
-    /// moved back to `Provisioning`; otherwise it stays in `Error`. Ordinary
-    /// application exits and crashes stay terminal and are not relaunched.
+    pub async fn reconcile_sandbox_templates(
+        &self,
+        templates: &[SandboxWorkloadTemplate],
+    ) -> Result<ReconcileSandboxTemplatesResponse, Status> {
+        if !self.driver_info.supports_sandbox_template_reconciliation {
+            return Ok(ReconcileSandboxTemplatesResponse::default());
+        }
+        let mut driver_templates = Vec::with_capacity(templates.len());
+        for template in templates {
+            match driver_sandbox_template_resource_from_public(template, &self.driver_info.name) {
+                Ok(template) => driver_templates.push(template),
+                Err(err) if err.code() == Code::InvalidArgument => {
+                    warn!(
+                        template_id = template
+                            .metadata
+                            .as_ref()
+                            .map_or("", |metadata| metadata.id.as_str()),
+                        template_name = template
+                            .metadata
+                            .as_ref()
+                            .map_or("", |metadata| metadata.name.as_str()),
+                        workspace = template
+                            .metadata
+                            .as_ref()
+                            .map_or("", |metadata| metadata.workspace.as_str()),
+                        error = %err,
+                        "Skipping invalid sandbox template during reconciliation"
+                    );
+                }
+                Err(err) => return Err(*err),
+            }
+        }
+        let reconciler = self.sandbox_template_reconciler.clone().ok_or_else(|| {
+            Status::failed_precondition("sandbox-template reconciler unavailable")
+        })?;
+        self.driver
+            .call_reconciler(
+                reconciler,
+                openshell_otel::rpc::RECONCILE_SANDBOX_TEMPLATES,
+                |reconciler| async move {
+                    reconciler
+                        .reconcile_sandbox_templates(Request::new(
+                            ReconcileSandboxTemplatesRequest {
+                                templates: driver_templates,
+                            },
+                        ))
+                        .await
+                },
+            )
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    /// Start sandboxes whose store records say they should be running.
+    /// For each sandbox in the store whose phase is not `Deleting` or `Error`,
+    /// ask the driver to start the underlying resource. If the driver reports
+    /// that the resource no longer exists or fails to start, move the sandbox
+    /// to the `Error` phase so the failure surfaces in the UI.
     ///
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-start state on its first poll.
@@ -2598,6 +2898,8 @@ impl ComputeRuntime {
             runtime.reconcile_loop(cancel_rx).await;
         });
 
+        let lease_scoped_handle = self.spawn_lease_scoped_reconciler(cancel_tx.subscribe());
+
         loop {
             tokio::select! {
                 () = tokio::time::sleep(LEASE_RENEWAL_INTERVAL) => {
@@ -2624,6 +2926,9 @@ impl ComputeRuntime {
                         let _ = cancel_tx.send(true);
                         let _ = watch_handle.await;
                         let _ = reconcile_handle.await;
+                        if let Some(handle) = lease_scoped_handle {
+                            let _ = handle.await;
+                        }
                         return;
                     }
                 }
@@ -2633,6 +2938,9 @@ impl ComputeRuntime {
         let _ = cancel_tx.send(true);
         let _ = watch_handle.await;
         let _ = reconcile_handle.await;
+        if let Some(handle) = lease_scoped_handle {
+            let _ = handle.await;
+        }
         info!(replica = %lease.replica_id(), "reconciler lease lost — returning to standby");
     }
 
@@ -3861,7 +4169,7 @@ fn driver_sandbox_spec_from_public(
         template: spec
             .template
             .as_ref()
-            .map(|template| driver_sandbox_template_from_public(template, driver_name))
+            .map(|template| driver_inline_sandbox_template_from_public(template, driver_name))
             .transpose()?,
         policy: spec.policy.clone(),
         resource_requirements: spec.resource_requirements.as_ref().map(|requirements| {
@@ -3879,7 +4187,75 @@ fn driver_sandbox_spec_from_public(
     })
 }
 
-fn driver_sandbox_template_from_public(
+fn driver_sandbox_template_resource_from_public(
+    template: &SandboxWorkloadTemplate,
+    driver_name: &str,
+) -> Result<DriverSandboxTemplateResource, Box<Status>> {
+    let metadata = template
+        .metadata
+        .as_ref()
+        .ok_or_else(|| Box::new(Status::invalid_argument("template metadata is required")))?;
+    let spec = template
+        .spec
+        .as_ref()
+        .ok_or_else(|| Box::new(Status::invalid_argument("template spec is required")))?;
+    let workload = spec
+        .workload
+        .as_ref()
+        .ok_or_else(|| Box::new(Status::invalid_argument("template workload is required")))?;
+
+    Ok(DriverSandboxTemplateResource {
+        id: metadata.id.clone(),
+        name: metadata.name.clone(),
+        workspace: metadata.workspace.clone(),
+        resource_version: metadata.resource_version,
+        labels: metadata.labels.clone(),
+        annotations: metadata.annotations.clone(),
+        deletion_timestamp_ms: metadata.deletion_timestamp_ms,
+        template: Some(driver_sandbox_template_from_workload(
+            workload,
+            &spec.driver_config,
+            driver_name,
+        )?),
+        desired_service_level: spec
+            .desired_service_level
+            .as_ref()
+            .map(driver_template_service_level_from_public),
+        resource_requirements: driver_resource_requirements_from_workload(workload),
+    })
+}
+
+fn driver_template_service_level_from_public(
+    service_level: &SandboxServiceLevel,
+) -> DriverSandboxTemplateServiceLevel {
+    DriverSandboxTemplateServiceLevel {
+        startup: service_level
+            .startup
+            .as_ref()
+            .map(driver_template_startup_from_public),
+    }
+}
+
+fn driver_template_startup_from_public(startup: &SandboxStartup) -> DriverSandboxTemplateStartup {
+    DriverSandboxTemplateStartup {
+        ready_within: startup.ready_within,
+        max_burst: startup.max_burst,
+    }
+}
+
+fn driver_resource_requirements_from_workload(
+    workload: &SandboxWorkloadConfig,
+) -> Option<DriverSandboxResourceRequirements> {
+    let resources = workload.resources.as_ref()?;
+    resources
+        .gpu
+        .as_ref()
+        .map(|gpu| DriverSandboxResourceRequirements {
+            gpu: Some(DriverGpuResourceRequirements { count: gpu.count }),
+        })
+}
+
+fn driver_inline_sandbox_template_from_public(
     template: &SandboxTemplate,
     driver_name: &str,
 ) -> Result<DriverSandboxTemplate, Box<Status>> {
@@ -3893,6 +4269,36 @@ fn driver_sandbox_template_from_public(
         driver_config: select_driver_config(&template.driver_config, driver_name)?,
         user_namespaces: template.user_namespaces,
     })
+}
+
+fn driver_sandbox_template_from_workload(
+    workload: &SandboxWorkloadConfig,
+    driver_config: &Option<prost_types::Struct>,
+    driver_name: &str,
+) -> Result<DriverSandboxTemplate, Box<Status>> {
+    Ok(DriverSandboxTemplate {
+        image: workload.image.clone(),
+        agent_socket_path: String::new(),
+        labels: HashMap::new(),
+        environment: workload.environment.clone(),
+        resources: workload
+            .resources
+            .as_ref()
+            .map(driver_resource_limits_from_workload),
+        platform_config: None,
+        driver_config: select_driver_config(driver_config, driver_name)?,
+        user_namespaces: None,
+    })
+}
+
+fn driver_resource_limits_from_workload(
+    resources: &SandboxResources,
+) -> DriverResourceRequirements {
+    DriverResourceRequirements {
+        cpu_limit: resources.cpu.clone(),
+        memory_limit: resources.memory.clone(),
+        ..Default::default()
+    }
 }
 
 fn select_driver_config(
@@ -4594,20 +5000,6 @@ impl NoopTestDriver {
             sandbox_authentication: None,
         }
     }
-
-    pub fn authenticating_sandbox(sandbox_id: impl Into<String>) -> Self {
-        Self {
-            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
-            sandbox_authentication: Some(Ok(sandbox_id.into())),
-        }
-    }
-
-    pub fn failing_sandbox_authentication(code: Code, message: impl Into<String>) -> Self {
-        Self {
-            workspace_delete_failures: std::sync::atomic::AtomicUsize::new(0),
-            sandbox_authentication: Some(Err((code, message.into()))),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -4633,7 +5025,9 @@ impl ComputeDriver for NoopTestDriver {
         match &self.sandbox_authentication {
             Some(Ok(sandbox_id)) => Ok(tonic::Response::new(
                 openshell_core::proto::compute::v1::AuthenticateSandboxResponse {
-                    sandbox_id: sandbox_id.clone(),
+                    binding: Some(authenticate_sandbox_response::Binding::SandboxId(
+                        sandbox_id.clone(),
+                    )),
                 },
             )),
             Some(Err((code, message))) => Err(Status::new(*code, message.clone())),
@@ -4659,6 +5053,8 @@ impl ComputeDriver for NoopTestDriver {
                 supports_sandbox_authentication: self.sandbox_authentication.is_some(),
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
+                supports_warm_supervisor_bootstrap: false,
+                supports_sandbox_template_reconciliation: false,
             },
         ))
     }
@@ -4804,6 +5200,8 @@ pub async fn new_test_runtime_with_driver(
             supports_sandbox_authentication,
             driver_reports_runtime_readiness: false,
             resource_capabilities: None,
+            supports_sandbox_template_reconciliation: false,
+            supports_warm_supervisor_bootstrap: false,
         },
         telemetry_compute_driver: TelemetryComputeDriver::custom(),
         driver_process: None,
@@ -4813,6 +5211,10 @@ pub async fn new_test_runtime_with_driver(
         sandbox_watch_bus: SandboxWatchBus::new(),
         tracing_log_bus: TracingLogBus::new(),
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+        supervisor_bootstrap_identity: None,
+        sandbox_claim_activation: None,
+        sandbox_template_reconciler: None,
+        lease_scoped_reconciler: None,
         sync_lock: Arc::new(Mutex::new(())),
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         gateway_listener_requirements: Vec::new(),
@@ -4834,6 +5236,22 @@ mod tests {
     use std::sync::{Arc, Mutex as TestMutex};
     use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
     use tokio_stream::wrappers::UnboundedReceiverStream;
+
+    struct TestLeaseScopedReconciler {
+        started: Arc<Notify>,
+        stopped: Arc<Notify>,
+    }
+
+    #[tonic::async_trait]
+    impl LeaseScopedReconciler for TestLeaseScopedReconciler {
+        async fn run(&self, mut cancel: watch::Receiver<bool>) {
+            self.started.notify_one();
+            if !*cancel.borrow() {
+                let _ = cancel.changed().await;
+            }
+            self.stopped.notify_one();
+        }
+    }
 
     fn string_value(value: &str) -> prost_types::Value {
         prost_types::Value {
@@ -4953,6 +5371,9 @@ mod tests {
         listed_sandboxes: Vec<DriverSandbox>,
         current_sandboxes: Vec<DriverSandbox>,
         workspace_rpcs_unimplemented: bool,
+        create_error: Option<Code>,
+        supports_sandbox_template_reconciliation: bool,
+        supports_warm_supervisor_bootstrap: bool,
     }
 
     #[tonic::async_trait]
@@ -4983,6 +5404,9 @@ mod tests {
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
+                supports_warm_supervisor_bootstrap: self.supports_warm_supervisor_bootstrap,
+                supports_sandbox_template_reconciliation: self
+                    .supports_sandbox_template_reconciliation,
             }))
         }
 
@@ -5050,6 +5474,9 @@ mod tests {
             &self,
             _request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
+            if let Some(code) = self.create_error {
+                return Err(Status::new(code, "controlled create error"));
+            }
             Ok(tonic::Response::new(CreateSandboxResponse {}))
         }
 
@@ -5325,6 +5752,8 @@ mod tests {
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
+                supports_warm_supervisor_bootstrap: false,
+                supports_sandbox_template_reconciliation: false,
             }))
         }
 
@@ -5536,6 +5965,8 @@ mod tests {
                 supports_sandbox_authentication: false,
                 driver_reports_runtime_readiness: false,
                 resource_capabilities: None,
+                supports_sandbox_template_reconciliation: false,
+                supports_warm_supervisor_bootstrap: false,
             },
             telemetry_compute_driver: TelemetryComputeDriver::custom(),
             driver_process: None,
@@ -5545,6 +5976,10 @@ mod tests {
             sandbox_watch_bus: SandboxWatchBus::new(),
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+            supervisor_bootstrap_identity: None,
+            sandbox_claim_activation: None,
+            sandbox_template_reconciler: None,
+            lease_scoped_reconciler: None,
             sync_lock: Arc::new(Mutex::new(())),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             gateway_listener_requirements: Vec::new(),
@@ -5559,6 +5994,64 @@ mod tests {
         let mut runtime = test_runtime_for_driver(driver, driver_name).await;
         runtime.driver_info.gateway_manages_lifecycle = true;
         runtime
+    }
+
+    #[tokio::test]
+    async fn lease_scoped_reconciler_stops_when_cancelled() {
+        let mut runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let started = Arc::new(Notify::new());
+        let stopped = Arc::new(Notify::new());
+        runtime.lease_scoped_reconciler = Some(Arc::new(TestLeaseScopedReconciler {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        }));
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let handle = runtime
+            .spawn_lease_scoped_reconciler(cancel_rx)
+            .expect("configured reconciler should start");
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("reconciler should start");
+
+        cancel_tx.send(true).unwrap();
+        handle.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("reconciler should stop after cancellation");
+    }
+
+    #[tokio::test]
+    async fn lease_holder_runs_and_awaits_lease_scoped_reconciler() {
+        let driver = ControlledDriver::new();
+        let mut runtime = test_runtime(driver).await;
+        let started = Arc::new(Notify::new());
+        let stopped = Arc::new(Notify::new());
+        runtime.lease_scoped_reconciler = Some(Arc::new(TestLeaseScopedReconciler {
+            started: started.clone(),
+            stopped: stopped.clone(),
+        }));
+
+        let lease = lease::ReconcilerLease::new(
+            runtime.store.clone(),
+            runtime.replica_id.clone(),
+            lease::LEASE_TTL,
+        );
+        let guard = lease.acquire_or_steal().await.unwrap();
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let runtime = Arc::new(runtime);
+        let holder = tokio::spawn(async move {
+            runtime.run_as_holder(&lease, guard, &mut shutdown_rx).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("lease holder should start the reconciler");
+        shutdown_tx.send(true).unwrap();
+        holder.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), stopped.notified())
+            .await
+            .expect("lease holder should await reconciler shutdown");
     }
 
     fn register_test_supervisor_session(runtime: &ComputeRuntime, sandbox_id: &str) {
@@ -5688,6 +6181,38 @@ mod tests {
         assert_eq!(
             stored.status.unwrap().main_process_instance_id,
             "instance-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_preserves_provisioning_record() {
+        let runtime = test_runtime(Arc::new(TestDriver {
+            create_error: Some(Code::Unavailable),
+            ..Default::default()
+        }))
+        .await;
+        let sandbox = sandbox_record("sb-ambiguous", "sandbox-a", SandboxPhase::Provisioning);
+
+        let err = runtime
+            .create_sandbox(sandbox, None, false, None)
+            .await
+            .expect_err("ambiguous create should remain unavailable");
+
+        assert_eq!(err.code(), Code::Unavailable);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-ambiguous")
+            .await
+            .unwrap()
+            .expect("provisioning record must be retained");
+        assert_eq!(stored.phase(), SandboxPhase::Provisioning as i32);
+        assert_eq!(stored.object_name(), "sandbox-a");
+        assert_eq!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .as_deref(),
+            Some("sb-ambiguous")
         );
     }
 
@@ -5938,6 +6463,49 @@ mod tests {
             last_transition_time: String::new(),
         });
         sandbox
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_is_pruned_when_backend_resource_never_appears() {
+        let runtime = test_runtime(Arc::new(TestDriver {
+            create_error: Some(Code::Unavailable),
+            ..Default::default()
+        }))
+        .await;
+        let sandbox = sandbox_record("sb-ambiguous", "sandbox-a", SandboxPhase::Provisioning);
+
+        let err = runtime
+            .create_sandbox(sandbox, None, false, None)
+            .await
+            .expect_err("ambiguous create should remain unavailable");
+        assert_eq!(err.code(), Code::Unavailable);
+        assert_eq!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .as_deref(),
+            Some("sb-ambiguous")
+        );
+
+        runtime
+            .reconcile_store_with_backend(Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert!(
+            runtime
+                .store
+                .get_message::<Sandbox>("sb-ambiguous")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            runtime
+                .sandbox_index
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
+                .is_none()
+        );
     }
 
     fn ssh_session_record(id: &str, sandbox_id: &str) -> SshSession {
@@ -6535,7 +7103,7 @@ mod tests {
         let traced = test_exporter::install_traced();
         async {
             runtime
-                .create_sandbox(sandbox, None, false)
+                .create_sandbox(sandbox, None, false, None)
                 .await
                 .expect("create succeeds");
         }
@@ -6741,7 +7309,7 @@ mod tests {
         let traced = test_exporter::install_traced();
         async {
             runtime
-                .create_sandbox(sandbox, None, false)
+                .create_sandbox(sandbox, None, false, None)
                 .await
                 .expect_err("driver refuses the create");
         }
@@ -7827,7 +8395,10 @@ mod tests {
             ..Default::default()
         });
 
-        runtime.create_sandbox(sandbox, None, false).await.unwrap();
+        runtime
+            .create_sandbox(sandbox, None, false, None)
+            .await
+            .unwrap();
         runtime
             .apply_sandbox_update(ready_driver_sandbox("sb-1", "sandbox-a"))
             .await
@@ -9650,6 +10221,7 @@ mod tests {
                 }),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -9821,6 +10393,7 @@ mod tests {
                 })),
                 workspace: "default".to_string(),
             }],
+            ..Default::default()
         }))
         .await;
 
@@ -10599,11 +11172,33 @@ mod tests {
             user_namespaces: Some(true),
             ..SandboxTemplate::default()
         };
-        let driver_template = driver_sandbox_template_from_public(&template, "test")
+        let driver_template = driver_inline_sandbox_template_from_public(&template, "test")
             .expect("template conversion should succeed");
 
         assert_eq!(driver_template.user_namespaces, Some(true));
         assert!(driver_template.platform_config.is_none());
+    }
+
+    #[test]
+    fn driver_workload_template_preserves_cpu_memory_limits() {
+        let workload = SandboxWorkloadConfig {
+            image: "registry.example.com/agent:latest".to_string(),
+            resources: Some(SandboxResources {
+                cpu: "500m".to_string(),
+                memory: "2Gi".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let driver_template = driver_sandbox_template_from_workload(&workload, &None, "kubernetes")
+            .expect("template conversion should succeed");
+        let resources = driver_template
+            .resources
+            .expect("CPU and memory limits should be forwarded to the driver");
+
+        assert_eq!(resources.cpu_limit, "500m");
+        assert_eq!(resources.memory_limit, "2Gi");
     }
 
     #[tokio::test]
@@ -10621,12 +11216,220 @@ mod tests {
             SandboxWatchBus::new(),
             TracingLogBus::new(),
             Arc::new(SupervisorSessionRegistry::new()),
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
 
         let initialization = traced.span_with("driver.initialize", "driver.name", "test-driver");
         test_exporter::assert_is_root(&initialization);
+    }
+
+    #[tokio::test]
+    async fn template_reconciliation_sends_one_authoritative_snapshot() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let driver = FakeComputeDriver::new().with_sandbox_template_reconciliation();
+        let runtime = ComputeRuntime::from_driver(
+            "kubernetes".to_string(),
+            Arc::new(driver.clone()),
+            None,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+            None,
+            Some(Arc::new(driver.clone())),
+        )
+        .await
+        .unwrap();
+        driver.clear_calls();
+        let template = SandboxWorkloadTemplate {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "template-id".to_string(),
+                name: "python".to_string(),
+                workspace: "default".to_string(),
+                resource_version: 7,
+                ..Default::default()
+            }),
+            spec: Some(openshell_core::proto::SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    image: "registry.example.com/python:latest".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        let result = runtime
+            .reconcile_sandbox_templates(&[template])
+            .await
+            .unwrap();
+        assert_eq!(result.reconciled, 1);
+        assert_eq!(result.pruned, 0);
+        assert!(matches!(
+            driver.calls().as_slice(),
+            [FakeComputeDriverCall::ReconcileSandboxTemplates { templates }]
+                if templates.len() == 1
+                    && templates[0].id == "template-id"
+                    && templates[0].resource_version == 7
+        ));
+    }
+
+    #[tokio::test]
+    async fn template_reconciliation_skips_invalid_templates_in_authoritative_snapshot() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let driver = FakeComputeDriver::new().with_sandbox_template_reconciliation();
+        let runtime = ComputeRuntime::from_driver(
+            "kubernetes".to_string(),
+            Arc::new(driver.clone()),
+            None,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+            None,
+            Some(Arc::new(driver.clone())),
+        )
+        .await
+        .unwrap();
+        driver.clear_calls();
+
+        let template = |id: &str| SandboxWorkloadTemplate {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            spec: Some(openshell_core::proto::SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    image: "registry.example.com/python:latest".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let valid = template("valid-template");
+        let mut invalid = template("invalid-template");
+        invalid.spec.as_mut().unwrap().driver_config = Some(prost_types::Struct {
+            fields: std::iter::once(("kubernetes".to_string(), string_value("not-an-object")))
+                .collect(),
+        });
+
+        let result = runtime
+            .reconcile_sandbox_templates(&[invalid, valid])
+            .await
+            .unwrap();
+        assert_eq!(result.reconciled, 1);
+        assert_eq!(result.pruned, 0);
+        assert!(matches!(
+            driver.calls().as_slice(),
+            [FakeComputeDriverCall::ReconcileSandboxTemplates { templates }]
+                if templates.len() == 1 && templates[0].id == "valid-template"
+        ));
+    }
+
+    #[tokio::test]
+    async fn compute_driver_rejects_warm_capability_without_activation_controller() {
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let error = ComputeRuntime::from_driver(
+            "test-driver".to_string(),
+            Arc::new(TestDriver {
+                supports_warm_supervisor_bootstrap: true,
+                ..TestDriver::default()
+            }),
+            None,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("warm capability without activation controller must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("without an activation controller")
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_driver_rejects_reconciliation_capability_without_reconciler_service() {
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let error = ComputeRuntime::from_driver(
+            "test-driver".to_string(),
+            Arc::new(TestDriver {
+                supports_sandbox_template_reconciliation: true,
+                ..TestDriver::default()
+            }),
+            None,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("reconciliation capability without a reconciler service must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("without providing the optional reconciler service")
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_driver_discards_activation_controller_without_warm_capability() {
+        struct TestActivationSpawner;
+
+        impl SandboxClaimActivationSpawner for TestActivationSpawner {
+            fn spawn(
+                &self,
+                _activator: Arc<dyn SupervisorBootstrapActivator>,
+                _registration_rx: watch::Receiver<u64>,
+                _shutdown_rx: watch::Receiver<bool>,
+            ) {
+                panic!("activation controller must not start without warm capability");
+            }
+        }
+
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let runtime = ComputeRuntime::from_driver(
+            "test-driver".to_string(),
+            Arc::new(TestDriver::default()),
+            None,
+            store,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+            Some(Arc::new(TestActivationSpawner)),
+            None,
+        )
+        .await
+        .expect("non-warm drivers should ignore activation controllers");
+
+        assert!(runtime.sandbox_claim_activation.is_none());
     }
 
     #[tokio::test]
@@ -10642,6 +11445,7 @@ mod tests {
         let endpoint = connect_remote_compute_driver("external-test", &socket_path)
             .await
             .unwrap();
+        let reconciler = RemoteSandboxTemplateReconciler::new(endpoint.channel.clone());
         let remote = RemoteComputeDriver::new(endpoint.channel);
         let sandbox = DriverSandbox {
             id: "sb-trace".to_string(),
@@ -10667,9 +11471,16 @@ mod tests {
                 }))
                 .await
                 .unwrap();
+            reconciler
+                .reconcile_sandbox_templates(Request::new(ReconcileSandboxTemplatesRequest {
+                    templates: Vec::new(),
+                }))
+                .await
+                .unwrap();
             remote
                 .create_sandbox(Request::new(CreateSandboxRequest {
                     sandbox: Some(sandbox.clone()),
+                    sandbox_template: None,
                 }))
                 .await
                 .unwrap();
@@ -10712,7 +11523,7 @@ mod tests {
         let traceparents = driver.traceparents();
         assert_eq!(
             traceparents.len(),
-            9,
+            10,
             "the client interceptor should cover every RPC"
         );
         assert!(
@@ -10807,6 +11618,11 @@ mod tests {
         );
 
         let mut sandbox = sandbox_record("sb-uds", "uds-sandbox", SandboxPhase::Provisioning);
+        sandbox.created_from_workload_template =
+            Some(openshell_core::proto::SandboxWorkloadTemplateProvenance {
+                name: "template-a".to_string(),
+                resource_version: "42".to_string(),
+            });
         sandbox.spec = Some(SandboxSpec {
             log_level: "debug".to_string(),
             policy: Some(openshell_core::proto::SandboxPolicy {
@@ -10835,7 +11651,10 @@ mod tests {
         });
 
         runtime.validate_sandbox_create(&sandbox).await.unwrap();
-        runtime.create_sandbox(sandbox, None, false).await.unwrap();
+        runtime
+            .create_sandbox(sandbox, None, false, None)
+            .await
+            .unwrap();
         let calls = driver.calls();
         assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");
         let validated = match &calls[2] {
@@ -10862,7 +11681,10 @@ mod tests {
         );
         assert!(matches!(
             &calls[3],
-            FakeComputeDriverCall::CreateSandbox { sandbox: Some(sandbox) }
+            FakeComputeDriverCall::CreateSandbox {
+                sandbox: Some(sandbox),
+                ..
+            }
                 if sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref())
                     .is_some_and(|policy| policy.version == 42)
         ));
@@ -10962,7 +11784,10 @@ mod tests {
             deletion_timestamp_ms: 0,
         });
 
-        let created = runtime.create_sandbox(sandbox, None, false).await.unwrap();
+        let created = runtime
+            .create_sandbox(sandbox, None, false, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             created.metadata.as_ref().unwrap().resource_version,
@@ -10997,7 +11822,10 @@ mod tests {
             .labels
             .insert("env".to_string(), "prod".to_string());
 
-        runtime.create_sandbox(sandbox, None, false).await.unwrap();
+        runtime
+            .create_sandbox(sandbox, None, false, None)
+            .await
+            .unwrap();
 
         let matching = runtime
             .store
@@ -11022,12 +11850,12 @@ mod tests {
         let runtime1 = runtime.clone();
         let sandbox1 = sandbox.clone();
         let handle1 =
-            tokio::spawn(async move { runtime1.create_sandbox(sandbox1, None, false).await });
+            tokio::spawn(async move { runtime1.create_sandbox(sandbox1, None, false, None).await });
 
         let runtime2 = runtime.clone();
         let sandbox2 = sandbox.clone();
         let handle2 =
-            tokio::spawn(async move { runtime2.create_sandbox(sandbox2, None, false).await });
+            tokio::spawn(async move { runtime2.create_sandbox(sandbox2, None, false, None).await });
 
         // Wait for both to complete
         let result1 = handle1.await.unwrap();

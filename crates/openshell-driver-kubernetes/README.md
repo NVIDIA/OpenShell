@@ -63,6 +63,72 @@ Kubernetes API calls use explicit timeouts so gRPC handlers do not block
 indefinitely when the API server is slow or unavailable. Resource and Event
 watches recover in place with API-friendly backoff after transient watcher
 errors, avoiding a gateway-side watch restart and its associated watch gap.
+Managed and operator modes watch both `Sandbox` and `SandboxClaim` resources
+across workspace namespaces, scoped to the current gateway identity.
+
+## Warm-Pool Allocation
+
+The driver can use Agent Sandbox extension CRDs for transparent warm-pool
+allocation. When `warm_pooling.enabled` is true, the driver reconciles eligible
+OpenShell `SandboxTemplate` resources into generated
+`extensions.agents.x-k8s.io/v1beta1` `SandboxTemplate` and `SandboxWarmPool`
+resources. It watches and caches those generated pools, resolves each pool's
+referenced `SandboxTemplate`, and computes an in-memory fingerprint of the
+template spec.
+
+On create, the driver maps the OpenShell workspace to its target Kubernetes
+namespace, renders the spec that direct `Sandbox` creation would use, strips
+per-sandbox identity values from the fingerprint, and matches it against the
+warm-pool cache for that namespace. Shared mode uses the configured namespace,
+managed mode uses the gateway-owned workspace namespace, and operator mode uses
+the allowlisted workspace namespace.
+If exactly one pool matches, the driver creates a v1beta1 `SandboxClaim` with
+`spec.warmPoolRef.name` set to that pool and
+`spec.lifecycle.shutdownPolicy` set to `Delete`. If no pool matches, multiple
+pools match, or the v1beta1 extension APIs are absent, the driver falls back to
+direct `Sandbox` creation. RBAC failures are logged as configuration errors;
+claim inventory and cleanup return the error instead of reporting an empty
+backend.
+Claim watch events publish pending and selected warm-pool status through the
+same lifecycle stream as direct `Sandbox` resources in every namespace mode.
+Stop and start operations resolve claim-backed sandbox IDs through
+`status.sandbox.name` on the claim, then patch the selected `Sandbox` in the
+claim's namespace.
+
+The extension CRDs are intentionally v1beta1-only. The core
+`agents.x-k8s.io/Sandbox` CRD still supports the existing v1beta1-to-v1alpha1
+fallback.
+
+The gateway periodically sends the complete authoritative OpenShell template
+set to drivers that advertise template reconciliation support. It also triggers
+a sweep after template creation and deletion. The Kubernetes driver applies the
+set and prunes generated resources, scoped by the gateway identity, when their
+source template is absent. Transient Kubernetes or driver outages recover on a
+later sweep without delivery rows or delete tombstones.
+In operator mode, reconciliation waits for the first authoritative namespace
+allowlist snapshot before it applies or prunes generated resources. A delayed
+label watch or failed initial namespace-file load therefore cannot make an
+unsynchronized empty allowlist look like an instruction to delete warm pools.
+Kubernetes creates a warm pool when
+`desired_service_level.startup.ready_within` is strictly less than
+`warm_pooling.templates.ready_within_threshold_secs` (default 5 seconds). The
+pool replica count comes from `desired_service_level.startup.max_burst`, capped
+by `warm_pooling.templates.max_replicas` (default 20). Generated resource names
+include both a source-template-ID hash and the rendered-spec fingerprint, which
+keeps same-named templates from different workspaces distinct in shared mode.
+
+Disabling `warm_pooling.enabled` disables warm-pool allocation. If the Agent
+Sandbox extension APIs remain reachable, reconciliation deletes existing
+gateway-owned generated resources. The driver discovers the extension API
+resources dynamically and caches successful discovery results for 30 seconds.
+It does not cache discovery errors, and it continues claim inventory,
+activation, and cleanup independently of new warm allocation. Installing the
+extension CRDs therefore takes effect without restarting the gateway.
+The standalone remote driver is cold-only because the current remote driver
+protocol has no gateway-side claim activation callback. It can still reconcile
+template desired state to remove existing gateway-owned pools. The allocation
+cache remains replica-local and runs on every in-process gateway because
+sandbox creation reads it locally.
 
 ## Workspace Persistence
 
@@ -102,10 +168,11 @@ values must override image-provided environment variables.
 Sandbox pods run as `service_account_name` and keep
 `automountServiceAccountToken: false`. The only Kubernetes token exposed to the
 supervisor is an explicit, audience-bound projected token mounted at
-`/var/run/secrets/openshell/token` for the one-shot `IssueSandboxToken`
-bootstrap exchange. The Kubernetes driver authenticates that token through the
-compute-driver protocol using its own `service_account_name` and workspace-mode
-namespace policy; the gateway receives only the verified sandbox ID.
+`/var/run/secrets/openshell/token` for the `RegisterSupervisor` bootstrap
+stream. The Kubernetes driver authenticates that token through the compute-driver
+protocol using its own `service_account_name` and workspace-mode namespace
+policy; the gateway receives only the verified sandbox ID and activates
+already-bound cold pods by returning a gateway-minted sandbox JWT on that stream.
 
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.

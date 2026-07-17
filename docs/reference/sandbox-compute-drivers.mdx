@@ -431,7 +431,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | Set the `StorageClass` for the workspace PVC. Empty (default) omits `storageClassName` and uses the cluster's default `StorageClass`. Set this on clusters with no default `StorageClass`, otherwise the workspace PVC stays `Pending` and the sandbox never starts. |
-| `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
+| `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for `RegisterSupervisor` bootstrap. |
 
 Managed-mode Secret copying requires the gateway ServiceAccount to create
 Secrets. Kubernetes RBAC cannot restrict Secret `create` by resource name, so
@@ -473,6 +473,67 @@ the driver sets `spec.operatingMode` to `Suspended` or `Running`. For
 workspace PVC keep their identity across both operations. Stop returns only
 after the controller reports suspension and deletes the old pod, so an
 immediate start cannot race the prior pod's termination.
+
+When Kubernetes warm pooling is enabled, the driver can satisfy compatible
+create requests by creating `extensions.agents.x-k8s.io/v1beta1`
+`SandboxClaim` resources instead of direct `Sandbox` resources. OpenShell sets
+each claim's `spec.lifecycle.shutdownPolicy` to `Delete`. The driver generates
+`SandboxWarmPool` resources from eligible OpenShell templates,
+discovers those pools across namespaces it can observe, resolves each pool's
+generated `SandboxTemplate`, and matches only against pools in the Kubernetes
+namespace selected for the OpenShell workspace. Shared mode selects
+`sandbox_namespace`, managed mode uses the derived gateway-owned workspace
+namespace, and operator mode uses the allowlisted workspace namespace. Set
+`openshell.drivers.kubernetes.warm_pooling.enabled = false` to force direct
+`Sandbox` creation. Treat warm-pooling enablement as an installation-time
+choice and do not change it on a live system. When the extension APIs remain
+reachable, the next reconciliation removes existing gateway-owned generated
+warm-pool resources. Kubernetes exposes this behavior through the optional
+`SandboxTemplateReconciler` driver service. Drivers that do not advertise
+template reconciliation implement only the core `ComputeDriver` service.
+
+The driver watches `SandboxClaim` lifecycle changes in shared, managed, and
+operator modes. In managed and operator modes, it watches claims across
+workspace namespaces and scopes them to the current gateway identity, so claim
+selection and readiness update the corresponding OpenShell sandbox record.
+Operator-mode template reconciliation waits for the first authoritative
+namespace allowlist snapshot before applying or pruning generated resources.
+An unavailable label watch or invalid initial namespace file therefore defers
+reconciliation instead of interpreting an unsynchronized empty allowlist as an
+instruction to delete warm pools.
+
+Warm pooling requires the Agent Sandbox extension APIs from `extensions.yaml`.
+The OpenShell chart grants RBAC for those APIs, but it does not install the
+`SandboxClaim`, `SandboxTemplate`, or `SandboxWarmPool` CRDs. The driver uses
+Kubernetes discovery to detect each resource and caches successful discovery
+results for 30 seconds. When resources are absent, OpenShell avoids calls to
+them and continues with direct `Sandbox` creation. Installing the CRDs takes
+effect without a gateway restart. Discovery failures are not cached, and RBAC
+failures against discovered resources are logged as configuration errors.
+Claim inventory, activation, and cleanup remain active independently of new
+warm allocation so transient failures cannot be mistaken for an empty claim
+backend.
+
+Warm allocation requires the in-process Kubernetes driver because activation
+is completed by a gateway-side claim controller. The standalone external
+Kubernetes driver advertises warm allocation as unavailable and creates direct
+`Sandbox` resources even when extension APIs are installed. It can still
+reconcile template desired state to remove existing gateway-owned pools.
+
+The gateway sends the complete authoritative OpenShell `SandboxTemplate` set at
+startup, after template mutations, and periodically. Failed reconciliations are
+retried from the gateway store; no per-template delivery rows or delete
+tombstones are persisted. Generated resources carry the gateway identity, and
+the driver prunes owned resources whose source template is absent.
+The driver creates generated Agent Sandbox `SandboxTemplate` and
+`SandboxWarmPool` resources when
+`desired_service_level.startup.ready_within` is strictly less than
+`ready_within_threshold_secs` (default `5`). The generated warm-pool replica
+count comes from `desired_service_level.startup.max_burst`, capped by
+`max_replicas` (default `20`).
+
+Templates that do not request startup below the threshold, or templates deleted
+from OpenShell, cause the driver to delete their generated warm-pool resources.
 
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
