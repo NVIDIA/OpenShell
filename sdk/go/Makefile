@@ -6,40 +6,40 @@ test:
 ifndef MISE
 	$(error mise is not installed. Install from https://mise.jdx.dev)
 endif
-	mise run test
+	mise run go:test
 
 test-integration:
 ifndef MISE
 	$(error mise is not installed. Install from https://mise.jdx.dev)
 endif
-	mise run test:integration
+	mise run go:test:integration
 
 lint:
 ifndef MISE
 	$(error mise is not installed. Install from https://mise.jdx.dev)
 endif
-	mise run lint
+	mise run go:lint
 
 fmt:
 ifndef MISE
 	$(error mise is not installed. Install from https://mise.jdx.dev)
 endif
-	mise run fmt
+	mise run go:fmt
 
 build:
 ifndef MISE
 	$(error mise is not installed. Install from https://mise.jdx.dev)
 endif
-	mise run build
+	mise run go:build
 
 ci:
 ifndef MISE
 	$(error mise is not installed. Install from https://mise.jdx.dev)
 endif
-	mise run ci
+	mise run go:ci
 
 docs-check:
 ifndef MISE
 	$(error mise is not installed. Install from https://mise.jdx.dev)
 endif
-	mise run docs:check
+	mise run go:docs:check

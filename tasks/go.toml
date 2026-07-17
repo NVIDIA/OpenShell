@@ -1,36 +1,45 @@
-[tools]
-go = "1.25"
-protoc = "29.6"
-"go:github.com/golangci/golangci-lint/v2/cmd/golangci-lint" = "2.12"
-"go:google.golang.org/protobuf/cmd/protoc-gen-go" = "1.36.11"
-"go:google.golang.org/grpc/cmd/protoc-gen-go-grpc" = "1.6.2"
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-[tasks.test]
-description = "Run unit tests with coverage"
+# Go SDK development, build, lint, and format tasks
+
+["go:test"]
+description = "Run Go SDK unit tests with coverage"
+dir = "sdk/go"
 run = "go test -coverprofile=coverage.out -coverpkg=./openshell/... -race ./..."
+hide = true
 
-[tasks."test:integration"]
-description = "Run integration tests"
+["go:test:integration"]
+description = "Run Go SDK integration tests"
+dir = "sdk/go"
 run = "go test -tags=integration -race ./..."
+hide = true
 
-[tasks.lint]
-description = "Run linter"
+["go:lint"]
+description = "Run Go SDK linter"
+dir = "sdk/go"
 run = "golangci-lint run ./..."
+hide = true
 
-[tasks.fmt]
-description = "Format code"
+["go:fmt"]
+description = "Format Go SDK code"
+dir = "sdk/go"
 run = "goimports -w . && go fmt ./..."
+hide = true
 
-[tasks.build]
-description = "Build all packages"
+["go:build"]
+description = "Build Go SDK packages"
+dir = "sdk/go"
 run = "go build ./..."
+hide = true
 
-[tasks.ci]
-description = "Run full CI pipeline"
-depends = ["lint", "build", "test", "proto:check", "docs:check"]
+["go:ci"]
+description = "Run Go SDK full CI pipeline"
+depends = ["go:lint", "go:build", "go:test", "go:proto:check", "go:docs:check"]
 
-[tasks."docs:check"]
-description = "Verify every public package has a docs page"
+["go:docs:check"]
+description = "Verify every public Go SDK package has a docs page"
+dir = "sdk/go"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
@@ -71,9 +80,11 @@ fi
 
 echo "Docs check passed: all public packages have documentation."
 """
+hide = true
 
-[tasks."proto:gen"]
+["go:proto:gen"]
 description = "Generate Go bindings from proto files"
+dir = "sdk/go"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
@@ -121,9 +132,11 @@ for pkg in openshellv1 datamodelv1 sandboxv1; do
   echo "  $PROTO_DIR/$pkg/: $(ls "$PROTO_DIR/$pkg/"*.go 2>/dev/null | wc -l | tr -d ' ') files"
 done
 """
+hide = true
 
-[tasks."proto:check"]
-description = "Verify generated proto files are up to date"
+["go:proto:check"]
+description = "Verify generated Go SDK proto files are up to date"
+dir = "sdk/go"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
@@ -173,7 +186,7 @@ DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "$PROTO_DIR" \
 
 if [ -n "$DIFF_OUTPUT" ]; then
   echo "ERROR: Generated proto files are out of date."
-  echo "Run 'mise run proto:gen' to regenerate."
+  echo "Run 'mise run go:proto:gen' to regenerate."
   echo ""
   echo "$DIFF_OUTPUT"
   exit 1
@@ -181,9 +194,11 @@ fi
 
 echo "Proto check passed: generated files are up to date."
 """
+hide = true
 
-[tasks."proto:clean"]
-description = "Remove all generated proto files"
+["go:proto:clean"]
+description = "Remove all generated Go SDK proto files"
+dir = "sdk/go"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
@@ -200,18 +215,20 @@ done
 
 echo "Proto clean complete."
 """
+hide = true
 
-[tasks."proto:sync"]
-description = "Sync proto files from upstream OpenShell repo"
+["go:proto:sync"]
+description = "Sync Go SDK proto files from root proto directory"
+dir = "sdk/go"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
-UPSTREAM_PATH="${UPSTREAM_PATH:-../OpenShell/proto}"
+UPSTREAM_PATH="${UPSTREAM_PATH:-../../proto}"
 
 if [ ! -d "$UPSTREAM_PATH" ]; then
   echo "ERROR: Upstream proto directory not found: $UPSTREAM_PATH"
-  echo "Set UPSTREAM_PATH env var to the correct location."
+  echo "Expected root proto/ directory at $UPSTREAM_PATH (relative to sdk/go/)."
   exit 1
 fi
 
@@ -229,14 +246,6 @@ for f in $PROTO_FILES; do
   echo "Copied $f"
 done
 
-# Record upstream commit SHA
-UPSTREAM_REPO_DIR="$(cd "$UPSTREAM_PATH/.." && pwd)"
-if [ -d "$UPSTREAM_REPO_DIR/.git" ]; then
-  SHA=$(git -C "$UPSTREAM_REPO_DIR" rev-parse HEAD)
-else
-  SHA="unknown"
-fi
-echo "$SHA" > "$PROTO_DIR/UPSTREAM_VERSION"
-echo "Upstream version: $SHA"
 echo "Proto sync complete."
 """
+hide = true
