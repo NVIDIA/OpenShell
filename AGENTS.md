@@ -1,3 +1,5 @@
+Hello!
+
 # Agent Instructions
 
 This file is the primary instruction surface for agents contributing to OpenShell. It is injected into your context on every interaction — keep that in mind when proposing changes to it.
