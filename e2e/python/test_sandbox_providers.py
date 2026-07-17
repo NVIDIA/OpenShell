@@ -99,6 +99,34 @@ def _delete_provider(stub: object, name: str) -> None:
             raise
 
 
+@contextmanager
+def _providers_v2_enabled(stub: object) -> Iterator[None]:
+    """Enable the gateway-global ``providers_v2_enabled`` opt-in for the block.
+
+    Composing a provider's network policy onto a sandbox is gated behind this
+    setting, which defaults off. The built-in github profile's git-transport
+    rules only reach the sandbox with it enabled. ``global`` is a Python keyword,
+    so it is passed positionally through a dict expansion.
+    """
+    stub.UpdateConfig(
+        openshell_pb2.UpdateConfigRequest(
+            setting_key="providers_v2_enabled",
+            setting_value=sandbox_pb2.SettingValue(bool_value=True),
+            **{"global": True},
+        )
+    )
+    try:
+        yield
+    finally:
+        stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
+                setting_key="providers_v2_enabled",
+                delete_setting=True,
+                **{"global": True},
+            )
+        )
+
+
 # ===========================================================================
 # Tests: placeholder visibility
 # ===========================================================================
@@ -484,3 +512,66 @@ def test_update_provider_rejects_type_change(
         assert "type cannot be changed" in exc_info.value.details()
     finally:
         _delete_provider(stub, name)
+
+
+# ===========================================================================
+# Tests: git transport network policy
+# ===========================================================================
+
+
+def test_github_provider_allows_https_git_clone(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """Built-in github provider permits anonymous HTTPS clone/fetch (#1769).
+
+    Git smart HTTP clone/fetch issues a POST to ``*/git-upload-pack``. The
+    read-only preset (GET/HEAD/OPTIONS) denied that POST, so ``git clone`` over
+    HTTPS failed. Attaching the github provider composes its network policy onto
+    the sandbox, exercising provider attachment, effective-policy composition,
+    TLS interception, and real git behavior end to end. git delegates HTTPS to a
+    ``git-remote-https`` helper whose ancestor is ``/usr/bin/git``, so the
+    profile's git binary covers it via ancestor matching.
+    """
+    with _providers_v2_enabled(sandbox_client._stub), provider(
+        sandbox_client._stub,
+        name="e2e-test-github-clone",
+        provider_type="github",
+        # A required credential value is needed to create the provider, but an
+        # anonymous clone of a public repo never uses it: git only sends the
+        # token when a credential helper is configured.
+        credentials={"GITHUB_TOKEN": "e2e-placeholder-unused"},
+    ) as provider_name:
+        # git opens /dev/null O_RDWR, so it must be read-write; the shared
+        # _default_policy only grants /dev/urandom. Everything else (binaries,
+        # CA bundle, clone target) is covered by the standard allowlist.
+        policy = _default_policy()
+        policy.filesystem.read_write.append("/dev/null")
+        spec = datamodel_pb2.SandboxSpec(
+            policy=policy,
+            providers=[provider_name],
+        )
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            clone = sb.exec(
+                [
+                    "git",
+                    "clone",
+                    "--depth",
+                    "1",
+                    "https://github.com/octocat/Hello-World.git",
+                    "/tmp/hello-world",
+                ],
+                timeout_seconds=120,
+            )
+            assert clone.exit_code == 0, (
+                "git clone over HTTPS should succeed with the github provider "
+                f"attached; stdout={clone.stdout!r} stderr={clone.stderr!r}"
+            )
+
+            # A completed clone materializes .git/HEAD, proving ref discovery
+            # (GET) and upload-pack (POST) both succeeded, not just a handshake.
+            head = sb.exec(["cat", "/tmp/hello-world/.git/HEAD"])
+            assert head.exit_code == 0, (
+                f"cloned repo is missing .git/HEAD; stderr={head.stderr!r}"
+            )

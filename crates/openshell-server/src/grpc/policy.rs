@@ -5127,16 +5127,44 @@ mod tests {
             }),
             "github API endpoints should be read-only; git transport uses explicit rules"
         );
+        // Pin the exact composed rule set for the git transport. Clone/fetch
+        // needs GET */info/refs then POST */git-upload-pack; a broader or extra
+        // POST rule (e.g. POST **) would also permit push (git-receive-pack), so
+        // matching the whole set fails on any such regression (see #1769).
+        let git_transport = layers[0]
+            .rule
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.host == "github.com")
+            .expect("composed policy should include the github.com git transport");
+        let mut allowed: Vec<(&str, &str)> = git_transport
+            .rules
+            .iter()
+            .map(|rule| {
+                let allow = rule
+                    .allow
+                    .as_ref()
+                    .expect("git transport rules must be allow rules");
+                (allow.method.as_str(), allow.path.as_str())
+            })
+            .collect();
+        allowed.sort_unstable();
+        let mut expected = vec![
+            ("GET", "**"),
+            ("HEAD", "**"),
+            ("OPTIONS", "**"),
+            ("POST", "/**/git-upload-pack"),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            allowed, expected,
+            "composed git transport allow rules must be exactly the read-only \
+             methods plus POST */git-upload-pack; a broader POST rule would \
+             enable push (git-receive-pack)"
+        );
         assert!(
-            layers[0].rule.endpoints.iter().any(|endpoint| {
-                endpoint.host == "github.com"
-                    && endpoint.rules.iter().any(|rule| {
-                        rule.allow.as_ref().is_some_and(|allow| {
-                            allow.method == "POST" && allow.path.contains("git-upload-pack")
-                        })
-                    })
-            }),
-            "github git transport should allow POST git-upload-pack for clone/fetch"
+            git_transport.deny_rules.is_empty(),
+            "composed git transport should block push via its narrow allow set, not deny rules"
         );
     }
 
