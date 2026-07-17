@@ -119,8 +119,12 @@ function Start-Gw {
     # openshell.db). Without this, sandbox names persist across gateway restarts
     # and across runs, colliding on `create` ("already exists") and leaving orphan
     # records behind. In-memory means every gateway starts clean and leaves nothing.
+    # Config path goes through the env var (clap: OPENSHELL_GATEWAY_CONFIG), NOT a
+    # --config token: Start-Process -ArgumentList does not quote array elements, so a
+    # config path containing a space gets split and the gateway's arg parser rejects it.
+    $env:OPENSHELL_GATEWAY_CONFIG = $toml
     $p = Start-Process -FilePath $gateway `
-        -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--config", $toml, "--log-level", "info") `
+        -ArgumentList @("--disable-tls", "--db-url", "sqlite::memory:", "--log-level", "info") `
         -WorkingDirectory $here -PassThru -NoNewWindow `
         -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
     $deadline = (Get-Date).AddSeconds(30)

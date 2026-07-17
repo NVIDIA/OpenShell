@@ -160,6 +160,10 @@ try {
   $env:OPENSHELL_WXC_EXEC_PATH = $WxcExecPath
   $env:OPENSHELL_OCSF_JSON     = "1"
   $env:OPENSHELL_OCSF_LOG_DIR  = $resultDir
+  # Config path goes through the env var (clap: OPENSHELL_GATEWAY_CONFIG), NOT a
+  # --config token: Start-Process -ArgumentList does not quote array elements, so a
+  # config path containing a space gets split and the gateway's arg parser rejects it.
+  $env:OPENSHELL_GATEWAY_CONFIG = $toml
   Remove-Item Env:OPENSHELL_MXC_MOCK_WXC -ErrorAction SilentlyContinue
 
   # 7. Start the gateway (background, TLS disabled on the loopback control plane).
@@ -167,7 +171,7 @@ try {
   $gwLog    = Join-Path $resultDir "gateway.log"
   $gwErrLog = Join-Path $resultDir "gateway.err.log"
   $gw = Start-Process -FilePath $gateway `
-    -ArgumentList @("--disable-tls", "--config", $toml, "--log-level", "info") `
+    -ArgumentList @("--disable-tls", "--log-level", "info") `
     -WorkingDirectory $here -PassThru -NoNewWindow `
     -RedirectStandardOutput $gwLog -RedirectStandardError $gwErrLog
   Info "gateway pid $($gw.Id); logs -> $(Split-Path $gwLog -Leaf) (+ .err)"
