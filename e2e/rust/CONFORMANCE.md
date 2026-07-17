@@ -33,7 +33,8 @@ The test profiles separate the surface being validated:
   gateway driver. This includes command execution through the streaming
   `ExecSandbox` API and process-hardening checks.
 - `e2e-cli-conformance` validates portable CLI behavior against the canonical
-  Docker-backed gateway, including the gateway smoke test.
+  Docker-backed gateway, including the gateway smoke test, port forwarding,
+  and file upload/download workflows.
 
 VM filesystem behavior is not driver-independent. The `vm_overlay` test remains
 under the `e2e-vm` profile and runs alongside API conformance in the VM lane.

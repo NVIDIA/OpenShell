@@ -50,6 +50,21 @@ path = "tests/sandbox_lifecycle.rs"
 required-features = ["e2e-cli-conformance"]
 
 [[test]]
+name = "port_forward"
+path = "tests/port_forward.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
+name = "sync"
+path = "tests/sync.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
+name = "upload_create"
+path = "tests/upload_create.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
 name = "smoke"
 path = "tests/smoke.rs"
 required-features = ["e2e-cli-conformance"]
