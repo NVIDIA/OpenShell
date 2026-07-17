@@ -52,12 +52,11 @@ synchronously. Sandbox row removal remains bound to the stable ID and resource
 version. Settings retain their existing best-effort name-based cleanup; SSH
 sessions, indexes, and watch/log buses are cleaned after confirmed removal.
 
-The request workflow runs in an owned task so client cancellation cannot strand
-a mutation. A gateway restart does not resume or reissue a persisted `Deleting`
-operation. If the backend completed the delete, watcher or reconciliation
-cleanup removes the row. If the backend never accepted the call, the row can
-remain `Deleting`; crash-safe retries require a durable operation generation
-that the compute driver honors.
+The request acquires both locks before starting owned work, so cancellation
+while queued does not leave a delete armed. After that commitment point, the
+owned task prevents cancellation from stranding a mutation. A gateway restart
+does not resume a persisted `Deleting` operation. If the backend completed the
+delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 
 ## Runtime Summary
 

@@ -119,6 +119,13 @@ struct SandboxDeleteTarget {
     sandbox_name: String,
 }
 
+/// Identity and driver result for a completed delete request.
+#[derive(Debug, Eq, PartialEq)]
+pub struct DeleteSandboxResult {
+    pub sandbox_id: String,
+    pub deleted: bool,
+}
+
 #[derive(Debug)]
 struct DeleteTransition {
     /// Snapshot restored if the driver result is ambiguous and no newer write
@@ -440,6 +447,11 @@ impl ComputeRuntime {
         self.sync_lock.clone().lock_owned().await
     }
 
+    #[cfg(test)]
+    pub(crate) fn delete_gate_entry_count(&self) -> usize {
+        self.delete_gates.entry_count()
+    }
+
     pub async fn new_docker(
         config: openshell_core::Config,
         docker_config: DockerComputeConfig,
@@ -680,11 +692,10 @@ impl ComputeRuntime {
         }
     }
 
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool, Status> {
-        // Resolve the request to a stable identity before spawning the owned
-        // worker. Cancellation before this lookup completes is harmless
-        // because no mutation has occurred; after the lookup, the worker can
-        // never retarget a replacement sandbox that reuses the name.
+    pub(crate) async fn delete_sandbox(&self, name: &str) -> Result<DeleteSandboxResult, Status> {
+        // Resolve and acquire both request-side locks before spawning the
+        // owned worker. Cancellation while any of these awaits is pending is
+        // harmless because no mutation or detached work has started.
         let candidate = self
             .store
             .get_message_by_name::<Sandbox>(name)
@@ -695,24 +706,32 @@ impl ComputeRuntime {
             sandbox_id: candidate.object_id().to_string(),
             sandbox_name: candidate.object_name().to_string(),
         };
+        let delete_guard = self.delete_gates.lock_for(&target.sandbox_id).await;
+        let global_guard = self.lock_global_for_delete(&delete_guard).await;
 
-        // The owned task keeps the delete workflow running if the client drops
-        // its request after the gateway has durably persisted `Deleting`. We
-        // still await it here so the API remains synchronous for live clients.
+        // There is no await between acquiring the initial guards and spawning
+        // the worker. From this commitment point onward, request cancellation
+        // cannot stop the delete after it starts mutating durable state.
         let runtime = self.clone();
-        tokio::spawn(async move { runtime.delete_sandbox_inner(target).await })
-            .await
-            .map_err(|err| {
-                Status::internal(format!(
-                    "sandbox delete worker terminated unexpectedly: {err}"
-                ))
-            })?
+        tokio::spawn(async move {
+            runtime
+                .delete_sandbox_inner(target, delete_guard, global_guard)
+                .await
+        })
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "sandbox delete worker terminated unexpectedly: {err}"
+            ))
+        })?
     }
 
-    async fn delete_sandbox_inner(&self, target: SandboxDeleteTarget) -> Result<bool, Status> {
-        let delete_guard = self.delete_gates.lock_for(&target.sandbox_id).await;
-
-        let guard = self.lock_global_for_delete(&delete_guard).await;
+    async fn delete_sandbox_inner(
+        &self,
+        target: SandboxDeleteTarget,
+        delete_guard: SandboxDeleteGuard,
+        guard: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<DeleteSandboxResult, Status> {
         let current = self
             .store
             .get_message::<Sandbox>(&target.sandbox_id)
@@ -723,7 +742,10 @@ impl ComputeRuntime {
             // waited. A different sandbox may now use the old name; this
             // request acknowledges only the disappearance of its original ID.
             self.cleanup_removed_sandbox_state(&target.sandbox_id).await;
-            return Ok(true);
+            return Ok(DeleteSandboxResult {
+                sandbox_id: target.sandbox_id,
+                deleted: true,
+            });
         };
         if current.object_name() != target.sandbox_name {
             return Err(Status::aborted(
@@ -738,7 +760,12 @@ impl ComputeRuntime {
             .begin_sandbox_delete_with_initial_snapshot(&target.sandbox_id, Some(current))
             .await?
         {
-            BeginDelete::AlreadyDeleting => return Ok(true),
+            BeginDelete::AlreadyDeleting => {
+                return Ok(DeleteSandboxResult {
+                    sandbox_id: target.sandbox_id,
+                    deleted: true,
+                });
+            }
             BeginDelete::Started(transition) => *transition,
         };
 
@@ -768,7 +795,10 @@ impl ComputeRuntime {
                         "compute resource was absent, but gateway cleanup did not complete",
                     ));
                 }
-                Ok(deleted)
+                Ok(DeleteSandboxResult {
+                    sandbox_id: target.sandbox_id,
+                    deleted,
+                })
             }
             Err(err) => {
                 self.recover_failed_delete(&delete_guard, &transition).await;
@@ -1000,30 +1030,13 @@ impl ComputeRuntime {
         match observed {
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
                 let session_connected = self.supervisor_sessions.has_session(sandbox_id);
-                match self
-                    .store
-                    .update_message_cas::<Sandbox, _>(
-                        sandbox_id,
-                        deleting_resource_version,
-                        |sandbox| {
-                            apply_driver_snapshot(sandbox, &snapshot, session_connected);
-                        },
-                    )
-                    .await
-                {
-                    Ok(recovered) => {
-                        self.sandbox_index.update_from_sandbox(&recovered);
-                        self.sandbox_watch_bus.notify(sandbox_id);
-                    }
-                    Err(err) => {
-                        self.handle_delete_recovery_write_failure(
-                            sandbox_id,
-                            err,
-                            "reconcile observed backend snapshot",
-                        )
-                        .await;
-                    }
-                }
+                self.write_delete_recovery_with_retry(
+                    sandbox_id,
+                    deleting_resource_version,
+                    "reconcile observed backend snapshot",
+                    |sandbox| apply_driver_snapshot(sandbox, &snapshot, session_connected),
+                )
+                .await;
             }
             Ok(None) => {
                 match self
@@ -1042,36 +1055,111 @@ impl ComputeRuntime {
             }
             Ok(Some(_)) | Err(_) => {
                 let previous = transition.previous.clone();
-                match self
-                    .store
-                    .update_message_cas::<Sandbox, _>(
-                        sandbox_id,
-                        deleting_resource_version,
-                        |sandbox| *sandbox = previous.clone(),
-                    )
-                    .await
-                {
-                    Ok(recovered) => {
-                        self.sandbox_index.update_from_sandbox(&recovered);
-                        self.sandbox_watch_bus.notify(sandbox_id);
-                    }
-                    Err(err) => {
-                        self.handle_delete_recovery_write_failure(
-                            sandbox_id,
-                            err,
-                            "restore pre-delete snapshot",
-                        )
-                        .await;
-                    }
-                }
+                self.write_delete_recovery_with_retry(
+                    sandbox_id,
+                    deleting_resource_version,
+                    "restore pre-delete snapshot",
+                    |sandbox| *sandbox = previous.clone(),
+                )
+                .await;
             }
         }
     }
 
-    /// Handles a failed recovery CAS while the caller holds `sync_lock`.
+    /// Applies an exact-version delete recovery, retrying transient persistence
+    /// failures only while the durable row remains at the version this delete
+    /// owns. CAS conflicts belong to a newer writer and are never retried.
+    async fn write_delete_recovery_with_retry<F>(
+        &self,
+        sandbox_id: &str,
+        deleting_resource_version: u64,
+        recovery_action: &'static str,
+        apply: F,
+    ) where
+        F: Fn(&mut Sandbox) + Send + Sync,
+    {
+        for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
+            match self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox_id,
+                    deleting_resource_version,
+                    |sandbox| apply(sandbox),
+                )
+                .await
+            {
+                Ok(recovered) => {
+                    self.sandbox_index.update_from_sandbox(&recovered);
+                    self.sandbox_watch_bus.notify(sandbox_id);
+                    return;
+                }
+                Err(error @ crate::persistence::PersistenceError::Conflict { .. }) => {
+                    self.handle_delete_recovery_conflict(sandbox_id, error, recovery_action)
+                        .await;
+                    return;
+                }
+                Err(error) => match self.store.get(Sandbox::object_type(), sandbox_id).await {
+                    Ok(None) => {
+                        debug!(
+                            sandbox_id,
+                            recovery_action,
+                            "Delete recovery found the row removed by another replica; cleaning local state"
+                        );
+                        self.cleanup_removed_sandbox_state(sandbox_id).await;
+                        return;
+                    }
+                    Ok(Some(record))
+                        if record.resource_version == deleting_resource_version
+                            && attempt < DELETE_PHASE_CAS_RETRY_LIMIT =>
+                    {
+                        debug!(
+                            sandbox_id,
+                            recovery_action,
+                            attempt,
+                            error = %error,
+                            "Delete recovery write failed while its version was unchanged; retrying"
+                        );
+                        tokio::task::yield_now().await;
+                    }
+                    Ok(Some(record)) if record.resource_version == deleting_resource_version => {
+                        warn!(
+                            sandbox_id,
+                            recovery_action,
+                            attempt,
+                            error = %error,
+                            "Delete recovery write failed after bounded retries; sandbox remains deleting"
+                        );
+                        return;
+                    }
+                    Ok(Some(record)) => {
+                        debug!(
+                            sandbox_id,
+                            recovery_action,
+                            error = %error,
+                            current_resource_version = record.resource_version,
+                            "Skipped delete recovery after a concurrent state change"
+                        );
+                        return;
+                    }
+                    Err(fetch_error) => {
+                        warn!(
+                            sandbox_id,
+                            recovery_action,
+                            error = %error,
+                            fetch_error = %fetch_error,
+                            "Failed to verify sandbox state after delete recovery write failure"
+                        );
+                        return;
+                    }
+                },
+            }
+        }
+    }
+
+    /// Handles a recovery CAS conflict while the caller holds `sync_lock`.
     /// Another replica may have removed the durable row during the external
     /// driver lookup; in that case this replica still needs local cleanup.
-    async fn handle_delete_recovery_write_failure(
+    async fn handle_delete_recovery_conflict(
         &self,
         sandbox_id: &str,
         error: crate::persistence::PersistenceError,
@@ -3872,6 +3960,7 @@ mod tests {
                 .expect("delete did not finish")
                 .unwrap()
                 .unwrap()
+                .deleted
         );
         stop_watch_loop(shutdown_tx, watch_handle).await;
     }
@@ -3900,6 +3989,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap()
+                .deleted
         );
         assert!(
             tokio::time::timeout(Duration::from_secs(1), second)
@@ -3907,6 +3997,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap()
+                .deleted
         );
         assert_eq!(driver.delete_calls(), 1);
     }
@@ -3958,6 +4049,7 @@ mod tests {
                 .expect("second delete did not finish")
                 .unwrap()
                 .unwrap()
+                .deleted
         );
         assert_eq!(driver.delete_calls(), 2);
         assert!(
@@ -3967,6 +4059,62 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_waiting_delete_does_not_retry_after_leader_failure() {
+        let driver = ControlledDriver::new();
+        driver.block_delete();
+        driver.set_delete_outcome(ControlledDeleteOutcome::Error("delete failed"));
+        driver.set_get_outcome(ControlledGetOutcome::Error("lookup failed"));
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let delete_gate = runtime.delete_gates.gate_for(sandbox.object_id());
+        let first_runtime = runtime.clone();
+        let first = tokio::spawn(async move { first_runtime.delete_sandbox("sandbox-a").await });
+        tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
+            .await
+            .expect("first delete did not reach the driver");
+
+        let second_runtime = runtime.clone();
+        let second = tokio::spawn(async move { second_runtime.delete_sandbox("sandbox-a").await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&delete_gate) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second delete did not start waiting on the sandbox gate");
+
+        second.abort();
+        assert!(second.await.unwrap_err().is_cancelled());
+        driver.release_delete();
+
+        let first_error = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first delete did not finish")
+            .unwrap()
+            .unwrap_err();
+        assert!(first_error.message().contains("delete failed"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), driver.delete_started.notified())
+                .await
+                .is_err(),
+            "canceled waiting delete unexpectedly reached the driver"
+        );
+        assert_eq!(driver.delete_calls(), 1);
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
         );
     }
 
@@ -4000,7 +4148,7 @@ mod tests {
         runtime.store.put_message(&replacement).await.unwrap();
         drop(delete_guard);
 
-        assert!(delete.await.unwrap().unwrap());
+        assert!(delete.await.unwrap().unwrap().deleted);
         assert_eq!(driver.delete_calls(), 0);
         assert!(
             runtime
@@ -4060,7 +4208,7 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
 
-        assert!(!runtime.delete_sandbox("sandbox-a").await.unwrap());
+        assert!(!runtime.delete_sandbox("sandbox-a").await.unwrap().deleted);
         assert!(
             runtime
                 .store
@@ -4115,7 +4263,7 @@ mod tests {
             .unwrap();
 
         driver.release_delete();
-        assert!(!delete.await.unwrap().unwrap());
+        assert!(!delete.await.unwrap().unwrap().deleted);
         assert!(
             runtime
                 .store
@@ -4175,7 +4323,7 @@ mod tests {
         let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
-        assert!(runtime.delete_sandbox("sandbox-a").await.unwrap());
+        assert!(runtime.delete_sandbox("sandbox-a").await.unwrap().deleted);
 
         let stored = runtime
             .store
@@ -4233,6 +4381,7 @@ mod tests {
                 .expect("delete did not finish")
                 .unwrap()
                 .unwrap()
+                .deleted
         );
         assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
         assert!(
@@ -4279,6 +4428,7 @@ mod tests {
                 .expect("delete did not finish")
                 .unwrap()
                 .unwrap()
+                .deleted
         );
         assert_sandbox_owned_records(&runtime, &sandbox, &session, false).await;
         assert!(
@@ -4550,6 +4700,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap()
+                .deleted
         );
         assert!(
             runtime
@@ -5330,7 +5481,7 @@ mod tests {
 
         runtime.validate_sandbox_create(&sandbox).await.unwrap();
         runtime.create_sandbox(sandbox, None).await.unwrap();
-        assert!(runtime.delete_sandbox("uds-sandbox").await.unwrap());
+        assert!(runtime.delete_sandbox("uds-sandbox").await.unwrap().deleted);
 
         let calls = driver.calls();
         assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");

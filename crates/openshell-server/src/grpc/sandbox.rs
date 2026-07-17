@@ -505,19 +505,14 @@ async fn handle_delete_sandbox_inner(
         return Err(Status::invalid_argument("name is required"));
     }
 
-    let sandbox_id = state
-        .store
-        .get_message_by_name::<Sandbox>(&name)
-        .await
-        .ok()
-        .flatten()
-        .map(|sandbox| sandbox.object_id().to_string());
-    let deleted = state.compute.delete_sandbox(&name).await?;
-    if deleted && let Some(sandbox_id) = sandbox_id {
-        state.telemetry.end_sandbox_session(&sandbox_id);
+    let result = state.compute.delete_sandbox(&name).await?;
+    if result.deleted {
+        state.telemetry.end_sandbox_session(&result.sandbox_id);
     }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
-    Ok(Response::new(DeleteSandboxResponse { deleted }))
+    Ok(Response::new(DeleteSandboxResponse {
+        deleted: result.deleted,
+    }))
 }
 
 async fn sandbox_by_name(state: &Arc<ServerState>, name: &str) -> Result<Sandbox, Status> {
@@ -2341,6 +2336,60 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(7);
         sandbox
+    }
+
+    #[tokio::test]
+    async fn delete_handler_ends_telemetry_for_the_resolved_sandbox_id() {
+        let state = test_server_state().await;
+        let mut original = test_sandbox("reused-name", Vec::new());
+        original.metadata.as_mut().unwrap().id = "sandbox-original".to_string();
+        state.store.put_message(&original).await.unwrap();
+
+        // Hold the global guard so the handler can resolve the original ID and
+        // acquire its delete gate, but cannot yet revalidate or mutate it.
+        let global_guard = state.compute.sandbox_sync_guard().await;
+        let delete_state = state.clone();
+        let delete = tokio::spawn(async move {
+            handle_delete_sandbox_inner(
+                &delete_state,
+                Request::new(DeleteSandboxRequest {
+                    name: "reused-name".to_string(),
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while state.compute.delete_gate_entry_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delete did not resolve and acquire the original sandbox gate");
+
+        state
+            .store
+            .delete(Sandbox::object_type(), original.object_id())
+            .await
+            .unwrap();
+        let mut replacement = test_sandbox("reused-name", Vec::new());
+        replacement.metadata.as_mut().unwrap().id = "sandbox-replacement".to_string();
+        state.store.put_message(&replacement).await.unwrap();
+        drop(global_guard);
+
+        let response = delete.await.unwrap().unwrap().into_inner();
+        assert!(response.deleted);
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>(replacement.object_id())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            state.telemetry.ended_sandbox_sessions(),
+            [original.object_id().to_string()]
+        );
     }
 
     #[tokio::test]
