@@ -11,6 +11,7 @@ persisted sandbox spec environment map.
 
 from __future__ import annotations
 
+import fcntl
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
@@ -99,32 +100,72 @@ def _delete_provider(stub: object, name: str) -> None:
             raise
 
 
-@contextmanager
-def _providers_v2_enabled(stub: object) -> Iterator[None]:
-    """Enable the gateway-global ``providers_v2_enabled`` opt-in for the block.
+@pytest.fixture
+def providers_v2_enabled(
+    sandbox_client: SandboxClient,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[None]:
+    """Enable the gateway-global ``providers_v2_enabled`` opt-in for one test.
 
     Composing a provider's network policy onto a sandbox is gated behind this
-    setting, which defaults off. The built-in github profile's git-transport
-    rules only reach the sandbox with it enabled. ``global`` is a Python keyword,
-    so it is passed positionally through a dict expansion.
+    setting, which defaults off; the built-in github profile's git-transport
+    rules only reach the sandbox with it enabled.
+
+    The setting is gateway-global, so this mutates shared state. To keep it safe
+    on an existing or shared gateway and under parallel workers:
+
+    - The mutation is serialized across xdist workers with an exclusive file lock
+      on the run's shared base temp dir (``getbasetemp().parent``), held for the
+      whole test so the read-modify-restore cannot interleave.
+    - The exact prior value (or absence) is captured via ``GetGatewayConfig`` and
+      restored in ``finally``, leaving the gateway as it was found.
+
+    ``global`` is a Python keyword, so it is passed through a dict expansion.
     """
-    stub.UpdateConfig(
-        openshell_pb2.UpdateConfigRequest(
-            setting_key="providers_v2_enabled",
-            setting_value=sandbox_pb2.SettingValue(bool_value=True),
-            **{"global": True},
+    stub = sandbox_client._stub
+    key = "providers_v2_enabled"
+    lock_path = tmp_path_factory.getbasetemp().parent / "providers-v2-setting.lock"
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+
+        # GetGatewayConfig returns known keys even when unset, with an empty
+        # SettingValue (no populated oneof). Only treat the setting as explicitly
+        # present when its value oneof is actually set; otherwise restore = delete.
+        config = stub.GetGatewayConfig(sandbox_pb2.GetGatewayConfigRequest())
+        prior_value = sandbox_pb2.SettingValue()
+        had_prior = (
+            key in config.settings
+            and config.settings[key].WhichOneof("value") is not None
         )
-    )
-    try:
-        yield
-    finally:
+        if had_prior:
+            prior_value.CopyFrom(config.settings[key])
+
         stub.UpdateConfig(
             openshell_pb2.UpdateConfigRequest(
-                setting_key="providers_v2_enabled",
-                delete_setting=True,
+                setting_key=key,
+                setting_value=sandbox_pb2.SettingValue(bool_value=True),
                 **{"global": True},
             )
         )
+        try:
+            yield
+        finally:
+            if had_prior:
+                stub.UpdateConfig(
+                    openshell_pb2.UpdateConfigRequest(
+                        setting_key=key,
+                        setting_value=prior_value,
+                        **{"global": True},
+                    )
+                )
+            else:
+                stub.UpdateConfig(
+                    openshell_pb2.UpdateConfigRequest(
+                        setting_key=key,
+                        delete_setting=True,
+                        **{"global": True},
+                    )
+                )
 
 
 # ===========================================================================
@@ -519,6 +560,7 @@ def test_update_provider_rejects_type_change(
 # ===========================================================================
 
 
+@pytest.mark.usefixtures("providers_v2_enabled")
 def test_github_provider_allows_https_git_clone(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
@@ -531,9 +573,11 @@ def test_github_provider_allows_https_git_clone(
     the sandbox, exercising provider attachment, effective-policy composition,
     TLS interception, and real git behavior end to end. git delegates HTTPS to a
     ``git-remote-https`` helper whose ancestor is ``/usr/bin/git``, so the
-    profile's git binary covers it via ancestor matching.
+    profile's git binary covers it via ancestor matching. The
+    ``providers_v2_enabled`` fixture turns on the gateway-global gate that
+    composes the provider's network policy.
     """
-    with _providers_v2_enabled(sandbox_client._stub), provider(
+    with provider(
         sandbox_client._stub,
         name="e2e-test-github-clone",
         provider_type="github",
