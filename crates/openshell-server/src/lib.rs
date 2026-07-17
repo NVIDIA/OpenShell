@@ -304,7 +304,7 @@ pub struct ServerState {
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
     /// Gateway-minted sandbox JWT issuer. `None` when `config.gateway_jwt`
-    /// is not configured; in that mode `IssueSandboxToken` returns
+    /// is not configured; in that mode Kubernetes bootstrap RPCs return
     /// `Status::unavailable`. Populated at startup from the on-disk key
     /// material that `certgen` writes.
     pub sandbox_jwt_issuer: Option<Arc<auth::sandbox_jwt::SandboxJwtIssuer>>,
@@ -315,7 +315,7 @@ pub struct ServerState {
     pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
 
     /// Optional K8s `ServiceAccount` authenticator that backs the
-    /// `IssueSandboxToken` bootstrap path. Only present when the gateway
+    /// Kubernetes supervisor bootstrap paths. Only present when the gateway
     /// runs in-cluster.
     pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
 

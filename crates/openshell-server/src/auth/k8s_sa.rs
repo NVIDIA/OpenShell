@@ -3,13 +3,13 @@
 
 //! Kubernetes `ServiceAccount` bootstrap authenticator.
 //!
-//! Path-scoped to `IssueSandboxToken`. Validates a projected SA token
+//! Path-scoped to the Kubernetes supervisor bootstrap RPCs. Validates a projected SA token
 //! presented by a sandbox pod, reads the pod's `openshell.io/sandbox-id`
 //! annotation, verifies the pod is controlled by the corresponding Sandbox CR,
 //! and returns a [`Principal::Sandbox`] with
-//! [`SandboxIdentitySource::K8sServiceAccount`]. The `IssueSandboxToken` handler
-//! then mints a gateway-signed JWT for that sandbox id; subsequent gRPC calls
-//! from the supervisor use the gateway-minted JWT validated by
+//! [`SandboxIdentitySource::K8sServiceAccount`]. The bootstrap handlers then
+//! mint a gateway-signed JWT for that sandbox id; subsequent gRPC calls from
+//! the supervisor use the gateway-minted JWT validated by
 //! [`super::sandbox_jwt::SandboxJwtAuthenticator`].
 //!
 //! This is the only authenticator that talks to the K8s apiserver. It is
@@ -31,9 +31,13 @@ use std::sync::Arc;
 use tonic::Status;
 use tracing::{debug, info, warn};
 
-/// gRPC method path that this authenticator accepts. All other paths fall
-/// through (return `Ok(None)`) so a gateway-minted JWT is required there.
+/// Legacy gRPC method path accepted by this authenticator. All other
+/// non-bootstrap paths fall through (return `Ok(None)`) so a gateway-minted JWT
+/// is required there.
 pub const ISSUE_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/IssueSandboxToken";
+/// Supervisor pod registration path accepted by this authenticator for the
+/// phase-1 cold Kubernetes activation flow.
+pub const REGISTER_SUPERVISOR_POD_PATH: &str = "/openshell.v1.OpenShell/RegisterSupervisorPod";
 
 /// Pod annotation that binds a sandbox pod to its UUID. Set by the
 /// Kubernetes compute driver at pod-create time. The gateway accepts this
@@ -96,9 +100,9 @@ impl Authenticator for K8sServiceAccountAuthenticator {
         headers: &http::HeaderMap,
         path: &str,
     ) -> Result<Option<Principal>, Status> {
-        // Scope: only the bootstrap RPC. Other paths fall through so the
-        // SandboxJwtAuthenticator (or OIDC) handles them.
-        if path != ISSUE_SANDBOX_TOKEN_PATH {
+        // Scope: only Kubernetes bootstrap RPCs. Other paths fall through so
+        // the SandboxJwtAuthenticator (or OIDC) handles them.
+        if path != ISSUE_SANDBOX_TOKEN_PATH && path != REGISTER_SUPERVISOR_POD_PATH {
             return Ok(None);
         }
 
@@ -999,7 +1003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticates_on_issue_path_only() {
+    async fn authenticates_on_bootstrap_paths_only() {
         let resolved = ResolvedK8sIdentity {
             sandbox_id: "sandbox-a".to_string(),
             pod_name: "openshell-sandbox-a".to_string(),
@@ -1024,6 +1028,22 @@ mod tests {
             _ => panic!("expected sandbox principal"),
         }
 
+        let on_register = auth
+            .authenticate(&bearer_headers("sa-jwt"), REGISTER_SUPERVISOR_POD_PATH)
+            .await
+            .unwrap()
+            .expect("expected principal");
+        match on_register {
+            Principal::Sandbox(p) => {
+                assert_eq!(p.sandbox_id, "sandbox-a");
+                assert!(matches!(
+                    p.source,
+                    SandboxIdentitySource::K8sServiceAccount { .. }
+                ));
+            }
+            _ => panic!("expected sandbox principal"),
+        }
+
         let off_issue = auth
             .authenticate(
                 &bearer_headers("sa-jwt"),
@@ -1033,11 +1053,11 @@ mod tests {
             .unwrap();
         assert!(
             off_issue.is_none(),
-            "K8s SA authenticator must be scoped to IssueSandboxToken"
+            "K8s SA authenticator must be scoped to bootstrap paths"
         );
         assert_eq!(
             fake.seen_tokens.lock().unwrap().len(),
-            1,
+            2,
             "off-path call must not consult the apiserver"
         );
     }

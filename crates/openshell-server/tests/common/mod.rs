@@ -24,8 +24,9 @@ use openshell_core::proto::{
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxTemplateRequest,
     HealthRequest, HealthResponse, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxTemplatesRequest,
-    ListSandboxTemplatesResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame, RevokeSshSessionRequest,
+    ListSandboxTemplatesResponse, ListSandboxesRequest, ListSandboxesResponse,
+    PodActivationMessage, ProviderResponse, RefreshSandboxTokenRequest,
+    RefreshSandboxTokenResponse, RegisterSupervisorPodRequest, RelayFrame, RevokeSshSessionRequest,
     RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, SandboxTemplateResponse,
     ServiceStatus, SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
     open_shell_client::OpenShellClient,
@@ -497,6 +498,15 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<IssueSandboxTokenRequest>,
     ) -> Result<Response<IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type RegisterSupervisorPodStream = ReceiverStream<Result<PodActivationMessage, Status>>;
+
+    async fn register_supervisor_pod(
+        &self,
+        _request: tonic::Request<RegisterSupervisorPodRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorPodStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
