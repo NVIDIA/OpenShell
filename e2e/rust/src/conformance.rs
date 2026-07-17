@@ -10,9 +10,9 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    CreateSandboxRequest, DeleteSandboxRequest, GetSandboxRequest, GpuResourceRequirements,
-    ListSandboxesRequest, ResourceRequirements, SandboxPhase, SandboxSpec, WatchSandboxRequest,
-    open_shell_client::OpenShellClient,
+    CreateSandboxRequest, DeleteSandboxRequest, ExecSandboxRequest, GetSandboxRequest,
+    GpuResourceRequirements, ListSandboxesRequest, ResourceRequirements, SandboxPhase, SandboxSpec,
+    WatchSandboxRequest, exec_sandbox_event, open_shell_client::OpenShellClient,
 };
 use openshell_core::{ObjectId, ObjectName};
 use tonic::Code;
@@ -128,6 +128,11 @@ fn all_scenarios() -> &'static [Scenario] {
             name: "labels",
             description: "Labels are persisted on create and filter list results correctly",
             sandbox_name_stems: &["labels-a", "labels-b"],
+        },
+        Scenario {
+            name: "exec",
+            description: "A command executes in a ready sandbox and streams its output and exit status",
+            sandbox_name_stems: &["exec"],
         },
     ]
 }
@@ -304,6 +309,7 @@ async fn run_scenario(name: &str, client: &mut GrpcClient, run_id: &str) -> Resu
         "validate" => scenario_validate(client).await,
         "concurrent" => scenario_concurrent(client, run_id).await,
         "labels" => scenario_labels(client, run_id).await,
+        "exec" => scenario_exec(client, run_id).await,
         _ => Err(miette::miette!("scenario '{name}' is not yet implemented")),
     }
 }
@@ -827,6 +833,106 @@ async fn scenario_labels(client: &mut GrpcClient, run_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Scenario: execute a command in a ready sandbox through the gateway API.
+///
+/// Verifies stdout and the final exit status independently, then deletes the
+/// sandbox regardless of whether command execution succeeds.
+async fn scenario_exec(client: &mut GrpcClient, run_id: &str) -> Result<()> {
+    const OUTPUT_MARKER: &str = "conformance-exec-ok";
+
+    let sandbox_name = format!("conformance-exec-{run_id}");
+    let response = client
+        .create_sandbox(CreateSandboxRequest {
+            name: sandbox_name.clone(),
+            spec: Some(SandboxSpec::default()),
+            labels: HashMap::default(),
+            annotations: HashMap::default(),
+            workspace: String::new(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("create_sandbox failed")?;
+
+    let sandbox = response
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("create_sandbox response missing sandbox"))?;
+    let sandbox_id = sandbox.object_id().to_string();
+
+    if let Err(error) = wait_for_ready(client, &sandbox_id, &sandbox_name).await {
+        let _ = client
+            .delete_sandbox(DeleteSandboxRequest {
+                name: sandbox_name,
+                workspace: String::new(),
+            })
+            .await;
+        return Err(error);
+    }
+
+    let exec_result = async {
+        let mut stream = client
+            .exec_sandbox(ExecSandboxRequest {
+                sandbox_id,
+                command: vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("printf {OUTPUT_MARKER}"),
+                ],
+                ..Default::default()
+            })
+            .await
+            .into_diagnostic()
+            .wrap_err("exec_sandbox failed")?
+            .into_inner();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit_code = None;
+
+        while let Some(event) = stream.next().await {
+            match event
+                .into_diagnostic()
+                .wrap_err("exec_sandbox stream error")?
+                .payload
+            {
+                Some(exec_sandbox_event::Payload::Stdout(chunk)) => stdout.extend(chunk.data),
+                Some(exec_sandbox_event::Payload::Stderr(chunk)) => stderr.extend(chunk.data),
+                Some(exec_sandbox_event::Payload::Exit(exit)) => exit_code = Some(exit.exit_code),
+                None => {}
+            }
+        }
+
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
+        if !stdout.contains(OUTPUT_MARKER) {
+            return Err(miette::miette!(
+                "exec_sandbox stdout did not contain '{OUTPUT_MARKER}'; stdout={stdout:?}, stderr={stderr:?}"
+            ));
+        }
+        if exit_code != Some(0) {
+            return Err(miette::miette!(
+                "exec_sandbox returned exit code {exit_code:?}; stdout={stdout:?}, stderr={stderr:?}"
+            ));
+        }
+
+        Ok(())
+    }
+    .await;
+
+    let cleanup_result = client
+        .delete_sandbox(DeleteSandboxRequest {
+            name: sandbox_name,
+            workspace: String::new(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("delete_sandbox after exec failed");
+
+    exec_result?;
+    cleanup_result?;
+    Ok(())
+}
+
 pub fn conformance_list(output: &str) -> Result<()> {
     let scenarios = all_scenarios();
 
@@ -889,6 +995,7 @@ mod tests {
                 "validate",
                 "concurrent",
                 "labels",
+                "exec",
             ]
         );
     }
@@ -921,6 +1028,7 @@ mod tests {
                 "conformance-concurrent-b-deadbeef",
                 "conformance-labels-a-deadbeef",
                 "conformance-labels-b-deadbeef",
+                "conformance-exec-deadbeef",
             ]
         );
     }

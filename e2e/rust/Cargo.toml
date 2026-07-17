@@ -59,6 +59,16 @@ path = "tests/sandbox_lifecycle.rs"
 required-features = ["e2e-cli-conformance"]
 
 [[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+required-features = ["e2e-cli-conformance"]
+
+[[test]]
+name = "vm_overlay"
+path = "tests/vm_overlay.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
 name = "custom_image"
 path = "tests/custom_image.rs"
 required-features = ["e2e-docker"]

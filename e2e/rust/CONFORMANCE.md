@@ -30,9 +30,13 @@ scenario.
 The test profiles separate the surface being validated:
 
 - `e2e-api-conformance` invokes the scenario engine directly against every
-  gateway driver.
+  gateway driver. This includes command execution through the streaming
+  `ExecSandbox` API.
 - `e2e-cli-conformance` validates portable CLI behavior against the canonical
-  Docker-backed gateway.
+  Docker-backed gateway, including the gateway smoke test.
+
+VM filesystem behavior is not driver-independent. The `vm_overlay` test remains
+under the `e2e-vm` profile and runs alongside API conformance in the VM lane.
 
 Gateway provisioners export the endpoint and any mTLS paths through
 `OPENSHELL_GATEWAY_ENDPOINT` and the `OPENSHELL_CONFORMANCE_TLS_*` variables.

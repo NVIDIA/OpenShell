@@ -129,6 +129,25 @@ async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
     combined
 }
 
+async fn exec_in_sandbox(name: &str, command: &[&str]) -> String {
+    let mut cmd = openshell_cmd();
+    cmd.args(["sandbox", "exec", "--name", name, "--no-tty", "--"])
+        .args(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output().await.expect("spawn openshell sandbox exec");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = normalize_output(&format!("{stdout}{stderr}"));
+    assert!(
+        output.status.success(),
+        "sandbox exec should succeed (exit {:?}):\n{combined}",
+        output.status.code()
+    );
+    combined
+}
+
 #[tokio::test]
 async fn sandbox_stop_start_preserves_workspace() {
     const SENTINEL: &str = "openshell-stop-start-sentinel";
@@ -248,6 +267,12 @@ async fn sandbox_create_keeps_sandbox_after_tty_command_by_default() {
              last observed sandbox list: {last_sandbox_list:?}"
         );
     }
+
+    let exec_output = exec_in_sandbox(&sandbox_name, &["echo", "sandbox-exec-ok"]).await;
+    assert!(
+        exec_output.contains("sandbox-exec-ok"),
+        "expected sandbox exec output in:\n{exec_output}"
+    );
 
     delete_sandbox(&sandbox_name).await;
 }
