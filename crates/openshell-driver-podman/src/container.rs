@@ -1155,40 +1155,11 @@ mod tests {
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     fn json_struct(value: Value) -> prost_types::Struct {
-        match json_value(value).kind {
-            Some(prost_types::value::Kind::StructValue(value)) => value,
-            _ => panic!("expected JSON object"),
-        }
-    }
-
-    fn json_value(value: Value) -> prost_types::Value {
-        match value {
-            Value::Null => prost_types::Value { kind: None },
-            Value::Bool(value) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::BoolValue(value)),
-            },
-            Value::Number(value) => prost_types::Value {
-                kind: value.as_f64().map(prost_types::value::Kind::NumberValue),
-            },
-            Value::String(value) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::StringValue(value)),
-            },
-            Value::Array(values) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::ListValue(
-                    prost_types::ListValue {
-                        values: values.into_iter().map(json_value).collect(),
-                    },
-                )),
-            },
-            Value::Object(values) => prost_types::Value {
-                kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
-                    fields: values
-                        .into_iter()
-                        .map(|(key, value)| (key, json_value(value)))
-                        .collect(),
-                })),
-            },
-        }
+        let Value::Object(object) = value else {
+            panic!("expected JSON object");
+        };
+        proto_struct::json_object_to_struct(object)
+            .expect("test JSON must convert to a protobuf Struct")
     }
 
     fn gpu_resources(count: Option<u32>) -> ResourceRequirements {

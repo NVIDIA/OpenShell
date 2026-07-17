@@ -27,6 +27,8 @@ openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
 openshell-server-macros = { path = "../openshell-server-macros" }
+openshell-supervisor-middleware = { path = "../openshell-supervisor-middleware" }
+openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
 
 # Kubernetes client (used by the `generate-certs` subcommand)
 kube = { workspace = true }
@@ -81,6 +83,8 @@ toml = { workspace = true }
 tokio-stream = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-sts = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }

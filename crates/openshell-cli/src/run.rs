@@ -1818,39 +1818,9 @@ fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
         ));
     };
 
-    Ok(prost_types::Struct {
-        fields: fields
-            .into_iter()
-            .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
-            .collect::<Result<_>>()?,
-    })
-}
-
-fn json_to_protobuf_value(value: serde_json::Value) -> Result<prost_types::Value> {
-    use prost_types::{ListValue, Struct, Value, value::Kind};
-
-    let kind = match value {
-        serde_json::Value::Null => Kind::NullValue(0),
-        serde_json::Value::Bool(value) => Kind::BoolValue(value),
-        serde_json::Value::Number(value) => Kind::NumberValue(value.as_f64().ok_or_else(|| {
-            miette!("--driver-config-json contains a number that cannot be represented")
-        })?),
-        serde_json::Value::String(value) => Kind::StringValue(value),
-        serde_json::Value::Array(values) => Kind::ListValue(ListValue {
-            values: values
-                .into_iter()
-                .map(json_to_protobuf_value)
-                .collect::<Result<_>>()?,
-        }),
-        serde_json::Value::Object(fields) => Kind::StructValue(Struct {
-            fields: fields
-                .into_iter()
-                .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
-                .collect::<Result<_>>()?,
-        }),
-    };
-
-    Ok(Value { kind: Some(kind) })
+    openshell_core::proto_struct::json_object_to_struct(fields)
+        .into_diagnostic()
+        .wrap_err("--driver-config-json contains a value that cannot be represented")
 }
 
 fn validate_cpu_quantity(value: &str) -> Result<String> {
@@ -5634,6 +5604,7 @@ fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefresh
         "google_service_account_jwt" => {
             Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
+        "aws_sts_assume_role" => Ok(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
         _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
     }
 }
@@ -5686,6 +5657,7 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }

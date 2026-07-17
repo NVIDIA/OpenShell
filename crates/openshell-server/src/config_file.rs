@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
+use openshell_core::proto::SupervisorMiddlewareService;
 use openshell_core::{
     GatewayAuthConfig, GatewayInterceptorConfig, GatewayJwtConfig,
     GatewayProviderProfileSourceConfig, MtlsAuthConfig, OidcConfig, TlsConfig,
@@ -57,6 +58,9 @@ pub struct OpenShellRoot {
 
     #[serde(default)]
     pub gateway: GatewayFileSection,
+
+    #[serde(default)]
+    pub supervisor: SupervisorFileSection,
 
     /// `[openshell.drivers.<name>]` tables — passed verbatim to each driver
     /// crate's `Deserialize` impl after the gateway-side inheritance merge.
@@ -165,6 +169,42 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// `[openshell.supervisor]` section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorFileSection {
+    /// Statically registered supervisor middleware services. Registration is
+    /// operator-owned and changes require a gateway restart.
+    #[serde(default)]
+    pub middleware: Vec<MiddlewareServiceFileConfig>,
+}
+
+/// One `[[openshell.supervisor.middleware]]` supervisor middleware registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MiddlewareServiceFileConfig {
+    /// Operator-facing name used for diagnostics.
+    pub name: String,
+    /// Plaintext gRPC endpoint reachable by the gateway and supervisors.
+    pub grpc_endpoint: String,
+    /// Operator-owned body limit for every binding exposed by this service.
+    pub max_body_bytes: u64,
+    /// Default RPC timeout using an integer with an `ms` or `s` suffix.
+    #[serde(default)]
+    pub timeout: Option<String>,
+}
+
+impl From<&MiddlewareServiceFileConfig> for SupervisorMiddlewareService {
+    fn from(config: &MiddlewareServiceFileConfig) -> Self {
+        Self {
+            name: config.name.clone(),
+            grpc_endpoint: config.grpc_endpoint.clone(),
+            max_body_bytes: config.max_body_bytes,
+            timeout: config.timeout.clone().unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -406,6 +446,31 @@ allow_unauthenticated_users = true
         let file = load(tmp.path()).expect("valid auth config parses");
         let auth = file.openshell.gateway.auth.expect("auth config");
         assert!(auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn parses_supervisor_middleware_registration() {
+        let toml = r#"
+[[openshell.supervisor.middleware]]
+name = "local-guard"
+grpc_endpoint = "http://127.0.0.1:50051"
+max_body_bytes = 262144
+timeout = "2s"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid middleware registration parses");
+        assert_eq!(
+            file.openshell.supervisor.middleware,
+            vec![MiddlewareServiceFileConfig {
+                name: "local-guard".into(),
+                grpc_endpoint: "http://127.0.0.1:50051".into(),
+                max_body_bytes: 262_144,
+                timeout: Some("2s".into()),
+            }]
+        );
+        let registration =
+            SupervisorMiddlewareService::from(&file.openshell.supervisor.middleware[0]);
+        assert_eq!(registration.timeout, "2s");
     }
 
     #[test]

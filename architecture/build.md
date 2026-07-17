@@ -148,7 +148,8 @@ The high-level CI model:
 
 1. PR-context gate jobs publish required statuses for the PR head commit.
 2. Standard branch checks run from trusted mirror branches.
-3. Label-gated E2E, GPU, and Kubernetes checks run from trusted mirror branches.
+3. Label-gated Docker, Podman, VM, GPU, and Kubernetes E2E checks run from
+   trusted mirror branches.
 4. Merge-group checks run against GitHub's temporary queue branch for the final integration state.
 5. Gate jobs verify that the mirror branch matches the PR head, or that the merge-group workflow ran for the queued SHA, and that the expected non-gate workflow actually ran.
 6. Release workflows rebuild and publish binaries, wheels, images, and docs.

@@ -111,6 +111,14 @@ provider_profile_sources = [
   { type = "user" },
 ]
 
+# Operator-run supervisor middleware. The gRPC endpoint must be reachable from
+# both the gateway and sandbox supervisors.
+[[openshell.supervisor.middleware]]
+name = "local-content-guard"
+grpc_endpoint = "http://host.openshell.internal:50051"
+max_body_bytes = 262144
+timeout = "500ms"
+
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
@@ -166,6 +174,32 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. When omitted, it defaults to `0`: the token `exp` claim and `expires_at_ms` response field become `0`, and the sandbox JWT does not expire. Use that default only for local single-player Docker, Podman, or VM gateways. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway uses `0`.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
+
+## Supervisor Middleware Services
+
+Register operator-run supervisor middleware services with one or more `[[openshell.supervisor.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
+
+```toml
+[[openshell.supervisor.middleware]]
+name = "local-content-guard"
+grpc_endpoint = "http://host.openshell.internal:50051"
+max_body_bytes = 262144
+timeout = "500ms"
+```
+
+Each service implements the supervisor middleware gRPC contract and exposes bindings through `Describe`. Policies reference the operator-owned registration `name`, attaching the complete middleware and all of its bindings. Bindings are identified by operation and phase. A manifest may expose at most one binding for each operation and phase pair; V1 supports only `HttpRequest/pre_credentials`, so a service currently exposes one binding. Registration names must be unique, and operator-run registrations cannot claim the reserved `openshell/` namespace. The service-reported manifest name is diagnostic metadata and does not need to match the registration name.
+
+The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
+
+`max_body_bytes` is the operator limit for every binding exposed by the service. It must be greater than zero, no larger than each binding's advertised limit, and no larger than the 4 MiB platform maximum. OpenShell rejects an oversized value instead of silently clamping it. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size body and its protobuf envelope fit on the transport.
+
+`timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The effective timeout covers `ValidateConfig` and `EvaluateHttpRequest`; `Describe` uses the service timeout because binding metadata is not available yet.
+
+The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
+
+See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, body-limit, and operational guidance.
+
+## Gateway Interceptors
 
 `[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target only methods in the gateway's built-in allowlist of unary mutation RPCs. New RPCs are non-interceptable until they are deliberately added to that allowlist; adding one does not require handler-specific interceptor code. Request bodies are exposed as protobuf JSON objects. Fields marked secret in the protobuf schema are recursively omitted from requests and post-commit responses. Interceptors cannot patch an omitted field or a containing object.
 

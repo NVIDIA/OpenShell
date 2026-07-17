@@ -1014,6 +1014,7 @@ enum ProviderCredentialRefreshStrategy {
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN = 3;
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS = 4;
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT = 5;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_AWS_STS_ASSUME_ROLE = 6;
 }
 
 message ProviderCredentialRefreshMaterial {
@@ -1023,6 +1024,15 @@ message ProviderCredentialRefreshMaterial {
   bool secret = 4;
 }
 
+// Declares that a single refresh operation mints more than one credential.
+// The refresh is attached to a primary credential; each additional output
+// maps a strategy-defined semantic output id to a sibling credential whose
+// env_vars receive the minted value.
+message ProviderCredentialRefreshOutput {
+  string output = 1;      // strategy-defined semantic output id (e.g. "session_token")
+  string credential = 2;  // sibling credential name whose env_vars receive this output
+}
+
 message ProviderCredentialRefresh {
   ProviderCredentialRefreshStrategy strategy = 1;
   string token_url = 2;
@@ -1030,6 +1040,7 @@ message ProviderCredentialRefresh {
   int64 refresh_before_seconds = 4;
   int64 max_lifetime_seconds = 5;
   repeated ProviderCredentialRefreshMaterial material = 6;
+  repeated ProviderCredentialRefreshOutput additional_outputs = 7;
 }
 
 message ProviderCredentialRefreshStatus {
@@ -1067,6 +1078,11 @@ message StoredProviderCredentialRefreshState {
   repeated string scopes = 14;
   int64 refresh_before_seconds = 15;
   int64 max_lifetime_seconds = 16;
+  // Resolved mapping of strategy-defined output id -> concrete env key, pinned
+  // at configure time from the profile's additional_outputs. Read by minting,
+  // collision reservation, and env-key surfacing so later profile edits cannot
+  // silently redirect writes.
+  map<string, string> additional_output_keys = 17;
 }
 
 message GetProviderRefreshStatusRequest {

@@ -94,9 +94,9 @@ CLASS:ACTIVITY [SEVERITY] ACTION DETAILS [CONTEXT]
 - SSH: peer address and authentication type
 - Process: `name(pid)` with exit code or command line
 - Config: description of what changed
-- Finding: quoted title with confidence level
+- Finding: quoted title with the stable finding type, optional confidence, and source-specific context attributes when available
 
-**Context** in brackets at the end provides the policy rule and enforcement engine that produced the decision.
+**Context** in brackets provides structured fields such as policy provenance, source-specific attributes, and denial reasons.
 
 ### Examples
 
@@ -130,6 +130,13 @@ An HTTP request to a non-default port. HTTP log URLs include the port whenever i
 OCSF HTTP:GET [INFO] ALLOWED GET http://api.internal.corp:8080/v1/status [policy:internal_api engine:opa]
 ```
 
+A supervisor middleware HTTP event records whether it transformed the request. If the middleware also emits a finding, that remains a separate event:
+
+```text
+OCSF HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware] [failed:false transformed:true]
+OCSF FINDING:CREATE [MED] "configured content matched" [type:content_guard.match count:1 middleware:prototype-content-guard]
+```
+
 Proxy and SSH servers ready:
 
 ```text
@@ -159,6 +166,8 @@ OCSF CONFIG:LOADED [INFO] Policy reloaded successfully [policy_hash:0cc0c2b52557
 ## Denial Reasons
 
 Denied `NET:` and `HTTP:` events carry a `[reason:...]` suffix that surfaces the decision detail from the event's `status_detail` field. The reason helps distinguish between policy misses, SSRF hardening, and L7 enforcement without inspecting the full OCSF JSONL record.
+
+For supervisor middleware denials, `status_detail` contains a platform-owned reason derived from the policy-local middleware config name and optional validated reason code. Middleware failure details also use platform-owned error codes. OpenShell does not copy per-request service text into logs.
 
 Common reason phrases emitted by the sandbox include:
 
@@ -196,9 +205,9 @@ An upstream that the proxy cannot reach returns `502 Bad Gateway`:
 }
 ```
 
-The `error` field is a short machine-readable code (`policy_denied`, `ssrf_denied`, `upstream_unreachable`). The `detail` field is a human-readable explanation suitable for display in an agent transcript.
+The `error` field is a short machine-readable code (`policy_denied`, `middleware_denied`, `middleware_failed`, `ssrf_denied`, `upstream_unreachable`). The `detail` field is a human-readable explanation suitable for display in an agent transcript.
 
-For L7 REST denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When policy advisor is enabled, it also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/openshell/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry.
+For L7 REST policy denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When policy advisor is enabled, it also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/openshell/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry. A middleware denial instead identifies the policy-local config in `middleware` and can include a validated `reason_code`. A fail-closed runtime failure uses `middleware_failed` with platform-owned text. Both middleware responses omit `rule_missing`, `next_steps`, and `agent_guidance` because no policy rule is missing.
 
 ## Filesystem Sandbox Logs
 

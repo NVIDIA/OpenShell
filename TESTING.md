@@ -150,6 +150,7 @@ Suites:
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
 - Docker suite (`--features e2e-docker`) - common suite plus Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway resume.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
+- VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 
 GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
 Podman container that requests `--device nvidia.com/gpu=all`. The probe image
@@ -171,6 +172,12 @@ Run the Podman-backed Rust CLI e2e suite:
 
 ```shell
 mise run e2e:podman
+```
+
+Run the VM-backed Rust CLI e2e suite:
+
+```shell
+mise run e2e:vm
 ```
 
 Run a single test directly with cargo:
