@@ -1792,6 +1792,66 @@ fn chown_recursive(
     Ok(())
 }
 
+/// Whether an existing sandbox-writable path is already owned by the configured
+/// identity.
+///
+/// Symlinks are treated as "matching" so the reconcile pass never chowns
+/// through them (mirrors the symlink refusal in [`chown_sandbox_home`]). A
+/// `None` uid/gid component is ignored, matching how `chown` leaves that
+/// component untouched.
+#[cfg(unix)]
+fn path_owner_matches(path: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
+    if meta.file_type().is_symlink() {
+        return Ok(true);
+    }
+    let uid_ok = uid.is_none_or(|u| meta.uid() == u.as_raw());
+    let gid_ok = gid.is_none_or(|g| meta.gid() == g.as_raw());
+    Ok(uid_ok && gid_ok)
+}
+
+/// Repair ownership of existing sandbox-writable paths that have drifted away
+/// from the configured identity.
+///
+/// This is the opt-in counterpart to the create-only chown in
+/// [`prepare_filesystem`]: a persisted `read_write` tree (e.g. a bind-mounted
+/// state dir) can come back owned by an unrelated host user after a reboot
+/// shifts the rootless user-namespace subuid base, leaving the sandbox unable
+/// to read its own state. A path already owned by the target identity is left
+/// untouched (a single `stat`), so this is a no-op on healthy launches. Only
+/// paths the policy already declares sandbox-writable are considered. See
+/// NVIDIA/OpenShell#2336.
+#[cfg(unix)]
+fn reconcile_read_write_ownership(
+    paths: &[PathBuf],
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+) -> Result<()> {
+    for path in paths {
+        if !path.exists() || path_owner_matches(path, uid, gid)? {
+            continue;
+        }
+        info!(
+            path = %path.display(),
+            ?uid,
+            ?gid,
+            "Reconciling stale ownership on existing sandbox-writable path"
+        );
+        chown_sandbox_home(path, uid, gid)?;
+    }
+    Ok(())
+}
+
+/// Whether the opt-in ownership reconcile pass is enabled via
+/// [`RECONCILE_SANDBOX_OWNERSHIP`](openshell_core::sandbox_env::RECONCILE_SANDBOX_OWNERSHIP).
+#[cfg(unix)]
+fn sandbox_ownership_reconcile_enabled() -> bool {
+    std::env::var_os(openshell_core::sandbox_env::RECONCILE_SANDBOX_OWNERSHIP)
+        .is_some_and(|value| value == "1" || value == "true")
+}
+
 /// Prepare filesystem for the sandboxed process.
 ///
 /// Creates `read_write` directories if they don't exist and sets ownership
@@ -1864,6 +1924,15 @@ pub fn prepare_filesystem_with_identity(
             );
             chown(path, uid, gid).into_diagnostic()?;
         }
+    }
+
+    // Opt-in: repair existing sandbox-writable trees whose ownership drifted
+    // (e.g. after a host reboot shifted the rootless userns subuid base). Off by
+    // default, so the create-only chown contract above is unchanged. This is the
+    // only identity-specific preparation Docker and Podman can opt into, since
+    // they clear SANDBOX_UID and skip the driver-injected path below.
+    if sandbox_ownership_reconcile_enabled() {
+        reconcile_read_write_ownership(&policy.filesystem.read_write, uid, gid)?;
     }
 
     // Retain the existing Kubernetes/OpenShift behavior for driver-injected
@@ -2802,6 +2871,94 @@ mod tests {
         let after = std::fs::metadata(&existing).unwrap();
         assert_eq!(after.uid(), before.uid());
         assert_eq!(after.gid(), before.gid());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn path_owner_matches_detects_current_and_mismatched_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("state");
+        std::fs::write(&file, "x").unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        let cur_uid = Uid::from_raw(meta.uid());
+        let cur_gid = Gid::from_raw(meta.gid());
+
+        assert!(path_owner_matches(&file, Some(cur_uid), Some(cur_gid)).unwrap());
+        let other_uid = Uid::from_raw(meta.uid().wrapping_add(1));
+        assert!(!path_owner_matches(&file, Some(other_uid), Some(cur_gid)).unwrap());
+        // A `None` component is ignored, matching `chown` semantics.
+        assert!(path_owner_matches(&file, None, Some(cur_gid)).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_owner_matches_treats_symlink_as_matching() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        // Symlinks are never chowned through, so they always report "matching".
+        assert!(path_owner_matches(&link, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::similar_names)]
+    fn reconcile_read_write_ownership_is_noop_when_already_owned() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("f"), "x").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let uid = Uid::from_raw(before.uid());
+        let gid = Gid::from_raw(before.gid());
+
+        // Already the target identity: no chown attempted, so this succeeds even
+        // without privilege and leaves ownership unchanged.
+        reconcile_read_write_ownership(std::slice::from_ref(&path), Some(uid), Some(gid)).unwrap();
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_read_write_ownership_skips_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        reconcile_read_write_ownership(&[missing], Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_read_write_ownership_triggers_on_mismatch() {
+        // As non-root a genuine ownership mismatch forces a chown that EPERMs,
+        // proving the reconcile pass fires — the inverse of the create-only skip
+        // contract exercised above.
+        use std::os::unix::fs::MetadataExt;
+
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state");
+        std::fs::create_dir(&path).unwrap();
+        let gid = Gid::from_raw(std::fs::metadata(&path).unwrap().gid());
+
+        assert!(
+            reconcile_read_write_ownership(&[path], Some(Uid::from_raw(0)), Some(gid)).is_err()
+        );
     }
 
     #[cfg(unix)]
