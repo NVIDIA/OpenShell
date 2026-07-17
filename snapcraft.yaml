@@ -20,7 +20,7 @@ description: |
 
          sudo snap install docker
 
-       Support for system-installed Docker is coming in snapd 2.76.
+       Support for system-installed Docker is coming in snapd 2.77.
 
     2. Connect the required interfaces:
 
