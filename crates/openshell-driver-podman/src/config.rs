@@ -69,11 +69,8 @@ impl FromStr for ImagePullPolicy {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PodmanComputeConfig {
-    /// Path to the Podman API Unix socket.
-    ///
-    /// `None` means auto-detect: the driver probes
-    /// [`openshell_core::config::detect_podman_socket`] for the first
-    /// responsive candidate when it starts.
+    /// Podman API Unix socket. When unset, use the socket selected by
+    /// gateway auto-detection.
     pub socket_path: Option<PathBuf>,
     /// Default OCI image for sandboxes.
     pub default_image: String,
