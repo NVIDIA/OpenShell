@@ -1171,8 +1171,8 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
 ///
 /// The walk does not cross filesystem boundaries (compares `st_dev`) so that
 /// read-only mounts nested under `/sandbox` are left untouched. Any remaining
-/// `EROFS` errors from `chown` are logged as warnings rather than aborting
-/// startup.
+/// `EROFS` errors from `chown` are logged at debug level and the walk still
+/// recurses into children (a read-only directory may contain writable submounts).
 #[cfg(unix)]
 fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -1209,9 +1209,9 @@ fn chown_recursive(path: &Path, uid: Option<Uid>, gid: Option<Gid>, root_dev: u6
     if let Err(e) = chown(path, uid, gid) {
         if e == nix::errno::Errno::EROFS {
             debug!(path = %path.display(), "Skipping read-only path during sandbox home chown");
-            return Ok(());
+        } else {
+            return Err(e).into_diagnostic();
         }
-        return Err(e).into_diagnostic();
     }
 
     if meta.is_dir()
