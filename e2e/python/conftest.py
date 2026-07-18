@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell import InferenceRouteClient, Sandbox, SandboxClient
+from openshell import InferenceRouteClient, Sandbox, SandboxClient, WorkspaceClient
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -64,7 +64,7 @@ def sandbox_client(cluster_name: str | None) -> Iterator[SandboxClient]:
 def ensure_sandbox_persistence_ready(sandbox_client: SandboxClient) -> None:
     for _ in range(60):
         try:
-            sandbox_client.list_ids(limit=1)
+            sandbox_client.list_ids(workspace="default", limit=1)
             return
         except grpc.RpcError as exc:
             details = exc.details() or ""
@@ -89,6 +89,7 @@ def ensure_sandbox_persistence_ready(sandbox_client: SandboxClient) -> None:
 def sandbox(cluster_name: str | None) -> Callable[..., Sandbox]:
     def _create(*, spec: object | None = None, delete_on_exit: bool = True) -> Sandbox:
         return Sandbox(
+            workspace="default",
             cluster=cluster_name,
             spec=spec,
             delete_on_exit=delete_on_exit,
@@ -103,6 +104,11 @@ def sandbox(cluster_name: str | None) -> Callable[..., Sandbox]:
 @pytest.fixture(scope="session")
 def inference_client(sandbox_client: SandboxClient) -> InferenceRouteClient:
     return InferenceRouteClient.from_sandbox_client(sandbox_client)
+
+
+@pytest.fixture(scope="session")
+def workspace_client(sandbox_client: SandboxClient) -> WorkspaceClient:
+    return WorkspaceClient.from_sandbox_client(sandbox_client)
 
 
 @pytest.fixture(scope="session")

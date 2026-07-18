@@ -8,29 +8,34 @@ package openshell.inference.v1;
 import "datamodel.proto";
 import "options.proto";
 
-// Inference service provides cluster inference configuration and bundle delivery.
+// Inference service provides workspace-scoped inference route configuration and bundle delivery.
 service Inference {
   // Return the resolved inference route bundle for sandbox-local execution.
   rpc GetInferenceBundle(GetInferenceBundleRequest)
       returns (GetInferenceBundleResponse);
 
-  // Set cluster-level inference configuration.
+  // Set the inference route for a workspace.
   //
-  // This controls how requests sent to `inference.local` are routed.
-  rpc SetClusterInference(SetClusterInferenceRequest)
-      returns (SetClusterInferenceResponse);
+  // This controls how requests sent to `inference.local` are routed
+  // for sandboxes in the specified workspace.
+  rpc SetInferenceRoute(SetInferenceRouteRequest)
+      returns (SetInferenceRouteResponse);
 
-  // Get cluster-level inference configuration.
-  rpc GetClusterInference(GetClusterInferenceRequest)
-      returns (GetClusterInferenceResponse);
+  // Get the inference route for a workspace.
+  rpc GetInferenceRoute(GetInferenceRouteRequest)
+      returns (GetInferenceRouteResponse);
+
+  // Delete an inference route from a workspace.
+  rpc DeleteInferenceRoute(DeleteInferenceRouteRequest)
+      returns (DeleteInferenceRouteResponse);
 
 }
 
-// Persisted cluster inference configuration.
+// Persisted inference route configuration.
 //
 // Only `provider_name` and `model_id` are stored; endpoint, protocols,
 // credentials, and auth style are resolved from the provider at bundle time.
-message ClusterInferenceConfig {
+message InferenceRouteConfig {
   // Provider record name backing this route.
   string provider_name = 1;
   // Model identifier to force on generation calls.
@@ -39,15 +44,15 @@ message ClusterInferenceConfig {
   uint64 timeout_secs = 3;
 }
 
-// Storage envelope for the managed cluster inference route.
+// Storage envelope for a workspace-scoped inference route.
 message InferenceRoute {
   openshell.datamodel.v1.ObjectMeta metadata = 1;
-  ClusterInferenceConfig config = 2;
+  InferenceRouteConfig config = 2;
   // Monotonic version incremented on every update.
   uint64 version = 3;
 }
 
-message SetClusterInferenceRequest {
+message SetInferenceRouteRequest {
   // Provider record name to use for credentials + endpoint mapping.
   string provider_name = 1;
   // Model identifier to force on generation calls.
@@ -61,6 +66,8 @@ message SetClusterInferenceRequest {
   bool no_verify = 5;
   // Per-route request timeout in seconds. 0 means use default (60s).
   uint64 timeout_secs = 6;
+  // Target workspace. Empty string defaults to "default".
+  string workspace = 7;
 }
 
 message ValidatedEndpoint {
@@ -68,7 +75,7 @@ message ValidatedEndpoint {
   string protocol = 2;
 }
 
-message SetClusterInferenceResponse {
+message SetInferenceRouteResponse {
   string provider_name = 1;
   string model_id = 2;
   uint64 version = 3;
@@ -80,15 +87,19 @@ message SetClusterInferenceResponse {
   repeated ValidatedEndpoint validated_endpoints = 6;
   // Per-route request timeout in seconds that was persisted.
   uint64 timeout_secs = 7;
+  // Workspace the route was configured in.
+  string workspace = 8;
 }
 
-message GetClusterInferenceRequest {
+message GetInferenceRouteRequest {
   // Route name to query. Empty string defaults to "inference.local" (user-facing).
   // Use "sandbox-system" for the sandbox system-level inference route.
   string route_name = 1;
+  // Target workspace. Empty string defaults to "default".
+  string workspace = 2;
 }
 
-message GetClusterInferenceResponse {
+message GetInferenceRouteResponse {
   string provider_name = 1;
   string model_id = 2;
   uint64 version = 3;
@@ -96,6 +107,21 @@ message GetClusterInferenceResponse {
   string route_name = 4;
   // Per-route request timeout in seconds. 0 means default (60s).
   uint64 timeout_secs = 5;
+  // Workspace the route belongs to.
+  string workspace = 6;
+}
+
+message DeleteInferenceRouteRequest {
+  // Route name to delete. Empty string defaults to "inference.local" (user-facing).
+  // Use "sandbox-system" for the sandbox system-level inference route.
+  string route_name = 1;
+  // Target workspace. Empty string defaults to "default".
+  string workspace = 2;
+}
+
+message DeleteInferenceRouteResponse {
+  // Whether a route was actually deleted.
+  bool deleted = 1;
 }
 
 message GetInferenceBundleRequest {}

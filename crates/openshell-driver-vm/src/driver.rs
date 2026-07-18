@@ -4982,6 +4982,7 @@ fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bo
         id: sandbox.id.clone(),
         name: sandbox.name.clone(),
         namespace: sandbox.namespace.clone(),
+        workspace: sandbox.workspace.clone(),
         status: Some(SandboxStatus {
             sandbox_name: sandbox.name.clone(),
             instance_id: String::new(),

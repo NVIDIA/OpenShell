@@ -648,7 +648,7 @@ async fn local_policy_override_survives_gateway_policy_polls() {
     let mut guard = SandboxGuard::create_keep_with_args(
         &[
             "--name",
-            "e2e-local-policy-override",
+            "e2e-lcl-pol-ovrd",
             "--from",
             dockerfile,
             "--policy",

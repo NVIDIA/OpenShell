@@ -320,7 +320,7 @@ create_client_sandbox() {
   fi
 
   local sandbox_name policy_file openshell
-  sandbox_name="openshell-mcp-client-$$"
+  sandbox_name="mcp-client-$$"
   policy_file="$(mktemp "${TMPDIR:-/tmp}/openshell-mcp-conformance-base-policy.XXXXXX.yaml")"
   openshell="$(openshell_bin)"
 

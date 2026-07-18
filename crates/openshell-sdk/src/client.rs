@@ -168,6 +168,7 @@ impl OpenShellClient {
             .unary(|mut grpc| {
                 let request = proto::GetSandboxRequest {
                     name: name.to_string(),
+                    workspace: String::new(),
                 };
                 async move { grpc.get_sandbox(request).await }
             })
@@ -183,6 +184,8 @@ impl OpenShellClient {
                     limit: opts.limit,
                     offset: opts.offset,
                     label_selector: opts.label_selector.clone().unwrap_or_default(),
+                    workspace: String::new(),
+                    all_workspaces: false,
                 };
                 async move { grpc.list_sandboxes(request).await }
             })
@@ -205,6 +208,7 @@ impl OpenShellClient {
             .unary(|mut grpc| {
                 let request = proto::DeleteSandboxRequest {
                     name: name.to_string(),
+                    workspace: String::new(),
                 };
                 async move { grpc.delete_sandbox(request).await }
             })
@@ -470,6 +474,7 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         name: name.unwrap_or_default(),
         labels,
         annotations: HashMap::new(),
+        workspace: String::new(),
     }
 }
 

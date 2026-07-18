@@ -758,6 +758,7 @@ mod tests {
                 config: HashMap::from([("region".to_string(), "old".to_string())]),
                 ..Provider::default()
             }),
+            workspace: String::new(),
         };
         let json = codec
             .decode_message_to_json("openshell.v1.CreateProviderRequest", &request)
@@ -1063,6 +1064,7 @@ mod tests {
             name: "demo".to_string(),
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            workspace: String::new(),
         };
 
         let bytes = request.encode_to_vec();

@@ -99,6 +99,7 @@ pub trait PolicyStoreExt {
         &self,
         id: &str,
         sandbox_id: &str,
+        workspace: &str,
         version: i64,
         payload: &[u8],
         hash: &str,
@@ -165,6 +166,7 @@ pub trait PolicyStoreExt {
         &self,
         chunk: &DraftChunkRecord,
         dedup_key: Option<&str>,
+        workspace: &str,
     ) -> PersistenceResult<String>;
 
     async fn get_draft_chunk(&self, id: &str) -> PersistenceResult<Option<DraftChunkRecord>>;
@@ -210,6 +212,7 @@ impl PolicyStoreExt for Store {
         &self,
         id: &str,
         sandbox_id: &str,
+        workspace: &str,
         version: i64,
         payload: &[u8],
         hash: &str,
@@ -217,12 +220,12 @@ impl PolicyStoreExt for Store {
         match self {
             Self::Postgres(store) => {
                 store
-                    .put_policy_revision(id, sandbox_id, version, payload, hash)
+                    .put_policy_revision(id, sandbox_id, workspace, version, payload, hash)
                     .await
             }
             Self::Sqlite(store) => {
                 store
-                    .put_policy_revision(id, sandbox_id, version, payload, hash)
+                    .put_policy_revision(id, sandbox_id, workspace, version, payload, hash)
                     .await
             }
         }
@@ -323,10 +326,11 @@ impl PolicyStoreExt for Store {
         &self,
         chunk: &DraftChunkRecord,
         dedup_key: Option<&str>,
+        workspace: &str,
     ) -> PersistenceResult<String> {
         match self {
-            Self::Postgres(store) => store.put_draft_chunk(chunk, dedup_key).await,
-            Self::Sqlite(store) => store.put_draft_chunk(chunk, dedup_key).await,
+            Self::Postgres(store) => store.put_draft_chunk(chunk, dedup_key, workspace).await,
+            Self::Sqlite(store) => store.put_draft_chunk(chunk, dedup_key, workspace).await,
         }
     }
 

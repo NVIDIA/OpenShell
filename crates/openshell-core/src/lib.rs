@@ -47,7 +47,9 @@ pub use config::{
     MtlsAuthConfig, OidcConfig, TlsConfig,
 };
 pub use error::{ComputeDriverError, Error, Result};
-pub use metadata::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, SetResourceVersion};
+pub use metadata::{
+    GetResourceVersion, ObjectId, ObjectLabels, ObjectName, ObjectWorkspace, SetResourceVersion,
+};
 
 /// Build version string derived from git metadata.
 ///

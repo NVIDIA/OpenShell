@@ -88,6 +88,7 @@ pub struct PolicyLocalContext {
     gateway_endpoint: Option<String>,
     sandbox_name: Option<String>,
     shorthand_log_dir: PathBuf,
+    workspace_rx: tokio::sync::watch::Receiver<String>,
 }
 
 impl PolicyLocalContext {
@@ -95,12 +96,14 @@ impl PolicyLocalContext {
         current_policy: Option<ProtoSandboxPolicy>,
         gateway_endpoint: Option<String>,
         sandbox_name: Option<String>,
+        workspace_rx: tokio::sync::watch::Receiver<String>,
     ) -> Self {
         Self::with_log_dir(
             current_policy,
             gateway_endpoint,
             sandbox_name,
             PathBuf::from(LOG_DIR),
+            workspace_rx,
         )
     }
 
@@ -109,12 +112,14 @@ impl PolicyLocalContext {
         gateway_endpoint: Option<String>,
         sandbox_name: Option<String>,
         shorthand_log_dir: PathBuf,
+        workspace_rx: tokio::sync::watch::Receiver<String>,
     ) -> Self {
         Self {
             current_policy: Arc::new(RwLock::new(current_policy)),
             gateway_endpoint,
             sandbox_name,
             shorthand_log_dir,
+            workspace_rx,
         }
     }
 
@@ -490,7 +495,10 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
     };
 
     let client = match openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await {
-        Ok(client) => client,
+        Ok(client) => {
+            client.set_workspace(ctx.workspace_rx.borrow().clone());
+            client
+        }
         Err(error) => {
             return (
                 502,
@@ -917,6 +925,7 @@ async fn open_lookup_session(
     let client = openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint)
         .await
         .map_err(|e| (502, error_payload("gateway_connect_failed", e.to_string())))?;
+    client.set_workspace(ctx.workspace_rx.borrow().clone());
     Ok(LookupSession {
         client,
         sandbox_name,
@@ -1326,6 +1335,10 @@ struct L7DenyRuleJson {
 mod tests {
     use super::*;
 
+    fn test_workspace_rx() -> tokio::sync::watch::Receiver<String> {
+        tokio::sync::watch::channel(String::new()).1
+    }
+
     #[test]
     fn proposal_chunks_from_body_accepts_add_rule_operation() {
         let body = br#"{
@@ -1467,7 +1480,7 @@ mod tests {
 ";
         std::fs::write(&log_path, body).unwrap();
 
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf(), test_workspace_rx());
         let (status, payload) = recent_denials_response(&ctx, "last=10").await;
         assert_eq!(status, 200);
         assert_eq!(payload["log_available"], true);
@@ -1498,7 +1511,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf(), test_workspace_rx());
         let (status, payload) = recent_denials_response(&ctx, "").await;
         assert_eq!(status, 200);
         assert_eq!(payload["log_available"], false);
@@ -1508,7 +1521,7 @@ mod tests {
     #[tokio::test]
     async fn recent_denials_signals_when_log_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf(), test_workspace_rx());
         let (status, payload) = recent_denials_response(&ctx, "").await;
         assert_eq!(status, 200);
         assert_eq!(payload["log_available"], false);
@@ -1571,7 +1584,7 @@ mod tests {
         );
         std::fs::write(&log_path, line).unwrap();
 
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf());
+        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf(), test_workspace_rx());
         let (_, payload) = recent_denials_response(&ctx, "last=1").await;
         let denials = payload["denials"].as_array().unwrap();
         assert_eq!(denials.len(), 1);
@@ -1633,6 +1646,7 @@ mod tests {
             }),
             None,
             None,
+            test_workspace_rx(),
         );
 
         // Even the otherwise-public `current_policy` route returns 404 with
@@ -1660,6 +1674,7 @@ mod tests {
             }),
             None,
             None,
+            test_workspace_rx(),
         );
 
         let (mut client, mut server) = tokio::io::duplex(4096);
@@ -1753,7 +1768,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_routes_reject_malformed_paths() {
         let _guard = ProposalsFlagGuard::set(true).await;
-        let ctx = PolicyLocalContext::new(None, None, None);
+        let ctx = PolicyLocalContext::new(None, None, None, test_workspace_rx());
 
         // Empty chunk_id after the prefix is 404, not a wildcard list.
         let (status, _) = route_request(&ctx, "GET", "/v1/proposals/", &[]).await;
@@ -1774,7 +1789,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_status_route_returns_503_when_no_gateway() {
         let _guard = ProposalsFlagGuard::set(true).await;
-        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()));
+        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()), test_workspace_rx());
 
         let (status, body) = route_request(&ctx, "GET", "/v1/proposals/chunk-id", &[]).await;
         assert_eq!(status, 503);
@@ -1784,7 +1799,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_wait_route_returns_503_when_no_gateway() {
         let _guard = ProposalsFlagGuard::set(true).await;
-        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()));
+        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()), test_workspace_rx());
 
         let (status, body) =
             route_request(&ctx, "GET", "/v1/proposals/chunk-id/wait?timeout=1", &[]).await;
@@ -1795,7 +1810,7 @@ mod tests {
     #[tokio::test]
     async fn proposal_routes_return_feature_disabled_when_flag_off() {
         let _guard = ProposalsFlagGuard::set(false).await;
-        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()));
+        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()), test_workspace_rx());
 
         let (status, body) = route_request(&ctx, "GET", "/v1/proposals/abc", &[]).await;
         assert_eq!(status, 404);
@@ -1871,7 +1886,7 @@ mod tests {
         // whole-policy diff would never see another change and burn the
         // full timeout. Rule-coverage must return immediately.
         let proposed = proposed_curl_rule_for_github();
-        let ctx = PolicyLocalContext::new(Some(policy_with_rule(proposed.clone())), None, None);
+        let ctx = PolicyLocalContext::new(Some(policy_with_rule(proposed.clone())), None, None, test_workspace_rx());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
 
         let start = tokio::time::Instant::now();
@@ -1897,7 +1912,7 @@ mod tests {
             version: 1,
             ..Default::default()
         };
-        let ctx = PolicyLocalContext::new(Some(initial), None, None);
+        let ctx = PolicyLocalContext::new(Some(initial), None, None, test_workspace_rx());
 
         // Concurrently, an unrelated rule lands. We must not return.
         let unrelated_load = {
@@ -1948,6 +1963,7 @@ mod tests {
             }),
             None,
             None,
+            test_workspace_rx(),
         );
 
         let matching_load = {
@@ -1985,6 +2001,7 @@ mod tests {
             }),
             None,
             None,
+            test_workspace_rx(),
         );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
         let start = tokio::time::Instant::now();

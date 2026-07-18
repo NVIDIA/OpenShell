@@ -347,7 +347,7 @@ def test_create_sandbox_rejects_unknown_provider(
         providers=["nonexistent-provider-xyz"],
     )
     with pytest.raises(grpc.RpcError) as exc_info:
-        sandbox_client.create(spec=spec)
+        sandbox_client.create(workspace="default", spec=spec)
 
     assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
     assert "nonexistent-provider-xyz" in (exc_info.value.details() or "")
@@ -613,3 +613,78 @@ def test_github_provider_allows_https_git_clone(
             assert head.exit_code == 0, (
                 f"cloned repo is missing .git/HEAD; stderr={head.stderr!r}"
             )
+
+
+# ===========================================================================
+# Tests: provider profile platform vs workspace scope isolation
+# ===========================================================================
+
+
+def test_provider_profile_platform_vs_workspace_isolation(
+    sandbox_client: "SandboxClient",
+) -> None:
+    """Platform-scoped (workspace='') and workspace-scoped profiles are isolated."""
+    stub = sandbox_client._stub
+    platform_id = "e2e-platform-profile"
+    workspace_id = "e2e-workspace-profile"
+
+    def _make_profile(profile_id: str) -> openshell_pb2.ProviderProfileImportItem:
+        return openshell_pb2.ProviderProfileImportItem(
+            profile=openshell_pb2.ProviderProfile(
+                id=profile_id,
+                display_name=f"{profile_id} display",
+                category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_OTHER,
+            ),
+            source=f"{profile_id}.yaml",
+        )
+
+    def _cleanup() -> None:
+        for pid, ws in [(platform_id, ""), (workspace_id, "default")]:
+            try:
+                stub.DeleteProviderProfile(
+                    openshell_pb2.DeleteProviderProfileRequest(id=pid, workspace=ws)
+                )
+            except grpc.RpcError:
+                pass
+
+    _cleanup()
+    try:
+        resp = stub.ImportProviderProfiles(
+            openshell_pb2.ImportProviderProfilesRequest(
+                profiles=[_make_profile(platform_id)],
+                workspace="",
+            )
+        )
+        assert resp.imported, "platform-scoped import should succeed"
+
+        resp = stub.ImportProviderProfiles(
+            openshell_pb2.ImportProviderProfilesRequest(
+                profiles=[_make_profile(workspace_id)],
+                workspace="default",
+            )
+        )
+        assert resp.imported, "workspace-scoped import should succeed"
+
+        platform_list = stub.ListProviderProfiles(
+            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace="")
+        )
+        platform_ids = [p.id for p in platform_list.profiles]
+        assert platform_id in platform_ids, (
+            "platform profile should appear in platform list"
+        )
+        assert workspace_id not in platform_ids, (
+            "workspace profile should NOT appear in platform list"
+        )
+
+        workspace_list = stub.ListProviderProfiles(
+            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace="default")
+        )
+        workspace_ids = [p.id for p in workspace_list.profiles]
+        assert workspace_id in workspace_ids, (
+            "workspace profile should appear in workspace list"
+        )
+        assert platform_id not in workspace_ids, (
+            "platform profile should NOT appear in workspace list"
+        )
+    finally:
+        _cleanup()

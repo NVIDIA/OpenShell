@@ -28,7 +28,7 @@ if [[ -z "${OPENSHELL_BIN:-}" ]]; then
 fi
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
-SANDBOX="${SANDBOX:-mechanistic-smoke-${RUN_ID}}"
+SANDBOX="${SANDBOX:-ms-${RUN_ID}}"
 KEEP_SANDBOX="${KEEP_SANDBOX:-0}"
 # Allow override so CI can set a shorter interval via OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS.
 FLUSH_WAIT="${FLUSH_WAIT:-15}"

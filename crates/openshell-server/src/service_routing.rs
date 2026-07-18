@@ -48,10 +48,11 @@ pub fn endpoint_key(sandbox: &str, service: &str) -> String {
 
 pub fn endpoint_url(
     config: &openshell_core::Config,
+    workspace: &str,
     sandbox: &str,
     service: &str,
 ) -> Option<String> {
-    let host = endpoint_host(&config.service_routing, sandbox, service)?;
+    let host = endpoint_host(&config.service_routing, workspace, sandbox, service)?;
     let scheme = endpoint_scheme(config);
     let port = config.bind_address.port();
     let include_port = !matches!((scheme, port), ("https", 443) | ("http", 80));
@@ -73,34 +74,50 @@ fn endpoint_scheme(config: &openshell_core::Config) -> &'static str {
     }
 }
 
-fn endpoint_host(config: &ServiceRoutingConfig, sandbox: &str, service: &str) -> Option<String> {
+fn endpoint_host(
+    config: &ServiceRoutingConfig,
+    workspace: &str,
+    sandbox: &str,
+    service: &str,
+) -> Option<String> {
     let base_domain = config.base_domains.first()?;
     Some(if service.is_empty() {
-        format!("{sandbox}.{base_domain}")
+        format!("{workspace}--{sandbox}.{base_domain}")
     } else {
-        format!("{sandbox}--{service}.{base_domain}")
+        format!("{workspace}--{sandbox}--{service}.{base_domain}")
     })
 }
 
-pub fn parse_host(host: &str, config: &ServiceRoutingConfig) -> Option<(String, String)> {
+// The `--` delimiter is unambiguous because both workspace and sandbox name
+// validation reject consecutive hyphens (see `validate_workspace_name` and
+// `validate_sandbox_spec`).
+pub fn parse_host(host: &str, config: &ServiceRoutingConfig) -> Option<(String, String, String)> {
     let host = host.split_once(':').map_or(host, |(name, _)| name);
     for base_domain in &config.base_domains {
         let expected_suffix = format!(".{base_domain}");
         let Some(encoded) = host.strip_suffix(&expected_suffix) else {
             continue;
         };
-        let (sandbox, service) = if let Some((sandbox, service)) = encoded.split_once("--") {
+        let (workspace, rest) = encoded.split_once("--")?;
+        if workspace.is_empty() || workspace.contains("--") {
+            return None;
+        }
+        let (sandbox, service) = if let Some((sandbox, service)) = rest.split_once("--") {
             if service.is_empty() || service.contains("--") {
                 return None;
             }
             (sandbox, service)
         } else {
-            (encoded, "")
+            (rest, "")
         };
         if sandbox.is_empty() || sandbox.contains("--") {
             return None;
         }
-        return Some((sandbox.to_string(), service.to_string()));
+        return Some((
+            workspace.to_string(),
+            sandbox.to_string(),
+            service.to_string(),
+        ));
     }
     None
 }
@@ -116,11 +133,13 @@ pub async fn proxy_sandbox_service_request(
     let Some(host) = request_host(&req) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((sandbox_name, service_name)) = parse_host(host, &state.config.service_routing) else {
+    let Some((workspace, sandbox_name, service_name)) =
+        parse_host(host, &state.config.service_routing)
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    match proxy_to_endpoint(state, req, sandbox_name, service_name).await {
+    match proxy_to_endpoint(state, req, &workspace, sandbox_name, service_name).await {
         Ok(response) => response.into_response(),
         Err(err) => err.into_response(),
     }
@@ -209,10 +228,12 @@ pub fn service_error_response(status: StatusCode, message: &'static str) -> Axum
 async fn proxy_to_endpoint(
     state: Arc<ServerState>,
     mut req: Request<Body>,
+    workspace: &str,
     sandbox_name: String,
     service_name: String,
 ) -> Result<Response<Body>, ServiceRouteError> {
-    let endpoint = match load_endpoint(&state.store, &sandbox_name, &service_name).await {
+    let endpoint = match load_endpoint(&state.store, workspace, &sandbox_name, &service_name).await
+    {
         Ok(endpoint) => endpoint,
         Err(err) => {
             emit_service_http_failure(&state, &req, &sandbox_name, &service_name, None, &err);
@@ -409,12 +430,13 @@ async fn proxy_to_endpoint(
 
 async fn load_endpoint(
     store: &Store,
+    workspace: &str,
     sandbox_name: &str,
     service_name: &str,
 ) -> Result<ServiceEndpoint, ServiceRouteError> {
     let key = endpoint_key(sandbox_name, service_name);
     store
-        .get_message_by_name::<ServiceEndpoint>(&key)
+        .get_message_by_name::<ServiceEndpoint>(workspace, &key)
         .await
         .map_err(|err| {
             warn!(error = %err, endpoint = %key, "sandbox service routing: failed to load service endpoint");
@@ -572,7 +594,9 @@ pub fn emit_cross_origin_service_http_rejection(state: &ServerState, req: &Reque
     let Some(host) = request_host(req) else {
         return;
     };
-    let Some((sandbox_name, service_name)) = parse_host(host, &state.config.service_routing) else {
+    let Some((_workspace, sandbox_name, service_name)) =
+        parse_host(host, &state.config.service_routing)
+    else {
         return;
     };
     let err = ServiceRouteError::new(
@@ -805,6 +829,8 @@ mod tests {
                 labels: std::collections::HashMap::default(),
                 resource_version: 0,
                 annotations: std::collections::HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             sandbox_id: "sandbox-id".to_string(),
             sandbox_name: "my-sandbox".to_string(),
@@ -840,8 +866,8 @@ mod tests {
             .with_server_sans(["*.dev.openshell.localhost"]);
 
         assert_eq!(
-            endpoint_url(&cfg, "my-sandbox", "web").as_deref(),
-            Some("http://my-sandbox--web.dev.openshell.localhost:8080/")
+            endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+            Some("http://default--my-sandbox--web.dev.openshell.localhost:8080/")
         );
     }
 
@@ -852,8 +878,8 @@ mod tests {
             .with_server_sans(["*.dev.openshell.localhost"]);
 
         assert_eq!(
-            endpoint_url(&cfg, "my-sandbox", "").as_deref(),
-            Some("http://my-sandbox.dev.openshell.localhost:8080/")
+            endpoint_url(&cfg, "default", "my-sandbox", "").as_deref(),
+            Some("http://default--my-sandbox.dev.openshell.localhost:8080/")
         );
     }
 
@@ -864,8 +890,8 @@ mod tests {
             .with_server_sans(["*.dev.openshell.localhost"]);
 
         assert_eq!(
-            endpoint_url(&cfg, "my-sandbox", "web").as_deref(),
-            Some("https://my-sandbox--web.dev.openshell.localhost:8080/")
+            endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+            Some("https://default--my-sandbox--web.dev.openshell.localhost:8080/")
         );
     }
 
@@ -877,24 +903,47 @@ mod tests {
             .with_loopback_service_http(false);
 
         assert_eq!(
-            endpoint_url(&cfg, "my-sandbox", "web").as_deref(),
-            Some("https://my-sandbox--web.dev.openshell.localhost:8080/")
+            endpoint_url(&cfg, "default", "my-sandbox", "web").as_deref(),
+            Some("https://default--my-sandbox--web.dev.openshell.localhost:8080/")
+        );
+    }
+
+    #[test]
+    fn endpoint_url_includes_workspace_prefix_for_non_default() {
+        let cfg = openshell_core::Config::new(Some(tls_config()))
+            .with_bind_address("127.0.0.1:8080".parse().unwrap())
+            .with_server_sans(["*.dev.openshell.localhost"]);
+
+        assert_eq!(
+            endpoint_url(&cfg, "staging", "my-sandbox", "web").as_deref(),
+            Some("http://staging--my-sandbox--web.dev.openshell.localhost:8080/")
         );
     }
 
     #[test]
     fn parses_sandbox_service_host() {
         assert_eq!(
-            parse_host("my-sandbox--web.dev.openshell.localhost", &config()),
-            Some(("my-sandbox".to_string(), "web".to_string()))
+            parse_host(
+                "default--my-sandbox--web.dev.openshell.localhost",
+                &config()
+            ),
+            Some((
+                "default".to_string(),
+                "my-sandbox".to_string(),
+                "web".to_string()
+            ))
         );
     }
 
     #[test]
     fn parses_sandbox_host_without_service_label() {
         assert_eq!(
-            parse_host("my-sandbox.dev.openshell.localhost", &config()),
-            Some(("my-sandbox".to_string(), String::new()))
+            parse_host("default--my-sandbox.dev.openshell.localhost", &config()),
+            Some((
+                "default".to_string(),
+                "my-sandbox".to_string(),
+                String::new()
+            ))
         );
     }
 
@@ -909,16 +958,27 @@ mod tests {
     #[test]
     fn parses_sandbox_service_host_with_port() {
         assert_eq!(
-            parse_host("my-sandbox--web.dev.openshell.localhost:8080", &config()),
-            Some(("my-sandbox".to_string(), "web".to_string()))
+            parse_host(
+                "default--my-sandbox--web.dev.openshell.localhost:8080",
+                &config()
+            ),
+            Some((
+                "default".to_string(),
+                "my-sandbox".to_string(),
+                "web".to_string()
+            ))
         );
     }
 
     #[test]
     fn parses_alternate_service_routing_domain() {
         assert_eq!(
-            parse_host("my-sandbox--web.svc.gateway.localhost", &config()),
-            Some(("my-sandbox".to_string(), "web".to_string()))
+            parse_host("default--my-sandbox--web.svc.gateway.localhost", &config()),
+            Some((
+                "default".to_string(),
+                "my-sandbox".to_string(),
+                "web".to_string()
+            ))
         );
     }
 
@@ -926,6 +986,43 @@ mod tests {
     fn rejects_unknown_base_domain() {
         assert_eq!(
             parse_host("my-sandbox--web.prod.openshell.localhost", &config()),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_workspace_prefixed_host() {
+        assert_eq!(
+            parse_host(
+                "staging--my-sandbox--web.dev.openshell.localhost",
+                &config()
+            ),
+            Some((
+                "staging".to_string(),
+                "my-sandbox".to_string(),
+                "web".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_consecutive_hyphens_in_workspace() {
+        assert_eq!(
+            parse_host(
+                "team--ml--my-sandbox--web.dev.openshell.localhost",
+                &config()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_consecutive_hyphens_in_service() {
+        assert_eq!(
+            parse_host(
+                "default--my-sandbox--web--app.dev.openshell.localhost",
+                &config()
+            ),
             None
         );
     }
@@ -1100,5 +1197,38 @@ mod tests {
         assert_eq!(upstream.headers()[header::UPGRADE], "websocket");
         assert_eq!(upstream.headers()["sec-websocket-key"], "abc");
         assert_eq!(upstream.headers()[header::HOST], "127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn load_endpoint_uses_workspace_for_lookup() {
+        let store = crate::persistence::test_store().await;
+
+        let ep = ServiceEndpoint {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "ep-1".to_string(),
+                name: "my-sandbox--web".to_string(),
+                created_at_ms: 1_700_000_000_000,
+                labels: std::collections::HashMap::default(),
+                resource_version: 0,
+                annotations: std::collections::HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            sandbox_id: "sandbox-1".to_string(),
+            sandbox_name: "my-sandbox".to_string(),
+            service_name: "web".to_string(),
+            target_port: 8080,
+            domain: true,
+        };
+        store.put_message(&ep).await.unwrap();
+
+        let found = load_endpoint(&store, "default", "my-sandbox", "web").await;
+        assert!(found.is_ok(), "should find endpoint in correct workspace");
+
+        let not_found = load_endpoint(&store, "staging", "my-sandbox", "web").await;
+        assert!(
+            not_found.is_err(),
+            "should not find endpoint in wrong workspace"
+        );
     }
 }

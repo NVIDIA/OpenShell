@@ -56,6 +56,8 @@ fn sandbox_with_phase(name: &str, phase: proto::SandboxPhase) -> proto::Sandbox 
             labels: HashMap::new(),
             annotations: HashMap::new(),
             resource_version: 1,
+            deletion_timestamp_ms: 0,
+            workspace: String::new(),
         }),
         spec: None,
         status: Some(proto::SandboxStatus {
@@ -574,6 +576,55 @@ impl OpenShell for TestOpenShell {
         &self,
         _: tonic::Request<proto::RefreshSandboxTokenRequest>,
     ) -> Result<Response<proto::RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn create_workspace(
+        &self,
+        _: tonic::Request<proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _: tonic::Request<proto::GetWorkspaceRequest>,
+    ) -> Result<Response<proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _: tonic::Request<proto::ListWorkspacesRequest>,
+    ) -> Result<Response<proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _: tonic::Request<proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _: tonic::Request<proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _: tonic::Request<proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _: tonic::Request<proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<proto::ListWorkspaceMembersResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
 }

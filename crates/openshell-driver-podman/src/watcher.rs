@@ -7,7 +7,9 @@ use crate::client::{
     ContainerInspect, ContainerListEntry, ContainerState, HealthState, PodmanApiError,
     PodmanClient, PodmanEvent,
 };
-use crate::container::{LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, short_id};
+use crate::container::{
+    LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME, LABEL_SANDBOX_WORKSPACE, short_id,
+};
 use futures::Stream;
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::{
@@ -76,7 +78,7 @@ pub async fn start_watch(client: PodmanClient) -> Result<WatchStream, PodmanApiE
     let mut event_rx = client.events_stream(LABEL_MANAGED_FILTER).await?;
 
     // 2. List existing containers for initial state sync.
-    let existing = client.list_containers(LABEL_MANAGED_FILTER).await?;
+    let existing = client.list_containers(&[LABEL_MANAGED_FILTER]).await?;
 
     for entry in &existing {
         // For running containers, use inspect to get full state including
@@ -215,9 +217,16 @@ async fn map_podman_event(
                         .get(LABEL_SANDBOX_NAME)
                         .cloned()
                         .unwrap_or_default();
+                    let workspace = event
+                        .actor
+                        .attributes
+                        .get(LABEL_SANDBOX_WORKSPACE)
+                        .cloned()
+                        .unwrap_or_default();
                     Some(sandbox_event(build_driver_sandbox(
                         sandbox_id.clone(),
                         sandbox_name,
+                        workspace,
                         String::new(),
                         short_id(container_id),
                         DriverCondition {
@@ -247,6 +256,7 @@ async fn map_podman_event(
 fn build_driver_sandbox(
     sandbox_id: String,
     sandbox_name: String,
+    workspace: String,
     instance_name: String,
     instance_id: String,
     condition: DriverCondition,
@@ -265,6 +275,7 @@ fn build_driver_sandbox(
             conditions: vec![condition],
             deleting,
         }),
+        workspace,
     }
 }
 
@@ -277,6 +288,12 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
         .get(LABEL_SANDBOX_NAME)
         .cloned()
         .unwrap_or_default();
+    let workspace = inspect
+        .config
+        .labels
+        .get(LABEL_SANDBOX_WORKSPACE)
+        .cloned()
+        .unwrap_or_default();
 
     let condition = condition_from_state(&inspect.state);
     let deleting = inspect.state.status == "removing";
@@ -284,6 +301,7 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
     Some(build_driver_sandbox(
         sandbox_id,
         sandbox_name,
+        workspace,
         inspect.name.trim_start_matches('/').to_string(),
         short_id(&inspect.id),
         condition,
@@ -297,6 +315,11 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
     let sandbox_name = entry
         .labels
         .get(LABEL_SANDBOX_NAME)
+        .cloned()
+        .unwrap_or_default();
+    let workspace = entry
+        .labels
+        .get(LABEL_SANDBOX_WORKSPACE)
         .cloned()
         .unwrap_or_default();
 
@@ -316,6 +339,7 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
     Some(build_driver_sandbox(
         sandbox_id,
         sandbox_name,
+        workspace,
         entry.names.first().cloned().unwrap_or_default(),
         short_id(&entry.id),
         DriverCondition {
@@ -497,6 +521,7 @@ mod tests {
                 conditions: vec![condition],
                 deleting: false,
             }),
+            workspace: String::new(),
         };
 
         let event = WatchSandboxesEvent {

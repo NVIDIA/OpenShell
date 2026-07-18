@@ -6,7 +6,7 @@ display_name: Gator Gate Agent
 description: Validate and monitor OpenShell GitHub issues and pull requests through the gator state machine.
 
 sandbox:
-  name_prefix: gator
+  name_prefix: gtr
   from: agent://.
   gateway: docker-dev
   background_log_dir: logs

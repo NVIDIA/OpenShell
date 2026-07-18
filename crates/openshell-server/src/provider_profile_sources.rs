@@ -484,7 +484,7 @@ fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
 
 pub async fn user_provider_profiles(store: &Store) -> Result<Vec<StoredProviderProfile>, Status> {
     let profiles: Vec<StoredProviderProfile> = store
-        .list_messages(10_000, 0)
+        .list_all_messages(10_000, 0)
         .await
         .map_err(|e| Status::internal(format!("list provider profiles failed: {e}")))?;
     Ok(profiles)
@@ -502,6 +502,8 @@ pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfil
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
+            workspace: String::new(),
+            deletion_timestamp_ms: 0,
         }),
         profile: Some(profile),
     }

@@ -4,12 +4,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use openshell_core::ObjectId;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
     DeleteServiceRequest, DeleteServiceResponse, ExposeServiceRequest, GetServiceRequest,
     ListServicesRequest, ListServicesResponse, Sandbox, ServiceEndpoint, ServiceEndpointResponse,
 };
+use openshell_core::{ObjectId, ObjectWorkspace};
 use prost::Message as _;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -18,14 +18,17 @@ use crate::ServerState;
 use crate::persistence::{ObjectType, WriteCondition};
 use crate::service_routing;
 
-const MAX_SERVICE_NAME_LEN: usize = 28;
-const MAX_SANDBOX_NAME_LEN: usize = 28;
+const MAX_SERVICE_NAME_LEN: usize = super::MAX_ROUTABLE_NAME_LEN;
+const MAX_SANDBOX_NAME_LEN: usize = super::MAX_ROUTABLE_NAME_LEN;
 
 pub(super) async fn handle_expose_service(
     state: &Arc<ServerState>,
     request: Request<ExposeServiceRequest>,
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     let req = request.into_inner();
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .ensure_active()?;
     validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
     if req.target_port == 0 || req.target_port > u32::from(u16::MAX) {
@@ -34,7 +37,7 @@ pub(super) async fn handle_expose_service(
 
     let sandbox = state
         .store
-        .get_message_by_name::<Sandbox>(&req.sandbox)
+        .get_message_by_name::<Sandbox>(&workspace, &req.sandbox)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
@@ -45,7 +48,7 @@ pub(super) async fn handle_expose_service(
     // Fetch existing endpoint to determine create vs. update path
     let existing = state
         .store
-        .get_message_by_name::<ServiceEndpoint>(&key)
+        .get_message_by_name::<ServiceEndpoint>(&workspace, &key)
         .await
         .map_err(|e| Status::internal(format!("fetch endpoint failed: {e}")))?;
 
@@ -88,6 +91,8 @@ pub(super) async fn handle_expose_service(
             labels: HashMap::from([("sandbox".to_string(), req.sandbox.clone())]),
             resource_version: 0,
             annotations: HashMap::new(),
+            workspace: workspace.clone(),
+            deletion_timestamp_ms: 0,
         }),
         sandbox_id: sandbox.object_id().to_string(),
         sandbox_name: req.sandbox.clone(),
@@ -103,6 +108,7 @@ pub(super) async fn handle_expose_service(
             ServiceEndpoint::object_type(),
             &id,
             &key,
+            &workspace,
             &endpoint.encode_to_vec(),
             Some(&labels_json),
             condition,
@@ -115,7 +121,7 @@ pub(super) async fn handle_expose_service(
         meta.resource_version = result.resource_version;
     }
 
-    let url = service_routing::endpoint_url(&state.config, &req.sandbox, &req.service)
+    let url = service_routing::endpoint_url(&state.config, &workspace, &req.sandbox, &req.service)
         .unwrap_or_default();
     service_routing::emit_service_endpoint_config_event(&endpoint, &url, created);
 
@@ -130,10 +136,13 @@ pub(super) async fn handle_get_service(
     request: Request<GetServiceRequest>,
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     let req = request.into_inner();
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
 
-    let endpoint = get_service_endpoint(state, &req.sandbox, &req.service)
+    let endpoint = get_service_endpoint(state, &workspace, &req.sandbox, &req.service)
         .await?
         .ok_or_else(|| Status::not_found("service endpoint not found"))?;
 
@@ -145,18 +154,43 @@ pub(super) async fn handle_list_services(
     request: Request<ListServicesRequest>,
 ) -> Result<Response<ListServicesResponse>, Status> {
     let req = request.into_inner();
+    if req.all_workspaces && !req.workspace.is_empty() {
+        return Err(Status::invalid_argument(
+            "all_workspaces and workspace are mutually exclusive",
+        ));
+    }
     if !req.sandbox.is_empty() {
         validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     }
 
     let limit = super::clamp_limit(req.limit, 100, super::MAX_PAGE_SIZE);
-    let endpoints: Vec<ServiceEndpoint> = if req.sandbox.is_empty() {
-        state.store.list_messages(limit, req.offset).await
+    let endpoints: Vec<ServiceEndpoint> = if req.all_workspaces {
+        if !req.sandbox.is_empty() {
+            return Err(Status::invalid_argument(
+                "sandbox filter is not supported with all_workspaces",
+            ));
+        }
+        state.store.list_all_messages(limit, req.offset).await
     } else {
-        state
-            .store
-            .list_messages_with_selector(&format!("sandbox={}", req.sandbox), limit, req.offset)
-            .await
+        let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+            .await?
+            .name;
+        if req.sandbox.is_empty() {
+            state
+                .store
+                .list_messages(&workspace, limit, req.offset)
+                .await
+        } else {
+            state
+                .store
+                .list_messages_with_selector(
+                    &workspace,
+                    &format!("sandbox={}", req.sandbox),
+                    limit,
+                    req.offset,
+                )
+                .await
+        }
     }
     .map_err(|e| Status::internal(format!("list endpoints failed: {e}")))?;
 
@@ -173,10 +207,13 @@ pub(super) async fn handle_delete_service(
     request: Request<DeleteServiceRequest>,
 ) -> Result<Response<DeleteServiceResponse>, Status> {
     let req = request.into_inner();
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     validate_endpoint_name("sandbox", &req.sandbox, MAX_SANDBOX_NAME_LEN)?;
     validate_optional_endpoint_name("service", &req.service, MAX_SERVICE_NAME_LEN)?;
 
-    let endpoint = get_service_endpoint(state, &req.sandbox, &req.service).await?;
+    let endpoint = get_service_endpoint(state, &workspace, &req.sandbox, &req.service).await?;
     let Some(endpoint) = endpoint else {
         return Ok(Response::new(DeleteServiceResponse { deleted: false }));
     };
@@ -184,7 +221,7 @@ pub(super) async fn handle_delete_service(
     let key = service_routing::endpoint_key(&req.sandbox, &req.service);
     let deleted = state
         .store
-        .delete_by_name(ServiceEndpoint::object_type(), &key)
+        .delete_by_name(ServiceEndpoint::object_type(), &workspace, &key)
         .await
         .map_err(|e| Status::internal(format!("delete endpoint failed: {e}")))?;
 
@@ -197,13 +234,14 @@ pub(super) async fn handle_delete_service(
 
 async fn get_service_endpoint(
     state: &Arc<ServerState>,
+    workspace: &str,
     sandbox: &str,
     service: &str,
 ) -> Result<Option<ServiceEndpoint>, Status> {
     let key = service_routing::endpoint_key(sandbox, service);
     state
         .store
-        .get_message_by_name::<ServiceEndpoint>(&key)
+        .get_message_by_name::<ServiceEndpoint>(workspace, &key)
         .await
         .map_err(|e| Status::internal(format!("fetch endpoint failed: {e}")))
 }
@@ -212,8 +250,10 @@ fn service_endpoint_response(
     state: &Arc<ServerState>,
     endpoint: ServiceEndpoint,
 ) -> ServiceEndpointResponse {
+    let workspace = endpoint.object_workspace();
     let url = service_routing::endpoint_url(
         &state.config,
+        workspace,
         &endpoint.sandbox_name,
         &endpoint.service_name,
     )
@@ -288,6 +328,8 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             spec: Some(openshell_core::proto::SandboxSpec::default()),
             ..Default::default()
@@ -333,6 +375,7 @@ mod tests {
                 service: "web".to_string(),
                 target_port: 8080,
                 domain: true,
+                workspace: "default".to_string(),
             }),
         )
         .await
@@ -346,6 +389,8 @@ mod tests {
                 sandbox: "my-sandbox".to_string(),
                 limit: 0,
                 offset: 0,
+                workspace: "default".to_string(),
+                all_workspaces: false,
             }),
         )
         .await
@@ -362,6 +407,7 @@ mod tests {
             Request::new(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
+                workspace: "default".to_string(),
             }),
         )
         .await
@@ -374,6 +420,7 @@ mod tests {
             Request::new(DeleteServiceRequest {
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
+                workspace: "default".to_string(),
             }),
         )
         .await
@@ -386,6 +433,7 @@ mod tests {
             Request::new(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
+                workspace: "default".to_string(),
             }),
         )
         .await
@@ -398,6 +446,8 @@ mod tests {
                 sandbox: "my-sandbox".to_string(),
                 limit: 0,
                 offset: 0,
+                workspace: "default".to_string(),
+                all_workspaces: false,
             }),
         )
         .await
@@ -421,6 +471,7 @@ mod tests {
                     service: "web".to_string(),
                     target_port: 8080,
                     domain: true,
+                    workspace: "default".to_string(),
                 }),
             )
             .await
@@ -435,6 +486,7 @@ mod tests {
                     service: "web".to_string(),
                     target_port: 9090,
                     domain: true,
+                    workspace: "default".to_string(),
                 }),
             )
             .await
@@ -459,6 +511,8 @@ mod tests {
                 sandbox: "my-sandbox".to_string(),
                 limit: 0,
                 offset: 0,
+                workspace: "default".to_string(),
+                all_workspaces: false,
             }),
         )
         .await
@@ -480,6 +534,7 @@ mod tests {
                 service: "web".to_string(),
                 target_port: 7070,
                 domain: true,
+                workspace: "default".to_string(),
             }),
         )
         .await
@@ -495,6 +550,7 @@ mod tests {
                     service: "web".to_string(),
                     target_port: 8080,
                     domain: true,
+                    workspace: "default".to_string(),
                 }),
             )
             .await
@@ -509,6 +565,7 @@ mod tests {
                     service: "web".to_string(),
                     target_port: 9090,
                     domain: true,
+                    workspace: "default".to_string(),
                 }),
             )
             .await
@@ -531,6 +588,7 @@ mod tests {
             Request::new(GetServiceRequest {
                 sandbox: "my-sandbox".to_string(),
                 service: "web".to_string(),
+                workspace: "default".to_string(),
             }),
         )
         .await
@@ -542,5 +600,226 @@ mod tests {
             "port should be one of the updated values, got {port}"
         );
         assert_ne!(port, 7070, "port should not be the original value");
+    }
+
+    #[tokio::test]
+    async fn service_crud_is_workspace_isolated() {
+        use openshell_core::proto::{
+            CreateWorkspaceRequest, DeleteServiceRequest, GetServiceRequest, ListServicesRequest,
+        };
+
+        let state = test_server_state().await;
+
+        // Create a second workspace "beta".
+        crate::grpc::workspace::handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "beta".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Seed a sandbox named "my-sandbox" in each workspace.
+        seed_sandbox(&state, "my-sandbox").await;
+
+        let mut sbx_beta = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sandbox-my-sandbox-beta".to_string(),
+                name: "my-sandbox".to_string(),
+                created_at_ms: 1_000,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                resource_version: 0,
+                workspace: "beta".to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            spec: Some(openshell_core::proto::SandboxSpec::default()),
+            ..Default::default()
+        };
+        sbx_beta.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sbx_beta).await.unwrap();
+
+        // Expose same service name on the same sandbox name in each workspace.
+        handle_expose_service(
+            &state,
+            Request::new(ExposeServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                service: "web".to_string(),
+                target_port: 8080,
+                domain: true,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        handle_expose_service(
+            &state,
+            Request::new(ExposeServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                service: "web".to_string(),
+                target_port: 9090,
+                domain: true,
+                workspace: "beta".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Get in "default" returns port 8080.
+        let got = handle_get_service(
+            &state,
+            Request::new(GetServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                service: "web".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(got.endpoint.as_ref().unwrap().target_port, 8080);
+
+        // Get in "beta" returns port 9090.
+        let got = handle_get_service(
+            &state,
+            Request::new(GetServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                service: "web".to_string(),
+                workspace: "beta".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(got.endpoint.as_ref().unwrap().target_port, 9090);
+
+        // List in each workspace returns 1 service.
+        let listed = handle_list_services(
+            &state,
+            Request::new(ListServicesRequest {
+                sandbox: "my-sandbox".to_string(),
+                limit: 100,
+                offset: 0,
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed.services.len(), 1);
+        assert_eq!(
+            listed.services[0].endpoint.as_ref().unwrap().target_port,
+            8080
+        );
+
+        let listed = handle_list_services(
+            &state,
+            Request::new(ListServicesRequest {
+                sandbox: "my-sandbox".to_string(),
+                limit: 100,
+                offset: 0,
+                workspace: "beta".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed.services.len(), 1);
+        assert_eq!(
+            listed.services[0].endpoint.as_ref().unwrap().target_port,
+            9090
+        );
+
+        // Delete in "default" does not affect "beta".
+        let deleted = handle_delete_service(
+            &state,
+            Request::new(DeleteServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                service: "web".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(deleted.deleted);
+
+        let listed = handle_list_services(
+            &state,
+            Request::new(ListServicesRequest {
+                sandbox: "my-sandbox".to_string(),
+                limit: 100,
+                offset: 0,
+                workspace: "default".to_string(),
+                all_workspaces: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(listed.services.is_empty());
+
+        let got = handle_get_service(
+            &state,
+            Request::new(GetServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                service: "web".to_string(),
+                workspace: "beta".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(got.endpoint.as_ref().unwrap().target_port, 9090);
+
+        // all_workspaces returns services from all workspaces.
+        // Re-create the "default" service.
+        handle_expose_service(
+            &state,
+            Request::new(ExposeServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                service: "api".to_string(),
+                target_port: 3000,
+                domain: true,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let listed = handle_list_services(
+            &state,
+            Request::new(ListServicesRequest {
+                sandbox: String::new(),
+                limit: 100,
+                offset: 0,
+                workspace: String::new(),
+                all_workspaces: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed.services.len(), 2);
+
+        // all_workspaces with non-empty workspace is rejected.
+        let err = handle_list_services(
+            &state,
+            Request::new(ListServicesRequest {
+                sandbox: String::new(),
+                limit: 100,
+                offset: 0,
+                workspace: "default".to_string(),
+                all_workspaces: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

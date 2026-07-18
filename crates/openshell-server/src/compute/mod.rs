@@ -13,7 +13,10 @@ pub use openshell_driver_podman::PodmanComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
-use crate::persistence::{ObjectId, ObjectName, ObjectRecord, ObjectType, Store, WriteCondition};
+use crate::persistence::{
+    DRAFT_CHUNK_OBJECT_TYPE, ObjectId, ObjectName, ObjectRecord, ObjectType, POLICY_OBJECT_TYPE,
+    Store, WriteCondition,
+};
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
@@ -21,6 +24,7 @@ use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
+use openshell_core::{ObjectLabels, ObjectWorkspace};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
@@ -32,7 +36,7 @@ use openshell_core::proto::compute::v1::{
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, SshSession,
+    SandboxTemplate, ServiceEndpoint, SshSession,
 };
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
@@ -40,6 +44,7 @@ use openshell_driver_kubernetes::{
 };
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -509,20 +514,21 @@ impl ComputeRuntime {
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
         let mut sandbox = sandbox;
-        let labels_json = sandbox
-            .metadata
-            .as_ref()
-            .map(|metadata| &metadata.labels)
-            .filter(|labels| !labels.is_empty())
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?;
+        let labels_map = sandbox.object_labels();
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+            None
+        } else {
+            Some(serde_json::to_string(&labels_map).map_err(|e| {
+                Status::internal(format!("failed to serialize labels: {e}"))
+            })?)
+        };
         let result = self
             .store
             .put_if(
                 Sandbox::object_type(),
                 &sandbox_id,
                 sandbox.object_name(),
+                sandbox.object_workspace(),
                 &sandbox.encode_to_vec(),
                 labels_json.as_deref(),
                 WriteCondition::MustCreate,
@@ -591,13 +597,13 @@ impl ComputeRuntime {
         }
     }
 
-    pub async fn delete_sandbox(&self, name: &str) -> Result<bool, Status> {
+    pub async fn delete_sandbox(&self, workspace: &str, name: &str) -> Result<bool, Status> {
         let _guard = self.sync_lock.lock().await;
 
         // Resolve sandbox ID from name
         let sandbox = self
             .store
-            .get_message_by_name::<Sandbox>(name)
+            .get_message_by_name::<Sandbox>(workspace, name)
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
@@ -611,7 +617,9 @@ impl ComputeRuntime {
 
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(&id);
-        self.cleanup_sandbox_owned_records(&sandbox).await;
+        self.cleanup_sandbox_owned_records(&sandbox)
+            .await
+            .map_err(|e| Status::internal(format!("cleanup owned records for sandbox {id}: {e}")))?;
 
         let deleted = self
             .driver
@@ -726,6 +734,7 @@ impl ComputeRuntime {
                 Sandbox::object_type(),
                 &id,
                 &name,
+                sandbox.object_workspace(),
                 &sandbox.encode_to_vec(),
                 labels_json.as_deref(),
                 WriteCondition::MatchResourceVersion(expected_resource_version),
@@ -782,7 +791,7 @@ impl ComputeRuntime {
 
         let records = self
             .store
-            .list(Sandbox::object_type(), 1000, 0)
+            .list_by_type(Sandbox::object_type(), 1000, 0)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -1082,7 +1091,7 @@ impl ComputeRuntime {
 
         let records = self
             .store
-            .list(Sandbox::object_type(), 500, 0)
+            .list_by_type(Sandbox::object_type(), 500, 0)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -1180,27 +1189,39 @@ impl ComputeRuntime {
             if supervisor_promoted {
                 ensure_supervisor_ready_status(&mut status, &sandbox_name);
             }
+            let workspace = incoming.workspace.clone();
             let mut sandbox = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: incoming.id.clone(),
                     name: sandbox_name,
                     created_at_ms: now_ms,
-                    labels: std::collections::HashMap::new(),
+                    labels: HashMap::new(),
                     resource_version: 0,
                     annotations: std::collections::HashMap::new(),
+                    workspace,
+                    deletion_timestamp_ms: 0,
                 }),
                 spec: None,
                 status,
             };
             sandbox.set_phase(phase as i32);
 
+            let labels_map = sandbox.object_labels();
+            let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+                None
+            } else {
+                Some(serde_json::to_string(&labels_map).map_err(|e| {
+                    format!("failed to serialize labels: {e}")
+                })?)
+            };
             self.store
                 .put_if(
                     Sandbox::object_type(),
                     &incoming.id,
                     sandbox.object_name(),
+                    sandbox.object_workspace(),
                     &sandbox.encode_to_vec(),
-                    None,
+                    labels_json.as_deref(),
                     WriteCondition::MustCreate,
                 )
                 .await
@@ -1385,7 +1406,7 @@ impl ComputeRuntime {
             .await
             .map_err(|e| e.to_string())?;
         if let Some(sandbox) = sandbox.as_ref() {
-            self.cleanup_sandbox_owned_records(sandbox).await;
+            self.cleanup_sandbox_owned_records(sandbox).await?;
         }
 
         let _ = self
@@ -1399,42 +1420,84 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) {
-        self.cleanup_sandbox_ssh_sessions(sandbox.object_id()).await;
+    async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) -> Result<(), String> {
+        self.cleanup_sandbox_ssh_sessions(sandbox.object_id(), sandbox.object_workspace())
+            .await?;
+        self.cleanup_sandbox_service_endpoints(sandbox.object_id(), sandbox.object_workspace())
+            .await?;
 
-        if let Err(e) = self
-            .store
-            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
+        self.store
+            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_workspace(), sandbox.object_name())
             .await
-        {
-            warn!(
-                sandbox_id = %sandbox.object_id(),
-                sandbox_name = %sandbox.object_name(),
-                error = %e,
-                "Failed to delete sandbox settings during cleanup"
-            );
+            .map_err(|e| format!("delete sandbox settings: {e}"))?;
+
+        for (object_type, label) in [
+            (POLICY_OBJECT_TYPE, "policy revisions"),
+            (DRAFT_CHUNK_OBJECT_TYPE, "draft policy chunks"),
+        ] {
+            self.store
+                .delete_by_scope(object_type, sandbox.object_id())
+                .await
+                .map_err(|e| format!("delete {label}: {e}"))?;
         }
+
+        Ok(())
     }
 
-    async fn cleanup_sandbox_ssh_sessions(&self, sandbox_id: &str) {
-        if let Ok(records) = self.store.list(SshSession::object_type(), 1000, 0).await {
-            for record in records {
-                if let Ok(session) = SshSession::decode(record.payload.as_slice())
-                    && session.sandbox_id == sandbox_id
-                    && let Err(e) = self
-                        .store
-                        .delete(SshSession::object_type(), session.object_id())
-                        .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        session_id = %session.object_id(),
-                        error = %e,
-                        "Failed to delete SSH session during sandbox cleanup"
-                    );
-                }
+    async fn cleanup_sandbox_ssh_sessions(
+        &self,
+        sandbox_id: &str,
+        workspace: &str,
+    ) -> Result<(), String> {
+        let records = self
+            .store
+            .list(SshSession::object_type(), workspace, 1000, 0)
+            .await
+            .map_err(|e| format!("list SSH sessions: {e}"))?;
+
+        for record in records {
+            if let Ok(session) = SshSession::decode(record.payload.as_slice())
+                && session.sandbox_id == sandbox_id
+            {
+                self.store
+                    .delete(SshSession::object_type(), session.object_id())
+                    .await
+                    .map_err(|e| format!("delete SSH session {}: {e}", session.object_id()))?;
             }
         }
+
+        Ok(())
+    }
+
+    // TODO: introduce a per-sandbox cap on service endpoints and paginate
+    // this cleanup loop, or query by sandbox label instead of scanning the
+    // full workspace. Without a cap the flat 1,000-record page could miss
+    // endpoints in large workspaces.
+    async fn cleanup_sandbox_service_endpoints(
+        &self,
+        sandbox_id: &str,
+        workspace: &str,
+    ) -> Result<(), String> {
+        let records = self
+            .store
+            .list(ServiceEndpoint::object_type(), workspace, 1000, 0)
+            .await
+            .map_err(|e| format!("list service endpoints: {e}"))?;
+
+        for record in records {
+            if let Ok(endpoint) = ServiceEndpoint::decode(record.payload.as_slice())
+                && endpoint.sandbox_id == sandbox_id
+            {
+                self.store
+                    .delete(ServiceEndpoint::object_type(), endpoint.object_id())
+                    .await
+                    .map_err(|e| {
+                        format!("delete service endpoint {}: {e}", endpoint.object_id())
+                    })?;
+            }
+        }
+
+        Ok(())
     }
 
     fn cleanup_sandbox_state(&self, sandbox_id: &str) {
@@ -1590,6 +1653,7 @@ fn driver_sandbox_from_public(
             .map(|spec| driver_sandbox_spec_from_public(spec, driver_name))
             .transpose()?,
         status: sandbox.status.as_ref().map(driver_status_from_public),
+        workspace: sandbox.object_workspace().to_string(),
     })
 }
 
@@ -2424,6 +2488,8 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             ..Default::default()
         };
@@ -2440,6 +2506,8 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             sandbox_id: sandbox_id.to_string(),
             token: format!("token-{id}"),
@@ -2853,6 +2921,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             })
             .await
             .unwrap();
@@ -2895,6 +2964,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: None,
+                workspace: "default".to_string(),
             })
             .await
             .unwrap();
@@ -2943,6 +3013,7 @@ mod tests {
                     "Starting",
                     "VM is starting",
                 ))),
+                workspace: "default".to_string(),
             })
             .await
             .unwrap();
@@ -3062,6 +3133,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             }],
             current_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
@@ -3082,6 +3154,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             }],
         }))
         .await;
@@ -3130,6 +3203,7 @@ mod tests {
                     "DependenciesNotReady",
                     "Pod exists with phase: Pending; Service Exists",
                 ))),
+                workspace: "default".to_string(),
             }],
             current_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
@@ -3143,6 +3217,7 @@ mod tests {
                     message: "Pod is Ready".to_string(),
                     last_transition_time: String::new(),
                 })),
+                workspace: "default".to_string(),
             }],
         }))
         .await;
@@ -3184,6 +3259,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             }],
             ..Default::default()
         }))
@@ -3222,7 +3298,32 @@ mod tests {
                 SANDBOX_SETTINGS_OBJECT_TYPE,
                 "settings-sb-1",
                 sandbox.object_name(),
+                sandbox.object_workspace(),
                 br#"{"revision":1,"settings":{}}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put(
+                POLICY_OBJECT_TYPE,
+                "policy-sb-1",
+                sandbox.object_id(),
+                sandbox.object_workspace(),
+                br#"{"version":1}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put(
+                DRAFT_CHUNK_OBJECT_TYPE,
+                "draft-sb-1",
+                sandbox.object_id(),
+                sandbox.object_workspace(),
+                br#"{"chunk":1}"#,
                 None,
             )
             .await
@@ -3248,16 +3349,32 @@ mod tests {
         assert!(
             runtime
                 .sandbox_index
-                .sandbox_id_for_sandbox_name(sandbox.object_name())
+                .sandbox_id_for_sandbox_name(sandbox.object_workspace(), sandbox.object_name())
                 .is_none()
         );
         assert!(
             runtime
                 .store
-                .get_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
+                .get_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_workspace(), sandbox.object_name())
                 .await
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            runtime
+                .store
+                .list_by_scope(POLICY_OBJECT_TYPE, sandbox.object_id(), 100, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .store
+                .list_by_scope(DRAFT_CHUNK_OBJECT_TYPE, sandbox.object_id(), 100, 0)
+                .await
+                .unwrap()
+                .is_empty()
         );
         assert!(
             runtime
@@ -3529,7 +3646,12 @@ mod tests {
 
         runtime.validate_sandbox_create(&sandbox).await.unwrap();
         runtime.create_sandbox(sandbox, None).await.unwrap();
-        assert!(runtime.delete_sandbox("uds-sandbox").await.unwrap());
+        assert!(
+            runtime
+                .delete_sandbox("default", "uds-sandbox")
+                .await
+                .unwrap()
+        );
 
         let calls = driver.calls();
         assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");
@@ -3586,6 +3708,8 @@ mod tests {
             labels: HashMap::new(),
             resource_version: 0,
             annotations: HashMap::new(),
+            workspace: "default".to_string(),
+            deletion_timestamp_ms: 0,
         });
 
         let created = runtime.create_sandbox(sandbox, None).await.unwrap();
@@ -3627,7 +3751,7 @@ mod tests {
 
         let matching = runtime
             .store
-            .list_messages_with_selector::<Sandbox>("env=prod", 10, 0)
+            .list_messages_with_selector::<Sandbox>("default", "env=prod", 10, 0)
             .await
             .unwrap();
         assert_eq!(matching.len(), 1);
@@ -3684,7 +3808,7 @@ mod tests {
             .expect("should have one successful creation");
         let retrieved = runtime
             .store
-            .get_message_by_name::<Sandbox>("test-concurrent")
+            .get_message_by_name::<Sandbox>("default", "test-concurrent")
             .await
             .unwrap();
         assert!(
@@ -3696,5 +3820,76 @@ mod tests {
             created_sandbox.object_id(),
             "retrieved sandbox should match created sandbox"
         );
+    }
+
+    #[test]
+    fn driver_sandbox_from_public_populates_workspace() {
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "work".to_string(),
+                workspace: "alpha".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let driver_sb = driver_sandbox_from_public(&sandbox, "kubernetes").unwrap();
+        assert_eq!(driver_sb.workspace, "alpha");
+        assert_eq!(driver_sb.name, "work");
+        assert_eq!(driver_sb.id, "sb-1");
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_uses_workspace_from_driver() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-w1".to_string(),
+                name: "work".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "DependenciesNotReady",
+                    "Provisioning",
+                ))),
+                workspace: "team-ml".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-w1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.object_workspace(), "team-ml");
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_preserves_workspace() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-w2".to_string(),
+                name: "work".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "DependenciesNotReady",
+                    "Provisioning",
+                ))),
+                workspace: "alpha".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-w2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.object_workspace(), "alpha");
     }
 }

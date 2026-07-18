@@ -21,6 +21,7 @@ import grpc
 import httpx
 
 from ._proto import (
+    datamodel_pb2,
     inference_pb2,
     inference_pb2_grpc,
     openshell_pb2,
@@ -159,6 +160,7 @@ class _ImmutableLabels(dict[str, str]):
 class SandboxRef:
     id: str
     name: str
+    workspace: str
     status: SandboxStatusRef
     # Excluded from equality/hash to preserve the original identity while the
     # immutable mapping remains safe for deepcopy, pickle, and asdict.
@@ -197,6 +199,7 @@ class SandboxSession:
     def __init__(self, client: SandboxClient, sandbox: SandboxRef) -> None:
         self._client = client
         self.sandbox = sandbox
+        self._workspace = sandbox.workspace
 
     @property
     def id(self) -> str:
@@ -245,7 +248,7 @@ class SandboxSession:
         )
 
     def delete(self) -> bool:
-        return self._client.delete(self.sandbox.name)
+        return self._client.delete(self.sandbox.name, workspace=self._workspace)
 
 
 class SandboxClient:
@@ -427,6 +430,7 @@ class SandboxClient:
     def create(
         self,
         *,
+        workspace: str,
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
@@ -437,6 +441,7 @@ class SandboxClient:
                 spec=request_spec,
                 name=name or "",
                 labels=dict(labels) if labels else {},
+                workspace=workspace,
             ),
             timeout=self._timeout,
         )
@@ -448,40 +453,77 @@ class SandboxClient:
     def create_session(
         self,
         *,
+        workspace: str,
         spec: openshell_pb2.SandboxSpec | None = None,
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
     ) -> SandboxSession:
-        return SandboxSession(self, self.create(spec=spec, name=name, labels=labels))
+        return SandboxSession(
+            self, self.create(workspace=workspace, spec=spec, name=name, labels=labels)
+        )
 
-    def get(self, sandbox_name: str) -> SandboxRef:
+    def get(self, sandbox_name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
-            openshell_pb2.GetSandboxRequest(name=sandbox_name),
+            openshell_pb2.GetSandboxRequest(name=sandbox_name, workspace=workspace),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def get_session(self, sandbox_name: str) -> SandboxSession:
-        return SandboxSession(self, self.get(sandbox_name))
+    def get_session(self, sandbox_name: str, *, workspace: str) -> SandboxSession:
+        return SandboxSession(self, self.get(sandbox_name, workspace=workspace))
 
     def list(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[SandboxRef]:
+        request = openshell_pb2.ListSandboxesRequest(
+            workspace=workspace,
+            limit=limit,
+            offset=offset,
+            label_selector=label_selector or "",
+        )
+        response = self._stub.ListSandboxes(request, timeout=self._timeout)
+        return [_sandbox_ref(item) for item in response.sandboxes]
+
+    def list_for_all_workspaces(
         self,
         *,
         limit: int = 100,
         offset: int = 0,
         label_selector: str | None = None,
     ) -> builtins.list[SandboxRef]:
-        response = self._stub.ListSandboxes(
-            openshell_pb2.ListSandboxesRequest(
-                limit=limit,
-                offset=offset,
-                label_selector=label_selector or "",
-            ),
-            timeout=self._timeout,
+        request = openshell_pb2.ListSandboxesRequest(
+            all_workspaces=True,
+            limit=limit,
+            offset=offset,
+            label_selector=label_selector or "",
         )
+        response = self._stub.ListSandboxes(request, timeout=self._timeout)
         return [_sandbox_ref(item) for item in response.sandboxes]
 
     def list_ids(
+        self,
+        *,
+        workspace: str,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[str]:
+        return [
+            item.id
+            for item in self.list(
+                workspace=workspace,
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
+            )
+        ]
+
+    def list_ids_for_all_workspaces(
         self,
         *,
         limit: int = 100,
@@ -490,23 +532,27 @@ class SandboxClient:
     ) -> builtins.list[str]:
         return [
             item.id
-            for item in self.list(
-                limit=limit, offset=offset, label_selector=label_selector
+            for item in self.list_for_all_workspaces(
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector,
             )
         ]
 
-    def delete(self, sandbox_name: str) -> bool:
+    def delete(self, sandbox_name: str, *, workspace: str) -> bool:
         response = self._stub.DeleteSandbox(
-            openshell_pb2.DeleteSandboxRequest(name=sandbox_name),
+            openshell_pb2.DeleteSandboxRequest(name=sandbox_name, workspace=workspace),
             timeout=self._timeout,
         )
         return bool(response.deleted)
 
-    def wait_deleted(self, sandbox_name: str, *, timeout_seconds: float = 60.0) -> None:
+    def wait_deleted(
+        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 60.0
+    ) -> None:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
-                self.get(sandbox_name)
+                self.get(sandbox_name, workspace=workspace)
             except grpc.RpcError as exc:
                 if (
                     isinstance(exc, grpc.Call)
@@ -518,11 +564,11 @@ class SandboxClient:
         raise SandboxError(f"sandbox {sandbox_name} was not deleted within timeout")
 
     def wait_ready(
-        self, sandbox_name: str, *, timeout_seconds: float = 300.0
+        self, sandbox_name: str, *, workspace: str, timeout_seconds: float = 300.0
     ) -> SandboxRef:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
-            sandbox = self.get(sandbox_name)
+            sandbox = self.get(sandbox_name, workspace=workspace)
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_READY:
                 return sandbox
             if sandbox.status.phase == openshell_pb2.SANDBOX_PHASE_ERROR:
@@ -646,14 +692,14 @@ class SandboxClient:
 
 
 @dataclass(frozen=True)
-class ClusterInferenceConfig:
+class InferenceRouteConfig:
     provider_name: str
     model_id: str
     version: int
 
 
 class InferenceRouteClient:
-    """gRPC client for cluster-level inference configuration."""
+    """gRPC client for workspace-scoped inference route configuration."""
 
     def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
         self._stub = inference_pb2_grpc.InferenceStub(channel)
@@ -663,37 +709,128 @@ class InferenceRouteClient:
     def from_sandbox_client(cls, client: SandboxClient) -> InferenceRouteClient:
         return cls(client._channel, timeout=client._timeout)
 
-    def set_cluster(
+    def set_route(
         self,
         *,
+        workspace: str,
         provider_name: str,
         model_id: str,
         no_verify: bool = False,
-    ) -> ClusterInferenceConfig:
-        response = self._stub.SetClusterInference(
-            inference_pb2.SetClusterInferenceRequest(
+    ) -> InferenceRouteConfig:
+        response = self._stub.SetInferenceRoute(
+            inference_pb2.SetInferenceRouteRequest(
+                workspace=workspace,
                 provider_name=provider_name,
                 model_id=model_id,
                 no_verify=no_verify,
             ),
             timeout=self._timeout,
         )
-        return ClusterInferenceConfig(
+        return InferenceRouteConfig(
             provider_name=response.provider_name,
             model_id=response.model_id,
             version=response.version,
         )
 
-    def get_cluster(self) -> ClusterInferenceConfig:
-        response = self._stub.GetClusterInference(
-            inference_pb2.GetClusterInferenceRequest(),
+    def get_route(self, *, workspace: str) -> InferenceRouteConfig:
+        response = self._stub.GetInferenceRoute(
+            inference_pb2.GetInferenceRouteRequest(workspace=workspace),
             timeout=self._timeout,
         )
-        return ClusterInferenceConfig(
+        return InferenceRouteConfig(
             provider_name=response.provider_name,
             model_id=response.model_id,
             version=response.version,
         )
+
+    def delete_route(
+        self,
+        *,
+        workspace: str,
+        route_name: str = "",
+    ) -> bool:
+        response = self._stub.DeleteInferenceRoute(
+            inference_pb2.DeleteInferenceRouteRequest(
+                workspace=workspace,
+                route_name=route_name,
+            ),
+            timeout=self._timeout,
+        )
+        return response.deleted
+
+
+@dataclass(frozen=True)
+class WorkspaceRef:
+    name: str
+    phase: str
+    labels: dict[str, str]
+
+
+def _workspace_ref(ws: datamodel_pb2.Workspace) -> WorkspaceRef:
+    meta = ws.metadata
+    return WorkspaceRef(
+        name=meta.name,
+        phase=datamodel_pb2.WorkspacePhase.Name(ws.status.phase),
+        labels=dict(meta.labels),
+    )
+
+
+class WorkspaceClient:
+    """gRPC client for workspace lifecycle operations."""
+
+    def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
+        self._stub = openshell_pb2_grpc.OpenShellStub(channel)
+        self._timeout = timeout
+
+    @classmethod
+    def from_sandbox_client(cls, client: SandboxClient) -> WorkspaceClient:
+        return cls(client._channel, timeout=client._timeout)
+
+    def create(
+        self,
+        name: str,
+        *,
+        labels: Mapping[str, str] | None = None,
+    ) -> WorkspaceRef:
+        response = self._stub.CreateWorkspace(
+            openshell_pb2.CreateWorkspaceRequest(
+                name=name,
+                labels=dict(labels) if labels else {},
+            ),
+            timeout=self._timeout,
+        )
+        return _workspace_ref(response.workspace)
+
+    def get(self, name: str) -> WorkspaceRef:
+        response = self._stub.GetWorkspace(
+            openshell_pb2.GetWorkspaceRequest(name=name),
+            timeout=self._timeout,
+        )
+        return _workspace_ref(response.workspace)
+
+    def list(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[WorkspaceRef]:
+        response = self._stub.ListWorkspaces(
+            openshell_pb2.ListWorkspacesRequest(
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector or "",
+            ),
+            timeout=self._timeout,
+        )
+        return [_workspace_ref(ws) for ws in response.workspaces]
+
+    def delete(self, name: str) -> bool:
+        response = self._stub.DeleteWorkspace(
+            openshell_pb2.DeleteWorkspaceRequest(name=name),
+            timeout=self._timeout,
+        )
+        return response.deleted
 
 
 class Sandbox:
@@ -702,6 +839,7 @@ class Sandbox:
     def __init__(
         self,
         *,
+        workspace: str,
         cluster: str | None = None,
         sandbox: str | SandboxRef | None = None,
         delete_on_exit: bool = True,
@@ -723,6 +861,7 @@ class Sandbox:
         OIDC-protected gateways (e.g. passing `insecure=True` for a
         self-signed dev IdP). Non-OIDC gateways ignore them.
         """
+        self._workspace = workspace
         self._cluster = cluster
         self._sandbox_input = sandbox
         self._delete_on_exit = delete_on_exit
@@ -771,15 +910,23 @@ class Sandbox:
 
         if self._sandbox_input is None:
             self._session = client.create_session(
-                spec=self._spec, name=self._name, labels=self._labels
+                workspace=self._workspace,
+                spec=self._spec,
+                name=self._name,
+                labels=self._labels,
             )
         elif isinstance(self._sandbox_input, SandboxRef):
             self._session = SandboxSession(client, self._sandbox_input)
         else:
-            self._session = client.get_session(self._sandbox_input)
+            self._session = client.get_session(
+                self._sandbox_input, workspace=self._workspace
+            )
+
+        self._workspace = getattr(self._session, "_workspace", self._workspace)
 
         ready = client.wait_ready(
             self._session.sandbox.name,
+            workspace=self._workspace,
             timeout_seconds=self._ready_timeout_seconds,
         )
         self._session = SandboxSession(client, ready)
@@ -796,7 +943,10 @@ class Sandbox:
                 try:
                     deleted = self._session.delete()
                     if deleted:
-                        self._client.wait_deleted(self._session.sandbox.name)
+                        self._client.wait_deleted(
+                            self._session.sandbox.name,
+                            workspace=self._workspace,
+                        )
                 except grpc.RpcError as exc:
                     if (
                         not isinstance(exc, grpc.Call)
@@ -885,6 +1035,7 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
     return SandboxRef(
         id=sandbox.metadata.id if sandbox.metadata else "",
         name=sandbox.metadata.name if sandbox.metadata else "",
+        workspace=sandbox.metadata.workspace if sandbox.metadata else "",
         status=SandboxStatusRef(
             phase=status.phase if status else 0,
             current_policy_version=status.current_policy_version if status else 0,

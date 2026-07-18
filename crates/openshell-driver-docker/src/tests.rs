@@ -46,6 +46,7 @@ fn test_sandbox() -> DriverSandbox {
             sandbox_token: String::new(),
         }),
         status: None,
+        workspace: String::new(),
     }
 }
 
@@ -1951,6 +1952,7 @@ fn container_name_preserves_id_suffix_for_long_names() {
         namespace: "default".to_string(),
         spec: None,
         status: None,
+        workspace: "default".to_string(),
     };
     let second = DriverSandbox {
         id: "sbx-second-0987654321".to_string(),
@@ -1976,15 +1978,19 @@ fn container_name_preserves_id_suffix_for_long_names() {
 }
 
 #[test]
-fn container_name_empty_sandbox_name_uses_id_only() {
+fn container_name_empty_sandbox_name_uses_workspace_and_id() {
     let sandbox = DriverSandbox {
         id: "sbx-abc".to_string(),
         name: String::new(),
         namespace: "default".to_string(),
         spec: None,
         status: None,
+        workspace: "default".to_string(),
     };
-    assert_eq!(container_name_for_sandbox(&sandbox), "openshell-sbx-abc",);
+    assert_eq!(
+        container_name_for_sandbox(&sandbox),
+        "openshell-default---sbx-abc",
+    );
 }
 
 #[test]

@@ -119,25 +119,25 @@ async fn delete_sandbox(name: &str) {
 async fn sandbox_labels_are_stored_and_filterable() {
     // Create sandboxes with different labels
     let name1 = create_sandbox_with_labels(
-        "e2e-label-test-dev-backend",
+        "e2e-lbl-dev-back",
         &[("env", "dev"), ("team", "backend")],
     )
     .await;
 
     let name2 = create_sandbox_with_labels(
-        "e2e-label-test-staging-backend",
+        "e2e-lbl-stg-back",
         &[("env", "staging"), ("team", "backend")],
     )
     .await;
 
     let name3 = create_sandbox_with_labels(
-        "e2e-label-test-prod-frontend",
+        "e2e-lbl-prd-frnt",
         &[("env", "prod"), ("team", "frontend")],
     )
     .await;
 
     let name4 = create_sandbox_with_labels(
-        "e2e-label-test-dev-data",
+        "e2e-lbl-dev-data",
         &[("env", "dev"), ("team", "data")],
     )
     .await;

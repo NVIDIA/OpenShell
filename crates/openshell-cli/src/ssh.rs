@@ -76,6 +76,7 @@ async fn ssh_session_config(
     server: &str,
     name: &str,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<SshSessionConfig> {
     let mut client = grpc_client(server, tls).await?;
 
@@ -83,6 +84,7 @@ async fn ssh_session_config(
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
+            workspace: workspace.to_string(),
         })
         .await
         .into_diagnostic()?
@@ -255,8 +257,9 @@ async fn sandbox_connect_with_mode(
     name: &str,
     tls: &TlsOptions,
     replace_process: bool,
+    workspace: &str,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls).await?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
 
     let mut command = ssh_base_command(&session.proxy_command);
     command
@@ -278,16 +281,22 @@ async fn sandbox_connect_with_mode(
 }
 
 /// Connect to a sandbox via SSH.
-pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
-    sandbox_connect_with_mode(server, name, tls, true).await
+pub async fn sandbox_connect(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
+    sandbox_connect_with_mode(server, name, tls, true, workspace).await
 }
 
 pub(crate) async fn sandbox_connect_without_exec(
     server: &str,
     name: &str,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
-    sandbox_connect_with_mode(server, name, tls, false).await
+    sandbox_connect_with_mode(server, name, tls, false, workspace).await
 }
 
 pub async fn sandbox_connect_editor(
@@ -296,12 +305,14 @@ pub async fn sandbox_connect_editor(
     name: &str,
     editor: Editor,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
     // Verify the sandbox exists before writing SSH config / launching the editor.
     let mut client = grpc_client(server, tls).await?;
     client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
+            workspace: workspace.to_string(),
         })
         .await
         .into_diagnostic()?
@@ -309,8 +320,8 @@ pub async fn sandbox_connect_editor(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found: {name}"))?;
 
-    let host_alias = host_alias(name);
-    install_ssh_config(gateway, name)?;
+    let host_alias = host_alias(name, workspace);
+    install_ssh_config(gateway, name, workspace)?;
     launch_editor(editor, &host_alias)?;
     eprintln!(
         "{} Opened {} for sandbox {}",
@@ -331,10 +342,11 @@ pub async fn sandbox_forward(
     spec: &ForwardSpec,
     background: bool,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
     openshell_core::forward::check_port_available(spec)?;
 
-    let session = ssh_session_config(server, name, tls).await?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
 
     let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));
     command
@@ -528,12 +540,13 @@ async fn sandbox_exec_with_mode(
     tty: bool,
     tls: &TlsOptions,
     replace_process: bool,
+    workspace: &str,
 ) -> Result<()> {
     if command.is_empty() {
         return Err(miette::miette!("no command provided"));
     }
 
-    let session = ssh_session_config(server, name, tls).await?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
     let mut ssh = ssh_base_command(&session.proxy_command);
 
     if tty {
@@ -572,8 +585,9 @@ pub async fn sandbox_exec(
     command: &[String],
     tty: bool,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
-    sandbox_exec_with_mode(server, name, command, tty, tls, true).await
+    sandbox_exec_with_mode(server, name, command, tty, tls, true, workspace).await
 }
 
 pub(crate) async fn sandbox_exec_without_exec(
@@ -582,8 +596,9 @@ pub(crate) async fn sandbox_exec_without_exec(
     command: &[String],
     tty: bool,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
-    sandbox_exec_with_mode(server, name, command, tty, tls, false).await
+    sandbox_exec_with_mode(server, name, command, tty, tls, false, workspace).await
 }
 
 /// What to pack into the tar archive streamed to the sandbox.
@@ -754,8 +769,9 @@ async fn ssh_tar_upload(
     dest_dir: Option<&str>,
     source: UploadSource,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
-    let session = ssh_session_config(server, name, tls).await?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
 
     // When no explicit destination is given, use the unescaped `$HOME` shell
     // variable so the remote shell resolves it at runtime.
@@ -940,6 +956,7 @@ fn resolve_file_download_target(
 /// Files are streamed as a tar archive to `ssh ... tar xf - -C <dest>` on
 /// the sandbox side.  When `dest` is `None`, files are uploaded to the
 /// sandbox user's home directory.
+#[allow(clippy::too_many_arguments)]
 pub async fn sandbox_sync_up_files(
     server: &str,
     name: &str,
@@ -948,6 +965,7 @@ pub async fn sandbox_sync_up_files(
     local_path: &Path,
     dest: Option<&str>,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
     if files.is_empty() {
         return Ok(());
@@ -962,6 +980,7 @@ pub async fn sandbox_sync_up_files(
             archive_prefix: file_list_archive_prefix(local_path),
         },
         tls,
+        workspace,
     )
     .await
 }
@@ -979,6 +998,7 @@ pub async fn sandbox_sync_up(
     local_path: &Path,
     sandbox_path: Option<&str>,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
     // When an explicit destination is given and looks like a file path (does
     // not end with '/'), split into parent directory + target basename so that
@@ -1005,6 +1025,7 @@ pub async fn sandbox_sync_up(
                     tar_name: target_name.into(),
                 },
                 tls,
+                workspace,
             )
             .await;
         }
@@ -1032,6 +1053,7 @@ pub async fn sandbox_sync_up(
             tar_name,
         },
         tls,
+        workspace,
     )
     .await
 }
@@ -1139,9 +1161,10 @@ pub async fn sandbox_sync_down(
     sandbox_path: &str,
     dest: &str,
     tls: &TlsOptions,
+    workspace: &str,
 ) -> Result<()> {
     let sandbox_path = validate_sandbox_source_path(sandbox_path)?;
-    let session = ssh_session_config(server, name, tls).await?;
+    let session = ssh_session_config(server, name, tls, workspace).await?;
     let sandbox_path = resolve_sandbox_source_path(&session, &sandbox_path).await?;
     let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
 
@@ -1417,8 +1440,13 @@ fn grpc_server_from_ssh_gateway_url(gateway_url: &str) -> Result<String> {
 /// and sandbox name instead of pre-created gateway/token credentials.  It is
 /// suitable for use as an SSH `ProxyCommand` in `~/.ssh/config` because it
 /// creates a fresh session on every invocation.
-pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
-    let session = ssh_session_config(server, name, tls).await?;
+pub async fn sandbox_ssh_proxy_by_name(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<()> {
+    let session = ssh_session_config(server, name, tls, workspace).await?;
     sandbox_ssh_proxy(
         &session.gateway_url,
         &session.sandbox_id,
@@ -1428,20 +1456,21 @@ pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOption
     .await
 }
 
-fn host_alias(name: &str) -> String {
-    format!("openshell-{name}")
+fn host_alias(name: &str, workspace: &str) -> String {
+    format!("openshell-{name}.{workspace}")
 }
 
-fn render_ssh_config(gateway: &str, name: &str) -> String {
+fn render_ssh_config(gateway: &str, name: &str, workspace: &str) -> String {
     let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
     let exe = shell_escape(&exe.to_string_lossy());
 
     let proxy_cmd = format!(
-        "{exe} ssh-proxy --gateway-name {} --name {}",
+        "{exe} ssh-proxy --gateway-name {} --name {} --workspace {}",
         shell_escape(gateway),
         shell_escape(name),
+        shell_escape(workspace),
     );
-    let host_alias = host_alias(name);
+    let host_alias = host_alias(name, workspace);
     format!(
         "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ServerAliveInterval 15\n    ServerAliveCountMax 3\n    ProxyCommand {proxy_cmd}\n"
     )
@@ -1567,7 +1596,7 @@ fn upsert_host_block(contents: &str, alias: &str, block: &str) -> String {
     rendered
 }
 
-pub fn install_ssh_config(gateway: &str, name: &str) -> Result<PathBuf> {
+pub fn install_ssh_config(gateway: &str, name: &str, workspace: &str) -> Result<PathBuf> {
     let managed_config = openshell_ssh_config_path()?;
     let main_config = user_ssh_config_path()?;
     ensure_openshell_include(&main_config, &managed_config)?;
@@ -1576,8 +1605,8 @@ pub fn install_ssh_config(gateway: &str, name: &str) -> Result<PathBuf> {
         openshell_core::paths::create_dir_restricted(parent)?;
     }
 
-    let alias = host_alias(name);
-    let block = render_ssh_config(gateway, name);
+    let alias = host_alias(name, workspace);
+    let block = render_ssh_config(gateway, name, workspace);
     let contents = fs::read_to_string(&managed_config).unwrap_or_default();
     let updated = upsert_host_block(&contents, &alias, &block);
     fs::write(&managed_config, updated)
@@ -1624,8 +1653,8 @@ fn launch_editor_command(binary: &str, label: &str, remote_target: &str) -> Resu
 /// The `ProxyCommand` uses `--gateway-name` so that `ssh-proxy` resolves the
 /// gateway endpoint and TLS certificates from the gateway metadata directory
 /// (`~/.config/openshell/gateways/<name>/mtls/`).
-pub fn print_ssh_config(gateway: &str, name: &str) {
-    print!("{}", render_ssh_config(gateway, name));
+pub fn print_ssh_config(gateway: &str, name: &str, workspace: &str) {
+    print!("{}", render_ssh_config(gateway, name, workspace));
 }
 
 #[cfg(test)]
@@ -1674,8 +1703,8 @@ mod tests {
         let user_config = ssh_dir.join("config");
         fs::write(&user_config, "Host personal\n    HostName example.com\n").unwrap();
 
-        let managed_path = install_ssh_config("openshell", "demo").unwrap();
-        install_ssh_config("openshell", "demo").unwrap();
+        let managed_path = install_ssh_config("openshell", "demo", "default").unwrap();
+        install_ssh_config("openshell", "demo", "default").unwrap();
 
         let main_contents = fs::read_to_string(&user_config).unwrap();
         assert!(main_contents.contains("Host personal"));
@@ -1686,7 +1715,12 @@ mod tests {
         assert!(include_idx < host_idx);
 
         let managed_contents = fs::read_to_string(&managed_path).unwrap();
-        assert_eq!(managed_contents.matches("Host openshell-demo").count(), 1);
+        assert_eq!(
+            managed_contents
+                .matches("Host openshell-demo.default")
+                .count(),
+            1
+        );
         assert!(managed_contents.contains("ProxyCommand"));
 
         unsafe {
@@ -1699,6 +1733,25 @@ mod tests {
                 None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
+    }
+
+    #[test]
+    fn render_ssh_config_includes_workspace_in_proxy_command() {
+        let config = render_ssh_config("my-gw", "demo", "beta");
+        assert!(
+            config.contains("Host openshell-demo.beta"),
+            "host alias should be workspace-qualified: {config}"
+        );
+        assert!(
+            config.contains("--workspace beta"),
+            "ProxyCommand should include --workspace: {config}"
+        );
+    }
+
+    #[test]
+    fn host_alias_includes_workspace() {
+        assert_eq!(host_alias("demo", "default"), "openshell-demo.default");
+        assert_eq!(host_alias("demo", "beta"), "openshell-demo.beta");
     }
 
     #[test]

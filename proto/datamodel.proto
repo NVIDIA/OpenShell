@@ -33,6 +33,39 @@ message ObjectMeta {
   // Opaque key-value metadata that is not used for selectors.
   // Annotation keys use the same qualified-key shape as labels, but values may be longer.
   map<string, string> annotations = 6;
+
+  // Workspace that owns this resource. Empty is normalized to "default" by the
+  // gateway. Immutable after creation.
+  string workspace = 7;
+
+  // Milliseconds since Unix epoch when graceful deletion was initiated.
+  // Zero means the object is not being deleted. Once set, this field is
+  // immutable — the only path forward is completing deletion.
+  int64 deletion_timestamp_ms = 8;
+}
+
+// Phase of a workspace's lifecycle.
+enum WorkspacePhase {
+  WORKSPACE_PHASE_UNSPECIFIED = 0;
+  WORKSPACE_PHASE_ACTIVE = 1;
+  WORKSPACE_PHASE_TERMINATING = 2;
+}
+
+// Status of a workspace.
+message WorkspaceStatus {
+  WorkspacePhase phase = 1;
+}
+
+// Workspace resource. A hard isolation boundary for sandboxes, providers, and
+// other workspace-scoped resources.
+message Workspace {
+  // Kubernetes-style metadata (id, name, labels, timestamps, resource version).
+  // The workspace field in this ObjectMeta is unused (a workspace does not
+  // belong to another workspace).
+  ObjectMeta metadata = 1;
+
+  // Current lifecycle status.
+  WorkspaceStatus status = 2;
 }
 
 // Provider model stored by OpenShell.
@@ -48,4 +81,8 @@ message Provider {
   // Expiration timestamps for credential values, keyed by credential/env var
   // name. A zero or missing value means the credential does not expire.
   map<string, int64> credential_expires_at_ms = 5;
+  // Workspace where this provider's type profile is stored.
+  // Empty string = platform/global scope. Must be empty or match
+  // metadata.workspace; cross-workspace references are rejected.
+  string profile_workspace = 6;
 }

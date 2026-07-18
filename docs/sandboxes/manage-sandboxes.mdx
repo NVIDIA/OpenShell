@@ -229,10 +229,10 @@ The Python SDK accepts the same gateway labels and selectors. Labels passed to
 from openshell import SandboxClient
 
 with SandboxClient.from_active_cluster() as client:
-    sandbox = client.create(name="deep-research-1", labels={"env": "dev", "team": "platform"})
+    sandbox = client.create(workspace="default", name="deep-research-1", labels={"env": "dev", "team": "platform"})
     assert sandbox.labels["team"] == "platform"
 
-    matches = client.list(label_selector="env=dev,team=platform")
+    matches = client.list(workspace="default", label_selector="env=dev,team=platform")
     assert sandbox.id in {s.id for s in matches}
 ```
 

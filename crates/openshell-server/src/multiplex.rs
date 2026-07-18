@@ -2149,8 +2149,8 @@ mod tests {
                 "/openshell.v1.OpenShell/DeleteSandbox",
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
-                "/openshell.inference.v1.Inference/GetClusterInference",
-                "/openshell.inference.v1.Inference/SetClusterInference",
+                "/openshell.inference.v1.Inference/GetInferenceRoute",
+                "/openshell.inference.v1.Inference/SetInferenceRoute",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
                 let chain = AuthenticatorChain::new(vec![mock]);

@@ -27,6 +27,9 @@ pub const LABEL_SANDBOX_NAME: &str = "openshell.ai/sandbox-name";
 /// Container/pod label carrying the sandbox namespace.
 pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
 
+/// Container/pod label carrying the sandbox workspace.
+pub const LABEL_SANDBOX_WORKSPACE: &str = "openshell.ai/sandbox-workspace";
+
 // ---------------------------------------------------------------------------
 
 /// Path to the sandbox supervisor binary inside the container image.
