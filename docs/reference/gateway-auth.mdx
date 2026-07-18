@@ -91,7 +91,7 @@ The same settings are available through environment variables:
 |---|---|---|
 | `OPENSHELL_OIDC_ISSUER` | OIDC issuer URL. The gateway discovers `/.well-known/openid-configuration` from this URL. | None |
 | `OPENSHELL_OIDC_AUDIENCE` | Expected JWT `aud` claim. | `openshell-cli` |
-| `OPENSHELL_OIDC_JWKS_TTL` | JWKS cache TTL in seconds. The gateway also refreshes on an unknown key ID. | `3600` |
+| `OPENSHELL_OIDC_JWKS_TTL` | JWKS cache TTL in seconds. The gateway also refreshes on an unknown key ID. Must be greater than zero. | `3600` |
 | `OPENSHELL_OIDC_ROLES_CLAIM` | Dot-separated claim path containing roles. | `realm_access.roles` |
 | `OPENSHELL_OIDC_ADMIN_ROLE` | Role required for admin operations. | `openshell-admin` |
 | `OPENSHELL_OIDC_USER_ROLE` | Role required for standard user operations. | `openshell-user` |
@@ -182,12 +182,31 @@ For a headless environment, set `OPENSHELL_NO_BROWSER=1` before registering or l
 1. The CLI loads the stored OIDC token bundle.
 2. If the access token is expired and a refresh token is available, the CLI refreshes it with the OIDC scopes saved in the gateway metadata.
 3. The CLI connects to the gateway and attaches `authorization: Bearer <token>` metadata to each gRPC request.
-4. The gateway validates the JWT signature, issuer, audience, expiration, and key ID against the issuer's JWKS.
+4. The gateway validates the JWT signature, issuer, audience, expiration, subject, and key ID against the issuer's JWKS.
 5. The gateway extracts roles and optional scopes from the configured claim paths.
 6. The gateway authorizes the gRPC method. Platform-scoped methods require the configured admin role. Workspace-scoped methods require the configured user role and a sufficient membership in the target workspace. Admin role holders satisfy user-role checks and bypass workspace membership checks.
 
 For the Platform Admin, Workspace Admin, and Workspace User permissions, refer
 to [Manage Workspaces and Access](/sandboxes/manage-workspaces).
+
+#### JWT validation
+
+The gateway validates OIDC access tokens against the issuer's JWKS endpoint. It derives the signing algorithm from each JWK's `kty` and `crv` fields, not from the JWT header:
+
+| JWK `kty` | `crv` | Algorithm |
+|---|---|---|
+| RSA | — | RS256, RS384, RS512, PS256, PS384, or PS512 |
+| EC | P-256 | ES256 |
+| EC | P-384 | ES384 |
+| OKP | Ed25519 | EdDSA (Ed25519) |
+
+For EC and OKP keys, `crv` fully determines the algorithm. For RSA keys, the algorithm is selected from the JWK's declared `alg` field when it names one of the six RSA algorithms above; if `alg` is absent (as with Microsoft Entra ID, which omits it entirely), the gateway defaults to RS256. If `alg` names a non-RSA algorithm, the key is treated as contradictory and skipped (see below) rather than falling back to RS256.
+
+The gateway rejects tokens when the JWT header `alg` does not match the algorithm pinned from the JWK. Tokens must include `iss`, `aud`, `exp`, and `sub` claims. The `iss` and `aud` values must match the configured issuer and audience.
+
+JWKs with `use: enc`, an `alg` that genuinely contradicts the derived algorithm (for example an RSA key declaring `ES256`), or `key_ops` that excludes `verify` are skipped. The gateway refreshes the JWKS cache when it encounters an unknown key ID, throttled to at most once per second to bound how much an unknown-`kid` lookup can amplify requests against the issuer. If a refresh yields zero usable keys, the gateway keeps serving the previous key set rather than dropping all signing keys and failing every request, but only for up to three times the configured TTL. If the JWKS is still empty after that grace period, the cached keys are evicted and all tokens are rejected until the issuer recovers.
+
+Common identity providers such as Keycloak (RS256), Microsoft Entra ID (RSA), and Okta (often ES256) publish compatible signing keys.
 
 If `OPENSHELL_OIDC_SCOPES_CLAIM` is set, the gateway also enforces scopes. It accepts space-delimited scope strings such as `scope: "openid sandbox:read"` and JSON arrays such as `scp: ["sandbox:read"]`. Standard OIDC scopes such as `openid`, `profile`, `email`, and `offline_access` are ignored for authorization. `openshell:all` grants access to all scoped methods.
 
