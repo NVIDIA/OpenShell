@@ -167,14 +167,14 @@ pub(super) async fn handle_create_workspace(
     super::validation::validate_object_metadata(workspace.metadata.as_ref(), "workspace")?;
 
     let meta = workspace.metadata.as_ref().unwrap();
-    let labels_json = if meta.labels.is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::to_string(&meta.labels)
-                .map_err(|e| Status::internal(format!("failed to serialize workspace labels: {e}")))?,
-        )
-    };
+    let labels_json =
+        if meta.labels.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&meta.labels).map_err(|e| {
+                Status::internal(format!("failed to serialize workspace labels: {e}"))
+            })?)
+        };
 
     let result = state
         .store
@@ -289,10 +289,7 @@ pub(super) async fn handle_delete_workspace(
     // Track the resource_version so the final delete targets exactly this
     // workspace instance (prevents ABA if a same-name workspace is recreated
     // between the blocker scan and the delete).
-    let mut delete_version = ws
-        .metadata
-        .as_ref()
-        .map_or(0, |m| m.resource_version);
+    let mut delete_version = ws.metadata.as_ref().map_or(0, |m| m.resource_version);
 
     if !already_terminating {
         let cas_result = state
@@ -309,10 +306,7 @@ pub(super) async fn handle_delete_workspace(
             .await;
         match cas_result {
             Ok(updated) => {
-                delete_version = updated
-                    .metadata
-                    .as_ref()
-                    .map_or(0, |m| m.resource_version);
+                delete_version = updated.metadata.as_ref().map_or(0, |m| m.resource_version);
             }
             Err(e) => {
                 if matches!(e, crate::persistence::PersistenceError::Conflict { .. }) {
@@ -320,9 +314,7 @@ pub(super) async fn handle_delete_workspace(
                         .store
                         .get_message_by_name("", &name)
                         .await
-                        .map_err(|e| {
-                            Status::internal(format!("workspace re-fetch failed: {e}"))
-                        })?;
+                        .map_err(|e| Status::internal(format!("workspace re-fetch failed: {e}")))?;
                     let refreshed = refreshed.ok_or_else(|| {
                         Status::not_found(format!("workspace '{name}' not found"))
                     })?;
@@ -357,10 +349,16 @@ pub(super) async fn handle_delete_workspace(
         (StoredProviderProfile::object_type(), "provider profile"),
         (ServiceEndpoint::object_type(), "service"),
         (SshSession::object_type(), "ssh session"),
-        (super::policy::SANDBOX_SETTINGS_OBJECT_TYPE, "sandbox settings"),
+        (
+            super::policy::SANDBOX_SETTINGS_OBJECT_TYPE,
+            "sandbox settings",
+        ),
         (POLICY_OBJECT_TYPE, "sandbox policy"),
         (DRAFT_CHUNK_OBJECT_TYPE, "draft policy chunk"),
-        (StoredProviderCredentialRefreshState::object_type(), "credential refresh state"),
+        (
+            StoredProviderCredentialRefreshState::object_type(),
+            "credential refresh state",
+        ),
     ] {
         let records = state
             .store
@@ -464,9 +462,10 @@ pub(super) async fn handle_add_workspace_member(
     let member_labels_json = if member_labels.as_ref().is_none_or(HashMap::is_empty) {
         None
     } else {
-        Some(serde_json::to_string(&member_labels).map_err(|e| {
-            Status::internal(format!("failed to serialize labels: {e}"))
-        })?)
+        Some(
+            serde_json::to_string(&member_labels)
+                .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+        )
     };
     let result = state
         .store
@@ -674,7 +673,9 @@ mod tests {
     async fn resolve_workspace_not_found_rejects_sandbox_create() {
         let state = test_server_state().await;
 
-        let err = resolve_workspace(&state.store, "ghost-ws").await.unwrap_err();
+        let err = resolve_workspace(&state.store, "ghost-ws")
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), Code::NotFound);
         assert!(err.message().contains("ghost-ws"));
     }
@@ -1090,8 +1091,8 @@ mod tests {
 
     #[test]
     fn validate_workspace_name_rejects_over_max_length() {
-        let err =
-            validate_workspace_name(&"a".repeat(crate::grpc::MAX_ROUTABLE_NAME_LEN + 1)).unwrap_err();
+        let err = validate_workspace_name(&"a".repeat(crate::grpc::MAX_ROUTABLE_NAME_LEN + 1))
+            .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("exceeds maximum length"));
     }

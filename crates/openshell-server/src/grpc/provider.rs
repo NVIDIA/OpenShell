@@ -148,9 +148,10 @@ pub(super) async fn create_provider_record_with_catalog(
     let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
         None
     } else {
-        Some(serde_json::to_string(&labels_map).map_err(|e| {
-            Status::internal(format!("failed to serialize labels: {e}"))
-        })?)
+        Some(
+            serde_json::to_string(&labels_map)
+                .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+        )
     };
     let result = store
         .put_if(
@@ -300,10 +301,7 @@ pub(super) async fn update_provider_record_with_catalog(
 
     // Serialize labels for storage
     let labels_map = candidate.object_labels();
-    let labels_json = if labels_map
-        .as_ref()
-        .is_none_or(HashMap::is_empty)
-    {
+    let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
         None
     } else {
         Some(
@@ -413,9 +411,7 @@ where
     let mut offset = 0u32;
     loop {
         let records = if let Some(ws) = workspace {
-            store
-                .list(Sandbox::object_type(), ws, 1000, offset)
-                .await
+            store.list(Sandbox::object_type(), ws, 1000, offset).await
         } else {
             store
                 .list_by_type(Sandbox::object_type(), 1000, offset)
@@ -553,8 +549,15 @@ pub(super) async fn resolve_provider_environment_with_catalog(
     let mut env = HashMap::new();
     let mut expires = HashMap::new();
     let now_ms = crate::persistence::current_time_ms();
-    validate_provider_environment_keys_unique_at(store, catalog, workspace, provider_names, None, now_ms)
-        .await?;
+    validate_provider_environment_keys_unique_at(
+        store,
+        catalog,
+        workspace,
+        provider_names,
+        None,
+        now_ms,
+    )
+    .await?;
     let registry = openshell_providers::ProviderRegistry::new();
 
     for name in provider_names {
@@ -942,8 +945,13 @@ pub async fn validate_provider_environment_keys_unique(
     let catalog = ProviderProfileSources::with_default_sources()
         .snapshot_catalog(store)
         .await?;
-    validate_provider_environment_keys_unique_with_catalog(store, &catalog, workspace, provider_names)
-        .await
+    validate_provider_environment_keys_unique_with_catalog(
+        store,
+        &catalog,
+        workspace,
+        provider_names,
+    )
+    .await
 }
 
 pub async fn validate_provider_environment_keys_unique_with_catalog(
@@ -1318,8 +1326,9 @@ pub(super) async fn handle_create_provider(
     request: Request<CreateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.ensure_active()?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .ensure_active()?;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -1366,8 +1375,9 @@ pub(super) async fn handle_get_provider(
     request: Request<GetProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     let provider = get_provider_record(state.store.as_ref(), &workspace, &req.name).await?;
 
     Ok(Response::new(ProviderResponse {
@@ -1396,7 +1406,9 @@ pub(super) async fn handle_list_providers(
         all.into_iter().map(redact_provider_credentials).collect()
     } else {
         let workspace =
-            super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace).await?.name;
+            super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
+                .await?
+                .name;
         list_provider_records(state.store.as_ref(), &workspace, limit, request.offset).await?
     };
 
@@ -1420,7 +1432,7 @@ async fn workspace_scoped_profiles(
     let mut profiles: Vec<ProviderProfile> = stored
         .into_iter()
         .filter_map(|sp| {
-            let rv = sp.metadata.as_ref().map(|m| m.resource_version).unwrap_or(0);
+            let rv = sp.metadata.as_ref().map_or(0, |m| m.resource_version);
             sp.profile.map(|p| profile_response_payload(p, rv))
         })
         .collect();
@@ -1438,7 +1450,8 @@ pub(super) async fn handle_list_provider_profiles(
     let request = request.into_inner();
     let workspace =
         super::workspace::resolve_profile_workspace(state.store.as_ref(), &request.workspace)
-            .await?.name;
+            .await?
+            .name;
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
     let offset = request.offset as usize;
     let profiles = workspace_scoped_profiles(state.store.as_ref(), &workspace)
@@ -1457,7 +1470,9 @@ pub(super) async fn handle_get_provider_profile(
 ) -> Result<Response<ProviderProfileResponse>, Status> {
     let req = request.into_inner();
     let workspace =
-        super::workspace::resolve_profile_workspace(state.store.as_ref(), &req.workspace).await?.name;
+        super::workspace::resolve_profile_workspace(state.store.as_ref(), &req.workspace)
+            .await?
+            .name;
     let id = req.id;
     let id = normalize_profile_id_request(&id)?;
     let id_norm = normalize_profile_id(&id);
@@ -1479,7 +1494,8 @@ pub(super) async fn handle_import_provider_profiles(
     let request = request.into_inner();
     let workspace =
         super::workspace::resolve_profile_workspace(state.store.as_ref(), &request.workspace)
-            .await?.ensure_active()?;
+            .await?
+            .ensure_active()?;
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
@@ -1519,9 +1535,10 @@ pub(super) async fn handle_import_provider_profiles(
         let profile_labels_json = if profile_labels.as_ref().is_none_or(HashMap::is_empty) {
             None
         } else {
-            Some(serde_json::to_string(&profile_labels).map_err(|e| {
-                Status::internal(format!("failed to serialize labels: {e}"))
-            })?)
+            Some(
+                serde_json::to_string(&profile_labels)
+                    .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+            )
         };
         let result = state
             .store
@@ -1560,7 +1577,8 @@ pub(super) async fn handle_update_provider_profiles(
     let request = request.into_inner();
     let workspace =
         super::workspace::resolve_profile_workspace(state.store.as_ref(), &request.workspace)
-            .await?.ensure_active()?;
+            .await?
+            .ensure_active()?;
     let items = request.profile.into_iter().collect::<Vec<_>>();
     let (profiles, mut diagnostics) = profiles_from_import_items(&items);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
@@ -1683,7 +1701,8 @@ pub(super) async fn handle_lint_provider_profiles(
     let request = request.into_inner();
     let workspace =
         super::workspace::resolve_profile_workspace(state.store.as_ref(), &request.workspace)
-            .await?.name;
+            .await?
+            .name;
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let catalog = state
@@ -1708,7 +1727,9 @@ pub(super) async fn handle_delete_provider_profile(
 ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
     let req = request.into_inner();
     let workspace =
-        super::workspace::resolve_profile_workspace(state.store.as_ref(), &req.workspace).await?.name;
+        super::workspace::resolve_profile_workspace(state.store.as_ref(), &req.workspace)
+            .await?
+            .name;
     let id = req.id;
     let id = normalize_profile_id_request(&id)?;
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
@@ -1768,10 +1789,10 @@ pub(super) async fn get_provider_type_profile(
         .map_err(|e| Status::internal(format!("list provider profiles failed: {e}")))?;
     let id_norm = normalize_profile_id(id);
     for sp in &stored {
-        if let Some(profile) = sp.profile.as_ref() {
-            if normalize_profile_id(&profile.id) == id_norm {
-                return Ok(Some(ProviderTypeProfile::from_proto(profile)));
-            }
+        if let Some(profile) = sp.profile.as_ref()
+            && normalize_profile_id(&profile.id) == id_norm
+        {
+            return Ok(Some(ProviderTypeProfile::from_proto(profile)));
         }
     }
     // Fall back to builtin profiles (workspace-agnostic).
@@ -2070,8 +2091,7 @@ async fn profile_attached_sandbox_diagnostics(
     profiles: &[(String, ProviderTypeProfile)],
     operation: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
-    let mut candidate_profiles =
-        HashMap::<String, (String, ProviderProfile)>::new();
+    let mut candidate_profiles = HashMap::<String, (String, ProviderProfile)>::new();
     for (source, profile) in profiles {
         let Some(id) = normalize_profile_id(&profile.id) else {
             continue;
@@ -2286,8 +2306,9 @@ pub(super) async fn handle_update_provider(
     request: Request<UpdateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -2334,8 +2355,9 @@ pub(super) async fn handle_get_provider_refresh_status(
     request: Request<GetProviderRefreshStatusRequest>,
 ) -> Result<Response<GetProviderRefreshStatusResponse>, Status> {
     let request = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
+        .await?
+        .name;
     if request.provider.trim().is_empty() {
         return Err(Status::invalid_argument("provider is required"));
     }
@@ -2377,8 +2399,9 @@ pub(super) async fn handle_configure_provider_refresh(
     request: Request<ConfigureProviderRefreshRequest>,
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
     let request = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
+        .await?
+        .name;
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
     if provider_name.is_empty() {
@@ -2646,10 +2669,7 @@ pub(super) async fn handle_configure_provider_refresh(
             r#type: String::new(),
             credentials: HashMap::new(),
             config: HashMap::new(),
-            credential_expires_at_ms: HashMap::from([(
-                credential_key.to_string(),
-                expires_at_ms,
-            )]),
+            credential_expires_at_ms: HashMap::from([(credential_key.to_string(), expires_at_ms)]),
             profile_workspace: String::new(),
         };
         update_provider_record_with_catalog(state.store.as_ref(), &catalog, &workspace, updated)
@@ -2668,8 +2688,9 @@ pub(super) async fn handle_rotate_provider_credential(
     request: Request<RotateProviderCredentialRequest>,
 ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
     let request = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
+        .await?
+        .name;
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
     if provider_name.is_empty() {
@@ -2726,8 +2747,9 @@ pub(super) async fn handle_delete_provider_refresh(
     request: Request<DeleteProviderRefreshRequest>,
 ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
     let request = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
+        .await?
+        .name;
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
     if provider_name.is_empty() {
@@ -2793,8 +2815,9 @@ pub(super) async fn handle_delete_provider(
     request: Request<DeleteProviderRequest>,
 ) -> Result<Response<DeleteProviderResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     let name = req.name;
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &workspace, &name).await;
     let result = delete_provider_record(state.store.as_ref(), &workspace, &name).await;
@@ -4177,9 +4200,12 @@ mod tests {
             !conflict.valid,
             "lint should detect conflict with existing profile in the same workspace"
         );
-        assert!(conflict.diagnostics.iter().any(|d| {
-            d.profile_id == "scoped-lint" && d.message.contains("already exists")
-        }));
+        assert!(
+            conflict
+                .diagnostics
+                .iter()
+                .any(|d| { d.profile_id == "scoped-lint" && d.message.contains("already exists") })
+        );
 
         crate::grpc::workspace::handle_create_workspace(
             &state,
@@ -4208,8 +4234,7 @@ mod tests {
             no_conflict
                 .diagnostics
                 .iter()
-                .all(|d| d.profile_id != "scoped-lint"
-                    || !d.message.contains("already exists")),
+                .all(|d| d.profile_id != "scoped-lint" || !d.message.contains("already exists")),
             "lint against different workspace should not see profile from default"
         );
     }
@@ -8824,12 +8849,18 @@ mod tests {
         let profile = get_provider_type_profile(&store, "", "global-custom")
             .await
             .unwrap();
-        assert!(profile.is_some(), "global profile should be found at workspace ''");
+        assert!(
+            profile.is_some(),
+            "global profile should be found at workspace ''"
+        );
 
         let miss = get_provider_type_profile(&store, "default", "global-custom")
             .await
             .unwrap();
-        assert!(miss.is_none(), "global profile should NOT be found at workspace 'default'");
+        assert!(
+            miss.is_none(),
+            "global profile should NOT be found at workspace 'default'"
+        );
     }
 
     #[tokio::test]

@@ -368,30 +368,22 @@ WHERE object_type = $1 AND workspace = $2 AND name = $3
         object_type: &str,
         workspace: &str,
     ) -> PersistenceResult<u64> {
-        let result = sqlx::query(
-            "DELETE FROM objects WHERE object_type = $1 AND workspace = $2",
-        )
-        .bind(object_type)
-        .bind(workspace)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| map_db_error(&e))?;
+        let result = sqlx::query("DELETE FROM objects WHERE object_type = $1 AND workspace = $2")
+            .bind(object_type)
+            .bind(workspace)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
         Ok(result.rows_affected())
     }
 
-    pub async fn delete_by_scope(
-        &self,
-        object_type: &str,
-        scope: &str,
-    ) -> PersistenceResult<u64> {
-        let result = sqlx::query(
-            "DELETE FROM objects WHERE object_type = $1 AND scope = $2",
-        )
-        .bind(object_type)
-        .bind(scope)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| map_db_error(&e))?;
+    pub async fn delete_by_scope(&self, object_type: &str, scope: &str) -> PersistenceResult<u64> {
+        let result = sqlx::query("DELETE FROM objects WHERE object_type = $1 AND scope = $2")
+            .bind(object_type)
+            .bind(scope)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
         Ok(result.rows_affected())
     }
 

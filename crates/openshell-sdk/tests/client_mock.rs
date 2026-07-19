@@ -54,7 +54,11 @@ fn sandbox_with_phase(name: &str, phase: proto::SandboxPhase) -> proto::Sandbox 
     sandbox_with_phase_ws(name, phase, "default")
 }
 
-fn sandbox_with_phase_ws(name: &str, phase: proto::SandboxPhase, workspace: &str) -> proto::Sandbox {
+fn sandbox_with_phase_ws(
+    name: &str,
+    phase: proto::SandboxPhase,
+    workspace: &str,
+) -> proto::Sandbox {
     proto::Sandbox {
         metadata: Some(proto::datamodel::v1::ObjectMeta {
             id: format!("id-{name}"),
@@ -614,7 +618,10 @@ impl OpenShell for TestOpenShell {
         let req = request.into_inner();
         *self.state.last_workspace_request.lock().await = Some(req.name.clone());
         Ok(Response::new(proto::CreateWorkspaceResponse {
-            workspace: Some(workspace_proto(&req.name, proto::datamodel::v1::WorkspacePhase::Active)),
+            workspace: Some(workspace_proto(
+                &req.name,
+                proto::datamodel::v1::WorkspacePhase::Active,
+            )),
         }))
     }
 
@@ -625,7 +632,10 @@ impl OpenShell for TestOpenShell {
         let name = request.into_inner().name;
         *self.state.last_workspace_request.lock().await = Some(name.clone());
         Ok(Response::new(proto::GetWorkspaceResponse {
-            workspace: Some(workspace_proto(&name, proto::datamodel::v1::WorkspacePhase::Active)),
+            workspace: Some(workspace_proto(
+                &name,
+                proto::datamodel::v1::WorkspacePhase::Active,
+            )),
         }))
     }
 
@@ -1109,7 +1119,10 @@ async fn list_workspaces_returns_all() {
     let endpoint = start_mock(state.clone()).await;
     let client = connect(&endpoint).await;
 
-    let workspaces = client.list_workspaces(ListOptions::default()).await.unwrap();
+    let workspaces = client
+        .list_workspaces(ListOptions::default())
+        .await
+        .unwrap();
     assert_eq!(workspaces.len(), 2);
     assert_eq!(workspaces[0].name, "default");
     assert_eq!(workspaces[1].name, "staging");

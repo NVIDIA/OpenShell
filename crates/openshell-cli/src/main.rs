@@ -2830,10 +2830,8 @@ async fn main() -> Result<()> {
                 }
                 InferenceCommands::Delete { system } => {
                     let route_name = if system { "sandbox-system" } else { "" };
-                    run::gateway_inference_delete(
-                        endpoint, route_name, &cli.workspace, &tls,
-                    )
-                    .await?;
+                    run::gateway_inference_delete(endpoint, route_name, &cli.workspace, &tls)
+                        .await?;
                 }
             }
         }
@@ -3326,8 +3324,7 @@ async fn main() -> Result<()> {
                 }
                 ProviderCommands::ListProfiles { output, global } => {
                     let ws = if global { "" } else { &cli.workspace };
-                    run::provider_list_profiles(endpoint, output.as_str(), ws, &tls)
-                        .await?;
+                    run::provider_list_profiles(endpoint, output.as_str(), ws, &tls).await?;
                 }
                 ProviderCommands::Profile(command) => {
                     let profile_workspace =
@@ -3417,7 +3414,15 @@ async fn main() -> Result<()> {
                 tls.oidc_token.as_deref(),
                 tls.edge_token.as_deref(),
             )?;
-            openshell_tui::run(channel, interceptor, &ctx.name, &ctx.endpoint, &cli.workspace, theme).await?;
+            openshell_tui::run(
+                channel,
+                interceptor,
+                &ctx.name,
+                &ctx.endpoint,
+                &cli.workspace,
+                theme,
+            )
+            .await?;
         }
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()

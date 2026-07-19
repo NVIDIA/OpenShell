@@ -609,12 +609,9 @@ impl PodmanComputeDriver {
 
     /// Stop a sandbox container without deleting it.
     pub async fn stop_sandbox(&self, sandbox_id: &str) -> Result<(), ComputeDriverError> {
-        let container_id = self
-            .find_container_id(sandbox_id)
-            .await?
-            .ok_or_else(|| {
-                ComputeDriverError::Precondition("sandbox container not found".into())
-            })?;
+        let container_id = self.find_container_id(sandbox_id).await?.ok_or_else(|| {
+            ComputeDriverError::Precondition("sandbox container not found".into())
+        })?;
         info!(sandbox_id = %sandbox_id, container = %container_id, "Stopping sandbox container");
 
         self.client

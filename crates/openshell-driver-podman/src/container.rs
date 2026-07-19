@@ -1657,7 +1657,10 @@ mod tests {
         let mut sandbox = test_sandbox("real-id", "real-name");
         sandbox.namespace = "real-namespace".to_string();
         let mut label_overrides = std::collections::HashMap::new();
-        label_overrides.insert("openshell.ai/sandbox-id".to_string(), "spoofed-id".to_string());
+        label_overrides.insert(
+            "openshell.ai/sandbox-id".to_string(),
+            "spoofed-id".to_string(),
+        );
         label_overrides.insert(
             "openshell.ai/sandbox-name".to_string(),
             "spoofed-name".to_string(),
@@ -1681,7 +1684,9 @@ mod tests {
             .as_object()
             .expect("labels should be an object");
         assert_eq!(
-            labels.get("openshell.ai/sandbox-id").and_then(|v| v.as_str()),
+            labels
+                .get("openshell.ai/sandbox-id")
+                .and_then(|v| v.as_str()),
             Some("real-id"),
             "openshell.sandbox-id must not be overridden by template labels"
         );

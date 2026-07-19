@@ -36,11 +36,10 @@ use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
     ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, DeleteProviderProfileRequest,
-    DeleteInferenceRouteRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
-    DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest,
-    ExecSandboxRequest, ExposeServiceRequest,
-    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
+    CreateSandboxRequest, CreateSshSessionRequest, DeleteInferenceRouteRequest,
+    DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
+    DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest,
+    ExposeServiceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
     GetGatewayInfoRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
     GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest,
@@ -52,10 +51,10 @@ use openshell_core::proto::{
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
     ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
     SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
-    ServiceStatus, SetInferenceRouteRequest, SettingScope,
-    SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    ServiceStatus, SetInferenceRouteRequest, SettingScope, SettingValue, TcpForwardFrame,
+    TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderProfilesRequest,
+    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -5068,8 +5067,7 @@ pub async fn provider_create_with_options(
 
     if from_existing {
         let discovered =
-            discover_existing_provider_data(&mut client, &provider_type, profile_workspace)
-                .await?;
+            discover_existing_provider_data(&mut client, &provider_type, profile_workspace).await?;
         let Some(discovered) = discovered else {
             return Err(miette::miette!(
                 "no existing local credentials/config found for provider type '{provider_type}'"

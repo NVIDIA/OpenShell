@@ -194,7 +194,7 @@ impl SandboxGuard {
         .await;
 
         let collect_stderr = || {
-            let _ = stderr_task.abort();
+            stderr_task.abort();
             let buf = stderr_buf.lock().unwrap();
             buf.clone()
         };

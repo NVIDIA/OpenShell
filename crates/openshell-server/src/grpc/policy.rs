@@ -1629,8 +1629,9 @@ async fn handle_update_config_inner(
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let req = request.into_inner();
     validate_annotations(&req.annotations, "annotations")?;
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
         resolve_sandbox_by_name_for_principal(
@@ -2075,7 +2076,7 @@ async fn handle_update_config_inner(
 
     let payload = new_policy.encode_to_vec();
     let hash = deterministic_policy_hash(&new_policy);
-    let (next_version, committed_annotations) = {
+    let (_next_version, committed_annotations) = {
         let mut committed = None;
         for attempt in 1..=MERGE_RETRY_LIMIT {
             let latest = state
@@ -2236,7 +2237,9 @@ pub(super) async fn handle_get_sandbox_policy_status(
     let workspace = if req.global {
         String::new()
     } else {
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name
+        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+            .await?
+            .name
     };
 
     let (policy_id, active_version) = if req.global {
@@ -2292,7 +2295,9 @@ pub(super) async fn handle_list_sandbox_policies(
     let workspace = if req.global {
         String::new()
     } else {
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name
+        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+            .await?
+            .name
     };
 
     let policy_id = if req.global {
@@ -2417,8 +2422,9 @@ pub(super) async fn handle_get_sandbox_logs(
     let req = request.into_inner();
     // TODO(phase2): workspace is resolved but not used for authorization.
     // Verify the sandbox belongs to this workspace before returning logs.
-    let _workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let _workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
     }
@@ -2533,8 +2539,9 @@ pub(super) async fn handle_submit_policy_analysis(
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -2824,8 +2831,9 @@ pub(super) async fn handle_get_draft_policy(
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -2895,8 +2903,9 @@ async fn handle_approve_draft_chunk_inner(
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -2997,8 +3006,9 @@ async fn handle_reject_draft_chunk_inner(
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3097,8 +3107,9 @@ async fn handle_approve_all_draft_chunks_inner(
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3220,8 +3231,9 @@ pub(super) async fn handle_edit_draft_chunk(
     request: Request<EditDraftChunkRequest>,
 ) -> Result<Response<EditDraftChunkResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3286,8 +3298,9 @@ async fn handle_undo_draft_chunk_inner(
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3373,8 +3386,9 @@ pub(super) async fn handle_clear_draft_chunks(
     request: Request<ClearDraftChunksRequest>,
 ) -> Result<Response<ClearDraftChunksResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3411,8 +3425,9 @@ pub(super) async fn handle_get_draft_history(
     request: Request<GetDraftHistoryRequest>,
 ) -> Result<Response<GetDraftHistoryResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3969,7 +3984,14 @@ async fn apply_merge_operations_with_retry(
                 .map(Some)
         } else {
             store
-                .put_policy_revision(&policy_id, sandbox_id, workspace, next_version, &payload, &hash)
+                .put_policy_revision(
+                    &policy_id,
+                    sandbox_id,
+                    workspace,
+                    next_version,
+                    &payload,
+                    &hash,
+                )
                 .await
                 .map(|()| None)
         };
@@ -9126,7 +9148,11 @@ mod tests {
     async fn conditionally_reject_transitions_pending_chunk() {
         let store = test_store().await;
         store
-            .put_draft_chunk(&pending_draft_chunk("cas-pending", "sb-cas-pending"), None, "default")
+            .put_draft_chunk(
+                &pending_draft_chunk("cas-pending", "sb-cas-pending"),
+                None,
+                "default",
+            )
             .await
             .unwrap();
 
@@ -9185,7 +9211,11 @@ mod tests {
     async fn conditionally_reject_loses_race_to_approval() {
         let store = test_store().await;
         store
-            .put_draft_chunk(&pending_draft_chunk("cas-race", "sb-cas-race"), None, "default")
+            .put_draft_chunk(
+                &pending_draft_chunk("cas-race", "sb-cas-race"),
+                None,
+                "default",
+            )
             .await
             .unwrap();
 
@@ -9987,7 +10017,9 @@ mod tests {
         }];
 
         let (left, right) = tokio::join!(
-            apply_merge_operations_with_retry(&store, sandbox_id, "default", None, &add_allow, None),
+            apply_merge_operations_with_retry(
+                &store, sandbox_id, "default", None, &add_allow, None
+            ),
             apply_merge_operations_with_retry(&store, sandbox_id, "default", None, &add_deny, None),
         );
 

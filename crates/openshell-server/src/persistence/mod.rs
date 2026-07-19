@@ -328,11 +328,7 @@ impl Store {
     }
 
     /// Delete all objects of a given type with a matching scope.
-    pub async fn delete_by_scope(
-        &self,
-        object_type: &str,
-        scope: &str,
-    ) -> PersistenceResult<u64> {
+    pub async fn delete_by_scope(&self, object_type: &str, scope: &str) -> PersistenceResult<u64> {
         store_dispatch!(self.delete_by_scope(object_type, scope))
     }
 
@@ -408,12 +404,7 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        store_dispatch!(self.list_all_with_selector(
-            object_type,
-            label_selector,
-            limit,
-            offset
-        ))
+        store_dispatch!(self.list_all_with_selector(object_type, label_selector, limit, offset))
     }
 
     // -----------------------------------------------------------------------

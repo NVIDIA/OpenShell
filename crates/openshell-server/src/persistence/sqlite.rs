@@ -410,11 +410,7 @@ WHERE "object_type" = ?1 AND "workspace" = ?2
         Ok(result.rows_affected())
     }
 
-    pub async fn delete_by_scope(
-        &self,
-        object_type: &str,
-        scope: &str,
-    ) -> PersistenceResult<u64> {
+    pub async fn delete_by_scope(&self, object_type: &str, scope: &str) -> PersistenceResult<u64> {
         let result = sqlx::query(
             r#"
 DELETE FROM "objects"

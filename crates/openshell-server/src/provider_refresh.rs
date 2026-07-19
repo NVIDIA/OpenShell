@@ -1595,9 +1595,10 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let refreshed = refresh_provider_credential(&store, "default", "aws-sts-test", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap();
+        let refreshed =
+            refresh_provider_credential(&store, "default", "aws-sts-test", "AWS_ACCESS_KEY_ID")
+                .await
+                .unwrap();
         assert_eq!(refreshed.status, "refreshed");
         assert!(refreshed.expires_at_ms > 0);
 
@@ -1756,9 +1757,10 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let err = refresh_provider_credential(&store, "default", "aws-sts-partial", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap_err();
+        let err =
+            refresh_provider_credential(&store, "default", "aws-sts-partial", "AWS_ACCESS_KEY_ID")
+                .await
+                .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("both be set or both omitted"));
 
@@ -1879,10 +1881,15 @@ mod tests {
             ]),
         };
 
-        let err =
-            apply_minted_credential(&store, "default", &refreshing_provider, "AWS_ACCESS_KEY_ID", &minted)
-                .await
-                .unwrap_err();
+        let err = apply_minted_credential(
+            &store,
+            "default",
+            &refreshing_provider,
+            "AWS_ACCESS_KEY_ID",
+            &minted,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert!(err.message().contains("AWS_SECRET_ACCESS_KEY"));
     }
@@ -1982,9 +1989,10 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let refreshed = refresh_provider_credential(&store, "default", "aws-sts-session", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap();
+        let refreshed =
+            refresh_provider_credential(&store, "default", "aws-sts-session", "AWS_ACCESS_KEY_ID")
+                .await
+                .unwrap();
         assert_eq!(refreshed.status, "refreshed");
         let stored = store
             .get_message_by_name::<Provider>("default", "aws-sts-session")
@@ -2044,9 +2052,14 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let err = refresh_provider_credential(&store, "default", "aws-sts-lonesession", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap_err();
+        let err = refresh_provider_credential(
+            &store,
+            "default",
+            "aws-sts-lonesession",
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("aws_session_token requires"));
     }
@@ -2124,7 +2137,8 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let rotate = refresh_provider_credential(&store, "default", "aws-race", "AWS_ACCESS_KEY_ID");
+        let rotate =
+            refresh_provider_credential(&store, "default", "aws-race", "AWS_ACCESS_KEY_ID");
         let interfere = async {
             // Wait until the rotation is inside the STS call (its state read has
             // already happened), then delete the refresh and release STS.
@@ -2238,7 +2252,8 @@ mod tests {
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
 
-        let rotate = refresh_provider_credential(&store, "default", "aws-superseded", "AWS_ACCESS_KEY_ID");
+        let rotate =
+            refresh_provider_credential(&store, "default", "aws-superseded", "AWS_ACCESS_KEY_ID");
         let interfere = async {
             if tokio::time::timeout(std::time::Duration::from_secs(15), hit_rx)
                 .await
@@ -2249,10 +2264,11 @@ mod tests {
             // Simulate a concurrent rotation or reconfigure winning the
             // generation: any write to the refresh state bumps its version, so
             // the in-flight rotation's version-matched persist will lose.
-            let mut winner = get_refresh_state(&store, "default", &provider_id, "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap()
-                .unwrap();
+            let mut winner =
+                get_refresh_state(&store, "default", &provider_id, "AWS_ACCESS_KEY_ID")
+                    .await
+                    .unwrap()
+                    .unwrap();
             winner.last_error = "won-by-concurrent-writer".to_string();
             put_refresh_state(&store, &winner).await.unwrap();
             let _ = release_tx.send(());

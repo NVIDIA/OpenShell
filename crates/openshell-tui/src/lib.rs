@@ -2016,22 +2016,18 @@ async fn refresh_providers(app: &mut App) {
         },
         all_workspaces: app.all_workspaces,
     };
-    let providers = match tokio::time::timeout(
-        Duration::from_secs(5),
-        app.client.list_providers(req),
-    )
-    .await
-    {
-        Ok(Ok(resp)) => resp.into_inner().providers,
-        Ok(Err(e)) => {
-            app.status_text = format!("failed to list providers: {}", e.message());
-            return;
-        }
-        Err(_) => {
-            app.status_text = "list providers timed out".to_string();
-            return;
-        }
-    };
+    let providers =
+        match tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await {
+            Ok(Ok(resp)) => resp.into_inner().providers,
+            Ok(Err(e)) => {
+                app.status_text = format!("failed to list providers: {}", e.message());
+                return;
+            }
+            Err(_) => {
+                app.status_text = "list providers timed out".to_string();
+                return;
+            }
+        };
 
     let profiles: HashMap<(String, String), openshell_core::proto::ProviderProfile> =
         if app.providers_v2_enabled {
@@ -2046,20 +2042,15 @@ async fn refresh_providers(app: &mut App) {
                     offset: 0,
                     workspace: ws.clone(),
                 };
-                match tokio::time::timeout(
+                if let Ok(Ok(resp)) = tokio::time::timeout(
                     Duration::from_secs(5),
                     app.client.list_provider_profiles(req),
                 )
                 .await
                 {
-                    Ok(Ok(resp)) => {
-                        for profile in resp.into_inner().profiles {
-                            all_profiles
-                                .insert((ws.clone(), profile.id.clone()), profile);
-                        }
+                    for profile in resp.into_inner().profiles {
+                        all_profiles.insert((ws.clone(), profile.id.clone()), profile);
                     }
-                    Ok(Err(_)) => {}
-                    Err(_) => {}
                 }
             }
             all_profiles

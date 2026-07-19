@@ -24,7 +24,6 @@ use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 use hyper_util::rt::TokioIo;
 use openshell_core::ComputeDriverKind;
-use openshell_core::{ObjectLabels, ObjectWorkspace};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
@@ -38,6 +37,7 @@ use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
     SandboxTemplate, ServiceEndpoint, SshSession,
 };
+use openshell_core::{ObjectLabels, ObjectWorkspace};
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
@@ -518,9 +518,10 @@ impl ComputeRuntime {
         let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
             None
         } else {
-            Some(serde_json::to_string(&labels_map).map_err(|e| {
-                Status::internal(format!("failed to serialize labels: {e}"))
-            })?)
+            Some(
+                serde_json::to_string(&labels_map)
+                    .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+            )
         };
         let result = self
             .store
@@ -619,7 +620,9 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.notify(&id);
         self.cleanup_sandbox_owned_records(&sandbox)
             .await
-            .map_err(|e| Status::internal(format!("cleanup owned records for sandbox {id}: {e}")))?;
+            .map_err(|e| {
+                Status::internal(format!("cleanup owned records for sandbox {id}: {e}"))
+            })?;
 
         let deleted = self
             .driver
@@ -1197,7 +1200,7 @@ impl ComputeRuntime {
                     created_at_ms: now_ms,
                     labels: HashMap::new(),
                     resource_version: 0,
-                    annotations: std::collections::HashMap::new(),
+                    annotations: HashMap::new(),
                     workspace,
                     deletion_timestamp_ms: 0,
                 }),
@@ -1210,9 +1213,10 @@ impl ComputeRuntime {
             let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
                 None
             } else {
-                Some(serde_json::to_string(&labels_map).map_err(|e| {
-                    format!("failed to serialize labels: {e}")
-                })?)
+                Some(
+                    serde_json::to_string(&labels_map)
+                        .map_err(|e| format!("failed to serialize labels: {e}"))?,
+                )
             };
             self.store
                 .put_if(
@@ -1427,7 +1431,11 @@ impl ComputeRuntime {
             .await?;
 
         self.store
-            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_workspace(), sandbox.object_name())
+            .delete_by_name(
+                SANDBOX_SETTINGS_OBJECT_TYPE,
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+            )
             .await
             .map_err(|e| format!("delete sandbox settings: {e}"))?;
 
@@ -3355,7 +3363,11 @@ mod tests {
         assert!(
             runtime
                 .store
-                .get_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_workspace(), sandbox.object_name())
+                .get_by_name(
+                    SANDBOX_SETTINGS_OBJECT_TYPE,
+                    sandbox.object_workspace(),
+                    sandbox.object_name()
+                )
                 .await
                 .unwrap()
                 .is_none()

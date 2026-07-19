@@ -252,7 +252,7 @@ async fn upsert_inference_route(
             created_at_ms: now_ms,
             labels: HashMap::new(),
             resource_version: 0,
-            annotations: std::collections::HashMap::new(),
+            annotations: HashMap::new(),
             workspace: workspace.to_string(),
             deletion_timestamp_ms: 0,
         });
@@ -271,9 +271,10 @@ async fn upsert_inference_route(
     let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
         None
     } else {
-        Some(serde_json::to_string(&labels_map).map_err(|e| {
-            Status::internal(format!("failed to serialize labels: {e}"))
-        })?)
+        Some(
+            serde_json::to_string(&labels_map)
+                .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+        )
     };
     store
         .put_if(
@@ -1083,9 +1084,9 @@ mod tests {
                 id: format!("id-{name}"),
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),
@@ -1104,16 +1105,16 @@ mod tests {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once((key_name.to_string(), key_value.to_string())).collect(),
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
         }
     }
@@ -1207,9 +1208,9 @@ mod tests {
                 id: "provider-bedrock-bridge".to_string(),
                 name: "bedrock-bridge".to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),
@@ -1227,7 +1228,7 @@ mod tests {
                 "http://bedrock-bridge.demo.svc.cluster.local:8080".to_string(),
             ))
             .collect(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
         };
         store
@@ -1288,9 +1289,9 @@ mod tests {
                 id: "provider-bedrock-misconfigured".to_string(),
                 name: "bedrock-misconfigured".to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),
@@ -1301,8 +1302,8 @@ mod tests {
             ))
             .collect(),
             // Intentionally no BEDROCK_BASE_URL.
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
         };
         store
@@ -1341,20 +1342,20 @@ mod tests {
                 id: "provider-bedrock-bridge".to_string(),
                 name: "bedrock-bridge".to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),
             r#type: "aws-bedrock".to_string(),
-            credentials: std::collections::HashMap::new(),
+            credentials: HashMap::new(),
             config: std::iter::once((
                 "BEDROCK_BASE_URL".to_string(),
                 "http://bedrock-bridge.demo.svc.cluster.local:8080".to_string(),
             ))
             .collect(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
         };
         store
@@ -1571,9 +1572,9 @@ mod tests {
                 id: "provider-1".to_string(),
                 name: "openai-dev".to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),
@@ -1585,7 +1586,7 @@ mod tests {
                 "https://station.example.com/v1".to_string(),
             ))
             .collect(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
         };
         store
@@ -1598,9 +1599,9 @@ mod tests {
                 id: "r-1".to_string(),
                 name: CLUSTER_INFERENCE_ROUTE_NAME.to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),
@@ -1714,9 +1715,9 @@ mod tests {
                 id: "provider-vertex-test".to_string(),
                 name: "vertex-test".to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
                 resource_version: 0,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),
@@ -1735,7 +1736,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
         };
         store
@@ -2051,18 +2052,15 @@ mod tests {
     // resolve_vertex_ai_route tests
     // -------------------------------------------------------------------------
 
-    fn make_vertex_provider_with_config(
-        name: &str,
-        config: std::collections::HashMap<String, String>,
-    ) -> Provider {
+    fn make_vertex_provider_with_config(name: &str, config: HashMap<String, String>) -> Provider {
         Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
+                labels: HashMap::new(),
                 resource_version: 1,
-                annotations: std::collections::HashMap::new(),
+                annotations: HashMap::new(),
                 workspace: "default".to_string(),
                 deletion_timestamp_ms: 0,
             }),
@@ -2073,7 +2071,7 @@ mod tests {
             ))
             .collect(),
             config,
-            credential_expires_at_ms: std::collections::HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
         }
     }
@@ -2519,7 +2517,7 @@ mod tests {
 
     #[test]
     fn resolve_vertex_ai_route_missing_project_fails() {
-        let config = std::collections::HashMap::new();
+        let config = HashMap::new();
         let provider = make_vertex_provider_with_config("vertex-no-proj", config);
 
         let err = resolve_provider_route(&provider, "claude-3-5-sonnet@20241022")
@@ -2563,10 +2561,7 @@ mod tests {
             ))
             .collect(),
             config,
-            ..make_vertex_provider_with_config(
-                "vertex-bootstrap-only",
-                std::collections::HashMap::new(),
-            )
+            ..make_vertex_provider_with_config("vertex-bootstrap-only", HashMap::new())
         };
 
         let err = resolve_provider_route(&provider, "claude-3-5-sonnet@20241022")
@@ -3147,8 +3142,8 @@ mod tests {
                 id: "provider-alpha".to_string(),
                 name: "openai-alpha".to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
-                annotations: std::collections::HashMap::new(),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
                 resource_version: 0,
                 workspace: "alpha".to_string(),
                 deletion_timestamp_ms: 0,
@@ -3159,8 +3154,8 @@ mod tests {
                 "sk-alpha-key".to_string(),
             ))
             .collect(),
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
         };
         store
@@ -3173,8 +3168,8 @@ mod tests {
                 id: "provider-beta".to_string(),
                 name: "anthropic-beta".to_string(),
                 created_at_ms: 1_000_000,
-                labels: std::collections::HashMap::new(),
-                annotations: std::collections::HashMap::new(),
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
                 resource_version: 0,
                 workspace: "beta".to_string(),
                 deletion_timestamp_ms: 0,
@@ -3185,8 +3180,8 @@ mod tests {
                 "sk-beta-key".to_string(),
             ))
             .collect(),
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
             profile_workspace: String::new(),
         };
         store

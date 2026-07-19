@@ -1480,7 +1480,13 @@ mod tests {
 ";
         std::fs::write(&log_path, body).unwrap();
 
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf(), test_workspace_rx());
+        let ctx = PolicyLocalContext::with_log_dir(
+            None,
+            None,
+            None,
+            dir.path().to_path_buf(),
+            test_workspace_rx(),
+        );
         let (status, payload) = recent_denials_response(&ctx, "last=10").await;
         assert_eq!(status, 200);
         assert_eq!(payload["log_available"], true);
@@ -1511,7 +1517,13 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf(), test_workspace_rx());
+        let ctx = PolicyLocalContext::with_log_dir(
+            None,
+            None,
+            None,
+            dir.path().to_path_buf(),
+            test_workspace_rx(),
+        );
         let (status, payload) = recent_denials_response(&ctx, "").await;
         assert_eq!(status, 200);
         assert_eq!(payload["log_available"], false);
@@ -1521,7 +1533,13 @@ mod tests {
     #[tokio::test]
     async fn recent_denials_signals_when_log_is_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf(), test_workspace_rx());
+        let ctx = PolicyLocalContext::with_log_dir(
+            None,
+            None,
+            None,
+            dir.path().to_path_buf(),
+            test_workspace_rx(),
+        );
         let (status, payload) = recent_denials_response(&ctx, "").await;
         assert_eq!(status, 200);
         assert_eq!(payload["log_available"], false);
@@ -1584,7 +1602,13 @@ mod tests {
         );
         std::fs::write(&log_path, line).unwrap();
 
-        let ctx = PolicyLocalContext::with_log_dir(None, None, None, dir.path().to_path_buf(), test_workspace_rx());
+        let ctx = PolicyLocalContext::with_log_dir(
+            None,
+            None,
+            None,
+            dir.path().to_path_buf(),
+            test_workspace_rx(),
+        );
         let (_, payload) = recent_denials_response(&ctx, "last=1").await;
         let denials = payload["denials"].as_array().unwrap();
         assert_eq!(denials.len(), 1);
@@ -1789,7 +1813,12 @@ mod tests {
     #[tokio::test]
     async fn proposal_status_route_returns_503_when_no_gateway() {
         let _guard = ProposalsFlagGuard::set(true).await;
-        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()), test_workspace_rx());
+        let ctx = PolicyLocalContext::new(
+            None,
+            None,
+            Some("test-sandbox".to_string()),
+            test_workspace_rx(),
+        );
 
         let (status, body) = route_request(&ctx, "GET", "/v1/proposals/chunk-id", &[]).await;
         assert_eq!(status, 503);
@@ -1799,7 +1828,12 @@ mod tests {
     #[tokio::test]
     async fn proposal_wait_route_returns_503_when_no_gateway() {
         let _guard = ProposalsFlagGuard::set(true).await;
-        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()), test_workspace_rx());
+        let ctx = PolicyLocalContext::new(
+            None,
+            None,
+            Some("test-sandbox".to_string()),
+            test_workspace_rx(),
+        );
 
         let (status, body) =
             route_request(&ctx, "GET", "/v1/proposals/chunk-id/wait?timeout=1", &[]).await;
@@ -1810,7 +1844,12 @@ mod tests {
     #[tokio::test]
     async fn proposal_routes_return_feature_disabled_when_flag_off() {
         let _guard = ProposalsFlagGuard::set(false).await;
-        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()), test_workspace_rx());
+        let ctx = PolicyLocalContext::new(
+            None,
+            None,
+            Some("test-sandbox".to_string()),
+            test_workspace_rx(),
+        );
 
         let (status, body) = route_request(&ctx, "GET", "/v1/proposals/abc", &[]).await;
         assert_eq!(status, 404);
@@ -1886,7 +1925,12 @@ mod tests {
         // whole-policy diff would never see another change and burn the
         // full timeout. Rule-coverage must return immediately.
         let proposed = proposed_curl_rule_for_github();
-        let ctx = PolicyLocalContext::new(Some(policy_with_rule(proposed.clone())), None, None, test_workspace_rx());
+        let ctx = PolicyLocalContext::new(
+            Some(policy_with_rule(proposed.clone())),
+            None,
+            None,
+            test_workspace_rx(),
+        );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
 
         let start = tokio::time::Instant::now();

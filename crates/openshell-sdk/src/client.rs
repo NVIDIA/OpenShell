@@ -633,12 +633,7 @@ impl WorkspaceScopedClient {
     }
 
     /// Run a command inside a sandbox and buffer stdout/stderr.
-    pub async fn exec(
-        &self,
-        name: &str,
-        cmd: &[String],
-        opts: ExecOptions,
-    ) -> Result<ExecResult> {
+    pub async fn exec(&self, name: &str, cmd: &[String], opts: ExecOptions) -> Result<ExecResult> {
         let sandbox = self.get_sandbox(name).await?;
         let request = proto::ExecSandboxRequest {
             sandbox_id: sandbox.id,

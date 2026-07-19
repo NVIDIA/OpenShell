@@ -985,10 +985,9 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
         None
     } else {
         Some(
-            serde_json::to_string(&labels_map)
-                .map_err(|e| Error::Config {
-                    message: format!("failed to serialize labels: {e}"),
-                })?,
+            serde_json::to_string(&labels_map).map_err(|e| Error::Config {
+                message: format!("failed to serialize labels: {e}"),
+            })?,
         )
     };
     match store

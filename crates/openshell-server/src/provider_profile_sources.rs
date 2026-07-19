@@ -304,6 +304,7 @@ impl EffectiveProviderProfileCatalog {
         self.source_count
     }
 
+    #[allow(dead_code)]
     pub(crate) fn list_profiles(&self) -> Vec<ProviderProfile> {
         self.profiles
             .values()
@@ -311,6 +312,7 @@ impl EffectiveProviderProfileCatalog {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn get_profile(&self, id: &str) -> Option<ProviderProfile> {
         let id = normalize_profile_id(id)?;
         self.profiles.get(&id).map(|entry| entry.response.clone())
@@ -490,6 +492,7 @@ pub async fn user_provider_profiles(store: &Store) -> Result<Vec<StoredProviderP
     Ok(profiles)
 }
 
+#[expect(dead_code)]
 pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
     use crate::persistence::current_time_ms;
     let now_ms = current_time_ms();

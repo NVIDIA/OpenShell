@@ -11,7 +11,6 @@
 
 use crate::ServerState;
 use crate::persistence::{ObjectLabels, ObjectType, WriteCondition, generate_name};
-use std::collections::HashMap;
 use futures::future;
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
@@ -30,6 +29,7 @@ use openshell_core::telemetry::{
 };
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -143,8 +143,9 @@ async fn handle_create_sandbox_inner(
     }
     crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
 
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace).await?.ensure_active()?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
+        .await?
+        .ensure_active()?;
 
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
@@ -257,8 +258,9 @@ pub(super) async fn handle_get_sandbox(
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
 
     let sandbox = state
         .store
@@ -295,17 +297,15 @@ pub(super) async fn handle_list_sandboxes(
             crate::grpc::validation::validate_label_selector(&request.label_selector)?;
             state
                 .store
-                .list_all_messages_with_selector(
-                    &request.label_selector,
-                    limit,
-                    request.offset,
-                )
+                .list_all_messages_with_selector(&request.label_selector, limit, request.offset)
                 .await
                 .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
         }
     } else {
         let workspace =
-            super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace).await?.name;
+            super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
+                .await?
+                .name;
         if request.label_selector.is_empty() {
             state
                 .store
@@ -337,8 +337,9 @@ pub(super) async fn handle_list_sandbox_providers(
     request: Request<ListSandboxProvidersRequest>,
 ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
     let req = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
     let sandbox = sandbox_by_name(state, &workspace, &req.sandbox_name).await?;
     let providers = providers_for_sandbox(state, &sandbox, &workspace).await?;
     Ok(Response::new(ListSandboxProvidersResponse { providers }))
@@ -349,8 +350,9 @@ pub(super) async fn handle_attach_sandbox_provider(
     request: Request<AttachSandboxProviderRequest>,
 ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
     let request = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace).await?.ensure_active()?;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
+        .await?
+        .ensure_active()?;
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
     }
@@ -469,8 +471,9 @@ pub(super) async fn handle_detach_sandbox_provider(
     request: Request<DetachSandboxProviderRequest>,
 ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
     let request = request.into_inner();
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &request.workspace)
+        .await?
+        .name;
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
     }
@@ -567,8 +570,9 @@ async fn handle_delete_sandbox_inner(
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
-    let workspace =
-        super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace).await?.name;
+    let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &req.workspace)
+        .await?
+        .name;
 
     let sandbox_id = state
         .store
@@ -1156,10 +1160,7 @@ fn acquire_ssh_connection_slots(
     Ok(())
 }
 
-fn decrement_ssh_connection_count(
-    counts: &std::sync::Mutex<HashMap<String, u32>>,
-    key: &str,
-) {
+fn decrement_ssh_connection_count(counts: &std::sync::Mutex<HashMap<String, u32>>, key: &str) {
     let mut counts = counts.lock().unwrap();
     if let Some(count) = counts.get_mut(key) {
         *count = count.saturating_sub(1);
@@ -1436,7 +1437,7 @@ pub(super) async fn handle_create_ssh_session(
             created_at_ms: now_ms,
             labels: HashMap::new(),
             resource_version: 0,
-            annotations: std::collections::HashMap::new(),
+            annotations: HashMap::new(),
             workspace: sandbox.object_workspace().to_string(),
             deletion_timestamp_ms: 0,
         }),
@@ -1454,9 +1455,10 @@ pub(super) async fn handle_create_ssh_session(
     let session_labels_json = if session_labels.as_ref().is_none_or(HashMap::is_empty) {
         None
     } else {
-        Some(serde_json::to_string(&session_labels).map_err(|e| {
-            Status::internal(format!("failed to serialize labels: {e}"))
-        })?)
+        Some(
+            serde_json::to_string(&session_labels)
+                .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+        )
     };
     state
         .store
@@ -1521,9 +1523,10 @@ pub(super) async fn handle_revoke_ssh_session(
     let session_labels_json = if session_labels.as_ref().is_none_or(HashMap::is_empty) {
         None
     } else {
-        Some(serde_json::to_string(&session_labels).map_err(|e| {
-            Status::internal(format!("failed to serialize labels: {e}"))
-        })?)
+        Some(
+            serde_json::to_string(&session_labels)
+                .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+        )
     };
     state
         .store
@@ -2388,10 +2391,7 @@ mod tests {
                 name.len() <= MAX_ROUTABLE_NAME_LEN,
                 "generated name '{name}' exceeds {MAX_ROUTABLE_NAME_LEN} chars"
             );
-            assert!(
-                !name.is_empty(),
-                "generated name should not be empty"
-            );
+            assert!(!name.is_empty(), "generated name should not be empty");
         }
     }
 

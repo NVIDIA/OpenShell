@@ -83,8 +83,7 @@ pub async fn run_networking(
     sandbox_id: Option<&str>,
     sandbox_name: Option<&str>,
     openshell_endpoint: Option<&str>,
-    #[allow(unused_variables)]
-    inference_routes: Option<&str>,
+    #[allow(unused_variables)] inference_routes: Option<&str>,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     workspace_rx: tokio::sync::watch::Receiver<String>,

@@ -49,13 +49,7 @@ impl Drop for WorkspaceCleanup {
     fn drop(&mut self) {
         let bin = openshell_bin();
         let _ = std::process::Command::new(&bin)
-            .args([
-                "provider",
-                "delete",
-                PROVIDER,
-                "--workspace",
-                WORKSPACE,
-            ])
+            .args(["provider", "delete", PROVIDER, "--workspace", WORKSPACE])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -115,7 +109,11 @@ async fn workspace_full_crud_lifecycle() {
 
     // 5. List providers in default workspace — should NOT see our provider.
     let res = run_cli(&["provider", "list"]).await;
-    assert!(res.success, "provider list (default) failed: {}", res.output);
+    assert!(
+        res.success,
+        "provider list (default) failed: {}",
+        res.output
+    );
     assert!(
         !res.output.contains(PROVIDER),
         "default workspace should not contain the workspace-scoped provider: {}",
@@ -149,14 +147,7 @@ async fn workspace_full_crud_lifecycle() {
     );
 
     // 8. Delete the provider.
-    let res = run_cli(&[
-        "provider",
-        "delete",
-        PROVIDER,
-        "--workspace",
-        WORKSPACE,
-    ])
-    .await;
+    let res = run_cli(&["provider", "delete", PROVIDER, "--workspace", WORKSPACE]).await;
     assert!(res.success, "provider delete failed: {}", res.output);
 
     // 9. Workspace deletion should now succeed.
@@ -226,7 +217,11 @@ async fn workspace_terminating_rejects_creates() {
 
     // 3. Attempt deletion — fails, but workspace is now Terminating.
     let res = run_cli(&["workspace", "delete", WORKSPACE_TERM]).await;
-    assert!(!res.success, "delete should fail with blocker: {}", res.output);
+    assert!(
+        !res.success,
+        "delete should fail with blocker: {}",
+        res.output
+    );
 
     // 4. Workspace list should show Terminating status.
     let res = run_cli(&["workspace", "list"]).await;
