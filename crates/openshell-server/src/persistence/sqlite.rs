@@ -507,7 +507,7 @@ LIMIT ?2 OFFSET ?3
     ) -> PersistenceResult<Vec<ObjectRecord>> {
         let rows = sqlx::query(
             r#"
-SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels"
+SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
 FROM "objects"
 WHERE "object_type" = ?1 AND "scope" = ?2
 ORDER BY "created_at_ms" ASC, "name" ASC

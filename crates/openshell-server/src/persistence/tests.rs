@@ -1685,3 +1685,47 @@ async fn cas_update_message_cas_rejects_name_change() {
         "error should mention name immutability: {err}"
     );
 }
+
+#[tokio::test]
+async fn list_by_scope_returns_resource_version() {
+    let store = test_store().await;
+
+    // Create a scoped record via put_scoped (resource_version = 1).
+    store
+        .put_scoped(
+            "ssh_session",
+            "sess-1",
+            "sess-1",
+            "default",
+            "sandbox-owner-id",
+            b"payload-v1",
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Update via put_scoped (ON CONFLICT increments resource_version to 2).
+    store
+        .put_scoped(
+            "ssh_session",
+            "sess-1",
+            "sess-1",
+            "default",
+            "sandbox-owner-id",
+            b"payload-v2",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let records = store
+        .list_by_scope("ssh_session", "sandbox-owner-id", 100, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].resource_version, 2,
+        "list_by_scope must return the actual resource_version, not a default"
+    );
+}

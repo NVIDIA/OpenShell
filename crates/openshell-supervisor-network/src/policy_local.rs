@@ -489,6 +489,17 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         );
     };
 
+    let workspace = ctx.workspace_rx.borrow().clone();
+    if workspace.is_empty() {
+        return (
+            503,
+            serde_json::json!({
+                "error": "workspace_unavailable",
+                "detail": "sandbox workspace has not been discovered yet; retry shortly"
+            }),
+        );
+    }
+
     let chunks = match proposal_chunks_from_body(body) {
         Ok(chunks) => chunks,
         Err(error) => return (400, error_payload("invalid_proposal", error)),
@@ -496,7 +507,7 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
 
     let client = match openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await {
         Ok(client) => {
-            client.set_workspace(ctx.workspace_rx.borrow().clone());
+            client.set_workspace(workspace);
             client
         }
         Err(error) => {
@@ -922,10 +933,20 @@ async fn open_lookup_session(
                 ),
             )
         })?;
+    let workspace = ctx.workspace_rx.borrow().clone();
+    if workspace.is_empty() {
+        return Err((
+            503,
+            error_payload(
+                "workspace_unavailable",
+                "sandbox workspace has not been discovered yet; retry shortly".to_string(),
+            ),
+        ));
+    }
     let client = openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint)
         .await
         .map_err(|e| (502, error_payload("gateway_connect_failed", e.to_string())))?;
-    client.set_workspace(ctx.workspace_rx.borrow().clone());
+    client.set_workspace(workspace);
     Ok(LookupSession {
         client,
         sandbox_name,

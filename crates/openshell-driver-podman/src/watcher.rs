@@ -221,8 +221,7 @@ async fn map_podman_event(
                         .actor
                         .attributes
                         .get(LABEL_SANDBOX_WORKSPACE)
-                        .cloned()
-                        .unwrap_or_default();
+                        .cloned()?;
                     Some(sandbox_event(build_driver_sandbox(
                         sandbox_id.clone(),
                         sandbox_name,
@@ -292,8 +291,7 @@ pub fn driver_sandbox_from_inspect(inspect: &ContainerInspect) -> Option<DriverS
         .config
         .labels
         .get(LABEL_SANDBOX_WORKSPACE)
-        .cloned()
-        .unwrap_or_default();
+        .cloned()?;
 
     let condition = condition_from_state(&inspect.state);
     let deleting = inspect.state.status == "removing";
@@ -320,8 +318,7 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
     let workspace = entry
         .labels
         .get(LABEL_SANDBOX_WORKSPACE)
-        .cloned()
-        .unwrap_or_default();
+        .cloned()?;
 
     let (reason, status_str, message) = match entry.state.as_str() {
         "running" => (

@@ -7312,7 +7312,7 @@ pub async fn sandbox_settings_get(
         .into_inner();
 
     if json {
-        let obj = settings_to_json_sandbox(name, &response);
+        let obj = settings_to_json_sandbox(name, workspace, &response);
         println!("{}", serde_json::to_string_pretty(&obj).into_diagnostic()?);
         return Ok(());
     }
@@ -7390,6 +7390,7 @@ pub async fn gateway_settings_get(server: &str, json: bool, tls: &TlsOptions) ->
 
 fn settings_to_json_sandbox(
     name: &str,
+    workspace: &str,
     response: &openshell_core::proto::GetSandboxConfigResponse,
 ) -> serde_json::Value {
     let policy_source = if response.policy_source == PolicySource::Global as i32 {
@@ -7420,6 +7421,7 @@ fn settings_to_json_sandbox(
 
     serde_json::json!({
         "sandbox": name,
+        "workspace": workspace,
         "config_revision": response.config_revision,
         "policy_source": policy_source,
         "policy_hash": response.policy_hash,

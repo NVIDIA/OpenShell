@@ -1333,7 +1333,12 @@ impl App {
                 }
             }
             KeyCode::Char('c') if !self.providers_v2_enabled => {
-                self.open_create_provider_form();
+                if self.all_workspaces {
+                    self.status_text =
+                        "Switch to a specific workspace to create providers.".to_string();
+                } else {
+                    self.open_create_provider_form();
+                }
             }
             // Fetch and show provider detail.
             KeyCode::Enter if self.provider_count > 0 => {
@@ -1530,7 +1535,12 @@ impl App {
                 }
             }
             KeyCode::Char('c') => {
-                self.open_create_form();
+                if self.all_workspaces {
+                    self.status_text =
+                        "Switch to a specific workspace to create sandboxes.".to_string();
+                } else {
+                    self.open_create_form();
+                }
             }
             KeyCode::Enter if self.sandbox_count > 0 => {
                 self.screen = Screen::Sandbox;
@@ -2950,6 +2960,7 @@ impl App {
         self.sandbox_labels.clear();
         self.sandbox_annotations.clear();
         self.sandbox_policy_versions.clear();
+        self.sandbox_workspaces.clear();
         self.sandbox_selected = 0;
         self.sandbox_count = 0;
         self.sandbox_log_lines.clear();
@@ -2969,6 +2980,7 @@ impl App {
         self.provider_names.clear();
         self.provider_types.clear();
         self.provider_cred_keys.clear();
+        self.provider_workspaces.clear();
         self.provider_selected = 0;
         self.provider_count = 0;
         self.confirm_provider_delete = false;
