@@ -497,13 +497,21 @@ if ($Action -eq "ci" -and (Get-HostArch) -ne "amd64") {
 }
 
 $targets = Get-SelectedTargets $Target
-$z3Features = Configure-Z3
-$Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
-$Z3ServerFeatures = $z3Features.ServerFeatures
-$env:LIBCLANG_PATH = Resolve-LibclangPath
-Add-PathEntry $env:LIBCLANG_PATH
-Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"
-Configure-Arm64CrossBuild $targets
+if ($Action -in @("test", "test-unsupported")) {
+    foreach ($rustTarget in $targets) {
+        Assert-NativeTestTarget $rustTarget
+    }
+}
+
+if ($Action -in @("check", "build", "test", "test-unsupported", "ci")) {
+    $z3Features = Configure-Z3
+    $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
+    $Z3ServerFeatures = $z3Features.ServerFeatures
+    $env:LIBCLANG_PATH = Resolve-LibclangPath
+    Add-PathEntry $env:LIBCLANG_PATH
+    Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"
+    Configure-Arm64CrossBuild $targets
+}
 
 switch ($Action) {
     "check" {
