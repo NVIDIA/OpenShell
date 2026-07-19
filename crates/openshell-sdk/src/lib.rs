@@ -41,11 +41,11 @@ pub mod transport;
 pub mod types;
 
 pub use auth::EdgeAuthInterceptor;
-pub use client::OpenShellClient;
+pub use client::{OpenShellClient, WorkspaceScopedClient};
 pub use config::{AuthConfig, ClientConfig};
 pub use error::SdkError;
 pub use refresh::{Refresh, RefreshError, RefreshedToken, TokenSource};
 pub use types::{
     ExecOptions, ExecResult, Health, ListOptions, SandboxPhase, SandboxRef, SandboxSpec,
-    ServiceStatus,
+    ServiceStatus, WorkspaceRef,
 };
