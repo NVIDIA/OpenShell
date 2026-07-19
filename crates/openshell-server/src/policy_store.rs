@@ -15,6 +15,7 @@ use std::collections::HashMap;
 pub struct AtomicPolicyRevisionWrite {
     pub id: String,
     pub sandbox_id: String,
+    pub workspace: String,
     pub version: i64,
     pub policy_payload: Vec<u8>,
     pub policy_hash: String,

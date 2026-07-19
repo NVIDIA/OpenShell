@@ -2117,6 +2117,7 @@ async fn handle_update_config_inner(
             let write = AtomicPolicyRevisionWrite {
                 id: uuid::Uuid::new_v4().to_string(),
                 sandbox_id: sandbox_id.clone(),
+                workspace: workspace.clone(),
                 version: next_version,
                 policy_payload: payload.clone(),
                 policy_hash: hash.clone(),
@@ -3972,6 +3973,7 @@ async fn apply_merge_operations_with_retry(
                 .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
                     id: policy_id,
                     sandbox_id: sandbox_id.to_string(),
+                    workspace: workspace.to_string(),
                     version: next_version,
                     policy_payload: payload,
                     policy_hash: hash.clone(),

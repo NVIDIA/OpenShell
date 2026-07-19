@@ -760,6 +760,7 @@ async fn policy_atomic_write_commits_revision_provenance_and_sandbox_projection(
         .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
             id: "policy-atomic-1".to_string(),
             sandbox_id: "sandbox-atomic".to_string(),
+            workspace: "default".to_string(),
             version: 1,
             policy_payload: policy.encode_to_vec(),
             policy_hash: "hash-atomic-1".to_string(),
@@ -828,6 +829,7 @@ async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts()
         .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
             id: "conflicting-policy".to_string(),
             sandbox_id: "sandbox-rollback".to_string(),
+            workspace: "default".to_string(),
             version: 1,
             policy_payload: policy.encode_to_vec(),
             policy_hash: "conflicting-hash".to_string(),
@@ -851,6 +853,45 @@ async fn policy_atomic_write_rolls_back_sandbox_when_revision_insert_conflicts()
     );
     assert!(after.metadata.as_ref().unwrap().annotations.is_empty());
     assert!(after.spec.as_ref().unwrap().policy.is_none());
+}
+
+#[tokio::test]
+async fn policy_atomic_write_persists_workspace() {
+    let store = test_store().await;
+    store
+        .put_message(&policy_test_sandbox("sandbox-ws", "ws-test"))
+        .await
+        .unwrap();
+    let current = store
+        .get_message::<Sandbox>("sandbox-ws")
+        .await
+        .unwrap()
+        .unwrap();
+    let current_version = current.metadata.as_ref().unwrap().resource_version;
+    let policy = SandboxPolicy::default();
+
+    store
+        .put_policy_revision_atomic(&AtomicPolicyRevisionWrite {
+            id: "policy-ws-1".to_string(),
+            sandbox_id: "sandbox-ws".to_string(),
+            workspace: "my-workspace".to_string(),
+            version: 1,
+            policy_payload: policy.encode_to_vec(),
+            policy_hash: "hash-ws-1".to_string(),
+            provenance: StdHashMap::new(),
+            expected_resource_version: current_version,
+            annotations: StdHashMap::new(),
+            backfill_policy: Some(policy),
+        })
+        .await
+        .unwrap();
+
+    let record = store
+        .get("sandbox_policy", "policy-ws-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.workspace, "my-workspace");
 }
 
 #[tokio::test]

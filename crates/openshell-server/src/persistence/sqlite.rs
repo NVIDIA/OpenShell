@@ -692,9 +692,9 @@ WHERE "object_type" = 'sandbox' AND "id" = ?1 AND "resource_version" = ?4
         sqlx::query(
             r#"
 INSERT INTO "objects" (
-    "object_type", "id", "scope", "version", "status", "payload", "created_at_ms", "updated_at_ms"
+    "object_type", "id", "scope", "version", "status", "payload", "created_at_ms", "updated_at_ms", "workspace"
 )
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
 "#,
         )
         .bind(POLICY_OBJECT_TYPE)
@@ -704,6 +704,7 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
         .bind("pending")
         .bind(wrapped_payload)
         .bind(now_ms)
+        .bind(&write.workspace)
         .execute(&mut *tx)
         .await
         .map_err(|e| map_db_error(&e))?;
