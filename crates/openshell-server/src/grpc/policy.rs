@@ -1235,7 +1235,7 @@ pub(super) async fn handle_get_sandbox_config(
         .unwrap_or_default();
     let provider_profile_catalog = state
         .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref())
+        .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
 
     // Try to get the latest policy from the policy history table.
@@ -1408,7 +1408,7 @@ async fn compute_provider_env_revision(
     provider_names: &[String],
 ) -> Result<u64, Status> {
     let catalog = ProviderProfileSources::with_default_sources()
-        .snapshot_catalog(store)
+        .snapshot_catalog(store, workspace)
         .await?;
     compute_provider_env_revision_with_catalog(store, &catalog, workspace, provider_names).await
 }
@@ -1480,7 +1480,7 @@ async fn profile_provider_policy_layers(
     provider_names: &[String],
 ) -> Result<Vec<ProviderPolicyLayer>, Status> {
     let catalog = ProviderProfileSources::with_default_sources()
-        .snapshot_catalog(store)
+        .snapshot_catalog(store, workspace)
         .await?;
     profile_provider_policy_layers_with_catalog(store, &catalog, workspace, provider_names).await
 }
@@ -1568,7 +1568,7 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     let provider_names = spec.providers;
     let provider_profile_catalog = state
         .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref())
+        .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
     let provider_env_revision = compute_provider_env_revision_with_catalog(
         state.store.as_ref(),
@@ -2581,7 +2581,7 @@ pub(super) async fn handle_submit_policy_analysis(
     // fix is to recompute baseline after each successful auto-approve.
     let provider_profile_catalog = state
         .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref())
+        .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
     let current_policy = current_effective_policy_for_sandbox(
         state,

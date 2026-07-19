@@ -315,10 +315,7 @@ pub fn driver_sandbox_from_list_entry(entry: &ContainerListEntry) -> Option<Driv
         .get(LABEL_SANDBOX_NAME)
         .cloned()
         .unwrap_or_default();
-    let workspace = entry
-        .labels
-        .get(LABEL_SANDBOX_WORKSPACE)
-        .cloned()?;
+    let workspace = entry.labels.get(LABEL_SANDBOX_WORKSPACE).cloned()?;
 
     let (reason, status_str, message) = match entry.state.as_str() {
         "running" => (
@@ -473,6 +470,7 @@ mod tests {
         let mut labels = std::collections::HashMap::new();
         labels.insert(LABEL_SANDBOX_ID.to_string(), "test-id".to_string());
         labels.insert(LABEL_SANDBOX_NAME.to_string(), "test-name".to_string());
+        labels.insert(LABEL_SANDBOX_WORKSPACE.to_string(), "default".to_string());
 
         let entry = ContainerListEntry {
             id: "abc123def456789".to_string(),

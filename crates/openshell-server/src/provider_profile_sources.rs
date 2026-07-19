@@ -44,7 +44,11 @@ pub trait ProviderProfileSource: Send + Sync + std::fmt::Debug {
     fn source_id(&self) -> &str;
     fn user_managed(&self) -> bool;
     fn allow_empty(&self) -> bool;
-    async fn snapshot(&self, store: &Store) -> Result<ProviderProfileSnapshot, Status>;
+    async fn snapshot(
+        &self,
+        store: &Store,
+        workspace: &str,
+    ) -> Result<ProviderProfileSnapshot, Status>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -64,7 +68,11 @@ impl ProviderProfileSource for BuiltinProviderProfileSource {
         false
     }
 
-    async fn snapshot(&self, _store: &Store) -> Result<ProviderProfileSnapshot, Status> {
+    async fn snapshot(
+        &self,
+        _store: &Store,
+        _workspace: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
         let profiles = builtin_profiles()
             .iter()
             .map(ProviderTypeProfile::to_proto)
@@ -93,8 +101,12 @@ impl ProviderProfileSource for UserProviderProfileSource {
         true
     }
 
-    async fn snapshot(&self, store: &Store) -> Result<ProviderProfileSnapshot, Status> {
-        let stored = user_provider_profiles(store).await?;
+    async fn snapshot(
+        &self,
+        store: &Store,
+        workspace: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
+        let stored = user_provider_profiles(store, workspace).await?;
         let mut profiles = Vec::new();
         let mut hasher = Sha256::new();
         hasher.update(b"openshell-user-provider-profile-source-v1");
@@ -128,7 +140,11 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
         false
     }
 
-    async fn snapshot(&self, _store: &Store) -> Result<ProviderProfileSnapshot, Status> {
+    async fn snapshot(
+        &self,
+        _store: &Store,
+        _workspace: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
         let InterceptorProfileSnapshot { revision, profiles } =
             Self::snapshot(self).await.map_err(|err| {
                 Status::unavailable(format!(
@@ -264,8 +280,9 @@ impl ProviderProfileSources {
     pub(crate) async fn snapshot_catalog(
         &self,
         store: &Store,
+        workspace: &str,
     ) -> Result<EffectiveProviderProfileCatalog, Status> {
-        let snapshots = self.snapshots(store).await?;
+        let snapshots = self.snapshots(store, workspace).await?;
         let catalog = build_effective_profiles(snapshots)?;
         debug!(
             catalog_revision = %catalog.revision(),
@@ -279,10 +296,11 @@ impl ProviderProfileSources {
     async fn snapshots(
         &self,
         store: &Store,
+        workspace: &str,
     ) -> Result<Vec<CollectedProviderProfileSnapshot>, Status> {
         let mut snapshots = Vec::with_capacity(self.sources.len());
         for source in &self.sources {
-            let snapshot = source.snapshot(store).await?;
+            let snapshot = source.snapshot(store, workspace).await?;
             snapshots.push(CollectedProviderProfileSnapshot {
                 source_id: source.source_id().to_string(),
                 revision: snapshot.revision,
@@ -484,11 +502,23 @@ fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
-pub async fn user_provider_profiles(store: &Store) -> Result<Vec<StoredProviderProfile>, Status> {
-    let profiles: Vec<StoredProviderProfile> = store
-        .list_all_messages(10_000, 0)
+pub async fn user_provider_profiles(
+    store: &Store,
+    workspace: &str,
+) -> Result<Vec<StoredProviderProfile>, Status> {
+    let mut profiles: Vec<StoredProviderProfile> = store
+        .list_messages("", 10_000, 0)
         .await
-        .map_err(|e| Status::internal(format!("list provider profiles failed: {e}")))?;
+        .map_err(|e| Status::internal(format!("list platform provider profiles failed: {e}")))?;
+    if !workspace.is_empty() {
+        let ws_profiles: Vec<StoredProviderProfile> = store
+            .list_messages(workspace, 10_000, 0)
+            .await
+            .map_err(|e| {
+                Status::internal(format!("list workspace provider profiles failed: {e}"))
+            })?;
+        profiles.extend(ws_profiles);
+    }
     Ok(profiles)
 }
 
@@ -553,7 +583,11 @@ impl ProviderProfileSource for StaticProviderProfileSource {
         false
     }
 
-    async fn snapshot(&self, _store: &Store) -> Result<ProviderProfileSnapshot, Status> {
+    async fn snapshot(
+        &self,
+        _store: &Store,
+        _workspace: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
         Ok(self.snapshot.clone())
     }
 }
@@ -580,7 +614,11 @@ impl ProviderProfileSource for SequencedProviderProfileSource {
         false
     }
 
-    async fn snapshot(&self, _store: &Store) -> Result<ProviderProfileSnapshot, Status> {
+    async fn snapshot(
+        &self,
+        _store: &Store,
+        _workspace: &str,
+    ) -> Result<ProviderProfileSnapshot, Status> {
         let index = self
             .fetch_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -697,7 +735,7 @@ mod tests {
         );
         let store = crate::persistence::test_store().await;
 
-        let first = sources.snapshot_catalog(&store).await.unwrap();
+        let first = sources.snapshot_catalog(&store, "default").await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
         assert_eq!(first.source_count(), 1);
         assert_eq!(
@@ -710,7 +748,7 @@ mod tests {
         let first_profile_hash = first_profile_hash.finalize();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
 
-        let second = sources.snapshot_catalog(&store).await.unwrap();
+        let second = sources.snapshot_catalog(&store, "default").await.unwrap();
         assert_eq!(fetch_count.load(Ordering::SeqCst), 2);
         assert_eq!(
             second.get_profile("moving-profile").unwrap().display_name,
@@ -869,7 +907,7 @@ mod tests {
         let store = crate::persistence::test_store().await;
 
         let profiles = sources
-            .snapshot_catalog(&store)
+            .snapshot_catalog(&store, "default")
             .await
             .unwrap()
             .list_profiles();
@@ -904,7 +942,10 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let err = sources.snapshot_catalog(&store).await.unwrap_err();
+        let err = sources
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap_err();
         assert!(err.message().contains("returned no profiles"));
         task.abort();
     }
@@ -928,7 +969,10 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let err = sources.snapshot_catalog(&store).await.unwrap_err();
+        let err = sources
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap_err();
         assert!(err.message().contains("is invalid"));
         task.abort();
     }
@@ -956,7 +1000,7 @@ mod tests {
         let store = crate::persistence::test_store().await;
 
         let profiles = sources
-            .snapshot_catalog(&store)
+            .snapshot_catalog(&store, "default")
             .await
             .unwrap()
             .list_profiles();
@@ -991,7 +1035,10 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let err = sources.snapshot_catalog(&store).await.unwrap_err();
+        let err = sources
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap_err();
         assert!(
             err.message()
                 .contains("duplicate provider profile id 'github'")
@@ -1018,7 +1065,10 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let err = sources.snapshot_catalog(&store).await.unwrap_err();
+        let err = sources
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap_err();
         assert!(err.message().contains("duplicate provider profile id"));
         task.abort();
     }
@@ -1045,7 +1095,10 @@ mod tests {
         .unwrap();
         let store = crate::persistence::test_store().await;
 
-        let err = sources.snapshot_catalog(&store).await.unwrap_err();
+        let err = sources
+            .snapshot_catalog(&store, "default")
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
         task.abort();
     }
@@ -1080,5 +1133,77 @@ mod tests {
         let entry = catalog.profiles.get("slack").unwrap();
         assert_eq!(entry.source_id, "interceptor/test");
         assert!(!entry.user_managed);
+    }
+
+    fn stored_profile_in_workspace(id: &str, workspace: &str) -> StoredProviderProfile {
+        use crate::persistence::current_time_ms;
+        let now_ms = current_time_ms();
+        let proto = profile(id);
+        let proto = profile_storage_payload(proto);
+        StoredProviderProfile {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: proto.id.clone(),
+                created_at_ms: now_ms,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+                annotations: std::collections::HashMap::new(),
+                workspace: workspace.to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            profile: Some(proto),
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_duplicate_profile_ids_do_not_collide() {
+        let store = crate::persistence::test_store().await;
+        store
+            .put_message(&stored_profile_in_workspace("my-api", "alpha"))
+            .await
+            .unwrap();
+        store
+            .put_message(&stored_profile_in_workspace("my-api", "beta"))
+            .await
+            .unwrap();
+
+        let sources = ProviderProfileSources::with_default_sources();
+
+        let alpha = sources.snapshot_catalog(&store, "alpha").await.unwrap();
+        assert!(alpha.get_profile("my-api").is_some());
+
+        let beta = sources.snapshot_catalog(&store, "beta").await.unwrap();
+        assert!(beta.get_profile("my-api").is_some());
+    }
+
+    #[tokio::test]
+    async fn platform_scoped_profiles_visible_from_workspace_catalog() {
+        let store = crate::persistence::test_store().await;
+        store
+            .put_message(&stored_profile_in_workspace("platform-api", ""))
+            .await
+            .unwrap();
+
+        let sources = ProviderProfileSources::with_default_sources();
+
+        let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+        assert!(catalog.get_profile("platform-api").is_some());
+    }
+
+    #[tokio::test]
+    async fn workspace_profiles_not_visible_from_other_workspace() {
+        let store = crate::persistence::test_store().await;
+        store
+            .put_message(&stored_profile_in_workspace("ws-only", "alpha"))
+            .await
+            .unwrap();
+
+        let sources = ProviderProfileSources::with_default_sources();
+
+        let alpha = sources.snapshot_catalog(&store, "alpha").await.unwrap();
+        assert!(alpha.get_profile("ws-only").is_some());
+
+        let beta = sources.snapshot_catalog(&store, "beta").await.unwrap();
+        assert!(beta.get_profile("ws-only").is_none());
     }
 }

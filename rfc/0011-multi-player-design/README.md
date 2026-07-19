@@ -987,7 +987,14 @@ foundations. The work can be phased to deliver value incrementally:
   and visible only within their workspace. Each scope is listed independently
   — `ListProviderProfiles` returns profiles from the requested scope plus
   built-ins, not a merged view across scopes. Built-in profiles are included
-  in both scopes for convenience. Add `UpdateProviderProfiles` RPC for
+  in both scopes for convenience. The `EffectiveProviderProfileCatalog`
+  (`snapshot_catalog`) takes a `workspace` parameter so that profile resolution
+  is workspace-scoped on both read and write paths. The `UserProviderProfileSource`
+  loads platform-scoped profiles (workspace `""`) plus the target workspace's
+  profiles, merging both sets. Builtins and interceptor-provided profiles remain
+  workspace-agnostic. This ensures that two workspaces can independently import
+  profiles with the same ID without causing a global catalog collision.
+  Add `UpdateProviderProfiles` RPC for
   in-place updates to existing custom profiles, with optimistic concurrency
   control via a `resource_version` field on `ProviderProfile` — updates must
   supply the current version to prevent stale overwrites.
@@ -1187,41 +1194,6 @@ Admin has configured, platform scope shows what the Platform Admin and the
 system provide. The trade-off is discoverability — new users listing profiles
 in their workspace would see nothing until a Workspace Admin imports profiles,
 which could be confusing for single-player deployments.
-
-### Provider profile catalog workspace scoping
-
-The `EffectiveProviderProfileCatalog` merges profiles from multiple sources
-(builtins, user-imported, gateway interceptors) into a single point-in-time
-snapshot. Currently the catalog is workspace-unaware — `snapshot_catalog`
-returns all profiles from all sources regardless of workspace.
-
-Phase 1 handles workspace scoping for profile list/get handlers by querying
-the store directly (workspace-scoped user profiles + builtins), bypassing the
-catalog. This works because interceptor-provided profiles are not yet
-workspace-scoped in practice, but it creates two divergent profile resolution
-paths:
-
-- **Read path** (list/get handlers): store query + builtins, workspace-scoped.
-- **Write path** (create/update provider, resolve credentials, compute policy):
-  full catalog snapshot, workspace-unaware.
-
-A profile visible through the catalog (e.g., interceptor-provided) could be
-usable for provider creation but invisible in the list response. Conversely,
-workspace isolation in the read path is not enforced in the write path — a
-provider in workspace A could theoretically resolve a profile imported into
-workspace B through the catalog.
-
-The correct long-term fix is to add workspace as a parameter to
-`snapshot_catalog` so the catalog itself enforces workspace boundaries. This
-would unify the read and write paths and ensure interceptor-provided profiles
-participate in workspace scoping. Design considerations:
-
-- Builtins should remain workspace-agnostic (available in every workspace).
-- Interceptor-provided profiles need a scoping model — are they
-  platform-scoped (visible in all workspaces) or workspace-scoped?
-- The catalog's content-addressed revision must account for workspace scope
-  so that downstream revision tracking (policy env revisions) reflects
-  workspace-specific profile sets.
 
 ### Workspace-scoped settings
 

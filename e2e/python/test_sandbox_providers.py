@@ -23,7 +23,7 @@ from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from openshell import Sandbox, SandboxClient
+    from openshell import Sandbox, SandboxClient, WorkspaceClient
 
 
 # ---------------------------------------------------------------------------
@@ -688,3 +688,70 @@ def test_provider_profile_platform_vs_workspace_isolation(
         )
     finally:
         _cleanup()
+
+
+def test_cross_workspace_profile_ids_do_not_collide(
+    sandbox_client: "SandboxClient",
+    workspace_client: "WorkspaceClient",
+) -> None:
+    """Same profile ID in two workspaces must not cause a catalog collision."""
+    import contextlib
+    import uuid
+
+    stub = sandbox_client._stub
+    profile_id = f"e2e-xws-{uuid.uuid4().hex[:8]}"
+    ws_a = f"ws-a-{uuid.uuid4().hex[:8]}"
+    ws_b = f"ws-b-{uuid.uuid4().hex[:8]}"
+
+    def _make_profile() -> openshell_pb2.ProviderProfileImportItem:
+        return openshell_pb2.ProviderProfileImportItem(
+            profile=openshell_pb2.ProviderProfile(
+                id=profile_id,
+                display_name=f"{profile_id} display",
+                category=openshell_pb2.PROVIDER_PROFILE_CATEGORY_OTHER,
+            ),
+            source=f"{profile_id}.yaml",
+        )
+
+    workspace_client.create(ws_a)
+    workspace_client.create(ws_b)
+    try:
+        resp_a = stub.ImportProviderProfiles(
+            openshell_pb2.ImportProviderProfilesRequest(
+                profiles=[_make_profile()],
+                workspace=ws_a,
+            )
+        )
+        assert resp_a.imported, "import into ws-a should succeed"
+
+        resp_b = stub.ImportProviderProfiles(
+            openshell_pb2.ImportProviderProfilesRequest(
+                profiles=[_make_profile()],
+                workspace=ws_b,
+            )
+        )
+        assert resp_b.imported, "import into ws-b should succeed"
+
+        list_a = stub.ListProviderProfiles(
+            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace=ws_a)
+        )
+        assert any(p.id == profile_id for p in list_a.profiles), (
+            "profile should appear in ws-a"
+        )
+
+        list_b = stub.ListProviderProfiles(
+            openshell_pb2.ListProviderProfilesRequest(limit=200, workspace=ws_b)
+        )
+        assert any(p.id == profile_id for p in list_b.profiles), (
+            "profile should appear in ws-b"
+        )
+    finally:
+        for ws in [ws_a, ws_b]:
+            with contextlib.suppress(Exception):
+                stub.DeleteProviderProfile(
+                    openshell_pb2.DeleteProviderProfileRequest(
+                        id=profile_id, workspace=ws
+                    )
+                )
+            with contextlib.suppress(Exception):
+                workspace_client.delete(ws)

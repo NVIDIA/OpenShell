@@ -76,7 +76,7 @@ pub(super) async fn create_provider_record(
     provider: Provider,
 ) -> Result<Provider, Status> {
     let catalog = ProviderProfileSources::with_default_sources()
-        .snapshot_catalog(store)
+        .snapshot_catalog(store, workspace)
         .await?;
     create_provider_record_with_catalog(store, &catalog, workspace, provider).await
 }
@@ -223,7 +223,7 @@ pub(super) async fn update_provider_record(
     provider: Provider,
 ) -> Result<Provider, Status> {
     let catalog = ProviderProfileSources::with_default_sources()
-        .snapshot_catalog(store)
+        .snapshot_catalog(store, workspace)
         .await?;
     update_provider_record_with_catalog(store, &catalog, workspace, provider).await
 }
@@ -531,7 +531,7 @@ pub(super) async fn resolve_provider_environment(
     provider_names: &[String],
 ) -> Result<ProviderEnvironment, Status> {
     let catalog = ProviderProfileSources::with_default_sources()
-        .snapshot_catalog(store)
+        .snapshot_catalog(store, workspace)
         .await?;
     resolve_provider_environment_with_catalog(store, &catalog, workspace, provider_names).await
 }
@@ -943,7 +943,7 @@ pub async fn validate_provider_environment_keys_unique(
     provider_names: &[String],
 ) -> Result<(), Status> {
     let catalog = ProviderProfileSources::with_default_sources()
-        .snapshot_catalog(store)
+        .snapshot_catalog(store, workspace)
         .await?;
     validate_provider_environment_keys_unique_with_catalog(
         store,
@@ -996,7 +996,7 @@ pub async fn validate_provider_update_against_attached_sandboxes(
     provider: &Provider,
 ) -> Result<(), Status> {
     let catalog = ProviderProfileSources::with_default_sources()
-        .snapshot_catalog(store)
+        .snapshot_catalog(store, workspace)
         .await?;
     validate_provider_update_against_attached_sandboxes_with_catalog(
         store, &catalog, workspace, provider,
@@ -1343,7 +1343,7 @@ pub(super) async fn handle_create_provider(
     let provider_type = provider.r#type.clone();
     let catalog = state
         .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref())
+        .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
     let result =
         create_provider_record_with_catalog(state.store.as_ref(), &catalog, &workspace, provider)
@@ -1501,7 +1501,7 @@ pub(super) async fn handle_import_provider_profiles(
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let catalog = state
         .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref())
+        .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
     diagnostics.extend(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
@@ -1586,7 +1586,7 @@ pub(super) async fn handle_update_provider_profiles(
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let catalog = state
         .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref())
+        .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
     diagnostics.extend(
         profile_update_target_diagnostics(
@@ -1707,7 +1707,7 @@ pub(super) async fn handle_lint_provider_profiles(
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let catalog = state
         .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref())
+        .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
     diagnostics.extend(
         profile_conflict_diagnostics(state.store.as_ref(), &catalog, &workspace, &profiles).await?,
@@ -1735,7 +1735,7 @@ pub(super) async fn handle_delete_provider_profile(
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let catalog = state
         .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref())
+        .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
     if let Some(source_id) = catalog.static_source_for_profile(&id) {
         return Err(Status::failed_precondition(format!(
@@ -1797,7 +1797,7 @@ pub(super) async fn get_provider_type_profile(
     }
     // Fall back to builtin profiles (workspace-agnostic).
     let catalog = ProviderProfileSources::with_default_sources()
-        .snapshot_catalog(store)
+        .snapshot_catalog(store, workspace)
         .await?;
     if let Some(profile) = catalog.get_type_profile(id) {
         // Only return builtins that are not user-managed (i.e., always available).
@@ -2323,7 +2323,7 @@ pub(super) async fn handle_update_provider(
         .extend(req.credential_expires_at_ms);
     let catalog = state
         .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref())
+        .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
     let result =
         update_provider_record_with_catalog(state.store.as_ref(), &catalog, &workspace, provider)
@@ -2546,7 +2546,7 @@ pub(super) async fn handle_configure_provider_refresh(
         .ok_or_else(|| Status::not_found("provider not found"))?;
     let catalog = state
         .provider_profile_sources
-        .snapshot_catalog(state.store.as_ref())
+        .snapshot_catalog(state.store.as_ref(), &workspace)
         .await?;
     validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
         state.store.as_ref(),
@@ -4521,7 +4521,7 @@ mod tests {
         };
         let catalog = state
             .provider_profile_sources
-            .snapshot_catalog(state.store.as_ref())
+            .snapshot_catalog(state.store.as_ref(), "default")
             .await
             .unwrap();
         let provider =
