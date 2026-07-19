@@ -573,7 +573,7 @@ mod tests {
         assert_eq!(meta.name, "new-ws");
         assert!(!meta.id.is_empty(), "id should be a generated UUID");
         assert!(meta.created_at_ms > 0, "created_at_ms should be set");
-        assert_eq!(meta.labels.get("env").map(|s| s.as_str()), Some("test"));
+        assert_eq!(meta.labels.get("env").map(String::as_str), Some("test"));
         assert!(meta.resource_version > 0, "resource_version should be set");
         assert_eq!(meta.deletion_timestamp_ms, 0);
 
@@ -635,7 +635,7 @@ mod tests {
         let ws = resp.workspace.unwrap();
         let meta = ws.metadata.as_ref().unwrap();
         assert_eq!(meta.name, "fetch-me");
-        assert_eq!(meta.labels.get("team").map(|s| s.as_str()), Some("infra"));
+        assert_eq!(meta.labels.get("team").map(String::as_str), Some("infra"));
     }
 
     #[tokio::test]
