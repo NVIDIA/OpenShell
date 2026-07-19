@@ -463,9 +463,11 @@ unique-within-workspace, every workspace-scoped RPC includes the workspace in
 its request message. A `WorkspaceScoped` trait implemented on each request type
 provides uniform access:
 
-    trait WorkspaceScoped {
-        fn workspace(&self) -> &str;
-    }
+```rust
+trait WorkspaceScoped {
+    fn workspace(&self) -> &str;
+}
+```
 
 **Single authorization path.** A shared `authorize_workspace` function replaces
 per-handler authorization boilerplate. It extracts the principal from request
@@ -473,9 +475,11 @@ extensions, checks for Platform Admin global role bypass, resolves
 workspace membership from the durable store, and verifies the membership role
 meets the method's declared minimum:
 
-    let principal = authorize_workspace(
-        &request, WorkspaceRole::User, &self.membership,
-    )?;
+```rust
+let principal = authorize_workspace(
+    &request, WorkspaceRole::User, &self.membership,
+)?;
+```
 
 Every workspace-scoped handler uses this one-line call. The middleware layer
 is unchanged: it authenticates the caller, inserts the principal into request
@@ -1350,46 +1354,58 @@ showing the authorization check at each step.
 
 **1. Platform Admin creates a workspace.**
 
-    CreateWorkspace { name: "team-ml" }
-    → global_role = "platform_admin" → pass
-    → persist Workspace { name: "team-ml" }
+```text
+CreateWorkspace { name: "team-ml" }
+→ global_role = "platform_admin" → pass
+→ persist Workspace { name: "team-ml" }
+```
 
 **2. Platform Admin adds a Workspace Admin.**
 
-    AddWorkspaceMember { workspace: "team-ml", subject: "bob@corp.example.com", role: WORKSPACE_ADMIN }
-    → global_role = "platform_admin" → bypass membership check → pass
-    → persist membership ("team-ml", "bob@corp.example.com", Admin)
+```text
+AddWorkspaceMember { workspace: "team-ml", subject: "bob@corp.example.com", role: WORKSPACE_ADMIN }
+→ global_role = "platform_admin" → bypass membership check → pass
+→ persist membership ("team-ml", "bob@corp.example.com", Admin)
+```
 
 **3. Workspace Admin adds a User.**
 
-    AddWorkspaceMember { workspace: "team-ml", subject: "alice@corp.example.com", role: USER }
-    → authorize_workspace("team-ml", WorkspaceRole::Admin)
-    → lookup ("team-ml", "bob@corp.example.com") → Admin → pass
-    → validate: Workspace Admins cannot assign the Admin role → USER is allowed
-    → persist membership ("team-ml", "alice@corp.example.com", User)
+```text
+AddWorkspaceMember { workspace: "team-ml", subject: "alice@corp.example.com", role: USER }
+→ authorize_workspace("team-ml", WorkspaceRole::Admin)
+→ lookup ("team-ml", "bob@corp.example.com") → Admin → pass
+→ validate: Workspace Admins cannot assign the Admin role → USER is allowed
+→ persist membership ("team-ml", "alice@corp.example.com", User)
+```
 
 **4. Workspace Admin adds a provider.**
 
-    CreateProvider { workspace: "team-ml", name: "claude-key", type: "claude", credentials: {...} }
-    → authorize_workspace("team-ml", WorkspaceRole::Admin) → pass
-    → persist Provider { workspace: "team-ml", name: "claude-key" }
+```text
+CreateProvider { workspace: "team-ml", name: "claude-key", type: "claude", credentials: {...} }
+→ authorize_workspace("team-ml", WorkspaceRole::Admin) → pass
+→ persist Provider { workspace: "team-ml", name: "claude-key" }
+```
 
 **5. User creates a sandbox.**
 
-    CreateSandbox { workspace: "team-ml", name: "my-sandbox", providers: ["claude-key"] }
-    → authorize_workspace("team-ml", WorkspaceRole::User)
-    → lookup ("team-ml", "alice@corp.example.com") → User → pass
-    → validate provider "claude-key" exists in "team-ml" → yes
-    → resolve effective policy: gateway default + provider profiles for ["claude-key"]
-    → persist Sandbox { workspace: "team-ml", name: "my-sandbox" }
-    → dispatch to driver (K8s managed → namespace "openshell-prod-team-ml")
+```text
+CreateSandbox { workspace: "team-ml", name: "my-sandbox", providers: ["claude-key"] }
+→ authorize_workspace("team-ml", WorkspaceRole::User)
+→ lookup ("team-ml", "alice@corp.example.com") → User → pass
+→ validate provider "claude-key" exists in "team-ml" → yes
+→ resolve effective policy: gateway default + provider profiles for ["claude-key"]
+→ persist Sandbox { workspace: "team-ml", name: "my-sandbox" }
+→ dispatch to driver (K8s managed → namespace "openshell-prod-team-ml")
+```
 
 **6. User deletes the sandbox.**
 
-    DeleteSandbox { workspace: "team-ml", name: "my-sandbox" }
-    → authorize_workspace("team-ml", WorkspaceRole::User) → pass
-    → drain and delete sandbox
-    → dispatch delete to driver
+```text
+DeleteSandbox { workspace: "team-ml", name: "my-sandbox" }
+→ authorize_workspace("team-ml", WorkspaceRole::User) → pass
+→ drain and delete sandbox
+→ dispatch delete to driver
+```
 
 Membership records are stored in the durable object store as a
 `(workspace, principal_subject) → role` mapping, separate from the Workspace
@@ -1404,40 +1420,50 @@ bootstraps and operates scoped to a single sandbox.
 
 **7. Gateway mints a sandbox JWT at creation time.**
 
-    CreateSandbox → persist sandbox (uuid-a) → mint JWT:
-    JWT { sub: "spiffe://openshell/sandbox/uuid-a", sandbox_id: "uuid-a" }
-    → token injected into container/pod via compute driver
+```text
+CreateSandbox → persist sandbox (uuid-a) → mint JWT:
+JWT { sub: "spiffe://openshell/sandbox/uuid-a", sandbox_id: "uuid-a" }
+→ token injected into container/pod via compute driver
+```
 
 **8. Supervisor connects to the gateway.**
 
-    ConnectSupervisor (bidirectional stream)
-    Auth: Bearer <sandbox-jwt>
-    → SandboxJwtAuthenticator → Principal::Sandbox { sandbox_id: "uuid-a" }
-    → router: is_sandbox_callable("ConnectSupervisor") → yes
-    → supervisor sends SupervisorHello { sandbox_id: "uuid-a" }
-    → ensure_sandbox_principal_scope: JWT sandbox_id == hello sandbox_id → pass
-    → register session, send SessionAccepted, notify driver: sandbox ready
+```text
+ConnectSupervisor (bidirectional stream)
+Auth: Bearer <sandbox-jwt>
+→ SandboxJwtAuthenticator → Principal::Sandbox { sandbox_id: "uuid-a" }
+→ router: is_sandbox_callable("ConnectSupervisor") → yes
+→ supervisor sends SupervisorHello { sandbox_id: "uuid-a" }
+→ ensure_sandbox_principal_scope: JWT sandbox_id == hello sandbox_id → pass
+→ register session, send SessionAccepted, notify driver: sandbox ready
+```
 
 **9. Supervisor fetches provider credentials.**
 
-    GetSandboxProviderEnvironment { sandbox_id: "uuid-a" }
-    → enforce_sandbox_scope: JWT sandbox_id == request sandbox_id → pass
-    → gateway resolves providers for sandbox uuid-a (workspace-internal lookup)
-    → return { ANTHROPIC_API_KEY: "sk-...", ... }
+```text
+GetSandboxProviderEnvironment { sandbox_id: "uuid-a" }
+→ enforce_sandbox_scope: JWT sandbox_id == request sandbox_id → pass
+→ gateway resolves providers for sandbox uuid-a (workspace-internal lookup)
+→ return { ANTHROPIC_API_KEY: "sk-...", ... }
+```
 
 **10. Cross-sandbox and cross-principal access is rejected.**
 
-    Supervisor-A → GetSandboxProviderEnvironment { sandbox_id: "uuid-b" }
-    → enforce_sandbox_scope: "uuid-a" != "uuid-b" → PERMISSION_DENIED
+```text
+Supervisor-A → GetSandboxProviderEnvironment { sandbox_id: "uuid-b" }
+→ enforce_sandbox_scope: "uuid-a" != "uuid-b" → PERMISSION_DENIED
 
-    Supervisor-A → ListSandboxes { workspace: "team-ml" }
-    → router: is_sandbox_callable("ListSandboxes") → false → PERMISSION_DENIED
+Supervisor-A → ListSandboxes { workspace: "team-ml" }
+→ router: is_sandbox_callable("ListSandboxes") → false → PERMISSION_DENIED
+```
 
 **11. Supervisor learns its workspace from the config response.**
 
-    GetSandboxConfig { sandbox_id: "uuid-a" }
-    → response includes workspace: "team-ml"
-    → supervisor caches workspace for subsequent RPCs
+```text
+GetSandboxConfig { sandbox_id: "uuid-a" }
+→ response includes workspace: "team-ml"
+→ supervisor caches workspace for subsequent RPCs
+```
 
 The supervisor discovers its workspace from the `workspace` field in
 `GetSandboxConfigResponse`, returned by its first settings poll. It caches
@@ -1445,4 +1471,3 @@ this value and uses it for workspace-scoped RPCs such as `UpdateConfig`
 (policy sync), `SubmitPolicyAnalysis`, and `GetDraftPolicy`. The supervisor's
 authorization surface remains a single sandbox UUID — the workspace is used
 only to scope resource lookups, not for access control.
-
