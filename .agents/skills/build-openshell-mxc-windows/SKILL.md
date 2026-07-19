@@ -39,8 +39,9 @@ The skill targets a **Windows 11 host with CurrentBuild ≥ 26100**. Because the
 | Requirement | Check | Install hint |
 |---|---|---|
 | Windows 11 build ≥ 26100 | `[System.Environment]::OSVersion.Version` | OS update |
-| Visual Studio 2022 or newer with **MSVC v143** + **Windows 11 SDK** | `where.exe cl.exe` from a VS Developer PowerShell | Include the x64/x86 and ARM64 C++ tools. |
-| Visual C++ Clang and CMake tools | `where.exe clang.exe`; `where.exe cmake.exe` | `bindgen` needs host-native `libclang.dll`; bundled Z3 uses CMake and MSBuild. |
+| Visual Studio 2022 or newer with **MSVC v143** + **Windows 11 SDK** | `where.exe cl.exe` from a VS Developer PowerShell | Include the x64/x86 and ARM64 C++ tools. The wrapper discovers installed release directories such as `18` and `2022`. |
+| Visual C++ ARM64 Spectre-mitigated libraries | `vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre -property installationPath` | Required by ARM64 dependencies that select the Spectre runtime. |
+| Visual C++ Clang and CMake tools | `where.exe clang-cl.exe`; `where.exe cmake.exe` | `bindgen` needs host-native `libclang.dll`; ARM64 crypto crates use `clang-cl`; bundled Z3 uses CMake with native MSVC and Ninja for x64-to-ARM64 builds. |
 | Rust ≥ 1.88 via rustup with MSVC targets | `rustc --version` | `winget install Rustlang.Rustup` |
 | mise CLI for task orchestration only | `mise --version` | https://mise.jdx.dev/installing-mise.html |
 | Git ≥ 2.40 | `git --version` | `winget install Git.Git` |
@@ -212,6 +213,11 @@ if ($env:OPENSHELL_MXC_SKIP_ARM64 -ne "1") {
 ```
 
 ARM64 typically surfaces the same dependency issues as x64. If x64 passes but ARM64 fails, the fault is almost always a native dependency (a `*-sys` crate without ARM64 prebuilds) or an inline-asm block lacking aarch64 paths. Either find a pure-Rust replacement or add ARM64 to the existing cfg gate.
+
+On an x64 host this is a cross-build. The wrapper validates the ARM64 compiler
+and Spectre libraries, adds host-native LLVM and Ninja to `PATH`, lets ARM64
+crypto crates select `clang-cl`, and keeps bundled Z3 on native MSVC `cl.exe`.
+Use a short absolute `CARGO_TARGET_DIR` if Windows path-length limits are hit.
 
 ### Step 8: mise build --release (both targets)
 

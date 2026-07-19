@@ -173,9 +173,13 @@ The Windows build path is additive. Keep the repository's Linux `mise run ci`, d
 
 Use `--skip-tools` for Windows CI and automation. Rust must come from rustup with MSVC targets, and Visual Studio Build Tools must provide the linker and SDK. Because `--skip-tools` does not provision mise-managed tools, the Windows wrapper clears inherited `RUSTC_WRAPPER=sccache` before invoking Cargo. The wrapper excludes unsupported driver packages as top-level workspace targets for Windows check/test, but those library stubs still compile when the gateway depends on them. The wrapper may discover `VsDevCmd.bat`, but it must not install Visual Studio, Rust, Docker, Kubernetes, Podman, VM tooling, WSL, or Hyper-V.
 
-ARM64 validation requires the Visual Studio ARM64 C++ tools, host-native
-`libclang.dll`, CMake tools for bundled Z3, and an ARM64-capable Windows SDK.
-Test tasks reject a target that does not match the Windows host architecture.
+ARM64 validation requires the Visual Studio ARM64 C++ tools, ARM64
+Spectre-mitigated libraries, host-native `libclang.dll` and `clang-cl.exe`,
+CMake tools, Ninja, and an ARM64-capable Windows SDK. During x64-to-ARM64
+check/build, ARM64 crypto crates use `clang-cl` while bundled Z3 stays on
+native MSVC `cl.exe` with Ninja. Use a short `CARGO_TARGET_DIR` if Windows
+path-length limits are reached. Test tasks reject a target that does not match
+the Windows host architecture.
 
 ## What NOT to do in this skill
 

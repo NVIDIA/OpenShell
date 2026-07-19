@@ -43,6 +43,99 @@ $BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-pro
 $Z3WorkspaceFeatures = $BundledZ3WorkspaceFeatures
 $Z3ServerFeatures = $BundledZ3ServerFeatures
 
+function Get-VsInstallRoots {
+    $programFiles = @(
+        [Environment]::GetEnvironmentVariable("ProgramFiles"),
+        [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    ) | Where-Object { $_ }
+    $editions = @("Enterprise", "Professional", "Community", "BuildTools")
+    $candidates = @()
+
+    foreach ($programFilesRoot in $programFiles) {
+        $vsRoot = Join-Path $programFilesRoot "Microsoft Visual Studio"
+        if (-not (Test-Path $vsRoot -PathType Container)) {
+            continue
+        }
+        foreach ($releaseDir in Get-ChildItem $vsRoot -Directory) {
+            foreach ($edition in $editions) {
+                $installRoot = Join-Path $releaseDir.FullName $edition
+                $vsDevCmd = Join-Path $installRoot "Common7\Tools\VsDevCmd.bat"
+                if (-not (Test-Path $vsDevCmd -PathType Leaf)) {
+                    continue
+                }
+
+                $toolsetVersion = [version] "0.0"
+                $versionFile = Join-Path $installRoot "VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt"
+                if (Test-Path $versionFile -PathType Leaf) {
+                    try {
+                        $toolsetVersion = [version] ((Get-Content $versionFile -Raw).Trim())
+                    } catch {
+                        $toolsetVersion = [version] "0.0"
+                    }
+                }
+                $candidates += [pscustomobject]@{
+                    Root = $installRoot
+                    ToolsetVersion = $toolsetVersion
+                }
+            }
+        }
+    }
+
+    return @($candidates | Sort-Object ToolsetVersion -Descending | Select-Object -ExpandProperty Root -Unique)
+}
+
+function Get-DefaultMsvcToolsetRoot([string] $VsInstallRoot) {
+    $versionFile = Join-Path $VsInstallRoot "VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt"
+    if (Test-Path $versionFile -PathType Leaf) {
+        $version = (Get-Content $versionFile -Raw).Trim()
+        $toolsetRoot = Join-Path $VsInstallRoot "VC\Tools\MSVC\$version"
+        if (Test-Path $toolsetRoot -PathType Container) {
+            return (Resolve-Path $toolsetRoot).Path
+        }
+    }
+
+    $toolsetsRoot = Join-Path $VsInstallRoot "VC\Tools\MSVC"
+    if (Test-Path $toolsetsRoot -PathType Container) {
+        $toolset = Get-ChildItem $toolsetsRoot -Directory |
+            Sort-Object { try { [version] $_.Name } catch { [version] "0.0" } } -Descending |
+            Select-Object -First 1
+        if ($toolset) {
+            return $toolset.FullName
+        }
+    }
+
+    return $null
+}
+
+function Test-VsInstanceSupportsTarget([string] $VsInstallRoot, [string] $RustTarget) {
+    $toolsetRoot = Get-DefaultMsvcToolsetRoot $VsInstallRoot
+    if (-not $toolsetRoot) {
+        return $false
+    }
+
+    $hostToolsDir = switch (Get-HostArch) {
+        "arm64" { "Hostarm64" }
+        default { "Hostx64" }
+    }
+    $targetToolsDir = switch (Get-VsTargetArch $RustTarget) {
+        "arm64" { "arm64" }
+        default { "x64" }
+    }
+    $compiler = Join-Path $toolsetRoot "bin\$hostToolsDir\$targetToolsDir\cl.exe"
+    if (-not (Test-Path $compiler -PathType Leaf)) {
+        return $false
+    }
+
+    if ($RustTarget -eq "aarch64-pc-windows-msvc") {
+        $spectreLibs = Join-Path $toolsetRoot "lib\spectre\arm64"
+        if (-not (Test-Path $spectreLibs -PathType Container)) {
+            return $false
+        }
+    }
+
+    return $true
+}
+
 function Resolve-VsDevCmd([string] $RustTarget) {
     if ($env:OPENSHELL_VSDEVCMD -and (Test-Path $env:OPENSHELL_VSDEVCMD)) {
         return (Resolve-Path $env:OPENSHELL_VSDEVCMD).Path
@@ -55,35 +148,37 @@ function Resolve-VsDevCmd([string] $RustTarget) {
         $vswhere = $null
     }
     if ($vswhere -and (Test-Path $vswhere)) {
-        $requiredComponent = switch ($RustTarget) {
-            "x86_64-pc-windows-msvc" { "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" }
-            "aarch64-pc-windows-msvc" { "Microsoft.VisualStudio.Component.VC.Tools.ARM64" }
+        $requiredComponents = switch ($RustTarget) {
+            "x86_64-pc-windows-msvc" { @("Microsoft.VisualStudio.Component.VC.Tools.x86.x64") }
+            "aarch64-pc-windows-msvc" {
+                @(
+                    "Microsoft.VisualStudio.Component.VC.Tools.ARM64",
+                    "Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre"
+                )
+            }
             default { throw "Unsupported target: $RustTarget" }
         }
-        $found = & $vswhere -latest -products * -requires $requiredComponent -find "Common7\Tools\VsDevCmd.bat" | Select-Object -First 1
+        $found = & $vswhere -latest -products * -requires $requiredComponents -find "Common7\Tools\VsDevCmd.bat" | Select-Object -First 1
         if ($found -and (Test-Path $found)) {
-            return (Resolve-Path $found).Path
-        }
-    }
-
-    $programFiles = @(
-        [Environment]::GetEnvironmentVariable("ProgramFiles"),
-        [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
-    ) | Where-Object { $_ }
-    $versions = @("18", "2022", "17")
-    $editions = @("Enterprise", "Professional", "Community", "BuildTools")
-    foreach ($root in $programFiles) {
-        foreach ($version in $versions) {
-            foreach ($edition in $editions) {
-                $candidate = Join-Path $root "Microsoft Visual Studio\$version\$edition\Common7\Tools\VsDevCmd.bat"
-                if (Test-Path $candidate) {
-                    return (Resolve-Path $candidate).Path
-                }
+            $resolved = (Resolve-Path $found).Path
+            $installRoot = (Resolve-Path (Join-Path (Split-Path -Parent $resolved) "..\..")).Path
+            if (Test-VsInstanceSupportsTarget $installRoot $RustTarget) {
+                return $resolved
             }
         }
     }
 
-    throw "Could not find VsDevCmd.bat. Install Visual Studio Build Tools, or set OPENSHELL_VSDEVCMD."
+    foreach ($installRoot in Get-VsInstallRoots) {
+        if (Test-VsInstanceSupportsTarget $installRoot $RustTarget) {
+            $candidate = Join-Path $installRoot "Common7\Tools\VsDevCmd.bat"
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    if ($RustTarget -eq "aarch64-pc-windows-msvc") {
+        throw "Could not find a Visual Studio instance with the ARM64 compiler and ARM64 Spectre-mitigated libraries. Install Microsoft.VisualStudio.Component.VC.Tools.ARM64 and Microsoft.VisualStudio.Component.VC.Runtimes.ARM64.Spectre, or set OPENSHELL_VSDEVCMD."
+    }
+    throw "Could not find a Visual Studio instance with the x64 compiler. Install Microsoft.VisualStudio.Component.VC.Tools.x86.x64, or set OPENSHELL_VSDEVCMD."
 }
 
 function Get-LibclangBinSubdir {
@@ -114,21 +209,11 @@ function Resolve-LibclangPath {
         }
     }
 
-    $programFiles = @(
-        [Environment]::GetEnvironmentVariable("ProgramFiles"),
-        [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
-    ) | Where-Object { $_ }
-    $versions = @("2022", "18", "17")
-    $editions = @("Enterprise", "Professional", "Community", "BuildTools")
-    foreach ($root in $programFiles) {
-        foreach ($version in $versions) {
-            foreach ($edition in $editions) {
-                $candidateDir = Join-Path $root "Microsoft Visual Studio\$version\$edition\VC\Tools\Llvm\$subdir\bin"
-                $candidate = Join-Path $candidateDir "libclang.dll"
-                if (Test-Path $candidate) {
-                    return (Resolve-Path $candidateDir).Path
-                }
-            }
+    foreach ($installRoot in Get-VsInstallRoots) {
+        $candidateDir = Join-Path $installRoot "VC\Tools\Llvm\$subdir\bin"
+        $candidate = Join-Path $candidateDir "libclang.dll"
+        if (Test-Path $candidate -PathType Leaf) {
+            return (Resolve-Path $candidateDir).Path
         }
     }
 
@@ -138,6 +223,62 @@ function Resolve-LibclangPath {
     }
 
     throw "Could not find libclang.dll. Install Visual Studio C++ Clang tools, or set LIBCLANG_PATH to the directory containing libclang.dll."
+}
+
+function Resolve-NinjaPath {
+    $fromPath = Get-Command ninja.exe -ErrorAction SilentlyContinue
+    if ($fromPath) {
+        return $fromPath.Source
+    }
+
+    $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    if ($programFilesX86) {
+        $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+    } else {
+        $vswhere = $null
+    }
+    if ($vswhere -and (Test-Path $vswhere)) {
+        $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -find "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" | Select-Object -First 1
+        if ($found -and (Test-Path $found -PathType Leaf)) {
+            return (Resolve-Path $found).Path
+        }
+    }
+
+    foreach ($installRoot in Get-VsInstallRoots) {
+        $candidate = Join-Path $installRoot "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe"
+        if (Test-Path $candidate -PathType Leaf) {
+            return (Resolve-Path $candidate).Path
+        }
+    }
+
+    throw "Could not find ninja.exe. Install Microsoft.VisualStudio.Component.VC.CMake.Project."
+}
+
+function Add-PathEntry([string] $Directory) {
+    if (($env:PATH -split ";") -notcontains $Directory) {
+        $env:PATH = "$Directory;$env:PATH"
+    }
+}
+
+function Configure-Arm64CrossBuild([string[]] $RustTargets) {
+    if ((Get-HostArch) -ne "amd64" -or $RustTargets -notcontains "aarch64-pc-windows-msvc") {
+        return
+    }
+
+    $clangCl = Join-Path $env:LIBCLANG_PATH "clang-cl.exe"
+    if (-not (Test-Path $clangCl -PathType Leaf)) {
+        throw "ARM64 cross-compilation requires host-native clang-cl.exe next to libclang.dll. Install Microsoft.VisualStudio.Component.VC.Llvm.Clang."
+    }
+    Add-PathEntry $env:LIBCLANG_PATH
+
+    $ninja = Resolve-NinjaPath
+    Add-PathEntry (Split-Path -Parent $ninja)
+    [Environment]::SetEnvironmentVariable("CMAKE_GENERATOR_aarch64_pc_windows_msvc", "Ninja", "Process")
+
+    Write-Host "==> ARM64 cross-build toolchain"
+    Write-Host "    clang-cl: $clangCl"
+    Write-Host "    ninja:    $ninja"
+    Write-Host "    Z3:       MSVC cl.exe with Ninja"
 }
 
 function Get-HostArch {
@@ -241,7 +382,24 @@ function Invoke-VsCargo {
     $targetArch = Get-VsTargetArch $RustTarget
     $hostArch = Get-HostArch
     $logPath = Join-Path $LogDir $LogName
-    $cmd = "call `"$vsDevCmd`" -arch=$targetArch -host_arch=$hostArch && set `"CARGO_TARGET_DIR=$TargetDir`" && set `"CARGO_INCREMENTAL=0`" && set `"RUSTC_WRAPPER=`" && $CargoArgs"
+    $environmentSetup = @(
+        "set `"CARGO_TARGET_DIR=$TargetDir`"",
+        "set `"CARGO_INCREMENTAL=0`"",
+        "set `"RUSTC_WRAPPER=`""
+    )
+    if ($hostArch -eq "amd64" -and $RustTarget -eq "aarch64-pc-windows-msvc") {
+        # Let cmake-rs select MSVC cl.exe for bundled Z3. AWS-LC selects
+        # clang-cl inside its own ARM64 build script.
+        $environmentSetup += @(
+            "set `"CC=`"",
+            "set `"CXX=`"",
+            "set `"CC_aarch64-pc-windows-msvc=`"",
+            "set `"CXX_aarch64-pc-windows-msvc=`"",
+            "set `"CC_aarch64_pc_windows_msvc=`"",
+            "set `"CXX_aarch64_pc_windows_msvc=`""
+        )
+    }
+    $cmd = "call `"$vsDevCmd`" -arch=$targetArch -host_arch=$hostArch && $($environmentSetup -join ' && ') && $CargoArgs"
 
     Write-Host "==> $CargoArgs"
     Write-Host "    target: $RustTarget"
@@ -334,12 +492,18 @@ function Show-Artifacts([string[]] $RustTargets) {
     $rows | Format-Table -AutoSize
 }
 
+if ($Action -eq "ci" -and (Get-HostArch) -ne "amd64") {
+    throw "windows:ci is an x64-host contract. On ARM64, run windows:check:arm64, windows:build:arm64, windows:test:arm64, windows:test:unsupported:arm64, and windows:artifacts explicitly."
+}
+
 $targets = Get-SelectedTargets $Target
 $z3Features = Configure-Z3
 $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
 $Z3ServerFeatures = $z3Features.ServerFeatures
 $env:LIBCLANG_PATH = Resolve-LibclangPath
+Add-PathEntry $env:LIBCLANG_PATH
 Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"
+Configure-Arm64CrossBuild $targets
 
 switch ($Action) {
     "check" {

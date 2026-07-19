@@ -55,8 +55,10 @@ Windows validation is exposed through `tasks/windows.toml`:
 | `windows:ci` | Run check, build, test, unsupported-contract tests, and artifact reporting. |
 
 The Windows tasks call `tasks/scripts/windows-msvc.ps1`. The wrapper discovers
-Visual Studio's `VsDevCmd.bat`, adds rustup MSVC targets, clears inherited
-`RUSTC_WRAPPER`, and keeps build artifacts under the normal Cargo target tree.
+Visual Studio's `VsDevCmd.bat` with `vswhere` or by enumerating installed
+release directories, validates the requested compiler and ARM64 Spectre
+libraries, adds rustup MSVC targets, clears inherited `RUSTC_WRAPPER`, and
+keeps build artifacts under the normal Cargo target tree.
 Test tasks require the Rust target architecture to match the Windows host, so
 an ARM64 test result is native coverage rather than x64 emulation coverage.
 By default it enables bundled Z3 for reproducible Windows builds. When
@@ -68,10 +70,14 @@ The lane uses `mise run --skip-tools windows:*` because Windows Rust comes from
 rustup and linking comes from Visual Studio Build Tools. Mise orchestrates the
 tasks; it does not own the Windows toolchain.
 
-ARM64 validation requires the Visual Studio ARM64 MSVC tools, host-native Clang
-tools for `libclang.dll`, CMake tools for bundled Z3, and an ARM64-capable
-Windows SDK. Artifact hashing uses .NET SHA256 directly because module
-autoloading in the mise-launched Windows PowerShell process is not guaranteed.
+ARM64 validation requires the Visual Studio ARM64 MSVC tools, ARM64
+Spectre-mitigated libraries, host-native Clang tools, CMake tools, and an
+ARM64-capable Windows SDK. Clang provides `libclang.dll` for `bindgen` and
+`clang-cl.exe` for ARM64 crypto dependencies. During x64-to-ARM64 check/build,
+the wrapper uses Ninja with native MSVC `cl.exe` for bundled Z3 so the Z3 build
+does not inherit the crypto crates' compiler requirement. Artifact hashing uses
+.NET SHA256 directly because module autoloading in the mise-launched Windows
+PowerShell process is not guaranteed.
 
 ## CI Shape
 
@@ -83,6 +89,9 @@ mise run --skip-tools windows:build:x64
 mise run --skip-tools windows:test:x64
 mise run --skip-tools windows:test:unsupported:x64
 ```
+
+The ARM64 check and release build in this x64 job are cross-builds. Native
+ARM64 tests remain exclusive to an ARM64 runner.
 
 The ARM64 job is scaffolded but disabled until a Windows ARM64 runner is
 available. Once enabled, it should run check, release build, native workspace
