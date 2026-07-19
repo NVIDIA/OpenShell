@@ -419,6 +419,50 @@ async fn sqlite_name_unique_per_object_type() {
 }
 
 #[tokio::test]
+async fn sqlite_name_unique_scoped_by_workspace() {
+    let store = test_store().await;
+
+    store
+        .put("sandbox", "id-1", "shared-name", "alpha", b"payload1", None)
+        .await
+        .unwrap();
+
+    // Same name, same type, different workspace -> separate records.
+    store
+        .put("sandbox", "id-2", "shared-name", "beta", b"payload2", None)
+        .await
+        .unwrap();
+
+    let alpha = store
+        .get_by_name("sandbox", "alpha", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    let beta = store
+        .get_by_name("sandbox", "beta", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alpha.id, "id-1");
+    assert_eq!(beta.id, "id-2");
+    assert_eq!(alpha.payload, b"payload1");
+    assert_eq!(beta.payload, b"payload2");
+
+    // Same name, same type, same workspace -> upsert (existing behavior).
+    store
+        .put("sandbox", "id-3", "shared-name", "alpha", b"payload3", None)
+        .await
+        .unwrap();
+    let alpha = store
+        .get_by_name("sandbox", "alpha", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(alpha.id, "id-1", "upsert should keep original id");
+    assert_eq!(alpha.payload, b"payload3", "upsert should update payload");
+}
+
+#[tokio::test]
 async fn sqlite_id_globally_unique() {
     let store = test_store().await;
 

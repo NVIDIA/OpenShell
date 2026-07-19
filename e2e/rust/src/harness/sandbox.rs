@@ -220,7 +220,11 @@ impl SandboxGuard {
         }
 
         let sandbox_name = name.ok_or_else(|| {
-            format!("could not parse sandbox name from create output:\n{accumulated}")
+            let stderr_output = collect_stderr();
+            format!(
+                "could not parse sandbox name from create output:\n\
+                 Stdout:\n{accumulated}\nStderr:\n{stderr_output}"
+            )
         })?;
 
         Ok(Self {

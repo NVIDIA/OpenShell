@@ -50,17 +50,18 @@ fn validate_workspace_name(name: &str) -> Result<(), Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument("workspace name is required"));
     }
-    if name.len() > super::MAX_ROUTABLE_NAME_LEN {
+    if name.len() > crate::grpc::MAX_ROUTABLE_NAME_LEN {
         return Err(Status::invalid_argument(format!(
             "workspace name exceeds maximum length ({} > {})",
             name.len(),
-            super::MAX_ROUTABLE_NAME_LEN,
+            crate::grpc::MAX_ROUTABLE_NAME_LEN,
         )));
     }
     super::validation::validate_dns1123_label(name, "workspace name")
 }
 
 /// A resolved workspace name with its current lifecycle state.
+#[derive(Debug)]
 pub struct ResolvedWorkspace {
     pub name: String,
     pub terminating: bool,
@@ -553,6 +554,132 @@ mod tests {
     use crate::grpc::test_support::test_server_state;
 
     #[tokio::test]
+    async fn create_workspace_returns_metadata() {
+        let state = test_server_state().await;
+
+        let resp = handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "new-ws".to_string(),
+                labels: HashMap::from([("env".to_string(), "test".to_string())]),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let ws = resp.workspace.unwrap();
+        let meta = ws.metadata.as_ref().unwrap();
+        assert_eq!(meta.name, "new-ws");
+        assert!(!meta.id.is_empty(), "id should be a generated UUID");
+        assert!(meta.created_at_ms > 0, "created_at_ms should be set");
+        assert_eq!(meta.labels.get("env").map(|s| s.as_str()), Some("test"));
+        assert!(meta.resource_version > 0, "resource_version should be set");
+        assert_eq!(meta.deletion_timestamp_ms, 0);
+
+        let status = ws.status.as_ref().unwrap();
+        assert_eq!(status.phase, i32::from(WorkspacePhase::Active));
+    }
+
+    #[tokio::test]
+    async fn create_workspace_already_exists() {
+        let state = test_server_state().await;
+
+        handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "dup-ws".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "dup-ws".to_string(),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn get_workspace_round_trip() {
+        let state = test_server_state().await;
+
+        handle_create_workspace(
+            &state,
+            Request::new(CreateWorkspaceRequest {
+                name: "fetch-me".to_string(),
+                labels: HashMap::from([("team".to_string(), "infra".to_string())]),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_get_workspace(
+            &state,
+            Request::new(GetWorkspaceRequest {
+                name: "fetch-me".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let ws = resp.workspace.unwrap();
+        let meta = ws.metadata.as_ref().unwrap();
+        assert_eq!(meta.name, "fetch-me");
+        assert_eq!(meta.labels.get("team").map(|s| s.as_str()), Some("infra"));
+    }
+
+    #[tokio::test]
+    async fn get_workspace_not_found() {
+        let state = test_server_state().await;
+
+        let err = handle_get_workspace(
+            &state,
+            Request::new(GetWorkspaceRequest {
+                name: "no-such-ws".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_workspace_empty_name_rejected() {
+        let state = test_server_state().await;
+
+        let err = handle_get_workspace(
+            &state,
+            Request::new(GetWorkspaceRequest {
+                name: String::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_not_found_rejects_sandbox_create() {
+        let state = test_server_state().await;
+
+        let err = resolve_workspace(&state.store, "ghost-ws").await.unwrap_err();
+        assert_eq!(err.code(), Code::NotFound);
+        assert!(err.message().contains("ghost-ws"));
+    }
+
+    #[tokio::test]
     async fn delete_workspace_blocked_by_resources() {
         let state = test_server_state().await;
 
@@ -954,6 +1081,19 @@ mod tests {
     fn validate_workspace_name_rejects_consecutive_hyphens() {
         let err = validate_workspace_name("team--ml").unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_workspace_name_accepts_max_length() {
+        validate_workspace_name(&"a".repeat(crate::grpc::MAX_ROUTABLE_NAME_LEN)).unwrap();
+    }
+
+    #[test]
+    fn validate_workspace_name_rejects_over_max_length() {
+        let err =
+            validate_workspace_name(&"a".repeat(crate::grpc::MAX_ROUTABLE_NAME_LEN + 1)).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("exceeds maximum length"));
     }
 
     #[tokio::test]

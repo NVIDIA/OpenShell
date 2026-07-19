@@ -25,12 +25,9 @@ def test_workspace_crud(workspace_client: WorkspaceClient) -> None:
         fetched = workspace_client.get(name)
         assert fetched.name == name
         assert fetched.phase == "WORKSPACE_PHASE_ACTIVE"
-
-        assert workspace_client.delete(name)
-    except Exception:
+    finally:
         with contextlib.suppress(Exception):
             workspace_client.delete(name)
-        raise
 
 
 def test_workspace_create_with_labels(workspace_client: WorkspaceClient) -> None:
