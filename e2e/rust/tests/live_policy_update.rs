@@ -567,7 +567,7 @@ async fn initial_sparse_policy_is_acknowledged_as_loaded() {
     let mut guard = SandboxGuard::create_keep_with_args(
         &[
             "--name",
-            "e2e-2159-sparse-enrich",
+            "e2e-sparse-enrich",
             "--policy",
             sparse_policy,
             "--no-tty",
