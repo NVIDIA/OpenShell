@@ -43,6 +43,7 @@ mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
+mod supervisor_pod_registration;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -132,6 +133,11 @@ pub struct ServerState {
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
 
+    /// Pending Kubernetes supervisor pod registrations awaiting warm-pool
+    /// activation.
+    pub(crate) supervisor_pod_registrations:
+        Arc<supervisor_pod_registration::SupervisorPodRegistrationRegistry>,
+
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
@@ -202,6 +208,9 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
+            supervisor_pod_registrations: Arc::new(
+                supervisor_pod_registration::SupervisorPodRegistrationRegistry::new(),
+            ),
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,

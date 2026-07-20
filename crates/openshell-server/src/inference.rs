@@ -930,7 +930,10 @@ fn authorize_inference_bundle(
 ) -> Result<String, Status> {
     match principal {
         Some(crate::auth::principal::Principal::Sandbox(s)) => Ok(s.sandbox_id.clone()),
-        Some(crate::auth::principal::Principal::User(_)) => Err(Status::permission_denied(
+        Some(
+            crate::auth::principal::Principal::User(_)
+            | crate::auth::principal::Principal::K8sPod(_),
+        ) => Err(Status::permission_denied(
             "GetInferenceBundle requires a sandbox principal",
         )),
         Some(crate::auth::principal::Principal::Anonymous) | None => Err(Status::unauthenticated(

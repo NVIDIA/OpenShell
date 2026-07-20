@@ -692,7 +692,7 @@ impl OpenShell for OpenShellService {
         Box<dyn tokio_stream::Stream<Item = Result<PodActivationMessage, Status>> + Send + 'static>,
     >;
 
-    #[rpc_auth(auth = "sandbox")]
+    #[rpc_auth(auth = "pod_registration")]
     async fn register_supervisor_pod(
         &self,
         request: Request<RegisterSupervisorPodRequest>,

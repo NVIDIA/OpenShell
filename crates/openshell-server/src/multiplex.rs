@@ -471,6 +471,22 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 fields.insert("trust_domain".to_string(), trust_domain.clone());
             }
         }
+        Principal::K8sPod(pod) => {
+            fields.insert("kind".to_string(), "k8s_pod".to_string());
+            fields.insert("pod_name".to_string(), pod.pod_name.clone());
+            fields.insert("pod_uid".to_string(), pod.pod_uid.clone());
+            fields.insert(
+                "sandbox_owner_name".to_string(),
+                pod.sandbox_owner_name.clone(),
+            );
+            fields.insert(
+                "sandbox_owner_uid".to_string(),
+                pod.sandbox_owner_uid.clone(),
+            );
+            if let Some(sandbox_id) = &pod.sandbox_id {
+                fields.insert("sandbox_id".to_string(), sandbox_id.clone());
+            }
+        }
         Principal::Anonymous => {
             fields.insert("kind".to_string(), "anonymous".to_string());
         }
@@ -695,8 +711,9 @@ where
 ///
 /// Chain order (first-match-wins):
 /// 1. `K8sServiceAccountAuthenticator` (path-scoped to Kubernetes bootstrap
-///    RPCs) — resolves a projected SA token to a `Principal::Sandbox` so the
-///    bootstrap handler can mint a gateway JWT. No-op on every other path;
+///    RPCs) — resolves a projected SA token to either a legacy
+///    `Principal::Sandbox` for `IssueSandboxToken` or a registration-scoped
+///    pod principal for `RegisterSupervisorPod`. No-op on every other path;
 ///    only present when the gateway runs in-cluster.
 /// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
@@ -743,6 +760,7 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
 ///   `Principal::User` is gated by the RBAC `AuthzPolicy`.
 ///   `Principal::Sandbox` is gated by a supervisor-method allowlist, then
 ///   handlers enforce same-sandbox scope on request bodies.
+///   `Principal::K8sPod` is gated by the pod-registration method only.
 #[derive(Clone)]
 pub struct AuthGrpcRouter<S> {
     inner: S,
@@ -880,6 +898,14 @@ where
                             "sandbox principals may not call this method",
                         )));
                     }
+                }
+                Principal::K8sPod(ref pod) => {
+                    if !crate::auth::method_authz::is_pod_registration_callable(&path) {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "Kubernetes pod principals may only register supervisor pods",
+                        )));
+                    }
+                    req.extensions_mut().insert(pod.clone());
                 }
                 Principal::Anonymous => {
                     return Ok(status_response(tonic::Status::unauthenticated(
@@ -1821,7 +1847,8 @@ mod tests {
         use crate::auth::authenticator::test_support::MockAuthenticator;
         use crate::auth::identity::{Identity, IdentityProvider};
         use crate::auth::principal::{
-            Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+            Principal, RegisteredPodIdentity, SandboxIdentitySource, SandboxPrincipal,
+            UserPrincipal,
         };
         use http_body_util::Full;
         use std::sync::Arc;
@@ -1908,6 +1935,16 @@ mod tests {
                     issuer: "openshell-gateway:test".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
+            })
+        }
+
+        fn pod_registration_principal() -> Principal {
+            Principal::K8sPod(RegisteredPodIdentity {
+                pod_name: "pod-a".to_string(),
+                pod_uid: "pod-uid-a".to_string(),
+                sandbox_id: None,
+                sandbox_owner_name: "sandbox-owner-a".to_string(),
+                sandbox_owner_uid: "owner-uid-a".to_string(),
             })
         }
 
@@ -2099,6 +2136,43 @@ mod tests {
             ));
         }
 
+        #[tokio::test]
+        async fn pod_registration_principal_can_only_register_supervisor_pod() {
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+                pod_registration_principal(),
+            ))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+            let res = router
+                .call(empty_request(
+                    "/openshell.v1.OpenShell/RegisterSupervisorPod",
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), 200);
+            assert!(matches!(
+                seen.lock().unwrap().as_ref(),
+                Some(Principal::K8sPod(_))
+            ));
+
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+                pod_registration_principal(),
+            ))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/GetSandboxConfig"))
+                .await
+                .unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+        }
+
         /// A user principal — even one carrying `openshell:all` and the
         /// admin role — must not reach a `sandbox`-annotated method. The
         /// router enforces this from the per-handler auth-mode declarations
@@ -2131,7 +2205,6 @@ mod tests {
                 "/openshell.v1.OpenShell/ConnectSupervisor",
                 "/openshell.v1.OpenShell/RelayStream",
                 "/openshell.v1.OpenShell/IssueSandboxToken",
-                "/openshell.v1.OpenShell/RegisterSupervisorPod",
                 "/openshell.v1.OpenShell/RefreshSandboxToken",
                 "/openshell.inference.v1.Inference/GetInferenceBundle",
             ] {
@@ -2156,6 +2229,7 @@ mod tests {
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
                 "/openshell.inference.v1.Inference/GetInferenceRoute",
+                "/openshell.v1.OpenShell/RegisterSupervisorPod",
                 "/openshell.inference.v1.Inference/SetInferenceRoute",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));

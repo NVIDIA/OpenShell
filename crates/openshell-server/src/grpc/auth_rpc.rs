@@ -13,7 +13,9 @@
 //! until their own `exp` and are bounded by the configured short TTL.
 
 use crate::ServerState;
-use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+use crate::auth::principal::{
+    Principal, RegisteredPodIdentity, SandboxIdentitySource, SandboxPrincipal,
+};
 use openshell_core::proto::{
     IssueSandboxTokenRequest, IssueSandboxTokenResponse, PodActivationMessage,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RegisterSupervisorPodRequest, Sandbox,
@@ -36,7 +38,8 @@ pub async fn handle_issue_sandbox_token(
     // supervisors should use RegisterSupervisorPod so warm-pool activation can
     // later remain pending on the same bootstrap stream.
     let sandbox = require_k8s_bootstrap_sandbox(request.extensions(), "IssueSandboxToken")?;
-    let activation = mint_cold_pod_activation(state, &sandbox, "IssueSandboxToken").await?;
+    let activation =
+        mint_cold_pod_activation(state, &sandbox.sandbox_id, "IssueSandboxToken").await?;
     Ok(Response::new(IssueSandboxTokenResponse {
         token: activation.token,
         expires_at_ms: activation.token_expires_at_ms,
@@ -48,13 +51,21 @@ pub async fn handle_register_supervisor_pod(
     state: &Arc<ServerState>,
     request: Request<RegisterSupervisorPodRequest>,
 ) -> Result<Response<RegisterSupervisorPodStream>, Status> {
-    let sandbox = require_k8s_bootstrap_sandbox(request.extensions(), "RegisterSupervisorPod")?;
-    let activation = mint_cold_pod_activation(state, &sandbox, "RegisterSupervisorPod").await?;
-    info!(
-        sandbox_id = %activation.sandbox_id,
-        "activated registered supervisor pod"
-    );
-    Ok(Response::new(Box::pin(tokio_stream::once(Ok(activation)))))
+    let pod = require_registered_pod(request.extensions())?;
+    if let Some(sandbox_id) = pod.sandbox_id.as_deref() {
+        let activation =
+            mint_cold_pod_activation(state, sandbox_id, "RegisterSupervisorPod").await?;
+        info!(
+            sandbox_id = %activation.sandbox_id,
+            pod = %pod.pod_name,
+            pod_uid = %pod.pod_uid,
+            "activated bound supervisor pod"
+        );
+        return Ok(Response::new(Box::pin(tokio_stream::once(Ok(activation)))));
+    }
+
+    let stream = state.supervisor_pod_registrations.register_pending(pod)?;
+    Ok(Response::new(Box::pin(stream)))
 }
 
 #[allow(clippy::result_large_err, clippy::unused_async)]
@@ -140,34 +151,53 @@ fn require_k8s_bootstrap_sandbox(
     Ok(sandbox)
 }
 
+fn require_registered_pod(extensions: &tonic::Extensions) -> Result<RegisteredPodIdentity, Status> {
+    if let Some(pod) = extensions.get::<RegisteredPodIdentity>().cloned() {
+        return Ok(pod);
+    }
+
+    let principal = extensions
+        .get::<Principal>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("missing principal"))?;
+
+    let Principal::K8sPod(pod) = principal else {
+        return Err(Status::permission_denied(
+            "RegisterSupervisorPod requires a Kubernetes pod registration principal",
+        ));
+    };
+
+    Ok(pod)
+}
+
 async fn mint_cold_pod_activation(
     state: &Arc<ServerState>,
-    sandbox: &SandboxPrincipal,
+    sandbox_id: &str,
     rpc_name: &'static str,
 ) -> Result<PodActivationMessage, Status> {
     let issuer = state.sandbox_jwt_issuer.as_ref().ok_or_else(|| {
         warn!(
-            sandbox_id = %sandbox.sandbox_id,
+            sandbox_id = %sandbox_id,
             rpc = rpc_name,
             "bootstrap RPC called but sandbox JWT issuer is not configured"
         );
         Status::unavailable("sandbox JWT minting is not configured on this gateway")
     })?;
 
-    let record = load_sandbox(state, &sandbox.sandbox_id).await?;
-    let minted = issuer.mint(&sandbox.sandbox_id)?;
+    let record = load_sandbox(state, sandbox_id).await?;
+    let minted = issuer.mint(sandbox_id)?;
     let sandbox_name = record
         .metadata
         .as_ref()
         .map_or_else(String::new, |m| m.name.clone());
     info!(
-        sandbox_id = %sandbox.sandbox_id,
+        sandbox_id = %sandbox_id,
         rpc = rpc_name,
         "issued gateway sandbox JWT for cold pod activation"
     );
 
     Ok(PodActivationMessage {
-        sandbox_id: sandbox.sandbox_id.clone(),
+        sandbox_id: sandbox_id.to_string(),
         sandbox_name,
         token: minted.token,
         token_expires_at_ms: minted.expires_at_ms,
@@ -273,6 +303,16 @@ mod tests {
         })
     }
 
+    fn registered_pod(sandbox_id: Option<&str>) -> RegisteredPodIdentity {
+        RegisteredPodIdentity {
+            pod_name: "pod-a".to_string(),
+            pod_uid: "uid-a".to_string(),
+            sandbox_id: sandbox_id.map(str::to_string),
+            sandbox_owner_name: "sandbox-owner-a".to_string(),
+            sandbox_owner_uid: "owner-uid-a".to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn refresh_returns_new_token() {
         let state = state_with_issuer().await;
@@ -323,19 +363,10 @@ mod tests {
 
     #[tokio::test]
     async fn register_supervisor_pod_returns_immediate_activation_for_existing_sandbox() {
-        use crate::auth::principal::SandboxIdentitySource;
-
         let state = state_with_issuer().await;
         let mut req = Request::new(RegisterSupervisorPodRequest {});
         req.extensions_mut()
-            .insert(Principal::Sandbox(SandboxPrincipal {
-                sandbox_id: "sandbox-a".to_string(),
-                source: SandboxIdentitySource::K8sServiceAccount {
-                    pod_name: "pod-a".to_string(),
-                    pod_uid: "uid-a".to_string(),
-                },
-                trust_domain: Some("openshell".to_string()),
-            }));
+            .insert(Principal::K8sPod(registered_pod(Some("sandbox-a"))));
 
         let mut stream = handle_register_supervisor_pod(&state, req)
             .await
@@ -352,6 +383,28 @@ mod tests {
         assert!(activation.token_expires_at_ms > 0);
         assert!(activation.startup_metadata.is_empty());
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_supervisor_pod_keeps_unbound_warm_pod_pending() {
+        let state = state_with_issuer().await;
+        let mut req = Request::new(RegisterSupervisorPodRequest {});
+        req.extensions_mut()
+            .insert(Principal::K8sPod(registered_pod(None)));
+
+        let mut stream = handle_register_supervisor_pod(&state, req)
+            .await
+            .expect("register OK")
+            .into_inner();
+        assert_eq!(state.supervisor_pod_registrations.pending_count(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stream.next())
+                .await
+                .is_err(),
+            "unbound warm pod must wait for later activation"
+        );
+        drop(stream);
+        assert_eq!(state.supervisor_pod_registrations.pending_count(), 0);
     }
 
     #[tokio::test]

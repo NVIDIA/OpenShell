@@ -6,17 +6,16 @@
 //! Path-scoped to the Kubernetes supervisor bootstrap RPCs. Validates a projected SA token
 //! presented by a sandbox pod, reads the pod's `openshell.io/sandbox-id`
 //! annotation, verifies the pod is controlled by the corresponding Sandbox CR,
-//! and returns a [`Principal::Sandbox`] with
-//! [`SandboxIdentitySource::K8sServiceAccount`]. The bootstrap handlers then
-//! mint a gateway-signed JWT for that sandbox id; subsequent gRPC calls from
-//! the supervisor use the gateway-minted JWT validated by
-//! [`super::sandbox_jwt::SandboxJwtAuthenticator`].
+//! and returns either a sandbox principal for the legacy token RPC or a
+//! registration-scoped pod principal for `RegisterSupervisorPod`. Warm pods may
+//! register before they are bound to a sandbox, so registration identity must
+//! not grant sandbox-scoped RPC access.
 //!
 //! This is the only authenticator that talks to the K8s apiserver. It is
 //! optional — the gateway boots without it in singleplayer deployments.
 
 use super::authenticator::Authenticator;
-use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+use super::principal::{Principal, RegisteredPodIdentity, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
 use k8s_openapi::api::{
     authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo},
@@ -54,24 +53,16 @@ const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
 const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
 
-/// Resolved identity extracted from a validated SA token + pod lookup.
-#[derive(Debug, Clone)]
-pub struct ResolvedK8sIdentity {
-    pub sandbox_id: String,
-    pub pod_name: String,
-    pub pod_uid: String,
-}
-
 /// Apiserver-facing operations the authenticator depends on. Split out so
 /// tests can fake the apiserver without standing up a kube cluster.
 #[async_trait]
 pub trait K8sIdentityResolver: Send + Sync + 'static {
     /// Validate `token` via `TokenReview` (`aud == openshell-gateway`),
-    /// extract the pod name/uid, then `GET` the pod and read
-    /// `openshell.io/sandbox-id`. Returns `Ok(None)` when the token is
-    /// well-formed but does not authenticate (e.g. wrong audience); returns
-    /// `Err` for transport/server errors.
-    async fn resolve(&self, token: &str) -> Result<Option<ResolvedK8sIdentity>, Status>;
+    /// extract the pod name/uid, then `GET` the pod and owning Sandbox CR.
+    /// Returns `Ok(None)` when the token is well-formed but does not
+    /// authenticate (e.g. wrong audience); returns `Err` for
+    /// transport/server errors.
+    async fn resolve(&self, token: &str) -> Result<Option<RegisteredPodIdentity>, Status>;
 }
 
 /// Authenticator wrapper around a [`K8sIdentityResolver`].
@@ -118,18 +109,20 @@ impl Authenticator for K8sServiceAccountAuthenticator {
             return Ok(None);
         };
 
-        if resolved.sandbox_id.is_empty() {
-            warn!(
-                pod = %resolved.pod_name,
-                "pod missing openshell.io/sandbox-id annotation; rejecting"
-            );
-            return Err(Status::permission_denied(
-                "pod is not bound to a sandbox identity",
-            ));
+        if path == REGISTER_SUPERVISOR_POD_PATH {
+            return Ok(Some(Principal::K8sPod(resolved)));
         }
 
+        let sandbox_id = resolved.sandbox_id.clone().ok_or_else(|| {
+            warn!(
+                pod = %resolved.pod_name,
+                "pod missing openshell.io/sandbox-id annotation; rejecting legacy token issue"
+            );
+            Status::permission_denied("pod is not bound to a sandbox identity")
+        })?;
+
         Ok(Some(Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: resolved.sandbox_id,
+            sandbox_id,
             source: SandboxIdentitySource::K8sServiceAccount {
                 pod_name: resolved.pod_name,
                 pod_uid: resolved.pod_uid,
@@ -222,7 +215,7 @@ impl LiveK8sResolver {
 
 #[async_trait]
 impl K8sIdentityResolver for LiveK8sResolver {
-    async fn resolve(&self, token: &str) -> Result<Option<ResolvedK8sIdentity>, Status> {
+    async fn resolve(&self, token: &str) -> Result<Option<RegisteredPodIdentity>, Status> {
         let review = TokenReview {
             metadata: ObjectMeta::default(),
             spec: TokenReviewSpec {
@@ -295,7 +288,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
             return Err(Status::permission_denied("SA token pod UID mismatch"));
         }
 
-        let sandbox_id = pod_sandbox_id(&pod)?;
+        let sandbox_id = pod_sandbox_id(&pod);
 
         let owner = sandbox_owner_reference(&pod)?;
         let sandbox_cr = self.get_sandbox_cr_for_owner(&owner).await.map_err(|e| {
@@ -317,12 +310,17 @@ impl K8sIdentityResolver for LiveK8sResolver {
             );
             return Err(Status::permission_denied("sandbox owner not found"));
         };
-        validate_sandbox_owner_reference(&owner, &sandbox_id, &sandbox_cr)?;
+        validate_sandbox_owner_reference(&owner, &sandbox_cr)?;
+        if let Some(ref sandbox_id) = sandbox_id {
+            validate_sandbox_owner_binding(&owner, sandbox_id, &sandbox_cr)?;
+        }
 
-        Ok(Some(ResolvedK8sIdentity {
+        Ok(Some(RegisteredPodIdentity {
             sandbox_id,
             pod_name: identity.pod_name,
             pod_uid: identity.pod_uid,
+            sandbox_owner_name: owner.name,
+            sandbox_owner_uid: owner.uid,
         }))
     }
 }
@@ -393,20 +391,13 @@ fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, Status> {
 }
 
 #[allow(clippy::result_large_err)]
-fn pod_sandbox_id(pod: &Pod) -> Result<String, Status> {
-    let sandbox_id = pod
-        .metadata
+fn pod_sandbox_id(pod: &Pod) -> Option<String> {
+    pod.metadata
         .annotations
         .as_ref()
         .and_then(|a| a.get(SANDBOX_ID_ANNOTATION))
         .cloned()
-        .unwrap_or_default();
-    if sandbox_id.is_empty() {
-        return Err(Status::permission_denied(
-            "pod is not bound to a sandbox identity",
-        ));
-    }
-    Ok(sandbox_id)
+        .filter(|sandbox_id| !sandbox_id.is_empty())
 }
 
 #[allow(clippy::result_large_err)]
@@ -478,7 +469,6 @@ fn should_try_next_sandbox_api_version(err: &KubeError) -> bool {
 #[allow(clippy::result_large_err)]
 fn validate_sandbox_owner_reference(
     owner: &SandboxOwnerReference,
-    sandbox_id: &str,
     sandbox_cr: &DynamicObject,
 ) -> Result<(), Status> {
     let actual_uid = sandbox_cr.metadata.uid.as_deref().unwrap_or_default();
@@ -492,6 +482,15 @@ fn validate_sandbox_owner_reference(
         return Err(Status::permission_denied("sandbox owner UID mismatch"));
     }
 
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_sandbox_owner_binding(
+    owner: &SandboxOwnerReference,
+    sandbox_id: &str,
+    sandbox_cr: &DynamicObject,
+) -> Result<(), Status> {
     let actual_sandbox_id = sandbox_cr
         .metadata
         .labels
@@ -521,12 +520,12 @@ pub mod test_support {
     /// Fake resolver for unit tests. Returns the configured outcome on
     /// every call and records the tokens it observed.
     pub struct FakeResolver {
-        pub outcome: Result<Option<ResolvedK8sIdentity>, Status>,
+        pub outcome: Result<Option<RegisteredPodIdentity>, Status>,
         pub seen_tokens: Mutex<Vec<String>>,
     }
 
     impl FakeResolver {
-        pub fn returning(outcome: Result<Option<ResolvedK8sIdentity>, Status>) -> Self {
+        pub fn returning(outcome: Result<Option<RegisteredPodIdentity>, Status>) -> Self {
             Self {
                 outcome,
                 seen_tokens: Mutex::new(Vec::new()),
@@ -536,7 +535,7 @@ pub mod test_support {
 
     #[async_trait]
     impl K8sIdentityResolver for FakeResolver {
-        async fn resolve(&self, token: &str) -> Result<Option<ResolvedK8sIdentity>, Status> {
+        async fn resolve(&self, token: &str) -> Result<Option<RegisteredPodIdentity>, Status> {
             self.seen_tokens.lock().unwrap().push(token.to_string());
             match &self.outcome {
                 Ok(opt) => Ok(opt.clone()),
@@ -655,6 +654,16 @@ mod tests {
         }
     }
 
+    fn registered_pod(sandbox_id: Option<&str>) -> RegisteredPodIdentity {
+        RegisteredPodIdentity {
+            sandbox_id: sandbox_id.map(str::to_string),
+            pod_name: "openshell-sandbox-a".to_string(),
+            pod_uid: "uid-a".to_string(),
+            sandbox_owner_name: "sandbox-owner-a".to_string(),
+            sandbox_owner_uid: "cr-uid-a".to_string(),
+        }
+    }
+
     fn sandbox_cr(name: &str, uid: &str, sandbox_id: &str) -> DynamicObject {
         let sandbox_gvk =
             GroupVersionKind::gvk(SANDBOX_API_GROUP, SANDBOX_API_VERSION_V1BETA1, SANDBOX_KIND);
@@ -769,15 +778,12 @@ mod tests {
     }
 
     #[test]
-    fn pod_sandbox_id_requires_annotation() {
+    fn pod_sandbox_id_is_optional_for_warm_registration() {
         assert_eq!(
-            pod_sandbox_id(&pod_with_sandbox_id(Some("sandbox-id-a"))).unwrap(),
-            "sandbox-id-a"
+            pod_sandbox_id(&pod_with_sandbox_id(Some("sandbox-id-a"))).as_deref(),
+            Some("sandbox-id-a")
         );
-
-        let err = pod_sandbox_id(&pod_with_sandbox_id(None))
-            .expect_err("missing sandbox-id annotation must fail");
-        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(pod_sandbox_id(&pod_with_sandbox_id(None)).is_none());
     }
 
     #[test]
@@ -863,34 +869,40 @@ mod tests {
     }
 
     #[test]
-    fn validate_sandbox_owner_reference_requires_matching_cr_uid_and_label() {
+    fn validate_sandbox_owner_reference_requires_matching_cr_uid() {
         let owner = SandboxOwnerReference {
             api_version: SANDBOX_API_VERSION_FULL_V1BETA1.to_string(),
             name: "sandbox-a".to_string(),
             uid: "cr-uid-a".to_string(),
         };
         let cr = sandbox_cr("sandbox-a", "cr-uid-a", "sandbox-id-a");
-        validate_sandbox_owner_reference(&owner, "sandbox-id-a", &cr)
-            .expect("matching CR should be accepted");
+        validate_sandbox_owner_reference(&owner, &cr).expect("matching CR should be accepted");
 
         let wrong_uid = sandbox_cr("sandbox-a", "cr-uid-b", "sandbox-id-a");
-        let err = validate_sandbox_owner_reference(&owner, "sandbox-id-a", &wrong_uid)
+        let err = validate_sandbox_owner_reference(&owner, &wrong_uid)
             .expect_err("wrong CR UID must fail");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
 
+    #[test]
+    fn validate_sandbox_owner_binding_requires_matching_label() {
+        let owner = SandboxOwnerReference {
+            api_version: SANDBOX_API_VERSION_FULL_V1BETA1.to_string(),
+            name: "sandbox-a".to_string(),
+            uid: "cr-uid-a".to_string(),
+        };
+        let cr = sandbox_cr("sandbox-a", "cr-uid-a", "sandbox-id-a");
+        validate_sandbox_owner_binding(&owner, "sandbox-id-a", &cr)
+            .expect("matching label should be accepted");
         let wrong_label = sandbox_cr("sandbox-a", "cr-uid-a", "sandbox-id-b");
-        let err = validate_sandbox_owner_reference(&owner, "sandbox-id-a", &wrong_label)
+        let err = validate_sandbox_owner_binding(&owner, "sandbox-id-a", &wrong_label)
             .expect_err("wrong sandbox-id label must fail");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
     async fn authenticates_on_bootstrap_paths_only() {
-        let resolved = ResolvedK8sIdentity {
-            sandbox_id: "sandbox-a".to_string(),
-            pod_name: "openshell-sandbox-a".to_string(),
-            pod_uid: "uid-a".to_string(),
-        };
+        let resolved = registered_pod(Some("sandbox-a"));
         let fake = Arc::new(FakeResolver::returning(Ok(Some(resolved))));
         let auth = K8sServiceAccountAuthenticator::new(fake.clone());
 
@@ -916,14 +928,12 @@ mod tests {
             .unwrap()
             .expect("expected principal");
         match on_register {
-            Principal::Sandbox(p) => {
-                assert_eq!(p.sandbox_id, "sandbox-a");
-                assert!(matches!(
-                    p.source,
-                    SandboxIdentitySource::K8sServiceAccount { .. }
-                ));
+            Principal::K8sPod(p) => {
+                assert_eq!(p.sandbox_id.as_deref(), Some("sandbox-a"));
+                assert_eq!(p.pod_name, "openshell-sandbox-a");
+                assert_eq!(p.pod_uid, "uid-a");
             }
-            _ => panic!("expected sandbox principal"),
+            _ => panic!("expected pod registration principal"),
         }
 
         let off_issue = auth
@@ -970,12 +980,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pod_without_annotation_is_rejected() {
-        let resolved = ResolvedK8sIdentity {
-            sandbox_id: String::new(),
-            pod_name: "stray-pod".to_string(),
-            pod_uid: "uid".to_string(),
-        };
+    async fn issue_token_rejects_unbound_registered_pod() {
+        let resolved = registered_pod(None);
         let fake = Arc::new(FakeResolver::returning(Ok(Some(resolved))));
         let auth = K8sServiceAccountAuthenticator::new(fake);
         let err = auth
@@ -983,6 +989,27 @@ mod tests {
             .await
             .expect_err("unbound pod must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn register_supervisor_pod_accepts_unbound_registered_pod() {
+        let resolved = registered_pod(None);
+        let fake = Arc::new(FakeResolver::returning(Ok(Some(resolved))));
+        let auth = K8sServiceAccountAuthenticator::new(fake);
+        let principal = auth
+            .authenticate(&bearer_headers("sa-jwt"), REGISTER_SUPERVISOR_POD_PATH)
+            .await
+            .expect("unbound warm pod registration should authenticate")
+            .expect("expected principal");
+
+        match principal {
+            Principal::K8sPod(p) => {
+                assert!(p.sandbox_id.is_none());
+                assert_eq!(p.pod_name, "openshell-sandbox-a");
+                assert_eq!(p.sandbox_owner_uid, "cr-uid-a");
+            }
+            _ => panic!("expected pod registration principal"),
+        }
     }
 
     #[tokio::test]

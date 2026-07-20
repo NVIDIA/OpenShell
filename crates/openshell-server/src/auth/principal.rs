@@ -28,6 +28,12 @@ pub enum Principal {
     /// sandbox UUID. The wrapped `sandbox_id` MUST match any sandbox referenced
     /// in the request body for sandbox-class methods.
     Sandbox(#[allow(dead_code)] SandboxPrincipal),
+    /// Kubernetes pod authenticated for supervisor pod registration only.
+    ///
+    /// This is intentionally not a sandbox principal: warm pods can be valid
+    /// Kubernetes pods before they are claimed by a sandbox. The router only
+    /// allows this principal to call `RegisterSupervisorPod`.
+    K8sPod(RegisteredPodIdentity),
     /// Truly unauthenticated caller (health probes, reflection). Sandbox-class
     /// and user-class methods reject this variant.
     #[allow(dead_code)]
@@ -39,6 +45,27 @@ pub enum Principal {
 pub struct UserPrincipal {
     /// The verified identity from the authentication provider.
     pub identity: Identity,
+}
+
+/// Kubernetes pod identity validated by `TokenReview` and live pod lookup.
+///
+/// `sandbox_id` is present only when the pod is already bound to a concrete
+/// `OpenShell` sandbox. Unbound warm pods carry the owning Sandbox CR metadata
+/// but must not receive a gateway sandbox JWT until a later claim binds the
+/// exact pod UID to a sandbox.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct RegisteredPodIdentity {
+    /// Live pod name from the `TokenReview` binding.
+    pub pod_name: String,
+    /// Live pod UID from the `TokenReview` binding and pod lookup.
+    pub pod_uid: String,
+    /// `OpenShell` sandbox UUID from the pod annotation, when already bound.
+    pub sandbox_id: Option<String>,
+    /// Owning Sandbox CR name from the pod ownerReference.
+    pub sandbox_owner_name: String,
+    /// Owning Sandbox CR UID from the pod ownerReference and live CR lookup.
+    pub sandbox_owner_uid: String,
 }
 
 /// Sandbox caller — bound to one specific sandbox UUID.
