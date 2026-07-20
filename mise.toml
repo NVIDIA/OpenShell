@@ -54,10 +54,10 @@ KUBECONFIG = "{{config_root}}/kubeconfig"
 UV_CACHE_DIR = "{{config_root}}/.cache/uv"
 
 # Enable sccache for faster Rust builds.
-# Local builds use a disk cache (SCCACHE_DIR); CI sets SCCACHE_MEMCACHED_ENDPOINT
-# via repository variables to use a shared memcached backend instead.
+# Local builds share an OpenShell-specific user cache across worktrees; CI sets
+# SCCACHE_MEMCACHED_ENDPOINT via repository variables to use memcached instead.
 RUSTC_WRAPPER = "sccache"
-SCCACHE_DIR = "{{config_root}}/.cache/sccache"
+SCCACHE_DIR = "{{xdg_cache_home}}/openshell/sccache"
 
 # Shared build constants (overridable via environment).
 # DOCKER_BUILDKIT enables BuildKit for Docker; ignored by podman.
