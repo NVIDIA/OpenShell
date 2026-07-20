@@ -38,6 +38,10 @@ existing VM image acquisition -> UnpackedImage -> VmRootfsImage
 construction functions. Both cached-image paths use it before handing the
 resulting ext4 image to the existing VM launch path.
 
+Local image acquisition identifies Docker and Podman as distinct
+Docker-compatible image sources, while preserving the existing Docker-first,
+Podman-fallback selection policy. Registry acquisition remains a separate path.
+
 The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated
 when a sandbox create request asks for GPU resources.
