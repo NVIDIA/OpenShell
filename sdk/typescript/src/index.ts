@@ -11,11 +11,13 @@
 export type {
   ConnectOptions,
   EffectiveSettingView,
+  ExecExitEvent,
   ExecInteractiveOptions,
   ExecInteractiveSession,
   ExecOptions,
   ExecResult,
   ExecStreamChunk,
+  ExecStreamEvent,
   ForwardHandle,
   ForwardOptions,
   Health,
@@ -31,5 +33,6 @@ export type {
   SettingValue,
   SshSession,
   UpdateConfigResult,
+  WaitOptions,
 } from './client.js';
 export { errorCode, OpenShellClient, SandboxClient } from './client.js';

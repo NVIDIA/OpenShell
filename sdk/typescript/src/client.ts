@@ -14,7 +14,7 @@
 import type { AddressInfo } from 'node:net';
 import * as net from 'node:net';
 import type { MessageInitShape } from '@bufbuild/protobuf';
-import { type Client, createClient, type Transport } from '@connectrpc/connect';
+import { type CallOptions, type Client, createClient, type Transport } from '@connectrpc/connect';
 import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider } from './gen/datamodel_pb.js';
 import type { Sandbox, UpdateConfigResponse } from './gen/openshell_pb.js';
@@ -22,11 +22,13 @@ import {
   type ExecSandboxInputSchema,
   OpenShell,
   SandboxPhase,
+  type SandboxSpecSchema,
   ServiceStatus,
   type TcpForwardFrameSchema,
 } from './gen/openshell_pb.js';
 import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
+import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
 // The policy and setting value shapes are the generated protobuf messages;
@@ -50,6 +52,20 @@ export interface SandboxSpec {
   environment?: Record<string, string>;
   providers?: string[];
   gpu?: boolean;
+  /**
+   * Create-time sandbox policy (the safety boundary). Sandbox-scoped
+   * `setPolicy` cannot introduce static fields later, so express filesystem,
+   * landlock, process, and initial network policy here.
+   */
+  policy?: MessageInitShape<typeof SandboxPolicySchema>;
+  /**
+   * Advanced escape hatch: the full generated proto spec. Curated fields build
+   * the base spec, then `rawSpec` shallow-overrides at the top spec level, so
+   * any field it sets wins. Use it to reach proto spec fields the curated shape
+   * does not surface (template runtime class, resource limits, log level, and
+   * future additions) without an SDK change.
+   */
+  rawSpec?: MessageInitShape<typeof SandboxSpecSchema>;
 }
 
 export interface SandboxRef {
@@ -86,6 +102,17 @@ export interface ExecStreamChunk {
   data: Buffer;
 }
 
+// The terminal event of an exec stream, carrying the command exit code. It is
+// yielded in-band (not returned) so `for await` consumers cannot discard it.
+// Discriminate against ExecStreamChunk with `'type' in event`.
+export interface ExecExitEvent {
+  type: 'exit';
+  exitCode: number;
+}
+
+/** An exec stream item: a stdout/stderr chunk or the terminal exit event. */
+export type ExecStreamEvent = ExecStreamChunk | ExecExitEvent;
+
 export interface ExecInteractiveOptions {
   workdir?: string;
   environment?: Record<string, string>;
@@ -99,14 +126,21 @@ export interface ExecInteractiveOptions {
 }
 
 // The transport half of an interactive exec: raw stdin/stdout/stderr plus
-// resize, with no terminal glue. Drive it by consuming `output`; `done`
-// resolves with the exit code once the stream reaches its exit event.
+// resize, with no terminal glue. Drive it by consuming `output`, which yields
+// chunks then a terminal exit event; `done` resolves with the exit code once
+// the stream reaches that exit event and rejects if the stream ends without one.
 export interface ExecInteractiveSession {
-  output: AsyncIterable<ExecStreamChunk>;
+  output: AsyncIterable<ExecStreamEvent>;
   write(data: Buffer): void;
   resize(cols: number, rows: number): void;
   close(): void;
   done: Promise<number>;
+}
+
+/** Cancellation for the poll-based wait helpers. */
+export interface WaitOptions {
+  /** Abort the wait (and the in-flight poll RPC) early. */
+  signal?: AbortSignal;
 }
 
 export interface ForwardOptions {
@@ -189,6 +223,8 @@ export interface SetPolicyOptions {
   expectedResourceVersion?: string;
   /** Poll getConfig until the applied policy hash is observed. */
   wait?: boolean;
+  /** Bound the `wait` poll (seconds). Default 60. */
+  waitTimeoutSecs?: number;
 }
 
 export interface UpdateConfigResult {
@@ -276,9 +312,59 @@ function versionPin(value: string | undefined): bigint {
   return value ? BigInt(value) : 0n;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 const FORWARD_CHUNK = 64 * 1024;
+
+// Build CallOptions that bound one poll RPC by the remaining wall-clock budget
+// and honor caller cancellation, so a stalled RPC cannot outlive the deadline.
+function deadlineOptions(remainingMs: number, signal?: AbortSignal): CallOptions {
+  const timeout = AbortSignal.timeout(Math.max(0, remainingMs));
+  return {
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  };
+}
+
+// Translate a poll failure at the wait boundary: caller cancellation and
+// deadline expiry become explicit SdkErrors; anything else propagates.
+function mapWaitError(err: unknown, name: string, deadline: number, signal?: AbortSignal): SdkError {
+  if (signal?.aborted) return new SdkError('connect', `wait for sandbox '${name}' aborted`);
+  if (Date.now() >= deadline) return new SdkError('connect', `timed out waiting for sandbox '${name}'`);
+  return err instanceof SdkError ? err : fromConnect(err);
+}
+
+// Sleep between polls, bounded by the remaining deadline and interruptible by
+// the caller signal so the returned promise stays within its timeout budget.
+function waitSleep(delayMs: number, deadline: number, signal?: AbortSignal): Promise<void> {
+  const bounded = Math.min(delayMs, Math.max(0, deadline - Date.now()));
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, bounded);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(new SdkError('connect', 'wait aborted'));
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+// Wait for a socket to drain before writing more. Resolves on 'drain', and
+// also on 'close'/'error' so a pending await never leaks when the socket is
+// torn down mid-backpressure; short-circuits if it is already gone.
+function waitForDrain(socket: net.Socket): Promise<void> {
+  if (socket.writableEnded || socket.destroyed) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = (): void => {
+      socket.removeListener('drain', done);
+      socket.removeListener('close', done);
+      socket.removeListener('error', done);
+      resolve();
+    };
+    socket.once('drain', done);
+    socket.once('close', done);
+    socket.once('error', done);
+  });
+}
 
 // An async-iterable queue for the client-send half of bidi streams. Producers
 // `push()` frames; the connect transport consumes them as it drains the send
@@ -362,15 +448,23 @@ export class SandboxClient {
 
   async create(spec: SandboxSpec): Promise<SandboxRef> {
     try {
+      // Curated fields build the base spec; rawSpec then shallow-overrides at
+      // the top spec level (Object.assign, so any field it sets wins). The
+      // runtime assign avoids the generated $typeName upgrading the literal and
+      // rejecting the curated `template: { image }` init shorthand.
+      const specInit: MessageInitShape<typeof SandboxSpecSchema> = {
+        environment: spec.environment ?? {},
+        providers: spec.providers ?? [],
+        template: spec.image ? { image: spec.image } : undefined,
+        resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
+        policy: spec.policy,
+      };
+      if (spec.rawSpec) Object.assign(specInit, spec.rawSpec);
+
       const resp = await this.grpc.createSandbox({
         name: spec.name ?? '',
         labels: spec.labels ?? {},
-        spec: {
-          environment: spec.environment ?? {},
-          providers: spec.providers ?? [],
-          template: spec.image ? { image: spec.image } : undefined,
-          resourceRequirements: spec.gpu ? { gpu: {} } : undefined,
-        },
+        spec: specInit,
       });
       return sandboxRef(resp.sandbox);
     } catch (e) {
@@ -378,9 +472,9 @@ export class SandboxClient {
     }
   }
 
-  async get(name: string): Promise<SandboxRef> {
+  async get(name: string, callOptions?: CallOptions): Promise<SandboxRef> {
     try {
-      const resp = await this.grpc.getSandbox({ name });
+      const resp = await this.grpc.getSandbox({ name }, callOptions);
       return sandboxRef(resp.sandbox);
     } catch (e) {
       throw fromConnect(e);
@@ -409,44 +503,61 @@ export class SandboxClient {
     }
   }
 
-  async waitReady(name: string, timeoutSecs: number): Promise<SandboxRef> {
+  // Poll until the sandbox is ready. The timeout bounds the returned promise,
+  // not just the sleep loop: each poll RPC carries the remaining deadline (and
+  // any caller signal), so a stalled get() is aborted rather than hanging.
+  async waitReady(name: string, timeoutSecs: number, options?: WaitOptions | null): Promise<SandboxRef> {
     const deadline = Date.now() + timeoutSecs * 1000;
+    const signal = options?.signal;
     let delay = 250;
     for (;;) {
-      const ref = await this.get(name);
+      if (signal?.aborted) throw new SdkError('connect', `wait for sandbox '${name}' aborted`);
+      if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}'`);
+      let ref: SandboxRef;
+      try {
+        ref = await this.get(name, deadlineOptions(deadline - Date.now(), signal));
+      } catch (e) {
+        throw mapWaitError(e, name, deadline, signal);
+      }
       if (ref.phase === 'ready') return ref;
       if (ref.phase === 'error') throw new SdkError('connect', `sandbox '${name}' entered error phase`);
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}'`);
-      await sleep(delay);
+      await waitSleep(delay, deadline, signal);
       delay = Math.min(delay * 2, 2000);
     }
   }
 
-  async waitDeleted(name: string, timeoutSecs: number): Promise<void> {
+  // Poll until the sandbox is gone. Timeout and cancellation bound the returned
+  // promise the same way as waitReady.
+  async waitDeleted(name: string, timeoutSecs: number, options?: WaitOptions | null): Promise<void> {
     const deadline = Date.now() + timeoutSecs * 1000;
+    const signal = options?.signal;
     let delay = 250;
     for (;;) {
+      if (signal?.aborted) throw new SdkError('connect', `wait for sandbox '${name}' aborted`);
+      if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}' to delete`);
       try {
-        await this.get(name);
+        await this.get(name, deadlineOptions(deadline - Date.now(), signal));
       } catch (e) {
         if (e instanceof SdkError && e.code === 'not_found') return;
-        throw e;
+        throw mapWaitError(e, name, deadline, signal);
       }
       if (Date.now() >= deadline) throw new SdkError('connect', `timed out waiting for sandbox '${name}' to delete`);
-      await sleep(delay);
+      await waitSleep(delay, deadline, signal);
       delay = Math.min(delay * 2, 2000);
     }
   }
 
-  // Stream stdout/stderr as they arrive. The terminal ExecResult carries the
-  // exit code; its stdout/stderr are empty — the yielded chunks are the data.
-  // `exec()` drains this to reconstruct the buffered result, so both share one
-  // path.
+  // Stream stdout/stderr as they arrive, then a terminal exit event. The exit
+  // is yielded in-band (not returned) so `for await` consumers cannot silently
+  // discard it: a failing command is impossible to miss. If the gateway closes
+  // the stream without an exit event, this throws. `exec()` drains this same
+  // path to reconstruct the buffered result.
   async *execStream(
     name: string,
     command: string[],
     options?: ExecOptions | null,
-  ): AsyncGenerator<ExecStreamChunk, ExecResult, void> {
+  ): AsyncGenerator<ExecStreamEvent, void, void> {
     try {
       // Resolve the sandbox id first, exactly like the gateway client.
       const sandbox = await this.get(name);
@@ -460,7 +571,7 @@ export class SandboxClient {
         tty: false,
       });
 
-      let exitCode = -1;
+      let sawExit = false;
       for await (const event of stream) {
         switch (event.payload.case) {
           case 'stdout':
@@ -476,11 +587,12 @@ export class SandboxClient {
             };
             break;
           case 'exit':
-            exitCode = event.payload.value.exitCode;
+            sawExit = true;
+            yield { type: 'exit', exitCode: event.payload.value.exitCode };
             break;
         }
       }
-      return { exitCode, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+      if (!sawExit) throw new SdkError('rpc', 'ExecSandbox stream ended without an exit event');
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
     }
@@ -489,15 +601,19 @@ export class SandboxClient {
   async exec(name: string, command: string[], options?: ExecOptions | null): Promise<ExecResult> {
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
-    const stream = this.execStream(name, command, options);
-    let next = await stream.next();
-    for (; next.done !== true; next = await stream.next()) {
-      const chunk = next.value;
-      if (chunk.stream === 'stdout') stdout.push(chunk.data);
-      else stderr.push(chunk.data);
+    let exitCode: number | undefined;
+    for await (const event of this.execStream(name, command, options)) {
+      if ('type' in event) {
+        exitCode = event.exitCode;
+      } else if (event.stream === 'stdout') {
+        stdout.push(event.data);
+      } else {
+        stderr.push(event.data);
+      }
     }
+    if (exitCode === undefined) throw new SdkError('rpc', 'ExecSandbox stream ended without an exit event');
     return {
-      exitCode: next.value.exitCode,
+      exitCode,
       stdout: Buffer.concat(stdout),
       stderr: Buffer.concat(stderr),
     };
@@ -545,8 +661,8 @@ export class SandboxClient {
       rejectDone = reject;
     });
 
-    async function* output(): AsyncGenerator<ExecStreamChunk, void, void> {
-      let exitCode = -1;
+    async function* output(): AsyncGenerator<ExecStreamEvent, void, void> {
+      let sawExit = false;
       try {
         for await (const event of stream) {
           switch (event.payload.case) {
@@ -563,11 +679,15 @@ export class SandboxClient {
               };
               break;
             case 'exit':
-              exitCode = event.payload.value.exitCode;
+              sawExit = true;
+              yield { type: 'exit', exitCode: event.payload.value.exitCode };
+              resolveDone(event.payload.value.exitCode);
               break;
           }
         }
-        resolveDone(exitCode);
+        if (!sawExit) {
+          throw new SdkError('rpc', 'ExecSandboxInteractive stream ended without an exit event');
+        }
       } catch (e) {
         const err = e instanceof SdkError ? e : fromConnect(e);
         rejectDone(err);
@@ -669,6 +789,10 @@ export class SandboxClient {
     input.onDrain = () => socket.resume();
     try {
       const session = await this.grpc.createSshSession({ sandboxId });
+      // Defense-in-depth: the token feeds forwardTcp authorization, so hold it
+      // to the same trust-boundary contract as createSshSession. A violation
+      // tears down this one socket via the catch below.
+      validateSshResponse(session);
       token = session.token;
       input.push({
         payload: {
@@ -701,7 +825,10 @@ export class SandboxClient {
       for await (const frame of this.grpc.forwardTcp(input)) {
         if (frame.payload.case !== 'data') continue;
         const data = frame.payload.value;
-        if (data.length > 0) socket.write(Buffer.from(data));
+        if (data.length === 0) continue;
+        // Respect backpressure: if the local socket buffer is full, stop
+        // pulling sandbox data until it drains so memory stays bounded.
+        if (!socket.write(Buffer.from(data))) await waitForDrain(socket);
       }
       socket.end();
     } catch {
@@ -724,6 +851,9 @@ export class SandboxClient {
     try {
       const sandbox = await this.get(name);
       const resp = await this.grpc.createSshSession({ sandboxId: sandbox.id });
+      // Reject any response outside the proto trust-boundary contract before
+      // handing these values to the caller (they feed OpenSSH ProxyCommand).
+      validateSshResponse(resp);
       return {
         sandboxId: resp.sandboxId,
         token: resp.token,
@@ -790,10 +920,10 @@ export class SandboxClient {
     }
   }
 
-  async getConfig(name: string): Promise<SandboxConfig> {
+  async getConfig(name: string, callOptions?: CallOptions): Promise<SandboxConfig> {
     try {
-      const sandbox = await this.get(name);
-      const resp = await this.grpc.getSandboxConfig({ sandboxId: sandbox.id });
+      const sandbox = await this.get(name, callOptions);
+      const resp = await this.grpc.getSandboxConfig({ sandboxId: sandbox.id }, callOptions);
       return sandboxConfig(resp);
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
@@ -817,7 +947,7 @@ export class SandboxClient {
         expectedResourceVersion: versionPin(options?.expectedResourceVersion),
       });
       const result = updateConfigResult(resp);
-      if (options?.wait) await this.waitForPolicyHash(name, result.policyHash);
+      if (options?.wait) await this.waitForPolicyHash(name, result.policyHash, options.waitTimeoutSecs);
       return result;
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
@@ -844,16 +974,27 @@ export class SandboxClient {
     }
   }
 
+  // Poll getConfig until the applied policy hash is observed. Each poll RPC is
+  // bounded by the remaining deadline (deadlineOptions), so a stalled getConfig
+  // cannot make the returned promise outlive timeoutSecs.
   private async waitForPolicyHash(name: string, policyHash: string, timeoutSecs = 60): Promise<void> {
     const deadline = Date.now() + timeoutSecs * 1000;
     let delay = 100;
     for (;;) {
-      const config = await this.getConfig(name);
+      let config: SandboxConfig;
+      try {
+        config = await this.getConfig(name, deadlineOptions(deadline - Date.now()));
+      } catch (e) {
+        if (Date.now() >= deadline) {
+          throw new SdkError('connect', `timed out waiting for policy '${policyHash}' on sandbox '${name}'`);
+        }
+        throw e instanceof SdkError ? e : fromConnect(e);
+      }
       if (config.policyHash === policyHash) return;
       if (Date.now() >= deadline) {
         throw new SdkError('connect', `timed out waiting for policy '${policyHash}' on sandbox '${name}'`);
       }
-      await sleep(delay);
+      await waitSleep(delay, deadline);
       delay = Math.min(delay * 2, 2000);
     }
   }

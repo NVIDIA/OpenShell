@@ -39,6 +39,20 @@ console.log(result.stdout.toString())
 await client.sandbox.delete(sandbox.name)
 ```
 
+Express the create-time safety boundary with `policy`. Sandbox-scoped `setPolicy`
+cannot introduce static policy fields later, so set filesystem, landlock,
+process, and initial network policy at creation. For proto spec fields the
+curated shape does not surface, `rawSpec` is an escape hatch that shallow-
+overrides the assembled spec at the top level (any field it sets wins):
+
+```ts
+await client.sandbox.create({
+  image,
+  policy: { version: 1, networkPolicies: {} },
+  rawSpec: { logLevel: 'debug', template: { runtimeClassName: 'gvisor' } },
+})
+```
+
 ### Scoped clients
 
 `client.sandbox` is a `SandboxClient`. If you only need sandboxes, connect one
@@ -53,21 +67,24 @@ await sandbox.create({ image })
 
 ## Streaming and interactive exec
 
-`execStream` yields stdout/stderr chunks as they arrive, so long or chatty commands surface output incrementally instead of buffering until exit. The terminal value carries the exit code; the chunks carry the bytes. `exec` drains `execStream` internally, so its buffered `ExecResult` is unchanged.
+`execStream` yields stdout/stderr chunks as they arrive, so long or chatty commands surface output incrementally instead of buffering until exit. The stream ends with a terminal `{ type: 'exit', exitCode }` event, yielded in-band so a failing command cannot look successful under `for await`. Discriminate it with `'type' in event`. If the gateway closes the stream without an exit event, `execStream` throws. `exec` drains `execStream` internally, so its buffered `ExecResult` is unchanged.
 
 ```ts
-for await (const chunk of client.sandbox.execStream(name, ['pytest', '-q'])) {
-  process[chunk.stream].write(chunk.data) // 'stdout' | 'stderr'
+for await (const event of client.sandbox.execStream(name, ['pytest', '-q'])) {
+  if ('type' in event) console.log(`exit ${event.exitCode}`)
+  else process[event.stream].write(event.data) // 'stdout' | 'stderr'
 }
 ```
 
-`execInteractive` is the TTY + stdin transport primitive. Drive it by consuming `output`; `done` resolves with the exit code once the stream ends. It ships raw bytes only — raw mode, signal forwarding, and SIGWINCH stay with the caller.
+`execInteractive` is the TTY + stdin transport primitive. Drive it by consuming `output`, which yields the same chunk/exit events; `done` resolves with the exit code once the stream reaches its exit event and rejects if it ends without one. It ships raw bytes only; raw mode, signal forwarding, and SIGWINCH stay with the caller.
 
 ```ts
 const session = await client.sandbox.execInteractive(name, ['bash'])
 session.write(Buffer.from('echo hi\n'))
 session.resize(120, 40)
-for await (const chunk of session.output) process.stdout.write(chunk.data)
+for await (const event of session.output) {
+  if (!('type' in event)) process.stdout.write(event.data)
+}
 const code = await session.done
 ```
 
