@@ -623,7 +623,7 @@ def test_github_provider_allows_https_git_clone(
 def test_provider_profile_platform_vs_workspace_isolation(
     sandbox_client: "SandboxClient",
 ) -> None:
-    """Platform-scoped (workspace='') and workspace-scoped profiles are isolated."""
+    """Platform-scoped profiles are visible in workspace listings; workspace profiles are not visible in platform listings."""
     stub = sandbox_client._stub
     platform_id = "e2e-platform-profile"
     workspace_id = "e2e-workspace-profile"
@@ -683,8 +683,8 @@ def test_provider_profile_platform_vs_workspace_isolation(
         assert workspace_id in workspace_ids, (
             "workspace profile should appear in workspace list"
         )
-        assert platform_id not in workspace_ids, (
-            "platform profile should NOT appear in workspace list"
+        assert platform_id in workspace_ids, (
+            "platform profile should appear in workspace list (visible as fallback)"
         )
     finally:
         _cleanup()
