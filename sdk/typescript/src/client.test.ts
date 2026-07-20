@@ -62,7 +62,7 @@ describe('exec / execStream', () => {
     expect(Buffer.isBuffer(result.stdout)).toBe(true);
   });
 
-  it('execStream yields incremental chunks and returns an exit-only ExecResult', async () => {
+  it('execStream yields incremental chunks then a terminal exit event', async () => {
     const sandbox = client({
       getSandbox: () => readySandbox('sb', 'sb-id-1'),
       // eslint-disable-next-line require-yield
@@ -74,21 +74,75 @@ describe('exec / execStream', () => {
     });
 
     const chunks: Array<{ stream: string; data: string }> = [];
-    const gen = sandbox.execStream('sb', ['x']);
-    let next = await gen.next();
-    for (; next.done !== true; next = await gen.next()) {
-      chunks.push({
-        stream: next.value.stream,
-        data: next.value.data.toString(),
-      });
+    let exitCode: number | undefined;
+    for await (const event of sandbox.execStream('sb', ['x'])) {
+      if ('type' in event) exitCode = event.exitCode;
+      else chunks.push({ stream: event.stream, data: event.data.toString() });
     }
     expect(chunks).toEqual([
       { stream: 'stdout', data: 'a' },
       { stream: 'stderr', data: 'b' },
     ]);
-    expect(next.value.exitCode).toBe(0);
-    expect(next.value.stdout.length).toBe(0);
-    expect(next.value.stderr.length).toBe(0);
+    expect(exitCode).toBe(0);
+  });
+
+  it('surfaces a nonzero exit via for-await', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      execSandbox: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('boom') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 2 } } };
+      },
+    });
+
+    let streamed: number | undefined;
+    for await (const event of sandbox.execStream('sb', ['pytest'])) {
+      if ('type' in event) streamed = event.exitCode;
+    }
+    expect(streamed).toBe(2);
+  });
+
+  it('surfaces a nonzero exit via exec()', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      execSandbox: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('boom') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 2 } } };
+      },
+    });
+    const result = await sandbox.exec('sb', ['pytest']);
+    expect(result.exitCode).toBe(2);
+    expect(result.stdout.toString()).toBe('boom');
+  });
+
+  it('execStream throws when the stream ends without an exit event', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      execSandbox: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('partial') } } };
+      },
+    });
+    await expect(
+      (async () => {
+        for await (const _event of sandbox.execStream('sb', ['x'])) {
+          // drain to completion
+        }
+      })(),
+    ).rejects.toMatchObject({ code: 'rpc' });
+  });
+
+  it('exec throws when the stream ends without an exit event', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      execSandbox: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('partial') } } };
+      },
+    });
+    await expect(sandbox.exec('sb', ['x'])).rejects.toMatchObject({ code: 'rpc' });
   });
 
   it('maps a NotFound from get() to an SdkError not_found', async () => {
@@ -101,6 +155,74 @@ describe('exec / execStream', () => {
       code: 'not_found',
     });
     await expect(sandbox.exec('sb', ['x'])).rejects.toSatisfy((e) => errorCode(e) === 'not_found');
+  });
+});
+
+describe('create', () => {
+  it('sends the curated policy through spec.policy', async () => {
+    let created: { spec?: { policy?: { version?: number } } } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+    await sandbox.create({ image: 'img', policy: { version: 1, networkPolicies: {} } });
+    expect(created.spec?.policy?.version).toBe(1);
+  });
+
+  it('rawSpec reaches an ungated field and overrides a curated one', async () => {
+    let created: {
+      spec?: {
+        logLevel?: string;
+        template?: { image?: string };
+        providers?: string[];
+      };
+    } = {};
+    const sandbox = client({
+      createSandbox: (req) => {
+        created = req;
+        return readySandbox('sb', 'sb-id');
+      },
+    });
+    await sandbox.create({
+      image: 'curated-image',
+      providers: ['claude'],
+      rawSpec: { logLevel: 'debug', template: { image: 'raw-image' } },
+    });
+    // Ungated field only reachable via rawSpec.
+    expect(created.spec?.logLevel).toBe('debug');
+    // rawSpec wins on a field the curated shape also sets.
+    expect(created.spec?.template?.image).toBe('raw-image');
+    // Curated fields rawSpec does not touch survive.
+    expect(created.spec?.providers).toEqual(['claude']);
+  });
+});
+
+describe('waits', () => {
+  it('waitReady rejects rather than hanging when get() never resolves', async () => {
+    const sandbox = client({
+      // Only settles when the per-poll deadline signal aborts the call.
+      getSandbox: (_req, ctx) =>
+        new Promise((_resolve, reject) => {
+          ctx.signal.addEventListener('abort', () => reject(new ConnectError('canceled', Code.Canceled)));
+        }),
+    });
+    await expect(sandbox.waitReady('sb', 0.2)).rejects.toMatchObject({ code: 'connect' });
+  });
+
+  it('waitReady rejects when a caller AbortController fires mid-wait', async () => {
+    const controller = new AbortController();
+    const sandbox = client({
+      getSandbox: (_req, ctx) =>
+        new Promise((_resolve, reject) => {
+          ctx.signal.addEventListener('abort', () => reject(new ConnectError('canceled', Code.Canceled)));
+        }),
+    });
+    setTimeout(() => controller.abort(), 30);
+    await expect(sandbox.waitReady('sb', 30, { signal: controller.signal })).rejects.toMatchObject({
+      code: 'connect',
+    });
   });
 });
 
@@ -134,7 +256,9 @@ describe('execInteractive', () => {
     });
     const out: string[] = [];
     const collector = (async () => {
-      for await (const chunk of session.output) out.push(chunk.data.toString());
+      for await (const event of session.output) {
+        if (!('type' in event)) out.push(event.data.toString());
+      }
     })();
 
     session.write(Buffer.from('echo hi'));
@@ -306,6 +430,27 @@ describe('config / policy', () => {
     expect(configCalls).toBeGreaterThanOrEqual(2);
   });
 
+  // Fix #4 residual: setPolicy(..., {wait:true}) must not hang forever when the
+  // getConfig poll stalls. Each poll RPC is bounded by the remaining deadline,
+  // so a getSandboxConfig that never settles on its own is aborted and the wait
+  // rejects instead of pending forever. The handler resolves only on the call
+  // signal firing, proving the per-poll deadline (not the sleep loop) is what
+  // bounds the returned promise.
+  it('setPolicy wait rejects when the config poll stalls past the deadline', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id'),
+      updateConfig: () => ({ version: 5, policyHash: 'target', settingsRevision: 10n, deleted: false }),
+      getSandboxConfig: (_req, ctx) =>
+        new Promise((_resolve, reject) => {
+          ctx.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        }),
+    });
+
+    await expect(
+      sandbox.setPolicy('sb', { version: 1, networkPolicies: {} }, { wait: true, waitTimeoutSecs: 0.2 }),
+    ).rejects.toMatchObject({ code: 'connect' });
+  }, 5000);
+
   it('setSetting upserts a single sandbox-scoped setting (global=false)', async () => {
     let req: {
       name?: string;
@@ -382,6 +527,32 @@ describe('ssh sessions', () => {
   it('revokeSshSession returns the revoked flag', async () => {
     const sandbox = client({ revokeSshSession: () => ({ revoked: true }) });
     expect(await sandbox.revokeSshSession('tok')).toBe(true);
+  });
+
+  it('rejects a response that violates the ProxyCommand trust-boundary contract', async () => {
+    const base = {
+      sandboxId: 'sb-id',
+      token: 'tok-1',
+      gatewayHost: 'gw.example',
+      gatewayPort: 8443,
+      gatewayScheme: 'https',
+      hostKeyFingerprint: 'SHA256:abc',
+      expiresAtMs: 0n,
+    };
+    const cases: Array<Record<string, unknown>> = [
+      { ...base, gatewayScheme: 'ftp' },
+      { ...base, token: 'tok; rm -rf /' },
+      { ...base, gatewayPort: 70000 },
+    ];
+    for (const resp of cases) {
+      const sandbox = client({
+        getSandbox: () => readySandbox('sb', 'sb-id'),
+        createSshSession: () => resp,
+      });
+      await expect(sandbox.createSshSession('sb')).rejects.toMatchObject({
+        code: 'invalid_config',
+      });
+    }
   });
 });
 
@@ -465,5 +636,63 @@ describe('forward', () => {
       }),
     });
     await expect(sandbox.forward('sb', { targetPort: 9000 })).rejects.toMatchObject({ code: 'connect' });
+  });
+
+  // Backpressure (fix #6): the sandbox->local relay must stop pulling gRPC
+  // frames when socket.write() returns false and resume after 'drain', so a
+  // slow local reader cannot make Node buffer sandbox output without bound.
+  // Flood a large payload at a paused reader that only drains in small bites;
+  // every byte must still arrive intact and in order.
+  it('honors socket backpressure on the sandbox->local relay without dropping bytes', async () => {
+    const CHUNKS = 256;
+    const CHUNK = 64 * 1024; // 16 MiB total, well past any socket highWaterMark
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-bp'),
+      createSshSession: () => ({
+        sandboxId: 'sb-id-bp',
+        token: 'bp-tok',
+        gatewayHost: 'gw',
+        gatewayPort: 443,
+        gatewayScheme: 'https',
+        hostKeyFingerprint: '',
+        expiresAtMs: 0n,
+      }),
+      revokeSshSession: () => ({ revoked: true }),
+      // Ignore inbound frames; just blast a large, verifiable byte stream back.
+      forwardTcp: async function* () {
+        for (let i = 0; i < CHUNKS; i++) {
+          yield { payload: { case: 'data' as const, value: new Uint8Array(CHUNK).fill(i & 0xff) } };
+        }
+      },
+    });
+
+    const handle = await sandbox.forward('sb', { targetPort: 9000 });
+    const received = await new Promise<Buffer>((resolve, reject) => {
+      const socket = net.connect(handle.localPort, handle.localHost);
+      const buf: Buffer[] = [];
+      let total = 0;
+      socket.on('connect', () => socket.write('go'));
+      socket.on('data', (d) => {
+        buf.push(d);
+        total += d.length;
+        // Simulate a slow consumer: pause, then resume on the next tick. This
+        // keeps the OS/Node buffer near-full so writes return false and the
+        // relay must await 'drain'.
+        socket.pause();
+        setTimeout(() => socket.resume(), 0);
+        if (total >= CHUNKS * CHUNK) resolve(Buffer.concat(buf));
+      });
+      socket.on('error', reject);
+    });
+
+    expect(received.length).toBe(CHUNKS * CHUNK);
+    // Verify order + integrity: chunk i is filled with (i & 0xff).
+    for (let i = 0; i < CHUNKS; i++) {
+      expect(received[i * CHUNK]).toBe(i & 0xff);
+      expect(received[i * CHUNK + CHUNK - 1]).toBe(i & 0xff);
+    }
+
+    await handle.close();
+    await handle.closed;
   });
 });
