@@ -148,3 +148,7 @@ data:
     [openshell.drivers.kubernetes.sidecar]
     proxy_uid                    = {{ .Values.supervisor.sidecar.proxyUid | default 1337 }}
     process_binary_aware_network_policy = {{ .Values.supervisor.sidecar.processBinaryAwareNetworkPolicy }}
+
+    [openshell.drivers.kubernetes.proxy_pod]
+    proxy_uid                    = {{ .Values.supervisor.proxyPod.proxyUid | default 1337 }}
+    affinity                     = {{ .Values.supervisor.proxyPod.affinity | default "disabled" | quote }}

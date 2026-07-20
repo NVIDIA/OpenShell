@@ -48,6 +48,8 @@ supervisor:
   # "combined" runs the current single supervisor container in the agent pod.
   # "sidecar" runs network enforcement in a dedicated sidecar and the process
   # supervisor as a low-capability wrapper in the agent container.
+  # "proxy-pod" runs network enforcement in a separate supervisor Deployment and
+  # restricts the agent pod to that supervisor through NetworkPolicy.
   topology: "combined"
   sidecar:
     # -- UID for relaxed long-running network sidecars in sidecar topology.
@@ -61,6 +63,13 @@ supervisor:
     # inspection capabilities, and enforces endpoint/L7 policy without matching
     # policy.binaries.
     processBinaryAwareNetworkPolicy: true
+  proxyPod:
+    # -- UID for the network supervisor in proxy-pod topology. The configured
+    # UID must not match the sandbox UID.
+    proxyUid: 1337
+    # -- Same-node scheduling relationship between the workload pod and its
+    # paired proxy supervisor: disabled, preferred, or required.
+    affinity: disabled
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []
