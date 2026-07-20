@@ -3961,6 +3961,18 @@ pub async fn ensure_required_providers(
     Ok(configured_names)
 }
 
+/// Error for a missing `anthropic-oauth` provider (or its alias), which cannot
+/// be auto-created from env discovery or from inside a sandbox.
+fn missing_subscription_provider_error(provider_type: &str) -> Option<miette::Report> {
+    (openshell_core::inference::normalize_inference_provider_type(provider_type)
+        == Some(ANTHROPIC_OAUTH_PROVIDER_TYPE))
+    .then(|| {
+        miette::miette!(
+            "'{provider_type}' uses your Anthropic subscription login. Create the provider first, then retry:\n    openshell provider create --from-claude-login"
+        )
+    })
+}
+
 /// Prompt for (or auto-confirm) creation of a provider from local credentials.
 ///
 /// When `preferred_name` is `Some`, the provider is created with that exact
@@ -3979,16 +3991,11 @@ async fn auto_create_provider(
 
     // Subscription OAuth material lives in the host keychain and is harvested
     // by `provider create --from-claude-login`, not by env discovery — and it
-    // cannot be configured from inside a sandbox.
-    if openshell_core::inference::normalize_inference_provider_type(provider_type)
-        == Some(ANTHROPIC_OAUTH_PROVIDER_TYPE)
-    {
-        eprintln!(
-            "{} '{provider_type}' uses your Anthropic subscription login. Create the provider first, then retry:\n    openshell provider create --from-claude-login",
-            "!".yellow(),
-        );
-        eprintln!();
-        return Ok(());
+    // cannot be configured from inside a sandbox. Abort sandbox creation:
+    // continuing without the provider would drop Claude into an in-sandbox
+    // login flow that cannot succeed.
+    if let Some(err) = missing_subscription_provider_error(provider_type) {
+        return Err(err);
     }
 
     // --no-auto-providers: skip silently.
@@ -8432,10 +8439,10 @@ mod tests {
         ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
-        gateway_auth_label, gateway_env_override_warning, gateway_info_to_json,
-        gateway_remote_label, gateway_select_with, gateway_to_json, gateway_type_label,
-        git_sync_files, http_health_check, import_local_package_mtls_bundle,
-        inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
+        gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_to_json,
+        gateway_type_label, git_sync_files, http_health_check, import_local_package_mtls_bundle,
+        inferred_provider_type, missing_subscription_provider_error,
+        mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
         plaintext_gateway_is_remote, policy_revision_to_json, progress_step_from_metadata,
@@ -9019,6 +9026,21 @@ mod tests {
     fn inferred_provider_type_returns_none_for_unknown_command() {
         let result = inferred_provider_type(&["bash".to_string()]);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn missing_subscription_provider_aborts_sandbox_creation() {
+        for provider_type in ["anthropic-oauth", "claude-subscription"] {
+            let err = missing_subscription_provider_error(provider_type)
+                .expect("missing subscription provider must be an error, not a warning");
+            assert!(
+                err.to_string()
+                    .contains("openshell provider create --from-claude-login"),
+                "error must point at the setup command: {err}"
+            );
+        }
+        assert!(missing_subscription_provider_error("claude-code").is_none());
+        assert!(missing_subscription_provider_error("anthropic").is_none());
     }
 
     #[test]
