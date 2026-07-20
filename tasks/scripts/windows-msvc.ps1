@@ -38,7 +38,7 @@ if ([string]::IsNullOrWhiteSpace($TargetDir)) {
 }
 
 $UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-podman --exclude openshell-driver-vm"
-$BundledZ3WorkspaceFeatures = "--features openshell-cli/bundled-z3,openshell-prover/bundled-z3"
+$BundledZ3WorkspaceFeatures = "--features openshell-prover/bundled-z3"
 $BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-prover/bundled-z3"
 $Z3WorkspaceFeatures = $BundledZ3WorkspaceFeatures
 $Z3ServerFeatures = $BundledZ3ServerFeatures
