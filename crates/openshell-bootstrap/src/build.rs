@@ -1,18 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build container images for sandbox runtimes.
+//! Build and load container images for sandbox runtimes.
 //!
-//! This module wraps bollard's `build_image()` API to build a container image
-//! from a Dockerfile and build context. Package-managed local gateways use the
-//! host Docker daemon, so the resulting tag is passed to the gateway directly.
+//! This module wraps bollard's `build_image()` and `import_image()` APIs to
+//! build a container image from a Dockerfile or load one from a Docker archive.
+//! Package-managed local gateways use the host Docker daemon, so the resulting
+//! tag is passed to the gateway directly.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
 use bollard::Docker;
-use bollard::query_parameters::BuildImageOptionsBuilder;
+use bollard::query_parameters::{BuildImageOptionsBuilder, ImportImageOptionsBuilder};
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use tokio::time::timeout;
@@ -159,6 +160,76 @@ pub async fn build_local_image(
     build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
     on_log(format!("Built image {tag}"));
     Ok(())
+}
+
+/// Load a Docker archive into the local Docker daemon.
+///
+/// This is used by `openshell sandbox create --from <archive.tar>`. The image
+/// is loaded via Docker's `POST /images/load` endpoint and the embedded tag
+/// from the archive's manifest is returned.
+///
+/// Supports plain `.tar` and gzip-compressed `.tar.gz`/`.tgz` archives.
+pub async fn load_docker_archive(
+    archive_path: &Path,
+    on_log: &mut impl FnMut(String),
+) -> Result<String> {
+    on_log(format!("Loading Docker archive {}", archive_path.display()));
+
+    let archive_bytes = std::fs::read(archive_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read archive: {}", archive_path.display()))?;
+
+    let docker = Docker::connect_with_local_defaults()
+        .into_diagnostic()
+        .wrap_err("failed to connect to local Docker daemon")?;
+
+    let body = bollard::body_full(bytes::Bytes::from(archive_bytes));
+    let options = ImportImageOptionsBuilder::default().quiet(false).build();
+
+    let mut stream = docker.import_image(options, body, None);
+
+    let mut loaded_tag: Option<String> = None;
+    while let Some(result) = stream.next().await {
+        let info = result
+            .into_diagnostic()
+            .wrap_err("Docker image load stream error")?;
+
+        if let Some(stream_line) = &info.stream {
+            let trimmed = stream_line.trim();
+            if !trimmed.is_empty() {
+                on_log(trimmed.to_string());
+            }
+            // Docker responds with "Loaded image: <tag>" on success.
+            if let Some(tag) = trimmed.strip_prefix("Loaded image: ") {
+                loaded_tag = Some(tag.to_string());
+            }
+            // Docker responds with "Loaded image ID: sha256:<id>" for
+            // archives without a RepoTag.
+            if loaded_tag.is_none()
+                && let Some(id) = trimmed.strip_prefix("Loaded image ID: ")
+            {
+                loaded_tag = Some(id.to_string());
+            }
+        }
+
+        if let Some(status) = &info.status {
+            let trimmed = status.trim();
+            if !trimmed.is_empty() {
+                on_log(trimmed.to_string());
+            }
+        }
+    }
+
+    let tag = loaded_tag.ok_or_else(|| {
+        miette::miette!(
+            "Docker loaded the archive but did not report an image tag; \
+             the archive at {} may be empty or malformed",
+            archive_path.display()
+        )
+    })?;
+
+    on_log(format!("Loaded image {tag}"));
+    Ok(tag)
 }
 
 /// Build a container image using the local Docker daemon.

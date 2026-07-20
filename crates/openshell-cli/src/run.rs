@@ -477,6 +477,10 @@ pub async fn sandbox_create(
                     let tag = build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
                     Some(tag)
                 }
+                ResolvedSource::DockerArchive { path } => {
+                    let tag = load_from_docker_archive(&path, gateway_name).await?;
+                    Some(tag)
+                }
             }
         }
         None => None,
@@ -1037,13 +1041,16 @@ enum ResolvedSource {
         dockerfile: PathBuf,
         context: PathBuf,
     },
+    /// A Docker archive (`.tar` or `.tar.gz`) to load into the local daemon.
+    DockerArchive { path: PathBuf },
 }
 
-/// Classify the `--from` value into an image reference or a Dockerfile that
-/// needs building.
+/// Classify the `--from` value into an image reference, a Dockerfile that
+/// needs building, or a Docker archive that needs loading.
 ///
 /// Resolution order:
 /// 1. Existing file whose name contains "Dockerfile" → build from file.
+///    1b. Existing file with `.tar`/`.tar.gz`/`.tgz` extension → load archive.
 /// 2. Existing directory that contains a `Dockerfile` → build from directory.
 /// 3. Missing explicit local paths → local error, not image pull.
 /// 4. Value contains `/`, `:`, or `.` → treat as a full image reference.
@@ -1068,9 +1075,17 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
             });
         }
 
+        if filename_looks_like_docker_archive(path) {
+            let archive_path = path
+                .canonicalize()
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
+            return Ok(ResolvedSource::DockerArchive { path: archive_path });
+        }
+
         if value_looks_like_local_source(value) {
             return Err(miette::miette!(
-                "local --from file is not a Dockerfile: {}",
+                "local --from file is not a Dockerfile or Docker archive (.tar/.tar.gz/.tgz): {}",
                 path.display()
             ));
         }
@@ -1109,7 +1124,7 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
     if value_looks_like_local_source(value) {
         return Err(miette::miette!(
             "local --from path does not exist: {}\n\
-             Use an existing Dockerfile, a directory containing Dockerfile, or a container image reference.",
+             Use an existing Dockerfile, directory containing Dockerfile, Docker archive (.tar/.tar.gz/.tgz), or a container image reference.",
             path.display()
         ));
     }
@@ -1128,6 +1143,19 @@ fn filename_looks_like_dockerfile(path: &Path) -> bool {
         .unwrap_or_default();
     let lower = name.to_lowercase();
     lower.contains("dockerfile") || lower.ends_with(".dockerfile")
+}
+
+fn filename_looks_like_docker_archive(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let lower = name.to_lowercase();
+    // `.tar.gz` has extension `gz`, so check the compound suffix with ends_with.
+    lower.ends_with(".tar.gz")
+        || Path::new(&*lower)
+            .extension()
+            .is_some_and(|ext| ext == "tar" || ext == "tgz")
 }
 
 fn value_looks_like_local_source(value: &str) -> bool {
@@ -1196,6 +1224,43 @@ async fn build_from_dockerfile(
         &mut on_log,
     )
     .await?;
+
+    eprintln!();
+    eprintln!(
+        "{} Image {} is available in the local Docker daemon for gateway '{}'.",
+        "✓".green().bold(),
+        tag.cyan(),
+        gateway_name,
+    );
+    eprintln!();
+
+    Ok(tag)
+}
+
+/// Load a Docker archive and return the image tag.
+///
+/// Local-gateway only — same constraint as Dockerfile sources.
+async fn load_from_docker_archive(archive_path: &Path, gateway_name: &str) -> Result<String> {
+    let metadata = get_gateway_metadata(gateway_name);
+    if !dockerfile_sources_supported_for_gateway(metadata.as_ref()) {
+        return Err(miette!(
+            "local Docker archive sources are only supported for local gateways; gateway '{}' is remote",
+            gateway_name
+        ));
+    }
+
+    eprintln!(
+        "Loading Docker archive {} for gateway '{}'",
+        archive_path.display().to_string().cyan(),
+        gateway_name,
+    );
+    eprintln!();
+
+    let mut on_log = |msg: String| {
+        eprintln!("  {msg}");
+    };
+
+    let tag = openshell_bootstrap::build::load_docker_archive(archive_path, &mut on_log).await?;
 
     eprintln!();
     eprintln!(
@@ -7701,8 +7766,8 @@ mod tests {
                         .expect("failed to canonicalize context")
                 );
             }
-            super::ResolvedSource::Image(image) => {
-                panic!("expected Dockerfile source, got image {image}");
+            other => {
+                panic!("expected Dockerfile source, got {other:?}");
             }
         }
     }
@@ -7727,10 +7792,103 @@ mod tests {
 
         match resolve_from(image_ref).expect("expected image source") {
             super::ResolvedSource::Image(image) => assert_eq!(image, image_ref),
-            super::ResolvedSource::Dockerfile { .. } => {
-                panic!("expected image ref, got Dockerfile source");
+            other => {
+                panic!("expected image ref, got {other:?}");
             }
         }
+    }
+
+    #[test]
+    fn resolve_from_classifies_tar_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("image.tar");
+        fs::write(&archive, b"fake tar content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected DockerArchive source")
+        {
+            super::ResolvedSource::DockerArchive { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other => panic!("expected DockerArchive source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_from_classifies_tar_gz_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("image.tar.gz");
+        fs::write(&archive, b"fake tar.gz content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected DockerArchive source")
+        {
+            super::ResolvedSource::DockerArchive { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other => panic!("expected DockerArchive source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_from_classifies_tgz_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("image.tgz");
+        fs::write(&archive, b"fake tgz content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected DockerArchive source")
+        {
+            super::ResolvedSource::DockerArchive { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other => panic!("expected DockerArchive source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_from_rejects_missing_tar_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let missing = temp.path().join("missing.tar");
+
+        let err = resolve_from(missing.to_str().expect("temp path is not UTF-8"))
+            .expect_err("expected missing archive to be rejected");
+
+        assert!(
+            err.to_string().contains("local --from path does not exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn filename_looks_like_docker_archive_detects_extensions() {
+        use super::filename_looks_like_docker_archive;
+        assert!(filename_looks_like_docker_archive(Path::new("image.tar")));
+        assert!(filename_looks_like_docker_archive(Path::new(
+            "image.tar.gz"
+        )));
+        assert!(filename_looks_like_docker_archive(Path::new("image.tgz")));
+        assert!(filename_looks_like_docker_archive(Path::new("IMAGE.TAR")));
+        assert!(filename_looks_like_docker_archive(Path::new(
+            "my-image.TAR.GZ"
+        )));
+        assert!(!filename_looks_like_docker_archive(Path::new("Dockerfile")));
+        assert!(!filename_looks_like_docker_archive(Path::new("image.zip")));
     }
 
     #[test]
