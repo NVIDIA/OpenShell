@@ -265,9 +265,11 @@ impl ProxyHandle {
                 }
             }
 
+            let mut consecutive_fd_errors: u32 = 0;
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
+                        consecutive_fd_errors = 0;
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
@@ -314,14 +316,34 @@ impl ProxyHandle {
                         });
                     }
                     Err(err) => {
+                        // EMFILE (24) / ENFILE (23) indicate FD exhaustion —
+                        // back off exponentially to let connections drain.
+                        let is_fd_exhaustion = matches!(
+                            err.raw_os_error(),
+                            Some(24) | Some(23)
+                        );
+                        let (severity, backoff) = if is_fd_exhaustion {
+                            consecutive_fd_errors = consecutive_fd_errors.saturating_add(1);
+                            let backoff_ms = 100u64
+                                .saturating_mul(
+                                    1u64 << consecutive_fd_errors.min(6).saturating_sub(1),
+                                )
+                                .min(5_000);
+                            (SeverityId::Medium, std::time::Duration::from_millis(backoff_ms))
+                        } else {
+                            (SeverityId::Low, std::time::Duration::from_millis(100))
+                        };
                         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                             .activity(ActivityId::Fail)
-                            .severity(SeverityId::Low)
+                            .severity(severity)
                             .status(StatusId::Failure)
-                            .message(format!("Proxy accept error: {err}"))
+                            .message(format!(
+                                "Proxy accept error (retrying in {}ms): {err}",
+                                backoff.as_millis(),
+                            ))
                             .build();
                         ocsf_emit!(event);
-                        break;
+                        tokio::time::sleep(backoff).await;
                     }
                 }
             }
