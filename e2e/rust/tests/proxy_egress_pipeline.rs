@@ -16,7 +16,10 @@
 
 use std::io::{self, Error, ErrorKind, Write};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::sandbox::SandboxGuard;
@@ -84,7 +87,12 @@ async fn create_generic_provider(name: &str) -> Result<String, String> {
     .await
 }
 
-fn write_policy(host: &str, port: u16, endpoint_options: &str) -> Result<NamedTempFile, String> {
+fn write_policy_document(
+    host: &str,
+    port: u16,
+    endpoint_options: &str,
+    network_middlewares: &str,
+) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
     let policy = format!(
         r#"version: 1
@@ -111,6 +119,7 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 
+{network_middlewares}
 network_policies:
   proxy_egress_test:
     name: proxy_egress_test
@@ -128,6 +137,33 @@ network_policies:
     file.flush()
         .map_err(|error| format!("flush policy: {error}"))?;
     Ok(file)
+}
+
+fn write_policy(host: &str, port: u16, endpoint_options: &str) -> Result<NamedTempFile, String> {
+    write_policy_document(host, port, endpoint_options, "")
+}
+
+fn write_middleware_policy(
+    host: &str,
+    port: u16,
+    endpoint_options: &str,
+    on_error: &str,
+) -> Result<NamedTempFile, String> {
+    let network_middlewares = format!(
+        r#"network_middlewares:
+  regex-redactor:
+    name: Redact API tokens
+    middleware: openshell/regex
+    order: 10
+    config:
+      mode: redact
+    on_error: {on_error}
+    endpoints:
+      include: ["{host}"]
+      exclude: []
+"#
+    );
+    write_policy_document(host, port, endpoint_options, &network_middlewares)
 }
 
 fn write_denied_policy() -> Result<NamedTempFile, String> {
@@ -158,6 +194,50 @@ process:
 
 network_policies: {}
 "#;
+    file.write_all(policy.as_bytes())
+        .map_err(|error| format!("write policy: {error}"))?;
+    file.flush()
+        .map_err(|error| format!("flush policy: {error}"))?;
+    Ok(file)
+}
+
+fn write_ambiguous_policy(host: &str, port: u16) -> Result<NamedTempFile, String> {
+    let mut file = NamedTempFile::new().map_err(|error| format!("create policy: {error}"))?;
+    let policy = format!(
+        r#"version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  terminating:
+    name: terminating
+    endpoints:
+      - host: {host}
+        port: {port}
+{PRIVATE_ALLOWED_IPS}
+    binaries:
+      - path: "/**"
+  passthrough:
+    name: passthrough
+    endpoints:
+      - host: {host}
+        port: {port}
+        tls: skip
+{PRIVATE_ALLOWED_IPS}
+    binaries:
+      - path: "/**"
+"#
+    );
     file.write_all(policy.as_bytes())
         .map_err(|error| format!("write policy: {error}"))?;
     file.flush()
@@ -309,6 +389,7 @@ async fn read_http_request(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>
 
 struct KeepAliveHttpServer {
     port: u16,
+    connections: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 
@@ -321,14 +402,25 @@ impl KeepAliveHttpServer {
             .local_addr()
             .map_err(|error| format!("read HTTP server address: {error}"))?
             .port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let task_connections = Arc::clone(&connections);
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                task_connections.fetch_add(1, Ordering::AcqRel);
                 tokio::spawn(async move {
                     let _ = handle_keep_alive_connection(stream).await;
                 });
             }
         });
-        Ok(Self { port, task })
+        Ok(Self {
+            port,
+            connections,
+            task,
+        })
+    }
+
+    fn connection_count(&self) -> usize {
+        self.connections.load(Ordering::Acquire)
     }
 }
 
@@ -356,7 +448,54 @@ async fn handle_keep_alive_connection(mut stream: TcpStream) -> io::Result<()> {
 
 struct EchoServer {
     port: u16,
+    observed: Arc<Mutex<Vec<u8>>>,
     task: JoinHandle<()>,
+}
+
+struct RequestBodyEchoServer {
+    port: u16,
+    task: JoinHandle<()>,
+}
+
+impl RequestBodyEchoServer {
+    async fn start() -> Result<Self, String> {
+        let listener = TcpListener::bind(("0.0.0.0", 0))
+            .await
+            .map_err(|error| format!("bind request body echo server: {error}"))?;
+        let port = listener
+            .local_addr()
+            .map_err(|error| format!("read request body echo server address: {error}"))?
+            .port();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = handle_request_body_echo(stream).await;
+                });
+            }
+        });
+        Ok(Self { port, task })
+    }
+}
+
+impl Drop for RequestBodyEchoServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn handle_request_body_echo(mut stream: TcpStream) -> io::Result<()> {
+    let request = read_http_request(&mut stream)
+        .await?
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "missing HTTP request"))?;
+    let headers_end = header_end(&request)
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, "incomplete HTTP headers"))?;
+    let body = &request[headers_end..];
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.write_all(body).await
 }
 
 struct PipelineProbeServer {
@@ -430,22 +569,37 @@ impl EchoServer {
             .local_addr()
             .map_err(|error| format!("read echo server address: {error}"))?
             .port();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let task_observed = Arc::clone(&observed);
         let task = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                let observed = Arc::clone(&task_observed);
                 tokio::spawn(async move {
                     let mut buffer = [0_u8; 4096];
                     loop {
                         let Ok(read) = stream.read(&mut buffer).await else {
                             break;
                         };
-                        if read == 0 || stream.write_all(&buffer[..read]).await.is_err() {
+                        if read == 0 {
+                            break;
+                        }
+                        observed.lock().unwrap().extend_from_slice(&buffer[..read]);
+                        if stream.write_all(&buffer[..read]).await.is_err() {
                             break;
                         }
                     }
                 });
             }
         });
-        Ok(Self { port, task })
+        Ok(Self {
+            port,
+            observed,
+            task,
+        })
+    }
+
+    fn observed_bytes(&self) -> Vec<u8> {
+        self.observed.lock().unwrap().clone()
     }
 }
 
@@ -790,6 +944,140 @@ async fn policy_reload_updates_both_adapters_and_closes_existing_http_tunnel() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn ambiguous_policy_update_fails_closed_without_contacting_upstream() {
+    let server = KeepAliveHttpServer::start()
+        .await
+        .expect("start keep-alive HTTP server");
+    let valid_policy = write_policy(TEST_SERVER_HOST, server.port, "").expect("write valid policy");
+    let ambiguous_policy =
+        write_ambiguous_policy(TEST_SERVER_HOST, server.port).expect("write ambiguous policy");
+    let valid_policy_path = policy_path(&valid_policy);
+    let ambiguous_policy_path = policy_path(&ambiguous_policy);
+
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", &valid_policy_path],
+        &["sh", "-c", "echo Ready; sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create keep sandbox");
+
+    run_cli(&[
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &valid_policy_path,
+        "--wait",
+        "--timeout",
+        "120",
+    ])
+    .await
+    .expect("wait for valid policy");
+
+    let status_script = proxy_status_script(TEST_SERVER_HOST, server.port);
+    let before = guard
+        .exec(&["python3", "-c", &status_script])
+        .await
+        .expect("exercise both adapters before invalid update");
+    let before = parse_json_line(&before);
+    assert_eq!(before["connect"], 200, "CONNECT before update: {before}");
+    assert_eq!(before["forward"], 200, "forward before update: {before}");
+    let connections_before_rejection = server.connection_count();
+
+    let update_error = run_cli(&[
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &ambiguous_policy_path,
+        "--wait",
+        "--timeout",
+        "120",
+    ])
+    .await
+    .expect_err("ambiguous policy must report a failed revision");
+    assert!(
+        update_error.contains("ambiguity validation failed"),
+        "policy update should explain the ambiguity:\n{update_error}"
+    );
+
+    let quarantined = guard
+        .exec(&["python3", "-c", &status_script])
+        .await
+        .expect("exercise both adapters in fail-closed quarantine");
+    let quarantined = parse_json_line(&quarantined);
+    assert_eq!(
+        quarantined["connect"], 403,
+        "CONNECT in quarantine: {quarantined}"
+    );
+    assert_eq!(
+        quarantined["forward"], 403,
+        "forward in quarantine: {quarantined}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        server.connection_count(),
+        connections_before_rejection,
+        "quarantined requests must not contact the upstream server"
+    );
+
+    let logs = run_cli(&[
+        "logs",
+        &guard.name,
+        "-n",
+        "500",
+        "--since",
+        "2m",
+        "--source",
+        "sandbox",
+    ])
+    .await
+    .expect("fetch sandbox logs after rejection");
+    assert!(
+        logs.contains("configured_mode=fail_closed effective_mode=fail_closed"),
+        "OCSF logs should state the effective validation posture:\n{logs}"
+    );
+    assert!(
+        logs.contains("previous policy IS NOT active"),
+        "OCSF logs should state that the previous policy is inactive:\n{logs}"
+    );
+    assert!(
+        logs.contains("conflicting metadata") && logs.contains("tls"),
+        "OCSF logs should contain the overlap rationale:\n{logs}"
+    );
+
+    run_cli(&[
+        "policy",
+        "set",
+        &guard.name,
+        "--policy",
+        &valid_policy_path,
+        "--wait",
+        "--timeout",
+        "120",
+    ])
+    .await
+    .expect("valid policy should exit quarantine");
+    let recovered = guard
+        .exec(&["python3", "-c", &status_script])
+        .await
+        .expect("exercise both adapters after recovery");
+    let recovered = parse_json_line(&recovered);
+    assert_eq!(
+        recovered["connect"], 200,
+        "CONNECT after recovery: {recovered}"
+    );
+    assert_eq!(
+        recovered["forward"], 200,
+        "forward after recovery: {recovered}"
+    );
+
+    guard.cleanup().await;
+}
+
+#[tokio::test]
 async fn destination_denial_modes_match_across_connect_and_forward_adapters() {
     let policy = write_destination_denial_policy().expect("write destination denial policy");
     let policy_path = policy_path(&policy);
@@ -856,16 +1144,9 @@ for name, target in targets.items():
 print(json.dumps(result, sort_keys=True))
 "#;
 
-    let guard = SandboxGuard::create(&[
-        "--policy",
-        &policy_path,
-        "--",
-        "python3",
-        "-c",
-        script,
-    ])
-    .await
-    .expect("sandbox create");
+    let guard = SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", script])
+        .await
+        .expect("sandbox create");
     let result = parse_json_line(&guard.create_output);
     for name in [
         "metadata",
@@ -928,12 +1209,9 @@ async fn explicit_allowed_ips_and_implicit_ip_literals_succeed_through_both_adap
     let implicit_server = KeepAliveHttpServer::start()
         .await
         .expect("start implicit IP-literal server");
-    let policy = write_ip_literal_success_policy(
-        &gateway_ip,
-        explicit_server.port,
-        implicit_server.port,
-    )
-    .expect("write IP literal policy");
+    let policy =
+        write_ip_literal_success_policy(&gateway_ip, explicit_server.port, implicit_server.port)
+            .expect("write IP literal policy");
     let policy_path = policy_path(&policy);
     let mut guard = SandboxGuard::create_keep_with_args(
         &["--policy", &policy_path],
@@ -948,11 +1226,7 @@ async fn explicit_allowed_ips_and_implicit_ip_literals_succeed_through_both_adap
         ("implicit_ip_literal", implicit_server.port),
     ] {
         let output = guard
-            .exec(&[
-                "python3",
-                "-c",
-                &proxy_status_script(&gateway_ip, port),
-            ])
+            .exec(&["python3", "-c", &proxy_status_script(&gateway_ip, port)])
             .await
             .unwrap_or_else(|error| panic!("exercise {mode}: {error}"));
         let statuses = parse_json_line(&output);
@@ -1019,6 +1293,261 @@ print("RAW_RELAY_OK")
 }
 
 #[tokio::test]
+async fn middleware_redacts_request_bodies_through_both_adapters() {
+    let server = RequestBodyEchoServer::start()
+        .await
+        .expect("start request body echo server");
+    let policy = write_middleware_policy(TEST_SERVER_HOST, server.port, "", "fail_closed")
+        .expect("write middleware policy");
+    let policy_path = policy_path(&policy);
+    let script = format!(
+        r#"
+import json
+import os
+import socket
+import urllib.parse
+
+HOST = {host:?}
+PORT = {port}
+SECRET = "sk-1234567890abcdef"
+
+proxy_url = next(
+    os.environ[name]
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
+    if os.environ.get(name)
+)
+parsed = urllib.parse.urlparse(proxy_url)
+
+def read_response(sock):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("incomplete response headers")
+        data += chunk
+    headers, body = data.split(b"\r\n\r\n", 1)
+    length = 0
+    for line in headers.split(b"\r\n")[1:]:
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1].strip())
+    while len(body) < length:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        body += chunk
+    status = int(headers.split(None, 2)[1])
+    if status != 200:
+        raise RuntimeError(f"request failed with HTTP {{status}}: {{body!r}}")
+    return json.loads(body[:length])
+
+def request_bytes(target):
+    body = json.dumps({{"api_key": SECRET}}, separators=(",", ":")).encode()
+    return (
+        f"POST {{target}} HTTP/1.1\r\n"
+        f"Host: {{HOST}}:{{PORT}}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {{len(body)}}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode() + body
+
+target = f"{{HOST}}:{{PORT}}"
+with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as forward_sock:
+    forward_sock.sendall(request_bytes(f"http://{{target}}/middleware"))
+    forward = read_response(forward_sock)
+
+with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as connect_sock:
+    connect_sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode())
+    connect_response = b""
+    while b"\r\n\r\n" not in connect_response:
+        connect_response += connect_sock.recv(4096)
+    if int(connect_response.split(None, 2)[1]) != 200:
+        raise RuntimeError("CONNECT was denied")
+    connect_sock.sendall(request_bytes("/middleware"))
+    connect = read_response(connect_sock)
+
+print(json.dumps({{"connect": connect, "forward": forward}}, sort_keys=True))
+"#,
+        host = TEST_SERVER_HOST,
+        port = server.port,
+    );
+
+    let guard = SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+        .await
+        .expect("sandbox create");
+    let result = parse_json_line(&guard.create_output);
+    for adapter in ["connect", "forward"] {
+        assert_eq!(
+            result[adapter]["api_key"], "[REDACTED]",
+            "{adapter} did not deliver the middleware-transformed body: {result}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fail_closed_middleware_blocks_uninspectable_connect_payload_before_upstream() {
+    let server = EchoServer::start().await.expect("start TCP echo server");
+    let policy = write_middleware_policy(TEST_SERVER_HOST, server.port, "", "fail_closed")
+        .expect("write fail-closed middleware policy");
+    let policy_path = policy_path(&policy);
+    let script = format!(
+        r#"
+import os
+import socket
+import urllib.parse
+
+HOST = {host:?}
+PORT = {port}
+PAYLOAD = bytes([0x00, 0xff, 0x13, 0x37]) + b"not-http-or-tls"
+
+proxy_url = next(
+    os.environ[name]
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
+    if os.environ.get(name)
+)
+parsed = urllib.parse.urlparse(proxy_url)
+with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as sock:
+    target = f"{{HOST}}:{{PORT}}"
+    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode())
+    response = b""
+    while b"\r\n\r\n" not in response:
+        response += sock.recv(4096)
+    if int(response.split(None, 2)[1]) != 200:
+        raise RuntimeError("CONNECT was denied before tunnel establishment")
+    sock.sendall(PAYLOAD)
+    denial = b""
+    while True:
+        try:
+            chunk = sock.recv(4096)
+        except ConnectionResetError:
+            break
+        if not chunk:
+            break
+        denial += chunk
+    if denial and (
+        b"HTTP/1.1 403 Forbidden" not in denial
+        or b"unsupported_l7_protocol" not in denial
+    ):
+        raise RuntimeError(f"missing fail-closed middleware denial: {{denial!r}}")
+print("UNINSPECTABLE_MIDDLEWARE_BLOCKED")
+"#,
+        host = TEST_SERVER_HOST,
+        port = server.port,
+    );
+
+    let mut guard = SandboxGuard::create_keep_with_args(
+        &["--policy", &policy_path],
+        &["sh", "-c", "echo Ready; sleep infinity"],
+        "Ready",
+    )
+    .await
+    .expect("create keep sandbox");
+    let output = guard
+        .exec(&["python3", "-c", &script])
+        .await
+        .expect("exercise uninspectable fail-closed middleware");
+    assert!(
+        output.contains("UNINSPECTABLE_MIDDLEWARE_BLOCKED"),
+        "uninspectable payload was not blocked:\n{output}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        server.observed_bytes().is_empty(),
+        "uninspectable payload reached upstream before middleware denial"
+    );
+
+    let logs = run_cli(&[
+        "logs",
+        &guard.name,
+        "-n",
+        "500",
+        "--since",
+        "2m",
+        "--source",
+        "sandbox",
+    ])
+    .await
+    .expect("fetch sandbox logs after middleware denial");
+    assert!(
+        logs.contains("openshell.middleware.traffic_uninspectable")
+            && logs
+                .contains("Unsupported tunnel protocol cannot be inspected by required middleware"),
+        "OCSF logs should explain the fail-closed denial:\n{logs}"
+    );
+
+    guard.cleanup().await;
+}
+
+#[tokio::test]
+async fn fail_open_middleware_bypasses_uninspectable_tls_skip_connect() {
+    let server = EchoServer::start().await.expect("start TCP echo server");
+    let policy = write_middleware_policy(
+        TEST_SERVER_HOST,
+        server.port,
+        "        tls: skip",
+        "fail_open",
+    )
+    .expect("write fail-open middleware policy");
+    let policy_path = policy_path(&policy);
+    let script = format!(
+        r#"
+import os
+import socket
+import urllib.parse
+
+HOST = {host:?}
+PORT = {port}
+PAYLOAD = bytes([0x00, 0xff, 0x13, 0x37, 0x80]) + b"middleware-bypass"
+
+proxy_url = next(
+    os.environ[name]
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy")
+    if os.environ.get(name)
+)
+parsed = urllib.parse.urlparse(proxy_url)
+with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=10) as sock:
+    target = f"{{HOST}}:{{PORT}}"
+    sock.sendall(f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n".encode())
+    response = b""
+    while b"\r\n\r\n" not in response:
+        response += sock.recv(4096)
+    if int(response.split(None, 2)[1]) != 200:
+        raise RuntimeError("CONNECT was denied")
+    sock.sendall(PAYLOAD)
+    echoed = b""
+    while len(echoed) < len(PAYLOAD):
+        chunk = sock.recv(len(PAYLOAD) - len(echoed))
+        if not chunk:
+            break
+        echoed += chunk
+    if echoed != PAYLOAD:
+        raise RuntimeError(f"fail-open middleware did not preserve raw relay: {{echoed!r}}")
+print("UNINSPECTABLE_MIDDLEWARE_BYPASSED")
+"#,
+        host = TEST_SERVER_HOST,
+        port = server.port,
+    );
+
+    let guard = SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+        .await
+        .expect("sandbox create");
+    assert!(
+        guard
+            .create_output
+            .contains("UNINSPECTABLE_MIDDLEWARE_BYPASSED"),
+        "fail-open middleware did not bypass uninspectable traffic:\n{}",
+        guard.create_output
+    );
+    assert_eq!(
+        server.observed_bytes(),
+        [0x00, 0xff, 0x13, 0x37, 0x80]
+            .into_iter()
+            .chain(*b"middleware-bypass")
+            .collect::<Vec<_>>(),
+        "upstream did not receive the unchanged fail-open payload"
+    );
+}
+
+#[tokio::test]
 async fn forward_pipeline_never_reaches_upstream_as_first_request_overflow() {
     let server = PipelineProbeServer::start()
         .await
@@ -1069,16 +1598,9 @@ print("FORWARD_PIPELINE_CLOSED")
         port = server.port,
     );
 
-    let guard = SandboxGuard::create(&[
-        "--policy",
-        &policy_path,
-        "--",
-        "python3",
-        "-c",
-        &script,
-    ])
-    .await
-    .expect("sandbox create");
+    let guard = SandboxGuard::create(&["--policy", &policy_path, "--", "python3", "-c", &script])
+        .await
+        .expect("sandbox create");
     assert!(
         guard.create_output.contains("FORWARD_PIPELINE_CLOSED"),
         "forward proxy did not close after one response:\n{}",
@@ -1087,7 +1609,10 @@ print("FORWARD_PIPELINE_CLOSED")
 
     let observed = String::from_utf8(server.observed_request()).expect("upstream HTTP request");
     assert!(observed.starts_with("GET /allowed HTTP/1.1\r\n"));
-    assert!(observed.contains("Connection: close\r\n"));
+    assert!(
+        !observed.to_ascii_lowercase().contains("\r\nconnection:"),
+        "shared relay must remove hop-by-hop connection headers:\n{observed}"
+    );
     assert!(!observed.contains("/blocked"));
 }
 
