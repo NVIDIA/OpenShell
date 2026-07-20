@@ -203,11 +203,11 @@ impl InferenceContext {
     }
 }
 
-#[derive(Debug)]
 pub struct ProxyHandle {
     #[allow(dead_code)]
     http_addr: Option<SocketAddr>,
     join: JoinHandle<()>,
+    exited_rx: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl ProxyHandle {
@@ -312,7 +312,13 @@ impl ProxyHandle {
             ocsf_emit!(event);
         }
 
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
         let join = tokio::spawn(async move {
+            // Hold the sender for the lifetime of this task — when the task
+            // exits (panic, abort, or loop break), the sender drops and the
+            // receiver fires, notifying the sandbox that the proxy is gone.
+            let _proxy_exit_guard = exited_tx;
+
             // Wait for the OPA engine's symlink resolution reload to complete
             // before accepting connections. This prevents requests from
             // observing a generation transition mid-flight, which would cause
@@ -423,12 +429,20 @@ impl ProxyHandle {
         Ok(Self {
             http_addr: Some(local_addr),
             join,
+            exited_rx,
         })
     }
 
     #[allow(dead_code)]
     pub const fn http_addr(&self) -> Option<SocketAddr> {
         self.http_addr
+    }
+
+    /// Take the exit notification receiver for health monitoring.
+    /// Resolves when the proxy accept loop task exits for any reason.
+    pub fn take_exit_receiver(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+        let (_tx, dummy_rx) = tokio::sync::oneshot::channel();
+        std::mem::replace(&mut self.exited_rx, dummy_rx)
     }
 }
 
