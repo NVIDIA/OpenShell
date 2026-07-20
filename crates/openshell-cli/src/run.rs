@@ -4,18 +4,17 @@
 //! CLI command implementations.
 
 pub use crate::commands::common::{
-    PolicyGetView, confirm_global_setting_delete, confirm_global_setting_takeover,
-    is_valid_env_name, parse_credential_expiry_cli_value, parse_credential_expiry_value,
-    parse_duration_to_ms, parse_env_pairs, parse_key_value_pairs, parse_secret_material_env_pairs,
+    PolicyGetView, parse_credential_expiry_cli_value, parse_env_pairs, parse_key_value_pairs,
 };
 use crate::commands::common::{
-    ProvisioningDisplay, ProvisioningStep, format_epoch_ms, format_optional_epoch_ms,
+    ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
+    confirm_global_setting_takeover, format_epoch_ms, format_optional_epoch_ms,
     format_setting_value, format_timestamp, format_timestamp_ms, handle_platform_progress_event,
     is_provisioning_progress_event, non_empty_or, parse_cli_setting_value,
-    parse_credential_expiry_pairs, parse_credential_pairs, phase_name, print_policy_merge_warnings,
-    print_sandbox_header, print_sandbox_policy, provisioning_timeout_message,
-    ready_false_condition_message, scrub_git_env, short_hash, truncate_display,
-    truncate_status_field,
+    parse_credential_expiry_pairs, parse_credential_pairs, parse_duration_to_ms,
+    parse_secret_material_env_pairs, phase_name, print_policy_merge_warnings, print_sandbox_header,
+    print_sandbox_policy, provisioning_timeout_message, ready_false_condition_message,
+    scrub_git_env, short_hash, truncate_display, truncate_status_field,
 };
 
 use crate::policy_update::build_policy_update_plan;
@@ -3023,8 +3022,6 @@ async fn sandbox_exec_interactive_grpc(
 
     Ok(exit_code)
 }
-
-/// Print a single YAML line with dimmed keys and regular values.
 
 /// List sandboxes.
 #[allow(clippy::too_many_arguments)]

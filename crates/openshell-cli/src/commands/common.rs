@@ -620,6 +620,10 @@ pub fn parse_cli_setting_value(key: &str, raw_value: &str) -> Result<SettingValu
 
     let value = match setting.kind {
         SettingValueKind::String => {
+            // Reject typos client-side so `openshell settings set ...
+            // proposal_approval_mode autom` errors immediately instead of
+            // round-tripping through the server. The server enforces the
+            // same check independently for non-CLI callers.
             setting
                 .validate_string_value(raw_value)
                 .map_err(|allowed| {
