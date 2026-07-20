@@ -5,6 +5,26 @@
 
 use std::path::Path;
 
+/// `SELinux` relabelling mode for bind mounts.
+///
+/// On hosts with `SELinux` enabled (e.g. Fedora, RHEL) a bind-mounted path
+/// must be relabelled so the container process can access it.
+///
+/// * `shared` (`:z`) — the label is shared across all containers that mount
+///   the same path.  Safe when multiple sandboxes read the same data set.
+/// * `private` (`:Z`) — the label is private to *this* container.  The host
+///   directory becomes inaccessible to other containers (and potentially to
+///   the host) until the container is removed.  Use only when exclusive
+///   ownership is acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelinuxLabel {
+    /// Shared `SELinux` label (`:z`).
+    Shared,
+    /// Private `SELinux` label (`:Z`).
+    Private,
+}
+
 const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/opt/openshell",
     "/etc/openshell",
@@ -13,31 +33,35 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
 ];
 
 /// Validate a non-empty driver mount source.
-pub fn validate_mount_source(source: &str, field: &str) -> Result<String, String> {
-    let source = source.trim();
+pub fn validate_mount_source(source: &str, field: &str) -> Result<(), String> {
     if source.is_empty() {
         return Err(format!("{field} must not be empty"));
+    }
+    if source != source.trim() {
+        return Err(format!("{field} must not contain surrounding whitespace"));
     }
     if source.as_bytes().contains(&0) {
         return Err(format!("{field} must not contain NUL bytes"));
     }
-    Ok(source.to_string())
+    Ok(())
 }
 
 /// Validate a bind mount source as an absolute host path.
-pub fn validate_absolute_mount_source(source: &str, field: &str) -> Result<String, String> {
-    let source = validate_mount_source(source, field)?;
-    if !Path::new(&source).is_absolute() {
+pub fn validate_absolute_mount_source(source: &str, field: &str) -> Result<(), String> {
+    validate_mount_source(source, field)?;
+    if !Path::new(source).is_absolute() {
         return Err(format!("{field} must be an absolute host path"));
     }
-    Ok(source)
+    Ok(())
 }
 
 /// Validate a relative subpath inside a runtime-managed mount source.
-pub fn validate_mount_subpath(subpath: &str) -> Result<String, String> {
-    let subpath = subpath.trim();
+pub fn validate_mount_subpath(subpath: &str) -> Result<(), String> {
     if subpath.is_empty() {
         return Err("mount subpath must not be empty".to_string());
+    }
+    if subpath != subpath.trim() {
+        return Err("mount subpath must not contain surrounding whitespace".to_string());
     }
     if subpath.as_bytes().contains(&0) {
         return Err("mount subpath must not contain NUL bytes".to_string());
@@ -50,14 +74,16 @@ pub fn validate_mount_subpath(subpath: &str) -> Result<String, String> {
     {
         return Err("mount subpath must be relative and must not contain '..'".to_string());
     }
-    Ok(subpath.to_string())
+    Ok(())
 }
 
 /// Validate a container-side mount target for user-supplied driver mounts.
-pub fn validate_container_mount_target(target: &str) -> Result<String, String> {
-    let target = normalize_container_mount_target(target);
+pub fn validate_container_mount_target(target: &str) -> Result<(), String> {
     if target.is_empty() {
         return Err("mount target must not be empty".to_string());
+    }
+    if target != target.trim() {
+        return Err("mount target must not contain surrounding whitespace".to_string());
     }
     if target.as_bytes().contains(&0) {
         return Err("mount target must not contain NUL bytes".to_string());
@@ -65,42 +91,53 @@ pub fn validate_container_mount_target(target: &str) -> Result<String, String> {
     if !target.starts_with('/') {
         return Err("mount target must be an absolute container path".to_string());
     }
-    if target == "/" {
+    if target != "/" {
+        let segments = target.split('/').skip(1).collect::<Vec<_>>();
+        let has_internal_empty_segment = segments
+            .iter()
+            .take(segments.len().saturating_sub(1))
+            .any(|segment| segment.is_empty());
+        if has_internal_empty_segment || segments.contains(&".") {
+            return Err(
+                "mount target must be normalized and must not contain empty path segments or '.'"
+                    .to_string(),
+            );
+        }
+    }
+    let path = Path::new(target);
+    if path == Path::new("/") {
         return Err("mount target must not be the container root".to_string());
     }
-    let path = Path::new(&target);
     if path
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
     {
         return Err("mount target must not contain '..'".to_string());
     }
-    if target == "/sandbox" {
+    if path == Path::new("/sandbox") {
         return Err("mount target '/sandbox' is reserved for the OpenShell workspace".to_string());
     }
     for reserved in RESERVED_MOUNT_TARGETS {
-        if path_is_or_under(&target, reserved) {
+        if path_is_or_under(path, Path::new(reserved)) {
             return Err(format!(
                 "mount target '{target}' conflicts with reserved OpenShell path '{reserved}'"
             ));
         }
     }
-    Ok(target)
+    Ok(())
 }
 
-fn normalize_container_mount_target(target: &str) -> String {
-    let target = target.trim();
+/// Normalize a validated container-side mount target for semantic comparison.
+pub fn normalize_mount_target(target: &str) -> String {
     if target == "/" {
         return target.to_string();
     }
     target.trim_end_matches('/').to_string()
 }
 
-fn path_is_or_under(path: &str, parent: &str) -> bool {
-    path == parent
-        || path
-            .strip_prefix(parent)
-            .is_some_and(|rest| rest.starts_with('/'))
+/// Return true when `path` is exactly `parent` or is contained below it.
+pub fn path_is_or_under(path: &Path, parent: &Path) -> bool {
+    path == parent || path.starts_with(parent)
 }
 
 #[cfg(test)]
@@ -109,10 +146,8 @@ mod tests {
 
     #[test]
     fn container_target_allows_paths_under_workspace() {
-        assert_eq!(
-            validate_container_mount_target("/sandbox/work/").unwrap(),
-            "/sandbox/work"
-        );
+        validate_container_mount_target("/sandbox/work/").unwrap();
+        assert_eq!(normalize_mount_target("/sandbox/work/"), "/sandbox/work");
     }
 
     #[test]
@@ -138,16 +173,46 @@ mod tests {
 
     #[test]
     fn container_target_does_not_prefix_match_unrelated_paths() {
-        assert_eq!(
-            validate_container_mount_target("/etc/openshell-tools").unwrap(),
-            "/etc/openshell-tools"
-        );
+        validate_container_mount_target("/etc/openshell-tools").unwrap();
     }
 
     #[test]
     fn mount_subpath_must_be_relative_without_parent_dirs() {
-        assert_eq!(validate_mount_subpath(" project/a ").unwrap(), "project/a");
+        assert!(validate_mount_subpath("project/a").is_ok());
+        assert!(validate_mount_subpath(" project/a ").is_err());
         assert!(validate_mount_subpath("/project").is_err());
         assert!(validate_mount_subpath("../project").is_err());
+    }
+
+    #[test]
+    fn mount_values_reject_surrounding_whitespace() {
+        assert_eq!(
+            validate_mount_source(" volume ", "volume source").unwrap_err(),
+            "volume source must not contain surrounding whitespace"
+        );
+        assert_eq!(
+            validate_absolute_mount_source(" /host/path", "bind source").unwrap_err(),
+            "bind source must not contain surrounding whitespace"
+        );
+        assert_eq!(
+            validate_container_mount_target("/sandbox/work ").unwrap_err(),
+            "mount target must not contain surrounding whitespace"
+        );
+    }
+    #[test]
+    fn mount_target_rejects_internal_empty_or_dot_segments() {
+        assert_eq!(
+            validate_container_mount_target("/sandbox/work//tmp").unwrap_err(),
+            "mount target must be normalized and must not contain empty path segments or '.'"
+        );
+        assert_eq!(
+            validate_container_mount_target("/sandbox/work/./tmp").unwrap_err(),
+            "mount target must be normalized and must not contain empty path segments or '.'"
+        );
+        assert_eq!(
+            validate_container_mount_target("/sandbox/work/../../tmp").unwrap_err(),
+            "mount target must not contain '..'"
+        );
+        validate_container_mount_target("/sandbox/work/").unwrap();
     }
 }

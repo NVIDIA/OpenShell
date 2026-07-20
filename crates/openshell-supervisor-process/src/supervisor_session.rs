@@ -235,12 +235,14 @@ pub fn spawn(
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
+    expected_ssh_peer_pid: Option<u32>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_session_loop(
         endpoint,
         sandbox_id,
         ssh_socket_path,
         netns_fd,
+        expected_ssh_peer_pid,
     ))
 }
 
@@ -249,6 +251,7 @@ async fn run_session_loop(
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
+    expected_ssh_peer_pid: Option<u32>,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
@@ -256,7 +259,15 @@ async fn run_session_loop(
     loop {
         attempt += 1;
 
-        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path, netns_fd).await {
+        match run_single_session(
+            &endpoint,
+            &sandbox_id,
+            &ssh_socket_path,
+            netns_fd,
+            expected_ssh_peer_pid,
+        )
+        .await
+        {
             Ok(()) => {
                 let event =
                     session_closed_event(openshell_ocsf::ctx::ctx(), &endpoint, &sandbox_id);
@@ -283,6 +294,7 @@ async fn run_single_session(
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
+    expected_ssh_peer_pid: Option<u32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -352,6 +364,7 @@ async fn run_single_session(
                     sandbox_id,
                     ssh_socket_path,
                     netns_fd,
+                    expected_ssh_peer_pid,
                     &channel,
                     &tx,
                 );
@@ -375,6 +388,7 @@ fn handle_gateway_message(
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
+    expected_ssh_peer_pid: Option<u32>,
     channel: &grpc_client::AuthedChannel,
     tx: &mpsc::Sender<SupervisorMessage>,
 ) {
@@ -395,7 +409,16 @@ fn handle_gateway_message(
 
             tokio::spawn(async move {
                 let event_open = relay_open.clone();
-                match handle_relay_open(relay_open, &ssh_socket_path, netns_fd, channel, tx).await {
+                match handle_relay_open(
+                    relay_open,
+                    &ssh_socket_path,
+                    netns_fd,
+                    expected_ssh_peer_pid,
+                    channel,
+                    tx,
+                )
+                .await
+                {
                     Ok(()) => {
                         let event = relay_closed_event(
                             openshell_ocsf::ctx::ctx(),
@@ -446,11 +469,19 @@ async fn handle_relay_open(
     relay_open: RelayOpen,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
+    expected_ssh_peer_pid: Option<u32>,
     channel: grpc_client::AuthedChannel,
     tx: mpsc::Sender<SupervisorMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel_id = relay_open.channel_id.clone();
-    let target = match open_target(&relay_open, ssh_socket_path, netns_fd).await {
+    let target = match open_target(
+        &relay_open,
+        ssh_socket_path,
+        netns_fd,
+        expected_ssh_peer_pid,
+    )
+    .await
+    {
         Ok(target) => target,
         Err(err) => {
             send_relay_open_result(&tx, &channel_id, false, err.to_string()).await;
@@ -576,11 +607,23 @@ async fn open_target(
     relay_open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
+    expected_ssh_peer_pid: Option<u32>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     match relay_open.target.as_ref() {
         Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, netns_fd).await,
         Some(relay_open::Target::Ssh(_)) | None => {
-            let stream = tokio::net::UnixStream::connect(ssh_socket_path).await?;
+            let runtime_path = crate::unix_socket::runtime_path(ssh_socket_path);
+            let stream = tokio::net::UnixStream::connect(runtime_path.as_ref()).await?;
+            if let Some(expected_pid) = expected_ssh_peer_pid {
+                let credentials = stream.peer_cred()?;
+                let actual_pid = credentials.pid().and_then(|pid| u32::try_from(pid).ok());
+                if actual_pid != Some(expected_pid) {
+                    return Err(format!(
+                        "SSH relay peer PID mismatch: expected {expected_pid}, got {actual_pid:?}"
+                    )
+                    .into());
+                }
+            }
             Ok(Box::new(stream))
         }
     }
@@ -894,5 +937,38 @@ mod ocsf_event_tests {
         let err = map_stream_message::<SupervisorMessage>(Ok(None), "gateway closed stream")
             .expect_err("eof should force reconnect");
         assert_eq!(err.to_string(), "gateway closed stream");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ssh_target_requires_authenticated_supervisor_peer_pid() {
+        let socket =
+            std::path::PathBuf::from(format!("@openshell-relay-test-{}", uuid::Uuid::new_v4()));
+        let runtime_path = crate::unix_socket::runtime_path(&socket);
+        let listener = tokio::net::UnixListener::bind(runtime_path.as_ref()).unwrap();
+        let accept_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (_stream, _) = listener.accept().await.unwrap();
+            }
+        });
+        let relay = ssh_relay_open("peer-check");
+
+        let trusted = open_target(&relay, &socket, None, Some(std::process::id()))
+            .await
+            .expect("matching peer PID should be accepted");
+        drop(trusted);
+
+        let Err(err) = open_target(
+            &relay,
+            &socket,
+            None,
+            Some(std::process::id().saturating_add(1)),
+        )
+        .await
+        else {
+            panic!("mismatched peer PID must be rejected");
+        };
+        assert!(err.to_string().contains("peer PID mismatch"));
+        accept_task.await.unwrap();
     }
 }

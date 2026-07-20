@@ -13,8 +13,8 @@ import tempfile
 import threading
 import time
 from collections import namedtuple
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Never, SupportsIndex, cast
 from urllib.parse import urlparse
 
 import grpc
@@ -130,11 +130,42 @@ class SandboxStatusRef:
     current_policy_version: int
 
 
+class _ImmutableLabels(dict[str, str]):
+    """A read-only, copy- and pickle-safe label mapping."""
+
+    def _deny_mutation(self, *args: object, **kwargs: object) -> Never:
+        del args, kwargs
+        raise TypeError("sandbox labels are immutable")
+
+    __setitem__ = _deny_mutation
+    __delitem__ = _deny_mutation
+    clear = _deny_mutation
+    pop = _deny_mutation
+    popitem = _deny_mutation
+    setdefault = _deny_mutation
+    update = _deny_mutation
+    __ior__ = _deny_mutation
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _ImmutableLabels:
+        del memo
+        return type(self)(self)
+
+    def __reduce_ex__(self, protocol: SupportsIndex, /) -> str | tuple[Any, ...]:
+        del protocol
+        return type(self), (dict(self),)
+
+
 @dataclass(frozen=True)
 class SandboxRef:
     id: str
     name: str
     status: SandboxStatusRef
+    # Excluded from equality/hash to preserve the original identity while the
+    # immutable mapping remains safe for deepcopy, pickle, and asdict.
+    labels: Mapping[str, str] = field(default_factory=_ImmutableLabels, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
 
     @property
     def phase(self) -> int:
@@ -397,10 +428,16 @@ class SandboxClient:
         self,
         *,
         spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
-            openshell_pb2.CreateSandboxRequest(spec=request_spec),
+            openshell_pb2.CreateSandboxRequest(
+                spec=request_spec,
+                name=name or "",
+                labels=dict(labels) if labels else {},
+            ),
             timeout=self._timeout,
         )
         sandbox_ref = _sandbox_ref(response.sandbox)
@@ -412,8 +449,10 @@ class SandboxClient:
         self,
         *,
         spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
     ) -> SandboxSession:
-        return SandboxSession(self, self.create(spec=spec))
+        return SandboxSession(self, self.create(spec=spec, name=name, labels=labels))
 
     def get(self, sandbox_name: str) -> SandboxRef:
         response = self._stub.GetSandbox(
@@ -425,15 +464,36 @@ class SandboxClient:
     def get_session(self, sandbox_name: str) -> SandboxSession:
         return SandboxSession(self, self.get(sandbox_name))
 
-    def list(self, *, limit: int = 100, offset: int = 0) -> builtins.list[SandboxRef]:
+    def list(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[SandboxRef]:
         response = self._stub.ListSandboxes(
-            openshell_pb2.ListSandboxesRequest(limit=limit, offset=offset),
+            openshell_pb2.ListSandboxesRequest(
+                limit=limit,
+                offset=offset,
+                label_selector=label_selector or "",
+            ),
             timeout=self._timeout,
         )
         return [_sandbox_ref(item) for item in response.sandboxes]
 
-    def list_ids(self, *, limit: int = 100, offset: int = 0) -> builtins.list[str]:
-        return [item.id for item in self.list(limit=limit, offset=offset)]
+    def list_ids(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        label_selector: str | None = None,
+    ) -> builtins.list[str]:
+        return [
+            item.id
+            for item in self.list(
+                limit=limit, offset=offset, label_selector=label_selector
+            )
+        ]
 
     def delete(self, sandbox_name: str) -> bool:
         response = self._stub.DeleteSandbox(
@@ -646,6 +706,8 @@ class Sandbox:
         sandbox: str | SandboxRef | None = None,
         delete_on_exit: bool = True,
         spec: openshell_pb2.SandboxSpec | None = None,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
         auto_refresh: bool = True,
@@ -665,6 +727,9 @@ class Sandbox:
         self._sandbox_input = sandbox
         self._delete_on_exit = delete_on_exit
         self._spec = spec
+        self._name = name
+        # Copy so later caller mutation cannot change what gets sent on enter.
+        self._labels = dict(labels) if labels is not None else None
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
         self._auto_refresh = auto_refresh
@@ -686,6 +751,15 @@ class Sandbox:
         return self._session.sandbox
 
     def __enter__(self) -> Sandbox:
+        # Creation metadata cannot be applied when attaching to an existing
+        # sandbox; reject it before opening a connection.
+        if self._sandbox_input is not None and (
+            self._name is not None or self._labels is not None
+        ):
+            raise SandboxError(
+                "name and labels cannot be set when attaching to an existing sandbox"
+            )
+
         client = SandboxClient.from_active_cluster(
             cluster=self._cluster,
             timeout=self._timeout,
@@ -696,7 +770,9 @@ class Sandbox:
         self._client = client
 
         if self._sandbox_input is None:
-            self._session = client.create_session(spec=self._spec)
+            self._session = client.create_session(
+                spec=self._spec, name=self._name, labels=self._labels
+            )
         elif isinstance(self._sandbox_input, SandboxRef):
             self._session = SandboxSession(client, self._sandbox_input)
         else:
@@ -813,6 +889,7 @@ def _sandbox_ref(sandbox: openshell_pb2.Sandbox) -> SandboxRef:
             phase=status.phase if status else 0,
             current_policy_version=status.current_policy_version if status else 0,
         ),
+        labels=sandbox.metadata.labels if sandbox.metadata else {},
     )
 
 

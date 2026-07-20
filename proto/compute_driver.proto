@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
+import "options.proto";
 
 // Internal compute-driver contract used by the gateway.
 //
@@ -94,7 +95,7 @@ message DriverSandboxSpec {
   // the Kubernetes driver ignores this field and relies on its projected
   // ServiceAccount token bootstrap instead). Never echoed to the public
   // Sandbox proto.
-  string sandbox_token = 11;
+  string sandbox_token = 11 [(openshell.options.v1.secret) = true];
 }
 
 message ResourceRequirements {

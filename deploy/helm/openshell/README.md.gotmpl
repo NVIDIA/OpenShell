@@ -25,6 +25,8 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
 
 ## Install on OpenShift
 
+See the full [OpenShift install guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) for details. Quick start:
+
 ```shell
 # Precreate the openshell namespace so we can create the SCC cluster role
 oc create ns openshell

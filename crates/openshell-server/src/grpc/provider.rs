@@ -8,6 +8,10 @@
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
 };
+use crate::provider_profile_sources::{
+    EffectiveProviderProfileCatalog, ProviderProfileSources, profile_response_payload,
+    profile_storage_payload, stored_profile_resource_version, stored_provider_profile,
+};
 use openshell_core::proto::{
     Provider, ProviderCredentialTokenGrantAudienceOverride, ProviderProfile,
     ProviderProfileCredential, Sandbox,
@@ -63,8 +67,20 @@ impl ProviderEnvironment {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn create_provider_record(
     store: &Store,
+    provider: Provider,
+) -> Result<Provider, Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    create_provider_record_with_catalog(store, &catalog, provider).await
+}
+
+pub(super) async fn create_provider_record_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     mut provider: Provider,
 ) -> Result<Provider, Status> {
     use crate::persistence::{ObjectName, current_time_ms};
@@ -78,6 +94,7 @@ pub(super) async fn create_provider_record(
             created_at_ms: now_ms,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
         });
     }
 
@@ -98,7 +115,7 @@ pub(super) async fn create_provider_record(
         return Err(Status::invalid_argument("provider.type is required"));
     }
     if provider.credentials.is_empty()
-        && !provider_type_allows_empty_credentials(store, &provider.r#type).await?
+        && !provider_type_allows_empty_credentials(catalog, &provider.r#type)
     {
         return Err(Status::invalid_argument(
             "provider.credentials must not be empty",
@@ -173,8 +190,20 @@ pub(super) async fn list_provider_records(
         .collect())
 }
 
+#[cfg(test)]
 pub(super) async fn update_provider_record(
     store: &Store,
+    provider: Provider,
+) -> Result<Provider, Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    update_provider_record_with_catalog(store, &catalog, provider).await
+}
+
+pub(super) async fn update_provider_record_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider: Provider,
 ) -> Result<Provider, Status> {
     use crate::persistence::{ObjectId, ObjectName};
@@ -230,7 +259,8 @@ pub(super) async fn update_provider_record(
     // #1347.
     super::validation::validate_object_metadata(candidate.metadata.as_ref(), "provider")?;
     validate_provider_mutable_fields(&candidate)?;
-    validate_provider_update_against_attached_sandboxes(store, &candidate).await?;
+    validate_provider_update_against_attached_sandboxes_with_catalog(store, catalog, &candidate)
+        .await?;
 
     // Serialize labels for storage
     let labels_map = candidate.object_labels();
@@ -431,8 +461,20 @@ fn merge_i64_map(
 /// collects credential key-value pairs. Returns a map of environment variables
 /// to inject into the sandbox. Credential keys must be unique across attached
 /// providers so one provider cannot silently overwrite another provider's token.
+#[cfg(test)]
 pub(super) async fn resolve_provider_environment(
     store: &Store,
+    provider_names: &[String],
+) -> Result<ProviderEnvironment, Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    resolve_provider_environment_with_catalog(store, &catalog, provider_names).await
+}
+
+pub(super) async fn resolve_provider_environment_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<ProviderEnvironment, Status> {
     if provider_names.is_empty() {
@@ -442,7 +484,8 @@ pub(super) async fn resolve_provider_environment(
     let mut env = std::collections::HashMap::new();
     let mut expires = std::collections::HashMap::new();
     let now_ms = crate::persistence::current_time_ms();
-    validate_provider_environment_keys_unique_at(store, provider_names, None, now_ms).await?;
+    validate_provider_environment_keys_unique_at(store, catalog, provider_names, None, now_ms)
+        .await?;
     let registry = openshell_providers::ProviderRegistry::new();
 
     for name in provider_names {
@@ -495,7 +538,12 @@ pub(super) async fn resolve_provider_environment(
     Ok(ProviderEnvironment {
         environment: env,
         credential_expires_at_ms: expires,
-        dynamic_credentials: resolve_dynamic_credentials(store, provider_names).await?,
+        dynamic_credentials: resolve_dynamic_credentials_with_catalog(
+            store,
+            catalog,
+            provider_names,
+        )
+        .await?,
     })
 }
 
@@ -504,8 +552,9 @@ pub(super) async fn resolve_provider_environment(
 /// Returns a map of endpoint-bound keys to credential metadata for credentials
 /// that have `token_grant` configuration. Keys are internal supervisor metadata:
 /// host, port, endpoint path, and provider credential identity.
-pub(super) async fn resolve_dynamic_credentials(
+pub(super) async fn resolve_dynamic_credentials_with_catalog(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
 ) -> Result<std::collections::HashMap<String, ProviderProfileCredential>, Status> {
     if provider_names.is_empty() {
@@ -527,7 +576,7 @@ pub(super) async fn resolve_dynamic_credentials(
 
         let profile_id =
             normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
-        let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
+        let Some(profile) = get_provider_type_profile_with_catalog(catalog, profile_id) else {
             continue;
         };
 
@@ -818,8 +867,20 @@ pub async fn validate_provider_environment_keys_unique(
     store: &Store,
     provider_names: &[String],
 ) -> Result<(), Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    validate_provider_environment_keys_unique_with_catalog(store, &catalog, provider_names).await
+}
+
+pub async fn validate_provider_environment_keys_unique_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
+    provider_names: &[String],
+) -> Result<(), Status> {
     validate_provider_environment_keys_unique_at(
         store,
+        catalog,
         provider_names,
         None,
         crate::persistence::current_time_ms(),
@@ -827,8 +888,9 @@ pub async fn validate_provider_environment_keys_unique(
     .await
 }
 
-pub async fn validate_provider_credential_key_available_for_attached_sandboxes(
+pub async fn validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     credential_key: &str,
 ) -> Result<(), Status> {
@@ -838,11 +900,24 @@ pub async fn validate_provider_credential_key_available_for_attached_sandboxes(
         .entry(credential_key.to_string())
         .or_insert_with(|| "pending".to_string());
     candidate.credential_expires_at_ms.remove(credential_key);
-    validate_provider_update_against_attached_sandboxes(store, &candidate).await
+    validate_provider_update_against_attached_sandboxes_with_catalog(store, catalog, &candidate)
+        .await
 }
 
 pub async fn validate_provider_update_against_attached_sandboxes(
     store: &Store,
+    provider: &Provider,
+) -> Result<(), Status> {
+    let catalog = ProviderProfileSources::with_default_sources()
+        .snapshot_catalog(store)
+        .await?;
+    validate_provider_update_against_attached_sandboxes_with_catalog(store, &catalog, provider)
+        .await
+}
+
+pub async fn validate_provider_update_against_attached_sandboxes_with_catalog(
+    store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
 ) -> Result<(), Status> {
     let provider_name = provider.object_name().to_string();
@@ -853,6 +928,7 @@ pub async fn validate_provider_update_against_attached_sandboxes(
         };
         validate_provider_environment_keys_unique_at(
             store,
+            catalog,
             &spec.providers,
             Some(provider),
             crate::persistence::current_time_ms(),
@@ -870,6 +946,7 @@ pub async fn validate_provider_update_against_attached_sandboxes(
 
 async fn validate_provider_environment_keys_unique_at(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     provider_names: &[String],
     candidate_provider: Option<&Provider>,
     now_ms: i64,
@@ -899,7 +976,9 @@ async fn validate_provider_environment_keys_unique_at(
                 seen.insert(key, provider_name.clone());
             }
         }
-        dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider(store, &provider).await?);
+        dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
+            catalog, &provider,
+        ));
     }
     validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)?;
     Ok(())
@@ -915,19 +994,16 @@ struct DynamicTokenGrantBinding {
     score: u32,
 }
 
-async fn dynamic_token_grant_bindings_for_provider(
-    store: &Store,
+fn dynamic_token_grant_bindings_for_provider_with_catalog(
+    catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
-) -> Result<Vec<DynamicTokenGrantBinding>, Status> {
+) -> Vec<DynamicTokenGrantBinding> {
     let provider_name = provider.object_name().to_string();
     let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
-    let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
-        return Ok(Vec::new());
+    let Some(profile) = get_provider_type_profile_with_catalog(catalog, profile_id) else {
+        return Vec::new();
     };
-    Ok(dynamic_token_grant_bindings_for_profile(
-        &provider_name,
-        &profile.to_proto(),
-    ))
+    dynamic_token_grant_bindings_for_profile(&provider_name, &profile.to_proto())
 }
 
 fn dynamic_token_grant_bindings_for_profile(
@@ -1066,13 +1142,18 @@ async fn active_provider_environment_keys(
 ) -> Result<Vec<String>, Status> {
     let mut keys = active_provider_credential_keys(provider, now_ms);
     if !provider.object_id().is_empty() {
-        keys.extend(
+        for state in
             crate::provider_refresh::list_refresh_states_for_provider(store, provider.object_id())
                 .await?
-                .into_iter()
-                .map(|state| state.credential_key)
-                .filter(|key| is_valid_env_key(key)),
-        );
+        {
+            // The primary key plus every co-minted output key this refresh owns,
+            // so a configured-but-not-yet-minted refresh reserves all of them.
+            keys.extend(
+                std::iter::once(state.credential_key)
+                    .chain(state.additional_output_keys.into_values())
+                    .filter(|key| is_valid_env_key(key)),
+            );
+        }
     }
     keys.sort();
     keys.dedup();
@@ -1141,8 +1222,9 @@ use openshell_core::proto::{
     UpdateProviderProfilesResponse, UpdateProviderRequest,
 };
 use openshell_providers::{
-    CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
-    get_default_profile, normalize_profile_id, normalize_provider_type, validate_profile_set,
+    CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
+    normalize_profile_id, normalize_provider_type, strategy_output_env_key, strategy_output_spec,
+    strategy_primary_env_key, validate_profile_set,
 };
 use std::sync::Arc;
 use tonic::{Request, Response};
@@ -1161,7 +1243,12 @@ pub(super) async fn handle_create_provider(
         return Err(Status::invalid_argument("provider is required"));
     };
     let provider_type = provider.r#type.clone();
-    let result = create_provider_record(state.store.as_ref(), provider).await;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let result =
+        create_provider_record_with_catalog(state.store.as_ref(), &catalog, provider).await;
     match result {
         Ok(provider) => {
             emit_provider_lifecycle(
@@ -1207,12 +1294,6 @@ pub(super) async fn handle_list_providers(
     Ok(Response::new(ListProvidersResponse { providers }))
 }
 
-impl ObjectType for StoredProviderProfile {
-    fn object_type() -> &'static str {
-        "provider_profile"
-    }
-}
-
 pub(super) async fn handle_list_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<ListProviderProfilesRequest>,
@@ -1220,13 +1301,15 @@ pub(super) async fn handle_list_provider_profiles(
     let request = request.into_inner();
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
     let offset = request.offset as usize;
-    let mut profiles = merged_provider_profiles(state.store.as_ref()).await?;
-    profiles.sort_by(|left, right| left.id.cmp(&right.id));
-    let profiles = profiles
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let profiles = catalog
+        .list_profiles()
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(|profile| profile.to_proto())
         .collect();
 
     Ok(Response::new(ListProviderProfilesResponse { profiles }))
@@ -1238,10 +1321,13 @@ pub(super) async fn handle_get_provider_profile(
 ) -> Result<Response<ProviderProfileResponse>, Status> {
     let id = request.into_inner().id;
     let id = normalize_profile_id_request(&id)?;
-    let profile = get_provider_type_profile(state.store.as_ref(), &id)
-        .await?
-        .ok_or_else(|| Status::not_found("provider profile not found"))?
-        .to_proto();
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let profile = catalog
+        .get_profile(&id)
+        .ok_or_else(|| Status::not_found("provider profile not found"))?;
 
     Ok(Response::new(ProviderProfileResponse {
         profile: Some(profile),
@@ -1256,11 +1342,22 @@ pub(super) async fn handle_import_provider_profiles(
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-    diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    diagnostics
+        .extend(profile_conflict_diagnostics(state.store.as_ref(), &catalog, &profiles).await?);
     diagnostics.extend(validate_profile_set(&profiles));
     if !has_errors(&diagnostics) {
         diagnostics.extend(
-            profile_attached_sandbox_diagnostics(state.store.as_ref(), &profiles, "import").await?,
+            profile_attached_sandbox_diagnostics(
+                state.store.as_ref(),
+                &catalog,
+                &profiles,
+                "import",
+            )
+            .await?,
         );
     }
 
@@ -1313,8 +1410,14 @@ pub(super) async fn handle_update_provider_profiles(
     let (profiles, mut diagnostics) = profiles_from_import_items(&items);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     let target_id = normalize_profile_id_request(&request.id)?;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
     diagnostics.extend(
-        profile_update_target_diagnostics(state.store.as_ref(), &profiles, &target_id).await?,
+        profile_update_target_diagnostics(state.store.as_ref(), &catalog, &profiles, &target_id)
+            .await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
     let expected_resource_version = if request.expected_resource_version != 0 {
@@ -1335,14 +1438,15 @@ pub(super) async fn handle_update_provider_profiles(
             severity: "error".to_string(),
         });
     }
-    let _sandbox_sync_guard = if has_errors(&diagnostics) {
-        None
-    } else {
-        Some(state.compute.sandbox_sync_guard().await)
-    };
     if !has_errors(&diagnostics) {
         diagnostics.extend(
-            profile_attached_sandbox_diagnostics(state.store.as_ref(), &profiles, "update").await?,
+            profile_attached_sandbox_diagnostics(
+                state.store.as_ref(),
+                &catalog,
+                &profiles,
+                "update",
+            )
+            .await?,
         );
     }
 
@@ -1416,7 +1520,12 @@ pub(super) async fn handle_lint_provider_profiles(
     let request = request.into_inner();
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
-    diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    diagnostics
+        .extend(profile_conflict_diagnostics(state.store.as_ref(), &catalog, &profiles).await?);
     diagnostics.extend(validate_profile_set(&profiles));
     let valid = !has_errors(&diagnostics);
 
@@ -1432,13 +1541,17 @@ pub(super) async fn handle_delete_provider_profile(
 ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
     let id = request.into_inner().id;
     let id = normalize_profile_id_request(&id)?;
-    if get_default_profile(&id).is_some() {
-        return Err(Status::failed_precondition(
-            "built-in provider profiles cannot be deleted",
-        ));
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    if let Some(source_id) = catalog.static_source_for_profile(&id) {
+        return Err(Status::failed_precondition(format!(
+            "provider profile '{id}' is managed by source '{source_id}' and cannot be deleted"
+        )));
     }
 
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let existing = state
         .store
         .get_message_by_name::<StoredProviderProfile>(&id)
@@ -1465,41 +1578,20 @@ pub(super) async fn handle_delete_provider_profile(
     Ok(Response::new(DeleteProviderProfileResponse { deleted }))
 }
 
-pub(super) async fn get_provider_type_profile(
-    store: &Store,
+pub(super) fn get_provider_type_profile_with_catalog(
+    catalog: &EffectiveProviderProfileCatalog,
     id: &str,
-) -> Result<Option<ProviderTypeProfile>, Status> {
-    let Some(id) = normalize_profile_id(id) else {
-        return Ok(None);
-    };
-    if let Some(profile) = get_default_profile(&id) {
-        return Ok(Some(profile.clone()));
-    }
-    let profile = store
-        .get_message_by_name::<StoredProviderProfile>(&id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
-        .and_then(|stored| {
-            let resource_version = stored_profile_resource_version(&stored);
-            stored.profile.map(|profile| {
-                ProviderTypeProfile::from_proto(&profile_response_payload(
-                    profile,
-                    resource_version,
-                ))
-            })
-        });
-    Ok(profile)
+) -> Option<ProviderTypeProfile> {
+    catalog.get_type_profile(id)
 }
 
-async fn provider_refresh_defaults(
-    store: &Store,
+fn provider_refresh_defaults(
+    catalog: &EffectiveProviderProfileCatalog,
     provider: &Provider,
     credential_key: &str,
-) -> Result<Option<CredentialRefreshProfile>, Status> {
-    let Some(profile) = get_provider_type_profile(store, &provider.r#type).await? else {
-        return Ok(None);
-    };
-    Ok(profile
+) -> Option<CredentialRefreshProfile> {
+    let profile = get_provider_type_profile_with_catalog(catalog, &provider.r#type)?;
+    profile
         .credentials
         .iter()
         .find(|credential| {
@@ -1509,7 +1601,70 @@ async fn provider_refresh_defaults(
                     .iter()
                     .any(|env_var| env_var == credential_key)
         })
-        .and_then(|credential| credential.refresh.clone()))
+        .and_then(|credential| credential.refresh.clone())
+}
+
+/// Resolve the env keys a refresh co-mints (beyond its primary credential) from
+/// the provider's profile `additional_outputs`. Returns semantic output id ->
+/// env key. Empty when the provider type has no profile or the credential
+/// declares no additional outputs.
+fn resolved_additional_output_keys(
+    catalog: &EffectiveProviderProfileCatalog,
+    provider: &Provider,
+    credential_key: &str,
+) -> std::collections::HashMap<String, String> {
+    let Some(profile) = get_provider_type_profile_with_catalog(catalog, &provider.r#type) else {
+        return std::collections::HashMap::new();
+    };
+    profile.resolved_additional_output_keys(credential_key)
+}
+
+/// Validate that a strategy which pins canonical env keys (today only
+/// `aws_sts_assume_role`) is configured against a matching profile binding.
+///
+/// For such strategies the `SigV4` signer resolves credentials by fixed env
+/// name, so a caller must not be able to configure the refresh on an arbitrary
+/// credential key or on a provider whose profile does not declare it. This
+/// requires: (1) a profile refresh declaration for `credential_key` whose
+/// strategy matches, (2) `credential_key` equal to the canonical primary env
+/// key, and (3) every required strategy output resolved to its canonical env key
+/// via the profile's `additional_outputs`. Unconstrained strategies pass through.
+fn validate_strategy_profile_binding(
+    strategy: ProviderCredentialRefreshStrategy,
+    credential_key: &str,
+    refresh_defaults: Option<&CredentialRefreshProfile>,
+    additional_output_keys: &std::collections::HashMap<String, String>,
+) -> Result<(), Status> {
+    let Some(expected_primary) = strategy_primary_env_key(strategy) else {
+        return Ok(());
+    };
+    let strategy_name = crate::provider_refresh::refresh_strategy_name(strategy as i32);
+    let refresh_defaults = refresh_defaults.ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "strategy '{strategy_name}' requires a provider profile that declares this refresh on credential {expected_primary}"
+        ))
+    })?;
+    if refresh_defaults.strategy != strategy {
+        return Err(Status::failed_precondition(format!(
+            "provider profile declares strategy '{}' for {credential_key}, not '{strategy_name}'",
+            crate::provider_refresh::refresh_strategy_name(refresh_defaults.strategy as i32)
+        )));
+    }
+    if credential_key != expected_primary {
+        return Err(Status::failed_precondition(format!(
+            "strategy '{strategy_name}' requires credential_key {expected_primary}, got {credential_key}"
+        )));
+    }
+    let (required_outputs, _optional_outputs) = strategy_output_spec(strategy);
+    for output in required_outputs {
+        let expected_env = strategy_output_env_key(strategy, output).unwrap_or_default();
+        if additional_output_keys.get(*output).map(String::as_str) != Some(expected_env) {
+            return Err(Status::failed_precondition(format!(
+                "strategy '{strategy_name}' requires profile additional output '{output}' bound to {expected_env}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_refresh_material(
@@ -1537,41 +1692,14 @@ fn validate_refresh_material(
     Ok(())
 }
 
-async fn provider_type_allows_empty_credentials(
-    store: &Store,
+fn provider_type_allows_empty_credentials(
+    catalog: &EffectiveProviderProfileCatalog,
     provider_type: &str,
-) -> Result<bool, Status> {
-    let Some(profile) = get_provider_type_profile(store, provider_type).await? else {
-        return Ok(false);
+) -> bool {
+    let Some(profile) = get_provider_type_profile_with_catalog(catalog, provider_type) else {
+        return false;
     };
-    Ok(profile.allows_empty_provider_credentials())
-}
-
-async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfile>, Status> {
-    let mut profiles = default_profiles().to_vec();
-    profiles.extend(
-        custom_provider_profiles(store)
-            .await?
-            .into_iter()
-            .filter_map(|stored| {
-                let resource_version = stored_profile_resource_version(&stored);
-                stored.profile.map(|profile| {
-                    ProviderTypeProfile::from_proto(&profile_response_payload(
-                        profile,
-                        resource_version,
-                    ))
-                })
-            }),
-    );
-    Ok(profiles)
-}
-
-async fn custom_provider_profiles(store: &Store) -> Result<Vec<StoredProviderProfile>, Status> {
-    let profiles: Vec<StoredProviderProfile> = store
-        .list_messages(10_000, 0)
-        .await
-        .map_err(|e| Status::internal(format!("list provider profiles failed: {e}")))?;
-    Ok(profiles)
+    profile.allows_empty_provider_credentials()
 }
 
 fn normalize_profile_id_request(id: &str) -> Result<String, Status> {
@@ -1625,6 +1753,7 @@ fn add_empty_profile_set_diagnostic(
 
 async fn profile_conflict_diagnostics(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     profiles: &[(String, ProviderTypeProfile)],
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
     let mut diagnostics = Vec::new();
@@ -1632,12 +1761,14 @@ async fn profile_conflict_diagnostics(
         let Some(id) = normalize_profile_id(&profile.id) else {
             continue;
         };
-        if get_default_profile(&id).is_some() {
+        if let Some(source_id) = catalog.static_source_for_profile(&id) {
             diagnostics.push(ProfileValidationDiagnostic {
                 source: source.clone(),
                 profile_id: id.clone(),
                 field: "id".to_string(),
-                message: format!("provider profile '{id}' is built-in and cannot be overwritten"),
+                message: format!(
+                    "provider profile '{id}' is managed by source '{source_id}' and cannot be overwritten"
+                ),
                 severity: "error".to_string(),
             });
             continue;
@@ -1662,6 +1793,7 @@ async fn profile_conflict_diagnostics(
 
 async fn profile_update_target_diagnostics(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     profiles: &[(String, ProviderTypeProfile)],
     target_id: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
@@ -1682,12 +1814,14 @@ async fn profile_update_target_diagnostics(
             });
         }
     }
-    if get_default_profile(target_id).is_some() {
+    if let Some(source_id) = catalog.static_source_for_profile(target_id) {
         diagnostics.push(ProfileValidationDiagnostic {
             source: target_id.to_string(),
             profile_id: target_id.to_string(),
             field: "id".to_string(),
-            message: format!("provider profile '{target_id}' is built-in and cannot be updated"),
+            message: format!(
+                "provider profile '{target_id}' is managed by source '{source_id}' and cannot be updated"
+            ),
             severity: "error".to_string(),
         });
         return Ok(diagnostics);
@@ -1710,12 +1844,14 @@ async fn profile_update_target_diagnostics(
         let Some(id) = normalize_profile_id(&profile.id) else {
             continue;
         };
-        if get_default_profile(&id).is_some() {
+        if let Some(source_id) = catalog.static_source_for_profile(&id) {
             diagnostics.push(ProfileValidationDiagnostic {
                 source: source.clone(),
                 profile_id: id.clone(),
                 field: "id".to_string(),
-                message: format!("provider profile '{id}' is built-in and cannot be updated"),
+                message: format!(
+                    "provider profile '{id}' is managed by source '{source_id}' and cannot be updated"
+                ),
                 severity: "error".to_string(),
             });
         }
@@ -1725,6 +1861,7 @@ async fn profile_update_target_diagnostics(
 
 async fn profile_attached_sandbox_diagnostics(
     store: &Store,
+    catalog: &EffectiveProviderProfileCatalog,
     profiles: &[(String, ProviderTypeProfile)],
     operation: &str,
 ) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
@@ -1775,7 +1912,9 @@ async fn profile_attached_sandbox_diagnostics(
                     imported_profiles_used.push(used);
                 }
             } else {
-                bindings.extend(dynamic_token_grant_bindings_for_provider(store, &provider).await?);
+                bindings.extend(dynamic_token_grant_bindings_for_provider_with_catalog(
+                    catalog, &provider,
+                ));
             }
         }
 
@@ -1799,42 +1938,6 @@ async fn profile_attached_sandbox_diagnostics(
     }
 
     Ok(diagnostics)
-}
-
-fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
-    use crate::persistence::current_time_ms;
-    let now_ms = current_time_ms();
-    let profile = profile_storage_payload(profile);
-    StoredProviderProfile {
-        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: profile.id.clone(),
-            created_at_ms: now_ms,
-            labels: std::collections::HashMap::new(),
-            resource_version: 0,
-        }),
-        profile: Some(profile),
-    }
-}
-
-fn profile_storage_payload(mut profile: ProviderProfile) -> ProviderProfile {
-    profile.resource_version = 0;
-    profile
-}
-
-fn profile_response_payload(
-    mut profile: ProviderProfile,
-    resource_version: u64,
-) -> ProviderProfile {
-    profile.resource_version = resource_version;
-    profile
-}
-
-fn stored_profile_resource_version(stored: &StoredProviderProfile) -> u64 {
-    stored
-        .metadata
-        .as_ref()
-        .map_or(0, |metadata| metadata.resource_version)
 }
 
 fn proto_diagnostic(diagnostic: ProfileValidationDiagnostic) -> ProviderProfileDiagnostic {
@@ -1904,7 +2007,12 @@ pub(super) async fn handle_update_provider(
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
-    let result = update_provider_record(state.store.as_ref(), provider).await;
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    let result =
+        update_provider_record_with_catalog(state.store.as_ref(), &catalog, provider).await;
     match result {
         Ok(provider) => {
             emit_provider_lifecycle(
@@ -1996,6 +2104,18 @@ pub(super) async fn handle_configure_provider_refresh(
             crate::provider_refresh::refresh_strategy_name(strategy as i32)
         )));
     }
+    if strategy == ProviderCredentialRefreshStrategy::AwsStsAssumeRole {
+        let global_settings =
+            crate::grpc::policy::load_global_settings(state.store.as_ref()).await?;
+        if !crate::grpc::policy::bool_setting_enabled(
+            &global_settings,
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+        )? {
+            return Err(Status::failed_precondition(
+                "aws_sts_assume_role requires providers_v2_enabled=true",
+            ));
+        }
+    }
     if request.material.len() > MAX_PROVIDER_CONFIG_ENTRIES {
         return Err(Status::invalid_argument(format!(
             "material exceeds maximum entries ({} > {MAX_PROVIDER_CONFIG_ENTRIES})",
@@ -2043,6 +2163,42 @@ pub(super) async fn handle_configure_provider_refresh(
             "refresh token endpoints must be defined by the provider profile, not material",
         ));
     }
+    // The STS endpoint is always resolved from the region in production. Reject
+    // any caller-supplied override so an AWS-signed AssumeRole request cannot be
+    // redirected at an arbitrary service (CWE-918). Tests inject a mock endpoint
+    // through test-only code paths, not this boundary.
+    if request.material.contains_key("sts_endpoint_url") {
+        return Err(Status::invalid_argument(
+            "sts_endpoint_url material is not permitted",
+        ));
+    }
+    // Explicit AWS source credentials are all-or-nothing. Reject a partial pair
+    // early so a lone key can't later fall through to the gateway's ambient
+    // identity at mint time (CWE-20).
+    let has_source_access_key = request
+        .material
+        .get("aws_access_key_id")
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_source_secret_key = request
+        .material
+        .get("aws_secret_access_key")
+        .is_some_and(|value| !value.trim().is_empty());
+    if has_source_access_key != has_source_secret_key {
+        return Err(Status::invalid_argument(
+            "aws_access_key_id and aws_secret_access_key must both be set or both omitted",
+        ));
+    }
+    // An optional session token supports temporary source credentials (SSO or a
+    // prior AssumeRole). It only makes sense alongside the source key pair.
+    let has_source_session_token = request
+        .material
+        .get("aws_session_token")
+        .is_some_and(|value| !value.trim().is_empty());
+    if has_source_session_token && !has_source_access_key {
+        return Err(Status::invalid_argument(
+            "aws_session_token requires aws_access_key_id and aws_secret_access_key",
+        ));
+    }
     if request
         .expires_at_ms
         .is_some_and(|expires_at_ms| expires_at_ms < 0)
@@ -2052,20 +2208,53 @@ pub(super) async fn handle_configure_provider_refresh(
         ));
     }
 
+    // Serialize the reserve-then-persist sequence against other configurations
+    // and sandbox mutations. The collision validation below and the refresh-state
+    // persist further down are otherwise separate steps: two concurrent
+    // configures of providers attached to the same sandbox could each pass
+    // validation before either persisted and both reserve the same key (CWE-362).
+    // This is the same guard sandbox create/attach and profile changes take.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+
     let provider = state
         .store
         .get_message_by_name::<Provider>(provider_name)
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
-    validate_provider_credential_key_available_for_attached_sandboxes(
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref())
+        .await?;
+    validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
         state.store.as_ref(),
+        &catalog,
         &provider,
         credential_key,
     )
     .await?;
-    let refresh_defaults =
-        provider_refresh_defaults(state.store.as_ref(), &provider, credential_key).await?;
+    // Reserve every env key this refresh will co-mint (resolved from the
+    // profile's additional_outputs), not just the primary, so a
+    // configured-but-not-yet-minted refresh can't collide with another provider
+    // that later claims one of the derived keys.
+    let additional_output_keys =
+        resolved_additional_output_keys(&catalog, &provider, credential_key);
+    for additional_key in additional_output_keys.values() {
+        validate_provider_credential_key_available_for_attached_sandboxes_with_catalog(
+            state.store.as_ref(),
+            &catalog,
+            &provider,
+            additional_key,
+        )
+        .await?;
+    }
+    let refresh_defaults = provider_refresh_defaults(&catalog, &provider, credential_key);
+    validate_strategy_profile_binding(
+        strategy,
+        credential_key,
+        refresh_defaults.as_ref(),
+        &additional_output_keys,
+    )?;
     validate_refresh_material(&request.material, refresh_defaults.as_ref())?;
     let material_scopes = crate::provider_refresh::material_scopes(&request.material);
     let token_url = refresh_defaults
@@ -2130,6 +2319,7 @@ pub(super) async fn handle_configure_provider_refresh(
             scopes,
             refresh_before_seconds,
             max_lifetime_seconds,
+            additional_output_keys,
         },
     )?;
     if let Some(existing) = existing_refresh_state {
@@ -2146,6 +2336,7 @@ pub(super) async fn handle_configure_provider_refresh(
                 created_at_ms: 0,
                 labels: std::collections::HashMap::new(),
                 resource_version: 0,
+                annotations: std::collections::HashMap::new(),
             }),
             r#type: String::new(),
             credentials: std::collections::HashMap::new(),
@@ -2155,7 +2346,7 @@ pub(super) async fn handle_configure_provider_refresh(
                 expires_at_ms,
             )]),
         };
-        update_provider_record(state.store.as_ref(), updated).await?;
+        update_provider_record_with_catalog(state.store.as_ref(), &catalog, updated).await?;
     }
 
     Ok(Response::new(ConfigureProviderRefreshResponse {
@@ -2192,6 +2383,34 @@ pub(super) async fn handle_rotate_provider_credential(
     }))
 }
 
+/// Remove the expiry for each key the refresh still owns — one whose stored
+/// value equals the refresh's `expires_at_ms`. Independently updated expiries (no
+/// longer matching) are left in place.
+///
+/// This operates on `provider` in place so it can run inside a CAS closure
+/// against the current stored provider. The equality check must see the latest
+/// state, not a snapshot read earlier in the handler: a concurrent rotation or
+/// provider update between the read and the write could otherwise be clobbered
+/// by an unconditional zero (CWE-362).
+fn clear_refresh_owned_expiries(
+    provider: &mut Provider,
+    refresh_expires_at_ms: i64,
+    owned_keys: &[String],
+) {
+    if refresh_expires_at_ms <= 0 {
+        return;
+    }
+    for key in owned_keys {
+        if provider
+            .credential_expires_at_ms
+            .get(key)
+            .is_some_and(|expires_at_ms| *expires_at_ms == refresh_expires_at_ms)
+        {
+            provider.credential_expires_at_ms.remove(key);
+        }
+    }
+}
+
 pub(super) async fn handle_delete_provider_refresh(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRefreshRequest>,
@@ -2224,33 +2443,30 @@ pub(super) async fn handle_delete_provider_refresh(
     )
     .await?;
 
-    let refresh_owned_expiry = existing_refresh_state
-        .as_ref()
-        .is_some_and(|refresh_state| {
-            refresh_state.expires_at_ms > 0
-                && provider
-                    .credential_expires_at_ms
-                    .get(credential_key)
-                    .is_some_and(|expires_at_ms| *expires_at_ms == refresh_state.expires_at_ms)
-        });
-    if refresh_owned_expiry {
-        let updated = Provider {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: String::new(),
-                name: provider_name.to_string(),
-                created_at_ms: 0,
-                labels: std::collections::HashMap::new(),
-                resource_version: 0,
-            }),
-            r#type: String::new(),
-            credentials: std::collections::HashMap::new(),
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms: std::collections::HashMap::from([(
-                credential_key.to_string(),
-                0,
-            )]),
-        };
-        update_provider_record(state.store.as_ref(), updated).await?;
+    // A refresh co-manages the expiry of its primary credential and every pinned
+    // additional output. Clear each expiry this refresh still owns, leaving
+    // independently updated ones in place. The equality check and removal run
+    // inside the CAS closure so they see the current stored provider — deciding
+    // from the snapshot read above would let a concurrent rotation or provider
+    // update land between the read and the write and then be clobbered (CWE-362).
+    if let Some(refresh_state) = existing_refresh_state
+        && refresh_state.expires_at_ms > 0
+    {
+        let refresh_expires_at_ms = refresh_state.expires_at_ms;
+        let owned_keys: Vec<String> = std::iter::once(credential_key.to_string())
+            .chain(refresh_state.additional_output_keys.into_values())
+            .collect();
+        state
+            .store
+            .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
+                clear_refresh_owned_expiries(current, refresh_expires_at_ms, &owned_keys);
+            })
+            .await
+            .map_err(|e| {
+                Status::internal(format!(
+                    "clear refresh-owned credential expiries failed: {e}"
+                ))
+            })?;
     }
 
     Ok(Response::new(DeleteProviderRefreshResponse {
@@ -2453,6 +2669,7 @@ mod tests {
         let profile = ProviderProfile {
             id: "keycloak-sso".to_string(),
             resource_version: 0,
+            annotations: HashMap::new(),
             display_name: "Keycloak SSO".to_string(),
             description: String::new(),
             category: ProviderProfileCategory::Other as i32,
@@ -2526,6 +2743,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
@@ -2603,6 +2821,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec![
@@ -2766,7 +2985,7 @@ mod tests {
         assert!(built_in.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("built-in and cannot be updated")
+                .contains("managed by source 'builtin' and cannot be updated")
         }));
 
         let missing = handle_update_provider_profiles(
@@ -2918,6 +3137,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec![
@@ -2980,6 +3200,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
             credentials: [
@@ -3002,6 +3223,7 @@ mod tests {
         ProviderProfile {
             id: id.to_string(),
             resource_version: 0,
+            annotations: HashMap::new(),
             display_name: format!("{id} Profile"),
             description: String::new(),
             category: ProviderProfileCategory::Other as i32,
@@ -3039,6 +3261,7 @@ mod tests {
                 scopes: Vec::new(),
                 refresh_before_seconds: 300,
                 max_lifetime_seconds: 3600,
+                additional_outputs: Vec::new(),
                 material: vec![
                     ProviderCredentialRefreshMaterial {
                         name: "client_id".to_string(),
@@ -3142,7 +3365,9 @@ mod tests {
         assert_eq!(
             ids,
             vec![
+                "aws",
                 "aws-bedrock",
+                "aws-s3",
                 "claude-code",
                 "codex",
                 "copilot",
@@ -3269,7 +3494,7 @@ mod tests {
             response
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("built-in"))
+                .any(|diagnostic| diagnostic.message.contains("managed by source 'builtin'"))
         );
     }
 
@@ -3441,6 +3666,7 @@ mod tests {
                     profile: Some(ProviderProfile {
                         id: "advanced-api".to_string(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                         display_name: "Advanced API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Other as i32,
@@ -3589,6 +3815,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["custom-provider".to_string()],
@@ -3624,6 +3851,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -3724,6 +3952,140 @@ mod tests {
         );
     }
 
+    async fn state_with_authoritative_profiles_over_default_grants() -> Arc<ServerState> {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-a", "api.example.com", 443, "/v1/**").await;
+        import_token_grant_profile(&state, "grant-b", "api.example.com", 443, "/v1/**").await;
+        create_empty_token_grant_provider(store, "provider-a", "grant-a").await;
+        create_empty_token_grant_provider(store, "provider-b", "grant-b").await;
+        store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-authoritative-profiles-id".to_string(),
+                    name: "sandbox-authoritative-profiles".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut state = Arc::into_inner(state).expect("test server state should be uniquely owned");
+        state.provider_profile_sources = ProviderProfileSources::from_test_profiles(vec![
+            custom_profile("grant-a"),
+            custom_profile("grant-b"),
+        ]);
+        Arc::new(state)
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_uses_authoritative_profile_sources_for_expiry_update() {
+        let state = state_with_authoritative_profiles_over_default_grants().await;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+
+        handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "provider-a".to_string(),
+                credential_key: "REFRESH_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: Some(expires_at_ms),
+            }),
+        )
+        .await
+        .expect("authoritative profiles should govern the provider expiry update");
+
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("provider-a")
+            .await
+            .unwrap()
+            .expect("provider-a");
+        assert_eq!(
+            provider.credential_expires_at_ms.get("REFRESH_TOKEN"),
+            Some(&expires_at_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_provider_refresh_uses_authoritative_profile_sources_for_expiry_update() {
+        let state = state_with_authoritative_profiles_over_default_grants().await;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+        let updated = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "provider-a".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+            }),
+            r#type: String::new(),
+            credentials: HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::from([("REFRESH_TOKEN".to_string(), expires_at_ms)]),
+        };
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref())
+            .await
+            .unwrap();
+        let provider = update_provider_record_with_catalog(state.store.as_ref(), &catalog, updated)
+            .await
+            .unwrap();
+        let refresh_state = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "REFRESH_TOKEN",
+            crate::provider_refresh::NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 0,
+                max_lifetime_seconds: 0,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &refresh_state)
+            .await
+            .unwrap();
+
+        handle_delete_provider_refresh(
+            &state,
+            Request::new(DeleteProviderRefreshRequest {
+                provider: "provider-a".to_string(),
+                credential_key: "REFRESH_TOKEN".to_string(),
+            }),
+        )
+        .await
+        .expect("authoritative profiles should govern the provider expiry update");
+
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("provider-a")
+            .await
+            .unwrap()
+            .expect("provider-a");
+        assert!(
+            !provider
+                .credential_expires_at_ms
+                .contains_key("REFRESH_TOKEN")
+        );
+    }
+
     #[tokio::test]
     async fn configure_provider_refresh_accepts_vertex_service_account_token_key() {
         let state = test_server_state().await;
@@ -3736,6 +4098,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -3799,6 +4162,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -3842,6 +4206,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -3882,6 +4247,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_aws_sts_refresh_clears_all_pinned_output_expiries() {
+        use crate::grpc::policy::set_global_bool_setting_for_test;
+
+        let state = test_server_state().await;
+        set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-delete".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let refresh_expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+        handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "aws-delete".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: Some(refresh_expires_at_ms),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Simulate a completed mint: the primary and secret share the refresh's
+        // expiry (refresh-owned), while the session token was independently
+        // updated to a later value that must survive the delete.
+        let independent_expires_at_ms = refresh_expires_at_ms + 120_000;
+        update_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-delete".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: String::new(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::from([
+                    ("AWS_SECRET_ACCESS_KEY".to_string(), refresh_expires_at_ms),
+                    ("AWS_SESSION_TOKEN".to_string(), independent_expires_at_ms),
+                ]),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle_delete_provider_refresh(
+            &state,
+            Request::new(DeleteProviderRefreshRequest {
+                provider: "aws-delete".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("aws-delete")
+            .await
+            .unwrap()
+            .unwrap();
+        // Refresh-owned expiries for the primary and secret are cleared.
+        assert!(
+            !provider
+                .credential_expires_at_ms
+                .contains_key("AWS_ACCESS_KEY_ID")
+        );
+        assert!(
+            !provider
+                .credential_expires_at_ms
+                .contains_key("AWS_SECRET_ACCESS_KEY")
+        );
+        // The independently updated session-token expiry is preserved.
+        assert_eq!(
+            provider.credential_expires_at_ms.get("AWS_SESSION_TOKEN"),
+            Some(&independent_expires_at_ms)
+        );
+    }
+
+    #[test]
+    fn clear_refresh_owned_expiries_preserves_concurrently_changed_expiry() {
+        // Regression for the delete-refresh TOCTOU: the clearing decision runs
+        // inside the CAS closure against the current provider. Simulate a
+        // concurrent rotation that updated AWS_SESSION_TOKEN's expiry after the
+        // handler's initial read but before its write — by the time the closure
+        // runs, that value no longer matches the deleted refresh's expiry and
+        // must survive, while the still-owned keys are cleared.
+        let refresh_expires_at_ms = 1_000_000;
+        let concurrently_changed = refresh_expires_at_ms + 500_000;
+        let mut provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "p".to_string(),
+                name: "p".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+            }),
+            r#type: "aws".to_string(),
+            credentials: HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::from([
+                ("AWS_ACCESS_KEY_ID".to_string(), refresh_expires_at_ms),
+                ("AWS_SECRET_ACCESS_KEY".to_string(), refresh_expires_at_ms),
+                ("AWS_SESSION_TOKEN".to_string(), concurrently_changed),
+            ]),
+        };
+        let owned_keys = vec![
+            "AWS_ACCESS_KEY_ID".to_string(),
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "AWS_SESSION_TOKEN".to_string(),
+        ];
+
+        clear_refresh_owned_expiries(&mut provider, refresh_expires_at_ms, &owned_keys);
+
+        assert!(
+            !provider
+                .credential_expires_at_ms
+                .contains_key("AWS_ACCESS_KEY_ID")
+        );
+        assert!(
+            !provider
+                .credential_expires_at_ms
+                .contains_key("AWS_SECRET_ACCESS_KEY")
+        );
+        assert_eq!(
+            provider.credential_expires_at_ms.get("AWS_SESSION_TOKEN"),
+            Some(&concurrently_changed)
+        );
+    }
+
+    #[tokio::test]
     async fn configure_provider_refresh_rejects_credential_key_collision_for_attached_sandbox() {
         let state = test_server_state().await;
         import_test_graph_refresh_profile(&state).await;
@@ -3894,6 +4423,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -3916,6 +4446,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once(("OTHER_TOKEN".to_string(), "other".to_string()))
@@ -3935,6 +4466,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
@@ -3986,6 +4518,7 @@ mod tests {
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                     }),
                     r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                     credentials: HashMap::new(),
@@ -4005,6 +4538,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["first-graph".to_string(), "second-graph".to_string()],
@@ -4071,6 +4605,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -4138,6 +4673,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "outlook".to_string(),
                 credentials: std::iter::once((
@@ -4289,6 +4825,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -4366,6 +4903,7 @@ mod tests {
             &provider,
             "API_TOKEN",
             crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::new(),
                 strategy: ProviderCredentialRefreshStrategy::External,
                 material: HashMap::from([(
                     "endpoint".to_string(),
@@ -4411,6 +4949,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["gitlab-local".to_string()],
@@ -4455,6 +4994,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: std::iter::once((
@@ -4484,6 +5024,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: std::iter::once((
@@ -4518,6 +5059,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4538,6 +5080,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: HashMap::new(),
@@ -4556,6 +5099,7 @@ mod tests {
                     profile: Some(ProviderProfile {
                         id: "delegated-refresh-api".to_string(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                         display_name: "Delegated Refresh API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Messaging as i32,
@@ -4575,6 +5119,7 @@ mod tests {
                                 scopes: vec!["https://example.test/.default".to_string()],
                                 refresh_before_seconds: 300,
                                 max_lifetime_seconds: 3600,
+                                additional_outputs: Vec::new(),
                                 material: vec![
                                     ProviderCredentialRefreshMaterial {
                                         name: "client_id".to_string(),
@@ -4612,6 +5157,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "delegated-refresh-api".to_string(),
                 credentials: HashMap::new(),
@@ -4648,6 +5194,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "mixed-required-api".to_string(),
                 credentials: HashMap::new(),
@@ -4684,6 +5231,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "optional-static-api".to_string(),
                 credentials: HashMap::new(),
@@ -4704,6 +5252,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: HashMap::new(),
@@ -4730,6 +5279,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4758,6 +5308,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4805,6 +5356,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
@@ -4856,6 +5408,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -4885,6 +5438,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: HashMap::new(),
@@ -4916,6 +5470,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
@@ -4944,6 +5499,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: oversized_type.clone(),
             credentials: std::iter::once(("API_TOKEN".to_string(), "old".to_string())).collect(),
@@ -4961,6 +5517,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once(("API_TOKEN".to_string(), "new".to_string()))
@@ -4992,6 +5549,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "claude".to_string(),
             credentials: [
@@ -5046,6 +5604,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "test".to_string(),
             credentials: [
@@ -5095,6 +5654,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "test".to_string(),
             credentials: [
@@ -5129,6 +5689,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
@@ -5151,6 +5712,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
@@ -5184,6 +5746,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
@@ -5203,6 +5766,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -5241,6 +5805,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -5315,6 +5880,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: [
@@ -5359,6 +5925,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: std::iter::once((
@@ -5407,6 +5974,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-vertex-ai".to_string(),
                 credentials: [
@@ -5454,6 +6022,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "openai".to_string(),
                 credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
@@ -5492,6 +6061,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "outlook".to_string(),
                 credentials: std::iter::once((
@@ -5514,6 +6084,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "google-drive".to_string(),
                 credentials: std::iter::once((
@@ -5534,6 +6105,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["provider-a".to_string(), "provider-b".to_string()],
@@ -5552,6 +6124,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((
@@ -5586,6 +6159,7 @@ mod tests {
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
@@ -5607,6 +6181,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["my-claude".to_string()],
@@ -5643,6 +6218,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(SandboxSpec::default()),
             status: None,
@@ -5690,6 +6266,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: String::new(), // Empty type is ignored in update
             credentials: HashMap::new(),
@@ -6029,6 +6606,909 @@ mod tests {
         assert_eq!(new_keys_count, 1);
     }
 
+    #[tokio::test]
+    async fn configure_aws_sts_requires_v2_enabled() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "my-aws".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "aws".to_string(),
+                credentials: std::iter::once((
+                    "AWS_ACCESS_KEY_ID".to_string(),
+                    "placeholder".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "my-aws".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("providers_v2_enabled"));
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_succeeds_with_v2_enabled() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "my-aws-v2".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "aws".to_string(),
+                credentials: std::iter::once((
+                    "AWS_ACCESS_KEY_ID".to_string(),
+                    "placeholder".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "my-aws-v2".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .expect("status");
+
+        assert_eq!(response.credential_key, "AWS_ACCESS_KEY_ID");
+        assert_eq!(
+            response.strategy,
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_rejects_endpoint_override_material() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-endpoint-override".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "aws-endpoint-override".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([
+                    (
+                        "role_arn".to_string(),
+                        "arn:aws:iam::123456789012:role/Test".to_string(),
+                    ),
+                    (
+                        "sts_endpoint_url".to_string(),
+                        "http://127.0.0.1:1/".to_string(),
+                    ),
+                ]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("sts_endpoint_url"));
+
+        // The rejected configuration must not leave a refresh state behind.
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("aws-endpoint-override")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::provider_refresh::get_refresh_state(
+                state.store.as_ref(),
+                provider.object_id(),
+                "AWS_ACCESS_KEY_ID",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_rejects_partial_source_credentials() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-partial-source".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // aws_access_key_id without its secret half must be rejected rather than
+        // silently falling back to the gateway's ambient identity.
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "aws-partial-source".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([
+                    (
+                        "role_arn".to_string(),
+                        "arn:aws:iam::123456789012:role/Test".to_string(),
+                    ),
+                    ("aws_access_key_id".to_string(), "AKIATESTKEY".to_string()),
+                ]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("both be set or both omitted"));
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_rejects_session_token_without_pair() {
+        use crate::grpc::policy::set_global_bool_setting_for_test;
+
+        let state = test_server_state().await;
+        set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-lone-session".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "aws-lone-session".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([
+                    (
+                        "role_arn".to_string(),
+                        "arn:aws:iam::123456789012:role/Test".to_string(),
+                    ),
+                    (
+                        "aws_session_token".to_string(),
+                        "temp-session-token".to_string(),
+                    ),
+                ]),
+                secret_material_keys: vec!["aws_session_token".to_string()],
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("aws_session_token requires"));
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_persists_resolved_additional_output_keys() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-outputs".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "aws-outputs".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("aws-outputs")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            provider.object_id(),
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap()
+        .expect("refresh state should exist");
+
+        assert_eq!(
+            stored.additional_output_keys.get("secret_access_key"),
+            Some(&"AWS_SECRET_ACCESS_KEY".to_string())
+        );
+        assert_eq!(
+            stored.additional_output_keys.get("session_token"),
+            Some(&"AWS_SESSION_TOKEN".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_requires_profile_declaring_the_refresh() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        // A generic provider has no profile, so it declares no STS refresh
+        // binding. STS must not be configurable against it.
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "generic-no-profile".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "generic".to_string(),
+                credentials: std::iter::once((
+                    "AWS_ACCESS_KEY_ID".to_string(),
+                    "placeholder".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "generic-no-profile".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("provider profile"));
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_rejects_non_canonical_credential_key() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-wrong-key".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // AWS_SECRET_ACCESS_KEY is a co-managed output, not the STS primary. The
+        // profile declares no refresh on it, so STS cannot be pinned there.
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "aws-wrong-key".to_string(),
+                credential_key: "AWS_SECRET_ACCESS_KEY".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("AWS_ACCESS_KEY_ID"));
+    }
+
+    #[tokio::test]
+    async fn rotate_aws_sts_blocked_after_providers_v2_disabled() {
+        use crate::grpc::policy::set_global_bool_setting_for_test;
+
+        let state = test_server_state().await;
+
+        set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-gate".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "aws-gate".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Disable the gate after the refresh is already configured.
+        set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let err = handle_rotate_provider_credential(
+            &state,
+            Request::new(RotateProviderCredentialRequest {
+                provider: "aws-gate".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("providers_v2_enabled"));
+
+        // The gate rejection is recorded on the refresh state, and no credential
+        // was minted into the provider.
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("aws-gate")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!provider.credentials.contains_key("AWS_ACCESS_KEY_ID"));
+        let refresh_state = crate::provider_refresh::get_refresh_state(
+            state.store.as_ref(),
+            provider.object_id(),
+            "AWS_ACCESS_KEY_ID",
+        )
+        .await
+        .unwrap()
+        .expect("refresh state should exist");
+        assert_eq!(refresh_state.status, "error");
+    }
+
+    #[tokio::test]
+    async fn active_provider_environment_keys_include_additional_output_keys() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "aws-env".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                r#type: "aws".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let provider = state
+            .store
+            .get_message_by_name::<Provider>("aws-env")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A configured-but-not-yet-minted STS refresh: no minted values are in
+        // provider.credentials yet, but the reserved keys must still surface.
+        let refresh_state = crate::provider_refresh::new_refresh_state(
+            &provider,
+            "AWS_ACCESS_KEY_ID",
+            crate::provider_refresh::NewRefreshStateConfig {
+                additional_output_keys: HashMap::from([
+                    (
+                        "secret_access_key".to_string(),
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                    ),
+                    ("session_token".to_string(), "AWS_SESSION_TOKEN".to_string()),
+                ]),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 0,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .unwrap();
+        crate::provider_refresh::put_refresh_state(state.store.as_ref(), &refresh_state)
+            .await
+            .unwrap();
+
+        let keys = active_provider_environment_keys(state.store.as_ref(), &provider, 0)
+            .await
+            .unwrap();
+        assert!(keys.contains(&"AWS_ACCESS_KEY_ID".to_string()));
+        assert!(keys.contains(&"AWS_SECRET_ACCESS_KEY".to_string()));
+        assert!(keys.contains(&"AWS_SESSION_TOKEN".to_string()));
+    }
+
+    #[tokio::test]
+    async fn configure_aws_sts_validates_additional_credential_key_collision() {
+        use crate::grpc::StoredSettingValue;
+        use crate::grpc::StoredSettings;
+        use crate::grpc::policy::save_global_settings;
+
+        let state = test_server_state().await;
+
+        let global_settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+                StoredSettingValue::Bool(true),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(state.store.as_ref(), &global_settings)
+            .await
+            .unwrap();
+
+        let mut existing_provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "existing-aws-provider".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+            }),
+            r#type: "aws".to_string(),
+            credentials: HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+        };
+        existing_provider.credentials.insert(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "existing-key".to_string(),
+        );
+        create_provider_record(state.store.as_ref(), existing_provider)
+            .await
+            .unwrap();
+
+        let new_provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "new-aws-provider".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+            }),
+            r#type: "aws".to_string(),
+            credentials: std::iter::once((
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "placeholder".to_string(),
+            ))
+            .collect(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+        };
+        create_provider_record(state.store.as_ref(), new_provider)
+            .await
+            .unwrap();
+
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-aws-configure-collision".to_string(),
+                    name: "aws-configure-collision".to_string(),
+                    created_at_ms: 1,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec![
+                        "existing-aws-provider".to_string(),
+                        "new-aws-provider".to_string(),
+                    ],
+                    ..SandboxSpec::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "new-aws-provider".to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_configure_aws_sts_reserves_key_exactly_once() {
+        use crate::grpc::policy::set_global_bool_setting_for_test;
+
+        let state = test_server_state().await;
+        set_global_bool_setting_for_test(
+            state.store.as_ref(),
+            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
+            true,
+        )
+        .await
+        .unwrap();
+
+        for name in ["aws-a", "aws-b"] {
+            create_provider_record(
+                state.store.as_ref(),
+                Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: name.to_string(),
+                        created_at_ms: 0,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                        annotations: HashMap::new(),
+                    }),
+                    r#type: "aws".to_string(),
+                    credentials: HashMap::new(),
+                    config: HashMap::new(),
+                    credential_expires_at_ms: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Both providers are attached to the same sandbox, so their minted AWS
+        // credential env keys share a namespace and cannot both be reserved.
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-concurrent-configure".to_string(),
+                    name: "concurrent-configure".to_string(),
+                    created_at_ms: 1,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["aws-a".to_string(), "aws-b".to_string()],
+                    ..SandboxSpec::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let configure = |provider: &str| {
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: provider.to_string(),
+                credential_key: "AWS_ACCESS_KEY_ID".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32,
+                material: HashMap::from([(
+                    "role_arn".to_string(),
+                    "arn:aws:iam::123456789012:role/Test".to_string(),
+                )]),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: None,
+            })
+        };
+
+        let (result_a, result_b) = tokio::join!(
+            handle_configure_provider_refresh(&state, configure("aws-a")),
+            handle_configure_provider_refresh(&state, configure("aws-b")),
+        );
+
+        // Exactly one configuration wins; the other is rejected as a collision
+        // rather than both reserving the same key.
+        let ok_count = [&result_a, &result_b].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            ok_count,
+            1,
+            "exactly one concurrent configure should reserve the key; got a={:?} b={:?}",
+            result_a.as_ref().map(|_| ()),
+            result_b.as_ref().map(|_| ())
+        );
+        let err = [result_a, result_b]
+            .into_iter()
+            .find_map(Result::err)
+            .expect("one configure must fail");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
     fn google_cloud_provider(config: HashMap<String, String>) -> Provider {
         Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -6037,6 +7517,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "google-cloud".to_string(),
             credentials: HashMap::new(),
@@ -6139,6 +7620,7 @@ mod tests {
                 created_at_ms: 0,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: "github".to_string(),
             credentials: HashMap::new(),

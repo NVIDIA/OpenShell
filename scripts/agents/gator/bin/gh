@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+REAL_GH="${OPENSHELL_REAL_GH:-/usr/bin/gh}"
+GATOR_MARKER='> **gator-agent**'
+
+if [[ $# -lt 1 || "$1" != "api" ]]; then
+    exec "$REAL_GH" "$@"
+fi
+
+method="GET"
+input_file=""
+body_field=""
+endpoint=""
+args=("$@")
+
+consume_next=false
+for ((i = 1; i < ${#args[@]}; i++)); do
+    arg="${args[$i]}"
+
+    if [[ "$consume_next" == "true" ]]; then
+        consume_next=false
+        continue
+    fi
+
+    case "$arg" in
+        --method|-X)
+            if (( i + 1 < ${#args[@]} )); then
+                method="${args[$((i + 1))]}"
+                consume_next=true
+            fi
+            ;;
+        --method=*)
+            method="${arg#--method=}"
+            ;;
+        --input)
+            if (( i + 1 < ${#args[@]} )); then
+                input_file="${args[$((i + 1))]}"
+                consume_next=true
+            fi
+            ;;
+        --input=*)
+            input_file="${arg#--input=}"
+            ;;
+        -f|--field|-F|--raw-field)
+            if (( i + 1 < ${#args[@]} )); then
+                field="${args[$((i + 1))]}"
+                if [[ "$field" == body=* ]]; then
+                    body_field="${field#body=}"
+                fi
+                consume_next=true
+            fi
+            ;;
+        -fbody=*|--field=body=*|-Fbody=*|--raw-field=body=*)
+            body_field="${arg#*=body=}"
+            ;;
+        --*)
+            ;;
+        *)
+            if [[ -z "$endpoint" ]]; then
+                endpoint="${arg#/}"
+            fi
+            ;;
+    esac
+done
+
+read_body() {
+    if [[ -n "$input_file" && -f "$input_file" ]]; then
+        jq -r '.body // empty' "$input_file" 2>/dev/null || true
+        return
+    fi
+    printf '%s' "$body_field"
+}
+
+is_legacy_reviewer_failure_disposition() {
+    local existing_body="$1"
+    local head_sha="$2"
+
+    [[ "$existing_body" == *"$GATOR_MARKER"* ]] || return 1
+    [[ "$existing_body" == *"$head_sha"* ]] || return 1
+    [[ "$existing_body" == *"principal-engineer-reviewer"* ]] || return 1
+    [[ "$existing_body" == *"failed before producing"* ]] || return 1
+}
+
+is_draft_only_blocker_disposition() {
+    local existing_body="$1"
+    local head_sha="$2"
+    local lower_body
+
+    [[ "$existing_body" == *"$GATOR_MARKER"* ]] || return 1
+    [[ "$existing_body" == *"$head_sha"* ]] || return 1
+
+    lower_body="$(printf '%s' "$existing_body" | tr '[:upper:]' '[:lower:]')"
+    [[ "$lower_body" == *"## blocked"* ]] || return 1
+    [[ "$lower_body" == *"marked as a draft"* || "$lower_body" == *"pull request is a draft"* || "$lower_body" == *"pr is draft"* ]] || return 1
+}
+
+has_blocking_same_sha_disposition() {
+    local head_sha="$1"
+    local current_is_draft="$2"
+    local encoded_bodies="$3"
+    local encoded_body existing_body
+
+    while IFS= read -r encoded_body; do
+        [[ -n "$encoded_body" ]] || continue
+
+        existing_body="$(printf '%s' "$encoded_body" | jq -r . 2>/dev/null || printf '%s' "$encoded_body")"
+        [[ "$existing_body" == *"$head_sha"* ]] || continue
+
+        if is_legacy_reviewer_failure_disposition "$existing_body" "$head_sha"; then
+            continue
+        fi
+
+        if [[ "$current_is_draft" != "true" ]] && is_draft_only_blocker_disposition "$existing_body" "$head_sha"; then
+            continue
+        fi
+
+        return 0
+    done <<< "$encoded_bodies"
+
+    return 1
+}
+
+guard_duplicate_gator_disposition() {
+    local owner="$1"
+    local repo="$2"
+    local number="$3"
+    local body="$4"
+
+    [[ "$body" == *"$GATOR_MARKER"* ]] || return 0
+    [[ "$body" != *"## Monitoring Complete"* ]] || return 0
+
+    local pull_json head_sha current_is_draft
+    pull_json="$($REAL_GH api "repos/$owner/$repo/pulls/$number" 2>/dev/null || true)"
+    head_sha="$(printf '%s' "$pull_json" | jq -r '.head.sha // empty' 2>/dev/null || true)"
+    current_is_draft="$(printf '%s' "$pull_json" | jq -r '.draft // false' 2>/dev/null || true)"
+    [[ -n "$head_sha" ]] || return 0
+
+    if is_legacy_reviewer_failure_disposition "$body" "$head_sha"; then
+        echo "openshell-agent: blocked public reviewer sub-agent failure disposition for $owner/$repo#$number ($head_sha)" >&2
+        echo "openshell-agent: return OPENSHELL_AGENT_RESULT status=transient_failure with reason=reviewer_subagent_failed instead" >&2
+        return 20
+    fi
+
+    local existing_comments existing_reviews
+    existing_comments="$($REAL_GH api "repos/$owner/$repo/issues/$number/comments" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body | @json' 2>/dev/null || true)"
+    existing_reviews="$($REAL_GH api "repos/$owner/$repo/pulls/$number/reviews" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body | @json' 2>/dev/null || true)"
+
+    if has_blocking_same_sha_disposition "$head_sha" "$current_is_draft" "$(printf '%s\n%s\n' "$existing_comments" "$existing_reviews")"; then
+        echo "openshell-agent: blocked duplicate gator same-SHA disposition for $owner/$repo#$number ($head_sha)" >&2
+        echo "openshell-agent: push a new commit, remove the old disposition, or set OPENSHELL_GATOR_ALLOW_SAME_SHA_COMMENT=1 for an explicit maintainer-requested same-SHA action" >&2
+        return 20
+    fi
+}
+
+if [[ "${OPENSHELL_GATOR_ALLOW_SAME_SHA_COMMENT:-}" != "1" && "${method^^}" == "POST" ]]; then
+    request_body="$(read_body)"
+    if [[ "$endpoint" =~ ^repos/([^/]+)/([^/]+)/issues/([0-9]+)/comments$ ]]; then
+        guard_duplicate_gator_disposition "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "$request_body"
+    elif [[ "$endpoint" =~ ^repos/([^/]+)/([^/]+)/pulls/([0-9]+)/reviews$ ]]; then
+        guard_duplicate_gator_disposition "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "$request_body"
+    fi
+fi
+
+exec "$REAL_GH" "$@"

@@ -60,6 +60,16 @@ type SharedComputeDriver =
 
 const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
 
+#[derive(Debug, Clone)]
+pub struct ComputeDriverInfoSnapshot {
+    /// Gateway-selected driver name used for routing and `driver_config` keys.
+    pub name: String,
+    /// Driver-reported human-readable name from the startup capability snapshot.
+    pub driver_name: String,
+    /// Driver-reported implementation version from the startup capability snapshot.
+    pub driver_version: String,
+}
+
 #[tonic::async_trait]
 trait ShutdownCleanup: Send + Sync {
     async fn cleanup_on_shutdown(&self) -> Result<(), String>;
@@ -259,7 +269,7 @@ impl ComputeDriver for RemoteComputeDriver {
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
-    driver_name: String,
+    driver_info: ComputeDriverInfoSnapshot,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_resume: Option<Arc<dyn StartupResume>>,
     _driver_process: Option<Arc<ManagedDriverProcess>>,
@@ -307,10 +317,15 @@ impl ComputeRuntime {
             in_tree = driver_kind.is_some(),
             "Compute driver connected"
         );
+        let driver_info = ComputeDriverInfoSnapshot {
+            name: driver_name,
+            driver_name: capabilities.driver_name,
+            driver_version: capabilities.driver_version,
+        };
         let default_image = capabilities.default_image;
         Ok(Self {
             driver,
-            driver_name,
+            driver_info,
             shutdown_cleanup,
             startup_resume,
             _driver_process: driver_process,
@@ -457,8 +472,13 @@ impl ComputeRuntime {
     }
 
     #[must_use]
+    pub fn driver_info_snapshots(&self) -> &[ComputeDriverInfoSnapshot] {
+        std::slice::from_ref(&self.driver_info)
+    }
+
+    #[must_use]
     pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
-        self.driver_name.parse().ok()
+        self.driver_info.name.parse().ok()
     }
 
     #[must_use]
@@ -467,8 +487,8 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let driver_sandbox =
-            driver_sandbox_from_public(sandbox, &self.driver_name).map_err(|status| *status)?;
+        let driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
+            .map_err(|status| *status)?;
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                 sandbox: Some(driver_sandbox),
@@ -483,12 +503,20 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
-        let mut driver_sandbox =
-            driver_sandbox_from_public(&sandbox, &self.driver_name).map_err(|status| *status)?;
+        let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
+            .map_err(|status| *status)?;
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
         let mut sandbox = sandbox;
+        let labels_json = sandbox
+            .metadata
+            .as_ref()
+            .map(|metadata| &metadata.labels)
+            .filter(|labels| !labels.is_empty())
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?;
         let result = self
             .store
             .put_if(
@@ -496,7 +524,7 @@ impl ComputeRuntime {
                 &sandbox_id,
                 sandbox.object_name(),
                 &sandbox.encode_to_vec(),
-                None,
+                labels_json.as_deref(),
                 WriteCondition::MustCreate,
             )
             .await
@@ -1159,6 +1187,7 @@ impl ComputeRuntime {
                     created_at_ms: now_ms,
                     labels: std::collections::HashMap::new(),
                     resource_version: 0,
+                    annotations: std::collections::HashMap::new(),
                 }),
                 spec: None,
                 status,
@@ -1666,8 +1695,8 @@ fn extract_typed_resources(
 }
 
 /// Build the opaque `platform_config` Struct from platform-specific public
-/// template fields (`runtime_class_name`, annotations, `volume_claim_templates`)
-/// plus any resource fields beyond CPU/memory.
+/// template fields (`runtime_class_name`, annotations) plus any resource fields
+/// beyond CPU/memory.
 fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Struct> {
     use prost_types::{Struct, Value, value::Kind};
 
@@ -1701,16 +1730,6 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
                 kind: Some(Kind::StructValue(Struct {
                     fields: annotation_fields,
                 })),
-            },
-        );
-    }
-
-    // Pass through the raw volume_claim_templates Struct as a nested value.
-    if let Some(ref vct) = template.volume_claim_templates {
-        fields.insert(
-            "volume_claim_templates".to_string(),
-            Value {
-                kind: Some(Kind::StructValue(vct.clone())),
             },
         );
     }
@@ -2106,7 +2125,11 @@ impl ComputeDriver for NoopTestDriver {
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
-        driver_name: "test".to_string(),
+        driver_info: ComputeDriverInfoSnapshot {
+            name: "test".to_string(),
+            driver_name: "test".to_string(),
+            driver_version: "test".to_string(),
+        },
         shutdown_cleanup: None,
         startup_resume: None,
         _driver_process: None,
@@ -2361,7 +2384,11 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
-            driver_name: "test-driver".to_string(),
+            driver_info: ComputeDriverInfoSnapshot {
+                name: "test-driver".to_string(),
+                driver_name: "test-driver".to_string(),
+                driver_version: "test".to_string(),
+            },
             shutdown_cleanup: None,
             startup_resume,
             _driver_process: None,
@@ -2396,6 +2423,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             ..Default::default()
         };
@@ -2411,6 +2439,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             sandbox_id: sandbox_id.to_string(),
             token: format!("token-{id}"),
@@ -3556,6 +3585,7 @@ mod tests {
             created_at_ms: 1_000_000,
             labels: HashMap::new(),
             resource_version: 0,
+            annotations: HashMap::new(),
         });
 
         let created = runtime.create_sandbox(sandbox, None).await.unwrap();
@@ -3579,6 +3609,29 @@ mod tests {
             1,
             "database should have resource_version: 1 after create"
         );
+    }
+
+    #[tokio::test]
+    async fn created_sandbox_is_immediately_visible_to_label_selectors() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox =
+            sandbox_record("sb-labeled", "labeled-sandbox", SandboxPhase::Provisioning);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .labels
+            .insert("env".to_string(), "prod".to_string());
+
+        runtime.create_sandbox(sandbox, None).await.unwrap();
+
+        let matching = runtime
+            .store
+            .list_messages_with_selector::<Sandbox>("env=prod", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].object_id(), "sb-labeled");
     }
 
     #[tokio::test]

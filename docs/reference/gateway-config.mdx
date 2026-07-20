@@ -88,7 +88,8 @@ disable_tls = false
 # Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
 # when the driver-specific table does not override them.
 default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
-supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 client_tls_secret_name  = "openshell-client-tls"
 service_account_name    = "openshell-sandbox"
 host_gateway_ip         = "10.0.0.1"
@@ -102,6 +103,21 @@ guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 # Set either value to 0, or omit both, to disable rate limiting.
 grpc_rate_limit_requests       = 120
 grpc_rate_limit_window_seconds = 60
+
+# Optional exact provider-profile source composition. When omitted, the
+# gateway uses builtin + user.
+provider_profile_sources = [
+  { type = "builtin" },
+  { type = "user" },
+]
+
+# Operator-run supervisor middleware. The gRPC endpoint must be reachable from
+# both the gateway and sandbox supervisors.
+[[openshell.supervisor.middleware]]
+name = "local-content-guard"
+grpc_endpoint = "http://host.openshell.internal:50051"
+max_body_bytes = 262144
+timeout = "500ms"
 
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
@@ -132,6 +148,25 @@ roles_claim   = "realm_access.roles"
 admin_role    = "openshell-admin"
 user_role     = "openshell-user"
 scopes_claim  = ""
+
+[[openshell.gateway.interceptors]]
+name               = "quota"
+grpc_endpoint      = "unix:///run/openshell/interceptors/quota.sock"
+order              = 10
+failure_policy     = "fail_closed"
+binding_policy     = "allowlist"
+timeout            = "500ms"
+max_response_bytes = 1048576
+max_patches        = 32
+
+[[openshell.gateway.interceptors.bindings]]
+rpc            = "openshell.v1.OpenShell/CreateSandbox"
+phases         = ["modify_operation", "validate"]
+failure_policy = "fail_closed"
+
+[[openshell.gateway.interceptors.bindings]]
+rpc    = "openshell.v1.OpenShell/UpdateConfig"
+phases = ["validate"]
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
@@ -139,6 +174,59 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 `[openshell.gateway.gateway_jwt] ttl_secs` controls gateway-minted sandbox JWT lifetime. When omitted, it defaults to `0`: the token `exp` claim and `expires_at_ms` response field become `0`, and the sandbox JWT does not expire. Use that default only for local single-player Docker, Podman, or VM gateways. Kubernetes and other shared deployments should set a positive TTL; Helm renders `3600` seconds by default, and the gateway logs a warning when a Kubernetes gateway uses `0`.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
+
+## Supervisor Middleware Services
+
+Register operator-run supervisor middleware services with one or more `[[openshell.supervisor.middleware]]` entries. Registration is static and operator-owned; changing it requires restarting the gateway.
+
+```toml
+[[openshell.supervisor.middleware]]
+name = "local-content-guard"
+grpc_endpoint = "http://host.openshell.internal:50051"
+max_body_bytes = 262144
+timeout = "500ms"
+```
+
+Each service implements the supervisor middleware gRPC contract and exposes bindings through `Describe`. Policies reference the operator-owned registration `name`, attaching the complete middleware and all of its bindings. Bindings are identified by operation and phase. A manifest may expose at most one binding for each operation and phase pair; V1 supports only `HttpRequest/pre_credentials`, so a service currently exposes one binding. Registration names must be unique, and operator-run registrations cannot claim the reserved `openshell/` namespace. The service-reported manifest name is diagnostic metadata and does not need to match the registration name.
+
+The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
+
+`max_body_bytes` is the operator limit for every binding exposed by the service. It must be greater than zero, no larger than each binding's advertised limit, and no larger than the 4 MiB platform maximum. OpenShell rejects an oversized value instead of silently clamping it. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size body and its protobuf envelope fit on the transport.
+
+`timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The effective timeout covers `ValidateConfig` and `EvaluateHttpRequest`; `Describe` uses the service timeout because binding metadata is not available yet.
+
+The service `grpc_endpoint` currently supports plaintext `http://` and TLS `https://` using the platform trust store. Custom trust roots, client authentication, health checks, and runtime registration are not currently supported. The endpoint must be reachable from both the gateway and sandbox supervisors; use `host.openshell.internal` or another shared address that can be resolved in both places.
+
+See [Supervisor Middleware](/extensibility/supervisor-middleware) for selection, failure, body-limit, and operational guidance.
+
+## Gateway Interceptors
+
+`[[openshell.gateway.interceptors]]` configures gateway-side interceptor services. The gateway calls each service's `Describe` RPC at startup, validates its declared OpenShell RPC bindings against the compiled service descriptor, and applies matching phases from a central gRPC middleware path. Interceptors can target only methods in the gateway's built-in allowlist of unary mutation RPCs. New RPCs are non-interceptable until they are deliberately added to that allowlist; adding one does not require handler-specific interceptor code. Request bodies are exposed as protobuf JSON objects. Fields marked secret in the protobuf schema are recursively omitted from requests and post-commit responses. Interceptors cannot patch an omitted field or a containing object.
+
+`binding_policy` controls how the manifest and operator binding configuration combine:
+
+- `dynamic` enables valid manifest bindings and treats configured entries as optional narrowing overrides. This is the compatibility default. The gateway logs a startup warning because the interceptor controls its non-secret RPC authority.
+- `allowlist` enables only configured RPC selectors and phases. The gateway ignores and logs extra manifest declarations, but fails startup when the manifest omits a configured RPC or phase.
+- `exact` requires the configured and manifest RPC selectors and phases to match exactly.
+
+Bindings under `allowlist` and `exact` require `rpc` or `service` plus `method`, and a nonempty `phases` list. They match by RPC rather than manifest binding ID. Duplicate selectors, `id`, and `disabled` are invalid in these modes; omit a binding to disable it. Binding failure policy comes from the binding, then the configured service, then defaults to `fail_closed`. Manifest failure policies do not override strict-mode operator configuration.
+
+Bindings that include `post_commit` must resolve to `failure_policy = "fail_open"`; the gateway rejects fail-closed post-commit configuration at startup. Post-commit evaluation is observational. If response observation or interceptor evaluation fails after a handler succeeds, the gateway logs and counts the failure but returns the committed response unchanged.
+
+`provider_profile_sources` selects the exact ordered provider-profile source set. Omit it to use the built-in and user-managed sources. Use `{ type = "builtin" }`, `{ type = "user" }`, and `{ type = "interceptor", name = "<configured-interceptor-name>" }` entries to compose a catalog. An interceptor entry must reference a configured service whose manifest advertises `provider_profiles = true`. Selecting only an interceptor makes that catalog authoritative; include local sources explicitly to compose them. Empty or duplicate source lists, unknown interceptor names, and duplicate normalized profile IDs fail closed. Source order controls collection and diagnostics, not override precedence.
+
+For an authoritative interceptor catalog, select only that interceptor:
+
+```toml
+[openshell.gateway]
+provider_profile_sources = [
+  { type = "interceptor", name = "provider-governance" },
+]
+```
+
+The gateway validates snapshot structure and provider-profile semantics. It treats a configured interceptor as the source trust boundary and does not verify signature, hash, or key annotations in profile payloads.
+
+`failure_policy` accepts `fail_closed` or `fail_open`. `timeout` accepts `ms` and `s` suffixes. In `dynamic` mode, binding overrides may select a manifest binding by `id`, `rpc`, or `service` plus `method`; they can disable a binding, narrow its phases, or override its failure policy.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
 
@@ -172,11 +260,16 @@ service_account_name           = "openshell-sandbox"
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]
-supervisor_image               = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "IfNotPresent"
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method     = "image-volume"
+# "combined" runs the existing single supervisor container with full process,
+# filesystem, and network enforcement in the agent container. "sidecar" moves
+# pod-level network enforcement and gateway session handling into a network sidecar.
+topology                       = "combined"
 grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
 ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
@@ -194,6 +287,24 @@ sa_token_ttl_secs              = 3600
 # shared roots such as /run, /var, /tmp, and /etc are rejected.
 # Supervisor-to-gateway auth still uses gateway JWTs.
 provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
+# Explicit sandbox UID/GID for the supervisor container securityContext and
+# PVC init container. When unset, the driver auto-detects from OpenShift SCC
+# namespace annotations (openshift.io/sa.scc.uid-range) if present, falling
+# back to 1000 on non-OpenShift clusters.
+# sandbox_uid = 1500
+# sandbox_gid = 1500
+
+[openshell.drivers.kubernetes.sidecar]
+# UID used by relaxed long-running network sidecars. Strict process/binary-aware
+# sidecars run as UID 0 so Kubernetes grants the required /proc inspection
+# capabilities into the effective set. In sidecar topology the network init
+# container installs nftables rules that exempt the effective sidecar UID.
+proxy_uid                      = 1337
+# Keep process/binary-aware network policy enabled in sidecar topology. Set
+# false to run the sidecar as proxy_uid, drop the sidecar's extra /proc
+# inspection capabilities, and enforce endpoint/L7 policy without matching
+# policy.binaries.
+process_binary_aware_network_policy = true
 ```
 
 ### Docker
@@ -210,6 +321,7 @@ log_level       = "info"
 compute_drivers = ["docker"]
 
 [openshell.drivers.docker]
+socket_path        = "/var/run/docker.sock"
 default_image      = "ghcr.io/nvidia/openshell/sandbox:latest"
 # Docker vocabulary: Always | IfNotPresent | Never. Empty behaves like IfNotPresent.
 image_pull_policy  = "IfNotPresent"
@@ -219,7 +331,8 @@ grpc_endpoint      = "https://host.openshell.internal:17670"
 # Skip the image-pull-and-extract step by pointing at a locally built binary.
 supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
 # When supervisor_bin is omitted, Docker extracts /openshell-sandbox from this image.
-supervisor_image   = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca       = "/etc/openshell/certs/ca.pem"
 guest_tls_cert     = "/etc/openshell/certs/client.pem"
 guest_tls_key      = "/etc/openshell/certs/client-key.pem"
@@ -261,7 +374,8 @@ network_name            = "openshell"
 # host_gateway_ip       = "192.168.127.254"
 sandbox_ssh_socket_path = "/run/openshell/ssh.sock"
 stop_timeout_secs       = 10
-supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Defaults to the gateway version; override to pin a specific build.
+# supervisor_image      = "ghcr.io/nvidia/openshell/supervisor:<version>"
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
@@ -306,6 +420,9 @@ overlay_disk_mib = 4096
 guest_tls_ca     = "/var/lib/openshell/guest-tls/ca.pem"
 guest_tls_cert   = "/var/lib/openshell/guest-tls/client.pem"
 guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
+# Resolved sandbox UID/GID for the rootfs /etc/passwd entry.
+# Defaults to 10001 when unset; matching GID is used if sandbox_gid is empty.
+# sandbox_uid = 20001
 ```
 
 ### Extension Driver

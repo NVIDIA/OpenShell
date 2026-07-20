@@ -109,11 +109,6 @@ if [[ "$needs_build" == "1" ]]; then
         break
       fi
     done
-
-    if [[ -z "${Z3_SYS_Z3_HEADER:-}" ]]; then
-      echo "Falling back to bundled Z3 for local CLI build." >&2
-      build_args+=(--features bundled-z3)
-    fi
   fi
   cargo build "${build_args[@]}"
   # Persist state after successful build

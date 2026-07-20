@@ -165,7 +165,7 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | `openshell sandbox create -- <agent>`                      | Create a sandbox and launch an agent.           |
 | `openshell sandbox connect [name]`                         | SSH into a running sandbox.                     |
 | `openshell sandbox list`                                   | List all sandboxes.                             |
-| `openshell provider create --type [type]] --from-existing` | Create a credential provider from env vars.     |
+| `openshell provider create --type [type] --from-existing`  | Create a credential provider from env vars.     |
 | `openshell policy set <name> --policy file.yaml`           | Apply or update a policy on a running sandbox.  |
 | `openshell policy get <name>`                              | Show the active policy.                         |
 | `openshell inference set --provider <p> --model <m>`       | Configure the `inference.local` endpoint.       |
@@ -257,6 +257,8 @@ You can also compile telemetry out entirely. Telemetry support is a default-on `
 Telemetry events are limited to anonymous operational categories and counts, such as sandbox lifecycle outcomes, provider profile buckets, policy decision counts, and aggregate network activity denial categories. OpenShell telemetry does not collect sandbox names or IDs, hostnames, file paths, binary paths, prompts, credentials, provider names, model names, or user content.
 
 Opting out applies only to telemetry emitted by OpenShell. Third-party services, model providers, inference endpoints, agents, or tools that you configure and use with OpenShell may have their own terms and privacy practices.
+
+We publish aggregate usage trends from this telemetry every two weeks. See the [community telemetry reports](telemetry/README.md) for the latest summary.
 
 ## Notice and Disclaimer
 

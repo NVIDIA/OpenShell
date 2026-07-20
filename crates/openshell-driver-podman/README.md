@@ -68,16 +68,18 @@ mount types:
   pulls the image during provisioning using the sandbox image pull policy.
 
 Host bind mounts are disabled by default because they expose gateway host paths
-to sandbox requests. The driver still uses internal bind mounts for
-OpenShell-owned token and TLS material.
+to sandbox requests. The driver still uses internal bind mounts for configured
+TLS material; per-sandbox gateway JWTs are delivered through Podman secrets.
 
-Podman `bind` mounts accept `source`, `target`, and optional `read_only`.
-User-supplied bind and volume mounts are read-only by default; set
-`read_only: false` to make them writable. Podman image and volume mounts do not
-support `subpath` in OpenShell driver config. Mount targets must be absolute
-container paths and must not replace the workspace root (`/sandbox`) or overlap
-OpenShell supervisor files, `/etc/openshell`, `/etc/openshell-tls`, or
-`/run/netns`.
+Podman `bind` mounts accept `source`, `target`, optional `read_only`, and an
+optional `selinux_label` of `shared` (applies `:z`) or `private` (applies
+`:Z`) for SELinux-enforcing hosts. User-supplied bind and volume mounts are
+read-only by default; set `read_only: false` to make them writable. Podman
+image and volume mounts do not support `subpath` in OpenShell driver config.
+Mount `source` and `target` values must not contain surrounding whitespace.
+Mount targets must be absolute container paths and must not replace
+the workspace root (`/sandbox`) or overlap OpenShell supervisor files,
+`/etc/openshell`, `/etc/openshell-tls`, or `/run/netns`.
 
 Example named-volume usage:
 
@@ -128,8 +130,8 @@ sequenceDiagram
     C->>C: entrypoint: /opt/openshell/bin/openshell-sandbox
 ```
 
-The supervisor image from `deploy/docker/Dockerfile.supervisor` copies the static
-`openshell-sandbox` binary to `/openshell-sandbox`.
+The supervisor image from `deploy/docker/Dockerfile.supervisor` provides the
+static `openshell-sandbox` binary at `/openshell-sandbox`.
 Mounting that image at `/opt/openshell/bin` makes the binary available as
 `/opt/openshell/bin/openshell-sandbox`.
 

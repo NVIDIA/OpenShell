@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.inference.v1;
 
 import "datamodel.proto";
+import "options.proto";
 
 // Inference service provides cluster inference configuration and bundle delivery.
 service Inference {
@@ -104,7 +105,7 @@ message ResolvedRoute {
   string name = 1;
   string base_url = 2;
   repeated string protocols = 3;
-  string api_key = 4;
+  string api_key = 4 [(openshell.options.v1.secret) = true];
   string model_id = 5;
   string provider_type = 6;
   // Per-route request timeout in seconds. 0 means use default (60s).

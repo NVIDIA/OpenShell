@@ -221,6 +221,21 @@ openshell sandbox list --selector env=dev
 openshell sandbox list --selector env=dev,team=platform
 ```
 
+The Python SDK accepts the same gateway labels and selectors. Labels passed to
+`create` are stored on the gateway sandbox object and are returned on
+`SandboxRef.labels`, so selector-based listing finds Python-created sandboxes:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    sandbox = client.create(name="deep-research-1", labels={"env": "dev", "team": "platform"})
+    assert sandbox.labels["team"] == "platform"
+
+    matches = client.list(label_selector="env=dev,team=platform")
+    assert sandbox.id in {s.id for s in matches}
+```
+
 ## Expose Long Running Services
 
 Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
@@ -320,6 +335,8 @@ openshell term
 ```
 
 Use the terminal to spot blocked connections marked `action=deny` and inference-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy. Refer to [Policies](/sandboxes/policies) for the workflow.
+
+The dashboard has three panels stacked vertically: Gateways, Providers (or Global Settings), and Sandboxes. Navigate within a panel with `Up`/`Down` or `j`/`k`. At a list boundary the cursor overflows into the adjacent panel, skipping empty panels. Use `Tab`/`Shift+Tab` to cycle panels directly. Press `h`/`l` or `Left`/`Right` in the middle panel to switch between the Providers and Global Settings tabs.
 
 ## Port Forwarding
 

@@ -10,8 +10,9 @@
 
 set -euo pipefail
 
-if podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -q false; then
-  echo "ERROR: podman is not running rootless; this test requires rootless mode" >&2
+rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
+if [ "${rootless}" != "true" ]; then
+  echo "ERROR: podman is not running rootless; expected true, got '${rootless:-<empty>}'" >&2
   exit 2
 fi
 

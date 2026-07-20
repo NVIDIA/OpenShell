@@ -100,7 +100,7 @@ struct RunArgs {
     /// `kubernetes,podman`. The configuration format is future-proofed for
     /// multiple drivers, but the gateway currently requires exactly one.
     /// When unset, the gateway auto-detects the driver based on the runtime
-    /// environment (Kubernetes → Podman → Docker CLI or socket). VM is never
+    /// environment (Kubernetes → Podman → Docker). VM is never
     /// auto-detected and requires explicit configuration.
     #[arg(
         long,
@@ -372,8 +372,19 @@ fn prepare_server_config(args: &mut RunArgs, matches: &ArgMatches) -> Result<Ser
             args.grpc_rate_limit_requests,
             args.grpc_rate_limit_window_seconds,
         )
+        .with_gateway_interceptors(
+            file.as_ref()
+                .map(|f| f.openshell.gateway.interceptors.clone())
+                .unwrap_or_default(),
+        )
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
+    if let Some(sources) = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
+    {
+        config = config.with_provider_profile_sources(sources);
+    }
     validate_grpc_rate_limit_args(
         args.grpc_rate_limit_requests,
         args.grpc_rate_limit_window_seconds,

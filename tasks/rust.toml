@@ -18,12 +18,18 @@ hide = true
 
 ["rust:format"]
 description = "Format Rust code"
-run = "cargo fmt --all"
+run = [
+  "cargo fmt --all",
+  "cargo fmt --manifest-path e2e/rust/Cargo.toml --all",
+]
 hide = true
 
 ["rust:format:check"]
 description = "Check Rust formatting"
-run = "cargo fmt --all -- --check"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check",
+]
 hide = true
 
 ["rust:verify:telemetry-off"]

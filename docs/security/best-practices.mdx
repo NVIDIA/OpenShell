@@ -288,6 +288,7 @@ The following patterns weaken security without providing meaningful benefit.
 | Using broad binary globs | A glob like `/**` allows any binary to reach the endpoint, defeating binary-scoped enforcement. | Scope globs to specific directories (for example, `/sandbox/.vscode-server/**`). |
 | Skipping TLS termination on HTTPS APIs | Setting `tls: skip` disables placeholder credential rewriting, dynamic token grant injection, and L7 inspection. | Use the default auto-detect behavior unless the upstream requires client-certificate mTLS. |
 | Setting `enforcement: enforce` before auditing | Jumping to `enforce` without first running in `audit` mode risks breaking the agent's workflow. | Start with `audit`, review the logs, and switch to `enforce` after you validate the rules. |
+| Pasting raw stack traces in bug reports | Some frameworks include the full request config — including credentials — in error objects. The sandbox does not scrub application-level output. | Inspect error output before sharing. Redact any credentials, API keys, or tokens. |
 
 ## Related Topics
 

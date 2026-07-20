@@ -8,8 +8,9 @@
 use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, ProviderCredentialRefresh,
-    ProviderCredentialRefreshMaterial, ProviderCredentialRefreshStrategy, ProviderProfile,
-    ProviderProfileCategory, ProviderProfileCredential, ProviderProfileDiscovery,
+    ProviderCredentialRefreshMaterial, ProviderCredentialRefreshOutput,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCategory,
+    ProviderProfileCredential, ProviderProfileDiscovery,
 };
 use openshell_core::secrets::uses_reserved_revision_namespace;
 use serde::ser::SerializeStruct;
@@ -21,7 +22,9 @@ use std::sync::OnceLock;
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
+    include_str!("../../../providers/aws.yaml"),
     include_str!("../../../providers/aws-bedrock.yaml"),
+    include_str!("../../../providers/aws-s3.yaml"),
     include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/codex.yaml"),
     include_str!("../../../providers/copilot.yaml"),
@@ -147,6 +150,11 @@ pub struct CredentialRefreshProfile {
     pub max_lifetime_seconds: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub material: Vec<CredentialRefreshMaterialProfile>,
+    /// Additional credentials this refresh mints beyond its primary credential.
+    /// Each entry maps a strategy-defined semantic output id to a sibling
+    /// credential whose `env_vars` receive the minted value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_outputs: Vec<CredentialRefreshOutputProfile>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -158,6 +166,14 @@ pub struct CredentialRefreshMaterialProfile {
     pub required: bool,
     #[serde(default)]
     pub secret: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CredentialRefreshOutputProfile {
+    /// Strategy-defined semantic output id (e.g. `session_token`).
+    pub output: String,
+    /// Sibling credential name whose `env_vars` receive this output.
+    pub credential: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -297,6 +313,8 @@ pub struct ProviderTypeProfile {
     pub id: String,
     #[serde(default, skip_serializing_if = "is_u64_zero")]
     pub resource_version: u64,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub annotations: HashMap<String, String>,
     pub display_name: String,
     #[serde(default)]
     pub description: String,
@@ -328,6 +346,7 @@ impl ProviderTypeProfile {
         Self {
             id: profile.id.clone(),
             resource_version: profile.resource_version,
+            annotations: profile.annotations.clone(),
             display_name: profile.display_name.clone(),
             description: profile.description.clone(),
             category: ProviderProfileCategory::try_from(profile.category)
@@ -380,18 +399,69 @@ impl ProviderTypeProfile {
     /// Empty provider creation is allowed when at least one credential can be
     /// resolved at runtime, and every required credential can be resolved at
     /// runtime. Runtime-resolvable credentials are either gateway-mintable
-    /// refresh credentials or sandbox-side dynamic token grants.
+    /// refresh credentials, sandbox-side dynamic token grants, or additional
+    /// outputs co-minted by another credential's gateway-mintable refresh.
     #[must_use]
     pub fn allows_empty_provider_credentials(&self) -> bool {
+        let co_minted = self.co_minted_credential_names();
         let mut has_runtime_resolvable_credential = false;
         for credential in &self.credentials {
-            let is_runtime_resolvable = credential.is_runtime_resolvable();
+            let is_runtime_resolvable =
+                credential.is_runtime_resolvable() || co_minted.contains(credential.name.as_str());
             if credential.required && !is_runtime_resolvable {
                 return false;
             }
             has_runtime_resolvable_credential |= is_runtime_resolvable;
         }
         has_runtime_resolvable_credential
+    }
+
+    /// Names of credentials produced as `additional_outputs` of a
+    /// gateway-mintable refresh on some other credential.
+    fn co_minted_credential_names(&self) -> HashSet<&str> {
+        self.credentials
+            .iter()
+            .filter_map(|credential| credential.refresh.as_ref())
+            .filter(|refresh| refresh.is_gateway_mintable())
+            .flat_map(|refresh| refresh.additional_outputs.iter())
+            .map(|output| output.credential.as_str())
+            .collect()
+    }
+
+    /// For the credential resolved by `credential_key` (matched by name or env
+    /// var) that carries a refresh with `additional_outputs`, resolve each
+    /// output to the concrete env key of its target credential. Returns a map
+    /// of semantic output id -> env key (empty when there is no such refresh or
+    /// no additional outputs). Skips outputs whose target credential is missing
+    /// or does not declare exactly one env var; `validate_profile_set` reports
+    /// those as errors.
+    #[must_use]
+    pub fn resolved_additional_output_keys(&self, credential_key: &str) -> HashMap<String, String> {
+        let Some(refresh) = self
+            .credentials
+            .iter()
+            .find(|credential| {
+                credential.name == credential_key
+                    || credential.env_vars.iter().any(|env| env == credential_key)
+            })
+            .and_then(|credential| credential.refresh.as_ref())
+        else {
+            return HashMap::new();
+        };
+        refresh
+            .additional_outputs
+            .iter()
+            .filter_map(|output| {
+                let target = self
+                    .credentials
+                    .iter()
+                    .find(|credential| credential.name == output.credential)?;
+                let [env_key] = target.env_vars.as_slice() else {
+                    return None;
+                };
+                Some((output.output.clone(), env_key.clone()))
+            })
+            .collect()
     }
 
     /// Returns the credential suitable for `--from-gcloud-adc` bootstrap, if any.
@@ -418,6 +488,7 @@ impl ProviderTypeProfile {
         ProviderProfile {
             id: self.id.clone(),
             resource_version: self.resource_version,
+            annotations: self.annotations.clone(),
             display_name: self.display_name.clone(),
             description: self.description.clone(),
             category: self.category as i32,
@@ -474,12 +545,73 @@ impl CredentialProfile {
 impl CredentialRefreshProfile {
     #[must_use]
     pub fn is_gateway_mintable(&self) -> bool {
-        matches!(
-            self.strategy,
-            ProviderCredentialRefreshStrategy::Oauth2RefreshToken
-                | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
-                | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
-        )
+        is_gateway_mintable_strategy(self.strategy)
+    }
+}
+
+/// Whether the gateway can mint credentials for this refresh strategy (as
+/// opposed to strategies resolved elsewhere, e.g. `Static`/`External`).
+///
+/// Single source of truth shared with `openshell-server`; keep in sync with the
+/// dispatch in `provider_refresh::mint_credential`.
+#[must_use]
+pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy) -> bool {
+    matches!(
+        strategy,
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+            | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+            | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+            | ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+    )
+}
+
+/// Semantic output ids a refresh strategy can produce **in addition** to its
+/// primary credential, split into required and optional.
+///
+/// Drives `additional_outputs` validation. Strategies not listed here produce
+/// only a single (primary) credential and reject any `additional_outputs`.
+#[must_use]
+pub fn strategy_output_spec(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> (&'static [&'static str], &'static [&'static str]) {
+    match strategy {
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
+            (&["secret_access_key", "session_token"], &[])
+        }
+        _ => (&[], &[]),
+    }
+}
+
+/// Expected primary env key for strategies that constrain it, or `None` when the
+/// strategy accepts any caller-chosen primary key.
+///
+/// AWS `SigV4` signing looks up `AWS_ACCESS_KEY_ID` by name, so STS pins the
+/// primary key.
+#[must_use]
+pub fn strategy_primary_env_key(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> Option<&'static str> {
+    match strategy {
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => Some("AWS_ACCESS_KEY_ID"),
+        _ => None,
+    }
+}
+
+/// Expected concrete env key for a given strategy output, when the strategy
+/// constrains it (the `SigV4` signer resolves these by name).
+#[must_use]
+pub fn strategy_output_env_key(
+    strategy: ProviderCredentialRefreshStrategy,
+    output: &str,
+) -> Option<&'static str> {
+    match (strategy, output) {
+        (ProviderCredentialRefreshStrategy::AwsStsAssumeRole, "secret_access_key") => {
+            Some("AWS_SECRET_ACCESS_KEY")
+        }
+        (ProviderCredentialRefreshStrategy::AwsStsAssumeRole, "session_token") => {
+            Some("AWS_SESSION_TOKEN")
+        }
+        _ => None,
     }
 }
 
@@ -639,6 +771,7 @@ pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredenti
         "google_service_account_jwt" => {
             Some(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
+        "aws_sts_assume_role" => Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
         _ => None,
     }
 }
@@ -653,6 +786,7 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -675,6 +809,14 @@ fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> Credent
                 secret: material.secret,
             })
             .collect(),
+        additional_outputs: refresh
+            .additional_outputs
+            .iter()
+            .map(|output| CredentialRefreshOutputProfile {
+                output: output.output.clone(),
+                credential: output.credential.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -693,6 +835,14 @@ fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCr
                 description: material.description.clone(),
                 required: material.required,
                 secret: material.secret,
+            })
+            .collect(),
+        additional_outputs: refresh
+            .additional_outputs
+            .iter()
+            .map(|output| ProviderCredentialRefreshOutput {
+                output: output.output.clone(),
+                credential: output.credential.clone(),
             })
             .collect(),
     }
@@ -1287,6 +1437,136 @@ pub fn validate_profile_set(
                         ));
                     }
                 }
+
+                let strategy_name = provider_refresh_strategy_to_yaml(refresh.strategy);
+                let (required_outputs, optional_outputs) = strategy_output_spec(refresh.strategy);
+                let known_outputs: HashSet<&str> = required_outputs
+                    .iter()
+                    .chain(optional_outputs.iter())
+                    .copied()
+                    .collect();
+
+                if known_outputs.is_empty() && !refresh.additional_outputs.is_empty() {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.additional_outputs",
+                        format!("strategy {strategy_name} does not support additional_outputs"),
+                    ));
+                }
+
+                let mut seen_outputs = HashSet::new();
+                let mut mapped_required = HashSet::new();
+                for output in &refresh.additional_outputs {
+                    let output_id = output.output.trim();
+                    let cred_name = output.credential.trim();
+
+                    if output_id.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.output",
+                            "refresh additional output id is required",
+                        ));
+                        continue;
+                    }
+                    if !seen_outputs.insert(output_id.to_string()) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.output",
+                            format!("duplicate refresh additional output: {output_id}"),
+                        ));
+                    }
+                    if known_outputs.contains(output_id) {
+                        if required_outputs.contains(&output_id) {
+                            mapped_required.insert(output_id.to_string());
+                        }
+                    } else if !known_outputs.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.output",
+                            format!(
+                                "strategy {strategy_name} does not produce output '{output_id}'"
+                            ),
+                        ));
+                    }
+
+                    let Some(sibling) = profile.credentials.iter().find(|c| c.name == cred_name)
+                    else {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.credential",
+                            format!(
+                                "refresh additional output '{output_id}' references unknown credential '{cred_name}'"
+                            ),
+                        ));
+                        continue;
+                    };
+                    if sibling.refresh.is_some() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.credential",
+                            format!(
+                                "credential '{cred_name}' is a refresh output and must not declare its own refresh"
+                            ),
+                        ));
+                    }
+                    if sibling.env_vars.len() != 1 {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.credential",
+                            format!(
+                                "refresh output credential '{cred_name}' must declare exactly one env var"
+                            ),
+                        ));
+                        continue;
+                    }
+                    let resolved = sibling.env_vars[0].as_str();
+                    if let Some(expected) = strategy_output_env_key(refresh.strategy, output_id)
+                        && resolved != expected
+                    {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs.credential",
+                            format!(
+                                "refresh output '{output_id}' must map to env var {expected}, found {resolved}"
+                            ),
+                        ));
+                    }
+                }
+
+                for required in required_outputs {
+                    if !mapped_required.contains(*required) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.additional_outputs",
+                            format!(
+                                "strategy {strategy_name} requires additional output '{required}'"
+                            ),
+                        ));
+                    }
+                }
+
+                if let Some(expected_primary) = strategy_primary_env_key(refresh.strategy)
+                    && (credential.env_vars.len() != 1
+                        || credential.env_vars[0] != expected_primary)
+                {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.env_vars",
+                        format!(
+                            "strategy {strategy_name} requires primary credential to map to env var {expected_primary}"
+                        ),
+                    ));
+                }
             }
 
             if let Some(token_grant) = credential.token_grant.as_ref()
@@ -1696,11 +1976,11 @@ fn is_kubernetes_service_host(host: &str) -> bool {
     (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
 }
 
-static DEFAULT_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
+static BUILTIN_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
 
 #[must_use]
-pub fn default_profiles() -> &'static [ProviderTypeProfile] {
-    DEFAULT_PROFILES
+pub fn builtin_profiles() -> &'static [ProviderTypeProfile] {
+    BUILTIN_PROFILES
         .get_or_init(|| {
             parse_profile_catalog_yamls(BUILT_IN_PROFILE_YAMLS)
                 .expect("built-in provider profiles must be valid YAML")
@@ -1708,26 +1988,28 @@ pub fn default_profiles() -> &'static [ProviderTypeProfile] {
         .as_slice()
 }
 
-#[must_use]
-pub fn get_default_profile(id: &str) -> Option<&'static ProviderTypeProfile> {
-    default_profiles()
-        .iter()
-        .find(|profile| profile.id.eq_ignore_ascii_case(id))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use openshell_core::proto::ProviderProfileCategory;
 
     use super::{
-        DiscoveryProfile, ProfileError, ProviderTypeProfile, default_profiles, get_default_profile,
+        DiscoveryProfile, ProfileError, ProviderTypeProfile, builtin_profiles,
         normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
         profile_to_json, profile_to_yaml, validate_profile_set,
     };
 
+    fn builtin_profile(id: &str) -> &'static ProviderTypeProfile {
+        builtin_profiles()
+            .iter()
+            .find(|profile| profile.id == id)
+            .unwrap_or_else(|| panic!("built-in profile {id} should exist"))
+    }
+
     #[test]
-    fn default_profiles_are_sorted_by_id() {
-        let ids = default_profiles()
+    fn builtin_profiles_are_sorted_by_id() {
+        let ids = builtin_profiles()
             .iter()
             .map(|profile| profile.id.as_str())
             .collect::<Vec<_>>();
@@ -1738,7 +2020,7 @@ mod tests {
 
     #[test]
     fn github_profile_materializes_policy_metadata() {
-        let profile = get_default_profile("github").expect("github profile");
+        let profile = builtin_profile("github");
         let proto = profile.to_proto();
 
         assert_eq!(proto.id, "github");
@@ -1768,7 +2050,7 @@ mod tests {
 
     #[test]
     fn credential_env_vars_are_deduplicated_in_profile_order() {
-        let profile = get_default_profile("claude-code").expect("claude-code profile");
+        let profile = builtin_profile("claude-code");
         assert_eq!(
             profile.credential_env_vars(),
             vec!["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
@@ -1777,7 +2059,7 @@ mod tests {
 
     #[test]
     fn vertex_profile_declares_discovery_and_fallback_token_env_vars() {
-        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
+        let profile = builtin_profile("google-vertex-ai");
         let service_account_token = profile
             .credentials
             .iter()
@@ -1875,13 +2157,13 @@ credentials:
 
     #[test]
     fn adc_credential_returns_oauth2_refresh_token_credential_with_adc_material() {
-        let profile = get_default_profile("google-cloud").expect("google-cloud profile");
+        let profile = builtin_profile("google-cloud");
         let adc = profile
             .adc_credential()
             .expect("google-cloud should have an ADC credential");
         assert_eq!(adc.env_vars[0], "GCP_ADC_ACCESS_TOKEN");
 
-        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
+        let profile = builtin_profile("google-vertex-ai");
         let adc = profile
             .adc_credential()
             .expect("vertex should have an ADC credential");
@@ -1890,10 +2172,10 @@ credentials:
 
     #[test]
     fn adc_credential_returns_none_for_profiles_without_adc() {
-        let profile = get_default_profile("github").expect("github profile");
+        let profile = builtin_profile("github");
         assert!(profile.adc_credential().is_none());
 
-        let profile = get_default_profile("claude-code").expect("claude-code profile");
+        let profile = builtin_profile("claude-code");
         assert!(profile.adc_credential().is_none());
     }
 
@@ -2433,13 +2715,45 @@ endpoints:
 
     #[test]
     fn profile_json_round_trip_preserves_compact_dto_shape() {
-        let profile = get_default_profile("github").expect("github profile");
+        let profile = builtin_profile("github");
         let json = profile_to_json(profile).expect("profile should serialize");
         let parsed = parse_profile_json(&json).expect("profile should parse");
 
         assert_eq!(parsed.id, "github");
         assert_eq!(parsed.category, ProviderProfileCategory::SourceControl);
         assert_eq!(parsed.binaries[0].path, "/usr/bin/gh");
+    }
+
+    #[test]
+    fn profile_annotations_round_trip_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: signed
+annotations:
+  openshell.nvidia.com/profile-hash: sha256:abc123
+  openshell.nvidia.com/profile-signature: signed-token
+display_name: Signed
+description: Signed provider profile
+credentials: []
+endpoints: []
+binaries: []
+",
+        )
+        .expect("profile should parse");
+
+        let proto = profile.to_proto();
+        assert_eq!(
+            proto
+                .annotations
+                .get("openshell.nvidia.com/profile-signature")
+                .map(String::as_str),
+            Some("signed-token")
+        );
+
+        let exported = profile_to_yaml(&ProviderTypeProfile::from_proto(&proto))
+            .expect("profile should serialize");
+        let reparsed = parse_profile_yaml(&exported).expect("exported profile should parse");
+        assert_eq!(reparsed.annotations, profile.annotations);
     }
 
     #[test]
@@ -2593,6 +2907,7 @@ binaries: ["", /usr/bin/broken]
                 ProviderTypeProfile {
                     id: " alex-api ".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Space".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2608,6 +2923,7 @@ binaries: ["", /usr/bin/broken]
                 ProviderTypeProfile {
                     id: "alex_api".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Underscore".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2623,6 +2939,7 @@ binaries: ["", /usr/bin/broken]
                 ProviderTypeProfile {
                     id: "Alex-API".to_string(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                     display_name: "Case".to_string(),
                     description: String::new(),
                     category: ProviderProfileCategory::Other,
@@ -2689,5 +3006,429 @@ endpoints:
         .unwrap_err();
 
         assert!(matches!(err, ProfileError::InvalidEndpoint { id, .. } if id == "bad-endpoint"));
+    }
+
+    #[test]
+    fn aws_sts_strategy_serde_roundtrip() {
+        use openshell_core::proto::ProviderCredentialRefreshStrategy;
+        assert_eq!(
+            super::provider_refresh_strategy_from_yaml("aws_sts_assume_role"),
+            Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole)
+        );
+        assert_eq!(
+            super::provider_refresh_strategy_to_yaml(
+                ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            ),
+            "aws_sts_assume_role"
+        );
+    }
+
+    #[test]
+    fn aws_profile_parses_correctly() {
+        let aws = builtin_profile("aws");
+        assert_eq!(aws.display_name, "AWS");
+        assert_eq!(aws.credentials.len(), 3);
+        let access_key = aws
+            .credentials
+            .iter()
+            .find(|c| c.name == "access_key_id")
+            .unwrap();
+        assert!(access_key.refresh.is_some());
+        let refresh = access_key.refresh.as_ref().unwrap();
+        assert_eq!(
+            refresh.strategy,
+            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+        );
+        assert!(
+            refresh
+                .material
+                .iter()
+                .any(|m| m.name == "role_arn" && m.required)
+        );
+    }
+
+    #[test]
+    fn aws_s3_profile_parses_with_endpoints() {
+        let aws_s3 = builtin_profile("aws-s3");
+        assert_eq!(aws_s3.display_name, "AWS S3");
+        assert!(!aws_s3.endpoints.is_empty());
+        assert!(
+            !aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "**.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "*.s3.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "*.s3.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "*.s3.dualstack.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.dualstack.*.amazonaws.com")
+        );
+    }
+
+    #[test]
+    fn aws_profile_declares_additional_outputs() {
+        for id in ["aws", "aws-s3"] {
+            let profile = builtin_profile(id);
+            let refresh = profile
+                .credentials
+                .iter()
+                .find(|c| c.name == "access_key_id")
+                .and_then(|c| c.refresh.as_ref())
+                .expect("access_key_id refresh should exist");
+            let outputs: Vec<(&str, &str)> = refresh
+                .additional_outputs
+                .iter()
+                .map(|o| (o.output.as_str(), o.credential.as_str()))
+                .collect();
+            assert_eq!(
+                outputs,
+                vec![
+                    ("secret_access_key", "secret_access_key"),
+                    ("session_token", "session_token"),
+                ],
+                "unexpected additional_outputs for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn aws_profiles_are_runtime_resolvable() {
+        // With AwsStsAssumeRole recognized as gateway-mintable, all three
+        // required credentials are runtime-resolvable, so `--runtime-credentials`
+        // (empty provider creation) is allowed.
+        for id in ["aws", "aws-s3"] {
+            let profile = builtin_profile(id);
+            assert!(
+                profile.allows_empty_provider_credentials(),
+                "{id} should allow empty provider credentials"
+            );
+        }
+    }
+
+    #[test]
+    fn is_gateway_mintable_strategy_includes_aws_sts() {
+        assert!(super::is_gateway_mintable_strategy(
+            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+        ));
+    }
+
+    #[test]
+    fn additional_outputs_round_trip_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: aws-round-trip
+display_name: AWS Round Trip
+credentials:
+  - name: access_key_id
+    env_vars: [AWS_ACCESS_KEY_ID]
+    required: true
+    refresh:
+      strategy: aws_sts_assume_role
+      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token
+      material:
+        - name: role_arn
+          required: true
+  - name: secret_access_key
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true
+",
+        )
+        .expect("profile should parse");
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        assert_eq!(
+            from_proto.credentials[0].refresh,
+            profile.credentials[0].refresh
+        );
+
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        assert!(exported.contains("additional_outputs"));
+        assert!(exported.contains("session_token"));
+        let reparsed = parse_profile_yaml(&exported).expect("re-parse");
+        assert_eq!(
+            reparsed.credentials[0].refresh,
+            profile.credentials[0].refresh
+        );
+    }
+
+    fn aws_output_profile(additional_outputs: &str, credentials_tail: &str) -> ProviderTypeProfile {
+        parse_profile_yaml(&format!(
+            r"
+id: aws-outputs
+display_name: AWS Outputs
+credentials:
+  - name: access_key_id
+    env_vars: [AWS_ACCESS_KEY_ID]
+    required: true
+    refresh:
+      strategy: aws_sts_assume_role
+{additional_outputs}
+      material:
+        - name: role_arn
+          required: true
+{credentials_tail}
+"
+        ))
+        .expect("profile should parse")
+    }
+
+    const STANDARD_AWS_OUTPUT_TAIL: &str = "  - name: secret_access_key
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true";
+
+    #[test]
+    fn validate_rejects_additional_output_unknown_credential() {
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: nonexistent
+        - output: session_token
+          credential: session_token",
+            STANDARD_AWS_OUTPUT_TAIL,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d.field
+                == "credentials.refresh.additional_outputs.credential"
+                && d.message.contains("unknown credential 'nonexistent'")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_additional_output() {
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token",
+            STANDARD_AWS_OUTPUT_TAIL,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("duplicate refresh additional output")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_output_for_strategy() {
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token
+        - output: bogus
+          credential: session_token",
+            STANDARD_AWS_OUTPUT_TAIL,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("does not produce output 'bogus'")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_required_output() {
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key",
+            STANDARD_AWS_OUTPUT_TAIL,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("requires additional output 'session_token'")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_output_credential_with_own_refresh() {
+        let tail = "  - name: secret_access_key
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+    refresh:
+      strategy: oauth2_client_credentials
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true";
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token",
+            tail,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("must not declare its own refresh")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nonstandard_aws_output_env_key() {
+        let tail = "  - name: secret_access_key
+    env_vars: [WRONG_SECRET]
+    required: true
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true";
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token",
+            tail,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("must map to env var AWS_SECRET_ACCESS_KEY, found WRONG_SECRET")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_wrong_primary_env_key_for_aws_sts() {
+        let profile = parse_profile_yaml(
+            r"
+id: aws-wrong-primary
+display_name: AWS Wrong Primary
+credentials:
+  - name: access_key_id
+    env_vars: [NOT_AWS_ACCESS_KEY_ID]
+    required: true
+    refresh:
+      strategy: aws_sts_assume_role
+      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token
+      material:
+        - name: role_arn
+          required: true
+  - name: secret_access_key
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+  - name: session_token
+    env_vars: [AWS_SESSION_TOKEN]
+    required: true
+",
+        )
+        .expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.iter().any(|d| d
+                .message
+                .contains("requires primary credential to map to env var AWS_ACCESS_KEY_ID")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_additional_outputs_on_unsupported_strategy() {
+        let profile = parse_profile_yaml(
+            r"
+id: oauth-with-outputs
+display_name: OAuth With Outputs
+credentials:
+  - name: access_token
+    env_vars: [ACCESS_TOKEN]
+    required: true
+    refresh:
+      strategy: oauth2_client_credentials
+      additional_outputs:
+        - output: extra
+          credential: other
+  - name: other
+    env_vars: [OTHER]
+    required: false
+",
+        )
+        .expect("profile should parse");
+        let diagnostics = validate_profile_set(&[("oauth.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("does not support additional_outputs")),
+            "diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_standard_aws_additional_outputs() {
+        let profile = aws_output_profile(
+            "      additional_outputs:
+        - output: secret_access_key
+          credential: secret_access_key
+        - output: session_token
+          credential: session_token",
+            STANDARD_AWS_OUTPUT_TAIL,
+        );
+        let diagnostics = validate_profile_set(&[("aws.yaml".to_string(), profile)]);
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected diagnostics: {diagnostics:?}"
+        );
     }
 }

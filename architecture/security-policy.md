@@ -46,18 +46,21 @@ request is denied.
 ## Host Wildcards
 
 Network endpoint `host` patterns accept a `*` wildcard inside the first DNS
-label only. The OPA runtime matches with a `.` label boundary, so a wildcard
-never spans dots. The validator enforces the same boundary so that policy load
-fails fast instead of silently mismatching at the proxy.
+label and as an entire middle DNS label. The OPA runtime matches with a `.`
+label boundary, so a wildcard never spans dots. The validator enforces the same
+boundary so that policy load fails fast instead of silently mismatching at the
+proxy.
 
 | Pattern | Accepted | Example match | Notes |
 |---|---|---|---|
 | `*.example.com` | Yes | `api.example.com` | Single first label of any value. |
 | `**.example.com` | Yes | `a.b.example.com` | Recursive wildcard as the entire first label. |
 | `*-aiplatform.googleapis.com` | Yes | `us-central1-aiplatform.googleapis.com` | Intra-label wildcard inside the first DNS label. |
+| `*.s3.*.amazonaws.com` | Yes | `bucket.s3.us-east-1.amazonaws.com` | Middle-label `*` matches exactly one DNS label. |
 | `*` or `**` | No | — | Matches every host. |
 | `*.com`, `**.com` | No | — | TLD wildcards (`labels <= 2`). |
-| `foo.*.example.com` | No | — | Wildcard outside the first DNS label. |
+| `foo.us-*.example.com` | No | — | Partial middle-label wildcards are not allowed. |
+| `foo.**.example.com` | No | — | Recursive wildcard outside the first label is not allowed. |
 | `foo**.example.com` | No | — | Recursive `**` mixed inside a label; allowed only as the entire first label. |
 
 Validation rejects the disallowed patterns at policy load time with a message
@@ -128,7 +131,19 @@ through the proposal loop instead of treating the denial as terminal.
    auto-rejects the older ones with reason `"superseded by chunk X"`. This
    gives the agent a refinement path (broad mechanistic L4 → narrow agent
    L7) without an explicit `supersedes_chunk_id` field.
-5. **Escalation.** Anything else lands in `pending` for human review.
+5. **Mechanistic dedup and self-reject.** Mechanistic submissions dedup on
+   `(host, port, binary)`: a repeat denial for an endpoint that already has a
+   draft row folds into that row (bumping `hit_count`) instead of creating a
+   new chunk. When the endpoint is already covered by a *different* approved
+   chunk, the redundant mechanistic submission self-rejects on arrival with
+   reason `"already covered by approved chunk X"`. This only ever acts on a
+   genuinely fresh, still-`pending` submission; it never rewrites the status
+   of an already-decided chunk. A dedup hit that resolves to an approved
+   row's own id leaves that chunk `approved` and merged — the self-reject
+   path does not un-merge a rule, so flipping an approved chunk to `rejected`
+   would leave the governance ledger disagreeing with the still-enforced
+   policy.
+6. **Escalation.** Anything else lands in `pending` for human review.
 
 ## What the prover decides
 
@@ -179,6 +194,10 @@ Sandbox events that represent observable behavior use OCSF structured logs:
 
 Use plain tracing for internal plumbing such as retries, debug state, and
 intermediate steps where the final observable event is logged separately.
+Forward-proxy success is a final observable event: emit it only after
+middleware, token grants, credential rewriting, policy-generation checks, and
+the HTTP relay have succeeded so a later denial cannot coexist with an allowed
+record for the same request.
 
 Never log secrets, credentials, bearer tokens, or query parameters in OCSF
 messages. OCSF JSONL output may be shipped to external systems.

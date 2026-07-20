@@ -167,9 +167,14 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read client key from {key_path}"))?;
 
-        let tls_config = ClientTlsConfig::new()
+        let mut tls_config = ClientTlsConfig::new()
             .ca_certificate(Certificate::from_pem(ca_pem))
             .identity(Identity::from_pem(cert_pem, key_pem));
+        if let Ok(server_name) = std::env::var(sandbox_env::GATEWAY_TLS_SERVER_NAME)
+            && !server_name.is_empty()
+        {
+            tls_config = tls_config.domain_name(server_name);
+        }
 
         ep = ep
             .tls_config(tls_config)
@@ -439,16 +444,7 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
 /// Returns the expiry in milliseconds since the Unix epoch, or `None` if
 /// the token is not a parseable JWT.
 fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
-    use base64::Engine;
-    let mut parts = jwt.splitn(3, '.');
-    let _header = parts.next()?;
-    let payload_b64 = parts.next()?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    let exp_secs = value.get("exp")?.as_i64()?;
-    exp_secs.checked_mul(1000)
+    crate::jwt::parse_exp_secs(jwt)?.checked_mul(1000)
 }
 
 #[cfg(test)]
@@ -573,11 +569,25 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
     fetch_policy_with_client(&mut client, sandbox_id).await
 }
 
-/// Fetch sandbox policy using an existing client connection.
-async fn fetch_policy_with_client(
+/// Fetch the authoritative policy and revision metadata in one response.
+///
+/// Callers that must acknowledge the exact revision they loaded should retain
+/// this snapshot instead of re-fetching metadata after policy construction.
+/// The snapshot also carries the external middleware registrations required
+/// by the policy.
+pub async fn fetch_settings_snapshot(
+    endpoint: &str,
+    sandbox_id: &str,
+) -> Result<SettingsPollResult> {
+    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to fetch OpenShell settings snapshot");
+    let mut client = connect(endpoint).await?;
+    fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
+}
+
+async fn fetch_settings_snapshot_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_id: &str,
-) -> Result<Option<ProtoSandboxPolicy>> {
+) -> Result<SettingsPollResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -585,14 +595,22 @@ async fn fetch_policy_with_client(
         .await
         .into_diagnostic()?;
 
-    let inner = response.into_inner();
+    Ok(settings_poll_result(response.into_inner()))
+}
+
+/// Fetch sandbox policy using an existing client connection.
+async fn fetch_policy_with_client(
+    client: &mut OpenShellClient<AuthedChannel>,
+    sandbox_id: &str,
+) -> Result<Option<ProtoSandboxPolicy>> {
+    let snapshot = fetch_settings_snapshot_with_client(client, sandbox_id).await?;
 
     // version 0 with no policy means the sandbox was created without one.
-    if inner.version == 0 && inner.policy.is_none() {
+    if snapshot.version == 0 && snapshot.policy.is_none() {
         return Ok(None);
     }
 
-    Ok(Some(inner.policy.ok_or_else(|| {
+    Ok(Some(snapshot.policy.ok_or_else(|| {
         miette::miette!("Server returned non-zero version but empty policy")
     })?))
 }
@@ -607,12 +625,7 @@ async fn sync_policy_with_client(
         .update_config(UpdateConfigRequest {
             name: sandbox.to_string(),
             policy: Some(policy.clone()),
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()
@@ -661,6 +674,18 @@ pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPol
     sync_policy_with_client(&mut client, sandbox, policy).await
 }
 
+/// Sync an enriched policy and return the authoritative revision snapshot.
+pub async fn sync_policy_and_fetch_snapshot(
+    endpoint: &str,
+    sandbox_id: &str,
+    sandbox: &str,
+    policy: &ProtoSandboxPolicy,
+) -> Result<SettingsPollResult> {
+    let mut client = connect(endpoint).await?;
+    sync_policy_with_client(&mut client, sandbox, policy).await?;
+    fetch_settings_snapshot_with_client(&mut client, sandbox_id).await
+}
+
 /// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
 ///
 /// Returns a map of environment variable names to values derived from provider
@@ -700,6 +725,7 @@ pub struct CachedOpenShellClient {
 }
 
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
+#[derive(Clone, Debug)]
 pub struct SettingsPollResult {
     pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
@@ -711,6 +737,22 @@ pub struct SettingsPollResult {
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
     pub provider_env_revision: u64,
+    pub supervisor_middleware_services: Vec<crate::proto::SupervisorMiddlewareService>,
+}
+
+fn settings_poll_result(inner: crate::proto::GetSandboxConfigResponse) -> SettingsPollResult {
+    SettingsPollResult {
+        policy: inner.policy,
+        version: inner.version,
+        policy_hash: inner.policy_hash,
+        config_revision: inner.config_revision,
+        policy_source: PolicySource::try_from(inner.policy_source)
+            .unwrap_or(PolicySource::Unspecified),
+        settings: inner.settings,
+        global_policy_version: inner.global_policy_version,
+        provider_env_revision: inner.provider_env_revision,
+        supervisor_middleware_services: inner.supervisor_middleware_services,
+    }
 }
 
 pub struct ProviderEnvironmentResult {
@@ -743,19 +785,7 @@ impl CachedOpenShellClient {
             .await
             .into_diagnostic()?;
 
-        let inner = response.into_inner();
-
-        Ok(SettingsPollResult {
-            policy: inner.policy,
-            version: inner.version,
-            policy_hash: inner.policy_hash,
-            config_revision: inner.config_revision,
-            policy_source: PolicySource::try_from(inner.policy_source)
-                .unwrap_or(PolicySource::Unspecified),
-            settings: inner.settings,
-            global_policy_version: inner.global_policy_version,
-            provider_env_revision: inner.provider_env_revision,
-        })
+        Ok(settings_poll_result(response.into_inner()))
     }
 
     /// Submit denial summaries and/or agent-authored proposals for policy analysis.

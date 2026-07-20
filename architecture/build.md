@@ -106,13 +106,17 @@ Runtime layout:
   as a release artifact. Linux GNU VM driver binaries must not reference
   `GLIBC_*` symbols newer than `GLIBC_2.28`; release workflows verify this
   before publishing artifacts.
-- **Supervisor**: `scratch` base, static musl binary at `/openshell-sandbox`.
-  Static linkage is required because the image is mounted/extracted into
-  sandbox environments (Docker extraction, Podman image volumes, Kubernetes
-  init-container copy-self) and cannot rely on a dynamic loader.
+- **Supervisor**: Alpine base with `nftables`, static musl binary at
+  `/openshell-sandbox`. Static linkage keeps the binary usable when the image
+  is mounted/extracted into sandbox environments (Docker extraction, Podman
+  image volumes, Kubernetes init-container copy-self), while `nftables` supports
+  Kubernetes supervisor sidecar egress enforcement.
 
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
+The Helm chart omits the supervisor image from gateway configuration unless an
+operator supplies a repository or tag override, preserving that build-time
+pairing for Kubernetes sandboxes as well.
 Package formulas also pin Docker supervisor extraction to the matching release
 image tag so standalone gateway binaries do not infer image tags from package
 versions.
@@ -153,17 +157,19 @@ smoke check.
 
 ## CI and E2E
 
-Required checks run on GitHub Actions. Workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run.
+Required checks run on GitHub Actions. Workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run. `main` also uses GitHub merge queue so the final queued integration commit is validated before it merges.
 
 The high-level CI model:
 
 1. PR-context gate jobs publish required statuses for the PR head commit.
 2. Standard branch checks run from trusted mirror branches.
-3. Label-gated E2E, GPU, and Kubernetes checks run from trusted mirror branches.
-4. Gate jobs verify that the mirror branch matches the PR head and that the expected non-gate workflow actually ran.
-5. Release workflows rebuild and publish binaries, wheels, images, and docs.
+3. Label-gated Docker, Podman, VM, GPU, and Kubernetes E2E checks run from
+   trusted mirror branches.
+4. Merge-group checks run against GitHub's temporary queue branch for the final integration state.
+5. Gate jobs verify that the mirror branch matches the PR head, or that the merge-group workflow ran for the queued SHA, and that the expected non-gate workflow actually ran.
+6. Release workflows rebuild and publish binaries, wheels, images, and docs.
 
-See `CI.md` for the contributor workflow and labels.
+See `CI.md` for the contributor workflow, labels, and maintainer merge-queue workflow.
 
 ## Docs Site
 

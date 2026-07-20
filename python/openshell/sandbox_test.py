@@ -5,10 +5,16 @@ from __future__ import annotations
 
 import json
 import os
+import pickle
 import threading
 import time
+from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
+
+import pytest
 
 from openshell._proto import openshell_pb2
 from openshell.sandbox import (
@@ -18,6 +24,8 @@ from openshell.sandbox import (
     Sandbox,
     SandboxClient,
     SandboxError,
+    SandboxRef,
+    SandboxStatusRef,
     TlsConfig,
     _BearerAuthInterceptor,
     _load_cluster_bearer_token,
@@ -25,6 +33,7 @@ from openshell.sandbox import (
     _normalize_bearer,
     _OidcRefresher,
     _read_oidc_token_bundle,
+    _sandbox_ref,
 )
 
 
@@ -60,7 +69,7 @@ class _FakeInferenceStub:
         return _Response()
 
 
-def _client_with_fake_stub(stub: _FakeStub) -> SandboxClient:
+def _client_with_fake_stub(stub: object) -> SandboxClient:
     client = cast("SandboxClient", object.__new__(SandboxClient))
     client._timeout = 30.0
     client._stub = cast("Any", stub)
@@ -1413,3 +1422,272 @@ def test_from_active_cluster_reads_utf8_bytes_from_active_gateway_and_metadata(
         assert client._endpoint == "tést.example:8080"
     finally:
         client.close()
+
+
+# ---- Sandbox label / selector API tests ----
+
+
+def _make_sandbox_proto(
+    id_: str,
+    name: str,
+    labels: dict[str, str] | None = None,
+    phase: openshell_pb2.SandboxPhase = openshell_pb2.SANDBOX_PHASE_READY,
+    version: int = 0,
+) -> openshell_pb2.Sandbox:
+    sandbox = openshell_pb2.Sandbox()
+    sandbox.metadata.id = id_
+    sandbox.metadata.name = name
+    for key, value in (labels or {}).items():
+        sandbox.metadata.labels[key] = value
+    sandbox.status.phase = phase
+    sandbox.status.current_policy_version = version
+    return sandbox
+
+
+class _FakeSandboxStub:
+    def __init__(self, listed: list[openshell_pb2.Sandbox] | None = None) -> None:
+        self.create_request: openshell_pb2.CreateSandboxRequest | None = None
+        self.list_request: openshell_pb2.ListSandboxesRequest | None = None
+        self._listed = listed or []
+
+    def CreateSandbox(
+        self,
+        request: openshell_pb2.CreateSandboxRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.create_request = request
+        _ = timeout
+        return SimpleNamespace(
+            sandbox=_make_sandbox_proto(
+                "sandbox-1", request.name or "generated", dict(request.labels)
+            )
+        )
+
+    def ListSandboxes(
+        self,
+        request: openshell_pb2.ListSandboxesRequest,
+        timeout: float | None = None,
+    ) -> Any:
+        self.list_request = request
+        _ = timeout
+        return SimpleNamespace(sandboxes=list(self._listed))
+
+
+class _RecordingHighLevelClient:
+    """A stand-in for SandboxClient used to observe high-level forwarding."""
+
+    def __init__(self) -> None:
+        self.create_kwargs: dict[str, Any] | None = None
+
+    def create_session(
+        self,
+        *,
+        spec: Any = None,
+        name: str | None = None,
+        labels: Any = None,
+    ) -> Any:
+        self.create_kwargs = {"spec": spec, "name": name, "labels": labels}
+        return SimpleNamespace(sandbox=SimpleNamespace(name=name or "generated"))
+
+    def wait_ready(self, name: str, *, timeout_seconds: float = 300.0) -> SandboxRef:
+        _ = timeout_seconds
+        return SandboxRef(
+            id="sandbox-1",
+            name=name,
+            status=SandboxStatusRef(phase=2, current_policy_version=0),
+        )
+
+
+def test_create_forwards_name_and_labels() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    ref = client.create(name="job-1", labels={"aiq": "deep-research"})
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == "job-1"
+    assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
+    assert dict(ref.labels) == {"aiq": "deep-research"}
+
+
+def test_create_without_args_sends_empty_metadata() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.create()
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == ""
+    assert dict(stub.create_request.labels) == {}
+
+
+def test_create_copies_caller_labels() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    caller_labels = {"aiq": "deep-research"}
+    client.create(labels=caller_labels)
+    caller_labels["aiq"] = "mutated"
+
+    assert stub.create_request is not None
+    assert dict(stub.create_request.labels) == {"aiq": "deep-research"}
+
+
+def test_create_session_forwards_name_and_labels() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    session = client.create_session(name="job-2", labels={"team": "aiq"})
+
+    assert stub.create_request is not None
+    assert stub.create_request.name == "job-2"
+    assert dict(stub.create_request.labels) == {"team": "aiq"}
+    assert session.sandbox.name == "job-2"
+
+
+def test_list_forwards_label_selector() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list(label_selector="aiq=deep-research")
+
+    assert stub.list_request is not None
+    assert stub.list_request.label_selector == "aiq=deep-research"
+
+
+def test_list_without_selector_sends_empty_string() -> None:
+    stub = _FakeSandboxStub()
+    client = _client_with_fake_stub(stub)
+
+    client.list()
+
+    assert stub.list_request is not None
+    assert stub.list_request.label_selector == ""
+
+
+def test_list_ids_forwards_label_selector() -> None:
+    stub = _FakeSandboxStub(listed=[_make_sandbox_proto("sandbox-1", "job-1")])
+    client = _client_with_fake_stub(stub)
+
+    ids = client.list_ids(label_selector="aiq=deep-research")
+
+    assert stub.list_request is not None
+    assert stub.list_request.label_selector == "aiq=deep-research"
+    assert ids == ["sandbox-1"]
+
+
+def test_sandbox_ref_retains_gateway_labels() -> None:
+    proto = _make_sandbox_proto(
+        "sandbox-1", "job-1", {"aiq": "deep-research", "env": "dev"}
+    )
+
+    ref = _sandbox_ref(proto)
+
+    assert dict(ref.labels) == {"aiq": "deep-research", "env": "dev"}
+
+
+def test_returned_labels_are_immutable() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1", {"aiq": "deep-research"})
+    ref = _sandbox_ref(proto)
+
+    with pytest.raises(TypeError):
+        ref.labels["mutated"] = "nope"  # type: ignore[index]
+
+
+def test_direct_sandbox_ref_construction_defaults_labels() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+
+    assert dict(ref.labels) == {}
+
+
+def test_sandbox_ref_stays_hashable_with_labels_excluded_from_identity() -> None:
+    ref_a = _sandbox_ref(_make_sandbox_proto("sandbox-1", "job-1", {"aiq": "a"}))
+    ref_b = _sandbox_ref(_make_sandbox_proto("sandbox-1", "job-1", {"aiq": "b"}))
+
+    # Frozen dataclass must remain hashable despite the immutable labels field.
+    assert hash(ref_a) == hash(ref_b)
+    # Labels are excluded from identity: same (id, name, status) compares equal.
+    assert ref_a == ref_b
+    assert {ref_a, ref_b} == {ref_a}
+
+
+def test_sandbox_ref_labels_support_standard_serialization() -> None:
+    ref = _sandbox_ref(
+        _make_sandbox_proto("sandbox-1", "job-1", {"aiq": "deep-research"})
+    )
+
+    assert asdict(ref)["labels"] == {"aiq": "deep-research"}
+    assert dict(deepcopy(ref).labels) == {"aiq": "deep-research"}
+    assert dict(pickle.loads(pickle.dumps(ref)).labels) == {"aiq": "deep-research"}
+
+
+def test_default_sandbox_ref_labels_support_standard_serialization() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+
+    assert asdict(ref)["labels"] == {}
+    assert dict(deepcopy(ref).labels) == {}
+    assert dict(pickle.loads(pickle.dumps(ref)).labels) == {}
+
+
+def test_direct_sandbox_ref_copies_and_freezes_labels() -> None:
+    labels = {"aiq": "deep-research"}
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+        labels=labels,
+    )
+    labels["aiq"] = "mutated"
+
+    assert dict(ref.labels) == {"aiq": "deep-research"}
+    with pytest.raises(TypeError):
+        ref.labels["mutated"] = "nope"  # type: ignore[index]
+
+
+def test_high_level_creation_forwards_name_and_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recording = _RecordingHighLevelClient()
+    monkeypatch.setattr(
+        SandboxClient,
+        "from_active_cluster",
+        classmethod(lambda _cls, **_kwargs: recording),
+    )
+
+    sandbox = Sandbox(
+        name="job-1", labels={"aiq": "deep-research"}, delete_on_exit=False
+    )
+    sandbox.__enter__()
+
+    assert recording.create_kwargs == {
+        "spec": None,
+        "name": "job-1",
+        "labels": {"aiq": "deep-research"},
+    }
+
+
+def test_high_level_attach_rejects_name() -> None:
+    sandbox = Sandbox(sandbox="existing-sandbox", name="job-1")
+
+    with pytest.raises(SandboxError):
+        sandbox.__enter__()
+
+
+def test_high_level_attach_rejects_labels() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="existing",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+    sandbox = Sandbox(sandbox=ref, labels={"aiq": "deep-research"})
+
+    with pytest.raises(SandboxError):
+        sandbox.__enter__()

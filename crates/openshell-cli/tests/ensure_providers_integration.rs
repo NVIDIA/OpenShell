@@ -63,6 +63,7 @@ impl TestOpenShell {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
@@ -83,6 +84,13 @@ impl OpenShell for TestOpenShell {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
         }))
+    }
+
+    async fn get_gateway_info(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetGatewayInfoRequest>,
+    ) -> Result<Response<openshell_core::proto::GetGatewayInfoResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn create_sandbox(
@@ -349,6 +357,7 @@ impl OpenShell for TestOpenShell {
                 created_at_ms: existing_metadata.created_at_ms,
                 labels: existing_metadata.labels,
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),

@@ -78,7 +78,6 @@ create_sandbox() {
         --name "$SANDBOX" \
         --no-auto-providers \
         --no-tty \
-        --keep \
         -- bash -lc "echo sandbox ready" \
         | sed 's/^/  /'
 

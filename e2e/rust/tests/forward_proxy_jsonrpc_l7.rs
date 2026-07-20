@@ -429,7 +429,10 @@ print(json.dumps(results, sort_keys=True))
         ("forward_method_initialize_allowed", 200),
         ("forward_method_tools_list_allowed", 200),
         ("forward_method_tools_call_allowed", 200),
-        ("forward_method_tools_call_with_unmatched_params_allowed", 200),
+        (
+            "forward_method_tools_call_with_unmatched_params_allowed",
+            200,
+        ),
         // forward proxy — method denied
         ("forward_method_tools_delete_denied", 403),
         // forward proxy — batch
@@ -441,7 +444,10 @@ print(json.dumps(results, sort_keys=True))
         ("connect_method_initialize_allowed", 200),
         ("connect_method_tools_list_allowed", 200),
         ("connect_method_tools_call_allowed", 200),
-        ("connect_method_tools_call_with_unmatched_params_allowed", 200),
+        (
+            "connect_method_tools_call_with_unmatched_params_allowed",
+            200,
+        ),
         // CONNECT path — method denied
         ("connect_method_tools_delete_denied", 403),
     ] {

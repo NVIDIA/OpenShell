@@ -78,55 +78,6 @@ const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
 
-/// Default image holding the Linux `openshell-sandbox` binary. The gateway
-/// pulls this image and extracts the binary to a host-side cache when no
-/// explicit `supervisor_bin`, configured `supervisor_image`, sibling binary,
-/// or local build is available.
-const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
-
-/// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
-/// used when no supervisor binary override is provided.
-pub fn default_docker_supervisor_image() -> String {
-    format!(
-        "{DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO}:{}",
-        default_docker_supervisor_image_tag()
-    )
-}
-
-/// Image tag baked in at compile time to pair the gateway with a matching
-/// supervisor image.
-///
-/// Build pipelines pass `OPENSHELL_IMAGE_TAG` explicitly. The `IMAGE_TAG`
-/// fallback covers image build wrappers that already tag the gateway and
-/// supervisor together. Standalone release binaries also patch the Cargo
-/// package version, so use it when it has been set to a real release value.
-fn default_docker_supervisor_image_tag() -> String {
-    resolve_default_docker_supervisor_image_tag(
-        option_env!("OPENSHELL_IMAGE_TAG"),
-        option_env!("IMAGE_TAG"),
-        env!("CARGO_PKG_VERSION"),
-    )
-}
-
-fn resolve_default_docker_supervisor_image_tag(
-    openshell_image_tag: Option<&'static str>,
-    image_tag: Option<&'static str>,
-    cargo_pkg_version: &'static str,
-) -> String {
-    let tag = openshell_image_tag
-        .filter(|tag| !tag.is_empty())
-        .or_else(|| image_tag.filter(|tag| !tag.is_empty()))
-        .unwrap_or_else(|| {
-            if cargo_pkg_version.is_empty() || cargo_pkg_version == "0.0.0" {
-                "dev"
-            } else {
-                cargo_pkg_version
-            }
-        });
-
-    tag.replace('+', "-")
-}
-
 /// Queried by the Docker driver to decide when a sandbox's supervisor
 /// relay is live. Implementations return `true` once a sandbox has an
 /// active `ConnectSupervisor` session registered.
@@ -142,6 +93,11 @@ pub trait SupervisorReadiness: Send + Sync + 'static {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DockerComputeConfig {
+    /// Docker API Unix socket. When unset, use the socket selected by gateway
+    /// auto-detection, falling back to `/var/run/docker.sock` for an explicitly
+    /// configured Docker driver.
+    pub socket_path: Option<PathBuf>,
+
     /// Default OCI image for sandboxes.
     pub default_image: String,
 
@@ -194,6 +150,7 @@ pub struct DockerComputeConfig {
 impl Default for DockerComputeConfig {
     fn default() -> Self {
         Self {
+            socket_path: None,
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: String::new(),
             sandbox_namespace: "default".to_string(),
@@ -303,6 +260,8 @@ impl DockerSandboxDriverConfig {
     }
 }
 
+use openshell_core::driver_mounts::SelinuxLabel;
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum DockerDriverMountConfig {
@@ -311,6 +270,8 @@ enum DockerDriverMountConfig {
         target: String,
         #[serde(default = "default_true")]
         read_only: bool,
+        #[serde(default)]
+        selinux_label: Option<SelinuxLabel>,
     },
     Volume {
         source: String,
@@ -352,8 +313,22 @@ impl DockerComputeDriver {
         docker_config: &DockerComputeConfig,
         supervisor_readiness: Arc<dyn SupervisorReadiness>,
     ) -> CoreResult<Self> {
-        let docker = Docker::connect_with_local_defaults()
-            .map_err(|err| Error::execution(format!("failed to create Docker client: {err}")))?;
+        let socket_path = docker_config
+            .socket_path
+            .clone()
+            .or_else(openshell_core::config::detect_docker_socket)
+            .unwrap_or_else(|| PathBuf::from("/var/run/docker.sock"));
+        let socket_path_str = socket_path.to_str().ok_or_else(|| {
+            Error::config(format!(
+                "Docker socket path is not valid UTF-8: {}",
+                socket_path.display()
+            ))
+        })?;
+        let docker =
+            Docker::connect_with_socket(socket_path_str, 120, bollard::API_DEFAULT_VERSION)
+                .map_err(|err| {
+                    Error::execution(format!("failed to create Docker client: {err}"))
+                })?;
         let version = docker.version().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon version: {err}"))
         })?;
@@ -555,20 +530,18 @@ impl DockerComputeDriver {
     ) -> Result<(), Status> {
         for mount in &driver_config.mounts {
             if let DockerDriverMountConfig::Volume { source, .. } = mount {
-                match self.docker.inspect_volume(source.trim()).await {
+                match self.docker.inspect_volume(source).await {
                     Ok(volume) => {
                         if !self.config.enable_bind_mounts && docker_volume_is_bind_backed(&volume)
                         {
                             return Err(Status::failed_precondition(format!(
-                                "docker volume '{}' is backed by a host bind mount and requires enable_bind_mounts = true in [openshell.drivers.docker]",
-                                source.trim()
+                                "docker volume '{source}' is backed by a host bind mount and requires enable_bind_mounts = true in [openshell.drivers.docker]"
                             )));
                         }
                     }
                     Err(err) if is_not_found_error(&err) => {
                         return Err(Status::failed_precondition(format!(
-                            "docker volume '{}' does not exist",
-                            source.trim()
+                            "docker volume '{source}' does not exist"
                         )));
                     }
                     Err(err) => {
@@ -1763,70 +1736,108 @@ fn docker_driver_config(
     Ok(config)
 }
 
-fn docker_driver_mounts(config: &DockerSandboxDriverConfig) -> Result<Vec<Mount>, Status> {
-    config.mounts.iter().map(docker_mount_from_config).collect()
+/// Collect user-supplied bind mounts as string-format binds.
+///
+/// Bind mounts use the legacy `Binds` field (`-v` syntax) rather than the
+/// structured `Mount` API because the Docker Engine Mount object does not
+/// support `SELinux` relabelling (`:z` / `:Z`).  The string format does.
+fn docker_driver_bind_strings(config: &DockerSandboxDriverConfig) -> Result<Vec<String>, Status> {
+    config
+        .mounts
+        .iter()
+        .filter_map(|m| match m {
+            DockerDriverMountConfig::Bind {
+                source,
+                target,
+                read_only,
+                selinux_label,
+            } => Some(docker_bind_string(
+                source,
+                target,
+                *read_only,
+                *selinux_label,
+            )),
+            _ => None,
+        })
+        .collect()
 }
 
-fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, Status> {
+fn docker_bind_string(
+    source: &str,
+    target: &str,
+    read_only: bool,
+    selinux_label: Option<SelinuxLabel>,
+) -> Result<String, Status> {
+    driver_mounts::validate_absolute_mount_source(source, "bind source")
+        .map_err(Status::failed_precondition)?;
+    // Legacy `-v` binds silently create missing source directories as empty,
+    // root-owned paths.  The structured `--mount` API that was used before this
+    // change rejected missing sources at container-create time.  Preserve that
+    // fail-fast behaviour with an explicit existence check.
+    if !Path::new(source).exists() {
+        return Err(Status::failed_precondition(format!(
+            "bind source path does not exist: {source}"
+        )));
+    }
+    driver_mounts::validate_container_mount_target(target).map_err(Status::failed_precondition)?;
+    let normalized_target = driver_mounts::normalize_mount_target(target);
+
+    let mut opts = Vec::new();
+    if read_only {
+        opts.push("ro");
+    }
+    match selinux_label {
+        Some(SelinuxLabel::Shared) => opts.push("z"),
+        Some(SelinuxLabel::Private) => opts.push("Z"),
+        None => {}
+    }
+
+    if opts.is_empty() {
+        Ok(format!("{source}:{normalized_target}"))
+    } else {
+        Ok(format!("{source}:{normalized_target}:{}", opts.join(",")))
+    }
+}
+
+/// Collect user-supplied non-bind mounts as structured `Mount` objects.
+fn docker_driver_mounts(config: &DockerSandboxDriverConfig) -> Result<Vec<Mount>, Status> {
+    config
+        .mounts
+        .iter()
+        .filter_map(|m| docker_mount_from_config(m).transpose())
+        .collect()
+}
+
+fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Option<Mount>, Status> {
     match config {
-        DockerDriverMountConfig::Bind {
-            source,
-            target,
-            read_only,
-        } => Ok(Mount {
-            typ: Some(MountTypeEnum::BIND),
-            source: Some(
-                driver_mounts::validate_absolute_mount_source(source, "bind source")
-                    .map_err(Status::failed_precondition)?,
-            ),
-            target: Some(
-                driver_mounts::validate_container_mount_target(target)
-                    .map_err(Status::failed_precondition)?,
-            ),
-            read_only: Some(*read_only),
-            ..Default::default()
-        }),
+        DockerDriverMountConfig::Bind { .. } => {
+            // Bind mounts are handled via docker_driver_bind_strings.
+            Ok(None)
+        }
         DockerDriverMountConfig::Volume {
             source,
             target,
             read_only,
             subpath,
-        } => Ok(Mount {
+        } => Ok(Some(Mount {
             typ: Some(MountTypeEnum::VOLUME),
-            source: Some(
-                driver_mounts::validate_mount_source(source, "volume source")
-                    .map_err(Status::failed_precondition)?,
-            ),
-            target: Some(
-                driver_mounts::validate_container_mount_target(target)
-                    .map_err(Status::failed_precondition)?,
-            ),
+            source: Some(source.clone()),
+            target: Some(target.clone()),
             read_only: Some(*read_only),
-            volume_options: subpath
-                .as_ref()
-                .map(|subpath| {
-                    Ok::<MountVolumeOptions, Status>(MountVolumeOptions {
-                        subpath: Some(
-                            driver_mounts::validate_mount_subpath(subpath)
-                                .map_err(Status::failed_precondition)?,
-                        ),
-                        ..Default::default()
-                    })
-                })
-                .transpose()?,
+            volume_options: subpath.as_ref().map(|subpath| MountVolumeOptions {
+                subpath: Some(subpath.clone()),
+                ..Default::default()
+            }),
             ..Default::default()
-        }),
+        })),
         DockerDriverMountConfig::Tmpfs {
             target,
             options,
             size_bytes,
             mode,
-        } => Ok(Mount {
+        } => Ok(Some(Mount {
             typ: Some(MountTypeEnum::TMPFS),
-            target: Some(
-                driver_mounts::validate_container_mount_target(target)
-                    .map_err(Status::failed_precondition)?,
-            ),
+            target: Some(target.clone()),
             tmpfs_options: Some(MountTmpfsOptions {
                 size_bytes: validate_optional_positive_integral_i64(
                     *size_bytes,
@@ -1843,7 +1854,7 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
                     .transpose()?,
             }),
             ..Default::default()
-        }),
+        })),
         DockerDriverMountConfig::Image { .. } => Err(Status::failed_precondition(
             "invalid docker driver_config: docker image mounts are not supported",
         )),
@@ -1906,11 +1917,12 @@ fn validate_docker_driver_mounts(
                 ));
             }
         };
-        let target = driver_mounts::validate_container_mount_target(target)
+        driver_mounts::validate_container_mount_target(target)
             .map_err(Status::failed_precondition)?;
-        if !targets.insert(target.clone()) {
+        let normalized_target = driver_mounts::normalize_mount_target(target);
+        if !targets.insert(normalized_target.clone()) {
             return Err(Status::failed_precondition(format!(
-                "duplicate docker driver_config mount target '{target}'"
+                "duplicate docker driver_config mount target '{normalized_target}'"
             )));
         }
     }
@@ -2285,6 +2297,7 @@ fn build_container_create_body_with_gpu_devices(
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
     let user_mounts = docker_driver_mounts(driver_config)?;
+    let user_bind_strings = docker_driver_bind_strings(driver_config)?;
     let device_requests = gpu_device_ids.map(|device_ids| {
         vec![DeviceRequest {
             driver: Some("cdi".to_string()),
@@ -2322,7 +2335,11 @@ fn build_container_create_body_with_gpu_devices(
             memory: resource_limits.memory_bytes,
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
             device_requests,
-            binds: Some(build_binds(sandbox, config)?),
+            binds: {
+                let mut binds = build_binds(sandbox, config)?;
+                binds.extend(user_bind_strings);
+                Some(binds)
+            },
             mounts: Some(user_mounts),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
@@ -3033,7 +3050,9 @@ fn resolve_supervisor_bin_source(
 
     // Tier 5: pull the release-matched default supervisor image and extract
     // the binary to a host-side cache keyed by image content digest.
-    Ok(SupervisorBinSource::Image(default_docker_supervisor_image()))
+    Ok(SupervisorBinSource::Image(
+        openshell_core::config::default_supervisor_image(),
+    ))
 }
 
 pub(crate) async fn resolve_supervisor_bin(

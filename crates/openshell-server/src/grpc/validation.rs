@@ -15,10 +15,10 @@ use prost::Message;
 use tonic::Status;
 
 use super::{
-    MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_NAME_LEN,
-    MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES, MAX_PROVIDER_CREDENTIALS_ENTRIES,
-    MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS, MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN,
-    MAX_TEMPLATE_STRUCT_SIZE,
+    MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
+    MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
+    MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
+    MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,8 +32,10 @@ pub(super) const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
 /// Maximum length of the workdir field (bytes).
 pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
 
-/// Validate fields of an `ExecSandboxRequest` for control characters and size
-/// limits before constructing a shell command string.
+/// Validate exec request size limits and field-specific character constraints.
+///
+/// Command arguments only reject NUL (newlines are valid for inline scripts).
+/// Environment values and workdir reject both NUL and newlines.
 pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
     if req.command.len() > MAX_EXEC_COMMAND_ARGS {
         return Err(Status::invalid_argument(format!(
@@ -46,7 +48,7 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
                 "command argument {i} exceeds {MAX_EXEC_ARG_LEN} byte limit"
             )));
         }
-        reject_control_chars(arg, &format!("command argument {i}"))?;
+        reject_null_char(arg, &format!("command argument {i}"))?;
     }
     for (key, value) in &req.environment {
         if value.len() > MAX_EXEC_ARG_LEN {
@@ -70,11 +72,23 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
 
 /// Reject null bytes and newlines in a user-supplied value.
 pub(super) fn reject_control_chars(value: &str, field_name: &str) -> Result<(), Status> {
+    reject_null_char(value, field_name)?;
+    reject_newline_chars(value, field_name)?;
+    Ok(())
+}
+
+/// Reject null bytes in a user-supplied value.
+pub(super) fn reject_null_char(value: &str, field_name: &str) -> Result<(), Status> {
     if value.bytes().any(|b| b == 0) {
         return Err(Status::invalid_argument(format!(
             "{field_name} contains null bytes"
         )));
     }
+    Ok(())
+}
+
+/// Reject newline and carriage return characters in a user-supplied value.
+pub(super) fn reject_newline_chars(value: &str, field_name: &str) -> Result<(), Status> {
     if value.bytes().any(|b| b == b'\n' || b == b'\r') {
         return Err(Status::invalid_argument(format!(
             "{field_name} contains newline or carriage return characters"
@@ -206,14 +220,6 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
             )));
         }
     }
-    if let Some(ref s) = tmpl.volume_claim_templates {
-        let size = s.encoded_len();
-        if size > MAX_TEMPLATE_STRUCT_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "template.volume_claim_templates serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
-            )));
-        }
-    }
     if let Some(ref s) = tmpl.driver_config {
         let size = s.encoded_len();
         if size > MAX_TEMPLATE_STRUCT_SIZE {
@@ -253,6 +259,28 @@ pub(super) fn validate_string_map(
                 value.len()
             )));
         }
+    }
+    Ok(())
+}
+
+/// Validate object annotations.
+///
+/// Annotation keys use the same qualified-key shape as labels. Annotation
+/// values are opaque metadata and use the normal string-map size limits rather
+/// than Kubernetes label value limits.
+pub(super) fn validate_annotations(
+    annotations: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    validate_string_map(
+        annotations,
+        MAX_METADATA_ANNOTATIONS_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        field_name,
+    )?;
+    for key in annotations.keys() {
+        validate_label_key(key)?;
     }
     Ok(())
 }
@@ -615,6 +643,11 @@ pub(super) fn validate_object_metadata(
         validate_label_key(key)?;
         validate_label_value(value)?;
     }
+
+    validate_annotations(
+        &metadata.annotations,
+        &format!("{resource_type}.metadata.annotations"),
+    )?;
 
     Ok(())
 }
@@ -1147,6 +1180,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
             credentials,
@@ -1622,6 +1656,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_policy_safety_rejects_invalid_middleware_before_acceptance() {
+        use openshell_core::proto::{MiddlewareEndpointSelector, NetworkMiddlewareConfig};
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_middlewares.insert(
+            "redactor".into(),
+            NetworkMiddlewareConfig {
+                middleware: "openshell/regex".into(),
+                on_error: "maybe".into(),
+                endpoints: Some(MiddlewareEndpointSelector {
+                    include: vec!["api[.example.com".into()],
+                    exclude: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        );
+
+        let err = validate_policy_safety(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("invalid on_error"));
+        assert!(err.message().contains("invalid host pattern"));
+    }
+
+    #[test]
     fn validate_no_reserved_provider_policy_keys_rejects_reserved_key() {
         use openshell_core::proto::NetworkPolicyRule;
 
@@ -1807,5 +1865,55 @@ mod tests {
     fn reject_control_chars_rejects_newlines() {
         assert!(reject_control_chars("line1\nline2", "test").is_err());
         assert!(reject_control_chars("line1\rline2", "test").is_err());
+    }
+
+    #[test]
+    fn validate_exec_allows_newlines_in_command_args() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "def f():\n    return 1\nprint(f())".to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(validate_exec_request_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_exec_still_rejects_null_bytes_in_command_args() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["echo".to_string(), "hello\x00world".to_string()],
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(err.message().contains("null"));
+    }
+
+    #[test]
+    fn validate_exec_still_rejects_newlines_in_workdir() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["ls".to_string()],
+            workdir: "/tmp\nmalicious".to_string(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(err.message().contains("newline"));
+    }
+
+    #[test]
+    fn validate_exec_still_rejects_newlines_in_env_values() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["ls".to_string()],
+            environment: std::iter::once(("VAR".to_string(), "val\nmalicious".to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(err.message().contains("newline"));
     }
 }

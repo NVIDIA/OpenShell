@@ -66,6 +66,31 @@ matchers; generic JSON-RPC rules match only the method.
 JSON-RPC responses and server-to-client MCP messages on response or SSE streams
 are relayed but are not currently parsed for policy enforcement.
 
+For admitted HTTP requests, the proxy can run an ordered supervisor middleware
+chain after L7 policy evaluation and before credential injection. Destination
+host selectors choose the chain independently of the network rule that admitted
+the request. Policy-local map keys identify configs, while built-in names or
+operator-owned registration names identify implementations.
+
+Built-ins run in-process; operator services use the same bounded gRPC contract.
+`openshell-policy` validates policy-owned structure, and the active middleware
+registry validates implementation-owned config. The generic registry and chain
+runner live in `openshell-supervisor-middleware`; first-party implementations
+live in `openshell-supervisor-middleware-builtins`.
+
+The supervisor installs policy and middleware registry changes as one runtime
+generation and preserves the last-known-good generation if preparation fails.
+Policy-only updates reuse the connected registry, so an external middleware
+outage cannot block unrelated policy changes.
+
+Middleware cannot observe injected credentials or mutate supervisor-owned
+credential, routing, or framing headers. Body transformations are re-evaluated
+against body-aware L7 policy before later stages or the upstream can observe
+them. Requests, results, chain length, execution time, and diagnostics are
+bounded; external free-form diagnostic text is not exposed in responses or
+security logs. See [Supervisor Middleware](../docs/extensibility/supervisor-middleware.mdx)
+for configuration and protocol details.
+
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
 
@@ -171,11 +196,45 @@ the structured 403 and authors the narrowest rule. Mechanistically mapping L7
 would either over-broaden rules or require path-templating logic that rots
 quickly.
 
+## Policy Revision Acknowledgement
+
+When the supervisor loads a sandbox-scoped policy from the gateway, it retains
+the version, hash, source, and configuration revision returned with that exact
+policy snapshot. After the OPA engine is built successfully, the supervisor
+reports that revision as `LOADED`, which advances
+`SandboxStatus.current_policy_version` and moves the revision out of `Pending`.
+If policy construction fails, it reports the captured revision as `FAILED` with
+the original construction error. It never infers revision identity by comparing
+policy structure.
+
+This holds even when the initial policy is enriched with baseline paths during
+startup: the enriched revision the supervisor synced back to the gateway is the
+revision it acknowledges, so a successfully constructed initial policy never
+remains `Pending`. If the first poll returns a different revision, the supervisor
+processes it through the normal reload path instead of treating it as already
+loaded.
+
+Policy status delivery uses a FIFO background worker. Retryable delivery
+failures retain the ordered update and retry with capped exponential backoff;
+terminal errors are logged and discarded. The outbox is nonblocking and does
+not discard updates because of a fixed queue capacity, so status endpoint
+outages cannot block policy polling, enforcement, settings, or provider
+refreshes and cannot permanently lose the initial acknowledgement.
+
+Only sandbox-scoped revisions (`PolicySource::Sandbox`, version greater than
+zero) are acknowledged. Global policies and local-file development policies do
+not use the sandbox revision API and produce no acknowledgement. When explicit
+local Rego and data files are configured, the supervisor continues polling the
+gateway for settings and provider refreshes but never replaces the local OPA
+engine with a gateway policy revision.
+
 ## Failure Behavior
 
 - If gateway config polling fails, the sandbox keeps its last-known-good policy.
-- If a live policy update is invalid, the supervisor rejects it and keeps the
-  current policy.
+- If a live policy or middleware-registry update is invalid, the supervisor
+  rejects the combined update and keeps the current runtime pair.
+- If an operator-run middleware call fails, the selected config's `on_error`
+  behavior decides whether to deny the request or continue without that stage.
 - Existing raw byte streams are connection scoped. Dynamic policy changes apply
   to new connections or the next parsed HTTP request where the proxy can safely
   re-evaluate.

@@ -90,7 +90,7 @@ struct Args {
 
     /// OCI image containing the openshell-sandbox supervisor binary.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
-    supervisor_image: String,
+    supervisor_image: Option<String>,
 
     /// Host path to the CA certificate for sandbox mTLS.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_CA")]
@@ -130,7 +130,9 @@ async fn main() -> Result<()> {
         sandbox_ssh_socket_path: args.sandbox_ssh_socket_path,
         network_name: args.network_name,
         stop_timeout_secs: args.stop_timeout,
-        supervisor_image: args.supervisor_image,
+        supervisor_image: args
+            .supervisor_image
+            .unwrap_or_else(openshell_core::config::default_supervisor_image),
         guest_tls_ca: args.podman_tls_ca,
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,

@@ -133,6 +133,7 @@ async fn handle_create_sandbox_inner(
         crate::grpc::validation::validate_label_key(key)?;
         crate::grpc::validation::validate_label_value(value)?;
     }
+    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
 
     let _sandbox_sync_guard = if spec.providers.is_empty() {
         None
@@ -164,6 +165,7 @@ async fn handle_create_sandbox_inner(
         openshell_policy::ensure_sandbox_process_identity(policy);
         validate_no_reserved_provider_policy_keys(policy)?;
         validate_policy_safety(policy)?;
+        crate::middleware::validate_policy(state.middleware_registry.as_ref(), policy).await?;
     }
 
     let id = uuid::Uuid::new_v4().to_string();
@@ -182,6 +184,7 @@ async fn handle_create_sandbox_inner(
             created_at_ms: now_ms,
             labels: request.labels.clone(),
             resource_version: 0,
+            annotations: request.annotations.clone(),
         }),
         spec: Some(spec),
         status: None,
@@ -1361,6 +1364,7 @@ pub(super) async fn handle_create_ssh_session(
             created_at_ms: now_ms,
             labels: std::collections::HashMap::new(),
             resource_version: 0,
+            annotations: std::collections::HashMap::new(),
         }),
         sandbox_id: req.sandbox_id.clone(),
         token: token.clone(),
@@ -1466,9 +1470,6 @@ fn shell_escape(value: &str) -> Result<String, String> {
     if value.bytes().any(|b| b == 0) {
         return Err("value contains null bytes".to_string());
     }
-    if value.bytes().any(|b| b == b'\n' || b == b'\r') {
-        return Err("value contains newline or carriage return".to_string());
-    }
     if value.is_empty() {
         return Ok("''".to_string());
     }
@@ -1555,7 +1556,11 @@ async fn stream_exec_over_relay(
     timeout_seconds: u32,
     request_tty: bool,
 ) -> Result<(), Status> {
-    let command_preview: String = command.chars().take(120).collect();
+    let command_preview: String = command
+        .chars()
+        .take(120)
+        .flat_map(char::escape_default)
+        .collect();
     info!(
         sandbox_id = %sandbox_id,
         channel_id = %channel_id,
@@ -1631,7 +1636,11 @@ async fn stream_interactive_exec_over_relay(
     cols: u32,
     rows: u32,
 ) -> Result<(), Status> {
-    let command_preview: String = command.chars().take(120).collect();
+    let command_preview: String = command
+        .chars()
+        .take(120)
+        .flat_map(char::escape_default)
+        .collect();
     info!(
         sandbox_id = %sandbox_id,
         channel_id = %channel_id,
@@ -2061,10 +2070,20 @@ mod tests {
     }
 
     #[test]
-    fn shell_escape_rejects_newlines() {
-        assert!(shell_escape("line1\nline2").is_err());
-        assert!(shell_escape("line1\rline2").is_err());
-        assert!(shell_escape("line1\r\nline2").is_err());
+    fn shell_escape_allows_newlines() {
+        assert!(shell_escape("line1\nline2").is_ok());
+        assert!(shell_escape("line1\rline2").is_ok());
+        assert!(shell_escape("line1\r\nline2").is_ok());
+    }
+
+    #[test]
+    fn shell_escape_preserves_newlines_in_single_quotes() {
+        assert_eq!(shell_escape("line1\nline2").unwrap(), "'line1\nline2'");
+        assert_eq!(
+            shell_escape("def f():\n    return 1").unwrap(),
+            "'def f():\n    return 1'"
+        );
+        assert_eq!(shell_escape("line1\r\nline2").unwrap(), "'line1\r\nline2'");
     }
 
     // ---- build_remote_exec_command ----
@@ -2120,7 +2139,45 @@ mod tests {
             workdir: "/tmp\nmalicious".to_string(),
             ..Default::default()
         };
-        assert!(build_remote_exec_command(&req).is_err());
+        // Validation layer rejects newlines in workdir
+        assert!(validate_exec_request_fields(&req).is_err());
+    }
+
+    #[test]
+    fn build_remote_exec_command_accepts_multiline_script() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "def f():\n    return 1\nprint(f())".to_string(),
+            ],
+            ..Default::default()
+        };
+        let cmd = build_remote_exec_command(&req).unwrap();
+        assert!(cmd.starts_with("python3 -c "));
+        assert!(cmd.contains("'def f():\n    return 1\nprint(f())'"));
+    }
+
+    #[test]
+    fn build_remote_exec_command_multiline_with_single_quotes() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python3".to_string(),
+                "-c".to_string(),
+                "print('one')\r\nprint('two')".to_string(),
+            ],
+            ..Default::default()
+        };
+        let cmd = build_remote_exec_command(&req).unwrap();
+        assert!(cmd.starts_with("python3 -c "));
+        assert!(
+            cmd.contains("'print('\"'\"'one'\"'\"')\r\nprint('\"'\"'two'\"'\"')'"),
+            "CR/LF with embedded single quotes must compose correctly: {cmd}"
+        );
     }
 
     #[test]
@@ -2253,6 +2310,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once((credential_key.to_string(), "secret".to_string()))
@@ -2270,6 +2328,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: std::iter::once(("team".to_string(), "agents".to_string())).collect(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             spec: Some(openshell_core::proto::SandboxSpec {
                 log_level: "debug".to_string(),
@@ -2640,6 +2699,7 @@ mod tests {
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
+                annotations: HashMap::new(),
             }),
         )
         .await
@@ -2672,6 +2732,7 @@ mod tests {
                     ..Default::default()
                 }),
                 labels: HashMap::new(),
+                annotations: HashMap::new(),
             }),
         )
         .await
@@ -2680,6 +2741,73 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("_provider_work_github"));
         assert!(err.message().contains("reserved '_provider_' prefix"));
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_persists_long_metadata_annotations() {
+        let state = test_server_state().await;
+        let annotation_key = "openshell.nvidia.com/policy-signature".to_string();
+        let annotation_value = "x".repeat(512);
+
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "annotated".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
+                labels: HashMap::new(),
+                annotations: HashMap::from([(annotation_key.clone(), annotation_value.clone())]),
+            }),
+        )
+        .await
+        .expect("long annotations should be accepted")
+        .into_inner();
+
+        let created = response.sandbox.expect("created sandbox");
+        assert_eq!(
+            created
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.annotations.get(&annotation_key)),
+            Some(&annotation_value)
+        );
+
+        let fetched = handle_get_sandbox(
+            &state,
+            Request::new(GetSandboxRequest {
+                name: "annotated".to_string(),
+            }),
+        )
+        .await
+        .expect("created sandbox should be fetchable")
+        .into_inner()
+        .sandbox
+        .expect("fetched sandbox");
+        assert_eq!(
+            fetched
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.annotations.get(&annotation_key)),
+            Some(&annotation_value)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_still_rejects_long_label_values() {
+        let state = test_server_state().await;
+        let err = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "bad-label".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec::default()),
+                labels: HashMap::from([("team".to_string(), "x".repeat(512))]),
+                annotations: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("label value exceeds"));
     }
 
     #[tokio::test]
@@ -2703,6 +2831,7 @@ mod tests {
                         ..Default::default()
                     }),
                     labels: HashMap::new(),
+                    annotations: HashMap::new(),
                 }),
             )
             .await

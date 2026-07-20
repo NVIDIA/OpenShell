@@ -35,15 +35,36 @@ const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
+const SIDECAR_STATE_DIR: &str = "/run/openshell-sidecar";
+const SIDECAR_TLS_DIR: &str = "/etc/openshell-tls/proxy";
+#[cfg(target_os = "linux")]
+const CLIENT_TLS_DIR: &str = "/etc/openshell-tls/client";
+#[cfg(target_os = "linux")]
+const SIDECAR_CLIENT_TLS_SUBDIR: &str = "client";
+#[cfg(target_os = "linux")]
+const CLIENT_TLS_FILES: [&str; 3] = ["ca.crt", "tls.crt", "tls.key"];
+#[cfg(target_os = "linux")]
+const SIDECAR_STATE_DIR_MODE: u32 = 0o2775;
+#[cfg(target_os = "linux")]
+const SIDECAR_TLS_DIR_MODE: u32 = 0o755;
+#[cfg(target_os = "linux")]
+const SIDECAR_TLS_STAGING_DIR_MODE: u32 = 0o700;
+#[cfg(target_os = "linux")]
+const SIDECAR_CLIENT_TLS_DIR_MODE: u32 = 0o750;
+#[cfg(target_os = "linux")]
+const SIDECAR_CLIENT_TLS_FILE_MODE: u32 = 0o400;
 
 /// Which supervisor leaves are enabled in this process.
 ///
 /// Parsed from a comma-separated `--mode` value, e.g. `network`,
-/// `process`, or `network,process`. At least one must be set.
+/// `process`, or `network,process`. `network-init` is a one-shot setup mode
+/// used by the Kubernetes sidecar topology and cannot be combined with other
+/// mode components. At least one must be set.
 #[derive(Clone, Copy, Debug)]
 struct Mode {
     network: bool,
     process: bool,
+    network_init: bool,
 }
 
 impl std::str::FromStr for Mode {
@@ -53,20 +74,27 @@ impl std::str::FromStr for Mode {
         let mut mode = Self {
             network: false,
             process: false,
+            network_init: false,
         };
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             match part {
                 "network" => mode.network = true,
                 "process" => mode.process = true,
+                "network-init" => mode.network_init = true,
                 other => {
                     return Err(format!(
-                        "unknown mode component '{other}' (expected 'network' and/or 'process')"
+                        "unknown mode component '{other}' (expected 'network', 'process', or 'network-init')"
                     ));
                 }
             }
         }
-        if !mode.network && !mode.process {
-            return Err("--mode must enable at least one of: network, process".into());
+        if mode.network_init && (mode.network || mode.process) {
+            return Err("--mode=network-init cannot be combined with other components".into());
+        }
+        if !mode.network && !mode.process && !mode.network_init {
+            return Err(
+                "--mode must enable at least one of: network, process, network-init".into(),
+            );
         }
         Ok(mode)
     }
@@ -125,7 +153,8 @@ struct Args {
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 
-    /// Filesystem path to the Unix socket the embedded SSH daemon binds.
+    /// Unix socket the embedded SSH daemon binds. On Linux, a value beginning
+    /// with `@` selects an abstract socket in the network namespace.
     /// The supervisor bridges `RelayStream` traffic from the gateway onto
     /// this socket; nothing else should connect to it.
     #[arg(long, env = openshell_core::sandbox_env::SSH_SOCKET_PATH)]
@@ -149,9 +178,28 @@ struct Args {
     /// "network" and/or "process". Defaults to both (single-binary
     /// topology). Use --mode=network for a network-only sidecar, or
     /// --mode=process for a process-only supervisor when network
-    /// enforcement runs in another pod.
+    /// enforcement runs in another pod. Use --mode=network-init only in
+    /// the Kubernetes init container that prepares sidecar nftables.
     #[arg(long, default_value = DEFAULT_MODE)]
     mode: Mode,
+
+    /// UID that the long-running Kubernetes network sidecar will run as.
+    /// `--mode=network-init` installs nftables rules that exempt this UID.
+    #[arg(long, env = "OPENSHELL_PROXY_UID", default_value_t = 1337)]
+    proxy_uid: u32,
+
+    /// GID assigned to shared sidecar state directories. Defaults to
+    /// `--proxy-uid` when omitted.
+    #[arg(long, env = "OPENSHELL_PROXY_GID")]
+    proxy_gid: Option<u32>,
+
+    /// Shared state directory between the network init container and sidecar.
+    #[arg(long, env = "OPENSHELL_SIDECAR_STATE_DIR", default_value = SIDECAR_STATE_DIR)]
+    sidecar_state_dir: String,
+
+    /// Shared TLS work directory between the network init container and sidecar.
+    #[arg(long, env = "OPENSHELL_PROXY_TLS_DIR", default_value = SIDECAR_TLS_DIR)]
+    sidecar_tls_dir: String,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -194,6 +242,189 @@ fn copy_self(dest: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn prepare_sidecar_directory(path: &Path, uid: u32, gid: u32, mode: u32) -> Result<()> {
+    use miette::Context as _;
+    use nix::unistd::{Gid, Uid, chown};
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create sidecar directory {}", path.display()))?;
+    let mut perms = std::fs::metadata(path).into_diagnostic()?.permissions();
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to chmod sidecar directory {}", path.display()))?;
+    chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to chown sidecar directory {} to {uid}:{gid}",
+                path.display()
+            )
+        })?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_sidecar_directory_for_current_user(path: &Path, mode: u32) -> Result<()> {
+    use miette::Context as _;
+    use nix::unistd::{Gid, Uid, chown};
+    use std::os::unix::fs::PermissionsExt;
+
+    let uid = Uid::current();
+    let gid = Gid::current();
+    std::fs::create_dir_all(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create sidecar directory {}", path.display()))?;
+    chown(path, Some(uid), Some(gid))
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to chown sidecar directory {} to {}:{}",
+                path.display(),
+                uid.as_raw(),
+                gid.as_raw()
+            )
+        })?;
+    let mut perms = std::fs::metadata(path).into_diagnostic()?.permissions();
+    perms.set_mode(mode);
+    std::fs::set_permissions(path, perms)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to chmod sidecar directory {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_sidecar_client_tls_if_present(
+    source_dir: &Path,
+    sidecar_tls_dir: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<()> {
+    use miette::Context as _;
+    use nix::unistd::{Gid, Uid, chown};
+    use std::os::unix::fs::PermissionsExt;
+
+    if !source_dir.exists() {
+        return Ok(());
+    }
+
+    let dest_dir = sidecar_tls_dir.join(SIDECAR_CLIENT_TLS_SUBDIR);
+    prepare_sidecar_directory_for_current_user(&dest_dir, SIDECAR_TLS_STAGING_DIR_MODE)?;
+    for file_name in CLIENT_TLS_FILES {
+        let source = source_dir.join(file_name);
+        if !source.exists() {
+            return Err(miette::miette!(
+                "client TLS source file is missing: {}",
+                source.display()
+            ));
+        }
+        let dest = dest_dir.join(file_name);
+        if dest.exists() {
+            std::fs::remove_file(&dest)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to remove stale client TLS file {}", dest.display())
+                })?;
+        }
+        std::fs::copy(&source, &dest)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to copy client TLS file {} to {}",
+                    source.display(),
+                    dest.display()
+                )
+            })?;
+        let mut perms = std::fs::metadata(&dest).into_diagnostic()?.permissions();
+        perms.set_mode(SIDECAR_CLIENT_TLS_FILE_MODE);
+        std::fs::set_permissions(&dest, perms)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!("failed to chmod copied client TLS file {}", dest.display())
+            })?;
+        chown(&dest, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to chown copied client TLS file {} to {uid}:{gid}",
+                    dest.display()
+                )
+            })?;
+    }
+
+    prepare_sidecar_directory(&dest_dir, uid, gid, SIDECAR_CLIENT_TLS_DIR_MODE)?;
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn run_network_init(
+    proxy_user_id: u32,
+    proxy_primary_group_id: u32,
+    sidecar_state_dir: &str,
+    sidecar_tls_dir: &str,
+) -> Result<()> {
+    validate_network_init_ids(proxy_user_id, proxy_primary_group_id)?;
+
+    let sidecar_state_dir = Path::new(sidecar_state_dir);
+    let sidecar_tls_dir = Path::new(sidecar_tls_dir);
+    prepare_sidecar_directory(
+        sidecar_state_dir,
+        proxy_user_id,
+        proxy_primary_group_id,
+        SIDECAR_STATE_DIR_MODE,
+    )?;
+    // The init container runs as uid 0 with CAP_DAC_OVERRIDE dropped. Keep the
+    // TLS work directory owned by the init user until the client cert copy is
+    // complete, then hand it to the long-running proxy UID.
+    prepare_sidecar_directory_for_current_user(sidecar_tls_dir, SIDECAR_TLS_DIR_MODE)?;
+    copy_sidecar_client_tls_if_present(
+        Path::new(CLIENT_TLS_DIR),
+        sidecar_tls_dir,
+        proxy_user_id,
+        proxy_primary_group_id,
+    )?;
+    prepare_sidecar_directory(
+        sidecar_tls_dir,
+        proxy_user_id,
+        proxy_primary_group_id,
+        SIDECAR_TLS_DIR_MODE,
+    )?;
+    openshell_supervisor_process::netns::install_sidecar_bypass_rules(proxy_user_id)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_network_init_ids(proxy_user_id: u32, proxy_primary_group_id: u32) -> Result<()> {
+    if proxy_user_id != 0 && proxy_user_id < openshell_policy::MIN_SANDBOX_UID {
+        return Err(miette::miette!(
+            "--proxy-uid must be 0 or at least {}",
+            openshell_policy::MIN_SANDBOX_UID
+        ));
+    }
+    if proxy_primary_group_id < openshell_policy::MIN_SANDBOX_UID {
+        return Err(miette::miette!(
+            "--proxy-gid must be at least {}",
+            openshell_policy::MIN_SANDBOX_UID
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_network_init(
+    _proxy_uid: u32,
+    _proxy_gid: u32,
+    _sidecar_state_dir: &str,
+    _sidecar_tls_dir: &str,
+) -> Result<()> {
+    Err(miette::miette!(
+        "--mode=network-init is only supported on Linux"
+    ))
+}
+
 fn main() -> Result<()> {
     // Handle `copy-self <DEST>` before clap so it works without any of the
     // sandbox flags. Kubernetes init containers invoke this path to seed an
@@ -221,6 +452,16 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+
+    if args.mode.network_init {
+        let proxy_gid = args.proxy_gid.unwrap_or(args.proxy_uid);
+        return run_network_init(
+            args.proxy_uid,
+            proxy_gid,
+            &args.sidecar_state_dir,
+            &args.sidecar_tls_dir,
+        );
+    }
 
     // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
@@ -420,5 +661,51 @@ mod tests {
 
         let final_path = dest_dir.join("openshell-sandbox");
         assert!(final_path.exists(), "binary should land inside dest dir");
+    }
+
+    #[test]
+    fn mode_parses_network_init_standalone() {
+        let mode = "network-init".parse::<Mode>().unwrap();
+        assert!(mode.network_init);
+        assert!(!mode.network);
+        assert!(!mode.process);
+    }
+
+    #[test]
+    fn mode_rejects_combined_network_init() {
+        let err = "network-init,network".parse::<Mode>().unwrap_err();
+        assert!(err.contains("cannot be combined"));
+    }
+
+    #[test]
+    fn mode_rejects_empty_value() {
+        let err = "".parse::<Mode>().unwrap_err();
+        assert!(err.contains("at least one"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sidecar_tls_modes_preserve_proxy_owned_parent_and_private_client_dir() {
+        assert_eq!(SIDECAR_TLS_DIR_MODE, 0o755);
+        assert_eq!(SIDECAR_TLS_STAGING_DIR_MODE, 0o700);
+        assert_eq!(SIDECAR_CLIENT_TLS_DIR_MODE, 0o750);
+        assert_eq!(SIDECAR_CLIENT_TLS_FILE_MODE, 0o400);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_accepts_root_proxy_uid_for_binary_aware_sidecar() {
+        validate_network_init_ids(0, openshell_policy::MIN_SANDBOX_UID).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn network_init_still_rejects_low_non_root_proxy_ids() {
+        let uid_err =
+            validate_network_init_ids(999, openshell_policy::MIN_SANDBOX_UID).unwrap_err();
+        assert!(uid_err.to_string().contains("--proxy-uid"));
+
+        let gid_err = validate_network_init_ids(0, 999).unwrap_err();
+        assert!(gid_err.to_string().contains("--proxy-gid"));
     }
 }

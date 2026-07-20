@@ -86,6 +86,7 @@ mod tests {
                 created_at_ms: 1000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             sandbox_id: sandbox_id.to_string(),
             token: id.to_string(),

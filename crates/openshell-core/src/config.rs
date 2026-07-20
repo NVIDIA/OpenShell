@@ -12,7 +12,6 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -37,8 +36,40 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
-/// Default OCI image for the openshell-sandbox supervisor binary.
-pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
+/// Default OCI repository for the supervisor image (no tag).
+pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
+
+/// Return the default supervisor image reference with a version-pinned tag.
+#[must_use]
+pub fn default_supervisor_image() -> String {
+    format!(
+        "{DEFAULT_SUPERVISOR_IMAGE_REPO}:{}",
+        default_supervisor_image_tag()
+    )
+}
+
+fn default_supervisor_image_tag() -> String {
+    resolve_supervisor_image_tag(&[
+        option_env!("OPENSHELL_IMAGE_TAG").unwrap_or(""),
+        option_env!("IMAGE_TAG").unwrap_or(""),
+        env!("CARGO_PKG_VERSION"),
+    ])
+}
+
+/// Resolve the supervisor image tag from an ordered list of candidates.
+///
+/// Returns the first non-empty, non-`"0.0.0"` candidate, falling back to
+/// `"dev"` when none qualifies. Replaces `+` with `-` for OCI tag
+/// compatibility.
+#[must_use]
+pub fn resolve_supervisor_image_tag(candidates: &[&str]) -> String {
+    candidates
+        .iter()
+        .copied()
+        .find(|t| !t.is_empty() && *t != "0.0.0")
+        .unwrap_or("dev")
+        .replace('+', "-")
+}
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
@@ -131,20 +162,12 @@ pub fn detect_driver() -> Option<ComputeDriverKind> {
         return Some(ComputeDriverKind::Podman);
     }
 
-    // Docker: check if the CLI is available or a local Docker socket exists.
+    // Docker: check for a reachable local API socket.
     if is_docker_available() {
         return Some(ComputeDriverKind::Docker);
     }
 
     None
-}
-
-/// Check if a binary is available on the system PATH.
-fn is_binary_available(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
 }
 
 fn is_podman_available() -> bool {
@@ -196,13 +219,18 @@ fn podman_socket_candidates_from_env(
 }
 
 fn is_docker_available() -> bool {
-    is_binary_available("docker") || docker_socket_available()
+    detect_docker_socket().is_some()
 }
 
-fn docker_socket_available() -> bool {
-    docker_socket_candidates()
+pub fn detect_docker_socket() -> Option<PathBuf> {
+    detect_docker_socket_from_candidates(&docker_socket_candidates())
+}
+
+fn detect_docker_socket_from_candidates(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
         .iter()
-        .any(|path| is_unix_socket(path))
+        .find(|path| docker_socket_responds(path))
+        .cloned()
 }
 
 fn docker_socket_candidates() -> Vec<PathBuf> {
@@ -242,6 +270,15 @@ fn is_unix_socket(path: &Path) -> bool {
 fn podman_socket_responds(path: &Path) -> bool {
     unix_socket_http_ping(path, |response| {
         http_response_is_success(response) && contains_ascii(response, b"Libpod-Api-Version:")
+    })
+}
+
+#[cfg(unix)]
+fn docker_socket_responds(path: &Path) -> bool {
+    unix_socket_http_ping(path, |response| {
+        http_response_is_success(response)
+            && contains_ascii(response, b"Api-Version:")
+            && !contains_ascii(response, b"Libpod-Api-Version:")
     })
 }
 
@@ -318,6 +355,12 @@ fn podman_socket_responds(path: &Path) -> bool {
     false
 }
 
+#[cfg(not(unix))]
+fn docker_socket_responds(path: &Path) -> bool {
+    let _ = path;
+    false
+}
+
 /// Server configuration.
 ///
 /// Built programmatically in [`crate::Config::new`] and the gateway CLI from
@@ -351,6 +394,12 @@ pub struct Config {
 
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
+
+    /// Disabled-by-default gateway interceptor service configs.
+    pub gateway_interceptors: Vec<GatewayInterceptorConfig>,
+
+    /// Ordered provider-profile sources used to build the effective catalog.
+    pub provider_profile_sources: Vec<GatewayProviderProfileSourceConfig>,
 
     /// mTLS user authentication configuration. When enabled, a verified TLS
     /// client certificate can authenticate CLI/SDK callers as a
@@ -515,6 +564,112 @@ pub struct GatewayAuthConfig {
     pub allow_unauthenticated_users: bool,
 }
 
+/// One configured gateway interceptor service.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayInterceptorConfig {
+    /// Operator-assigned instance name used in logs and config overrides.
+    pub name: String,
+    /// Interceptor gRPC endpoint. Supports `http://`, `https://`, and
+    /// `unix://` endpoints.
+    pub grpc_endpoint: String,
+    /// Deterministic service ordering. Lower values run first.
+    #[serde(default)]
+    pub order: i32,
+    /// Default failure policy for this configured service.
+    #[serde(default)]
+    pub failure_policy: Option<GatewayInterceptorFailurePolicy>,
+    /// RFC-style timeout string such as `500ms` or `2s`.
+    #[serde(default)]
+    pub timeout: Option<String>,
+    /// Maximum accepted encoded `Evaluate` response size.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+    /// Maximum JSON patches accepted from one evaluation result.
+    #[serde(default)]
+    pub max_patches: Option<usize>,
+    /// Controls whether manifest bindings are dynamic, allowlisted, or must
+    /// exactly match operator configuration.
+    #[serde(default)]
+    pub binding_policy: GatewayInterceptorBindingPolicy,
+    /// Binding configuration. Its validation and authorization semantics are
+    /// selected by `binding_policy`.
+    #[serde(default)]
+    pub bindings: Vec<GatewayInterceptorBindingOverride>,
+}
+
+/// Operator policy for authorizing interceptor manifest bindings.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorBindingPolicy {
+    /// Preserve manifest-controlled binding discovery. Configured bindings
+    /// may narrow or disable manifest declarations.
+    #[default]
+    Dynamic,
+    /// Enable only configured RPC selectors and phases. Extra manifest
+    /// declarations are ignored.
+    Allowlist,
+    /// Require configured and manifest RPC selectors and phases to match.
+    Exact,
+}
+
+/// One configured source in the gateway's effective provider-profile catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GatewayProviderProfileSourceConfig {
+    /// Profiles bundled with the `OpenShell` build.
+    Builtin,
+    /// Profiles managed through the provider profile mutation APIs.
+    User,
+    /// Profiles vended by a configured gateway interceptor instance.
+    Interceptor { name: String },
+}
+
+/// Failure behavior when an interceptor evaluation cannot produce a valid
+/// result.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorFailurePolicy {
+    FailClosed,
+    FailOpen,
+}
+
+/// Configured binding authorization or dynamic-manifest override.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayInterceptorBindingOverride {
+    /// Binding id from the interceptor manifest.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Full selector form: `openshell.v1.OpenShell/CreateSandbox`.
+    #[serde(default)]
+    pub rpc: Option<String>,
+    /// Structured selector service, e.g. `openshell.v1.OpenShell`.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Structured selector method, e.g. `CreateSandbox`.
+    #[serde(default)]
+    pub method: Option<String>,
+    /// Narrowed phase set.
+    #[serde(default)]
+    pub phases: Option<Vec<GatewayInterceptorPhaseConfig>>,
+    /// Disable the selected binding.
+    #[serde(default)]
+    pub disabled: bool,
+    /// Binding-specific failure policy override.
+    #[serde(default)]
+    pub failure_policy: Option<GatewayInterceptorFailurePolicy>,
+}
+
+/// Config file phase names.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayInterceptorPhaseConfig {
+    ModifyOperation,
+    Validate,
+    PostCommit,
+}
+
 const fn default_jwks_ttl_secs() -> u64 {
     3600
 }
@@ -575,6 +730,11 @@ impl Config {
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
+            gateway_interceptors: Vec::new(),
+            provider_profile_sources: vec![
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+            ],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
@@ -662,6 +822,26 @@ impl Config {
     ) -> Self {
         self.grpc_rate_limit_requests = requests;
         self.grpc_rate_limit_window_secs = window_secs;
+        self
+    }
+
+    /// Set configured gateway interceptors.
+    #[must_use]
+    pub fn with_gateway_interceptors<I>(mut self, interceptors: I) -> Self
+    where
+        I: IntoIterator<Item = GatewayInterceptorConfig>,
+    {
+        self.gateway_interceptors = interceptors.into_iter().collect();
+        self
+    }
+
+    /// Set the ordered provider-profile sources used by the gateway.
+    #[must_use]
+    pub fn with_provider_profile_sources<I>(mut self, sources: I) -> Self
+    where
+        I: IntoIterator<Item = GatewayProviderProfileSourceConfig>,
+    {
+        self.provider_profile_sources = sources.into_iter().collect();
         self
     }
 
@@ -789,9 +969,11 @@ mod tests {
     #[cfg(unix)]
     use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket, normalize_compute_driver_name,
-        podman_socket_candidates_from_env, podman_socket_responds,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
+        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
+        GatewayProviderProfileSourceConfig, detect_docker_socket_from_candidates, detect_driver,
+        docker_host_unix_socket_path, docker_socket_responds, is_unix_socket,
+        normalize_compute_driver_name, podman_socket_candidates_from_env, podman_socket_responds,
     };
     #[cfg(unix)]
     use std::io::{Read as _, Write as _};
@@ -858,6 +1040,18 @@ mod tests {
     }
 
     #[test]
+    fn config_defaults_to_builtin_and_user_provider_profile_sources() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.provider_profile_sources,
+            vec![
+                GatewayProviderProfileSourceConfig::Builtin,
+                GatewayProviderProfileSourceConfig::User,
+            ]
+        );
+    }
+
+    #[test]
     fn gateway_jwt_ttl_defaults_to_non_expiring() {
         let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
             "signing_key_path": "/tmp/signing.pem",
@@ -867,6 +1061,35 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, 0);
+    }
+
+    #[test]
+    fn gateway_interceptor_failure_policy_rejects_ignore() {
+        let err =
+            serde_json::from_value::<GatewayInterceptorFailurePolicy>(serde_json::json!("ignore"))
+                .unwrap_err();
+
+        assert!(err.to_string().contains("unknown variant `ignore`"));
+    }
+
+    #[test]
+    fn gateway_interceptor_binding_policy_defaults_and_parses_strict_modes() {
+        let defaulted: GatewayInterceptorConfig = serde_json::from_value(serde_json::json!({
+            "name": "governance",
+            "grpc_endpoint": "unix:///tmp/governance.sock"
+        }))
+        .unwrap();
+        let allowlist: GatewayInterceptorBindingPolicy =
+            serde_json::from_value(serde_json::json!("allowlist")).unwrap();
+        let exact: GatewayInterceptorBindingPolicy =
+            serde_json::from_value(serde_json::json!("exact")).unwrap();
+
+        assert_eq!(
+            defaulted.binding_policy,
+            GatewayInterceptorBindingPolicy::Dynamic
+        );
+        assert_eq!(allowlist, GatewayInterceptorBindingPolicy::Allowlist);
+        assert_eq!(exact, GatewayInterceptorBindingPolicy::Exact);
     }
 
     #[test]
@@ -1027,6 +1250,90 @@ mod tests {
         handle.join().expect("probe server exits");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn docker_socket_probe_accepts_successful_ping_response() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let socket_path = temp_dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind docker socket");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept docker probe");
+            let mut request = [0_u8; 128];
+            let n = stream.read(&mut request).expect("read docker probe");
+            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nApi-Version: 1.51\r\nDocker-Experimental: false\r\nContent-Length: 2\r\n\r\nOK",
+                )
+                .expect("write docker ping response");
+        });
+
+        assert!(docker_socket_responds(&socket_path));
+        handle.join().expect("probe server exits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_socket_probe_rejects_podman_ping_response() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let socket_path = temp_dir.path().join("podman.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept docker probe");
+            let mut request = [0_u8; 128];
+            let n = stream.read(&mut request).expect("read docker probe");
+            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
+                )
+                .expect("write podman ping response");
+        });
+
+        assert!(!docker_socket_responds(&socket_path));
+        handle.join().expect("probe server exits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_socket_probe_rejects_inactive_socket() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let socket_path = temp_dir.path().join("docker.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind docker socket");
+        drop(listener);
+
+        assert!(is_unix_socket(&socket_path));
+        assert!(!docker_socket_responds(&socket_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_socket_detection_returns_the_responsive_candidate() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let inactive_path = temp_dir.path().join("inactive.sock");
+        let inactive_listener = UnixListener::bind(&inactive_path).expect("bind inactive socket");
+        drop(inactive_listener);
+
+        let responsive_path = temp_dir.path().join("responsive.sock");
+        let listener = UnixListener::bind(&responsive_path).expect("bind responsive socket");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept docker probe");
+            let mut request = [0_u8; 128];
+            let _ = stream.read(&mut request).expect("read docker probe");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nApi-Version: 1.51\r\nContent-Length: 2\r\n\r\nOK")
+                .expect("write docker ping response");
+        });
+
+        assert_eq!(
+            detect_docker_socket_from_candidates(&[inactive_path, responsive_path.clone(),]),
+            Some(responsive_path)
+        );
+        handle.join().expect("probe server exits");
+    }
+
     #[test]
     fn podman_socket_candidates_include_env_runtime_and_home_paths() {
         let candidates = podman_socket_candidates_from_env(
@@ -1063,5 +1370,43 @@ mod tests {
                 None => std::env::remove_var("KUBERNETES_SERVICE_HOST"),
             }
         }
+    }
+
+    #[test]
+    fn supervisor_image_tag_prefers_explicit_build_tags() {
+        use super::resolve_supervisor_image_tag;
+        assert_eq!(
+            resolve_supervisor_image_tag(&["1.2.3", "sha", "0.0.0"]),
+            "1.2.3"
+        );
+        assert_eq!(resolve_supervisor_image_tag(&["", "sha", "0.0.0"]), "sha");
+        assert_eq!(resolve_supervisor_image_tag(&["", "", "1.2.3"]), "1.2.3");
+        assert_eq!(resolve_supervisor_image_tag(&["", "", "0.0.0"]), "dev");
+        assert_eq!(
+            resolve_supervisor_image_tag(&["latest", "", "1.2.3"]),
+            "latest"
+        );
+    }
+
+    #[test]
+    fn supervisor_image_tag_sanitizes_build_metadata_for_oci() {
+        use super::resolve_supervisor_image_tag;
+        assert_eq!(
+            resolve_supervisor_image_tag(&["", "", "0.0.37-dev.156+g1d3b741ee"]),
+            "0.0.37-dev.156-g1d3b741ee",
+        );
+        assert_eq!(
+            resolve_supervisor_image_tag(&["0.0.37-dev.156+g1d3b741ee", "", "0.0.0"]),
+            "0.0.37-dev.156-g1d3b741ee",
+        );
+    }
+
+    #[test]
+    fn default_supervisor_image_is_version_pinned() {
+        use super::default_supervisor_image;
+        let image = default_supervisor_image();
+        assert!(image.starts_with("ghcr.io/nvidia/openshell/supervisor:"));
+        let tag = image.rsplit_once(':').unwrap().1;
+        assert!(!tag.is_empty());
     }
 }

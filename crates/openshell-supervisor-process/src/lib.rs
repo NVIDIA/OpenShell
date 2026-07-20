@@ -19,6 +19,8 @@ pub mod skills;
 pub mod ssh;
 pub mod supervisor_session;
 
+mod unix_socket;
+
 #[cfg(target_os = "linux")]
 pub mod bypass_monitor;
 #[cfg(target_os = "linux")]

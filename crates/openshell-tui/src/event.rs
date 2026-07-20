@@ -51,6 +51,8 @@ pub enum Event {
     SandboxSettingSetResult(Result<u64, String>),
     /// Sandbox setting delete result: `Ok(revision)` or `Err(message)`.
     SandboxSettingDeleteResult(Result<u64, String>),
+    /// Non-fatal warnings from port-forward setup after sandbox creation.
+    ForwardWarnings(Vec<String>),
 }
 
 pub struct EventHandler {
@@ -114,6 +116,15 @@ impl EventHandler {
 
     pub async fn next(&mut self) -> Option<Event> {
         self.rx.recv().await
+    }
+
+    /// Discard events queued before or while the TUI was suspended.
+    ///
+    /// The input reader is paused before this is called, so terminal input
+    /// remains in the TTY for the resumed reader. This primarily removes stale
+    /// tick events that would otherwise run refresh work before new key input.
+    pub fn discard_pending(&mut self) {
+        while self.rx.try_recv().is_ok() {}
     }
 
     /// Get a sender handle for dispatching events from background tasks.

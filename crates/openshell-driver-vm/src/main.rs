@@ -132,6 +132,12 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_GPU_VCPUS", default_value_t = 4)]
     gpu_vcpus: u8,
 
+    #[arg(long, env = "OPENSHELL_VM_SANDBOX_UID")]
+    sandbox_uid: Option<u32>,
+
+    #[arg(long, env = "OPENSHELL_VM_SANDBOX_GID")]
+    sandbox_gid: Option<u32>,
+
     #[arg(long, hide = true)]
     vm_backend: Option<String>,
 
@@ -214,6 +220,8 @@ async fn main() -> Result<()> {
         gpu_enabled: args.gpu,
         gpu_mem_mib: args.gpu_mem_mib,
         gpu_vcpus: args.gpu_vcpus,
+        sandbox_uid: args.sandbox_uid,
+        sandbox_gid: args.sandbox_gid,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;

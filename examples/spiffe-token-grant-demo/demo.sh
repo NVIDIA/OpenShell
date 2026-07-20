@@ -115,7 +115,7 @@ run "${OS[@]}" settings set --global --key providers_v2_enabled --value true --y
 run "${OS[@]}" provider profile lint -f "$PROFILE_FILE"
 run "${OS[@]}" provider profile import -f "$PROFILE_FILE"
 run "${OS[@]}" provider create --name "$PROVIDER_NAME" --type "$PROFILE_ID" --runtime-credentials
-run "${OS[@]}" sandbox create --name "$SANDBOX_NAME" --provider "$PROVIDER_NAME" --keep --no-tty -- echo "sandbox ready"
+run "${OS[@]}" sandbox create --name "$SANDBOX_NAME" --provider "$PROVIDER_NAME" --no-tty -- echo "sandbox ready"
 
 sandbox_curl_until "alpha" "http://alpha.default.svc.cluster.local/" "alpha called with path /:"
 ALPHA_OUTPUT="$SANDBOX_CURL_OUTPUT"

@@ -40,20 +40,21 @@ use openshell_core::proto::{
     DeleteProviderRefreshRequest, DeleteProviderRequest, DeleteSandboxRequest,
     DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuResourceRequirements,
-    HealthRequest, ImportProviderProfilesRequest, LintProviderProfilesRequest,
-    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
-    ListSandboxProvidersRequest, ListSandboxesRequest, ListServicesRequest, PlatformEvent,
-    PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
-    SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value, tcp_forward_init,
+    GetGatewayConfigRequest, GetGatewayInfoRequest, GetProviderProfileRequest,
+    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest,
+    GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest,
+    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
+    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
+    ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider,
+    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
+    ServiceStatus, SetClusterInferenceRequest, SettingScope, SettingValue, TcpForwardFrame,
+    TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderProfilesRequest,
+    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -525,6 +526,28 @@ fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>
     }
 }
 
+#[derive(Debug, Clone)]
+struct GatewayInfoView {
+    gateway: String,
+    server: String,
+    auth: Option<&'static str>,
+    status: String,
+    version: String,
+    compute_drivers: Vec<ComputeDriverInfoView>,
+}
+
+#[derive(Debug, Clone)]
+struct ComputeDriverInfoView {
+    name: String,
+    capabilities: ComputeDriverCapabilitiesView,
+}
+
+#[derive(Debug, Clone)]
+struct ComputeDriverCapabilitiesView {
+    driver_name: String,
+    driver_version: String,
+}
+
 /// Show gateway status.
 #[allow(clippy::branches_sharing_code)]
 pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) -> Result<()> {
@@ -580,6 +603,129 @@ pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) 
     }
 
     Ok(())
+}
+
+fn gateway_service_status_name(status: i32) -> &'static str {
+    match ServiceStatus::try_from(status) {
+        Ok(ServiceStatus::Healthy) => "healthy",
+        Ok(ServiceStatus::Degraded) => "degraded",
+        Ok(ServiceStatus::Unhealthy) => "unhealthy",
+        Ok(ServiceStatus::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+/// Show elevated gateway runtime information.
+pub async fn gateway_info(
+    gateway_name: &str,
+    server: &str,
+    tls: &TlsOptions,
+    output: &str,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let info = client
+        .get_gateway_info(GetGatewayInfoRequest {})
+        .await
+        .map_err(|err| match err.code() {
+            Code::Unimplemented => {
+                miette!("gateway info is not supported by this gateway version")
+            }
+            Code::PermissionDenied => miette!("gateway info requires admin privileges: {err}"),
+            _ => miette!("get_gateway_info failed: {err}"),
+        })?
+        .into_inner();
+
+    let view = GatewayInfoView {
+        gateway: gateway_name.to_string(),
+        server: server.to_string(),
+        auth: tls.is_bearer_auth().then_some("bearer"),
+        status: gateway_service_status_name(info.status).to_string(),
+        version: info.gateway_version,
+        compute_drivers: info
+            .compute_drivers
+            .into_iter()
+            .map(|driver| {
+                let capabilities = driver.capabilities.unwrap_or_default();
+                ComputeDriverInfoView {
+                    name: driver.name,
+                    capabilities: ComputeDriverCapabilitiesView {
+                        driver_name: capabilities.driver_name,
+                        driver_version: capabilities.driver_version,
+                    },
+                }
+            })
+            .collect(),
+    };
+
+    print_gateway_info(&view, output)
+}
+
+pub fn gateway_info_not_configured() -> Result<()> {
+    Err(miette!(
+        "No gateway configured.\nRegister a gateway with: openshell gateway add <endpoint>"
+    ))
+}
+
+fn print_gateway_info(view: &GatewayInfoView, output: &str) -> Result<()> {
+    if crate::output::print_output_single(output, view, gateway_info_to_json)? {
+        return Ok(());
+    }
+
+    println!("{}", "Gateway Info".cyan().bold());
+    println!();
+    println!("  {} {}", "Gateway:".dimmed(), view.gateway);
+    println!("  {} {}", "Server:".dimmed(), view.server);
+    if view.auth.is_some() {
+        println!("  {} Edge (bearer token)", "Auth:".dimmed());
+    }
+    println!("  {} {}", "Status:".dimmed(), view.status);
+    println!("  {} {}", "Version:".dimmed(), view.version);
+    print_compute_driver_info(&view.compute_drivers);
+
+    Ok(())
+}
+
+fn print_compute_driver_info(drivers: &[ComputeDriverInfoView]) {
+    if drivers.is_empty() {
+        return;
+    }
+
+    println!("  {}", "Compute drivers:".dimmed());
+    for driver in drivers {
+        println!("    {}", driver.name);
+        if driver.capabilities.driver_name != driver.name {
+            println!(
+                "      {} {}",
+                "Driver name:".dimmed(),
+                driver.capabilities.driver_name
+            );
+        }
+        println!(
+            "      {} {}",
+            "Driver version:".dimmed(),
+            driver.capabilities.driver_version
+        );
+    }
+}
+
+fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
+    serde_json::json!({
+        "gateway": &view.gateway,
+        "server": &view.server,
+        "auth": view.auth,
+        "status": &view.status,
+        "version": &view.version,
+        "compute_drivers": view
+            .compute_drivers
+            .iter()
+            .map(|driver| serde_json::json!({
+                "name": &driver.name,
+                "capabilities": {
+                    "driver_name": &driver.capabilities.driver_name,
+                    "driver_version": &driver.capabilities.driver_version,
+                },
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// Set the active gateway.
@@ -1356,31 +1502,73 @@ pub fn gateway_list(gateway_flag: &Option<String>, output: &str) -> Result<()> {
         .max()
         .unwrap_or(6)
         .max(6);
+    let auth_width = gateways
+        .iter()
+        .map(|g| gateway_auth_label(&g.metadata).len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let remote_labels: Vec<Option<String>> = gateways
+        .iter()
+        .map(|g| gateway_remote_label(&g.metadata))
+        .collect();
+    let show_remote = remote_labels.iter().any(Option::is_some);
+    let remote_width = remote_labels
+        .iter()
+        .filter_map(|label| label.as_ref().map(String::len))
+        .max()
+        .unwrap_or(6)
+        .max(6);
 
     // Print header
-    println!(
-        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<source_width$}  {}",
-        "NAME".bold(),
-        "ENDPOINT".bold(),
-        "TYPE".bold(),
-        "SOURCE".bold(),
-        "AUTH".bold(),
-    );
+    if show_remote {
+        println!(
+            "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<source_width$}  {:<auth_width$}  {:<remote_width$}",
+            "NAME".bold(),
+            "ENDPOINT".bold(),
+            "TYPE".bold(),
+            "SOURCE".bold(),
+            "AUTH".bold(),
+            "REMOTE".bold(),
+        );
+    } else {
+        println!(
+            "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<source_width$}  {}",
+            "NAME".bold(),
+            "ENDPOINT".bold(),
+            "TYPE".bold(),
+            "SOURCE".bold(),
+            "AUTH".bold(),
+        );
+    }
 
     // Print rows
-    for gateway in gateways {
+    for (gateway, remote_label) in gateways.iter().zip(remote_labels.iter()) {
         let metadata = &gateway.metadata;
         let is_active = active.as_deref() == Some(&metadata.name);
         let marker = if is_active { "*" } else { " " };
         let gw_type = gateway_type_label(metadata);
         let gw_auth = gateway_auth_label(metadata);
-        let line = format!(
-            "{marker} {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<source_width$}  {gw_auth}",
-            metadata.name,
-            metadata.gateway_endpoint,
-            gw_type,
-            gateway.source.label(),
-        );
+        let line = if show_remote {
+            let remote_label = remote_label.as_deref().unwrap_or("-");
+            format!(
+                "{marker} {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<source_width$}  {:<auth_width$}  {:<remote_width$}",
+                metadata.name,
+                metadata.gateway_endpoint,
+                gw_type,
+                gateway.source.label(),
+                gw_auth,
+                remote_label,
+            )
+        } else {
+            format!(
+                "{marker} {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {:<source_width$}  {gw_auth}",
+                metadata.name,
+                metadata.gateway_endpoint,
+                gw_type,
+                gateway.source.label(),
+            )
+        };
         if is_active {
             println!("{}", line.green());
         } else {
@@ -1400,7 +1588,21 @@ fn gateway_to_json(gateway: &ListedGateway, active: &Option<String>) -> serde_js
         "source": gateway.source.label(),
         "auth": gateway_auth_label(metadata),
         "active": active.as_deref() == Some(&metadata.name),
+        "is_remote": metadata.is_remote,
+        "remote_host": &metadata.remote_host,
+        "resolved_host": &metadata.resolved_host,
     })
+}
+
+fn gateway_remote_label(gateway: &GatewayMetadata) -> Option<String> {
+    match (&gateway.remote_host, &gateway.resolved_host) {
+        (Some(remote), Some(resolved)) if remote != resolved => {
+            Some(format!("{remote} -> {resolved}"))
+        }
+        (Some(remote), _) => Some(remote.clone()),
+        (None, Some(resolved)) => Some(resolved.clone()),
+        (None, None) => None,
+    }
 }
 
 async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<StatusCode>> {
@@ -1522,38 +1724,6 @@ pub fn gateway_remove(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Show gateway registration details.
-pub fn gateway_admin_info(name: &str) -> Result<()> {
-    let metadata = get_gateway_metadata(name).ok_or_else(|| {
-        miette::miette!(
-            "No gateway metadata found for '{name}'.\n\
-              Register it first: openshell gateway add <endpoint> --name {name}"
-        )
-    })?;
-
-    println!("{}", "Gateway Info".cyan().bold());
-    println!();
-    println!("  {} {}", "Gateway:".dimmed(), metadata.name);
-    println!(
-        "  {} {}",
-        "Gateway endpoint:".dimmed(),
-        metadata.gateway_endpoint
-    );
-
-    if metadata.is_remote {
-        if let Some(ref host) = metadata.remote_host {
-            println!("  {} {host}", "Remote host:".dimmed());
-        } else {
-            println!("  {} External registration", "Type:".dimmed());
-        }
-        if let Some(ref resolved) = metadata.resolved_host {
-            println!("  {} {resolved}", "Resolved host:".dimmed());
-        }
-    }
-
-    Ok(())
-}
-
 /// Validate system prerequisites for running a gateway.
 ///
 /// Checks Docker connectivity and reports the result. Returns exit code 0
@@ -1648,39 +1818,9 @@ fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
         ));
     };
 
-    Ok(prost_types::Struct {
-        fields: fields
-            .into_iter()
-            .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
-            .collect::<Result<_>>()?,
-    })
-}
-
-fn json_to_protobuf_value(value: serde_json::Value) -> Result<prost_types::Value> {
-    use prost_types::{ListValue, Struct, Value, value::Kind};
-
-    let kind = match value {
-        serde_json::Value::Null => Kind::NullValue(0),
-        serde_json::Value::Bool(value) => Kind::BoolValue(value),
-        serde_json::Value::Number(value) => Kind::NumberValue(value.as_f64().ok_or_else(|| {
-            miette!("--driver-config-json contains a number that cannot be represented")
-        })?),
-        serde_json::Value::String(value) => Kind::StringValue(value),
-        serde_json::Value::Array(values) => Kind::ListValue(ListValue {
-            values: values
-                .into_iter()
-                .map(json_to_protobuf_value)
-                .collect::<Result<_>>()?,
-        }),
-        serde_json::Value::Object(fields) => Kind::StructValue(Struct {
-            fields: fields
-                .into_iter()
-                .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
-                .collect::<Result<_>>()?,
-        }),
-    };
-
-    Ok(Value { kind: Some(kind) })
+    openshell_core::proto_struct::json_object_to_struct(fields)
+        .into_diagnostic()
+        .wrap_err("--driver-config-json contains a value that cannot be represented")
 }
 
 fn validate_cpu_quantity(value: &str) -> Result<String> {
@@ -1928,6 +2068,7 @@ pub async fn sandbox_create(
         }),
         name: name.unwrap_or_default().to_string(),
         labels,
+        annotations: HashMap::new(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -1970,13 +2111,9 @@ pub async fn sandbox_create(
         match client
             .update_config(UpdateConfigRequest {
                 name: sandbox_name.clone(),
-                policy: None,
                 setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
                 setting_value: Some(setting),
-                delete_setting: false,
-                global: false,
-                merge_operations: vec![],
-                expected_resource_version: 0,
+                ..Default::default()
             })
             .await
         {
@@ -2679,6 +2816,17 @@ pub async fn sandbox_get(
         let mut labels: Vec<_> = metadata.labels.iter().collect();
         labels.sort_by_key(|(k, _)| *k);
         for (key, value) in labels {
+            println!("    {key}: {value}");
+        }
+    }
+
+    if let Some(metadata) = &sandbox.metadata
+        && !metadata.annotations.is_empty()
+    {
+        println!("  {} ", "Annotations:".dimmed());
+        let mut annotations: Vec<_> = metadata.annotations.iter().collect();
+        annotations.sort_by_key(|(k, _)| *k);
+        for (key, value) in annotations {
             println!("    {key}: {value}");
         }
     }
@@ -3427,10 +3575,15 @@ pub async fn sandbox_list(
 fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
     let meta = sandbox.metadata.as_ref();
     let labels = meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.labels));
+    let annotations = meta.map_or_else(
+        || serde_json::json!({}),
+        |m| serde_json::json!(m.annotations),
+    );
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "labels": labels,
+        "annotations": annotations,
         "resource_version": meta.map_or(0, |m| m.resource_version),
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase()),
@@ -3883,6 +4036,7 @@ async fn auto_create_provider(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
@@ -3925,6 +4079,7 @@ async fn auto_create_provider(
                         created_at_ms: 0,
                         labels: HashMap::new(),
                         resource_version: 0,
+                        annotations: HashMap::new(),
                     }),
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
@@ -4004,6 +4159,47 @@ pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
             ));
         }
     }
+    Ok(map)
+}
+
+/// Resolve `--secret-material-env KEY[=ENVVAR]` values from the CLI process
+/// environment (`ENVVAR` defaults to `KEY`) so secrets never transit argv.
+pub fn parse_secret_material_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        let (key, env_name) = match item.split_once('=') {
+            Some((key, env_name)) => (key.trim(), env_name.trim()),
+            None => (item.trim(), item.trim()),
+        };
+        if key.is_empty() {
+            return Err(miette::miette!("--secret-material-env key cannot be empty"));
+        }
+        if env_name.is_empty() {
+            return Err(miette::miette!(
+                "--secret-material-env {key} names an empty environment variable"
+            ));
+        }
+
+        let value = std::env::var(env_name).map_err(|_| {
+            miette::miette!(
+                "--secret-material-env {key} requires local env var '{env_name}' to be set to a non-empty value"
+            )
+        })?;
+        if value.trim().is_empty() {
+            return Err(miette::miette!(
+                "--secret-material-env {key} requires local env var '{env_name}' to be set to a non-empty value"
+            ));
+        }
+
+        if map.contains_key(key) {
+            return Err(miette::miette!(
+                "--secret-material-env key '{key}' supplied more than once"
+            ));
+        }
+        map.insert(key.to_string(), value);
+    }
+
     Ok(map)
 }
 
@@ -4670,13 +4866,14 @@ pub async fn provider_create_with_options(
     };
 
     let adc_credential_key = if from_gcloud_adc {
-        let profile =
-            openshell_providers::get_default_profile(&provider_type).ok_or_else(|| {
+        let profile = fetch_provider_profile(&mut client, &provider_type)
+            .await
+            .map_err(|err| {
                 miette::miette!(
-                    "--from-gcloud-adc requires a built-in provider profile, \
-                 but '{provider_type}' has none"
+                    "--from-gcloud-adc is not supported for '{provider_type}' providers ({err})"
                 )
             })?;
+        let profile = ProviderTypeProfile::from_proto(&profile);
         let adc_cred = profile.adc_credential().ok_or_else(|| {
             miette::miette!(
                 "--from-gcloud-adc is not supported for '{provider_type}' providers \
@@ -4764,6 +4961,7 @@ pub async fn provider_create_with_options(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: provider_type.clone(),
                 credentials: credential_map,
@@ -5282,6 +5480,7 @@ pub struct ProviderRefreshConfigInput<'a> {
     pub credential_key: &'a str,
     pub strategy: &'a str,
     pub material: &'a [String],
+    pub secret_material_env: &'a [String],
     pub secret_material_keys: &'a [String],
     pub credential_expires_at_ms: Option<i64>,
 }
@@ -5292,7 +5491,21 @@ pub async fn provider_refresh_config(
     tls: &TlsOptions,
 ) -> Result<()> {
     let strategy = provider_refresh_strategy(input.strategy)?;
-    let material = parse_key_value_pairs(input.material, "--material")?;
+    let mut material = parse_key_value_pairs(input.material, "--material")?;
+    let mut secret_material_keys = input.secret_material_keys.to_vec();
+    // Env-resolved secrets are auto-marked secret; duplicate keys are an
+    // error rather than a precedence order.
+    for (key, value) in parse_secret_material_env_pairs(input.secret_material_env)? {
+        if material.contains_key(&key) {
+            return Err(miette!(
+                "duplicate material key '{key}': supplied via both --material and --secret-material-env"
+            ));
+        }
+        if !secret_material_keys.contains(&key) {
+            secret_material_keys.push(key.clone());
+        }
+        material.insert(key, value);
+    }
     let mut client = grpc_client(server, tls).await?;
     let status = client
         .configure_provider_refresh(ConfigureProviderRefreshRequest {
@@ -5300,7 +5513,7 @@ pub async fn provider_refresh_config(
             credential_key: input.credential_key.to_string(),
             strategy: strategy as i32,
             material,
-            secret_material_keys: input.secret_material_keys.to_vec(),
+            secret_material_keys,
             expires_at_ms: input.credential_expires_at_ms,
         })
         .await
@@ -5391,6 +5604,7 @@ fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefresh
         "google_service_account_jwt" => {
             Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
+        "aws_sts_assume_role" => Ok(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
         _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
     }
 }
@@ -5443,6 +5657,7 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -5695,6 +5910,7 @@ pub async fn provider_update(
                     created_at_ms: 0,
                     labels: HashMap::new(),
                     resource_version: 0,
+                    annotations: HashMap::new(),
                 }),
                 r#type: String::new(),
                 credentials: credential_map,
@@ -6114,6 +6330,56 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
     Ok(SandboxUploadPlan::Regular)
 }
 
+/// Upload a local path to a sandbox.
+///
+/// Symlink sources, including dangling links, bypass Git-aware filtering so
+/// the tar upload preserves the link instead of dereferencing its target.
+pub async fn sandbox_upload(
+    server: &str,
+    name: &str,
+    local_path: &Path,
+    sandbox_path: Option<&str>,
+    git_ignore: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let upload_plan = sandbox_upload_plan(local_path, git_ignore)?;
+    let dest_display = sandbox_path.unwrap_or("~");
+    eprintln!(
+        "Uploading {} -> sandbox:{}",
+        local_path.display(),
+        dest_display
+    );
+
+    match upload_plan {
+        SandboxUploadPlan::GitAware { base_dir, files } => {
+            sandbox_sync_up_files(
+                server,
+                name,
+                &base_dir,
+                &files,
+                local_path,
+                sandbox_path,
+                tls,
+            )
+            .await?;
+        }
+        SandboxUploadPlan::GitFilteredEmpty => {
+            eprintln!(
+                "{} .gitignore filtering excluded all files in {}; uploading unfiltered",
+                "⚠".yellow().bold(),
+                local_path.display(),
+            );
+            sandbox_sync_up(server, name, local_path, sandbox_path, tls).await?;
+        }
+        SandboxUploadPlan::Regular => {
+            sandbox_sync_up(server, name, local_path, sandbox_path, tls).await?;
+        }
+    }
+
+    eprintln!("{} Upload complete", "✓".green().bold());
+    Ok(())
+}
+
 fn scrub_git_env(command: &mut Command) -> &mut Command {
     for key in [
         "GIT_DIR",
@@ -6306,12 +6572,8 @@ pub async fn sandbox_policy_set_global(
         .update_config(UpdateConfigRequest {
             name: String::new(),
             policy: Some(policy),
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6504,13 +6766,10 @@ pub async fn gateway_setting_set(
     let response = client
         .update_config(UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
-            delete_setting: false,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6539,13 +6798,9 @@ pub async fn sandbox_setting_set(
     let response = client
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
-            policy: None,
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6574,13 +6829,10 @@ pub async fn gateway_setting_delete(
     let response = client
         .update_config(UpdateConfigRequest {
             name: String::new(),
-            policy: None,
             setting_key: key.to_string(),
-            setting_value: None,
             delete_setting: true,
             global: true,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6609,13 +6861,9 @@ pub async fn sandbox_setting_delete(
     let response = client
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
-            policy: None,
             setting_key: key.to_string(),
-            setting_value: None,
             delete_setting: true,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -6669,12 +6917,7 @@ pub async fn sandbox_policy_set(
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
             policy: Some(policy),
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
-            global: false,
-            merge_operations: vec![],
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?;
@@ -6843,13 +7086,8 @@ pub async fn sandbox_policy_update(
     let response = client
         .update_config(UpdateConfigRequest {
             name: name.to_string(),
-            policy: None,
-            setting_key: String::new(),
-            setting_value: None,
-            delete_setting: false,
-            global: false,
             merge_operations: plan.merge_operations,
-            expected_resource_version: 0,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -7282,6 +7520,9 @@ fn policy_revision_to_json(
     }
     if !rev.load_error.is_empty() {
         obj.insert("load_error".to_string(), serde_json::json!(rev.load_error));
+    }
+    if !rev.provenance.is_empty() {
+        obj.insert("provenance".to_string(), serde_json::json!(rev.provenance));
     }
     if view.includes_policy() {
         let policy = match rev.policy.as_ref() {
@@ -7838,18 +8079,21 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
+        ComputeDriverCapabilitiesView, ComputeDriverInfoView, GatewayInfoView, PolicyGetView,
         ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
-        gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_to_json,
-        gateway_type_label, git_sync_files, http_health_check, import_local_package_mtls_bundle,
+        gateway_auth_label, gateway_env_override_warning, gateway_info_to_json,
+        gateway_remote_label, gateway_select_with, gateway_to_json, gateway_type_label,
+        git_sync_files, http_health_check, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, parse_driver_config_json, plaintext_gateway_is_remote,
-        progress_step_from_metadata, provider_profile_allows_empty_credentials,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
-        service_expose_status_error, service_url_for_gateway,
+        parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
+        plaintext_gateway_is_remote, policy_revision_to_json, progress_step_from_metadata,
+        provider_profile_allows_empty_credentials, provisioning_timeout_message,
+        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
+        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
+        service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -7870,11 +8114,40 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GpuResourceRequirements, Provider, ProviderCredentialRefresh,
+        GpuResourceRequirements, PolicyStatus, Provider, ProviderCredentialRefresh,
         ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
         ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        ResourceRequirements, SandboxCondition, SandboxPolicyRevision, SandboxStatus,
+        datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn policy_revision_json_includes_revision_provenance() {
+        let revision = SandboxPolicyRevision {
+            version: 2,
+            policy_hash: "hash".to_string(),
+            provenance: std::collections::HashMap::from([(
+                "openshell.nvidia.com/policy-signature".to_string(),
+                "signed".to_string(),
+            )]),
+            ..Default::default()
+        };
+
+        let json = policy_revision_to_json(
+            "sandbox",
+            Some("example"),
+            Some(2),
+            &revision,
+            PolicyStatus::Pending,
+            PolicyGetView::Metadata,
+        )
+        .unwrap();
+
+        assert_eq!(
+            json["provenance"]["openshell.nvidia.com/policy-signature"],
+            "signed"
+        );
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -7991,6 +8264,73 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_reads_value_from_named_environment_variable() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_NAMED", "pem-material");
+
+        let parsed =
+            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_NAMED".to_string()])
+                .expect("parse");
+        assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_defaults_env_name_to_key() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_KEY_ONLY", "key-only-material");
+
+        let parsed = parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
+            .expect("parse");
+        assert_eq!(
+            parsed.get("NAV_PARSE_SME_KEY_ONLY"),
+            Some(&"key-only-material".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_missing_environment() {
+        let _guard = EnvVarGuard::unset("NAV_PARSE_SME_MISSING");
+
+        let err =
+            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
+                .expect_err("missing env should error");
+        assert!(err.to_string().contains(
+            "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
+        ));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_empty_environment_value() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_EMPTY", "   ");
+
+        let err = parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_EMPTY".to_string()])
+            .expect_err("blank env should error");
+        assert!(err.to_string().contains(
+            "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
+        ));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_empty_key() {
+        let err = parse_secret_material_env_pairs(&["=NAV_PARSE_SME_NO_KEY".to_string()])
+            .expect_err("empty key should error");
+        assert!(err.to_string().contains("key cannot be empty"));
+    }
+
+    #[test]
+    fn parse_secret_material_env_pairs_rejects_duplicate_keys() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_SME_DUP", "value");
+
+        let err = parse_secret_material_env_pairs(&[
+            "private_key=NAV_PARSE_SME_DUP".to_string(),
+            "private_key=NAV_PARSE_SME_DUP".to_string(),
+        ])
+        .expect_err("duplicate key should error");
+        assert!(
+            err.to_string()
+                .contains("key 'private_key' supplied more than once")
+        );
     }
 
     #[test]
@@ -8691,6 +9031,19 @@ mod tests {
         assert_eq!(plan, super::SandboxUploadPlan::Regular);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_upload_plan_accepts_dangling_symlinks() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let link = tmpdir.path().join("dangling-link");
+        std::os::unix::fs::symlink("missing-target", &link).expect("create symlink");
+
+        let plan =
+            sandbox_upload_plan(&link, true).expect("dangling symlink upload should be planned");
+
+        assert_eq!(plan, super::SandboxUploadPlan::Regular);
+    }
+
     #[test]
     fn sandbox_upload_plan_falls_back_when_all_files_gitignored() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
@@ -8887,6 +9240,89 @@ mod tests {
         assert_eq!(json["type"], "local");
         assert_eq!(json["auth"], "plaintext");
         assert_eq!(json["active"], true);
+    }
+
+    #[test]
+    fn gateway_to_json_includes_remote_registration_details() {
+        let gateway = ListedGateway {
+            metadata: GatewayMetadata {
+                name: "remote-vm".to_string(),
+                gateway_endpoint: "https://127.0.0.1:17670".to_string(),
+                is_remote: true,
+                remote_host: Some("user@gateway-alias".to_string()),
+                resolved_host: Some("10.0.0.5".to_string()),
+                auth_mode: Some("mtls".to_string()),
+                ..Default::default()
+            },
+            source: GatewayMetadataSource::User,
+        };
+
+        let json = gateway_to_json(&gateway, &Some("local-vm".to_string()));
+
+        assert_eq!(json["source"], "user");
+        assert_eq!(json["type"], "remote");
+        assert_eq!(json["auth"], "mtls");
+        assert_eq!(json["active"], false);
+        assert_eq!(json["is_remote"], true);
+        assert_eq!(json["remote_host"], "user@gateway-alias");
+        assert_eq!(json["resolved_host"], "10.0.0.5");
+        assert_eq!(
+            gateway_remote_label(&gateway.metadata).as_deref(),
+            Some("user@gateway-alias -> 10.0.0.5")
+        );
+    }
+
+    #[test]
+    fn gateway_info_json_includes_compute_drivers_when_available() {
+        let view = GatewayInfoView {
+            gateway: "openshell".to_string(),
+            server: "https://127.0.0.1:17670".to_string(),
+            auth: Some("bearer"),
+            status: "healthy".to_string(),
+            version: "0.0.75".to_string(),
+            compute_drivers: vec![ComputeDriverInfoView {
+                name: "podman".to_string(),
+                capabilities: ComputeDriverCapabilitiesView {
+                    driver_name: "podman".to_string(),
+                    driver_version: "0.0.75".to_string(),
+                },
+            }],
+        };
+
+        let json = gateway_info_to_json(&view);
+
+        assert_eq!(json["gateway"], "openshell");
+        assert_eq!(json["status"], "healthy");
+        assert_eq!(json["version"], "0.0.75");
+        assert_eq!(json["compute_drivers"][0]["name"], "podman");
+        assert_eq!(
+            json["compute_drivers"][0]["capabilities"]["driver_name"],
+            "podman"
+        );
+        assert_eq!(
+            json["compute_drivers"][0]["capabilities"]["driver_version"],
+            "0.0.75"
+        );
+    }
+
+    #[test]
+    fn gateway_info_json_includes_empty_compute_driver_list() {
+        let view = GatewayInfoView {
+            gateway: "openshell".to_string(),
+            server: "https://127.0.0.1:17670".to_string(),
+            auth: None,
+            status: "healthy".to_string(),
+            version: "0.0.74".to_string(),
+            compute_drivers: Vec::new(),
+        };
+
+        let json = gateway_info_to_json(&view);
+
+        assert!(
+            json["compute_drivers"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
     }
 
     #[test]
@@ -9600,6 +10036,7 @@ mod tests {
             resource_version: 42,
             created_at_ms: 1_234_567_890_000,
             labels,
+            annotations: std::collections::HashMap::new(),
         };
 
         let provider = Provider {

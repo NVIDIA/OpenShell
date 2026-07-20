@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use crate::{embedded_runtime, ffi, nft_ruleset, procguard, rootfs};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
+const KRUN_INIT_PID1_ENV: &str = "KRUN_INIT_PID1=1";
 
 /// PID of the VM worker process (libkrun fork or QEMU). Zero when not running.
 /// Used by the SIGTERM/SIGINT handler to forward signals to the VM.
@@ -833,15 +834,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     vm.set_console_output(&config.console_output)?;
 
-    let env = if config.env.is_empty() {
-        vec![
-            "HOME=/root".to_string(),
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-            "TERM=xterm".to_string(),
-        ]
-    } else {
-        config.env.clone()
-    };
+    let env = libkrun_guest_env(config);
     vm.set_exec(&config.exec_path, &config.args, &env)?;
 
     let pid = unsafe { libc::fork() };
@@ -887,6 +880,26 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             }
         }
     }
+}
+
+fn libkrun_guest_env(config: &VmLaunchConfig) -> Vec<String> {
+    let mut env = if config.env.is_empty() {
+        vec![
+            "HOME=/root".to_string(),
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            "TERM=xterm".to_string(),
+        ]
+    } else {
+        config.env.clone()
+    };
+
+    // libkrun normally keeps /init.krun as PID 1 and forks the configured
+    // executable. OpenShell's guest init is itself an init process and ends
+    // by exec'ing the supervisor, so ask libkrun to exec it directly. Keep
+    // this driver-owned setting authoritative over sandbox image/user env.
+    env.retain(|value| !value.starts_with("KRUN_INIT_PID1="));
+    env.push(KRUN_INIT_PID1_ENV.to_string());
+    env
 }
 
 pub fn validate_runtime_dir(dir: &Path) -> Result<(), String> {
@@ -1436,6 +1449,44 @@ mod tests {
         assert!(env.contains(&"VM_NET_GW=10.0.128.1".to_string()));
         assert!(env.contains(&"VM_NET_DNS=1.1.1.1".to_string()));
         assert!(env.contains(&"GPU_ENABLED=true".to_string()));
+    }
+
+    #[test]
+    fn libkrun_guest_env_runs_guest_init_as_pid_one() {
+        let env = libkrun_guest_env(&qemu_config());
+
+        assert!(env.contains(&"OPENSHELL_ENDPOINT=http://10.0.128.1:8080".to_string()));
+        assert!(env.contains(&KRUN_INIT_PID1_ENV.to_string()));
+    }
+
+    #[test]
+    fn libkrun_guest_env_overrides_caller_pid_one_setting() {
+        let mut config = qemu_config();
+        config.env.extend([
+            "KRUN_INIT_PID1=0".to_string(),
+            "KRUN_INIT_PID1=unexpected".to_string(),
+        ]);
+
+        let env = libkrun_guest_env(&config);
+        let pid_one_settings = env
+            .iter()
+            .filter(|value| value.starts_with("KRUN_INIT_PID1="))
+            .collect::<Vec<_>>();
+
+        assert_eq!(pid_one_settings.len(), 1);
+        assert_eq!(pid_one_settings[0], KRUN_INIT_PID1_ENV);
+    }
+
+    #[test]
+    fn libkrun_guest_env_keeps_defaults_when_no_env_is_configured() {
+        let mut config = qemu_config();
+        config.env.clear();
+
+        let env = libkrun_guest_env(&config);
+
+        assert!(env.contains(&"HOME=/root".to_string()));
+        assert!(env.contains(&"TERM=xterm".to_string()));
+        assert!(env.contains(&KRUN_INIT_PID1_ENV.to_string()));
     }
 
     #[test]
