@@ -91,6 +91,10 @@ jobs:
 
   e2e:
     needs: [compute-versions, build-gateway, build-supervisor]
+    permissions:
+      actions: read
+      contents: read
+      packages: read
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}

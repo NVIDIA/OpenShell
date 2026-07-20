@@ -69,6 +69,10 @@ jobs:
 
   e2e:
     needs: [build-gateway, build-supervisor]
+    permissions:
+      actions: read
+      contents: read
+      packages: read
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}
