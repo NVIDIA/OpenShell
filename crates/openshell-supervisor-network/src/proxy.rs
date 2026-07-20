@@ -316,20 +316,10 @@ impl ProxyHandle {
                         });
                     }
                     Err(err) => {
-                        // EMFILE (24) / ENFILE (23) indicate FD exhaustion —
-                        // back off exponentially to let connections drain.
-                        let is_fd_exhaustion = matches!(
-                            err.raw_os_error(),
-                            Some(24) | Some(23)
-                        );
+                        let is_fd_exhaustion = is_fd_exhaustion_error(&err);
                         let (severity, backoff) = if is_fd_exhaustion {
                             consecutive_fd_errors = consecutive_fd_errors.saturating_add(1);
-                            let backoff_ms = 100u64
-                                .saturating_mul(
-                                    1u64 << consecutive_fd_errors.min(6).saturating_sub(1),
-                                )
-                                .min(5_000);
-                            (SeverityId::Medium, std::time::Duration::from_millis(backoff_ms))
+                            (SeverityId::Medium, accept_backoff(consecutive_fd_errors))
                         } else {
                             (SeverityId::Low, std::time::Duration::from_millis(100))
                         };
@@ -371,6 +361,27 @@ fn emit_activity(tx: &Option<ActivitySender>, denied: bool, deny_group: &'static
     if let Some(tx) = tx {
         let _ = try_record_activity(tx, denied, deny_group);
     }
+}
+
+#[cfg(unix)]
+fn is_fd_exhaustion_error(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+}
+
+#[cfg(not(unix))]
+fn is_fd_exhaustion_error(_err: &std::io::Error) -> bool {
+    false
+}
+
+const ACCEPT_BACKOFF_BASE_MS: u64 = 100;
+const ACCEPT_BACKOFF_MAX_MS: u64 = 5_000;
+
+fn accept_backoff(consecutive_errors: u32) -> std::time::Duration {
+    let exponent = consecutive_errors.saturating_sub(1).min(7);
+    let ms = ACCEPT_BACKOFF_BASE_MS
+        .saturating_mul(1u64 << exponent)
+        .min(ACCEPT_BACKOFF_MAX_MS);
+    std::time::Duration::from_millis(ms)
 }
 
 fn l7_inspection_active(l7_route: Option<&L7RouteSnapshot>) -> bool {
@@ -9848,5 +9859,50 @@ network_policies:
                 );
             }
         }
+    }
+
+    #[test]
+    fn accept_backoff_exponential_progression() {
+        let ms = |n| accept_backoff(n).as_millis();
+        assert_eq!(ms(1), 100);
+        assert_eq!(ms(2), 200);
+        assert_eq!(ms(3), 400);
+        assert_eq!(ms(4), 800);
+        assert_eq!(ms(5), 1_600);
+        assert_eq!(ms(6), 3_200);
+        assert_eq!(ms(7), 5_000); // 6400 capped to 5000
+        assert_eq!(ms(8), 5_000); // stays at cap
+    }
+
+    #[test]
+    fn accept_backoff_zero_consecutive_errors() {
+        assert_eq!(accept_backoff(0).as_millis(), 100);
+    }
+
+    #[test]
+    fn accept_backoff_saturates_at_cap() {
+        assert_eq!(accept_backoff(100).as_millis(), 5_000);
+        assert_eq!(accept_backoff(u32::MAX).as_millis(), 5_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_fd_exhaustion_detects_emfile() {
+        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
+        assert!(is_fd_exhaustion_error(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_fd_exhaustion_detects_enfile() {
+        let err = std::io::Error::from_raw_os_error(libc::ENFILE);
+        assert!(is_fd_exhaustion_error(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_fd_exhaustion_rejects_other_errors() {
+        let err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+        assert!(!is_fd_exhaustion_error(&err));
     }
 }
