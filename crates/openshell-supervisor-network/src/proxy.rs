@@ -825,11 +825,12 @@ async fn handle_tcp_connection(
         emit_activity(&activity_tx, true, "connect_policy");
         respond(
             &mut client,
-            &build_json_error_response(
+            &build_json_error_response_with_reason(
                 403,
                 "Forbidden",
                 "policy_denied",
                 &format!("CONNECT {host_lc}:{port} not permitted by policy"),
+                &deny_reason,
             ),
         )
         .await?;
@@ -4878,6 +4879,34 @@ fn build_json_error_response(status: u16, status_text: &str, error: &str, detail
     .into_bytes()
 }
 
+fn build_json_error_response_with_reason(
+    status: u16,
+    status_text: &str,
+    error: &str,
+    detail: &str,
+    reason: &str,
+) -> Vec<u8> {
+    let mut body = serde_json::json!({
+        "error": error,
+        "detail": detail,
+    });
+    if !reason.is_empty() {
+        body["reason"] = serde_json::json!(reason);
+    }
+    let body_str = body.to_string();
+    format!(
+        "HTTP/1.1 {status} {status_text}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body_str.len(),
+        body_str,
+    )
+    .into_bytes()
+}
+
 fn build_middleware_deny_response(
     policy_name: &str,
     denial: &openshell_supervisor_middleware::MiddlewareDenial,
@@ -5125,6 +5154,48 @@ network_policies: {}
         assert!(body.get("rule_missing").is_none());
         assert!(body.get("next_steps").is_none());
         assert!(body.get("agent_guidance").is_none());
+    }
+
+    #[test]
+    fn policy_deny_response_includes_reason() {
+        let response = build_json_error_response_with_reason(
+            403,
+            "Forbidden",
+            "policy_denied",
+            "CONNECT api.example.com:443 not permitted by policy",
+            "binary '/usr/bin/node' not allowed in policy 'allow_api' (ancestors: [/usr/local/bin/claude])",
+        );
+        let response = String::from_utf8(response).expect("UTF-8 error response");
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+
+        assert_eq!(body["error"], "policy_denied");
+        assert_eq!(
+            body["detail"],
+            "CONNECT api.example.com:443 not permitted by policy"
+        );
+        assert_eq!(
+            body["reason"],
+            "binary '/usr/bin/node' not allowed in policy 'allow_api' (ancestors: [/usr/local/bin/claude])"
+        );
+    }
+
+    #[test]
+    fn policy_deny_response_omits_empty_reason() {
+        let response = build_json_error_response_with_reason(
+            403,
+            "Forbidden",
+            "policy_denied",
+            "CONNECT api.example.com:443 not permitted by policy",
+            "",
+        );
+        let response = String::from_utf8(response).expect("UTF-8 error response");
+        let (_, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON response");
+
+        assert_eq!(body["error"], "policy_denied");
+        assert!(body.get("reason").is_none());
     }
 
     #[test]
