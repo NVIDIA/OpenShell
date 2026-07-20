@@ -1314,7 +1314,7 @@ use openshell_core::proto::{
     UpdateProviderProfilesResponse, UpdateProviderRequest,
 };
 use openshell_providers::{
-    CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile, builtin_profiles,
+    CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
     normalize_profile_id, normalize_provider_type, strategy_output_env_key, strategy_output_spec,
     strategy_primary_env_key, validate_profile_set,
 };
@@ -1420,29 +1420,6 @@ pub(super) async fn handle_list_providers(
 /// Workspace-scoped profiles come from the store (user-managed, stored with the
 /// workspace key). Builtin/static profiles are always visible regardless of
 /// workspace.
-async fn workspace_scoped_profiles(
-    store: &Store,
-    workspace: &str,
-) -> Result<Vec<ProviderProfile>, Status> {
-    // User-managed profiles scoped to this workspace.
-    let stored: Vec<StoredProviderProfile> = store
-        .list_messages(workspace, 10_000, 0)
-        .await
-        .map_err(|e| Status::internal(format!("list provider profiles failed: {e}")))?;
-    let mut profiles: Vec<ProviderProfile> = stored
-        .into_iter()
-        .filter_map(|sp| {
-            let rv = sp.metadata.as_ref().map_or(0, |m| m.resource_version);
-            sp.profile.map(|p| profile_response_payload(p, rv))
-        })
-        .collect();
-    // Builtin profiles are workspace-agnostic.
-    for builtin in builtin_profiles() {
-        profiles.push(builtin.to_proto());
-    }
-    Ok(profiles)
-}
-
 pub(super) async fn handle_list_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<ListProviderProfilesRequest>,
@@ -1454,9 +1431,14 @@ pub(super) async fn handle_list_provider_profiles(
             .name;
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
     let offset = request.offset as usize;
-    let profiles = workspace_scoped_profiles(state.store.as_ref(), &workspace)
-        .await?
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), &workspace)
+        .await?;
+    let profiles = catalog
+        .list_all_scoped_profiles()
         .into_iter()
+        .map(|(_, profile)| profile)
         .skip(offset)
         .take(limit)
         .collect();
@@ -1475,11 +1457,12 @@ pub(super) async fn handle_get_provider_profile(
             .name;
     let id = req.id;
     let id = normalize_profile_id_request(&id)?;
-    let id_norm = normalize_profile_id(&id);
-    let profiles = workspace_scoped_profiles(state.store.as_ref(), &workspace).await?;
-    let profile = profiles
-        .into_iter()
-        .find(|p| normalize_profile_id(&p.id) == id_norm)
+    let catalog = state
+        .provider_profile_sources
+        .snapshot_catalog(state.store.as_ref(), &workspace)
+        .await?;
+    let profile = catalog
+        .get_profile(&id)
         .ok_or_else(|| Status::not_found("provider profile not found"))?;
 
     Ok(Response::new(ProviderProfileResponse {
@@ -1564,7 +1547,7 @@ pub(super) async fn handle_import_provider_profiles(
     }
 
     Ok(Response::new(ImportProviderProfilesResponse {
-        diagnostics: Vec::new(),
+        diagnostics: diagnostics.into_iter().map(proto_diagnostic).collect(),
         profiles: imported,
         imported: true,
     }))
@@ -2009,6 +1992,22 @@ async fn profile_conflict_diagnostics(
                 field: "id".to_string(),
                 message: format!("custom provider profile '{id}' already exists"),
                 severity: "error".to_string(),
+            });
+        } else if !workspace.is_empty()
+            && store
+                .get_message_by_name::<StoredProviderProfile>("", &id)
+                .await
+                .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
+                .is_some()
+        {
+            diagnostics.push(ProfileValidationDiagnostic {
+                source: source.clone(),
+                profile_id: id.clone(),
+                field: "id".to_string(),
+                message: format!(
+                    "profile '{id}' shadows a platform-scoped profile in this workspace"
+                ),
+                severity: "warning".to_string(),
             });
         }
     }
@@ -3028,6 +3027,8 @@ mod tests {
             binaries: Vec::new(),
             inference_capable: false,
             discovery: None,
+            source: String::new(),
+            scope: String::new(),
         };
 
         let mut dynamic_creds = HashMap::new();
@@ -3599,6 +3600,8 @@ mod tests {
             binaries: Vec::new(),
             inference_capable: false,
             discovery: None,
+            source: String::new(),
+            scope: String::new(),
         }
     }
 
@@ -4078,6 +4081,8 @@ mod tests {
                         }],
                         inference_capable: false,
                         discovery: None,
+                        source: String::new(),
+                        scope: String::new(),
                     }),
                     source: "advanced-api.yaml".to_string(),
                 }],
@@ -5726,6 +5731,8 @@ mod tests {
                         binaries: vec![],
                         inference_capable: false,
                         discovery: None,
+                        source: String::new(),
+                        scope: String::new(),
                     }),
                     source: "delegated-refresh-api.yaml".to_string(),
                 }],
@@ -8984,11 +8991,11 @@ mod tests {
             "workspace-scoped profile should appear in workspace list"
         );
         assert!(
-            !workspace_profiles
+            workspace_profiles
                 .profiles
                 .iter()
                 .any(|p| p.id == "e2e-platform"),
-            "platform-scoped profile should NOT appear in workspace list"
+            "platform-scoped profile should appear in workspace list (visible at all scopes)"
         );
 
         let delete = |id: &str, workspace: &str| {
@@ -9008,5 +9015,271 @@ mod tests {
 
         assert!(delete("e2e-platform", "").await.deleted);
         assert!(delete("e2e-workspace", "default").await.deleted);
+    }
+
+    #[tokio::test]
+    async fn cross_scope_duplicate_profile_id_no_longer_wedges_catalog() {
+        let state = test_server_state().await;
+
+        let import = |id: &str, workspace: &str| {
+            let state = state.clone();
+            let id = id.to_string();
+            let workspace = workspace.to_string();
+            async move {
+                handle_import_provider_profiles(
+                    &state,
+                    Request::new(ImportProviderProfilesRequest {
+                        profiles: vec![ProviderProfileImportItem {
+                            profile: Some(custom_profile(&id)),
+                            source: format!("{id}.yaml"),
+                        }],
+                        workspace,
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_inner()
+            }
+        };
+
+        let resp = import("dupe-profile", "").await;
+        assert!(resp.imported, "platform-scope import should succeed");
+
+        let resp = import("dupe-profile", "default").await;
+        assert!(resp.imported, "workspace-scope import should succeed");
+
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .expect("catalog should build successfully with cross-scope duplicate");
+        assert!(
+            catalog.get_profile("dupe-profile").is_some(),
+            "duplicate profile should be resolvable"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_profiles_shows_source_and_scope() {
+        let state = test_server_state().await;
+
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("scoped-api")),
+                    source: "scoped-api.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_list_provider_profiles(
+            &state,
+            Request::new(ListProviderProfilesRequest {
+                limit: 200,
+                offset: 0,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let user_profile = resp
+            .profiles
+            .iter()
+            .find(|p| p.id == "scoped-api")
+            .expect("imported profile should appear in list");
+        assert_eq!(user_profile.source, "user");
+        assert_eq!(user_profile.scope, "workspace");
+
+        let builtin = resp
+            .profiles
+            .iter()
+            .find(|p| p.source == "builtin")
+            .expect("builtin profiles should appear");
+        assert!(builtin.scope.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_profiles_workspace_shows_platform_profiles() {
+        let state = test_server_state().await;
+
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("platform-only")),
+                    source: "platform-only.yaml".to_string(),
+                }],
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_list_provider_profiles(
+            &state,
+            Request::new(ListProviderProfilesRequest {
+                limit: 200,
+                offset: 0,
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let platform = resp
+            .profiles
+            .iter()
+            .find(|p| p.id == "platform-only")
+            .expect("platform profile should appear in workspace list");
+        assert_eq!(platform.scope, "platform");
+    }
+
+    #[tokio::test]
+    async fn get_profile_returns_effective_workspace_scope() {
+        let state = test_server_state().await;
+
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("shadow-target")),
+                    source: "shadow-target.yaml".to_string(),
+                }],
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut ws_profile = custom_profile("shadow-target");
+        ws_profile.display_name = "Workspace Shadow".to_string();
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(ws_profile),
+                    source: "shadow-target.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "shadow-target".to_string(),
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let profile = resp.profile.unwrap();
+        assert_eq!(profile.display_name, "Workspace Shadow");
+        assert_eq!(profile.scope, "workspace");
+    }
+
+    #[tokio::test]
+    async fn import_shadow_warning_diagnostic() {
+        let state = test_server_state().await;
+
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("shadow-warn")),
+                    source: "shadow-warn.yaml".to_string(),
+                }],
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("shadow-warn")),
+                    source: "shadow-warn.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(resp.imported, "workspace import should succeed");
+        let has_shadow_warning = resp.diagnostics.iter().any(|d| {
+            d.message.contains("shadows a platform-scoped profile") && d.severity == "warning"
+        });
+        assert!(
+            has_shadow_warning,
+            "should warn about shadowing: {:?}",
+            resp.diagnostics
+        );
+    }
+
+    #[tokio::test]
+    async fn list_profiles_global_excludes_workspace_profiles() {
+        let state = test_server_state().await;
+
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("global-only")),
+                    source: "global-only.yaml".to_string(),
+                }],
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("ws-only")),
+                    source: "ws-only.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let resp = handle_list_provider_profiles(
+            &state,
+            Request::new(ListProviderProfilesRequest {
+                limit: 200,
+                offset: 0,
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(
+            resp.profiles.iter().any(|p| p.id == "global-only"),
+            "platform profile should appear in global list"
+        );
+        assert!(
+            !resp.profiles.iter().any(|p| p.id == "ws-only"),
+            "workspace profile should NOT appear in global list"
+        );
     }
 }

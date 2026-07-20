@@ -5206,6 +5206,8 @@ mod tests {
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: None,
+                    source: String::new(),
+                    scope: String::new(),
                 }),
             })
             .await
@@ -5270,6 +5272,8 @@ mod tests {
                     }],
                     inference_capable: false,
                     discovery: None,
+                    source: String::new(),
+                    scope: String::new(),
                 }),
             })
             .await
@@ -5326,6 +5330,8 @@ mod tests {
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: None,
+                    source: String::new(),
+                    scope: String::new(),
                 }),
             })
             .await
@@ -5722,6 +5728,8 @@ mod tests {
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: None,
+                    source: String::new(),
+                    scope: String::new(),
                 }),
             }
         }
@@ -6021,6 +6029,8 @@ mod tests {
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: None,
+                    source: String::new(),
+                    scope: String::new(),
                 }),
             }
         }
@@ -6259,6 +6269,8 @@ mod tests {
                         }],
                         inference_capable: false,
                         discovery: None,
+                        source: String::new(),
+                        scope: String::new(),
                     }),
                 }],
                 workspace: "default".to_string(),
@@ -8435,6 +8447,8 @@ mod tests {
                     }],
                     inference_capable: false,
                     discovery: None,
+                    source: String::new(),
+                    scope: String::new(),
                 }),
             })
             .await

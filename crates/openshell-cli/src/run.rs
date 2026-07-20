@@ -5485,14 +5485,17 @@ pub async fn provider_list_profiles(
     println!("{}", "Available Provider Profiles:".cyan().bold());
     let id_width = provider_profile_id_width(&profiles);
     let display_width = provider_profile_display_width(&profiles);
+    let source_width = provider_profile_source_width(&profiles);
+    let scope_width = provider_profile_scope_width(&profiles);
     let mut current_category = i32::MIN;
-    for profile in profiles {
+    for profile in &profiles {
         if profile.category != current_category {
             current_category = profile.category;
             println!();
             println!("  {}", display_provider_category(current_category).bold());
+            print_provider_type_header(id_width, scope_width, source_width, display_width);
         }
-        print_provider_type_row(&profile, id_width, display_width);
+        print_provider_type_row(profile, id_width, scope_width, source_width, display_width);
     }
 
     Ok(())
@@ -6066,6 +6069,7 @@ fn display_provider_category(category: i32) -> &'static str {
 
 const PROVIDER_PROFILE_ID_MAX_WIDTH: usize = 32;
 const PROVIDER_PROFILE_DISPLAY_MAX_WIDTH: usize = 40;
+const PROVIDER_PROFILE_SOURCE_MAX_WIDTH: usize = 24;
 
 fn provider_profile_id_width(profiles: &[ProviderProfile]) -> usize {
     profiles
@@ -6097,16 +6101,61 @@ fn provider_profile_display_width(profiles: &[ProviderProfile]) -> usize {
         .max(4)
 }
 
-fn print_provider_type_row(profile: &ProviderProfile, id_width: usize, display_width: usize) {
+fn provider_profile_scope_width(profiles: &[ProviderProfile]) -> usize {
+    profiles
+        .iter()
+        .map(|profile| profile.scope.chars().count())
+        .max()
+        .unwrap_or(5)
+        .max(5)
+}
+
+fn provider_profile_source_width(profiles: &[ProviderProfile]) -> usize {
+    profiles
+        .iter()
+        .map(|profile| {
+            profile
+                .source
+                .chars()
+                .count()
+                .min(PROVIDER_PROFILE_SOURCE_MAX_WIDTH)
+        })
+        .max()
+        .unwrap_or(6)
+        .max(6)
+}
+
+fn print_provider_type_header(
+    id_width: usize,
+    scope_width: usize,
+    source_width: usize,
+    display_width: usize,
+) {
+    let endpoints = "ENDPOINTS";
+    println!(
+        "    {:<id_width$}  {:<scope_width$}  {:<source_width$}  {:<display_width$}  {endpoints}",
+        "ID", "SCOPE", "SOURCE", "NAME"
+    );
+}
+
+fn print_provider_type_row(
+    profile: &ProviderProfile,
+    id_width: usize,
+    scope_width: usize,
+    source_width: usize,
+    display_width: usize,
+) {
     let inference = if profile.inference_capable {
         " inference"
     } else {
         ""
     };
     let id = truncate_display(&profile.id, PROVIDER_PROFILE_ID_MAX_WIDTH);
+    let scope = &profile.scope;
+    let source = truncate_display(&profile.source, PROVIDER_PROFILE_SOURCE_MAX_WIDTH);
     let display_name = truncate_display(&profile.display_name, PROVIDER_PROFILE_DISPLAY_MAX_WIDTH);
     println!(
-        "    {id:<id_width$}  {display_name:<display_width$}  endpoints: {:<2}{}",
+        "    {id:<id_width$}  {scope:<scope_width$}  {source:<source_width$}  {display_name:<display_width$}  {:<2}{}",
         profile.endpoints.len(),
         inference
     );

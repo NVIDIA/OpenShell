@@ -1232,6 +1232,12 @@ message ProviderProfile {
   uint64 resource_version = 10;
   // Optional non-secret annotations attached by profile sources or importers.
   map<string, string> annotations = 11;
+  // Server-set provenance: "builtin", "user", or "interceptor/{name}".
+  // Ignored on import/update payloads.
+  string source = 12;
+  // Server-set visibility: "platform", "workspace", or empty for
+  // non-scoped sources. Ignored on import/update payloads.
+  string scope = 13;
 }
 
 // Stored custom provider profile object.

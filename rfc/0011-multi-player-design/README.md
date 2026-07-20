@@ -323,15 +323,33 @@ Within a workspace, access varies by resource type:
 - **Provider profiles.** Provider profiles are type definitions that describe
   what a provider type needs (credentials, endpoints, filesystem paths).
   Profiles have two-tier scoping: platform-scoped profiles are managed by
-  Platform Admins; workspace-scoped profiles are managed by Workspace Admins
-  and visible only within their workspace. Built-in profiles (claude-code,
-  github, nvidia, etc.) are included in both scopes for convenience. Each
-  scope is listed independently — `ListProviderProfiles` returns profiles
-  from the requested scope (workspace or platform) plus built-ins, not a
-  merged view across scopes. This keeps the listing unambiguous: users see
-  exactly which custom profiles exist in their workspace without conflating
-  them with platform-level profiles. Import, update, and delete operations
-  target either platform scope or workspace scope explicitly.
+  Platform Admins and visible to all workspaces; workspace-scoped profiles
+  are managed by Workspace Admins and visible only within their workspace.
+  The same profile ID can exist at both platform and workspace scope — the
+  workspace profile shadows the platform profile for workspace-scoped
+  operations, with the platform profile as the fallback when no workspace
+  override exists. This lets Platform Admins publish org-wide defaults that
+  Workspace Admins can customize per-workspace without affecting other
+  workspaces.
+
+  Each profile carries two metadata fields in list/get responses: **source**
+  (provenance — `builtin`, `user`, or `interceptor/{name}`) and **scope**
+  (visibility — `platform`, `workspace`, or empty for sources like builtins
+  and interceptors that are not user-scoped). These fields are set by the
+  gateway and ignored on import payloads. Built-in profiles (claude-code,
+  github, nvidia, etc.) are visible in all scopes.
+
+  `ListProviderProfiles` returns all profiles visible in the requested
+  context: workspace-scoped listings include workspace custom profiles,
+  platform custom profiles, and builtins. When a workspace profile shadows
+  a platform profile, both appear in the listing with distinct scope values
+  so the user can see the override relationship. Platform-scoped listings
+  (`--global`) include only platform custom profiles and builtins.
+
+  Import, update, and delete operations target either platform scope or
+  workspace scope explicitly. Importing a profile at workspace scope when a
+  platform profile with the same ID exists produces a warning diagnostic
+  indicating the shadow relationship.
 
 - **Policies.** Users cannot modify policies directly. Sandbox policy is
   derived from attached provider profiles (see Policy Scoping below).
@@ -940,22 +958,49 @@ ones. The two flags are mutually exclusive.
 
 | Flag | Scope | Who | Behavior |
 |------|-------|-----|----------|
-| *(neither)* | Workspace (`default`) | Workspace Admin | Operates on workspace-scoped profiles; list returns workspace custom + built-in |
+| *(neither)* | Workspace (`default`) | Workspace Admin | Operates on workspace-scoped profiles; list returns all visible profiles (workspace + platform + built-in) |
 | `--workspace team-ml` | Workspace (`team-ml`) | Workspace Admin | Same, targeting a specific workspace |
-| `--global` | Platform | Platform Admin | Operates on platform-scoped profiles; list returns platform custom + built-in |
+| `--global` | Platform | Platform Admin | Operates on platform-scoped profiles; list returns platform custom + built-in only |
 
 ```shell
 # Platform Admin imports an org-wide custom profile (platform-scoped)
 openshell provider profile import --global -f internal-gitlab.yaml
 
-# Workspace Admin imports a team-specific profile (workspace-scoped)
-openshell provider profile import --workspace team-ml -f team-registry.yaml
+# Workspace Admin imports a team-specific override (workspace-scoped)
+openshell provider profile import --workspace team-ml -f internal-gitlab.yaml
 
-# Workspace custom + built-in (does not include platform-scoped)
-openshell provider profile list --workspace team-ml
+# All visible profiles: workspace custom + platform custom + built-in
+# When the same ID exists at both scopes, both appear with distinct SCOPE values
+openshell provider list-profiles --workspace team-ml
+```
 
-# Platform custom + built-in (does not include workspace-scoped)
-openshell provider profile list --global
+Example output showing source and scope columns:
+
+```
+Available Provider Profiles:
+
+  INFERENCE
+    ID                     SCOPE       SOURCE     NAME                               ENDPOINTS
+    anthropic              platform    user       Anthropic                          1  inference
+    anthropic              workspace   user       Anthropic (custom endpoints)       3  inference
+    openai                             builtin    OpenAI                             1  inference
+
+  OTHER
+    ID                     SCOPE       SOURCE                    NAME                               ENDPOINTS
+    gov-api                            interceptor/governance    Governance API                     1
+```
+
+Providers reference profiles by type. The `--global-profile` flag on
+`provider create` controls which scope the provider resolves its profile from.
+When a workspace profile shadows a platform profile, a provider without
+`--global-profile` uses the workspace version:
+
+```shell
+# Uses the workspace "anthropic" profile (shadows platform)
+openshell provider create --type anthropic --name my-anthropic
+
+# Explicitly uses the platform profile
+openshell provider create --type anthropic --name my-anthropic --global-profile
 ```
 
 ### Python SDK Surface
@@ -982,18 +1027,22 @@ foundations. The work can be phased to deliver value incrementally:
   resources inherit workspace from their parent sandbox or workspace context:
   services, SSH sessions, policy revisions, policy drafts, settings, provider
   refresh state, inference routes, audit records, and log/watch streams.
-  Provider profiles use two-tier scoping: platform-scoped profiles are managed
-  by Platform Admins; workspace-scoped profiles are managed by Workspace Admins
-  and visible only within their workspace. Each scope is listed independently
-  — `ListProviderProfiles` returns profiles from the requested scope plus
-  built-ins, not a merged view across scopes. Built-in profiles are included
-  in both scopes for convenience. The `EffectiveProviderProfileCatalog`
-  (`snapshot_catalog`) takes a `workspace` parameter so that profile resolution
-  is workspace-scoped on both read and write paths. The `UserProviderProfileSource`
-  loads platform-scoped profiles (workspace `""`) plus the target workspace's
-  profiles, merging both sets. Builtins and interceptor-provided profiles remain
-  workspace-agnostic. This ensures that two workspaces can independently import
-  profiles with the same ID without causing a global catalog collision.
+  Provider profiles use two-tier scoping with workspace shadowing: the same
+  profile ID can exist at both platform and workspace scope. Workspace profiles
+  shadow platform profiles for workspace-scoped operations; the platform
+  profile is the fallback when no workspace override exists. The
+  `EffectiveProviderProfileCatalog` stores layered entries per profile ID —
+  an effective profile (workspace if present, otherwise platform) and an
+  optional platform fallback for the shadowed entry.
+  `ListProviderProfiles` returns all profiles visible in the requested context
+  with `source` (provenance: `builtin`, `user`, `interceptor/{name}`) and
+  `scope` (visibility: `platform`, `workspace`, or empty for non-scoped
+  sources) metadata on each entry. When a workspace profile shadows a
+  platform profile, both appear in the listing with distinct scope values.
+  Built-in and interceptor profile IDs are reserved — user-managed profiles
+  cannot shadow them at any scope. Shadowing only applies between
+  user-managed scopes (workspace over platform). Builtins and
+  interceptor-provided profiles remain scope-agnostic.
   Add `UpdateProviderProfiles` RPC for
   in-place updates to existing custom profiles, with optimistic concurrency
   control via a `resource_version` field on `ProviderProfile` — updates must

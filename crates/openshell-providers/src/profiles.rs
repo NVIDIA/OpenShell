@@ -334,6 +334,10 @@ pub struct ProviderTypeProfile {
     pub inference_capable: bool,
     #[serde(default, skip_serializing_if = "discovery_is_empty")]
     pub discovery: DiscoveryProfile,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub scope: String,
 }
 
 // Provider profile import/export is expected to be lossless for the network
@@ -378,6 +382,8 @@ impl ProviderTypeProfile {
                 .as_ref()
                 .map(discovery_from_proto)
                 .unwrap_or_default(),
+            source: profile.source.clone(),
+            scope: profile.scope.clone(),
         }
     }
 
@@ -513,6 +519,8 @@ impl ProviderTypeProfile {
             inference_capable: self.inference_capable,
             discovery: (!discovery_is_empty(&self.discovery))
                 .then(|| discovery_to_proto(&self.discovery)),
+            source: self.source.clone(),
+            scope: self.scope.clone(),
         }
     }
 
@@ -2982,6 +2990,8 @@ binaries: ["", /usr/bin/broken]
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
+                    source: String::new(),
+                    scope: String::new(),
                 },
             ),
             (
@@ -2998,6 +3008,8 @@ binaries: ["", /usr/bin/broken]
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
+                    source: String::new(),
+                    scope: String::new(),
                 },
             ),
             (
@@ -3014,6 +3026,8 @@ binaries: ["", /usr/bin/broken]
                     binaries: Vec::new(),
                     inference_capable: false,
                     discovery: DiscoveryProfile::default(),
+                    source: String::new(),
+                    scope: String::new(),
                 },
             ),
         ];

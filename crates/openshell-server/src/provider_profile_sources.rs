@@ -27,6 +27,19 @@ use crate::persistence::{ObjectType, Store};
 const BUILTIN_SOURCE_ID: &str = "builtin";
 const USER_SOURCE_ID: &str = "user";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileScope {
+    Static,
+    Platform,
+    Workspace,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopedSnapshotProfile {
+    pub scope: ProfileScope,
+    pub profile: ProviderProfile,
+}
+
 impl ObjectType for StoredProviderProfile {
     fn object_type() -> &'static str {
         "provider_profile"
@@ -36,7 +49,7 @@ impl ObjectType for StoredProviderProfile {
 #[derive(Debug, Clone)]
 pub struct ProviderProfileSnapshot {
     revision: String,
-    profiles: Vec<ProviderProfile>,
+    profiles: Vec<ScopedSnapshotProfile>,
 }
 
 #[async_trait]
@@ -73,14 +86,19 @@ impl ProviderProfileSource for BuiltinProviderProfileSource {
         _store: &Store,
         _workspace: &str,
     ) -> Result<ProviderProfileSnapshot, Status> {
-        let profiles = builtin_profiles()
+        let proto_profiles: Vec<ProviderProfile> = builtin_profiles()
             .iter()
             .map(ProviderTypeProfile::to_proto)
-            .collect::<Vec<_>>();
-        Ok(ProviderProfileSnapshot {
-            revision: profile_snapshot_revision(&profiles),
-            profiles,
-        })
+            .collect();
+        let revision = profile_snapshot_revision(&proto_profiles);
+        let profiles = proto_profiles
+            .into_iter()
+            .map(|profile| ScopedSnapshotProfile {
+                scope: ProfileScope::Static,
+                profile,
+            })
+            .collect();
+        Ok(ProviderProfileSnapshot { revision, profiles })
     }
 }
 
@@ -106,19 +124,48 @@ impl ProviderProfileSource for UserProviderProfileSource {
         store: &Store,
         workspace: &str,
     ) -> Result<ProviderProfileSnapshot, Status> {
-        let stored = user_provider_profiles(store, workspace).await?;
         let mut profiles = Vec::new();
         let mut hasher = Sha256::new();
         hasher.update(b"openshell-user-provider-profile-source-v1");
-        for stored in stored {
+
+        let platform_stored: Vec<StoredProviderProfile> =
+            store.list_messages("", 10_000, 0).await.map_err(|e| {
+                Status::internal(format!("list platform provider profiles failed: {e}"))
+            })?;
+        for stored in platform_stored {
             let resource_version = stored_profile_resource_version(&stored);
             hasher.update(resource_version.to_le_bytes());
             if let Some(profile) = stored.profile {
                 let profile = profile_response_payload(profile, resource_version);
                 hasher.update(profile.encode_to_vec());
-                profiles.push(profile);
+                profiles.push(ScopedSnapshotProfile {
+                    scope: ProfileScope::Platform,
+                    profile,
+                });
             }
         }
+
+        if !workspace.is_empty() {
+            let ws_stored: Vec<StoredProviderProfile> = store
+                .list_messages(workspace, 10_000, 0)
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("list workspace provider profiles failed: {e}"))
+                })?;
+            for stored in ws_stored {
+                let resource_version = stored_profile_resource_version(&stored);
+                hasher.update(resource_version.to_le_bytes());
+                if let Some(profile) = stored.profile {
+                    let profile = profile_response_payload(profile, resource_version);
+                    hasher.update(profile.encode_to_vec());
+                    profiles.push(ScopedSnapshotProfile {
+                        scope: ProfileScope::Workspace,
+                        profile,
+                    });
+                }
+            }
+        }
+
         Ok(ProviderProfileSnapshot {
             revision: format!("sha256:{:x}", hasher.finalize()),
             profiles,
@@ -152,6 +199,13 @@ impl ProviderProfileSource for GatewayInterceptorProfileSource {
                     self.source_id()
                 ))
             })?;
+        let profiles = profiles
+            .into_iter()
+            .map(|profile| ScopedSnapshotProfile {
+                scope: ProfileScope::Static,
+                profile,
+            })
+            .collect();
         Ok(ProviderProfileSnapshot { revision, profiles })
     }
 }
@@ -165,18 +219,25 @@ pub struct ProviderProfileSources {
 struct CollectedProviderProfileSnapshot {
     source_id: String,
     revision: String,
-    profiles: Vec<ProviderProfile>,
+    profiles: Vec<ScopedSnapshotProfile>,
     user_managed: bool,
     allow_empty: bool,
 }
 
 #[derive(Debug, Clone)]
-struct EffectiveProfileEntry {
+struct ScopedProfileEntry {
     source_id: String,
     source_revision: String,
     user_managed: bool,
+    scope: ProfileScope,
     profile: ProviderTypeProfile,
     response: ProviderProfile,
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveProfileEntry {
+    effective: ScopedProfileEntry,
+    platform_fallback: Option<ScopedProfileEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -247,11 +308,19 @@ impl ProviderProfileSources {
 
     #[cfg(test)]
     pub(crate) fn from_test_profiles(profiles: Vec<ProviderProfile>) -> Self {
+        let revision = profile_snapshot_revision(&profiles);
+        let scoped = profiles
+            .into_iter()
+            .map(|profile| ScopedSnapshotProfile {
+                scope: ProfileScope::Static,
+                profile,
+            })
+            .collect();
         Self {
             sources: vec![Arc::new(StaticProviderProfileSource {
                 snapshot: ProviderProfileSnapshot {
-                    revision: profile_snapshot_revision(&profiles),
-                    profiles,
+                    revision,
+                    profiles: scoped,
                 },
             })],
         }
@@ -270,7 +339,16 @@ impl ProviderProfileSources {
             sources: vec![Arc::new(SequencedProviderProfileSource {
                 snapshots: snapshots
                     .into_iter()
-                    .map(|(revision, profiles)| ProviderProfileSnapshot { revision, profiles })
+                    .map(|(revision, profiles)| ProviderProfileSnapshot {
+                        revision,
+                        profiles: profiles
+                            .into_iter()
+                            .map(|profile| ScopedSnapshotProfile {
+                                scope: ProfileScope::Static,
+                                profile,
+                            })
+                            .collect(),
+                    })
                     .collect(),
                 fetch_count,
             })],
@@ -326,27 +404,42 @@ impl EffectiveProviderProfileCatalog {
     pub(crate) fn list_profiles(&self) -> Vec<ProviderProfile> {
         self.profiles
             .values()
-            .map(|entry| entry.response.clone())
+            .map(|entry| entry.effective.response.clone())
             .collect()
+    }
+
+    pub(crate) fn list_all_scoped_profiles(&self) -> Vec<(ProfileScope, ProviderProfile)> {
+        let mut result = Vec::new();
+        for entry in self.profiles.values() {
+            result.push((entry.effective.scope, entry.effective.response.clone()));
+            if let Some(fallback) = &entry.platform_fallback {
+                result.push((fallback.scope, fallback.response.clone()));
+            }
+        }
+        result
     }
 
     #[allow(dead_code)]
     pub(crate) fn get_profile(&self, id: &str) -> Option<ProviderProfile> {
         let id = normalize_profile_id(id)?;
-        self.profiles.get(&id).map(|entry| entry.response.clone())
+        self.profiles
+            .get(&id)
+            .map(|entry| entry.effective.response.clone())
     }
 
     pub(crate) fn get_type_profile(&self, id: &str) -> Option<ProviderTypeProfile> {
         let id = normalize_profile_id(id)?;
-        self.profiles.get(&id).map(|entry| entry.profile.clone())
+        self.profiles
+            .get(&id)
+            .map(|entry| entry.effective.profile.clone())
     }
 
     pub(crate) fn static_source_for_profile(&self, id: &str) -> Option<String> {
         let id = normalize_profile_id(id)?;
         self.profiles
             .get(&id)
-            .filter(|entry| !entry.user_managed)
-            .map(|entry| entry.source_id.clone())
+            .filter(|entry| !entry.effective.user_managed)
+            .map(|entry| entry.effective.source_id.clone())
     }
 
     pub(crate) fn hash_profile_revision(&self, profile_id: &str, hasher: &mut Sha256) {
@@ -361,15 +454,29 @@ impl EffectiveProviderProfileCatalog {
         };
 
         hasher.update(b"provider-profile-source-entry");
-        hasher.update(entry.source_id.as_bytes());
-        hasher.update(entry.source_revision.as_bytes());
-        let ownership_tag: &[u8] = if entry.user_managed {
+        hasher.update(entry.effective.source_id.as_bytes());
+        hasher.update(entry.effective.source_revision.as_bytes());
+        let scope_tag: &[u8] = match entry.effective.scope {
+            ProfileScope::Static => b"static",
+            ProfileScope::Platform => b"platform",
+            ProfileScope::Workspace => b"workspace",
+        };
+        hasher.update(scope_tag);
+        let ownership_tag: &[u8] = if entry.effective.user_managed {
             b"user-managed"
         } else {
             b"source-managed"
         };
         hasher.update(ownership_tag);
-        hasher.update(entry.response.encode_to_vec());
+        hasher.update(entry.effective.response.encode_to_vec());
+    }
+}
+
+fn scope_to_string(scope: ProfileScope) -> &'static str {
+    match scope {
+        ProfileScope::Static => "",
+        ProfileScope::Platform => "platform",
+        ProfileScope::Workspace => "workspace",
     }
 }
 
@@ -411,48 +518,111 @@ fn build_effective_profiles(
         catalog_hasher.update((source_revision.len() as u64).to_le_bytes());
         catalog_hasher.update(source_revision.as_bytes());
 
-        let source_profiles = snapshot
-            .profiles
-            .iter()
-            .map(|profile| {
-                (
-                    source_id.to_string(),
-                    ProviderTypeProfile::from_proto(profile),
-                )
-            })
-            .collect::<Vec<_>>();
-        validate_source_profiles(source_id, &source_profiles)?;
+        if snapshot.user_managed {
+            let platform: Vec<_> = snapshot
+                .profiles
+                .iter()
+                .filter(|sp| sp.scope == ProfileScope::Platform)
+                .map(|sp| {
+                    (
+                        source_id.to_string(),
+                        ProviderTypeProfile::from_proto(&sp.profile),
+                    )
+                })
+                .collect();
+            if !platform.is_empty() {
+                validate_source_profiles(source_id, &platform)?;
+            }
+            let workspace: Vec<_> = snapshot
+                .profiles
+                .iter()
+                .filter(|sp| sp.scope == ProfileScope::Workspace)
+                .map(|sp| {
+                    (
+                        source_id.to_string(),
+                        ProviderTypeProfile::from_proto(&sp.profile),
+                    )
+                })
+                .collect();
+            if !workspace.is_empty() {
+                validate_source_profiles(source_id, &workspace)?;
+            }
+        } else {
+            let source_profiles = snapshot
+                .profiles
+                .iter()
+                .map(|sp| {
+                    (
+                        source_id.to_string(),
+                        ProviderTypeProfile::from_proto(&sp.profile),
+                    )
+                })
+                .collect::<Vec<_>>();
+            validate_source_profiles(source_id, &source_profiles)?;
+        }
 
-        for profile in snapshot.profiles {
-            let id = normalize_profile_id(&profile.id).ok_or_else(|| {
+        for scoped_profile in snapshot.profiles {
+            let id = normalize_profile_id(&scoped_profile.profile.id).ok_or_else(|| {
                 Status::failed_precondition(format!(
                     "provider profile '{}' in source '{}' has invalid id",
-                    profile.id, source_id
+                    scoped_profile.profile.id, source_id
                 ))
             })?;
-            if let Some(existing) = profiles.get(&id) {
-                let location = if existing.source_id == source_id {
-                    format!("within source '{source_id}'")
-                } else {
-                    format!(
-                        "across configured sources '{}' and '{source_id}'",
-                        existing.source_id
-                    )
-                };
-                return Err(Status::failed_precondition(format!(
-                    "duplicate provider profile id '{id}' {location}"
-                )));
+
+            let mut response = scoped_profile.profile;
+            response.source = source_id.to_string();
+            response.scope = scope_to_string(scoped_profile.scope).to_string();
+
+            let new_entry = ScopedProfileEntry {
+                source_id: source_id.to_string(),
+                source_revision: source_revision.to_string(),
+                user_managed: snapshot.user_managed,
+                scope: scoped_profile.scope,
+                profile: ProviderTypeProfile::from_proto(&response),
+                response,
+            };
+
+            if let Some(existing) = profiles.get_mut(&id) {
+                let existing_scope = existing.effective.scope;
+                let new_scope = new_entry.scope;
+
+                match (existing_scope, new_scope) {
+                    (ProfileScope::Static, _) | (_, ProfileScope::Static) => {
+                        let location = if existing.effective.source_id == source_id {
+                            format!("within source '{source_id}'")
+                        } else {
+                            format!(
+                                "across configured sources '{}' and '{source_id}'",
+                                existing.effective.source_id
+                            )
+                        };
+                        return Err(Status::failed_precondition(format!(
+                            "duplicate provider profile id '{id}' {location}"
+                        )));
+                    }
+                    (ProfileScope::Platform, ProfileScope::Platform)
+                    | (ProfileScope::Workspace, ProfileScope::Workspace) => {
+                        return Err(Status::failed_precondition(format!(
+                            "duplicate provider profile id '{id}' within source '{source_id}'"
+                        )));
+                    }
+                    (ProfileScope::Platform, ProfileScope::Workspace) => {
+                        let fallback = std::mem::replace(&mut existing.effective, new_entry);
+                        existing.platform_fallback = Some(fallback);
+                    }
+                    (ProfileScope::Workspace, ProfileScope::Platform) => {
+                        existing.platform_fallback = Some(new_entry);
+                    }
+                }
+            } else {
+                profiles.insert(
+                    id,
+                    EffectiveProfileEntry {
+                        effective: new_entry,
+                        platform_fallback: None,
+                    },
+                );
             }
-            profiles.insert(
-                id,
-                EffectiveProfileEntry {
-                    source_id: source_id.to_string(),
-                    source_revision: source_revision.to_string(),
-                    user_managed: snapshot.user_managed,
-                    profile: ProviderTypeProfile::from_proto(&profile),
-                    response: profile,
-                },
-            );
         }
     }
 
@@ -502,26 +672,6 @@ fn profile_snapshot_revision(profiles: &[ProviderProfile]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
-pub async fn user_provider_profiles(
-    store: &Store,
-    workspace: &str,
-) -> Result<Vec<StoredProviderProfile>, Status> {
-    let mut profiles: Vec<StoredProviderProfile> = store
-        .list_messages("", 10_000, 0)
-        .await
-        .map_err(|e| Status::internal(format!("list platform provider profiles failed: {e}")))?;
-    if !workspace.is_empty() {
-        let ws_profiles: Vec<StoredProviderProfile> = store
-            .list_messages(workspace, 10_000, 0)
-            .await
-            .map_err(|e| {
-                Status::internal(format!("list workspace provider profiles failed: {e}"))
-            })?;
-        profiles.extend(ws_profiles);
-    }
-    Ok(profiles)
-}
-
 #[expect(dead_code)]
 pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
     use crate::persistence::current_time_ms;
@@ -544,6 +694,8 @@ pub fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfil
 
 pub fn profile_storage_payload(mut profile: ProviderProfile) -> ProviderProfile {
     profile.resource_version = 0;
+    profile.source = String::new();
+    profile.scope = String::new();
     profile
 }
 
@@ -760,12 +912,19 @@ mod tests {
         assert_ne!(first.revision(), second.revision());
     }
 
+    fn scoped(scope: ProfileScope, id: &str) -> ScopedSnapshotProfile {
+        ScopedSnapshotProfile {
+            scope,
+            profile: profile(id),
+        }
+    }
+
     #[test]
     fn empty_source_revision_is_invalid() {
         let err = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
             source_id: "source-a".to_string(),
             revision: "  ".to_string(),
-            profiles: vec![profile("github")],
+            profiles: vec![scoped(ProfileScope::Static, "github")],
             user_managed: false,
             allow_empty: false,
         }])
@@ -780,14 +939,14 @@ mod tests {
             CollectedProviderProfileSnapshot {
                 source_id: "source-a".to_string(),
                 revision: "a".to_string(),
-                profiles: vec![profile("github")],
+                profiles: vec![scoped(ProfileScope::Static, "github")],
                 user_managed: false,
                 allow_empty: false,
             },
             CollectedProviderProfileSnapshot {
                 source_id: "source-b".to_string(),
                 revision: "b".to_string(),
-                profiles: vec![profile("github")],
+                profiles: vec![scoped(ProfileScope::Static, "github")],
                 user_managed: false,
                 allow_empty: false,
             },
@@ -875,7 +1034,7 @@ mod tests {
         let err = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
             source_id: "interceptor/test".to_string(),
             revision: "invalid".to_string(),
-            profiles: vec![profile("GitHub")],
+            profiles: vec![scoped(ProfileScope::Static, "GitHub")],
             user_managed: false,
             allow_empty: false,
         }])
@@ -1124,15 +1283,15 @@ mod tests {
         let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
             source_id: "interceptor/test".to_string(),
             revision: "test".to_string(),
-            profiles: vec![profile("slack")],
+            profiles: vec![scoped(ProfileScope::Static, "slack")],
             user_managed: false,
             allow_empty: false,
         }])
         .unwrap();
 
         let entry = catalog.profiles.get("slack").unwrap();
-        assert_eq!(entry.source_id, "interceptor/test");
-        assert!(!entry.user_managed);
+        assert_eq!(entry.effective.source_id, "interceptor/test");
+        assert!(!entry.effective.user_managed);
     }
 
     fn stored_profile_in_workspace(id: &str, workspace: &str) -> StoredProviderProfile {
@@ -1205,5 +1364,217 @@ mod tests {
 
         let beta = sources.snapshot_catalog(&store, "beta").await.unwrap();
         assert!(beta.get_profile("ws-only").is_none());
+    }
+
+    #[test]
+    fn same_id_platform_and_workspace_builds_successfully() {
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![
+                scoped(ProfileScope::Platform, "anthropic"),
+                scoped(ProfileScope::Workspace, "anthropic"),
+            ],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        assert!(catalog.get_type_profile("anthropic").is_some());
+    }
+
+    #[test]
+    fn same_id_workspace_shadows_platform() {
+        let mut ws_profile = profile("anthropic");
+        ws_profile.display_name = "Workspace Anthropic".to_string();
+
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![
+                scoped(ProfileScope::Platform, "anthropic"),
+                ScopedSnapshotProfile {
+                    scope: ProfileScope::Workspace,
+                    profile: ws_profile,
+                },
+            ],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        let effective = catalog.get_profile("anthropic").unwrap();
+        assert_eq!(effective.display_name, "Workspace Anthropic");
+    }
+
+    #[test]
+    fn same_id_platform_fallback_preserved() {
+        let mut ws_profile = profile("anthropic");
+        ws_profile.display_name = "Workspace Anthropic".to_string();
+
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![
+                scoped(ProfileScope::Platform, "anthropic"),
+                ScopedSnapshotProfile {
+                    scope: ProfileScope::Workspace,
+                    profile: ws_profile,
+                },
+            ],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        let entry = catalog.profiles.get("anthropic").unwrap();
+        assert!(entry.platform_fallback.is_some());
+        assert_eq!(
+            entry.platform_fallback.as_ref().unwrap().scope,
+            ProfileScope::Platform
+        );
+        assert_eq!(
+            entry
+                .platform_fallback
+                .as_ref()
+                .unwrap()
+                .response
+                .display_name,
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn same_id_platform_only_no_fallback() {
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![scoped(ProfileScope::Platform, "anthropic")],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        let entry = catalog.profiles.get("anthropic").unwrap();
+        assert_eq!(entry.effective.scope, ProfileScope::Platform);
+        assert!(entry.platform_fallback.is_none());
+    }
+
+    #[test]
+    fn same_id_static_vs_user_still_errors() {
+        let err = build_effective_profiles(vec![
+            CollectedProviderProfileSnapshot {
+                source_id: "builtin".to_string(),
+                revision: "v1".to_string(),
+                profiles: vec![scoped(ProfileScope::Static, "openai")],
+                user_managed: false,
+                allow_empty: false,
+            },
+            CollectedProviderProfileSnapshot {
+                source_id: "user".to_string(),
+                revision: "v1".to_string(),
+                profiles: vec![scoped(ProfileScope::Platform, "openai")],
+                user_managed: true,
+                allow_empty: true,
+            },
+        ])
+        .unwrap_err();
+
+        assert!(
+            err.message()
+                .contains("duplicate provider profile id 'openai'")
+        );
+    }
+
+    #[test]
+    fn same_id_user_vs_interceptor_still_errors() {
+        let err = build_effective_profiles(vec![
+            CollectedProviderProfileSnapshot {
+                source_id: "user".to_string(),
+                revision: "v1".to_string(),
+                profiles: vec![scoped(ProfileScope::Platform, "slack")],
+                user_managed: true,
+                allow_empty: true,
+            },
+            CollectedProviderProfileSnapshot {
+                source_id: "interceptor/gov".to_string(),
+                revision: "v1".to_string(),
+                profiles: vec![scoped(ProfileScope::Static, "slack")],
+                user_managed: false,
+                allow_empty: false,
+            },
+        ])
+        .unwrap_err();
+
+        assert!(
+            err.message()
+                .contains("duplicate provider profile id 'slack'")
+        );
+    }
+
+    #[test]
+    fn same_id_same_scope_still_errors() {
+        let err = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![
+                scoped(ProfileScope::Platform, "anthropic"),
+                scoped(ProfileScope::Platform, "anthropic"),
+            ],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap_err();
+
+        assert!(err.message().contains("duplicate provider profile id"));
+        assert!(err.message().contains("anthropic"));
+    }
+
+    #[test]
+    fn list_all_scoped_profiles_returns_both_scopes() {
+        let mut ws_profile = profile("anthropic");
+        ws_profile.display_name = "Workspace Anthropic".to_string();
+
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![
+                scoped(ProfileScope::Platform, "anthropic"),
+                ScopedSnapshotProfile {
+                    scope: ProfileScope::Workspace,
+                    profile: ws_profile,
+                },
+            ],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        let all = catalog.list_all_scoped_profiles();
+        assert_eq!(all.len(), 2);
+        let scopes: Vec<ProfileScope> = all.iter().map(|(s, _)| *s).collect();
+        assert!(scopes.contains(&ProfileScope::Platform));
+        assert!(scopes.contains(&ProfileScope::Workspace));
+    }
+
+    #[tokio::test]
+    async fn same_id_platform_and_workspace_catalog_via_store() {
+        let store = crate::persistence::test_store().await;
+        store
+            .put_message(&stored_profile_in_workspace("my-api", ""))
+            .await
+            .unwrap();
+        store
+            .put_message(&stored_profile_in_workspace("my-api", "default"))
+            .await
+            .unwrap();
+
+        let sources = ProviderProfileSources::with_default_sources();
+        let catalog = sources.snapshot_catalog(&store, "default").await.unwrap();
+
+        assert!(catalog.get_profile("my-api").is_some());
+        let entry = catalog.profiles.get("my-api").unwrap();
+        assert_eq!(entry.effective.scope, ProfileScope::Workspace);
+        assert!(entry.platform_fallback.is_some());
     }
 }
