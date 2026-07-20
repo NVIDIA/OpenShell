@@ -116,6 +116,8 @@ openshell gateway add https://gateway.example.com \
 
 When you register or log in to an OIDC gateway, the CLI uses the Authorization Code flow with PKCE. It opens a browser, receives the authorization code on a localhost callback, exchanges the code for tokens, and stores the token bundle under the gateway credential directory. If `OPENSHELL_OIDC_CLIENT_SECRET` is set, the CLI uses the client credentials flow instead. Use that mode for CI and other non-interactive automation.
 
+The CLI selects an ephemeral loopback port by default. When an identity provider requires an exact redirect URI, set `OPENSHELL_OIDC_CALLBACK_PORT` to a pre-registered port before `openshell gateway login`. For example, a client registered with `http://127.0.0.1:8765/callback` uses `OPENSHELL_OIDC_CALLBACK_PORT=8765 openshell gateway login production`.
+
 The connection flow:
 
 1. The CLI loads the stored OIDC token bundle.
