@@ -2182,6 +2182,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::similar_names)]
     fn chown_sandbox_home_does_not_chown_across_device_boundary() {
         use std::os::unix::fs::MetadataExt;
 
