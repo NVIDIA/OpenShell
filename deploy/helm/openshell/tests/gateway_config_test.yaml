@@ -215,6 +215,32 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.managed_ssh_ingress\].*?enabled\s*=\s*true.*?gateway_namespace\s*=\s*"my-namespace".*?gateway_pod_selector\s*=.*?app\.kubernetes\.io/name.*?openshell'
 
+  - it: renders warm pooling config under [openshell.drivers.kubernetes.warm_pooling]
+    template: templates/gateway-config.yaml
+    set:
+      server.warmPooling.enabled: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pooling\].*?enabled\s*=\s*false'
+
+  - it: renders warm pool template config under [openshell.drivers.kubernetes.warm_pooling.templates]
+    template: templates/gateway-config.yaml
+    set:
+      server.warmPooling.templates.enabled: true
+      server.warmPooling.templates.readyWithinThresholdSecs: 3
+      server.warmPooling.templates.maxReplicas: 7
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pooling\.templates\].*?enabled\s*=\s*true'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pooling\.templates\].*?ready_within_threshold_secs\s*=\s*3'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pooling\.templates\].*?max_replicas\s*=\s*7'
+
   - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:

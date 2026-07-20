@@ -42,14 +42,14 @@ use openshell_core::proto::{
     ListSandboxTemplatesRequest, ListSandboxTemplatesResponse, ListSandboxesRequest,
     ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ListWorkspaceMembersRequest,
     ListWorkspaceMembersResponse, ListWorkspacesRequest, ListWorkspacesResponse,
-    PodActivationMessage, ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest,
-    PushSandboxLogsResponse, RefreshSandboxTokenRequest, RefreshSandboxTokenResponse,
-    RegisterSupervisorPodRequest, RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame,
-    RemoveWorkspaceMemberRequest, RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, SandboxResponse,
-    SandboxTemplateResponse, ServiceEndpointResponse, ServiceStatus, StartSandboxRequest,
-    StopSandboxRequest, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
+    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RegisterSupervisorRequest,
+    RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame, RemoveWorkspaceMemberRequest,
+    RemoveWorkspaceMemberResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, SandboxResponse, SandboxTemplateResponse,
+    ServiceEndpointResponse, ServiceStatus, StartSandboxRequest, StopSandboxRequest,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorActivationMessage,
     SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse,
     UpdateConfigRequest, UpdateConfigResponse, UpdateProviderProfilesRequest,
     UpdateProviderProfilesResponse, UpdateProviderRequest, WatchSandboxRequest,
@@ -687,15 +687,19 @@ impl OpenShell for OpenShellService {
         auth_rpc::handle_issue_sandbox_token(&self.state, request).await
     }
 
-    type RegisterSupervisorPodStream = Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<PodActivationMessage, Status>> + Send + 'static>,
+    type RegisterSupervisorStream = Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<SupervisorActivationMessage, Status>>
+                + Send
+                + 'static,
+        >,
     >;
 
-    async fn register_supervisor_pod(
+    async fn register_supervisor(
         &self,
-        request: Request<RegisterSupervisorPodRequest>,
-    ) -> Result<Response<Self::RegisterSupervisorPodStream>, Status> {
-        auth_rpc::handle_register_supervisor_pod(&self.state, request).await
+        request: Request<RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
+        auth_rpc::handle_register_supervisor(&self.state, request).await
     }
 
     async fn refresh_sandbox_token(

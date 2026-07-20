@@ -6,13 +6,14 @@
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    DeleteSandboxTemplateRequest, DeleteSandboxTemplateResponse, DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, UpsertSandboxTemplateRequest,
+    UpsertSandboxTemplateResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -68,6 +69,22 @@ impl ComputeDriver for ComputeDriverService {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
+    }
+
+    async fn upsert_sandbox_template(
+        &self,
+        _request: Request<UpsertSandboxTemplateRequest>,
+    ) -> Result<Response<UpsertSandboxTemplateResponse>, Status> {
+        Ok(Response::new(UpsertSandboxTemplateResponse {}))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _request: Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+        Ok(Response::new(DeleteSandboxTemplateResponse {
+            deleted: false,
+        }))
     }
 
     async fn get_sandbox(

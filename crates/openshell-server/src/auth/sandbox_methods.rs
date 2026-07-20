@@ -27,9 +27,6 @@ mod tests {
         ));
         assert!(is_sandbox_callable("/openshell.v1.OpenShell/RelayStream"));
         assert!(is_sandbox_callable(
-            "/openshell.v1.OpenShell/RegisterSupervisorPod"
-        ));
-        assert!(is_sandbox_callable(
             "/openshell.v1.OpenShell/GetSandboxConfig"
         ));
         assert!(is_sandbox_callable(
@@ -55,6 +52,9 @@ mod tests {
         ));
         assert!(!is_sandbox_callable(
             "/openshell.inference.v1.Inference/GetInferenceRoute"
+        ));
+        assert!(!is_sandbox_callable(
+            "/openshell.v1.OpenShell/RegisterSupervisor"
         ));
         assert!(!is_sandbox_callable(
             "/openshell.inference.v1.Inference/SetInferenceRoute"

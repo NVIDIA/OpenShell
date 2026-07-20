@@ -218,6 +218,22 @@ server:
   # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
   # to all sandboxes that don't explicitly override it.
   defaultRuntimeClassName: ""
+  # -- Enable transparent Kubernetes warm-pool allocation through Agent Sandbox
+  # v1beta1 SandboxClaim resources when a compatible OpenShell-enabled
+  # SandboxWarmPool exists in the target namespace.
+  warmPooling:
+    enabled: true
+    # -- Reconcile OpenShell SandboxTemplate lifecycle notifications into
+    # generated SandboxTemplate and SandboxWarmPool resources when the template
+    # asks for startup faster than readyWithinThresholdSecs.
+    templates:
+      enabled: true
+      # -- Strict startup threshold in seconds. Templates with
+      # desired_service_level.startup.ready_within below this value get a warm
+      # pool.
+      readyWithinThresholdSecs: 5
+      # -- Maximum generated warm-pool replicas per template.
+      maxReplicas: 20
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.

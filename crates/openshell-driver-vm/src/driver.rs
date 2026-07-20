@@ -38,17 +38,19 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition as SandboxCondition,
+    DeleteSandboxTemplateRequest, DeleteSandboxTemplateResponse, DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse, DriverCondition as SandboxCondition,
     DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
     DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
     EnsureWorkspaceRequest, EnsureWorkspaceResponse, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    StopSandboxRequest, StopSandboxResponse, UpsertSandboxTemplateRequest,
+    UpsertSandboxTemplateResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
+    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
+    watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -520,6 +522,7 @@ impl VmDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
+            supports_sandbox_template_lifecycle: false,
         }
     }
 
@@ -3299,6 +3302,22 @@ impl ComputeDriver for VmDriver {
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
+    async fn upsert_sandbox_template(
+        &self,
+        _request: Request<UpsertSandboxTemplateRequest>,
+    ) -> Result<Response<UpsertSandboxTemplateResponse>, Status> {
+        Ok(Response::new(UpsertSandboxTemplateResponse {}))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _request: Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+        Ok(Response::new(DeleteSandboxTemplateResponse {
+            deleted: false,
+        }))
+    }
+
     async fn create_sandbox(
         &self,
         request: Request<CreateSandboxRequest>,
@@ -5704,6 +5723,7 @@ mod tests {
             client
                 .create_sandbox(request_with_traceparent(CreateSandboxRequest {
                     sandbox: None,
+                    sandbox_template: None,
                 }))
                 .await
                 .is_err()
@@ -5811,6 +5831,7 @@ mod tests {
         };
         let request = request_with_traceparent(CreateSandboxRequest {
             sandbox: Some(sandbox),
+            sandbox_template: None,
         });
 
         let mut client = traced_driver_client(driver.clone()).await;

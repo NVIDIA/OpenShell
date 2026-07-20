@@ -90,6 +90,7 @@ func TestConverterCoversAllProtoFields_SandboxStartup(t *testing.T) {
 
 func TestConverterCoversAllProtoFields_SandboxTemplateProvenance(t *testing.T) {
 	handled := fieldSet{
+		"id":               true,
 		"name":             true,
 		"resource_version": true,
 	}

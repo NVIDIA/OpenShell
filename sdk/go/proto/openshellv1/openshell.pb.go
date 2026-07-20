@@ -486,29 +486,29 @@ func (x *IssueSandboxTokenResponse) GetExpiresAtMs() int64 {
 	return 0
 }
 
-// RegisterSupervisorPod request. Empty body; identity is established by the
+// RegisterSupervisor request. Empty body; identity is established by the
 // authentication credentials carried in the request headers (a projected
 // Kubernetes ServiceAccount JWT in the K8s driver path).
-type RegisterSupervisorPodRequest struct {
+type RegisterSupervisorRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *RegisterSupervisorPodRequest) Reset() {
-	*x = RegisterSupervisorPodRequest{}
+func (x *RegisterSupervisorRequest) Reset() {
+	*x = RegisterSupervisorRequest{}
 	mi := &file_openshell_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *RegisterSupervisorPodRequest) String() string {
+func (x *RegisterSupervisorRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*RegisterSupervisorPodRequest) ProtoMessage() {}
+func (*RegisterSupervisorRequest) ProtoMessage() {}
 
-func (x *RegisterSupervisorPodRequest) ProtoReflect() protoreflect.Message {
+func (x *RegisterSupervisorRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_openshell_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -520,14 +520,14 @@ func (x *RegisterSupervisorPodRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use RegisterSupervisorPodRequest.ProtoReflect.Descriptor instead.
-func (*RegisterSupervisorPodRequest) Descriptor() ([]byte, []int) {
+// Deprecated: Use RegisterSupervisorRequest.ProtoReflect.Descriptor instead.
+func (*RegisterSupervisorRequest) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{2}
 }
 
-// Activation sent by the gateway once a registered supervisor pod is bound to
+// Activation sent by the gateway once a registered supervisor instance is bound to
 // an OpenShell sandbox identity.
-type PodActivationMessage struct {
+type SupervisorActivationMessage struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// OpenShell sandbox UUID the supervisor should use for ConnectSupervisor.
 	SandboxId string `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
@@ -545,20 +545,20 @@ type PodActivationMessage struct {
 	sizeCache       protoimpl.SizeCache
 }
 
-func (x *PodActivationMessage) Reset() {
-	*x = PodActivationMessage{}
+func (x *SupervisorActivationMessage) Reset() {
+	*x = SupervisorActivationMessage{}
 	mi := &file_openshell_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *PodActivationMessage) String() string {
+func (x *SupervisorActivationMessage) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*PodActivationMessage) ProtoMessage() {}
+func (*SupervisorActivationMessage) ProtoMessage() {}
 
-func (x *PodActivationMessage) ProtoReflect() protoreflect.Message {
+func (x *SupervisorActivationMessage) ProtoReflect() protoreflect.Message {
 	mi := &file_openshell_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -570,40 +570,40 @@ func (x *PodActivationMessage) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use PodActivationMessage.ProtoReflect.Descriptor instead.
-func (*PodActivationMessage) Descriptor() ([]byte, []int) {
+// Deprecated: Use SupervisorActivationMessage.ProtoReflect.Descriptor instead.
+func (*SupervisorActivationMessage) Descriptor() ([]byte, []int) {
 	return file_openshell_proto_rawDescGZIP(), []int{3}
 }
 
-func (x *PodActivationMessage) GetSandboxId() string {
+func (x *SupervisorActivationMessage) GetSandboxId() string {
 	if x != nil {
 		return x.SandboxId
 	}
 	return ""
 }
 
-func (x *PodActivationMessage) GetSandboxName() string {
+func (x *SupervisorActivationMessage) GetSandboxName() string {
 	if x != nil {
 		return x.SandboxName
 	}
 	return ""
 }
 
-func (x *PodActivationMessage) GetToken() string {
+func (x *SupervisorActivationMessage) GetToken() string {
 	if x != nil {
 		return x.Token
 	}
 	return ""
 }
 
-func (x *PodActivationMessage) GetTokenExpiresAtMs() int64 {
+func (x *SupervisorActivationMessage) GetTokenExpiresAtMs() int64 {
 	if x != nil {
 		return x.TokenExpiresAtMs
 	}
 	return 0
 }
 
-func (x *PodActivationMessage) GetStartupMetadata() map[string]string {
+func (x *SupervisorActivationMessage) GetStartupMetadata() map[string]string {
 	if x != nil {
 		return x.StartupMetadata
 	}
@@ -1649,6 +1649,7 @@ type SandboxTemplateProvenance struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	Name            string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	ResourceVersion string                 `protobuf:"bytes,2,opt,name=resource_version,json=resourceVersion,proto3" json:"resource_version,omitempty"`
+	Id              string                 `protobuf:"bytes,3,opt,name=id,proto3" json:"id,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -1693,6 +1694,13 @@ func (x *SandboxTemplateProvenance) GetName() string {
 func (x *SandboxTemplateProvenance) GetResourceVersion() string {
 	if x != nil {
 		return x.ResourceVersion
+	}
+	return ""
+}
+
+func (x *SandboxTemplateProvenance) GetId() string {
+	if x != nil {
+		return x.Id
 	}
 	return ""
 }
@@ -13787,15 +13795,15 @@ const file_openshell_proto_rawDesc = "" +
 	"\x18IssueSandboxTokenRequest\"[\n" +
 	"\x19IssueSandboxTokenResponse\x12\x1a\n" +
 	"\x05token\x18\x01 \x01(\tB\x04\x88\xb5\x18\x01R\x05token\x12\"\n" +
-	"\rexpires_at_ms\x18\x02 \x01(\x03R\vexpiresAtMs\"\x1e\n" +
-	"\x1cRegisterSupervisorPodRequest\"\xc5\x02\n" +
-	"\x14PodActivationMessage\x12\x1d\n" +
+	"\rexpires_at_ms\x18\x02 \x01(\x03R\vexpiresAtMs\"\x1b\n" +
+	"\x19RegisterSupervisorRequest\"\xd3\x02\n" +
+	"\x1bSupervisorActivationMessage\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
 	"\fsandbox_name\x18\x02 \x01(\tR\vsandboxName\x12\x14\n" +
 	"\x05token\x18\x03 \x01(\tR\x05token\x12-\n" +
-	"\x13token_expires_at_ms\x18\x04 \x01(\x03R\x10tokenExpiresAtMs\x12b\n" +
-	"\x10startup_metadata\x18\x05 \x03(\v27.openshell.v1.PodActivationMessage.StartupMetadataEntryR\x0fstartupMetadata\x1aB\n" +
+	"\x13token_expires_at_ms\x18\x04 \x01(\x03R\x10tokenExpiresAtMs\x12i\n" +
+	"\x10startup_metadata\x18\x05 \x03(\v2>.openshell.v1.SupervisorActivationMessage.StartupMetadataEntryR\x0fstartupMetadata\x1aB\n" +
 	"\x14StartupMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"T\n" +
@@ -13867,10 +13875,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\astartup\x18\x01 \x01(\v2\x1c.openshell.v1.SandboxStartupR\astartup\"k\n" +
 	"\x0eSandboxStartup\x12<\n" +
 	"\fready_within\x18\x01 \x01(\v2\x19.google.protobuf.DurationR\vreadyWithin\x12\x1b\n" +
-	"\tmax_burst\x18\x02 \x01(\rR\bmaxBurst\"Z\n" +
+	"\tmax_burst\x18\x02 \x01(\rR\bmaxBurst\"j\n" +
 	"\x19SandboxTemplateProvenance\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12)\n" +
-	"\x10resource_version\x18\x02 \x01(\tR\x0fresourceVersion\"\xb1\x02\n" +
+	"\x10resource_version\x18\x02 \x01(\tR\x0fresourceVersion\x12\x0e\n" +
+	"\x02id\x18\x03 \x01(\tR\x02id\"\xb1\x02\n" +
 	"\rSandboxStatus\x12!\n" +
 	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12\x1b\n" +
 	"\tagent_pod\x18\x02 \x01(\tR\bagentPod\x12\x19\n" +
@@ -14854,7 +14863,7 @@ const file_openshell_proto_rawDesc = "" +
 	"\rWorkspaceRole\x12\x1e\n" +
 	"\x1aWORKSPACE_ROLE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13WORKSPACE_ROLE_USER\x10\x01\x12\x18\n" +
-	"\x14WORKSPACE_ROLE_ADMIN\x10\x022\xd1I\n" +
+	"\x14WORKSPACE_ROLE_ADMIN\x10\x022\xe3I\n" +
 	"\tOpenShell\x12Z\n" +
 	"\x06Health\x12\x1b.openshell.v1.HealthRequest\x1a\x1c.openshell.v1.HealthResponse\"\x15\x82\xb5\x18\x11\n" +
 	"\x0funauthenticated\x12i\n" +
@@ -14982,9 +14991,9 @@ const file_openshell_proto_rawDesc = "" +
 	"\x0fGetDraftHistory\x12$.openshell.v1.GetDraftHistoryRequest\x1a%.openshell.v1.GetDraftHistoryResponse\"\x1f\x82\xb5\x18\x1b\n" +
 	"\x06bearer\x12\x04user\"\vconfig:read\x12s\n" +
 	"\x11IssueSandboxToken\x12&.openshell.v1.IssueSandboxTokenRequest\x1a'.openshell.v1.IssueSandboxTokenResponse\"\r\x82\xb5\x18\t\n" +
-	"\asandbox\x12x\n" +
-	"\x15RegisterSupervisorPod\x12*.openshell.v1.RegisterSupervisorPodRequest\x1a\".openshell.v1.PodActivationMessage\"\r\x82\xb5\x18\t\n" +
-	"\asandbox0\x01\x12y\n" +
+	"\asandbox\x12\x89\x01\n" +
+	"\x12RegisterSupervisor\x12'.openshell.v1.RegisterSupervisorRequest\x1a).openshell.v1.SupervisorActivationMessage\"\x1d\x82\xb5\x18\x19\n" +
+	"\x17supervisor_registration0\x01\x12y\n" +
 	"\x13RefreshSandboxToken\x12(.openshell.v1.RefreshSandboxTokenRequest\x1a).openshell.v1.RefreshSandboxTokenResponse\"\r\x82\xb5\x18\t\n" +
 	"\asandbox\x12\x8d\x01\n" +
 	"\x0fCreateWorkspace\x12$.openshell.v1.CreateWorkspaceRequest\x1a%.openshell.v1.CreateWorkspaceResponse\"-\x82\xb5\x18)\n" +
@@ -15025,8 +15034,8 @@ var file_openshell_proto_goTypes = []any{
 	(WorkspaceRole)(0),                                   // 5: openshell.v1.WorkspaceRole
 	(*IssueSandboxTokenRequest)(nil),                     // 6: openshell.v1.IssueSandboxTokenRequest
 	(*IssueSandboxTokenResponse)(nil),                    // 7: openshell.v1.IssueSandboxTokenResponse
-	(*RegisterSupervisorPodRequest)(nil),                 // 8: openshell.v1.RegisterSupervisorPodRequest
-	(*PodActivationMessage)(nil),                         // 9: openshell.v1.PodActivationMessage
+	(*RegisterSupervisorRequest)(nil),                    // 8: openshell.v1.RegisterSupervisorRequest
+	(*SupervisorActivationMessage)(nil),                  // 9: openshell.v1.SupervisorActivationMessage
 	(*RefreshSandboxTokenRequest)(nil),                   // 10: openshell.v1.RefreshSandboxTokenRequest
 	(*RefreshSandboxTokenResponse)(nil),                  // 11: openshell.v1.RefreshSandboxTokenResponse
 	(*HealthRequest)(nil),                                // 12: openshell.v1.HealthRequest
@@ -15221,7 +15230,7 @@ var file_openshell_proto_goTypes = []any{
 	(*ListWorkspaceMembersRequest)(nil),                  // 201: openshell.v1.ListWorkspaceMembersRequest
 	(*ListWorkspaceMembersResponse)(nil),                 // 202: openshell.v1.ListWorkspaceMembersResponse
 	(*ExtensionServiceCredential)(nil),                   // 203: openshell.v1.ExtensionServiceCredential
-	nil,                                                  // 204: openshell.v1.PodActivationMessage.StartupMetadataEntry
+	nil,                                                  // 204: openshell.v1.SupervisorActivationMessage.StartupMetadataEntry
 	nil,                                                  // 205: openshell.v1.SandboxWorkloadConfig.EnvironmentEntry
 	nil,                                                  // 206: openshell.v1.PlatformEvent.MetadataEntry
 	nil,                                                  // 207: openshell.v1.CreateSandboxRequest.LabelsEntry
@@ -15261,7 +15270,7 @@ var file_openshell_proto_goTypes = []any{
 	(*sandboxv1.GetGatewayConfigResponse)(nil),           // 241: openshell.sandbox.v1.GetGatewayConfigResponse
 }
 var file_openshell_proto_depIdxs = []int32{
-	204, // 0: openshell.v1.PodActivationMessage.startup_metadata:type_name -> openshell.v1.PodActivationMessage.StartupMetadataEntry
+	204, // 0: openshell.v1.SupervisorActivationMessage.startup_metadata:type_name -> openshell.v1.SupervisorActivationMessage.StartupMetadataEntry
 	203, // 1: openshell.v1.RefreshSandboxTokenResponse.extension_credentials:type_name -> openshell.v1.ExtensionServiceCredential
 	4,   // 2: openshell.v1.HealthResponse.status:type_name -> openshell.v1.ServiceStatus
 	4,   // 3: openshell.v1.GetGatewayInfoResponse.status:type_name -> openshell.v1.ServiceStatus
@@ -15482,7 +15491,7 @@ var file_openshell_proto_depIdxs = []int32{
 	179, // 218: openshell.v1.OpenShell.ClearDraftChunks:input_type -> openshell.v1.ClearDraftChunksRequest
 	181, // 219: openshell.v1.OpenShell.GetDraftHistory:input_type -> openshell.v1.GetDraftHistoryRequest
 	6,   // 220: openshell.v1.OpenShell.IssueSandboxToken:input_type -> openshell.v1.IssueSandboxTokenRequest
-	8,   // 221: openshell.v1.OpenShell.RegisterSupervisorPod:input_type -> openshell.v1.RegisterSupervisorPodRequest
+	8,   // 221: openshell.v1.OpenShell.RegisterSupervisor:input_type -> openshell.v1.RegisterSupervisorRequest
 	10,  // 222: openshell.v1.OpenShell.RefreshSandboxToken:input_type -> openshell.v1.RefreshSandboxTokenRequest
 	188, // 223: openshell.v1.OpenShell.CreateWorkspace:input_type -> openshell.v1.CreateWorkspaceRequest
 	190, // 224: openshell.v1.OpenShell.GetWorkspace:input_type -> openshell.v1.GetWorkspaceRequest
@@ -15553,7 +15562,7 @@ var file_openshell_proto_depIdxs = []int32{
 	180, // 289: openshell.v1.OpenShell.ClearDraftChunks:output_type -> openshell.v1.ClearDraftChunksResponse
 	183, // 290: openshell.v1.OpenShell.GetDraftHistory:output_type -> openshell.v1.GetDraftHistoryResponse
 	7,   // 291: openshell.v1.OpenShell.IssueSandboxToken:output_type -> openshell.v1.IssueSandboxTokenResponse
-	9,   // 292: openshell.v1.OpenShell.RegisterSupervisorPod:output_type -> openshell.v1.PodActivationMessage
+	9,   // 292: openshell.v1.OpenShell.RegisterSupervisor:output_type -> openshell.v1.SupervisorActivationMessage
 	11,  // 293: openshell.v1.OpenShell.RefreshSandboxToken:output_type -> openshell.v1.RefreshSandboxTokenResponse
 	189, // 294: openshell.v1.OpenShell.CreateWorkspace:output_type -> openshell.v1.CreateWorkspaceResponse
 	191, // 295: openshell.v1.OpenShell.GetWorkspace:output_type -> openshell.v1.GetWorkspaceResponse

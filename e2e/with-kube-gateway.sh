@@ -679,6 +679,10 @@ fi
 echo "Installing agent-sandbox CRDs and controller (${AGENT_SANDBOX_VERSION})..."
 _agent_sandbox_base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
 kctl apply -f "${_agent_sandbox_base}/manifest.yaml"
+if [ "${OPENSHELL_E2E_KUBE_WARM_POOL:-0}" = "1" ]; then
+  echo "Installing agent-sandbox extension CRDs and controllers (${AGENT_SANDBOX_VERSION})..."
+  kctl apply -f "${_agent_sandbox_base}/extensions.yaml"
+fi
 wait_for_agent_sandbox_crd
 kctl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=300s
 

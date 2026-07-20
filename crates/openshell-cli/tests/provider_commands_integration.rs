@@ -1022,14 +1022,14 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type RegisterSupervisorPodStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::PodActivationMessage, Status>,
+    type RegisterSupervisorStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::SupervisorActivationMessage, Status>,
     >;
 
-    async fn register_supervisor_pod(
+    async fn register_supervisor(
         &self,
-        _request: tonic::Request<openshell_core::proto::RegisterSupervisorPodRequest>,
-    ) -> Result<Response<Self::RegisterSupervisorPodStream>, Status> {
+        _request: tonic::Request<openshell_core::proto::RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

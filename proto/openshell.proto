@@ -626,15 +626,15 @@ service OpenShell {
     };
   }
 
-  // Register a Kubernetes supervisor pod and wait for gateway activation.
+  // Register a supervisor instance and wait for gateway activation.
   //
-  // The initial trial activates already-bound cold pods immediately. Later
+  // The initial trial activates already-bound supervisor instances immediately. Later
   // warm-pool stages keep this stream pending until a SandboxClaim adopts the
-  // registered pod.
-  rpc RegisterSupervisorPod(RegisterSupervisorPodRequest)
-      returns (stream PodActivationMessage) {
+  // registered instance.
+  rpc RegisterSupervisor(RegisterSupervisorRequest)
+      returns (stream SupervisorActivationMessage) {
     option (openshell.options.v1.authorization) = {
-      auth_mode: "sandbox"
+      auth_mode: "supervisor_registration"
     };
   }
 
@@ -735,14 +735,14 @@ message IssueSandboxTokenResponse {
   int64 expires_at_ms = 2;
 }
 
-// RegisterSupervisorPod request. Empty body; identity is established by the
+// RegisterSupervisor request. Empty body; identity is established by the
 // authentication credentials carried in the request headers (a projected
 // Kubernetes ServiceAccount JWT in the K8s driver path).
-message RegisterSupervisorPodRequest {}
+message RegisterSupervisorRequest {}
 
-// Activation sent by the gateway once a registered supervisor pod is bound to
+// Activation sent by the gateway once a registered supervisor instance is bound to
 // an OpenShell sandbox identity.
-message PodActivationMessage {
+message SupervisorActivationMessage {
   // OpenShell sandbox UUID the supervisor should use for ConnectSupervisor.
   string sandbox_id = 1;
   // Human-readable sandbox name, if known.
@@ -938,6 +938,7 @@ message SandboxStartup {
 message SandboxTemplateProvenance {
   string name = 1;
   string resource_version = 2;
+  string id = 3;
 }
 
 // User-facing sandbox status derived by the gateway from compute-driver observations.

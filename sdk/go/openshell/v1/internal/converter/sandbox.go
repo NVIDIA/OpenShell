@@ -34,6 +34,7 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 	}
 	if provenance := s.GetCreatedFromTemplate(); provenance != nil {
 		result.CreatedFromTemplate = &types.SandboxTemplateProvenance{
+			ID:              provenance.GetId(),
 			Name:            provenance.GetName(),
 			ResourceVersion: provenance.GetResourceVersion(),
 		}
@@ -239,6 +240,7 @@ func sandboxTemplateProvenanceToProto(provenance *types.SandboxTemplateProvenanc
 		return nil
 	}
 	return &pb.SandboxTemplateProvenance{
+		Id:              provenance.ID,
 		Name:            provenance.Name,
 		ResourceVersion: provenance.ResourceVersion,
 	}
