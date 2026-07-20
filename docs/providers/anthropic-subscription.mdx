@@ -36,16 +36,20 @@ The CLI reads the macOS Keychain first, then falls back to `~/.claude/.credentia
 </Note>
 
 <Warning>
-The access token is marked non-injectable: it is stored only as gateway refresh state and is never exported into sandboxes. Sandboxes reach the model through `inference.local`, where the gateway adds the `Authorization: Bearer` header and the required `anthropic-beta: oauth-2025-04-20` flag at the egress boundary.
+Both tokens stay gateway-side: the access token is stored as the provider's `ANTHROPIC_OAUTH_TOKEN` credential and marked non-injectable, and the refresh token is stored in the gateway's refresh state. Neither is exported into sandboxes. Sandboxes reach the model through `inference.local`, where the gateway adds the `Authorization: Bearer` header and the required `anthropic-beta: oauth-2025-04-20` flag at the egress boundary.
+</Warning>
+
+<Warning>
+Inference routes are gateway-wide: any sandbox on the gateway can reach the route at `inference.local`, including sandboxes created without the `claude-subscription` provider attached. Because `--from-claude-login` points the default route at your personal subscription when no route exists, every sandbox on that gateway consumes your plan. Only use this provider on gateways where you trust all sandboxes.
 </Warning>
 
 ## Token Lifecycle
 
 The subscription OAuth token represents your whole plan, so it is shared across every sandbox bound to the provider, and revoking it is provider-wide. Anthropic rotates the refresh token on each refresh; the gateway persists the rotated token so refresh keeps working. The long-lived refresh material lives only in gateway state, never in a sandbox.
 
-To rotate or revoke, delete and recreate the provider, or rotate the credential through `openshell provider refresh`.
+To rotate the credential, delete and recreate the provider, or rotate through `openshell provider refresh`. Deleting the provider only removes the gateway's copy of the tokens — it does not revoke the OAuth session at Anthropic. Revocation happens via `claude /logout` or Anthropic's session management.
 
-If the refresh token becomes invalid — you logged out of Claude Code, revoked the session, or the plan lapsed — `openshell provider refresh status` reports the failure with recovery instructions: run `claude login` on the host, then delete and recreate the provider with `--from-claude-login`.
+If the refresh token becomes invalid — you logged out of Claude Code, revoked the session, or the plan lapsed — the provider enters the `reauth_required` state and the gateway stops retrying automatically. `openshell provider refresh status` reports the failure with recovery instructions: run `claude login` on the host, then delete and recreate the provider with `--from-claude-login`. An explicit `openshell provider refresh` retries the stored grant manually.
 
 ## Configure Inference Routing
 
