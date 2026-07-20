@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
+import "google/protobuf/duration.proto";
 import "options.proto";
 
 // Internal compute-driver contract used by the gateway.
@@ -30,6 +31,16 @@ service ComputeDriver {
   // Validate a sandbox before create-time provisioning.
   rpc ValidateSandboxCreate(ValidateSandboxCreateRequest)
       returns (ValidateSandboxCreateResponse);
+
+  // Notify an opted-in driver that a reusable sandbox template was created or
+  // updated in the gateway store.
+  rpc UpsertSandboxTemplate(UpsertSandboxTemplateRequest)
+      returns (UpsertSandboxTemplateResponse);
+
+  // Notify an opted-in driver that a reusable sandbox template was deleted
+  // from the gateway store.
+  rpc DeleteSandboxTemplate(DeleteSandboxTemplateRequest)
+      returns (DeleteSandboxTemplateResponse);
 
   // Fetch the platform-observed sandbox state for one sandbox.
   rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
@@ -72,6 +83,8 @@ message GetCapabilitiesResponse {
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
+  // Whether the driver wants gateway sandbox-template lifecycle notifications.
+  bool supports_sandbox_template_lifecycle = 6;
 }
 
 message GetGatewayListenerRequirementsRequest {}
@@ -185,6 +198,47 @@ message DriverSandboxTemplate {
   google.protobuf.Struct driver_config = 12;
 }
 
+// Gateway-owned reusable template translated into the driver-native compute
+// contract. Drivers opt in to receiving this resource via capabilities.
+message DriverSandboxTemplateResource {
+  string id = 1;
+  string name = 2;
+  string workspace = 3;
+  uint64 resource_version = 4;
+  map<string, string> labels = 5;
+  map<string, string> annotations = 6;
+  int64 deletion_timestamp_ms = 7;
+  DriverSandboxTemplate template = 8;
+  DriverSandboxTemplateServiceLevel desired_service_level = 9;
+  ResourceRequirements resource_requirements = 10;
+}
+
+message DriverSandboxTemplateServiceLevel {
+  DriverSandboxTemplateStartup startup = 1;
+}
+
+message DriverSandboxTemplateStartup {
+  google.protobuf.Duration ready_within = 1;
+  uint32 max_burst = 2;
+}
+
+message UpsertSandboxTemplateRequest {
+  DriverSandboxTemplateResource template = 1;
+}
+
+message UpsertSandboxTemplateResponse {}
+
+message DeleteSandboxTemplateRequest {
+  string id = 1;
+  string name = 2;
+  string workspace = 3;
+  uint64 resource_version = 4;
+}
+
+message DeleteSandboxTemplateResponse {
+  bool deleted = 1;
+}
+
 // Typed compute-resource requirements.
 //
 // Values use Kubernetes-style quantity strings (e.g. "500m", "2", "4Gi")
@@ -283,9 +337,20 @@ message ListSandboxesResponse {
 message CreateSandboxRequest {
   // Sandbox configuration to provision on the compute platform.
   DriverSandbox sandbox = 1;
+  // Template provenance set only when the public CreateSandbox request used a
+  // named SandboxTemplate.
+  DriverSandboxTemplateRef sandbox_template = 2;
 }
 
 message CreateSandboxResponse {}
+
+// Stable source template identity for a template-created sandbox.
+message DriverSandboxTemplateRef {
+  string id = 1;
+  string name = 2;
+  string workspace = 3;
+  uint64 resource_version = 4;
+}
 
 message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.

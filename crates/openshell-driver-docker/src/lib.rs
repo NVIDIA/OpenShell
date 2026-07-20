@@ -39,17 +39,18 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent,
-    DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest,
-    StartSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
-    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
-    watch_sandboxes_event,
+    DeleteSandboxTemplateRequest, DeleteSandboxTemplateResponse, DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse, DriverCondition, DriverPlatformEvent, DriverSandbox,
+    DriverSandboxStatus, DriverSandboxTemplate, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GatewayListenerRequirement, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GetSandboxResponse, GpuResourceRequirements, ListSandboxesRequest,
+    ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse, StopSandboxRequest,
+    StopSandboxResponse, UpsertSandboxTemplateRequest, UpsertSandboxTemplateResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
+    gateway_listener_requirement::Selector, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -1619,6 +1620,22 @@ impl ComputeDriver for DockerComputeDriver {
             )
             .await?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
+    }
+
+    async fn upsert_sandbox_template(
+        &self,
+        _request: Request<UpsertSandboxTemplateRequest>,
+    ) -> Result<Response<UpsertSandboxTemplateResponse>, Status> {
+        Ok(Response::new(UpsertSandboxTemplateResponse {}))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _request: Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+        Ok(Response::new(DeleteSandboxTemplateResponse {
+            deleted: false,
+        }))
     }
 
     async fn get_sandbox(

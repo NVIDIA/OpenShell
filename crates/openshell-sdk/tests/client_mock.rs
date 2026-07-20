@@ -364,13 +364,13 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(proto::CreateSshSessionResponse::default()))
     }
 
-    type RegisterSupervisorPodStream =
-        tokio_stream::wrappers::ReceiverStream<Result<proto::PodActivationMessage, Status>>;
+    type RegisterSupervisorStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::SupervisorActivationMessage, Status>>;
 
-    async fn register_supervisor_pod(
+    async fn register_supervisor(
         &self,
-        _: tonic::Request<proto::RegisterSupervisorPodRequest>,
-    ) -> Result<Response<Self::RegisterSupervisorPodStream>, Status> {
+        _: tonic::Request<proto::RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
         Err(Status::unimplemented("unused"))
     }
 

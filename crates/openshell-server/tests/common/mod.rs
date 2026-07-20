@@ -24,11 +24,11 @@ use openshell_core::proto::{
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxTemplateRequest,
     HealthRequest, HealthResponse, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxTemplatesRequest,
-    ListSandboxTemplatesResponse, ListSandboxesRequest, ListSandboxesResponse,
-    PodActivationMessage, ProviderResponse, RefreshSandboxTokenRequest,
-    RefreshSandboxTokenResponse, RegisterSupervisorPodRequest, RelayFrame, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, SandboxTemplateResponse,
-    ServiceStatus, SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
+    ListSandboxTemplatesResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
+    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RegisterSupervisorRequest, RelayFrame,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
+    SandboxTemplateResponse, ServiceStatus, SupervisorActivationMessage, SupervisorMessage,
+    TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -501,12 +501,12 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type RegisterSupervisorPodStream = ReceiverStream<Result<PodActivationMessage, Status>>;
+    type RegisterSupervisorStream = ReceiverStream<Result<SupervisorActivationMessage, Status>>;
 
-    async fn register_supervisor_pod(
+    async fn register_supervisor(
         &self,
-        _request: tonic::Request<RegisterSupervisorPodRequest>,
-    ) -> Result<Response<Self::RegisterSupervisorPodStream>, Status> {
+        _request: tonic::Request<RegisterSupervisorRequest>,
+    ) -> Result<Response<Self::RegisterSupervisorStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

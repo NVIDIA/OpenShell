@@ -533,6 +533,20 @@ enabled = true
 gateway_namespace = "openshell"
 gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes.io/instance" = "openshell" }
 
+[openshell.drivers.kubernetes.warm_pooling]
+# When enabled, compatible creates may use v1beta1 SandboxClaim resources
+# backed by the driver's cache of OpenShell-enabled SandboxWarmPool resources.
+enabled = true
+
+[openshell.drivers.kubernetes.warm_pooling.templates]
+# Optional OpenShell SandboxTemplate-backed reconciler for generated warm pools.
+enabled = true
+# Templates with desired_service_level.startup.ready_within strictly below
+# this threshold get a generated warm pool.
+ready_within_threshold_secs = 5
+# Cap desired_service_level.startup.max_burst for generated warm pools.
+max_replicas = 20
+
 [openshell.drivers.kubernetes.sidecar]
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
 # sidecars run as UID 0 so Kubernetes grants the required /proc inspection

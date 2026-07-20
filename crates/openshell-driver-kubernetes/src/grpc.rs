@@ -6,13 +6,14 @@
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
-    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
-    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
-    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    DeleteSandboxTemplateRequest, DeleteSandboxTemplateResponse, DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
+    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, UpsertSandboxTemplateRequest,
+    UpsertSandboxTemplateResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -65,6 +66,41 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
+    async fn upsert_sandbox_template(
+        &self,
+        request: Request<UpsertSandboxTemplateRequest>,
+    ) -> Result<Response<UpsertSandboxTemplateResponse>, Status> {
+        let template = request
+            .into_inner()
+            .template
+            .ok_or_else(|| Status::invalid_argument("template is required"))?;
+        self.driver
+            .upsert_sandbox_template(&template)
+            .await
+            .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
+        Ok(Response::new(UpsertSandboxTemplateResponse {}))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        request: Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+        let request = request.into_inner();
+        if request.id.is_empty() {
+            return Err(Status::invalid_argument("id is required"));
+        }
+        if request.workspace.is_empty() {
+            return Err(Status::invalid_argument("workspace is required"));
+        }
+        self.driver
+            .delete_sandbox_template(&request.id, &request.workspace)
+            .await
+            .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
+        Ok(Response::new(DeleteSandboxTemplateResponse {
+            deleted: true,
+        }))
+    }
+
     async fn get_sandbox(
         &self,
         request: Request<GetSandboxRequest>,
@@ -102,12 +138,12 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
+        let request = request.into_inner();
         let sandbox = request
-            .into_inner()
             .sandbox
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.driver
-            .create_sandbox(&sandbox)
+            .create_sandbox(&sandbox, request.sandbox_template.as_ref())
             .await
             .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
         Ok(Response::new(CreateSandboxResponse {}))
@@ -288,5 +324,16 @@ mod tests {
         assert!(!workspace_delete_requires_namespace_access(
             WorkspaceMode::Shared
         ));
+    }
+
+    #[test]
+    fn ambiguous_driver_errors_map_to_unavailable_status() {
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::Unavailable(
+            "create outcome unknown".to_string(),
+        ))
+        .into();
+
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "create outcome unknown");
     }
 }

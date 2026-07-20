@@ -272,11 +272,13 @@ async fn handle_create_sandbox_inner(
                 .await
                 .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?
                 .ok_or_else(|| Status::not_found("sandbox template not found"))?;
+            let template_id = template.object_id().to_string();
             let spec = template
                 .spec
                 .ok_or_else(|| Status::failed_precondition("sandbox template spec is required"))?;
             let metadata = template.metadata.as_ref();
             created_from_template = Some(SandboxTemplateProvenance {
+                id: template_id,
                 name: template_name.to_string(),
                 resource_version: metadata
                     .map_or(0, |metadata| metadata.resource_version)
@@ -364,7 +366,7 @@ async fn handle_create_sandbox_inner(
         })?;
 
     // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
-    // this mint and bootstrap via `RegisterSupervisorPod` at supervisor
+    // this mint and bootstrap via `RegisterSupervisor` at supervisor
     // startup; identifying "is this K8s?" lives in the compute layer, so
     // we mint unconditionally here when the issuer is configured and let
     // the K8s driver simply ignore the field.
@@ -553,6 +555,16 @@ pub(super) async fn handle_create_sandbox_template(
         .map_err(|e| Status::internal(format!("create sandbox template failed: {e}")))?;
     template.set_resource_version(result.resource_version);
 
+    if let Err(err) = state.compute.upsert_sandbox_template(&template).await {
+        warn!(
+            template_id = %template.object_id(),
+            template_name = %template.object_name(),
+            workspace = %template.object_workspace(),
+            error = %err,
+            "Failed to notify compute driver about sandbox template upsert"
+        );
+    }
+
     Ok(Response::new(SandboxTemplateResponse {
         template: Some(template),
     }))
@@ -650,11 +662,39 @@ pub(super) async fn handle_delete_sandbox_template(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
+    let existing = state
+        .store
+        .get_message_by_name::<SandboxTemplate>(&workspace, &req.name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox template failed: {e}")))?;
     let deleted = state
         .store
         .delete_by_name(SandboxTemplate::object_type(), &workspace, &req.name)
         .await
         .map_err(|e| Status::internal(format!("delete sandbox template failed: {e}")))?;
+    if deleted
+        && let Some(template) = existing
+        && let Err(err) = state
+            .compute
+            .delete_sandbox_template(
+                template.object_id().to_string(),
+                template.object_name().to_string(),
+                template.object_workspace().to_string(),
+                template
+                    .metadata
+                    .as_ref()
+                    .map_or(0, |metadata| metadata.resource_version),
+            )
+            .await
+    {
+        warn!(
+            template_id = %template.object_id(),
+            template_name = %template.object_name(),
+            workspace = %template.object_workspace(),
+            error = %err,
+            "Failed to notify compute driver about sandbox template delete"
+        );
+    }
     Ok(Response::new(DeleteSandboxTemplateResponse { deleted }))
 }
 
@@ -3733,6 +3773,13 @@ mod tests {
                 .as_ref()
                 .map(|provenance| provenance.name.as_str()),
             Some("default-image")
+        );
+        assert_eq!(
+            sandbox
+                .created_from_template
+                .as_ref()
+                .map(|provenance| provenance.id.as_str()),
+            Some("template-default-image")
         );
     }
 

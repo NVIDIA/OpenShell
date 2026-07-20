@@ -13,8 +13,8 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_PROXY_UID,
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig, KubernetesComputeDriver,
-    KubernetesSidecarConfig, ManagedSshIngressConfig, SupervisorSideloadMethod, SupervisorTopology,
-    WorkspaceMode,
+    KubernetesSidecarConfig, KubernetesWarmPoolingConfig, ManagedSshIngressConfig,
+    SupervisorSideloadMethod, SupervisorTopology, WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -163,7 +163,7 @@ struct Args {
     app_armor_profile: Option<AppArmorProfile>,
 
     /// Lifetime (seconds) of the projected `ServiceAccount` token
-    /// kubelet writes into each sandbox pod for the `RegisterSupervisorPod`
+    /// kubelet writes into each sandbox pod for the `RegisterSupervisor`
     /// bootstrap stream. Kubelet enforces a minimum of 600s; the
     /// gateway clamps values outside `[600, 86400]`. Default 3600.
     #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
@@ -280,6 +280,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             sandbox_uid: args.sandbox_uid,
             sandbox_gid: args.sandbox_gid,
+            warm_pooling: KubernetesWarmPoolingConfig::default(),
         },
         shutdown_rx,
     )

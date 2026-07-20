@@ -124,6 +124,9 @@ pub async fn authorize_workspace(
             workspace,
             grant: AuthGrant::Sandbox,
         }),
+        Principal::SupervisorBootstrap(_) => Err(Status::permission_denied(
+            "supervisor registration principals cannot access workspace resources",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
 }
@@ -158,6 +161,9 @@ pub fn require_platform_admin(admin_role: &str, principal: &Principal) -> Result
         )),
         Principal::Sandbox(_) => Err(Status::permission_denied(
             "sandbox principals cannot perform cross-workspace operations",
+        )),
+        Principal::SupervisorBootstrap(_) => Err(Status::permission_denied(
+            "supervisor registration principals cannot perform cross-workspace operations",
         )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }

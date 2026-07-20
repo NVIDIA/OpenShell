@@ -76,6 +76,7 @@ type SandboxStartup struct {
 
 // SandboxTemplateProvenance identifies the template revision used to create a sandbox.
 type SandboxTemplateProvenance struct {
+	ID              string
 	Name            string
 	ResourceVersion string
 }

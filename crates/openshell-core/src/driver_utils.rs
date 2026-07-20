@@ -381,10 +381,27 @@ pub fn build_capabilities_response(
     driver_version: impl Into<String>,
     default_image: impl Into<String>,
 ) -> GetCapabilitiesResponse {
+    build_capabilities_response_with_template_lifecycle(
+        driver_name,
+        driver_version,
+        default_image,
+        false,
+    )
+}
+
+/// Build a [`GetCapabilitiesResponse`] and opt into sandbox-template lifecycle
+/// notifications.
+pub fn build_capabilities_response_with_template_lifecycle(
+    driver_name: &str,
+    driver_version: impl Into<String>,
+    default_image: impl Into<String>,
+    supports_sandbox_template_lifecycle: bool,
+) -> GetCapabilitiesResponse {
     GetCapabilitiesResponse {
         driver_name: driver_name.to_string(),
         driver_version: driver_version.into(),
         default_image: default_image.into(),
+        supports_sandbox_template_lifecycle,
     }
 }
 

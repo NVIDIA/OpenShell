@@ -451,6 +451,31 @@ the driver sets `spec.operatingMode` to `Suspended` or `Running`. For
 `v1alpha1`, it sets `spec.replicas` to `0` or `1`. The Sandbox resource and its
 workspace PVC keep their identity across both operations.
 
+When Kubernetes warm pooling is enabled, the driver can satisfy compatible
+create requests by creating `extensions.agents.x-k8s.io/v1beta1`
+`SandboxClaim` resources instead of direct `Sandbox` resources. The driver
+discovers `SandboxWarmPool` resources labelled `openshell.ai/enabled=true`
+across namespaces it can observe, resolves each pool's `SandboxTemplate`, and
+matches only against pools in the Kubernetes namespace selected for the
+OpenShell workspace. The current shared-namespace mapping selects the configured
+`sandbox_namespace` for every workspace. Set
+`openshell.drivers.kubernetes.warm_pooling.enabled = false` to force direct
+`Sandbox` creation.
+
+When `openshell.drivers.kubernetes.warm_pooling.templates.enabled = true`, the
+gateway notifies the Kubernetes driver when OpenShell `SandboxTemplate`
+resources are created, deleted, or synced at gateway startup. The driver
+creates generated Agent Sandbox `SandboxTemplate` and `SandboxWarmPool`
+resources when `desired_service_level.startup.ready_within` is strictly less
+than `ready_within_threshold_secs` (default `5`). The generated warm-pool
+replica count comes from `desired_service_level.startup.max_burst`, capped by
+`max_replicas` (default `20`).
+
+The generated warm pools carry `openshell.ai/enabled=true`, so the existing
+matching path discovers them like any externally managed warm pool. Templates
+that do not request startup below the threshold, or templates deleted from
+OpenShell, cause the driver to delete its generated warm-pool resources.
+
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
 <Note>

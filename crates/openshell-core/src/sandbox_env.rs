@@ -88,7 +88,7 @@ pub const USER_ENVIRONMENT: &str = "OPENSHELL_USER_ENVIRONMENT";
 /// Path to the projected `ServiceAccount` JWT (Kubernetes driver).
 ///
 /// Used to register the supervisor pod and receive a gateway-minted JWT via
-/// `RegisterSupervisorPod`. Kubelet writes and rotates this file; the
+/// `RegisterSupervisor`. Kubelet writes and rotates this file; the
 /// supervisor presents its contents at startup and when rebootstrap is needed
 /// after refresh authentication failure.
 pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";

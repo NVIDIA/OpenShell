@@ -141,7 +141,7 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 |---|---|---|---|
 | Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API and CDI GPU devices when available. Delivers the supervisor via OCI image volume by default; falls back to extracting the binary to a host-side cache and bind-mounting it when `userns` is configured (overlay does not support idmapped mounts). |
-| Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
+| Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, GPU resources, and optionally Agent Sandbox v1beta1 warm-pool claims. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
 | Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a non-reserved custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. Reserved built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot be used as unmanaged socket endpoints. The gateway connects to a UDS the operator already provisioned, runs `GetCapabilities`, logs the advertised `driver_name`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
@@ -248,13 +248,74 @@ The supervisor itself remains root so it can establish isolation before
 starting unprivileged children.
 
 Kubernetes supervisors authenticate to the gateway in two stages. They first
-call `RegisterSupervisorPod` with the projected ServiceAccount token; the
+call `RegisterSupervisor` with the projected ServiceAccount token; the
 gateway validates the pod-bound token and live Agent Sandbox owner state, then
 activates already-bound cold pods by streaming back a gateway-minted sandbox
 JWT. The supervisor installs that JWT in memory and starts the normal
 `ConnectSupervisor` session as the activated sandbox. The gateway does not dial
 pod IPs or require an inbound activation port; activation is supervisor
 initiated over the existing outbound gRPC connection.
+
+When compatible OpenShell-enabled Agent Sandbox warm pools exist, the
+Kubernetes driver can create a `SandboxClaim` instead of a direct `Sandbox`.
+The driver watches warm pools and templates into a local cache so create
+requests do not list or fetch extension objects on the hot path. This remains
+behind the compute-driver boundary: other drivers and the driver-agnostic
+gateway lifecycle continue to operate on OpenShell sandbox identity and status.
+Warm-pool activation uses the same trust boundary as direct Kubernetes
+activation. The direct path validates `pod token -> live pod -> owning Sandbox
+CR -> Sandbox sandbox-id metadata`; the warm path validates `pod token -> live
+pod -> owning Sandbox CR -> associated SandboxClaim -> SandboxClaim sandbox-id
+metadata`. In both paths, sandbox-id metadata is not cryptographic proof by
+itself. It is trusted because the gateway and Agent Sandbox controllers own the
+relevant Kubernetes objects, and RBAC must prevent sandbox workloads and
+untrusted users from creating or mutating trusted `Sandbox`, `SandboxClaim`, pod
+metadata, or sandbox service-account identity in the gateway-managed namespace.
+Under that model, warm pooling does not require a separate anti-spoofing token
+or gateway-side claim mapping beyond the same live Kubernetes ownership and
+metadata consistency checks used by the direct path. If an operator grants
+untrusted principals write access to those objects, both warm and direct
+activation require a broader common proof model.
+Claim activation is level-triggered rather than dependent on a single watch
+event. The controller periodically relists OpenShell-managed claims and retries
+failed watch streams, because a claim can become visible before its selected
+`Sandbox`, pod, or outbound supervisor registration. A newly authenticated
+warm-supervisor registration clears completed-claim hints and triggers an immediate
+relist, so both a restarted process with the same pod UID and a replacement pod
+with a new UID can reactivate against an existing claim. It reconciles different
+claims concurrently, deduplicates work by claim UID, and caps concurrency so
+one late registration or slow Kubernetes lookup cannot block activation for
+the namespace or create unbounded work.
+The gateway retains activated pod-UID tombstones for one hour to reject
+duplicate registration and activation races, then prunes them opportunistically
+on registry access so long-running gateways do not accumulate one entry per
+historical pod. A new authenticated registration supersedes its pod-UID
+tombstone and receives a new local session ID. Activation and failure delivery
+are conditional on that session ID, preventing work started for an old process
+from consuming or terminating its replacement stream.
+Warm claim creation is idempotent by the deterministic claim name. After a
+create timeout, transport failure, server error, or conflict, the driver reads
+that name back and retries the same claim create when it is not yet visible. It
+never switches to direct Sandbox creation after an ambiguous claim write. An
+existing claim is accepted only when its OpenShell identity, workspace,
+allocation marker, and warm-pool reference match the request. If Kubernetes
+still cannot determine whether the claim exists, the driver returns
+`Unavailable` and the gateway retains the durable `Provisioning` record. This
+prevents another create from assigning a new sandbox ID to the same name while
+the original Kubernetes write may still be live; the normal driver watcher can
+subsequently reconcile an accepted claim.
+Drivers opt into OpenShell `SandboxTemplate` lifecycle notifications through
+the compute-driver capability snapshot. The Kubernetes driver uses those
+notifications, plus a startup sync of persisted templates, to generate Agent
+Sandbox `SandboxTemplate` and `SandboxWarmPool` resources for templates whose
+`desired_service_level.startup.ready_within` is strictly below the configured
+threshold. The generated pool size follows
+`desired_service_level.startup.max_burst` capped by the Kubernetes driver
+configuration. Sandbox creation and template reconciliation share one
+workspace-to-namespace mapping boundary; the current shared-namespace
+implementation maps every workspace to the configured Kubernetes namespace.
+The read-side warm-pool cache still runs on every replica so local create
+requests do not depend on a separate writer lease.
 
 Kubernetes can run the supervisor in the default combined topology or in a
 sidecar topology. Combined mode keeps network and process supervision in the

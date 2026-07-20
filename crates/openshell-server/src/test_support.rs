@@ -8,14 +8,16 @@ use futures::{Stream, stream};
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DeleteWorkspaceRequest, DeleteWorkspaceResponse, DriverSandbox, EnsureWorkspaceRequest,
+    DeleteSandboxTemplateRequest, DeleteSandboxTemplateResponse, DeleteWorkspaceRequest,
+    DeleteWorkspaceResponse, DriverSandbox, DriverSandboxTemplateRef, EnsureWorkspaceRequest,
     EnsureWorkspaceResponse, GatewayListenerRequirement, GetCapabilitiesRequest,
     GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
     GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_server::ComputeDriver, gateway_listener_requirement::Selector,
+    StopSandboxRequest, StopSandboxResponse, UpsertSandboxTemplateRequest,
+    UpsertSandboxTemplateResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    gateway_listener_requirement::Selector,
 };
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -48,6 +50,7 @@ pub enum FakeComputeDriverCall {
     ListSandboxes,
     CreateSandbox {
         sandbox: Option<DriverSandbox>,
+        sandbox_template: Option<DriverSandboxTemplateRef>,
     },
     StopSandbox {
         sandbox_id: String,
@@ -241,6 +244,7 @@ impl ComputeDriver for FakeComputeDriver {
                 driver_name: state.driver_name.clone(),
                 driver_version: state.driver_version.clone(),
                 default_image: state.default_image.clone(),
+                supports_sandbox_template_lifecycle: false,
             }
         });
         Ok(Response::new(response))
@@ -277,6 +281,24 @@ impl ComputeDriver for FakeComputeDriver {
                 .push(FakeComputeDriverCall::ValidateSandboxCreate { sandbox });
         });
         Ok(Response::new(ValidateSandboxCreateResponse {}))
+    }
+
+    async fn upsert_sandbox_template(
+        &self,
+        request: Request<UpsertSandboxTemplateRequest>,
+    ) -> Result<Response<UpsertSandboxTemplateResponse>, Status> {
+        self.record_traceparent(request.metadata());
+        Ok(Response::new(UpsertSandboxTemplateResponse {}))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        request: Request<DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<DeleteSandboxTemplateResponse>, Status> {
+        self.record_traceparent(request.metadata());
+        Ok(Response::new(DeleteSandboxTemplateResponse {
+            deleted: false,
+        }))
     }
 
     async fn get_sandbox(
@@ -323,14 +345,17 @@ impl ComputeDriver for FakeComputeDriver {
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
         self.record_traceparent(request.metadata());
-        let sandbox = request.into_inner().sandbox;
+        let request = request.into_inner();
+        let sandbox = request.sandbox;
+        let sandbox_template = request.sandbox_template;
         self.with_state(|state| {
             if let Some(sandbox) = sandbox.as_ref() {
                 state.sandboxes.insert(sandbox.id.clone(), sandbox.clone());
             }
-            state
-                .calls
-                .push(FakeComputeDriverCall::CreateSandbox { sandbox });
+            state.calls.push(FakeComputeDriverCall::CreateSandbox {
+                sandbox,
+                sandbox_template,
+            });
         });
         Ok(Response::new(CreateSandboxResponse {}))
     }
