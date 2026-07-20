@@ -172,12 +172,20 @@ prepare_guest_image_rootfs() {
             /opt/openshell/bin/umoci raw unpack \
                 --image "$payload_dir/oci:openshell" \
                 "$partial_root"
-            if [ ! -d "$partial_root/rootfs" ]; then
-                ts "FATAL: umoci unpack did not produce rootfs directory"
+            # `umoci raw unpack` extracts the image filesystem directly into
+            # the target directory — there is no bundle-style rootfs/
+            # subdirectory. Accept both layouts defensively.
+            if [ -d "$partial_root/rootfs" ] \
+                && [ ! -e "$partial_root/bin" ] \
+                && [ ! -e "$partial_root/usr" ]; then
+                mv "$partial_root/rootfs" "$image_root"
+                rm -rf "$partial_root"
+            elif [ -d "$partial_root" ]; then
+                mv "$partial_root" "$image_root"
+            else
+                ts "FATAL: umoci unpack did not produce a rootfs"
                 exit 1
             fi
-            mv "$partial_root/rootfs" "$image_root"
-            rm -rf "$partial_root"
             ;;
         *)
             ts "FATAL: unknown guest image payload source: ${source:-missing}"

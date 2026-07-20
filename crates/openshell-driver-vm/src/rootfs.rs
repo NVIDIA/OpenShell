@@ -655,6 +655,60 @@ fn sandbox_guest_user_ids(rootfs: &Path) -> Result<Option<(u32, u32)>, String> {
     Ok(None)
 }
 
+/// Check (read-only, without mounting) whether an ext4 image contains a
+/// directory at `guest_path`.
+///
+/// Used to validate image-prep output before it is cached: guest init exit
+/// codes do not survive the libkrun boundary — the VM powers off "cleanly"
+/// whatever status PID 1 exited with — so without an explicit content check
+/// a failed prep would poison the prepared-image cache forever.
+pub fn ext4_image_has_directory(image_path: &Path, guest_path: &str) -> Result<bool, String> {
+    let mut last_error = None;
+    for candidate in e2fs_tool_candidates("debugfs") {
+        let label = candidate.display().to_string();
+        let output = Command::new(&candidate)
+            .arg("-R")
+            .arg(format!("stat {guest_path}"))
+            .arg(image_path)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // debugfs exits 0 even when the target is missing; the
+                // result is only in its output text.
+                if stdout.contains("Type: directory") {
+                    return Ok(true);
+                }
+                if stdout.contains("File not found") || stderr.contains("File not found") {
+                    return Ok(false);
+                }
+                last_error = Some(format!(
+                    "{label} produced unrecognized output for {guest_path}\nstdout: {stdout}\nstderr: {stderr}"
+                ));
+            }
+            Ok(output) => {
+                last_error = Some(format!(
+                    "{label} failed with status {}\nstderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(format!("{label} not found"));
+            }
+            Err(err) => {
+                last_error = Some(format!("run {label}: {err}"));
+            }
+        }
+    }
+    Err(format!(
+        "inspect {} for {guest_path} failed: {}. Install e2fsprogs (debugfs) and retry",
+        image_path.display(),
+        last_error.unwrap_or_else(|| "debugfs not found".to_string())
+    ))
+}
+
 fn run_debugfs_batch(image_path: &Path, commands: &[String]) -> Result<(), String> {
     let command_path = temporary_injection_path(image_path);
     let mut contents = commands.join("\n");

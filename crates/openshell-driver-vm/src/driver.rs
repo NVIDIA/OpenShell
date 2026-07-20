@@ -10,8 +10,8 @@ use crate::lifecycle::{
 };
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
-    set_rootfs_image_file_mode, write_rootfs_image_file,
+    ext4_image_has_directory, extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root,
+    sandbox_guest_init_path, set_rootfs_image_file_mode, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use bollard::Docker;
@@ -2435,6 +2435,37 @@ impl VmDriver {
         {
             let _ = tokio::fs::remove_dir_all(staging_dir).await;
             return Err(err);
+        }
+
+        // Validate before caching: guest init exit codes do not survive the
+        // libkrun boundary (the VM powers off "cleanly" whatever status PID 1
+        // exited with), so a prep failure would otherwise cache a broken disk
+        // that poisons every later sandbox using this image.
+        let disk_to_validate = prepared_image.clone();
+        let has_rootfs = tokio::task::spawn_blocking(move || {
+            ext4_image_has_directory(&disk_to_validate, "/image-rootfs")
+        })
+        .await
+        .map_err(|err| Status::internal(format!("prepared image validation panicked: {err}")))?
+        .map_err(Status::internal)?;
+        if !has_rootfs {
+            let console = tokio::fs::read_to_string(staging_dir.join("image-prep-console.log"))
+                .await
+                .unwrap_or_default();
+            let tail = console
+                .lines()
+                .rev()
+                .take(12)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let _ = tokio::fs::remove_dir_all(staging_dir).await;
+            return Err(Status::failed_precondition(format!(
+                "image-prep for '{image_ref}' produced a disk without /image-rootfs \
+                 (not cached). guest console tail:\n{tail}"
+            )));
         }
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
@@ -4884,9 +4915,13 @@ fn prepared_image_disk_size_bytes(
             .map_err(|err| format!("stat {}: {err}", rootfs_archive.display()))?
             .len(),
     };
+    // The prep disk must hold the payload AND the unpacked rootfs at the
+    // same time (the payload is only removed after a successful unpack), and
+    // compressed layers commonly expand ~2.5-3x. The image file is created
+    // sparse, so generous headroom costs no real disk space.
     let requested = payload_size
-        .saturating_mul(3)
-        .saturating_add(512 * 1024 * 1024);
+        .saturating_mul(4)
+        .saturating_add(1024 * 1024 * 1024);
     Ok(minimum_size_bytes.max(requested))
 }
 
