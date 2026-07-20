@@ -35,7 +35,6 @@
     "format": "biome check --write .",
     "lint": "biome ci .",
     "test": "vitest run",
-    "demo": "tsx src/demo.ts",
     "prepublishOnly": "npm run gen && npm run build"
   },
   "dependencies": {
@@ -48,7 +47,6 @@
     "@bufbuild/buf": "^1.71.0",
     "@bufbuild/protoc-gen-es": "^2.2.3",
     "@types/node": "^24",
-    "tsx": "^4.19.2",
     "typescript": "^6.0.3",
     "vitest": "^4.1.10"
   }
