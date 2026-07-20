@@ -13054,6 +13054,65 @@ network_policies:
         assert_eq!(res, 3);
         assert_eq!(unk, 2);
     }
+
+    #[tokio::test]
+    async fn test_exit_receiver_fires_when_task_exits() {
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _guard = exited_tx;
+        });
+        handle.await.unwrap();
+        // The sender was dropped when the task completed, so the receiver
+        // should resolve immediately with an Err (sender dropped).
+        assert!(exited_rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_exit_receiver_fires_when_task_is_aborted() {
+        let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _guard = exited_tx;
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        // Abort drops the task's locals, including the sender guard.
+        assert!(exited_rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_take_exit_receiver_returns_real_receiver() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(std::future::pending::<()>());
+        let mut handle = ProxyHandle {
+            http_addr: None,
+            join,
+            exited_rx: rx,
+        };
+        let mut taken = handle.take_exit_receiver();
+        // Sender still alive — receiver should not be ready yet.
+        assert!(taken.try_recv().is_err());
+        // Drop the original sender — the taken receiver should resolve.
+        drop(tx);
+        assert!(taken.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_take_exit_receiver_second_call_returns_instantly() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(std::future::pending::<()>());
+        let mut handle = ProxyHandle {
+            http_addr: None,
+            join,
+            exited_rx: rx,
+        };
+        let _first = handle.take_exit_receiver();
+        let second = handle.take_exit_receiver();
+        // The dummy's sender was dropped inside take_exit_receiver, so
+        // the second receiver resolves immediately — this demonstrates
+        // the double-call hazard.
+        assert!(second.await.is_err());
+    }
+
     #[path = "compatibility.rs"]
     mod compatibility;
 }
