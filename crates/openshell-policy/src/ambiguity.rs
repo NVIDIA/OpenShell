@@ -1,0 +1,590 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Validation for endpoint selectors whose policy-derived behavior conflicts.
+
+use openshell_core::proto::{NetworkEndpoint, SandboxPolicy};
+use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::fmt;
+
+/// One pair of endpoints that can authorize the same request but disagree on
+/// policy-derived behavior that must have a single deterministic value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointAmbiguity {
+    pub left_policy: String,
+    pub left_endpoint_index: usize,
+    pub left_selector: String,
+    pub right_policy: String,
+    pub right_endpoint_index: usize,
+    pub right_selector: String,
+    pub overlapping_ports: Vec<u32>,
+    pub conflicts: Vec<String>,
+}
+
+impl fmt::Display for EndpointAmbiguity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "network policies '{}' endpoint[{}] ({}) and '{}' endpoint[{}] ({}) overlap on port(s) {} with conflicting metadata: {}",
+            self.left_policy,
+            self.left_endpoint_index,
+            self.left_selector,
+            self.right_policy,
+            self.right_endpoint_index,
+            self.right_selector,
+            self.overlapping_ports
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            self.conflicts.join("; "),
+        )
+    }
+}
+
+struct EndpointRef<'a> {
+    policy: &'a str,
+    index: usize,
+    endpoint: &'a NetworkEndpoint,
+}
+
+/// Reject endpoint metadata ambiguity before a policy generation is activated.
+///
+/// Request authorization rules (`access`, `rules`, and `deny_rules`) may be
+/// contributed by multiple compatible endpoints. Metadata used to establish
+/// or parse a connection must agree whenever the endpoint host, port, and (for
+/// request-specific metadata) path selectors can match the same request.
+#[must_use]
+pub fn find_endpoint_ambiguities(policy: &SandboxPolicy) -> Vec<EndpointAmbiguity> {
+    let endpoints = policy
+        .network_policies
+        .iter()
+        .flat_map(|(key, rule)| {
+            let policy_name = if rule.name.is_empty() {
+                key.as_str()
+            } else {
+                rule.name.as_str()
+            };
+            rule.endpoints
+                .iter()
+                .enumerate()
+                .map(move |(index, endpoint)| EndpointRef {
+                    policy: policy_name,
+                    index,
+                    endpoint,
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let mut ambiguities = Vec::new();
+    for left_index in 0..endpoints.len() {
+        for right_index in (left_index + 1)..endpoints.len() {
+            let left = &endpoints[left_index];
+            let right = &endpoints[right_index];
+            let overlapping_ports = overlapping_ports(left.endpoint, right.endpoint);
+            if overlapping_ports.is_empty()
+                || !host_patterns_overlap(&left.endpoint.host, &right.endpoint.host)
+            {
+                continue;
+            }
+
+            let mut conflicts = connection_conflicts(left.endpoint, right.endpoint);
+            if path_patterns_overlap(&left.endpoint.path, &right.endpoint.path) {
+                conflicts.extend(request_pipeline_conflicts(left.endpoint, right.endpoint));
+            }
+            if conflicts.is_empty() {
+                continue;
+            }
+
+            ambiguities.push(EndpointAmbiguity {
+                left_policy: left.policy.to_string(),
+                left_endpoint_index: left.index,
+                left_selector: endpoint_selector(left.endpoint),
+                right_policy: right.policy.to_string(),
+                right_endpoint_index: right.index,
+                right_selector: endpoint_selector(right.endpoint),
+                overlapping_ports,
+                conflicts,
+            });
+        }
+    }
+    ambiguities
+}
+
+fn endpoint_selector(endpoint: &NetworkEndpoint) -> String {
+    let host = if endpoint.host.is_empty() {
+        "<any-host>"
+    } else {
+        &endpoint.host
+    };
+    let path = if endpoint.path.is_empty() {
+        ""
+    } else {
+        endpoint.path.as_str()
+    };
+    format!("{host}:{}{}", display_ports(endpoint), path)
+}
+
+fn display_ports(endpoint: &NetworkEndpoint) -> String {
+    effective_ports(endpoint)
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn effective_ports(endpoint: &NetworkEndpoint) -> BTreeSet<u32> {
+    if endpoint.ports.is_empty() {
+        (endpoint.port > 0)
+            .then_some(endpoint.port)
+            .into_iter()
+            .collect()
+    } else {
+        endpoint
+            .ports
+            .iter()
+            .copied()
+            .filter(|port| *port > 0)
+            .collect()
+    }
+}
+
+fn overlapping_ports(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<u32> {
+    effective_ports(left)
+        .intersection(&effective_ports(right))
+        .copied()
+        .collect()
+}
+
+fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    push_conflict(
+        &mut conflicts,
+        "tls",
+        &normalized_tls(&left.tls),
+        &normalized_tls(&right.tls),
+    );
+    push_conflict(
+        &mut conflicts,
+        "allowed_ips",
+        &normalized_strings(&left.allowed_ips),
+        &normalized_strings(&right.allowed_ips),
+    );
+    push_conflict(
+        &mut conflicts,
+        "advisor_proposed",
+        &left.advisor_proposed,
+        &right.advisor_proposed,
+    );
+    conflicts
+}
+
+fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<String> {
+    let mut conflicts = Vec::new();
+    push_conflict(
+        &mut conflicts,
+        "protocol",
+        &left.protocol.to_ascii_lowercase(),
+        &right.protocol.to_ascii_lowercase(),
+    );
+    push_conflict(
+        &mut conflicts,
+        "enforcement",
+        &normalized_enforcement(&left.enforcement),
+        &normalized_enforcement(&right.enforcement),
+    );
+    push_conflict(
+        &mut conflicts,
+        "allow_encoded_slash",
+        &left.allow_encoded_slash,
+        &right.allow_encoded_slash,
+    );
+    push_conflict(
+        &mut conflicts,
+        "websocket_credential_rewrite",
+        &left.websocket_credential_rewrite,
+        &right.websocket_credential_rewrite,
+    );
+    push_conflict(
+        &mut conflicts,
+        "request_body_credential_rewrite",
+        &left.request_body_credential_rewrite,
+        &right.request_body_credential_rewrite,
+    );
+    push_conflict(
+        &mut conflicts,
+        "credential_signing",
+        &left.credential_signing,
+        &right.credential_signing,
+    );
+    push_conflict(
+        &mut conflicts,
+        "signing_service",
+        &left.signing_service,
+        &right.signing_service,
+    );
+    push_conflict(
+        &mut conflicts,
+        "signing_region",
+        &left.signing_region,
+        &right.signing_region,
+    );
+
+    if left.protocol.eq_ignore_ascii_case("graphql")
+        && right.protocol.eq_ignore_ascii_case("graphql")
+    {
+        push_conflict(
+            &mut conflicts,
+            "graphql_max_body_bytes",
+            &normalized_body_limit(left.graphql_max_body_bytes),
+            &normalized_body_limit(right.graphql_max_body_bytes),
+        );
+    }
+    if is_json_rpc_family(&left.protocol) && is_json_rpc_family(&right.protocol) {
+        push_conflict(
+            &mut conflicts,
+            "json_rpc_max_body_bytes",
+            &normalized_body_limit(left.json_rpc_max_body_bytes),
+            &normalized_body_limit(right.json_rpc_max_body_bytes),
+        );
+    }
+    if left.protocol.eq_ignore_ascii_case("mcp") && right.protocol.eq_ignore_ascii_case("mcp") {
+        push_conflict(
+            &mut conflicts,
+            "mcp.strict_tool_names",
+            &normalized_mcp_strict_tool_names(left),
+            &normalized_mcp_strict_tool_names(right),
+        );
+    }
+    conflicts
+}
+
+fn push_conflict<T: fmt::Debug + PartialEq>(
+    conflicts: &mut Vec<String>,
+    field: &str,
+    left: &T,
+    right: &T,
+) {
+    if left != right {
+        conflicts.push(format!("{field}={left:?} vs {right:?}"));
+    }
+}
+
+fn normalized_tls(value: &str) -> &'static str {
+    if value.eq_ignore_ascii_case("skip") {
+        "skip"
+    } else {
+        "auto"
+    }
+}
+
+fn normalized_enforcement(value: &str) -> &'static str {
+    if value.eq_ignore_ascii_case("enforce") {
+        "enforce"
+    } else {
+        "audit"
+    }
+}
+
+fn normalized_strings(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+const DEFAULT_BODY_LIMIT: u32 = 65_536;
+
+fn normalized_body_limit(value: u32) -> u32 {
+    if value == 0 {
+        DEFAULT_BODY_LIMIT
+    } else {
+        value
+    }
+}
+
+fn is_json_rpc_family(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case("json-rpc") || protocol.eq_ignore_ascii_case("mcp")
+}
+
+fn normalized_mcp_strict_tool_names(endpoint: &NetworkEndpoint) -> bool {
+    endpoint
+        .mcp
+        .as_ref()
+        .and_then(|options| options.strict_tool_names)
+        .unwrap_or(true)
+}
+
+fn host_patterns_overlap(left: &str, right: &str) -> bool {
+    if left.is_empty() || right.is_empty() {
+        return true;
+    }
+    glob_patterns_overlap(&left.to_ascii_lowercase(), &right.to_ascii_lowercase(), '.')
+}
+
+fn path_patterns_overlap(left: &str, right: &str) -> bool {
+    if left.is_empty()
+        || right.is_empty()
+        || matches!(left, "**" | "/**")
+        || matches!(right, "**" | "/**")
+    {
+        return true;
+    }
+    glob_patterns_overlap(left, right, '/')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobToken {
+    Literal(char),
+    Star { crosses_delimiter: bool },
+}
+
+fn tokenize_glob(pattern: &str) -> Vec<GlobToken> {
+    let chars = pattern.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] != '*' {
+            tokens.push(GlobToken::Literal(chars[index]));
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < chars.len() && chars[index] == '*' {
+            index += 1;
+        }
+        tokens.push(GlobToken::Star {
+            crosses_delimiter: index - start >= 2,
+        });
+    }
+    tokens
+}
+
+/// Decide whether two delimiter-aware glob languages intersect.
+///
+/// This is a small product-NFA search. `*` consumes any character except the
+/// delimiter and `**` consumes any character, including the delimiter. Star
+/// epsilon transitions and self-loops make the state space finite.
+fn glob_patterns_overlap(left: &str, right: &str, delimiter: char) -> bool {
+    let left = tokenize_glob(left);
+    let right = tokenize_glob(right);
+    let mut queue = VecDeque::from([(0_usize, 0_usize)]);
+    let mut seen = HashSet::new();
+
+    while let Some((left_index, right_index)) = queue.pop_front() {
+        if !seen.insert((left_index, right_index)) {
+            continue;
+        }
+        if left_index == left.len() && right_index == right.len() {
+            return true;
+        }
+
+        if matches!(left.get(left_index), Some(GlobToken::Star { .. })) {
+            queue.push_back((left_index + 1, right_index));
+        }
+        if matches!(right.get(right_index), Some(GlobToken::Star { .. })) {
+            queue.push_back((left_index, right_index + 1));
+        }
+
+        let Some(left_token) = left.get(left_index) else {
+            continue;
+        };
+        let Some(right_token) = right.get(right_index) else {
+            continue;
+        };
+        if tokens_share_character(*left_token, *right_token, delimiter) {
+            let next_left = if matches!(left_token, GlobToken::Star { .. }) {
+                left_index
+            } else {
+                left_index + 1
+            };
+            let next_right = if matches!(right_token, GlobToken::Star { .. }) {
+                right_index
+            } else {
+                right_index + 1
+            };
+            queue.push_back((next_left, next_right));
+        }
+    }
+    false
+}
+
+fn tokens_share_character(left: GlobToken, right: GlobToken, delimiter: char) -> bool {
+    match (left, right) {
+        (GlobToken::Literal(left), GlobToken::Literal(right)) => left == right,
+        (GlobToken::Literal(value), GlobToken::Star { crosses_delimiter })
+        | (GlobToken::Star { crosses_delimiter }, GlobToken::Literal(value)) => {
+            crosses_delimiter || value != delimiter
+        }
+        (
+            GlobToken::Star {
+                crosses_delimiter: _,
+            },
+            GlobToken::Star {
+                crosses_delimiter: _,
+            },
+        ) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openshell_core::proto::{NetworkBinary, NetworkPolicyRule};
+
+    fn endpoint(host: &str, port: u32) -> NetworkEndpoint {
+        NetworkEndpoint {
+            host: host.to_string(),
+            port,
+            ..Default::default()
+        }
+    }
+
+    fn policy_with(left: NetworkEndpoint, right: NetworkEndpoint) -> SandboxPolicy {
+        let mut policy = SandboxPolicy::default();
+        policy.network_policies.insert(
+            "left".to_string(),
+            NetworkPolicyRule {
+                name: "left".to_string(),
+                endpoints: vec![left],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        policy.network_policies.insert(
+            "right".to_string(),
+            NetworkPolicyRule {
+                name: "right".to_string(),
+                endpoints: vec![right],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/bash".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        policy
+    }
+
+    #[test]
+    fn exact_and_wildcard_hosts_overlap() {
+        assert!(host_patterns_overlap("api.example.com", "*.example.com"));
+        assert!(host_patterns_overlap(
+            "us-aiplatform.googleapis.com",
+            "*-aiplatform.googleapis.com"
+        ));
+        assert!(!host_patterns_overlap("api.example.com", "*.other.com"));
+    }
+
+    #[test]
+    fn intersecting_wildcards_are_detected() {
+        assert!(host_patterns_overlap("*.example.com", "api.*.com"));
+        assert!(host_patterns_overlap("**.example.com", "api.example.com"));
+        assert!(!host_patterns_overlap("*.example.com", "*.example.org"));
+    }
+
+    #[test]
+    fn disjoint_ports_do_not_overlap() {
+        let mut left = endpoint("api.example.com", 443);
+        left.tls = "skip".to_string();
+        let right = endpoint("api.example.com", 8443);
+        assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
+    }
+
+    #[test]
+    fn compatible_request_rules_may_overlap() {
+        let mut left = endpoint("api.example.com", 443);
+        left.protocol = "rest".to_string();
+        left.tls = "skip".to_string();
+        let mut right = left.clone();
+        left.access = "read-only".to_string();
+        right.access = "read-write".to_string();
+
+        assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
+    }
+
+    #[test]
+    fn disjoint_path_specific_protocols_may_overlap() {
+        let mut left = endpoint("api.example.com", 443);
+        left.path = "/graphql".to_string();
+        left.protocol = "graphql".to_string();
+        let mut right = endpoint("api.example.com", 443);
+        right.path = "/repos/**".to_string();
+        right.protocol = "rest".to_string();
+
+        assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
+    }
+
+    #[test]
+    fn exact_wildcard_tls_conflict_is_rejected() {
+        let mut left = endpoint("*.example.com", 443);
+        left.tls = "skip".to_string();
+        let right = endpoint("api.example.com", 443);
+        let ambiguities = find_endpoint_ambiguities(&policy_with(left, right));
+
+        assert_eq!(ambiguities.len(), 1);
+        assert!(ambiguities[0].conflicts[0].contains("tls"));
+        assert!(ambiguities[0].to_string().contains("left"));
+        assert!(ambiguities[0].to_string().contains("right"));
+    }
+
+    #[test]
+    fn allowed_ip_conflict_is_rejected_regardless_of_order() {
+        let mut left = endpoint("api.example.com", 443);
+        left.allowed_ips = vec!["10.0.1.0/24".to_string(), "10.0.0.0/24".to_string()];
+        let mut compatible = endpoint("api.example.com", 443);
+        compatible.allowed_ips = vec!["10.0.0.0/24".to_string(), "10.0.1.0/24".to_string()];
+        assert!(find_endpoint_ambiguities(&policy_with(left.clone(), compatible)).is_empty());
+
+        let mut conflicting = endpoint("api.example.com", 443);
+        conflicting.allowed_ips = vec!["10.0.2.0/24".to_string()];
+        let ambiguities = find_endpoint_ambiguities(&policy_with(left, conflicting));
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("allowed_ips"))
+        );
+    }
+
+    #[test]
+    fn credential_and_parser_conflicts_are_rejected_on_same_path() {
+        let mut left = endpoint("api.example.com", 443);
+        left.protocol = "rest".to_string();
+        left.credential_signing = "sigv4".to_string();
+        left.signing_service = "execute-api".to_string();
+        let mut right = left.clone();
+        right.signing_service = "bedrock".to_string();
+        right.allow_encoded_slash = true;
+
+        let ambiguities = find_endpoint_ambiguities(&policy_with(left, right));
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("signing_service"))
+        );
+        assert!(
+            ambiguities[0]
+                .conflicts
+                .iter()
+                .any(|field| field.contains("allow_encoded_slash"))
+        );
+    }
+
+    #[test]
+    fn different_binary_lists_do_not_hide_endpoint_ambiguity() {
+        let mut left = endpoint("api.example.com", 443);
+        left.tls = "skip".to_string();
+        let right = endpoint("api.example.com", 443);
+
+        assert_eq!(
+            find_endpoint_ambiguities(&policy_with(left, right)).len(),
+            1
+        );
+    }
+}
