@@ -542,9 +542,11 @@ async fn build_credential_set_for_sandbox_with_catalog(
 
         let provider_type = provider.r#type.trim();
         let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
-        let Some(profile) =
-            super::provider::get_provider_type_profile_with_catalog(catalog, profile_id)
-        else {
+        let Some(profile) = super::provider::get_provider_type_profile_for_scope(
+            catalog,
+            profile_id,
+            &provider.profile_workspace,
+        ) else {
             warn!(
                 provider_name = %name,
                 provider_type,
@@ -1502,9 +1504,11 @@ async fn profile_provider_policy_layers_with_catalog(
 
         let provider_type = provider.r#type.trim();
         let profile_id = normalize_provider_type(provider_type).unwrap_or(provider_type);
-        let Some(profile) =
-            super::provider::get_provider_type_profile_with_catalog(catalog, profile_id)
-        else {
+        let Some(profile) = super::provider::get_provider_type_profile_for_scope(
+            catalog,
+            profile_id,
+            &provider.profile_workspace,
+        ) else {
             warn!(
                 provider_name = %name,
                 provider_type,
@@ -5428,6 +5432,79 @@ mod tests {
         assert!(
             git_transport.deny_rules.is_empty(),
             "composed git transport should block push via its narrow allow set, not deny rules"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_policy_layers_respect_profile_workspace_scope() {
+        let store = test_store().await;
+
+        let make_stored_profile =
+            |id: &str, workspace: &str, host: &str| openshell_core::proto::StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("profile-{id}-{workspace}"),
+                    name: id.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                    annotations: HashMap::new(),
+                    workspace: workspace.to_string(),
+                    deletion_timestamp_ms: 0,
+                }),
+                profile: Some(openshell_core::proto::ProviderProfile {
+                    id: id.to_string(),
+                    display_name: format!("{host} profile"),
+                    endpoints: vec![NetworkEndpoint {
+                        host: host.to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            };
+
+        store
+            .put_message(&make_stored_profile(
+                "scope-api",
+                "",
+                "platform.example.com",
+            ))
+            .await
+            .unwrap();
+        store
+            .put_message(&make_stored_profile(
+                "scope-api",
+                "default",
+                "workspace.example.com",
+            ))
+            .await
+            .unwrap();
+
+        let mut global_provider = test_provider("global-prov", "scope-api");
+        global_provider.profile_workspace = String::new();
+        store.put_message(&global_provider).await.unwrap();
+
+        let normal_provider = test_provider("normal-prov", "scope-api");
+        store.put_message(&normal_provider).await.unwrap();
+
+        let global_layers =
+            profile_provider_policy_layers(&store, "default", &["global-prov".to_string()])
+                .await
+                .unwrap();
+        assert_eq!(global_layers.len(), 1);
+        assert_eq!(
+            global_layers[0].rule.endpoints[0].host, "platform.example.com",
+            "provider with profile_workspace='' should resolve the platform profile"
+        );
+
+        let normal_layers =
+            profile_provider_policy_layers(&store, "default", &["normal-prov".to_string()])
+                .await
+                .unwrap();
+        assert_eq!(normal_layers.len(), 1);
+        assert_eq!(
+            normal_layers[0].rule.endpoints[0].host, "workspace.example.com",
+            "provider with profile_workspace='default' should resolve the workspace profile"
         );
     }
 

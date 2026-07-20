@@ -650,7 +650,9 @@ pub(super) async fn resolve_dynamic_credentials_with_catalog(
 
         let profile_id =
             normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
-        let Some(profile) = get_provider_type_profile_with_catalog(catalog, profile_id) else {
+        let Some(profile) =
+            get_provider_type_profile_for_scope(catalog, profile_id, &provider.profile_workspace)
+        else {
             continue;
         };
 
@@ -1092,7 +1094,9 @@ fn dynamic_token_grant_bindings_for_provider_with_catalog(
 ) -> Vec<DynamicTokenGrantBinding> {
     let provider_name = provider.object_name().to_string();
     let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
-    let Some(profile) = get_provider_type_profile_with_catalog(catalog, profile_id) else {
+    let Some(profile) =
+        get_provider_type_profile_for_scope(catalog, profile_id, &provider.profile_workspace)
+    else {
         return Vec::new();
     };
     dynamic_token_grant_bindings_for_profile(&provider_name, &profile.to_proto())
@@ -1759,6 +1763,14 @@ pub(super) fn get_provider_type_profile_with_catalog(
     catalog.get_type_profile(id)
 }
 
+pub(super) fn get_provider_type_profile_for_scope(
+    catalog: &EffectiveProviderProfileCatalog,
+    id: &str,
+    profile_workspace: &str,
+) -> Option<ProviderTypeProfile> {
+    catalog.get_type_profile_for_scope(id, profile_workspace)
+}
+
 #[cfg(test)]
 pub(super) async fn get_provider_type_profile(
     store: &Store,
@@ -1796,7 +1808,11 @@ fn provider_refresh_defaults(
     provider: &Provider,
     credential_key: &str,
 ) -> Option<CredentialRefreshProfile> {
-    let profile = get_provider_type_profile_with_catalog(catalog, &provider.r#type)?;
+    let profile = get_provider_type_profile_for_scope(
+        catalog,
+        &provider.r#type,
+        &provider.profile_workspace,
+    )?;
     profile
         .credentials
         .iter()
@@ -1819,7 +1835,9 @@ fn resolved_additional_output_keys(
     provider: &Provider,
     credential_key: &str,
 ) -> HashMap<String, String> {
-    let Some(profile) = get_provider_type_profile_with_catalog(catalog, &provider.r#type) else {
+    let Some(profile) =
+        get_provider_type_profile_for_scope(catalog, &provider.r#type, &provider.profile_workspace)
+    else {
         return HashMap::new();
     };
     profile.resolved_additional_output_keys(credential_key)
@@ -9280,6 +9298,104 @@ mod tests {
         assert!(
             !resp.profiles.iter().any(|p| p.id == "ws-only"),
             "workspace profile should NOT appear in global list"
+        );
+    }
+
+    #[tokio::test]
+    async fn global_profile_provider_resolves_platform_profile_at_runtime() {
+        let state = test_server_state().await;
+
+        let mut platform_profile = custom_profile("scope-test");
+        platform_profile.display_name = "Platform Version".to_string();
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(platform_profile),
+                    source: "scope-test.yaml".to_string(),
+                }],
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut ws_profile = custom_profile("scope-test");
+        ws_profile.display_name = "Workspace Version".to_string();
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(ws_profile),
+                    source: "scope-test.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .unwrap();
+
+        let global_result = catalog.get_type_profile_for_scope("scope-test", "");
+        assert!(global_result.is_some());
+        assert_eq!(
+            global_result.unwrap().display_name,
+            "Platform Version",
+            "provider with profile_workspace='' should resolve platform profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_provider_resolves_workspace_shadow_at_runtime() {
+        let state = test_server_state().await;
+
+        let mut platform_profile = custom_profile("scope-test-ws");
+        platform_profile.display_name = "Platform Version".to_string();
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(platform_profile),
+                    source: "scope-test-ws.yaml".to_string(),
+                }],
+                workspace: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut ws_profile = custom_profile("scope-test-ws");
+        ws_profile.display_name = "Workspace Version".to_string();
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(ws_profile),
+                    source: "scope-test-ws.yaml".to_string(),
+                }],
+                workspace: "default".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let catalog = state
+            .provider_profile_sources
+            .snapshot_catalog(state.store.as_ref(), "default")
+            .await
+            .unwrap();
+
+        let ws_result = catalog.get_type_profile_for_scope("scope-test-ws", "default");
+        assert!(ws_result.is_some());
+        assert_eq!(
+            ws_result.unwrap().display_name,
+            "Workspace Version",
+            "provider with profile_workspace='default' should resolve workspace profile"
         );
     }
 }

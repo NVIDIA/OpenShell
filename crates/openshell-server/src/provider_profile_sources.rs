@@ -434,6 +434,31 @@ impl EffectiveProviderProfileCatalog {
             .map(|entry| entry.effective.profile.clone())
     }
 
+    pub(crate) fn get_type_profile_for_scope(
+        &self,
+        id: &str,
+        profile_workspace: &str,
+    ) -> Option<ProviderTypeProfile> {
+        let id = normalize_profile_id(id)?;
+        let entry = self.profiles.get(&id)?;
+
+        if entry.effective.scope == ProfileScope::Static {
+            return Some(entry.effective.profile.clone());
+        }
+
+        if profile_workspace.is_empty() {
+            match &entry.platform_fallback {
+                Some(fallback) => Some(fallback.profile.clone()),
+                None if entry.effective.scope == ProfileScope::Platform => {
+                    Some(entry.effective.profile.clone())
+                }
+                None => None,
+            }
+        } else {
+            Some(entry.effective.profile.clone())
+        }
+    }
+
     pub(crate) fn static_source_for_profile(&self, id: &str) -> Option<String> {
         let id = normalize_profile_id(id)?;
         self.profiles
@@ -1576,5 +1601,117 @@ mod tests {
         let entry = catalog.profiles.get("my-api").unwrap();
         assert_eq!(entry.effective.scope, ProfileScope::Workspace);
         assert!(entry.platform_fallback.is_some());
+    }
+
+    #[test]
+    fn scope_lookup_empty_pw_returns_platform_when_shadowed() {
+        let mut ws_profile = profile("anthropic");
+        ws_profile.display_name = "Workspace Anthropic".to_string();
+        let mut plat_profile = profile("anthropic");
+        plat_profile.display_name = "Platform Anthropic".to_string();
+
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![
+                ScopedSnapshotProfile {
+                    scope: ProfileScope::Platform,
+                    profile: plat_profile,
+                },
+                ScopedSnapshotProfile {
+                    scope: ProfileScope::Workspace,
+                    profile: ws_profile,
+                },
+            ],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        let result = catalog.get_type_profile_for_scope("anthropic", "");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().display_name, "Platform Anthropic");
+    }
+
+    #[test]
+    fn scope_lookup_empty_pw_returns_platform_when_no_shadow() {
+        let mut plat_profile = profile("anthropic");
+        plat_profile.display_name = "Platform Anthropic".to_string();
+
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![ScopedSnapshotProfile {
+                scope: ProfileScope::Platform,
+                profile: plat_profile,
+            }],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        let result = catalog.get_type_profile_for_scope("anthropic", "");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().display_name, "Platform Anthropic");
+    }
+
+    #[test]
+    fn scope_lookup_empty_pw_returns_none_when_only_workspace() {
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![scoped(ProfileScope::Workspace, "anthropic")],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        let result = catalog.get_type_profile_for_scope("anthropic", "");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn scope_lookup_empty_pw_returns_static() {
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "builtin".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![scoped(ProfileScope::Static, "anthropic")],
+            user_managed: false,
+            allow_empty: false,
+        }])
+        .unwrap();
+
+        let result = catalog.get_type_profile_for_scope("anthropic", "");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn scope_lookup_nonempty_pw_returns_effective() {
+        let mut ws_profile = profile("anthropic");
+        ws_profile.display_name = "Workspace Anthropic".to_string();
+        let mut plat_profile = profile("anthropic");
+        plat_profile.display_name = "Platform Anthropic".to_string();
+
+        let catalog = build_effective_profiles(vec![CollectedProviderProfileSnapshot {
+            source_id: "user".to_string(),
+            revision: "v1".to_string(),
+            profiles: vec![
+                ScopedSnapshotProfile {
+                    scope: ProfileScope::Platform,
+                    profile: plat_profile,
+                },
+                ScopedSnapshotProfile {
+                    scope: ProfileScope::Workspace,
+                    profile: ws_profile,
+                },
+            ],
+            user_managed: true,
+            allow_empty: true,
+        }])
+        .unwrap();
+
+        let result = catalog.get_type_profile_for_scope("anthropic", "default");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().display_name, "Workspace Anthropic");
     }
 }
