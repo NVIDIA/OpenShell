@@ -22,6 +22,22 @@ drive client provisioning UI, the driver attaches the shared
 clients to parse Kubernetes reasons, VM cache states, or other driver-local
 reason strings.
 
+## VM Rootfs Preparation Boundary
+
+The VM driver prepares an image rootfs and then launches it with the selected
+VM runtime. `openshell-driver-vm::provisioning` makes that hand-off explicit:
+
+```text
+existing VM image acquisition -> UnpackedImage -> VmRootfsImage
+                                                |
+                                                v
+                                         existing VM launch path
+```
+
+`VmRootfsMaterializer` adapts the existing rootfs preparation and ext4 image
+construction functions. Both cached-image paths use it before handing the
+resulting ext4 image to the existing VM launch path.
+
 The capability RPC reports driver identity, version, and the default sandbox
 image used by the gateway. GPU availability stays driver-local and is validated
 when a sandbox create request asks for GPU resources.

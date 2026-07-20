@@ -8,10 +8,10 @@ use crate::lifecycle::{
     BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
     RestoreContext, extension_state_dir,
 };
+use crate::provisioning::{RootfsMaterializationRequest, UnpackedImage, VmRootfsMaterializer};
 use crate::rootfs::{
-    clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
-    set_rootfs_image_file_mode, write_rootfs_image_file,
+    clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, extract_rootfs_archive_to,
+    sandbox_guest_init_path, set_rootfs_image_file_mode, write_rootfs_image_file,
 };
 use crate::runtime::VmBackend;
 use bollard::Docker;
@@ -2548,7 +2548,6 @@ impl VmDriver {
         let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
         let exported_rootfs = staging_dir.join(IMAGE_EXPORT_ROOTFS_ARCHIVE);
         let prepared_rootfs = staging_dir.join("rootfs");
-        let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
 
         tokio::fs::create_dir_all(image_cache_root_dir(&self.config.state_dir))
             .await
@@ -2589,8 +2588,6 @@ impl VmDriver {
             return Err(err);
         }
 
-        let image_ref_owned = image_ref.to_string();
-        let image_identity_owned = image_identity.to_string();
         let exported_rootfs_for_build = exported_rootfs.clone();
         let prepared_rootfs_for_build = prepared_rootfs.clone();
         let sandbox_uid = self.config.resolve_sandbox_uid();
@@ -2608,22 +2605,13 @@ impl VmDriver {
                 ("sandbox_uid".to_string(), sandbox_uid.to_string()),
             ]),
         );
-        let prepare_result = tokio::task::spawn_blocking(move || {
-            extract_rootfs_archive_to(&exported_rootfs_for_build, &prepared_rootfs_for_build)?;
-            prepare_sandbox_rootfs_from_image_root(
-                &prepared_rootfs_for_build,
-                &image_identity_owned,
-                sandbox_uid,
-                sandbox_gid,
-            )
-            .map_err(|err| {
-                format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
-            })
+        let extract_result = tokio::task::spawn_blocking(move || {
+            extract_rootfs_archive_to(&exported_rootfs_for_build, &prepared_rootfs_for_build)
         })
         .await
-        .map_err(|err| Status::internal(format!("local image preparation panicked: {err}")))?;
+        .map_err(|err| Status::internal(format!("local image extraction panicked: {err}")))?;
 
-        if let Err(err) = prepare_result {
+        if let Err(err) = extract_result {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
             return Err(Status::failed_precondition(err));
         }
@@ -2638,18 +2626,26 @@ impl VmDriver {
                 ("image_identity".to_string(), image_identity.to_string()),
             ]),
         );
-        let prepared_rootfs_for_build = prepared_rootfs.clone();
-        let prepared_image_for_build = prepared_image.clone();
+        let materialize_request = RootfsMaterializationRequest {
+            image_ref: image_ref.to_string(),
+            work_dir: staging_dir.clone(),
+            sandbox_uid,
+            sandbox_gid,
+        };
+        let unpacked_image = UnpackedImage::new(image_identity, prepared_rootfs.clone());
         let build_result = tokio::task::spawn_blocking(move || {
-            create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
+            VmRootfsMaterializer.materialize(&materialize_request, &unpacked_image)
         })
         .await
         .map_err(|err| Status::internal(format!("rootfs image build panicked: {err}")))?;
 
-        if let Err(err) = build_result {
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(Status::failed_precondition(err));
-        }
+        let prepared_image = match build_result {
+            Ok(artifact) => artifact.disk_path().to_path_buf(),
+            Err(err) => {
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(Status::failed_precondition(err));
+            }
+        };
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -2677,7 +2673,6 @@ impl VmDriver {
         let image_path = image_cache_rootfs_image(&self.config.state_dir, image_identity);
         let staging_dir = image_cache_staging_dir(&self.config.state_dir, image_identity);
         let prepared_rootfs = staging_dir.join("rootfs");
-        let prepared_image = staging_dir.join(IMAGE_CACHE_ROOTFS_IMAGE);
 
         tokio::fs::create_dir_all(image_cache_root_dir(&self.config.state_dir))
             .await
@@ -2731,9 +2726,6 @@ impl VmDriver {
             "vm driver: image layers pulled, preparing rootfs image"
         );
 
-        let image_ref_owned = image_ref.to_string();
-        let image_identity_owned = image_identity.to_string();
-        let prepared_rootfs_for_build = prepared_rootfs.clone();
         let sandbox_uid = self.config.resolve_sandbox_uid();
         let sandbox_gid = self.config.resolve_sandbox_gid(sandbox_uid);
         self.publish_vm_progress(
@@ -2747,30 +2739,6 @@ impl VmDriver {
                 ("sandbox_uid".to_string(), sandbox_uid.to_string()),
             ]),
         );
-        let prepare_result = tokio::task::spawn_blocking(move || {
-            prepare_sandbox_rootfs_from_image_root(
-                &prepared_rootfs_for_build,
-                &image_identity_owned,
-                sandbox_uid,
-                sandbox_gid,
-            )
-            .map_err(|err| {
-                format!("vm sandbox image '{image_ref_owned}' is not base-compatible: {err}")
-            })
-        })
-        .await
-        .map_err(|err| Status::internal(format!("image rootfs preparation panicked: {err}")))?;
-
-        if let Err(err) = prepare_result {
-            warn!(
-                image_ref = %image_ref,
-                error = %err,
-                "vm driver: rootfs preparation failed"
-            );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(Status::failed_precondition(err));
-        }
-
         self.publish_vm_progress(
             sandbox_id,
             "CreatingRootDisk",
@@ -2781,23 +2749,31 @@ impl VmDriver {
                 ("image_identity".to_string(), image_identity.to_string()),
             ]),
         );
-        let prepared_rootfs_for_build = prepared_rootfs.clone();
-        let prepared_image_for_build = prepared_image.clone();
+        let materialize_request = RootfsMaterializationRequest {
+            image_ref: image_ref.to_string(),
+            work_dir: staging_dir.clone(),
+            sandbox_uid,
+            sandbox_gid,
+        };
+        let unpacked_image = UnpackedImage::new(image_identity, prepared_rootfs.clone());
         let build_result = tokio::task::spawn_blocking(move || {
-            create_rootfs_image_from_dir(&prepared_rootfs_for_build, &prepared_image_for_build)
+            VmRootfsMaterializer.materialize(&materialize_request, &unpacked_image)
         })
         .await
         .map_err(|err| Status::internal(format!("image rootfs build panicked: {err}")))?;
 
-        if let Err(err) = build_result {
-            warn!(
-                image_ref = %image_ref,
-                error = %err,
-                "vm driver: rootfs image build failed"
-            );
-            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
-            return Err(Status::failed_precondition(err));
-        }
+        let prepared_image = match build_result {
+            Ok(artifact) => artifact.disk_path().to_path_buf(),
+            Err(err) => {
+                warn!(
+                    image_ref = %image_ref,
+                    error = %err,
+                    "vm driver: rootfs image build failed"
+                );
+                let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+                return Err(Status::failed_precondition(err));
+            }
+        };
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
             info!(
