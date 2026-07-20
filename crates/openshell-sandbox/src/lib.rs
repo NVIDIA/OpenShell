@@ -23,6 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+use openshell_core::PolicyValidationFailureMode;
+
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
     DispositionId, FindingInfo, OcsfEvent, SandboxContext, SeverityId, StateId, StatusId,
@@ -2024,7 +2026,7 @@ async fn load_policy(
                 let engine = Arc::new(OpaEngine::from_proto(&proto_policy)?);
                 let disposition = apply_policy_validation_failure(
                     &engine,
-                    PolicyValidationFailureMode::from_settings(&snapshot.settings),
+                    snapshot.policy_validation_failure_mode,
                     has_last_valid_policy,
                     candidate_version,
                     &validation_error,
@@ -2635,39 +2637,6 @@ async fn reconcile_middleware_registry(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PolicyValidationFailureMode {
-    FailClosed,
-    RetainLastValid,
-}
-
-impl PolicyValidationFailureMode {
-    fn from_settings(
-        settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
-    ) -> Self {
-        match extract_string_setting(
-            settings,
-            openshell_core::settings::POLICY_VALIDATION_FAILURE_MODE_KEY,
-        ) {
-            Some(openshell_core::settings::POLICY_VALIDATION_FAILURE_MODE_RETAIN_LAST_VALID) => {
-                Self::RetainLastValid
-            }
-            _ => Self::FailClosed,
-        }
-    }
-
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::FailClosed => {
-                openshell_core::settings::POLICY_VALIDATION_FAILURE_MODE_FAIL_CLOSED
-            }
-            Self::RetainLastValid => {
-                openshell_core::settings::POLICY_VALIDATION_FAILURE_MODE_RETAIN_LAST_VALID
-            }
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 struct PolicyValidationFailureDisposition {
     configured_mode: PolicyValidationFailureMode,
@@ -2972,7 +2941,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             // fail-closed quarantine, so an explicit retain_last_valid selection
             // can reactivate it without accepting any part of the invalid policy.
             if !policy_changed && let Some(rejected) = rejected_policy_generation.as_mut() {
-                let mode = PolicyValidationFailureMode::from_settings(&result.settings);
+                let mode = result.policy_validation_failure_mode;
                 if mode != rejected.configured_mode {
                     let disposition = apply_policy_validation_failure(
                         &ctx.opa_engine,
@@ -3189,8 +3158,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                             ))
                             .build());
 
-                        let failure_mode =
-                            PolicyValidationFailureMode::from_settings(&result.settings);
+                        let failure_mode = result.policy_validation_failure_mode;
                         let disposition = apply_policy_validation_failure(
                             &ctx.opa_engine,
                             failure_mode,
@@ -3329,22 +3297,6 @@ fn apply_agent_proposals_enabled(
             ),
         }
     }
-}
-
-/// Extract a string value from an effective setting, if present.
-fn extract_string_setting<'a>(
-    settings: &'a std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
-    key: &str,
-) -> Option<&'a str> {
-    use openshell_core::proto::setting_value;
-    settings
-        .get(key)
-        .and_then(|es| es.value.as_ref())
-        .and_then(|sv| sv.value.as_ref())
-        .and_then(|value| match value {
-            setting_value::Value::StringValue(value) => Some(value.as_str()),
-            _ => None,
-        })
 }
 
 /// Log individual setting changes between two snapshots.
@@ -3772,6 +3724,7 @@ filesystem_policy:
             provider_env_revision: 0,
             supervisor_middleware_services: Vec::new(),
             workspace: String::new(),
+            policy_validation_failure_mode: PolicyValidationFailureMode::default(),
         }
     }
 
@@ -4071,41 +4024,6 @@ filesystem_policy:
             "workspace must survive the snapshot so sync_policy_and_fetch_snapshot receives it"
         );
     }
-
-     fn string_effective_setting(value: &str) -> openshell_core::proto::EffectiveSetting {
-        openshell_core::proto::EffectiveSetting {
-            value: Some(openshell_core::proto::SettingValue {
-                value: Some(openshell_core::proto::setting_value::Value::StringValue(
-                    value.to_string(),
-                )),
-            }),
-            scope: openshell_core::proto::SettingScope::Global.into(),
-        }
-    }
-
-    #[test]
-    fn policy_validation_failure_mode_defaults_to_fail_closed() {
-        let settings = std::collections::HashMap::new();
-        assert_eq!(
-            PolicyValidationFailureMode::from_settings(&settings),
-            PolicyValidationFailureMode::FailClosed
-        );
-    }
-
-    #[test]
-    fn policy_validation_failure_mode_requires_explicit_retain_setting() {
-        let settings = std::collections::HashMap::from([(
-            openshell_core::settings::POLICY_VALIDATION_FAILURE_MODE_KEY.to_string(),
-            string_effective_setting(
-                openshell_core::settings::POLICY_VALIDATION_FAILURE_MODE_RETAIN_LAST_VALID,
-            ),
-        )]);
-        assert_eq!(
-            PolicyValidationFailureMode::from_settings(&settings),
-            PolicyValidationFailureMode::RetainLastValid
-        );
-    }
-
     #[test]
     fn fail_closed_validation_failure_deactivates_previous_generation() {
         let engine = OpaEngine::from_strings(

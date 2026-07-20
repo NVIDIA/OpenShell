@@ -214,6 +214,7 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.oidc.rolesClaim | string | `""` | Dot-separated path to the roles array in the JWT claims. Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups". |
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
+| server.policyValidationFailureMode | string | `"fail_closed"` | Posture when a candidate sandbox policy fails validation. `fail_closed` deactivates the previous policy; `retain_last_valid` keeps it active. |
 | server.providerTokenGrants.spiffe.enabled | bool | `false` | Mount the SPIFFE Workload API socket into sandbox pods for dynamic provider token grants. |
 | server.providerTokenGrants.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` | Path to the SPIFFE Workload API socket mounted into sandbox pods. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |

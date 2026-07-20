@@ -205,25 +205,23 @@ The following steps outline the hot-reload policy update workflow.
 
 OpenShell validates a complete candidate policy before activating any part of it. Endpoints may overlap when their connection and request-processing metadata agree. For example, two `api.example.com:443` REST entries can contribute different allow and deny rules when they use the same TLS, destination, credential, parser, and enforcement settings. OpenShell rejects the candidate when overlapping exact or wildcard host selectors disagree on those fields. Path-scoped endpoints may use different protocols only when their path selectors cannot match the same request.
 
-The gateway-global `policy_validation_failure_mode` setting determines what happens after rejection. Its default is `fail_closed`:
+The gateway's `policy_validation_failure_mode` configuration determines what happens after rejection. Set it under `[openshell.gateway]` in `gateway.toml`. Its default is `fail_closed`:
 
-```shell
-openshell settings set --global \
-  --key policy_validation_failure_mode \
-  --value fail_closed
+```toml
+[openshell.gateway]
+policy_validation_failure_mode = "fail_closed"
 ```
 
 In `fail_closed` mode, the supervisor publishes a quarantine generation, denies new egress, and closes connections pinned to the previous generation. The previous policy is not active. A later valid policy exits quarantine automatically.
 
 Operators that explicitly prioritize availability can retain the previous generation:
 
-```shell
-openshell settings set --global \
-  --key policy_validation_failure_mode \
-  --value retain_last_valid
+```toml
+[openshell.gateway]
+policy_validation_failure_mode = "retain_last_valid"
 ```
 
-In `retain_last_valid` mode, the rejected candidate remains inactive and the previous valid generation remains active. If no previous valid generation exists, such as during initial startup, OpenShell still fails closed. The setting is gateway-global and cannot be overridden by an individual sandbox.
+In `retain_last_valid` mode, the rejected candidate remains inactive and the previous valid generation remains active. If no previous valid generation exists, such as during initial startup, OpenShell still fails closed. Restart the gateway after changing `gateway.toml`; connected sandbox supervisors receive the configured posture from the restarted gateway. Individual sandboxes cannot override it.
 
 OCSF configuration and finding events identify the rejected candidate, validation rationale, configured and effective modes, active generation, and whether the previous policy is active. When `retain_last_valid` is configured without a previous valid generation, the effective mode remains `fail_closed`. Connection denials during quarantine include the validation failure as their policy denial rationale.
 

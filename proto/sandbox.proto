@@ -367,6 +367,10 @@ message GetSandboxConfigResponse {
   // Workspace the sandbox belongs to. Allows the supervisor to learn its
   // workspace context for subsequent workspace-scoped RPCs.
   string workspace = 10;
+  // Gateway-configured posture for rejected policy generations. Valid values
+  // are "fail_closed" and "retain_last_valid". Unknown or empty values must
+  // be treated as fail_closed by the supervisor.
+  string policy_validation_failure_mode = 11;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

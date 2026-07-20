@@ -104,13 +104,14 @@ deny rules only when their connection and request-processing metadata agree;
 conflicting TLS, destination, credential, parser, or enforcement metadata
 rejects the complete generation.
 
-The gateway-global `policy_validation_failure_mode` setting controls rejected
-generations. It defaults to `fail_closed`, which publishes a quarantine
+The `[openshell.gateway] policy_validation_failure_mode` configuration controls
+rejected generations. It defaults to `fail_closed`, which publishes a quarantine
 generation, denies new egress, invalidates existing relays, and leaves the
 previous policy inactive. Operators may explicitly select
 `retain_last_valid`, which keeps the previous generation active. With no
 previous valid generation, the effective mode remains `fail_closed` regardless
-of the configured mode. OCSF configuration and finding events state the
+of the configured mode. The gateway distributes this startup configuration to
+sandbox supervisors with each effective policy snapshot. OCSF configuration and finding events state the
 candidate version, validation rationale, configured and effective modes, active
 generation, and whether the previous policy is active. Static controls,
 such as filesystem allowlists and process identity, require a new sandbox

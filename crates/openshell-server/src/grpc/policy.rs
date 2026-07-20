@@ -1423,11 +1423,12 @@ pub(super) async fn handle_get_sandbox_config(
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
     let supervisor_middleware_services =
         state.middleware_registry.required_services(policy.as_ref());
-    let config_revision = compute_config_revision(
+    let config_revision = compute_config_revision_with_validation_mode(
         policy.as_ref(),
         &settings,
         policy_source,
         &supervisor_middleware_services,
+        state.config.policy_validation_failure_mode,
     );
     let provider_env_revision = compute_provider_env_revision_with_catalog(
         state.store.as_ref(),
@@ -1448,6 +1449,11 @@ pub(super) async fn handle_get_sandbox_config(
         provider_env_revision,
         supervisor_middleware_services,
         workspace,
+        policy_validation_failure_mode: state
+            .config
+            .policy_validation_failure_mode
+            .as_str()
+            .to_string(),
     }))
 }
 
@@ -1731,10 +1737,6 @@ async fn handle_update_config_inner(
             "one of policy, setting_key, or merge_operations must be provided",
         ));
     }
-    if has_setting {
-        validate_setting_scope(key, req.global)?;
-    }
-
     if req.global {
         if !req.annotations.is_empty() {
             return Err(Status::invalid_argument(
@@ -3695,14 +3697,16 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
 }
 
 /// Compute a fingerprint for the effective sandbox configuration.
-fn compute_config_revision(
+fn compute_config_revision_with_validation_mode(
     policy: Option<&ProtoSandboxPolicy>,
     settings: &HashMap<String, EffectiveSetting>,
     policy_source: PolicySource,
     supervisor_middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
+    policy_validation_failure_mode: openshell_core::PolicyValidationFailureMode,
 ) -> u64 {
     let mut hasher = Sha256::new();
     hasher.update((policy_source as i32).to_le_bytes());
+    hasher.update(policy_validation_failure_mode.as_str().as_bytes());
     if let Some(policy) = policy {
         hasher.update(deterministic_policy_hash(policy).as_bytes());
     }
@@ -3742,6 +3746,22 @@ fn compute_config_revision(
     let mut bytes = [0_u8; 8];
     bytes.copy_from_slice(&digest[..8]);
     u64::from_le_bytes(bytes)
+}
+
+#[cfg(test)]
+fn compute_config_revision(
+    policy: Option<&ProtoSandboxPolicy>,
+    settings: &HashMap<String, EffectiveSetting>,
+    policy_source: PolicySource,
+    supervisor_middleware_services: &[openshell_core::proto::SupervisorMiddlewareService],
+) -> u64 {
+    compute_config_revision_with_validation_mode(
+        policy,
+        settings,
+        policy_source,
+        supervisor_middleware_services,
+        openshell_core::PolicyValidationFailureMode::default(),
+    )
 }
 
 fn decode_draft_chunk_rule(record: &DraftChunkRecord) -> Result<Option<NetworkPolicyRule>, Status> {
@@ -4324,16 +4344,6 @@ fn validate_registered_setting_key(
             settings::registered_keys_csv()
         ))
     })
-}
-
-fn validate_setting_scope(key: &str, global: bool) -> Result<(), Status> {
-    if key == settings::POLICY_VALIDATION_FAILURE_MODE_KEY && !global {
-        return Err(Status::invalid_argument(format!(
-            "setting '{}' is gateway-global and must be configured with --global",
-            settings::POLICY_VALIDATION_FAILURE_MODE_KEY
-        )));
-    }
-    Ok(())
 }
 
 fn proto_setting_to_stored(key: &str, value: &SettingValue) -> Result<StoredSettingValue, Status> {
@@ -11758,6 +11768,28 @@ mod tests {
     }
 
     #[test]
+    fn config_revision_changes_when_validation_failure_mode_changes() {
+        let policy = ProtoSandboxPolicy::default();
+        let settings = HashMap::new();
+
+        let fail_closed = compute_config_revision_with_validation_mode(
+            Some(&policy),
+            &settings,
+            PolicySource::Sandbox,
+            &[],
+            openshell_core::PolicyValidationFailureMode::FailClosed,
+        );
+        let retain_last_valid = compute_config_revision_with_validation_mode(
+            Some(&policy),
+            &settings,
+            PolicySource::Sandbox,
+            &[],
+            openshell_core::PolicyValidationFailureMode::RetainLastValid,
+        );
+        assert_ne!(fail_closed, retain_last_valid);
+    }
+
+    #[test]
     fn config_revision_changes_when_supervisor_middleware_services_change() {
         let policy = ProtoSandboxPolicy::default();
         let settings = HashMap::new();
@@ -12232,15 +12264,6 @@ mod tests {
         let err = validate_registered_setting_key("policy").unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("unknown setting key"));
-    }
-
-    #[test]
-    fn policy_validation_failure_mode_is_gateway_global_only() {
-        assert!(validate_setting_scope(settings::POLICY_VALIDATION_FAILURE_MODE_KEY, true).is_ok());
-        let error = validate_setting_scope(settings::POLICY_VALIDATION_FAILURE_MODE_KEY, false)
-            .expect_err("sandbox-scoped override must be rejected");
-        assert_eq!(error.code(), Code::InvalidArgument);
-        assert!(error.message().contains("must be configured with --global"));
     }
 
     #[test]
