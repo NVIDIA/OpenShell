@@ -870,6 +870,38 @@ fn build_forward_allow_ocsf_event(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn build_forward_policy_deny_ocsf_event(
+    peer_addr: SocketAddr,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    binary: &str,
+    pid: &str,
+    ancestors: &str,
+    cmdline: &str,
+    reason: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Other)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .http_request(HttpRequest::new(
+            method,
+            OcsfUrl::new("http", host, path, port),
+        ))
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+        .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
+        .firewall_rule("-", "opa")
+        .message(format!("FORWARD denied {method} {host}:{port}{path}"))
+        .status_detail(reason)
+        .build()
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn deny_connect_destination(
     client: &mut TcpStream,
     denial: &DestinationDenial,
@@ -1433,7 +1465,11 @@ async fn handle_tcp_connection(
             port = port,
             "tls: skip — bypassing TLS auto-detection, raw tunnel"
         );
-        relay::relay_tcp(&mut client, &mut upstream).await?;
+        let Some(generation_guard) = relay::prepare_raw_relay(l7_route, &opa_engine, &decision)
+        else {
+            return Ok(());
+        };
+        relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await?;
         return Ok(());
     }
 
@@ -1614,7 +1650,11 @@ async fn handle_tcp_connection(
             port = port,
             "Non-TLS non-HTTP traffic detected, raw tunnel"
         );
-        relay::relay_tcp(&mut client, &mut upstream).await?;
+        let Some(generation_guard) = relay::prepare_raw_relay(l7_route, &opa_engine, &decision)
+        else {
+            return Ok(());
+        };
+        relay::relay_tcp(&mut client, &mut upstream, &generation_guard, &ctx).await?;
     }
 
     Ok(())
@@ -3923,28 +3963,18 @@ async fn handle_forward_proxy(
     let matched_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
-            {
-                let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Other)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Medium)
-                    .status(StatusId::Failure)
-                    .http_request(HttpRequest::new(
-                        method,
-                        OcsfUrl::new("http", &host_lc, &path, port),
-                    ))
-                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                    .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-                    .actor_process(
-                        Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                            .with_cmd_line(&cmdline_str),
-                    )
-                    .firewall_rule("-", "opa")
-                    .message(format!("FORWARD denied {method} {host_lc}:{port}{path}"))
-                    .build();
-                ocsf_emit!(event);
-            }
+            ocsf_emit!(build_forward_policy_deny_ocsf_event(
+                workload_addr,
+                method,
+                &host_lc,
+                port,
+                &path,
+                &binary_str,
+                &pid_str,
+                &ancestors_str,
+                &cmdline_str,
+                reason,
+            ));
             emit_denial_simple(
                 denial_tx,
                 &host_lc,
@@ -4034,8 +4064,10 @@ async fn handle_forward_proxy(
     let mut l7_activity_pending = false;
 
     // 4b. If the endpoint has L7 config, evaluate the request against
-    //     L7 policy.  The forward proxy handles exactly one request per
-    //     connection (Connection: close), so a single evaluation suffices.
+    //     L7 policy. The forward proxy handles exactly one request per
+    //     connection, so a single evaluation suffices. The shared HTTP relay
+    //     strips hop-by-hop `Connection` headers and drops the upstream after
+    //     the response instead of asking the upstream to close it.
     hydrate_l7_route(&opa_engine, &mut decision);
     if let Some(route) = decision
         .endpoint
@@ -4774,28 +4806,18 @@ async fn handle_forward_proxy(
     // The request has now survived middleware, token grant, credential
     // rewriting, generation checks, and the HTTP relay. Only now record the
     // final allowed outcome.
-    {
-        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Other)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .http_request(HttpRequest::new(
-                method,
-                OcsfUrl::new("http", &host_lc, &path, port),
-            ))
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
-            .firewall_rule(policy_str, "opa")
-            .message(format!("FORWARD allowed {method} {host_lc}:{port}{path}"))
-            .build();
-        ocsf_emit!(event);
-    }
+    ocsf_emit!(build_forward_allow_ocsf_event(
+        workload_addr,
+        method,
+        &host_lc,
+        port,
+        &path,
+        &binary_str,
+        &pid_str,
+        &ancestors_str,
+        &cmdline_str,
+        policy_str,
+    ));
     emit_forward_success_activity(activity_tx, l7_activity_pending);
 
     if let crate::l7::provider::RelayOutcome::Upgraded {
@@ -5212,6 +5234,28 @@ network_policies: {}
         assert_eq!(body["error"], "policy_denied");
         assert!(body.get("reason").is_none());
     }
+
+    #[test]
+     fn forward_policy_denial_ocsf_includes_validation_rationale() {
+        let reason = "policy validation failed; fail-closed quarantine is active; candidate version 7 rejected: conflicting tls metadata";
+        let event = build_forward_policy_deny_ocsf_event(
+            "127.0.0.1:45123".parse().unwrap(),
+            "GET",
+            "api.example.com",
+            80,
+            "/v1/models",
+            "/usr/bin/curl",
+            "42",
+            "/usr/bin/bash",
+            "curl http://api.example.com/v1/models",
+            reason,
+        );
+        let json = event.to_json().unwrap();
+
+         assert_eq!(json["status_detail"], reason);
+         assert_eq!(json["action"], "Denied");
+         assert_eq!(json["disposition"], "Blocked");
+     }
 
     #[test]
     fn endpoint_only_opa_allows_declared_endpoint_without_process_identity() {

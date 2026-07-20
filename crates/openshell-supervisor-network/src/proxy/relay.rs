@@ -102,7 +102,7 @@ pub(super) fn pin_l7_evaluator(
 /// attempting to write an HTTP response into it.
 pub(super) fn prepare_http_relay<'a>(
     route: Option<&L7RouteSnapshot>,
-    opa_engine: &OpaEngine,
+    opa_engine: &'a OpaEngine,
     decision: &EgressDecision,
     request: &'a L7EvalContext,
 ) -> Option<RelayContext<'a>> {
@@ -152,6 +152,30 @@ pub(super) fn prepare_http_relay<'a>(
     })
 }
 
+/// Pin the generation used by a raw relay so policy activation or quarantine
+/// closes streams that otherwise have no request boundary at which to notice
+/// a stale decision.
+pub(super) fn prepare_raw_relay(
+    route: Option<&L7RouteSnapshot>,
+    opa_engine: &OpaEngine,
+    decision: &EgressDecision,
+) -> Option<PolicyGenerationGuard> {
+    let expected_generation = route.map_or(decision.l4_policy_generation, |route| {
+        route.l7_policy_generation
+    });
+    match pin_policy_generation(opa_engine, expected_generation) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            emit_l7_tunnel_close_after_policy_change(
+                &decision.intent.destination.host,
+                decision.intent.destination.port,
+                error,
+            );
+            None
+        }
+    }
+}
+
 /// Relay an HTTP/1 stream using an already-authorized, generation-pinned context.
 ///
 /// CONNECT plaintext and TLS-terminated streams both enter through this
@@ -168,48 +192,87 @@ where
 {
     match context.policy {
         PreparedHttpPolicy::Inspect { configs, evaluator } if configs.len() == 1 => {
-            crate::l7::relay::relay_with_inspection(
-                &configs[0],
-                *evaluator,
-                client,
-                upstream,
-                context.request,
-            )
-            .await
+            let generation_guard = evaluator.generation_guard().clone();
+            tokio::select! {
+                result = crate::l7::relay::relay_with_inspection(
+                    &configs[0],
+                    *evaluator,
+                    client,
+                    upstream,
+                    context.request,
+                ) => result,
+                () = generation_guard.wait_until_stale() => {
+                    emit_stale_relay_close(context.request, &generation_guard);
+                    Ok(())
+                }
+            }
         }
         PreparedHttpPolicy::Inspect { configs, evaluator } => {
-            crate::l7::relay::relay_with_route_selection(
-                &configs,
-                *evaluator,
-                client,
-                upstream,
-                context.request,
-            )
-            .await
+            let generation_guard = evaluator.generation_guard().clone();
+            tokio::select! {
+                result = crate::l7::relay::relay_with_route_selection(
+                    &configs,
+                    *evaluator,
+                    client,
+                    upstream,
+                    context.request,
+                ) => result,
+                () = generation_guard.wait_until_stale() => {
+                    emit_stale_relay_close(context.request, &generation_guard);
+                    Ok(())
+                }
+            }
         }
         PreparedHttpPolicy::Passthrough { generation_guard } => {
-            crate::l7::relay::relay_passthrough_with_credentials(
-                client,
-                upstream,
-                context.request,
-                &generation_guard,
-                Some(context.middleware_engine),
-            )
-            .await
+            tokio::select! {
+                result = crate::l7::relay::relay_passthrough_with_credentials(
+                    client,
+                    upstream,
+                    context.request,
+                    &generation_guard,
+                    Some(context.middleware_engine),
+                ) => result,
+                () = generation_guard.wait_until_stale() => {
+                    emit_stale_relay_close(context.request, &generation_guard);
+                    Ok(())
+                }
+            }
         }
     }
 }
 
 /// Relay a policy-authorized raw TCP stream.
-pub(super) async fn relay_tcp<C, U>(client: &mut C, upstream: &mut U) -> Result<()>
+pub(super) async fn relay_tcp<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    generation_guard: &PolicyGenerationGuard,
+    request: &L7EvalContext,
+) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio::io::copy_bidirectional(client, upstream)
-        .await
-        .into_diagnostic()?;
+    tokio::select! {
+        result = tokio::io::copy_bidirectional(client, upstream) => {
+            result.into_diagnostic()?;
+        }
+        () = generation_guard.wait_until_stale() => {
+            emit_stale_relay_close(request, generation_guard);
+        }
+    }
     Ok(())
+}
+
+fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard) {
+    emit_l7_tunnel_close_after_policy_change(
+        &request.host,
+        request.port,
+        miette::miette!(
+            "policy generation is stale [captured_generation:{} current_generation:{}]",
+            guard.captured_generation(),
+            guard.current_generation(),
+        ),
+    );
 }
 
 #[cfg(test)]
@@ -302,5 +365,31 @@ mod tests {
             prepare_http_relay(None, &engine, &decision, &request).is_none(),
             "policy reload must prevent a stale relay from starting"
         );
+    }
+
+    #[tokio::test]
+    async fn raw_relay_closes_immediately_when_fail_closed_generation_is_published() {
+        let engine = Arc::new(OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap());
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let request = request_context();
+        let (_client_peer, mut proxy_client) = tokio::io::duplex(64);
+        let (_upstream_peer, mut proxy_upstream) = tokio::io::duplex(64);
+
+        let relay = tokio::spawn(async move {
+            relay_tcp(&mut proxy_client, &mut proxy_upstream, &guard, &request).await
+        });
+        tokio::task::yield_now().await;
+
+        engine
+            .enter_fail_closed("candidate policy validation failed")
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("raw relay should close when its generation becomes stale")
+            .expect("relay task should not panic")
+            .expect("stale relay closure should be clean");
     }
 }

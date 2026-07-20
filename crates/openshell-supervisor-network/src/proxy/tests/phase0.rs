@@ -461,7 +461,8 @@ fn forward_rewrite_does_not_treat_a_pipelined_request_as_body_overflow() {
                 POST http://target.example/blocked HTTP/1.1\r\n\
                 Host: target.example\r\n\
                 Content-Length: 0\r\n\r\n";
-    let rewritten = rewrite_forward_request(raw, raw.len(), "/allowed", None, false).unwrap();
+    let rewritten =
+        rewrite_forward_request(raw, raw.len(), "/allowed", "target.example", None, false).unwrap();
     let rewritten = String::from_utf8(rewritten).unwrap();
 
     assert!(rewritten.starts_with("GET /allowed HTTP/1.1\r\n"));
@@ -477,7 +478,8 @@ fn forward_rewrite_trims_pipeline_after_content_length_body() {
                 body\
                 GET http://target.example/blocked HTTP/1.1\r\n\
                 Host: target.example\r\n\r\n";
-    let rewritten = rewrite_forward_request(raw, raw.len(), "/allowed", None, false).unwrap();
+    let rewritten =
+        rewrite_forward_request(raw, raw.len(), "/allowed", "target.example", None, false).unwrap();
     let rewritten = String::from_utf8(rewritten).unwrap();
 
     assert!(rewritten.ends_with("\r\n\r\nbody"));
@@ -492,7 +494,8 @@ fn forward_rewrite_trims_pipeline_after_complete_chunked_body() {
                 4\r\nbody\r\n0\r\n\r\n\
                 GET http://target.example/blocked HTTP/1.1\r\n\
                 Host: target.example\r\n\r\n";
-    let rewritten = rewrite_forward_request(raw, raw.len(), "/allowed", None, false).unwrap();
+    let rewritten =
+        rewrite_forward_request(raw, raw.len(), "/allowed", "target.example", None, false).unwrap();
     let rewritten = String::from_utf8(rewritten).unwrap();
 
     assert!(rewritten.ends_with("4\r\nbody\r\n0\r\n\r\n"));
