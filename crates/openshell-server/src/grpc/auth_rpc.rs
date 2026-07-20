@@ -16,9 +16,10 @@ use crate::ServerState;
 use crate::auth::principal::{
     Principal, RegisteredPodIdentity, SandboxIdentitySource, SandboxPrincipal,
 };
+use crate::warm_pod_activation::{load_sandbox, mint_pod_activation};
 use openshell_core::proto::{
     IssueSandboxTokenRequest, IssueSandboxTokenResponse, PodActivationMessage,
-    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RegisterSupervisorPodRequest, Sandbox,
+    RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RegisterSupervisorPodRequest,
 };
 use std::sync::Arc;
 use std::{pin::Pin, result::Result as StdResult};
@@ -38,8 +39,7 @@ pub async fn handle_issue_sandbox_token(
     // supervisors should use RegisterSupervisorPod so warm-pool activation can
     // later remain pending on the same bootstrap stream.
     let sandbox = require_k8s_bootstrap_sandbox(request.extensions(), "IssueSandboxToken")?;
-    let activation =
-        mint_cold_pod_activation(state, &sandbox.sandbox_id, "IssueSandboxToken").await?;
+    let activation = mint_pod_activation(state, &sandbox.sandbox_id, "IssueSandboxToken").await?;
     Ok(Response::new(IssueSandboxTokenResponse {
         token: activation.token,
         expires_at_ms: activation.token_expires_at_ms,
@@ -53,8 +53,7 @@ pub async fn handle_register_supervisor_pod(
 ) -> Result<Response<RegisterSupervisorPodStream>, Status> {
     let pod = require_registered_pod(request.extensions())?;
     if let Some(sandbox_id) = pod.sandbox_id.as_deref() {
-        let activation =
-            mint_cold_pod_activation(state, sandbox_id, "RegisterSupervisorPod").await?;
+        let activation = mint_pod_activation(state, sandbox_id, "RegisterSupervisorPod").await?;
         info!(
             sandbox_id = %activation.sandbox_id,
             pod = %pod.pod_name,
@@ -168,54 +167,6 @@ fn require_registered_pod(extensions: &tonic::Extensions) -> Result<RegisteredPo
     };
 
     Ok(pod)
-}
-
-async fn mint_cold_pod_activation(
-    state: &Arc<ServerState>,
-    sandbox_id: &str,
-    rpc_name: &'static str,
-) -> Result<PodActivationMessage, Status> {
-    let issuer = state.sandbox_jwt_issuer.as_ref().ok_or_else(|| {
-        warn!(
-            sandbox_id = %sandbox_id,
-            rpc = rpc_name,
-            "bootstrap RPC called but sandbox JWT issuer is not configured"
-        );
-        Status::unavailable("sandbox JWT minting is not configured on this gateway")
-    })?;
-
-    let record = load_sandbox(state, sandbox_id).await?;
-    let minted = issuer.mint(sandbox_id)?;
-    let sandbox_name = record
-        .metadata
-        .as_ref()
-        .map_or_else(String::new, |m| m.name.clone());
-    info!(
-        sandbox_id = %sandbox_id,
-        rpc = rpc_name,
-        "issued gateway sandbox JWT for cold pod activation"
-    );
-
-    Ok(PodActivationMessage {
-        sandbox_id: sandbox_id.to_string(),
-        sandbox_name,
-        token: minted.token,
-        token_expires_at_ms: minted.expires_at_ms,
-        startup_metadata: std::collections::HashMap::default(),
-    })
-}
-
-async fn load_sandbox(state: &Arc<ServerState>, sandbox_id: &str) -> Result<Sandbox, Status> {
-    if sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("sandbox_id is required"));
-    }
-
-    state
-        .store
-        .get_message::<Sandbox>(sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))
 }
 
 #[cfg(test)]
