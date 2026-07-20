@@ -1731,6 +1731,9 @@ async fn handle_update_config_inner(
             "one of policy, setting_key, or merge_operations must be provided",
         ));
     }
+    if has_setting {
+        validate_setting_scope(key, req.global)?;
+    }
 
     if req.global {
         if !req.annotations.is_empty() {
@@ -4321,6 +4324,16 @@ fn validate_registered_setting_key(
             settings::registered_keys_csv()
         ))
     })
+}
+
+fn validate_setting_scope(key: &str, global: bool) -> Result<(), Status> {
+    if key == settings::POLICY_VALIDATION_FAILURE_MODE_KEY && !global {
+        return Err(Status::invalid_argument(format!(
+            "setting '{}' is gateway-global and must be configured with --global",
+            settings::POLICY_VALIDATION_FAILURE_MODE_KEY
+        )));
+    }
+    Ok(())
 }
 
 fn proto_setting_to_stored(key: &str, value: &SettingValue) -> Result<StoredSettingValue, Status> {
@@ -12219,6 +12232,15 @@ mod tests {
         let err = validate_registered_setting_key("policy").unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("unknown setting key"));
+    }
+
+    #[test]
+    fn policy_validation_failure_mode_is_gateway_global_only() {
+        assert!(validate_setting_scope(settings::POLICY_VALIDATION_FAILURE_MODE_KEY, true).is_ok());
+        let error = validate_setting_scope(settings::POLICY_VALIDATION_FAILURE_MODE_KEY, false)
+            .expect_err("sandbox-scoped override must be rejected");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("must be configured with --global"));
     }
 
     #[test]

@@ -107,6 +107,16 @@ pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
 /// fail-closes on unknown persisted values for defense in depth.
 pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
 
+/// Gateway security posture when a sandbox rejects a candidate policy during
+/// validation. The default is [`POLICY_VALIDATION_FAILURE_MODE_FAIL_CLOSED`].
+pub const POLICY_VALIDATION_FAILURE_MODE_KEY: &str = "policy_validation_failure_mode";
+pub const POLICY_VALIDATION_FAILURE_MODE_FAIL_CLOSED: &str = "fail_closed";
+pub const POLICY_VALIDATION_FAILURE_MODE_RETAIN_LAST_VALID: &str = "retain_last_valid";
+pub const POLICY_VALIDATION_FAILURE_MODE_VALUES: &[&str] = &[
+    POLICY_VALIDATION_FAILURE_MODE_FAIL_CLOSED,
+    POLICY_VALIDATION_FAILURE_MODE_RETAIN_LAST_VALID,
+];
+
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // Gateway-level opt-in for provider profile policy composition. Defaults
     // to false when unset.
@@ -136,6 +146,14 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         key: PROPOSAL_APPROVAL_MODE_KEY,
         kind: SettingValueKind::String,
         allowed_string_values: Some(PROPOSAL_APPROVAL_MODE_VALUES),
+    },
+    // Gateway security posture for policy validation failures. Defaults to
+    // fail_closed when unset. Operators may explicitly select availability-
+    // oriented last-known-good retention.
+    RegisteredSetting {
+        key: POLICY_VALIDATION_FAILURE_MODE_KEY,
+        kind: SettingValueKind::String,
+        allowed_string_values: Some(POLICY_VALIDATION_FAILURE_MODE_VALUES),
     },
 ];
 
@@ -168,6 +186,8 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
+        POLICY_VALIDATION_FAILURE_MODE_FAIL_CLOSED, POLICY_VALIDATION_FAILURE_MODE_KEY,
+        POLICY_VALIDATION_FAILURE_MODE_RETAIN_LAST_VALID, POLICY_VALIDATION_FAILURE_MODE_VALUES,
         PROPOSAL_APPROVAL_MODE_KEY, PROPOSAL_APPROVAL_MODE_VALUES, PROVIDERS_V2_ENABLED_KEY,
         REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
         registered_keys_csv, setting_for_key,
@@ -235,6 +255,28 @@ mod tests {
             // Caller gets the allowed slice back for diagnostics.
             assert_eq!(err, PROPOSAL_APPROVAL_MODE_VALUES);
         }
+    }
+
+    #[test]
+    fn policy_validation_failure_mode_accepts_only_documented_values() {
+        let setting = setting_for_key(POLICY_VALIDATION_FAILURE_MODE_KEY)
+            .expect("policy validation failure mode should be registered");
+        assert_eq!(setting.kind, SettingValueKind::String);
+        assert_eq!(
+            setting.allowed_string_values,
+            Some(POLICY_VALIDATION_FAILURE_MODE_VALUES)
+        );
+        assert!(
+            setting
+                .validate_string_value(POLICY_VALIDATION_FAILURE_MODE_FAIL_CLOSED)
+                .is_ok()
+        );
+        assert!(
+            setting
+                .validate_string_value(POLICY_VALIDATION_FAILURE_MODE_RETAIN_LAST_VALID)
+                .is_ok()
+        );
+        assert!(setting.validate_string_value("keep_old").is_err());
     }
 
     // ---- parse_bool_like ----

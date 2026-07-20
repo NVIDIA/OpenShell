@@ -20,6 +20,7 @@ use std::sync::{
     Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
+use tokio::sync::watch;
 use tracing::info;
 
 /// Baked-in rego rules for OPA policy evaluation.
@@ -123,6 +124,8 @@ pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
+    generation_tx: watch::Sender<u64>,
+    fail_closed_reason: RwLock<Option<String>>,
 }
 
 #[cfg(test)]
@@ -148,6 +151,7 @@ pub(crate) fn test_opa_query_count() -> u64 {
 pub struct PolicyGenerationGuard {
     captured_generation: u64,
     current_generation: Arc<AtomicU64>,
+    generation_rx: watch::Receiver<u64>,
 }
 
 impl PolicyGenerationGuard {
@@ -172,6 +176,19 @@ impl PolicyGenerationGuard {
             ));
         }
         Ok(())
+    }
+
+    /// Wait until the policy generation changes.
+    ///
+    /// Relay boundaries use this to close even an idle or raw stream as soon
+    /// as a new generation (including fail-closed quarantine) is published.
+    pub async fn wait_until_stale(&self) {
+        let mut receiver = self.generation_rx.clone();
+        while !self.is_stale() {
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 
@@ -219,6 +236,24 @@ impl TunnelPolicyEngine {
 }
 
 impl OpaEngine {
+    fn with_engine(engine: regorus::Engine) -> Self {
+        let generation = Arc::new(AtomicU64::new(0));
+        let (generation_tx, _) = watch::channel(0);
+        Self {
+            engine: Mutex::new(engine),
+            generation,
+            middleware_runner: RwLock::new(ChainRunner::default()),
+            generation_tx,
+            fail_closed_reason: RwLock::new(None),
+        }
+    }
+
+    fn advance_generation(&self) -> u64 {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.generation_tx.send_replace(generation);
+        generation
+    }
+
     #[cfg(test)]
     pub(crate) fn poison_lock_for_test(&self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -259,11 +294,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Load policy rules and data from strings (data is YAML).
@@ -314,11 +345,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Create OPA engine from a typed proto policy.
@@ -352,6 +379,18 @@ impl OpaEngine {
         entrypoint_pid: u32,
         require_binary_identity: bool,
     ) -> Result<Self> {
+        let ambiguities = openshell_policy::find_endpoint_ambiguities(proto);
+        if !ambiguities.is_empty() {
+            return Err(miette::miette!(
+                "network endpoint ambiguity validation failed:\n{}",
+                ambiguities
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+
         emit_binary_identity_mode(require_binary_identity, "proto");
         if let Err(violations) = openshell_policy::validate_sandbox_policy(proto) {
             let errors = violations
@@ -393,11 +432,7 @@ impl OpaEngine {
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self {
-            engine: Mutex::new(engine),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-        })
+        Ok(Self::with_engine(engine))
     }
 
     /// Evaluate a network access request against the loaded policy.
@@ -412,6 +447,19 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        let fail_closed_reason = self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .clone();
+        if let Some(reason) = fail_closed_reason {
+            return Ok(PolicyDecision {
+                allowed: false,
+                reason,
+                matched_policy: None,
+            });
+        }
 
         engine
             .set_input_json(&input_json.to_string())
@@ -467,6 +515,15 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         let generation = self.current_generation();
 
+        let fail_closed_reason = self
+            .fail_closed_reason
+            .read()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .clone();
+        if let Some(reason) = fail_closed_reason {
+            return Ok((NetworkAction::Deny { reason }, generation));
+        }
+
         engine
             .set_input_json(&input_json.to_string())
             .map_err(|e| miette::miette!("{e}"))?;
@@ -513,7 +570,11 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
     }
 
@@ -548,7 +609,11 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
     }
 
@@ -583,8 +648,59 @@ impl OpaEngine {
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
         *engine = new_engine;
         *runner = new_runner;
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
+        self.advance_generation();
         Ok(())
+    }
+
+    /// Publish a deny-all quarantine generation without activating any part
+    /// of the invalid candidate policy.
+    ///
+    /// The existing compiled engine remains available for an explicit
+    /// `retain_last_valid` posture or a later valid reload, but all new network
+    /// decisions deny with `reason` while the quarantine is active. Advancing
+    /// the generation invalidates and wakes every pinned relay.
+    pub fn enter_fail_closed(&self, reason: impl Into<String>) -> Result<u64> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        *self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? =
+            Some(reason.into());
+        Ok(self.advance_generation())
+    }
+
+    pub fn fail_closed_reason(&self) -> Option<String> {
+        self.fail_closed_reason
+            .read()
+            .ok()
+            .and_then(|reason| reason.clone())
+    }
+
+    /// Reactivate the compiled last-known-good engine after an operator
+    /// explicitly selects the availability-oriented retention posture.
+    pub fn exit_fail_closed(&self) -> Result<u64> {
+        let _engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let was_fail_closed = self
+            .fail_closed_reason
+            .write()
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?
+            .take()
+            .is_some();
+        if was_fail_closed {
+            Ok(self.advance_generation())
+        } else {
+            Ok(self.current_generation())
+        }
     }
 
     /// Current policy generation. Successful reloads increment this value.
@@ -600,7 +716,7 @@ impl OpaEngine {
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
         *runner = ChainRunner::from_registry(registry);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.advance_generation();
         Ok(())
     }
 
@@ -633,6 +749,7 @@ impl OpaEngine {
         Ok(PolicyGenerationGuard {
             captured_generation: generation,
             current_generation: Arc::clone(&self.generation),
+            generation_rx: self.generation_tx.subscribe(),
         })
     }
 
@@ -798,6 +915,7 @@ impl OpaEngine {
             generation_guard: PolicyGenerationGuard {
                 captured_generation: generation,
                 current_generation: Arc::clone(&self.generation),
+                generation_rx: self.generation_tx.subscribe(),
             },
             middleware_runner: self.middleware_runner()?,
         })
@@ -3079,11 +3197,7 @@ network_policies:
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
             .expect("data should load");
-        let engine = OpaEngine {
-            engine: Mutex::new(rego),
-            generation: Arc::new(AtomicU64::new(0)),
-            middleware_runner: RwLock::new(ChainRunner::default()),
-        };
+        let engine = OpaEngine::with_engine(rego);
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",
             serde_json::json!([{
@@ -4710,6 +4824,97 @@ network_policies:
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         assert_eq!(val, regorus::Value::from(true));
+    }
+
+    #[test]
+    fn proto_load_rejects_ambiguous_endpoint_metadata_with_rationale() {
+        let mut policy = ProtoSandboxPolicy::default();
+        policy.network_policies.insert(
+            "wildcard".to_string(),
+            NetworkPolicyRule {
+                name: "wildcard".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.com".to_string(),
+                    port: 443,
+                    tls: "skip".to_string(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        policy.network_policies.insert(
+            "exact".to_string(),
+            NetworkPolicyRule {
+                name: "exact".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/bash".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let Err(error) = OpaEngine::from_proto(&policy) else {
+            panic!("ambiguity must reject activation");
+        };
+        let message = error.to_string();
+        assert!(message.contains("ambiguity validation failed"));
+        assert!(message.contains("wildcard"));
+        assert!(message.contains("exact"));
+        assert!(message.contains("tls"));
+    }
+
+    #[tokio::test]
+    async fn fail_closed_quarantine_denies_and_wakes_generation_guards() {
+        let engine = test_engine();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let stale = guard.wait_until_stale();
+
+        let generation = engine
+            .enter_fail_closed("candidate policy validation failed: conflicting tls")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), stale)
+            .await
+            .expect("generation waiter should wake");
+        assert_eq!(generation, 1);
+        assert!(guard.is_stale());
+
+        let input = NetworkInput {
+            host: "api.anthropic.com".to_string(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: String::new(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let action = engine.evaluate_network_action(&input).unwrap();
+        assert_eq!(
+            action,
+            NetworkAction::Deny {
+                reason: "candidate policy validation failed: conflicting tls".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn valid_reload_exits_fail_closed_quarantine() {
+        let engine = test_engine();
+        engine.enter_fail_closed("invalid candidate").unwrap();
+        assert!(engine.fail_closed_reason().is_some());
+
+        engine.reload(TEST_POLICY, TEST_DATA_YAML).unwrap();
+
+        assert!(engine.fail_closed_reason().is_none());
+        assert_eq!(engine.current_generation(), 2);
     }
 
     #[test]
