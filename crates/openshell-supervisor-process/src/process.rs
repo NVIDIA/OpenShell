@@ -2155,25 +2155,19 @@ mod tests {
         let chowned_ref = Arc::clone(&chowned);
 
         let readonly_dir_clone = readonly_dir.clone();
-        let fake_chown = move |path: &Path,
-                               _uid: Option<Uid>,
-                               _gid: Option<Gid>|
-              -> nix::Result<()> {
-            if path == readonly_dir_clone {
-                return Err(nix::errno::Errno::EROFS);
-            }
-            chowned_ref.lock().unwrap().push(path.to_path_buf());
-            Ok(())
-        };
+        let fake_chown =
+            move |path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+                if path == readonly_dir_clone {
+                    return Err(nix::errno::Errno::EROFS);
+                }
+                chowned_ref.lock().unwrap().push(path.to_path_buf());
+                Ok(())
+            };
 
-        chown_recursive(&root, uid, gid, &fake_chown)
-            .expect("EROFS should be handled gracefully");
+        chown_recursive(&root, uid, gid, &fake_chown).expect("EROFS should be handled gracefully");
 
         let chowned = chowned.lock().unwrap();
-        assert!(
-            chowned.contains(&root),
-            "root should have been chowned"
-        );
+        assert!(chowned.contains(&root), "root should have been chowned");
         assert!(
             chowned.contains(&readonly_dir.join("writable-child.txt")),
             "writable child under EROFS directory should still be chowned"
@@ -2194,10 +2188,9 @@ mod tests {
         let uid = Some(nix::unistd::geteuid());
         let gid = Some(nix::unistd::getegid());
 
-        let fake_chown = |_path: &Path,
-                          _uid: Option<Uid>,
-                          _gid: Option<Gid>|
-              -> nix::Result<()> { Err(nix::errno::Errno::EPERM) };
+        let fake_chown = |_path: &Path, _uid: Option<Uid>, _gid: Option<Gid>| -> nix::Result<()> {
+            Err(nix::errno::Errno::EPERM)
+        };
 
         let result = chown_recursive(&root, uid, gid, &fake_chown);
         assert!(result.is_err(), "non-EROFS errors should propagate");
