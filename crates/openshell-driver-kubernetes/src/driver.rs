@@ -21,7 +21,7 @@ use kube::{Client, Error as KubeError};
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH,
+    LABEL_SANDBOX_WORKSPACE, SUPERVISOR_IMAGE_BINARY_PATH, openshell_sandbox_label_selector,
 };
 use openshell_core::gpu::{driver_gpu_requirements, effective_driver_gpu_count};
 use openshell_core::progress::{
@@ -746,9 +746,7 @@ impl KubernetesComputeDriver {
             KUBE_API_TIMEOUT,
             agent_sandbox_api
                 .api
-                .list(&ListParams::default().labels(&format!(
-                    "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}"
-                ))),
+                .list(&ListParams::default().labels(&openshell_sandbox_label_selector())),
         )
         .await
         {
@@ -1043,9 +1041,8 @@ impl KubernetesComputeDriver {
             .supported_agent_sandbox_api(self.watch_client.clone())
             .await?;
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
-        let watcher_config = watcher::Config::default().labels(&format!(
-            "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}"
-        ));
+        let watcher_config =
+            watcher::Config::default().labels(&openshell_sandbox_label_selector());
         let mut sandbox_stream = watcher::watcher(agent_sandbox_api.api, watcher_config).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
         let (tx, rx) = mpsc::channel(256);
@@ -1142,7 +1139,8 @@ impl KubernetesComputeDriver {
                             let _ = tx.send(Err(KubernetesDriverError::Message(err.to_string()))).await;
                             break;
                         }
-                    }
+                    },
+                    _ = tx.closed() => break,
                 }
             }
         });
@@ -5923,5 +5921,37 @@ mod tests {
             data: serde_json::json!({}),
         };
         assert!(sandbox_id_from_object(&obj).is_err());
+    }
+
+    #[test]
+    fn label_selector_used_by_list_and_watch_matches_shared_helper() {
+        let expected = openshell_sandbox_label_selector();
+        assert!(
+            expected.starts_with("openshell.ai/managed-by=openshell,"),
+            "selector must start with managed-by filter"
+        );
+        assert!(
+            expected.ends_with("openshell.ai/sandbox-id"),
+            "selector must require sandbox-id label presence"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_producer_exits_when_receiver_is_dropped() {
+        let (tx, rx) = mpsc::channel::<Result<WatchSandboxesEvent, KubernetesDriverError>>(16);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => break,
+                }
+            }
+        });
+
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("producer task did not exit within timeout")
+            .expect("producer task panicked");
     }
 }
