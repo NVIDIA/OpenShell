@@ -120,6 +120,10 @@ exits 0 rather than failing.
 and a `verdicts` object). Run it before the real-MXC lane to understand what
 will PASS vs SKIP on a given host:
 
+The probe uses a unique, user-owned Windows temp directory for every run.
+MXC treats config paths literally (it does not expand `%TEMP%`), and the
+per-run directory keeps AppContainer+DACL fallback mutations narrowly scoped.
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass `
   -File crates/openshell-driver-mxc/examples/probe-mxc-host.ps1
