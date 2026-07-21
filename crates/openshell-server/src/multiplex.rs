@@ -463,7 +463,7 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 match &sandbox.source {
                     SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
                     SandboxIdentitySource::BootstrapCert { .. } => "bootstrap_cert",
-                    SandboxIdentitySource::K8sServiceAccount { .. } => "k8s_service_account",
+                    SandboxIdentitySource::SupervisorBootstrap { .. } => "supervisor_bootstrap",
                 }
                 .to_string(),
             );
@@ -471,21 +471,13 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 fields.insert("trust_domain".to_string(), trust_domain.clone());
             }
         }
-        Principal::K8sPod(pod) => {
-            fields.insert("kind".to_string(), "k8s_pod".to_string());
-            fields.insert("pod_name".to_string(), pod.pod_name.clone());
-            fields.insert("pod_uid".to_string(), pod.pod_uid.clone());
-            fields.insert(
-                "sandbox_owner_name".to_string(),
-                pod.sandbox_owner_name.clone(),
-            );
-            fields.insert(
-                "sandbox_owner_uid".to_string(),
-                pod.sandbox_owner_uid.clone(),
-            );
-            if let Some(sandbox_id) = &pod.sandbox_id {
-                fields.insert("sandbox_id".to_string(), sandbox_id.clone());
-            }
+        Principal::SupervisorBootstrap(identity) => {
+            fields.insert("kind".to_string(), "supervisor_bootstrap".to_string());
+            fields.insert("driver".to_string(), identity.driver.clone());
+            fields.insert("instance_id".to_string(), identity.instance_id.clone());
+            fields.insert("instance_name".to_string(), identity.instance_name.clone());
+            fields.insert("owner_name".to_string(), identity.owner_name.clone());
+            fields.insert("owner_uid".to_string(), identity.owner_uid.clone());
         }
         Principal::Anonymous => {
             fields.insert("kind".to_string(), "anonymous".to_string());
@@ -710,11 +702,12 @@ where
 /// Assemble the authenticator chain for the gateway.
 ///
 /// Chain order (first-match-wins):
-/// 1. `K8sServiceAccountAuthenticator` (path-scoped to Kubernetes bootstrap
-///    RPCs) — resolves a projected SA token to either a legacy
-///    `Principal::Sandbox` for `IssueSandboxToken` or a registration-scoped
-///    pod principal for `RegisterSupervisorPod`. No-op on every other path;
-///    only present when the gateway runs in-cluster.
+/// 1. `SupervisorBootstrapAuthenticator` (path-scoped to supervisor bootstrap
+///    RPCs) — delegates driver-native bootstrap token validation to the active
+///    compute driver and resolves it to either a legacy `Principal::Sandbox`
+///    for `IssueSandboxToken` or a registration-scoped principal for
+///    `RegisterSupervisorPod`. No-op on every other path; only present when
+///    the active driver exposes a bootstrap identity provider.
 /// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
 /// 3. `OidcAuthenticator` — validates user Bearer tokens against the
@@ -732,8 +725,10 @@ where
 /// to pass-through unless mTLS or local unauthenticated users are enabled.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
-    if let Some(k8s) = state.k8s_sa_authenticator.clone() {
-        authenticators.push(k8s);
+    if let Some(provider) = state.compute.supervisor_bootstrap_identity_provider() {
+        authenticators.push(Arc::new(
+            crate::auth::k8s_sa::SupervisorBootstrapAuthenticator::new(provider),
+        ));
     }
     if let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
         authenticators.push(jwt);
@@ -760,7 +755,8 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
 ///   `Principal::User` is gated by the RBAC `AuthzPolicy`.
 ///   `Principal::Sandbox` is gated by a supervisor-method allowlist, then
 ///   handlers enforce same-sandbox scope on request bodies.
-///   `Principal::K8sPod` is gated by the pod-registration method only.
+///   `Principal::SupervisorBootstrap` is gated by the pod-registration method
+///   only.
 #[derive(Clone)]
 pub struct AuthGrpcRouter<S> {
     inner: S,
@@ -899,13 +895,13 @@ where
                         )));
                     }
                 }
-                Principal::K8sPod(ref pod) => {
+                Principal::SupervisorBootstrap(ref identity) => {
                     if !crate::auth::method_authz::is_pod_registration_callable(&path) {
                         return Ok(status_response(tonic::Status::permission_denied(
-                            "Kubernetes pod principals may only register supervisor pods",
+                            "supervisor bootstrap principals may only register supervisors",
                         )));
                     }
-                    req.extensions_mut().insert(pod.clone());
+                    req.extensions_mut().insert(identity.clone());
                 }
                 Principal::Anonymous => {
                     return Ok(status_response(tonic::Status::unauthenticated(
@@ -1847,10 +1843,12 @@ mod tests {
         use crate::auth::authenticator::test_support::MockAuthenticator;
         use crate::auth::identity::{Identity, IdentityProvider};
         use crate::auth::principal::{
-            Principal, RegisteredPodIdentity, SandboxIdentitySource, SandboxPrincipal,
-            UserPrincipal,
+            Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
         };
         use http_body_util::Full;
+        use openshell_core::supervisor_bootstrap::{
+            SupervisorBootstrapBinding, SupervisorBootstrapIdentity,
+        };
         use std::sync::Arc;
         use std::sync::Mutex;
         use tower::Service;
@@ -1938,13 +1936,14 @@ mod tests {
             })
         }
 
-        fn pod_registration_principal() -> Principal {
-            Principal::K8sPod(RegisteredPodIdentity {
-                pod_name: "pod-a".to_string(),
-                pod_uid: "pod-uid-a".to_string(),
-                sandbox_id: None,
-                sandbox_owner_name: "sandbox-owner-a".to_string(),
-                sandbox_owner_uid: "owner-uid-a".to_string(),
+        fn bootstrap_registration_principal() -> Principal {
+            Principal::SupervisorBootstrap(SupervisorBootstrapIdentity {
+                driver: "kubernetes".to_string(),
+                instance_name: "pod-a".to_string(),
+                instance_id: "pod-uid-a".to_string(),
+                owner_name: "sandbox-owner-a".to_string(),
+                owner_uid: "owner-uid-a".to_string(),
+                binding: SupervisorBootstrapBinding::WarmPending,
             })
         }
 
@@ -2137,9 +2136,9 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn pod_registration_principal_can_only_register_supervisor_pod() {
+        async fn bootstrap_registration_principal_can_only_register_supervisor_pod() {
             let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
-                pod_registration_principal(),
+                bootstrap_registration_principal(),
             ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
@@ -2155,11 +2154,11 @@ mod tests {
             assert_eq!(res.status(), 200);
             assert!(matches!(
                 seen.lock().unwrap().as_ref(),
-                Some(Principal::K8sPod(_))
+                Some(Principal::SupervisorBootstrap(_))
             ));
 
             let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
-                pod_registration_principal(),
+                bootstrap_registration_principal(),
             ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();

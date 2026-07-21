@@ -15,6 +15,7 @@
 //! to prevent cross-sandbox access (see issue #1354).
 
 use super::identity::Identity;
+use openshell_core::supervisor_bootstrap::SupervisorBootstrapIdentity;
 
 /// Who is calling.
 ///
@@ -28,12 +29,13 @@ pub enum Principal {
     /// sandbox UUID. The wrapped `sandbox_id` MUST match any sandbox referenced
     /// in the request body for sandbox-class methods.
     Sandbox(#[allow(dead_code)] SandboxPrincipal),
-    /// Kubernetes pod authenticated for supervisor pod registration only.
+    /// Driver runtime instance authenticated for supervisor bootstrap
+    /// registration only.
     ///
     /// This is intentionally not a sandbox principal: warm pods can be valid
-    /// Kubernetes pods before they are claimed by a sandbox. The router only
+    /// driver instances before they are claimed by a sandbox. The router only
     /// allows this principal to call `RegisterSupervisorPod`.
-    K8sPod(RegisteredPodIdentity),
+    SupervisorBootstrap(SupervisorBootstrapIdentity),
     /// Truly unauthenticated caller (health probes, reflection). Sandbox-class
     /// and user-class methods reject this variant.
     #[allow(dead_code)]
@@ -45,27 +47,6 @@ pub enum Principal {
 pub struct UserPrincipal {
     /// The verified identity from the authentication provider.
     pub identity: Identity,
-}
-
-/// Kubernetes pod identity validated by `TokenReview` and live pod lookup.
-///
-/// `sandbox_id` is present only when the pod is already bound to a concrete
-/// `OpenShell` sandbox. Unbound warm pods carry the owning Sandbox CR metadata
-/// but must not receive a gateway sandbox JWT until a later claim binds the
-/// exact pod UID to a sandbox.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct RegisteredPodIdentity {
-    /// Live pod name from the `TokenReview` binding.
-    pub pod_name: String,
-    /// Live pod UID from the `TokenReview` binding and pod lookup.
-    pub pod_uid: String,
-    /// `OpenShell` sandbox UUID from the pod annotation, when already bound.
-    pub sandbox_id: Option<String>,
-    /// Owning Sandbox CR name from the pod ownerReference.
-    pub sandbox_owner_name: String,
-    /// Owning Sandbox CR UID from the pod ownerReference and live CR lookup.
-    pub sandbox_owner_uid: String,
 }
 
 /// Sandbox caller — bound to one specific sandbox UUID.
@@ -97,7 +78,11 @@ pub enum SandboxIdentitySource {
     /// Per-sandbox client certificate. Reserved for channel-bound sandbox
     /// identity.
     BootstrapCert { fingerprint: String },
-    /// K8s `ServiceAccount` token used to bootstrap a gateway-minted JWT.
-    /// Populated only on Kubernetes bootstrap RPC paths.
-    K8sServiceAccount { pod_name: String, pod_uid: String },
+    /// Driver-provided bootstrap token used to bootstrap a gateway-minted JWT.
+    /// Populated only on supervisor bootstrap RPC paths.
+    SupervisorBootstrap {
+        driver: String,
+        instance_name: String,
+        instance_id: String,
+    },
 }

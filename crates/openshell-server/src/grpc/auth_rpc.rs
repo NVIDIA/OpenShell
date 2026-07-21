@@ -13,14 +13,13 @@
 //! until their own `exp` and are bounded by the configured short TTL.
 
 use crate::ServerState;
-use crate::auth::principal::{
-    Principal, RegisteredPodIdentity, SandboxIdentitySource, SandboxPrincipal,
-};
+use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use crate::warm_pod_activation::{load_sandbox, mint_pod_activation};
 use openshell_core::proto::{
     IssueSandboxTokenRequest, IssueSandboxTokenResponse, PodActivationMessage,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RegisterSupervisorPodRequest,
 };
+use openshell_core::supervisor_bootstrap::SupervisorBootstrapIdentity;
 use std::sync::Arc;
 use std::{pin::Pin, result::Result as StdResult};
 use tokio_stream::Stream;
@@ -51,19 +50,22 @@ pub async fn handle_register_supervisor_pod(
     state: &Arc<ServerState>,
     request: Request<RegisterSupervisorPodRequest>,
 ) -> Result<Response<RegisterSupervisorPodStream>, Status> {
-    let pod = require_registered_pod(request.extensions())?;
-    if let Some(sandbox_id) = pod.sandbox_id.as_deref() {
+    let identity = require_bootstrap_identity(request.extensions())?;
+    if let Some(sandbox_id) = identity.bound_sandbox_id() {
         let activation = mint_pod_activation(state, sandbox_id, "RegisterSupervisorPod").await?;
         info!(
             sandbox_id = %activation.sandbox_id,
-            pod = %pod.pod_name,
-            pod_uid = %pod.pod_uid,
-            "activated bound supervisor pod"
+            driver = %identity.driver,
+            instance_name = %identity.instance_name,
+            instance_id = %identity.instance_id,
+            "activated bound supervisor instance"
         );
         return Ok(Response::new(Box::pin(tokio_stream::once(Ok(activation)))));
     }
 
-    let stream = state.supervisor_pod_registrations.register_pending(pod)?;
+    let stream = state
+        .supervisor_pod_registrations
+        .register_pending(identity)?;
     Ok(Response::new(Box::pin(stream)))
 }
 
@@ -135,12 +137,12 @@ fn require_k8s_bootstrap_sandbox(
 
     if !matches!(
         sandbox.source,
-        SandboxIdentitySource::K8sServiceAccount { .. }
+        SandboxIdentitySource::SupervisorBootstrap { .. }
     ) {
         debug!(
             sandbox_id = %sandbox.sandbox_id,
             rpc = rpc_name,
-            "bootstrap RPC rejected: non-K8s ServiceAccount principal source"
+            "bootstrap RPC rejected: non-bootstrap principal source"
         );
         return Err(Status::permission_denied(
             "this principal cannot mint a sandbox token; use RefreshSandboxToken",
@@ -150,9 +152,11 @@ fn require_k8s_bootstrap_sandbox(
     Ok(sandbox)
 }
 
-fn require_registered_pod(extensions: &tonic::Extensions) -> Result<RegisteredPodIdentity, Status> {
-    if let Some(pod) = extensions.get::<RegisteredPodIdentity>().cloned() {
-        return Ok(pod);
+fn require_bootstrap_identity(
+    extensions: &tonic::Extensions,
+) -> Result<SupervisorBootstrapIdentity, Status> {
+    if let Some(identity) = extensions.get::<SupervisorBootstrapIdentity>().cloned() {
+        return Ok(identity);
     }
 
     let principal = extensions
@@ -160,13 +164,13 @@ fn require_registered_pod(extensions: &tonic::Extensions) -> Result<RegisteredPo
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
 
-    let Principal::K8sPod(pod) = principal else {
+    let Principal::SupervisorBootstrap(identity) = principal else {
         return Err(Status::permission_denied(
-            "RegisterSupervisorPod requires a Kubernetes pod registration principal",
+            "RegisterSupervisorPod requires a supervisor bootstrap principal",
         ));
     };
 
-    Ok(pod)
+    Ok(identity)
 }
 
 #[cfg(test)]
@@ -185,6 +189,7 @@ mod tests {
     use openshell_core::Config;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
+    use openshell_core::supervisor_bootstrap::SupervisorBootstrapBinding;
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio_stream::StreamExt;
@@ -254,13 +259,14 @@ mod tests {
         })
     }
 
-    fn registered_pod(sandbox_id: Option<&str>) -> RegisteredPodIdentity {
-        RegisteredPodIdentity {
-            pod_name: "pod-a".to_string(),
-            pod_uid: "uid-a".to_string(),
-            sandbox_id: sandbox_id.map(str::to_string),
-            sandbox_owner_name: "sandbox-owner-a".to_string(),
-            sandbox_owner_uid: "owner-uid-a".to_string(),
+    fn bootstrap_identity(binding: SupervisorBootstrapBinding) -> SupervisorBootstrapIdentity {
+        SupervisorBootstrapIdentity {
+            driver: "kubernetes".to_string(),
+            instance_name: "pod-a".to_string(),
+            instance_id: "uid-a".to_string(),
+            owner_name: "sandbox-owner-a".to_string(),
+            owner_uid: "owner-uid-a".to_string(),
+            binding,
         }
     }
 
@@ -298,9 +304,10 @@ mod tests {
         req.extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
                 sandbox_id: "sandbox-a".to_string(),
-                source: SandboxIdentitySource::K8sServiceAccount {
-                    pod_name: "pod-a".to_string(),
-                    pod_uid: "uid-a".to_string(),
+                source: SandboxIdentitySource::SupervisorBootstrap {
+                    driver: "kubernetes".to_string(),
+                    instance_name: "pod-a".to_string(),
+                    instance_id: "uid-a".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
@@ -317,7 +324,11 @@ mod tests {
         let state = state_with_issuer().await;
         let mut req = Request::new(RegisterSupervisorPodRequest {});
         req.extensions_mut()
-            .insert(Principal::K8sPod(registered_pod(Some("sandbox-a"))));
+            .insert(Principal::SupervisorBootstrap(bootstrap_identity(
+                SupervisorBootstrapBinding::BoundSandbox {
+                    sandbox_id: "sandbox-a".to_string(),
+                },
+            )));
 
         let mut stream = handle_register_supervisor_pod(&state, req)
             .await
@@ -341,7 +352,9 @@ mod tests {
         let state = state_with_issuer().await;
         let mut req = Request::new(RegisterSupervisorPodRequest {});
         req.extensions_mut()
-            .insert(Principal::K8sPod(registered_pod(None)));
+            .insert(Principal::SupervisorBootstrap(bootstrap_identity(
+                SupervisorBootstrapBinding::WarmPending,
+            )));
 
         let mut stream = handle_register_supervisor_pod(&state, req)
             .await
@@ -367,9 +380,10 @@ mod tests {
         req.extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
                 sandbox_id: "sandbox-deleted".to_string(),
-                source: SandboxIdentitySource::K8sServiceAccount {
-                    pod_name: "pod-a".to_string(),
-                    pod_uid: "uid-a".to_string(),
+                source: SandboxIdentitySource::SupervisorBootstrap {
+                    driver: "kubernetes".to_string(),
+                    instance_name: "pod-a".to_string(),
+                    instance_id: "uid-a".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
@@ -400,8 +414,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_rejects_k8s_sa_principal() {
-        // K8s SA-bootstrap principals must use RegisterSupervisorPod, not
+    async fn refresh_rejects_bootstrap_principal() {
+        // Bootstrap principals must use RegisterSupervisorPod, not
         // RefreshSandboxToken. The refresh path assumes a still-valid
         // gateway-minted JWT already exists.
         use crate::auth::principal::SandboxIdentitySource;
@@ -410,15 +424,16 @@ mod tests {
         req.extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
                 sandbox_id: "sandbox-a".to_string(),
-                source: SandboxIdentitySource::K8sServiceAccount {
-                    pod_name: "pod-a".to_string(),
-                    pod_uid: "uid-a".to_string(),
+                source: SandboxIdentitySource::SupervisorBootstrap {
+                    driver: "kubernetes".to_string(),
+                    instance_name: "pod-a".to_string(),
+                    instance_id: "uid-a".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
         let err = handle_refresh_sandbox_token(&state, req)
             .await
-            .expect_err("K8s SA principal must not refresh");
+            .expect_err("bootstrap principal must not refresh");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 

@@ -37,10 +37,12 @@ use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
     SandboxTemplate, ServiceEndpoint, SshSession,
 };
+use openshell_core::supervisor_bootstrap::SupervisorBootstrapIdentityProvider;
 use openshell_core::{ObjectLabels, ObjectWorkspace};
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
+    KubernetesSupervisorBootstrapIdentityProvider, LiveK8sResolver,
 };
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
@@ -231,6 +233,33 @@ impl Drop for ManagedDriverProcess {
     }
 }
 
+async fn kubernetes_supervisor_bootstrap_identity_provider(
+    config: &KubernetesComputeConfig,
+) -> Option<Arc<dyn SupervisorBootstrapIdentityProvider>> {
+    std::env::var_os("KUBERNETES_SERVICE_HOST")?;
+
+    match kube::Client::try_default().await {
+        Ok(client) => {
+            let resolver = Arc::new(LiveK8sResolver::new(
+                client,
+                &config.namespace,
+                "openshell-gateway".to_string(),
+                config.service_account_name.clone(),
+            ));
+            Some(Arc::new(
+                KubernetesSupervisorBootstrapIdentityProvider::new(resolver),
+            ))
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "in-cluster K8s client construction failed; supervisor bootstrap is disabled"
+            );
+            None
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AcquiredRemoteDriverEndpoint {
     pub(crate) name: String,
@@ -368,6 +397,7 @@ pub struct ComputeRuntime {
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    supervisor_bootstrap_identity: Option<Arc<dyn SupervisorBootstrapIdentityProvider>>,
     sync_lock: Arc<Mutex<()>>,
     delete_gates: Arc<DeleteGateRegistry>,
     gateway_bind_addresses: Vec<SocketAddr>,
@@ -393,6 +423,7 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
+        supervisor_bootstrap_identity: Option<Arc<dyn SupervisorBootstrapIdentityProvider>>,
         gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
         let capabilities = driver
@@ -425,6 +456,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            supervisor_bootstrap_identity,
             sync_lock: Arc::new(Mutex::new(())),
             delete_gates: Arc::new(DeleteGateRegistry::default()),
             gateway_bind_addresses,
@@ -486,6 +518,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            None,
             gateway_bind_addresses,
         )
         .await
@@ -499,6 +532,8 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
+        let supervisor_bootstrap_identity =
+            kubernetes_supervisor_bootstrap_identity_provider(&config).await;
         let driver = KubernetesComputeDriver::new(config)
             .await
             .map_err(|err| ComputeError::Message(err.to_string()))?;
@@ -514,6 +549,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            supervisor_bootstrap_identity,
             Vec::new(),
         )
         .await
@@ -539,6 +575,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            None,
             Vec::new(),
         )
         .await
@@ -567,6 +604,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            None,
             Vec::new(),
         )
         .await
@@ -580,6 +618,13 @@ impl ComputeRuntime {
     #[must_use]
     pub fn driver_info_snapshots(&self) -> &[ComputeDriverInfoSnapshot] {
         std::slice::from_ref(&self.driver_info)
+    }
+
+    #[must_use]
+    pub fn supervisor_bootstrap_identity_provider(
+        &self,
+    ) -> Option<Arc<dyn SupervisorBootstrapIdentityProvider>> {
+        self.supervisor_bootstrap_identity.clone()
     }
 
     #[must_use]
@@ -2845,6 +2890,7 @@ pub async fn new_test_runtime_for_driver(store: Arc<Store>, driver_name: &str) -
         sandbox_watch_bus: SandboxWatchBus::new(),
         tracing_log_bus: TracingLogBus::new(),
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+        supervisor_bootstrap_identity: None,
         sync_lock: Arc::new(Mutex::new(())),
         delete_gates: Arc::new(DeleteGateRegistry::default()),
         gateway_bind_addresses: Vec::new(),
@@ -3314,6 +3360,7 @@ mod tests {
             sandbox_watch_bus: SandboxWatchBus::new(),
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+            supervisor_bootstrap_identity: None,
             sync_lock: Arc::new(Mutex::new(())),
             delete_gates: Arc::new(DeleteGateRegistry::default()),
             gateway_bind_addresses: Vec::new(),

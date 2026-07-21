@@ -932,7 +932,7 @@ fn authorize_inference_bundle(
         Some(crate::auth::principal::Principal::Sandbox(s)) => Ok(s.sandbox_id.clone()),
         Some(
             crate::auth::principal::Principal::User(_)
-            | crate::auth::principal::Principal::K8sPod(_),
+            | crate::auth::principal::Principal::SupervisorBootstrap(_),
         ) => Err(Status::permission_denied(
             "GetInferenceBundle requires a sandbox principal",
         )),

@@ -8,8 +8,8 @@
 //! assignment; the future claim controller will activate the stored stream once
 //! it binds the exact pod UID to a sandbox.
 
-use crate::auth::principal::RegisteredPodIdentity;
 use openshell_core::proto::PodActivationMessage;
+use openshell_core::supervisor_bootstrap::SupervisorBootstrapIdentity;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::result::Result as StdResult;
@@ -31,13 +31,13 @@ pub struct SupervisorPodRegistrationRegistry {
 
 #[derive(Debug, Default)]
 struct Inner {
-    pending_by_pod_uid: HashMap<String, PendingRegistration>,
-    activated_pod_uid: HashMap<String, Instant>,
+    pending_by_instance_id: HashMap<String, PendingRegistration>,
+    activated_instance_id: HashMap<String, Instant>,
 }
 
 #[derive(Debug)]
 struct PendingRegistration {
-    identity: RegisteredPodIdentity,
+    identity: SupervisorBootstrapIdentity,
     sender: mpsc::Sender<StdResult<PodActivationMessage, Status>>,
     session_id: u64,
     registered_at: Instant,
@@ -52,29 +52,32 @@ impl SupervisorPodRegistrationRegistry {
     #[allow(clippy::result_large_err)]
     pub fn register_pending(
         self: &Arc<Self>,
-        identity: RegisteredPodIdentity,
+        identity: SupervisorBootstrapIdentity,
     ) -> Result<PendingRegistrationStream, Status> {
-        if identity.pod_uid.is_empty() {
-            return Err(Status::permission_denied("registered pod UID is required"));
+        if identity.instance_id.is_empty() {
+            return Err(Status::permission_denied(
+                "registered supervisor instance ID is required",
+            ));
         }
 
         let (sender, receiver) = mpsc::channel(1);
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-        let pod_uid = identity.pod_uid.clone();
-        let pod_name = identity.pod_name.clone();
-        let sandbox_owner = identity.sandbox_owner_name.clone();
+        let instance_id = identity.instance_id.clone();
+        let instance_name = identity.instance_name.clone();
+        let owner_name = identity.owner_name.clone();
+        let driver = identity.driver.clone();
 
         let replaced = {
             let mut inner = self.inner.lock().expect("pending pod registry poisoned");
-            if inner.activated_pod_uid.contains_key(&pod_uid) {
+            if inner.activated_instance_id.contains_key(&instance_id) {
                 return Err(Status::already_exists(
-                    "supervisor pod has already been activated",
+                    "supervisor instance has already been activated",
                 ));
             }
             inner
-                .pending_by_pod_uid
+                .pending_by_instance_id
                 .insert(
-                    pod_uid.clone(),
+                    instance_id.clone(),
                     PendingRegistration {
                         identity,
                         sender,
@@ -87,124 +90,132 @@ impl SupervisorPodRegistrationRegistry {
 
         if replaced {
             info!(
-                pod = %pod_name,
-                pod_uid = %pod_uid,
-                sandbox_owner = %sandbox_owner,
-                "replaced duplicate pending supervisor pod registration"
+                driver = %driver,
+                instance = %instance_name,
+                instance_id = %instance_id,
+                owner = %owner_name,
+                "replaced duplicate pending supervisor registration"
             );
         } else {
             info!(
-                pod = %pod_name,
-                pod_uid = %pod_uid,
-                sandbox_owner = %sandbox_owner,
-                "registered warm supervisor pod pending activation"
+                driver = %driver,
+                instance = %instance_name,
+                instance_id = %instance_id,
+                owner = %owner_name,
+                "registered warm supervisor instance pending activation"
             );
         }
 
         Ok(PendingRegistrationStream {
             registry: self.clone(),
-            pod_uid,
+            instance_id,
             session_id,
             inner: ReceiverStream::new(receiver),
         })
     }
 
     #[allow(clippy::result_large_err)]
-    pub(crate) fn pending_identity(&self, pod_uid: &str) -> Result<RegisteredPodIdentity, Status> {
+    pub(crate) fn pending_identity(
+        &self,
+        instance_id: &str,
+    ) -> Result<SupervisorBootstrapIdentity, Status> {
         let inner = self.inner.lock().expect("pending pod registry poisoned");
-        if inner.activated_pod_uid.contains_key(pod_uid) {
+        if inner.activated_instance_id.contains_key(instance_id) {
             return Err(Status::already_exists(
-                "supervisor pod has already been activated",
+                "supervisor instance has already been activated",
             ));
         }
         inner
-            .pending_by_pod_uid
-            .get(pod_uid)
+            .pending_by_instance_id
+            .get(instance_id)
             .map(|pending| pending.identity.clone())
-            .ok_or_else(|| Status::not_found("pending supervisor pod registration not found"))
+            .ok_or_else(|| Status::not_found("pending supervisor registration not found"))
     }
 
     #[allow(clippy::result_large_err)]
     pub(crate) fn activate(
         &self,
-        pod_uid: &str,
+        instance_id: &str,
         activation: PodActivationMessage,
     ) -> Result<(), Status> {
         let pending = {
             let mut inner = self.inner.lock().expect("pending pod registry poisoned");
-            if inner.activated_pod_uid.contains_key(pod_uid) {
+            if inner.activated_instance_id.contains_key(instance_id) {
                 return Err(Status::already_exists(
-                    "supervisor pod has already been activated",
+                    "supervisor instance has already been activated",
                 ));
             }
-            let Some(pending) = inner.pending_by_pod_uid.remove(pod_uid) else {
-                debug!(pod_uid = %pod_uid, "no pending supervisor pod registration to activate");
+            let Some(pending) = inner.pending_by_instance_id.remove(instance_id) else {
+                debug!(
+                    instance_id = %instance_id,
+                    "no pending supervisor registration to activate"
+                );
                 return Err(Status::not_found(
-                    "pending supervisor pod registration not found",
+                    "pending supervisor registration not found",
                 ));
             };
             inner
-                .activated_pod_uid
-                .insert(pod_uid.to_string(), Instant::now());
+                .activated_instance_id
+                .insert(instance_id.to_string(), Instant::now());
             pending
         };
 
-        let pod_name = pending.identity.pod_name.clone();
+        let instance_name = pending.identity.instance_name.clone();
         if pending.sender.try_send(Ok(activation)).is_err() {
             let mut inner = self.inner.lock().expect("pending pod registry poisoned");
-            inner.activated_pod_uid.remove(pod_uid);
+            inner.activated_instance_id.remove(instance_id);
             warn!(
-                pod = %pod_name,
-                pod_uid = %pod_uid,
-                "pending supervisor pod registration stream closed before activation"
+                instance = %instance_name,
+                instance_id = %instance_id,
+                "pending supervisor registration stream closed before activation"
             );
             return Err(Status::unavailable(
-                "registered pod stream closed before activation",
+                "registered supervisor stream closed before activation",
             ));
         }
 
         info!(
-            pod = %pod_name,
-            pod_uid = %pod_uid,
+            instance = %instance_name,
+            instance_id = %instance_id,
             pending_ms = pending.registered_at.elapsed().as_millis(),
-            "activated pending supervisor pod registration"
+            "activated pending supervisor registration"
         );
         Ok(())
     }
 
     #[allow(clippy::result_large_err)]
-    pub(crate) fn fail_pending(&self, pod_uid: &str, status: Status) -> Result<(), Status> {
+    pub(crate) fn fail_pending(&self, instance_id: &str, status: Status) -> Result<(), Status> {
         let pending = {
             let mut inner = self.inner.lock().expect("pending pod registry poisoned");
-            if inner.activated_pod_uid.contains_key(pod_uid) {
+            if inner.activated_instance_id.contains_key(instance_id) {
                 return Err(Status::already_exists(
-                    "supervisor pod has already been activated",
+                    "supervisor instance has already been activated",
                 ));
             }
-            inner.pending_by_pod_uid.remove(pod_uid)
+            inner.pending_by_instance_id.remove(instance_id)
         };
 
         let Some(pending) = pending else {
-            debug!(pod_uid = %pod_uid, "no pending supervisor pod registration to fail");
+            debug!(instance_id = %instance_id, "no pending supervisor registration to fail");
             return Err(Status::not_found(
-                "pending supervisor pod registration not found",
+                "pending supervisor registration not found",
             ));
         };
 
-        let pod_name = pending.identity.pod_name.clone();
+        let instance_name = pending.identity.instance_name.clone();
         pending.sender.try_send(Err(status)).map_err(|_| {
             warn!(
-                pod = %pod_name,
-                pod_uid = %pod_uid,
-                "pending supervisor pod registration stream closed before failure notification"
+                instance = %instance_name,
+                instance_id = %instance_id,
+                "pending supervisor registration stream closed before failure notification"
             );
-            Status::unavailable("registered pod stream closed before failure notification")
+            Status::unavailable("registered supervisor stream closed before failure notification")
         })?;
         info!(
-            pod = %pod_name,
-            pod_uid = %pod_uid,
+            instance = %instance_name,
+            instance_id = %instance_id,
             pending_ms = pending.registered_at.elapsed().as_millis(),
-            "failed pending supervisor pod registration"
+            "failed pending supervisor registration"
         );
         Ok(())
     }
@@ -215,7 +226,7 @@ impl SupervisorPodRegistrationRegistry {
         self.inner
             .lock()
             .expect("pending pod registry poisoned")
-            .pending_by_pod_uid
+            .pending_by_instance_id
             .len()
     }
 
@@ -225,19 +236,19 @@ impl SupervisorPodRegistrationRegistry {
         self.inner
             .lock()
             .expect("pending pod registry poisoned")
-            .activated_pod_uid
+            .activated_instance_id
             .len()
     }
 
-    fn remove_if_session(&self, pod_uid: &str, session_id: u64) {
+    fn remove_if_session(&self, instance_id: &str, session_id: u64) {
         let removed = {
             let mut inner = self.inner.lock().expect("pending pod registry poisoned");
             if inner
-                .pending_by_pod_uid
-                .get(pod_uid)
+                .pending_by_instance_id
+                .get(instance_id)
                 .is_some_and(|pending| pending.session_id == session_id)
             {
-                inner.pending_by_pod_uid.remove(pod_uid)
+                inner.pending_by_instance_id.remove(instance_id)
             } else {
                 None
             }
@@ -245,10 +256,10 @@ impl SupervisorPodRegistrationRegistry {
 
         if let Some(pending) = removed {
             debug!(
-                pod = %pending.identity.pod_name,
-                pod_uid = %pod_uid,
+                instance = %pending.identity.instance_name,
+                instance_id = %instance_id,
                 pending_ms = pending.registered_at.elapsed().as_millis(),
-                "removed pending supervisor pod registration"
+                "removed pending supervisor registration"
             );
         }
     }
@@ -256,7 +267,7 @@ impl SupervisorPodRegistrationRegistry {
 
 pub struct PendingRegistrationStream {
     registry: Arc<SupervisorPodRegistrationRegistry>,
-    pod_uid: String,
+    instance_id: String,
     session_id: u64,
     inner: ReceiverStream<StdResult<PodActivationMessage, Status>>,
 }
@@ -273,7 +284,7 @@ impl Stream for PendingRegistrationStream {
 impl Drop for PendingRegistrationStream {
     fn drop(&mut self) {
         self.registry
-            .remove_if_session(&self.pod_uid, self.session_id);
+            .remove_if_session(&self.instance_id, self.session_id);
     }
 }
 
@@ -283,13 +294,14 @@ mod tests {
     use std::collections::HashMap;
     use tokio_stream::StreamExt;
 
-    fn pod_identity(pod_uid: &str) -> RegisteredPodIdentity {
-        RegisteredPodIdentity {
-            pod_name: "warm-pod-a".to_string(),
-            pod_uid: pod_uid.to_string(),
-            sandbox_id: None,
-            sandbox_owner_name: "sandbox-owner-a".to_string(),
-            sandbox_owner_uid: "owner-uid-a".to_string(),
+    fn bootstrap_identity(instance_id: &str) -> SupervisorBootstrapIdentity {
+        SupervisorBootstrapIdentity {
+            driver: "kubernetes".to_string(),
+            instance_name: "warm-pod-a".to_string(),
+            instance_id: instance_id.to_string(),
+            owner_name: "sandbox-owner-a".to_string(),
+            owner_uid: "owner-uid-a".to_string(),
+            binding: openshell_core::supervisor_bootstrap::SupervisorBootstrapBinding::WarmPending,
         }
     }
 
@@ -297,7 +309,7 @@ mod tests {
     fn dropping_stream_removes_pending_registration() {
         let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
         let stream = registry
-            .register_pending(pod_identity("pod-uid-a"))
+            .register_pending(bootstrap_identity("pod-uid-a"))
             .expect("register pending");
         assert_eq!(registry.pending_count(), 1);
         drop(stream);
@@ -308,10 +320,10 @@ mod tests {
     fn duplicate_registration_replaces_prior_stream() {
         let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
         let old = registry
-            .register_pending(pod_identity("pod-uid-a"))
+            .register_pending(bootstrap_identity("pod-uid-a"))
             .expect("register old");
         let new = registry
-            .register_pending(pod_identity("pod-uid-a"))
+            .register_pending(bootstrap_identity("pod-uid-a"))
             .expect("register new");
 
         assert_eq!(registry.pending_count(), 1);
@@ -329,7 +341,7 @@ mod tests {
     async fn activation_sends_message_and_removes_pending_registration() {
         let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
         let mut stream = registry
-            .register_pending(pod_identity("pod-uid-a"))
+            .register_pending(bootstrap_identity("pod-uid-a"))
             .expect("register pending");
 
         let activation = PodActivationMessage {
@@ -376,7 +388,7 @@ mod tests {
     async fn activation_tombstone_rejects_duplicate_activation_and_registration() {
         let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
         let mut stream = registry
-            .register_pending(pod_identity("pod-uid-a"))
+            .register_pending(bootstrap_identity("pod-uid-a"))
             .expect("register pending");
 
         let activation = PodActivationMessage {
@@ -396,7 +408,7 @@ mod tests {
             .expect_err("duplicate activation must fail");
         assert_eq!(err.code(), tonic::Code::AlreadyExists);
 
-        let Err(err) = registry.register_pending(pod_identity("pod-uid-a")) else {
+        let Err(err) = registry.register_pending(bootstrap_identity("pod-uid-a")) else {
             panic!("activated pod UID must not register again");
         };
         assert_eq!(err.code(), tonic::Code::AlreadyExists);
@@ -406,7 +418,7 @@ mod tests {
     fn closed_pending_stream_cannot_be_activated() {
         let registry = Arc::new(SupervisorPodRegistrationRegistry::new());
         let stream = registry
-            .register_pending(pod_identity("pod-uid-a"))
+            .register_pending(bootstrap_identity("pod-uid-a"))
             .expect("register pending");
         drop(stream);
 

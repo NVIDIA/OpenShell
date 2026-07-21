@@ -4,12 +4,15 @@
 //! Gateway-side warm supervisor pod activation.
 //!
 //! The Kubernetes claim controller will call this module after it observes and
-//! revalidates a claim that binds a warm pod UID to an `OpenShell` sandbox.
+//! revalidates a claim that binds a warm supervisor instance to an `OpenShell`
+//! sandbox.
 
 use crate::ServerState;
-use crate::auth::principal::RegisteredPodIdentity;
 use async_trait::async_trait;
 use openshell_core::proto::{PodActivationMessage, Sandbox};
+use openshell_core::supervisor_bootstrap::{
+    SupervisorBootstrapActivationRequest, SupervisorBootstrapActivator, SupervisorBootstrapIdentity,
+};
 use std::sync::Arc;
 use tonic::Status;
 use tracing::{info, warn};
@@ -17,16 +20,19 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct WarmPodActivationTarget {
-    pub pod_uid: String,
+    pub driver: String,
+    pub instance_id: String,
     pub sandbox_id: String,
+    pub owner_uid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub struct ValidatedWarmPodActivation {
-    pub pod_uid: String,
-    pub pod_name: String,
-    pub sandbox_owner_uid: String,
+    pub driver: String,
+    pub instance_id: String,
+    pub instance_name: String,
+    pub owner_uid: String,
     pub sandbox_id: String,
 }
 
@@ -36,8 +42,57 @@ pub trait WarmPodActivationValidator: Send + Sync {
     async fn validate(
         &self,
         target: &WarmPodActivationTarget,
-        pending: &RegisteredPodIdentity,
+        pending: &SupervisorBootstrapIdentity,
     ) -> Result<ValidatedWarmPodActivation, Status>;
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct GatewaySupervisorBootstrapActivator {
+    state: Arc<ServerState>,
+}
+
+impl GatewaySupervisorBootstrapActivator {
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn new(state: Arc<ServerState>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait]
+impl SupervisorBootstrapActivator for GatewaySupervisorBootstrapActivator {
+    async fn activate_registered_supervisor(
+        &self,
+        request: SupervisorBootstrapActivationRequest,
+    ) -> Result<(), Status> {
+        let target = WarmPodActivationTarget {
+            driver: request.driver,
+            instance_id: request.instance_id,
+            sandbox_id: request.sandbox_id,
+            owner_uid: request.owner_uid,
+        };
+        activate_warm_pod(&self.state, &TrustDriverActivationRequest, target).await
+    }
+}
+
+struct TrustDriverActivationRequest;
+
+#[async_trait]
+impl WarmPodActivationValidator for TrustDriverActivationRequest {
+    async fn validate(
+        &self,
+        target: &WarmPodActivationTarget,
+        pending: &SupervisorBootstrapIdentity,
+    ) -> Result<ValidatedWarmPodActivation, Status> {
+        Ok(ValidatedWarmPodActivation {
+            driver: target.driver.clone(),
+            instance_id: target.instance_id.clone(),
+            instance_name: pending.instance_name.clone(),
+            owner_uid: target.owner_uid.clone(),
+            sandbox_id: target.sandbox_id.clone(),
+        })
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -52,7 +107,7 @@ where
 {
     let pending = state
         .supervisor_pod_registrations
-        .pending_identity(&target.pod_uid)?;
+        .pending_identity(&target.instance_id)?;
     let activation_result = async {
         let validated = validator.validate(&target, &pending).await?;
         ensure_validated_activation_matches_pending(&target, &pending, &validated)?;
@@ -65,14 +120,14 @@ where
             let stream_status = clone_status(&status);
             state
                 .supervisor_pod_registrations
-                .fail_pending(&target.pod_uid, stream_status)?;
+                .fail_pending(&target.instance_id, stream_status)?;
             return Err(status);
         }
     };
 
     state
         .supervisor_pod_registrations
-        .activate(&target.pod_uid, activation)?;
+        .activate(&target.instance_id, activation)?;
     Ok(())
 }
 
@@ -83,22 +138,27 @@ fn clone_status(status: &Status) -> Status {
 #[allow(clippy::result_large_err)]
 fn ensure_validated_activation_matches_pending(
     target: &WarmPodActivationTarget,
-    pending: &RegisteredPodIdentity,
+    pending: &SupervisorBootstrapIdentity,
     validated: &ValidatedWarmPodActivation,
 ) -> Result<(), Status> {
-    if validated.pod_uid != target.pod_uid || validated.pod_uid != pending.pod_uid {
+    if validated.driver != target.driver || validated.driver != pending.driver {
         return Err(Status::permission_denied(
-            "validated pod UID does not match pending registration",
+            "validated driver does not match pending registration",
         ));
     }
-    if validated.pod_name != pending.pod_name {
+    if validated.instance_id != target.instance_id || validated.instance_id != pending.instance_id {
         return Err(Status::permission_denied(
-            "validated pod name does not match pending registration",
+            "validated instance ID does not match pending registration",
         ));
     }
-    if validated.sandbox_owner_uid != pending.sandbox_owner_uid {
+    if validated.instance_name != pending.instance_name {
         return Err(Status::permission_denied(
-            "validated Sandbox owner UID does not match pending registration",
+            "validated instance name does not match pending registration",
+        ));
+    }
+    if validated.owner_uid != target.owner_uid || validated.owner_uid != pending.owner_uid {
+        return Err(Status::permission_denied(
+            "validated owner UID does not match pending registration",
         ));
     }
     if validated.sandbox_id != target.sandbox_id {
@@ -185,7 +245,7 @@ mod tests {
         async fn validate(
             &self,
             _target: &WarmPodActivationTarget,
-            _pending: &RegisteredPodIdentity,
+            _pending: &SupervisorBootstrapIdentity,
         ) -> Result<ValidatedWarmPodActivation, Status> {
             Ok(self.validated.clone())
         }
@@ -229,7 +289,10 @@ mod tests {
                 name: sandbox_id.to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::default(),
+                annotations: HashMap::default(),
                 resource_version: 0,
+                deletion_timestamp_ms: 0,
+                workspace: "default".to_string(),
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -241,28 +304,32 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
     }
 
-    fn pending_pod() -> RegisteredPodIdentity {
-        RegisteredPodIdentity {
-            pod_name: "warm-pod-a".to_string(),
-            pod_uid: "pod-uid-a".to_string(),
-            sandbox_id: None,
-            sandbox_owner_name: "sandbox-owner-a".to_string(),
-            sandbox_owner_uid: "owner-uid-a".to_string(),
+    fn pending_identity() -> SupervisorBootstrapIdentity {
+        SupervisorBootstrapIdentity {
+            driver: "kubernetes".to_string(),
+            instance_name: "warm-pod-a".to_string(),
+            instance_id: "pod-uid-a".to_string(),
+            owner_name: "sandbox-owner-a".to_string(),
+            owner_uid: "owner-uid-a".to_string(),
+            binding: openshell_core::supervisor_bootstrap::SupervisorBootstrapBinding::WarmPending,
         }
     }
 
     fn activation_target(sandbox_id: &str) -> WarmPodActivationTarget {
         WarmPodActivationTarget {
-            pod_uid: "pod-uid-a".to_string(),
+            driver: "kubernetes".to_string(),
+            instance_id: "pod-uid-a".to_string(),
             sandbox_id: sandbox_id.to_string(),
+            owner_uid: "owner-uid-a".to_string(),
         }
     }
 
     fn validated_activation(sandbox_id: &str) -> ValidatedWarmPodActivation {
         ValidatedWarmPodActivation {
-            pod_uid: "pod-uid-a".to_string(),
-            pod_name: "warm-pod-a".to_string(),
-            sandbox_owner_uid: "owner-uid-a".to_string(),
+            driver: "kubernetes".to_string(),
+            instance_id: "pod-uid-a".to_string(),
+            instance_name: "warm-pod-a".to_string(),
+            owner_uid: "owner-uid-a".to_string(),
             sandbox_id: sandbox_id.to_string(),
         }
     }
@@ -272,7 +339,7 @@ mod tests {
         let state = state_with_issuer().await;
         let mut stream = state
             .supervisor_pod_registrations
-            .register_pending(pending_pod())
+            .register_pending(pending_identity())
             .expect("register pending");
         let validator = StaticValidator {
             validated: validated_activation("sandbox-a"),
@@ -295,7 +362,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activation_for_unknown_pod_uid_fails_before_validation() {
+    async fn activation_for_unknown_instance_id_fails_before_validation() {
         let state = state_with_issuer().await;
         let validator = StaticValidator {
             validated: validated_activation("sandbox-a"),
@@ -303,7 +370,7 @@ mod tests {
 
         let err = activate_warm_pod(&state, &validator, activation_target("sandbox-a"))
             .await
-            .expect_err("unknown pod UID must fail");
+            .expect_err("unknown instance ID must fail");
 
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
@@ -313,7 +380,7 @@ mod tests {
         let state = state_with_issuer().await;
         let mut stream = state
             .supervisor_pod_registrations
-            .register_pending(pending_pod())
+            .register_pending(pending_identity())
             .expect("register pending");
         let validator = StaticValidator {
             validated: validated_activation("sandbox-deleted"),
@@ -334,11 +401,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn duplicate_activation_for_same_pod_uid_is_rejected() {
+    async fn duplicate_activation_for_same_instance_id_is_rejected() {
         let state = state_with_issuer().await;
         let mut stream = state
             .supervisor_pod_registrations
-            .register_pending(pending_pod())
+            .register_pending(pending_identity())
             .expect("register pending");
         let validator = StaticValidator {
             validated: validated_activation("sandbox-a"),
@@ -360,10 +427,10 @@ mod tests {
         let state = state_with_issuer().await;
         let mut stream = state
             .supervisor_pod_registrations
-            .register_pending(pending_pod())
+            .register_pending(pending_identity())
             .expect("register pending");
         let mut validated = validated_activation("sandbox-a");
-        validated.sandbox_owner_uid = "other-owner".to_string();
+        validated.owner_uid = "other-owner".to_string();
         let validator = StaticValidator { validated };
 
         let err = activate_warm_pod(&state, &validator, activation_target("sandbox-a"))

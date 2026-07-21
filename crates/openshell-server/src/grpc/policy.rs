@@ -1253,7 +1253,7 @@ async fn resolve_sandbox_by_name_for_principal(
             Ok(sandbox)
         }
         Principal::User(_) => sandbox.ok_or_else(|| Status::not_found("sandbox not found")),
-        Principal::K8sPod(_) => Err(Status::permission_denied(
+        Principal::SupervisorBootstrap(_) => Err(Status::permission_denied(
             "sandbox-scoped methods require a sandbox principal",
         )),
         Principal::Anonymous => Err(Status::unauthenticated(
