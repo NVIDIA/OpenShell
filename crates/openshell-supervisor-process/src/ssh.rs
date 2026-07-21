@@ -485,7 +485,9 @@ impl russh::server::Handler for SshHandler {
                 self.netns_fd,
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
-                &self.provider_credentials.child_env_with_gcp_resolved(),
+                &self
+                    .provider_credentials
+                    .child_env_with_static_config_resolved(),
                 &self.user_environment,
                 self.enforcement_mode,
             )?;
@@ -564,7 +566,9 @@ impl SshHandler {
         handle: Handle,
         command: Option<String>,
     ) -> anyhow::Result<()> {
-        let provider_env = self.provider_credentials.child_env_with_gcp_resolved();
+        let provider_env = self
+            .provider_credentials
+            .child_env_with_static_config_resolved();
         let state = self
             .channels
             .get_mut(&channel)

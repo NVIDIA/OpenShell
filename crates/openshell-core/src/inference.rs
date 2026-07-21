@@ -108,6 +108,48 @@ static ANTHROPIC_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     passthrough_headers: &["anthropic-version", "anthropic-beta"],
 };
 
+/// Credential key holding the Anthropic subscription ("plan") OAuth access token.
+///
+/// Written by the gateway's `OAuth2` refresh worker via the `--from-claude-login`
+/// CLI flow and consumed by [`ANTHROPIC_OAUTH_PROFILE`]. This credential is
+/// proxy-only: it is injected as an `Authorization: Bearer` header at the egress
+/// boundary and is never exported into the sandbox environment.
+pub const ANTHROPIC_OAUTH_TOKEN_KEY: &str = "ANTHROPIC_OAUTH_TOKEN";
+
+/// The `anthropic-beta` flag required for requests authenticated with an
+/// Anthropic subscription OAuth token (as opposed to an API key).
+pub const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
+
+/// Non-secret Anthropic env keys that sandbox clients must read at process
+/// startup. The credential pipeline placeholderizes all provider env values;
+/// these keys are resolved back to real values in the sandbox env because a
+/// placeholderized base URL cannot be parsed by SDKs. `ANTHROPIC_AUTH_TOKEN`
+/// and `ANTHROPIC_API_KEY` are deliberately excluded: they may hold real
+/// secrets and stay egress-time placeholders.
+pub const ANTHROPIC_STATIC_CONFIG_KEYS: &[&str] = &["ANTHROPIC_BASE_URL"];
+
+/// Inference profile for the Anthropic subscription ("plan") OAuth flow.
+///
+/// Differs from [`ANTHROPIC_PROFILE`] in two ways the Anthropic API requires for
+/// subscription tokens: the token is sent as `Authorization: Bearer <token>`
+/// (not `x-api-key`), and every request must carry `anthropic-beta:
+/// oauth-2025-04-20`. The beta flag is a default header so the boundary forces it
+/// even when the sandbox client does not send it; the router merges it with any
+/// client-supplied `anthropic-beta` value.
+static ANTHROPIC_OAUTH_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "anthropic-oauth",
+    default_base_url: "https://api.anthropic.com/v1",
+    protocols: ANTHROPIC_PROTOCOLS,
+    credential_key_names: &[ANTHROPIC_OAUTH_TOKEN_KEY],
+    base_url_config_keys: &["ANTHROPIC_BASE_URL"],
+    auth: AuthHeader::Bearer,
+    default_headers: &[
+        ("anthropic-version", "2023-06-01"),
+        ("anthropic-beta", ANTHROPIC_OAUTH_BETA),
+    ],
+    passthrough_headers: &["anthropic-version", "anthropic-beta"],
+};
+
 /// Credential environment variable names for the Vertex AI provider, in priority order.
 ///
 /// These are referenced by both the provider discovery logic in `openshell-providers`
@@ -220,6 +262,7 @@ pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
     match input.trim().to_ascii_lowercase().as_str() {
         "openai" => Some("openai"),
         "anthropic" => Some("anthropic"),
+        "anthropic-oauth" | "claude-subscription" => Some("anthropic-oauth"),
         "nvidia" => Some("nvidia"),
         "deepinfra" => Some("deepinfra"),
         "aws-bedrock" => Some("aws-bedrock"),
@@ -238,6 +281,7 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
     match normalize_inference_provider_type(provider_type)? {
         "openai" => Some(&OPENAI_PROFILE),
         "anthropic" => Some(&ANTHROPIC_PROFILE),
+        "anthropic-oauth" => Some(&ANTHROPIC_OAUTH_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
         "deepinfra" => Some(&DEEPINFRA_PROFILE),
         "google-vertex-ai" => Some(&VERTEX_AI_PROFILE),
@@ -474,6 +518,43 @@ mod tests {
         let (auth, headers) = auth_for_provider_type("google-vertex-ai");
         assert_eq!(auth, AuthHeader::Bearer);
         assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn profile_for_anthropic_oauth_types() {
+        for key in &["anthropic-oauth", "claude-subscription", "Anthropic-OAuth"] {
+            let profile = profile_for(key).expect("anthropic-oauth profile should be Some");
+            assert_eq!(profile.provider_type, "anthropic-oauth");
+        }
+    }
+
+    #[test]
+    fn normalize_aliases_claude_subscription_to_anthropic_oauth() {
+        assert_eq!(
+            normalize_inference_provider_type("claude-subscription"),
+            Some("anthropic-oauth")
+        );
+        assert_eq!(
+            normalize_inference_provider_type("anthropic-oauth"),
+            Some("anthropic-oauth")
+        );
+    }
+
+    #[test]
+    fn auth_for_anthropic_oauth_uses_bearer_with_default_headers() {
+        let (auth, headers) = auth_for_provider_type("anthropic-oauth");
+        assert_eq!(auth, AuthHeader::Bearer);
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| *k == "anthropic-version" && *v == "2023-06-01")
+        );
+        assert!(
+            headers
+                .iter()
+                .any(|(k, v)| *k == "anthropic-beta" && *v == ANTHROPIC_OAUTH_BETA),
+            "anthropic-beta must be a default header so the sandbox cannot omit it"
+        );
     }
 
     #[test]

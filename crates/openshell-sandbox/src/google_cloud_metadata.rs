@@ -11,7 +11,7 @@
 //! The emulator runs as a loopback HTTP server inside the sandbox network
 //! namespace (see [`metadata_server`](crate::metadata_server)). GCP SDKs
 //! discover it via the `GCE_METADATA_HOST` environment variable, which is
-//! set to the loopback address by `child_env_with_gcp_resolved()`.
+//! set to the loopback address by `child_env_with_static_config_resolved()`.
 
 use miette::{IntoDiagnostic, Result};
 use openshell_core::provider_credentials::ProviderCredentialState;

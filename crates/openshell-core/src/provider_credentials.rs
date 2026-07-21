@@ -152,24 +152,27 @@ impl ProviderCredentialState {
         inner.current = Arc::new(env);
     }
 
-    /// Return `child_env` with GCP static config vars resolved to real values.
+    /// Return `child_env` with non-secret static config vars resolved to real
+    /// values.
     ///
-    /// The credential pipeline placeholderizes ALL env values, but GCP SDKs
-    /// and coding agents read certain vars (project ID, region, metadata host)
-    /// at process startup before any HTTP request flows through the proxy.
-    /// This method overrides those vars with resolved real values while
-    /// keeping secret credentials (like `GCP_ACCESS_TOKEN`) as placeholders.
+    /// The credential pipeline placeholderizes ALL env values, but SDKs and
+    /// coding agents read certain vars (GCP project ID, region, metadata host,
+    /// Anthropic base URL) at process startup before any HTTP request flows
+    /// through the proxy. This method overrides those vars with resolved real
+    /// values while keeping secret credentials (like `GCP_ACCESS_TOKEN` or
+    /// `ANTHROPIC_AUTH_TOKEN`) as placeholders.
     ///
     /// Three layers of env var injection:
     /// 1. **Synthetic vars** (`GCE_METADATA_IP`, `METADATA_SERVER_DETECTION`)
     ///    — sandbox-internal config not from user
     ///    input, inserted directly here with real values.
-    /// 2. **`google_cloud::STATIC_CONFIG_KEYS`** — user-provided non-secret config
-    ///    (project ID, region, SA email) that was placeholderized by
+    /// 2. **`google_cloud::STATIC_CONFIG_KEYS`** and
+    ///    **`inference::ANTHROPIC_STATIC_CONFIG_KEYS`** — non-secret config
+    ///    (project ID, region, SA email, base URL) that was placeholderized by
     ///    `ProviderPlugin::inject_env` → `SecretResolver`; un-placeholderized
     ///    here so SDKs can read them at startup.
     /// 3. Everything else stays as placeholders for proxy-time resolution.
-    pub fn child_env_with_gcp_resolved(&self) -> HashMap<String, String> {
+    pub fn child_env_with_static_config_resolved(&self) -> HashMap<String, String> {
         use crate::google_cloud;
 
         let inner = self
@@ -177,6 +180,18 @@ impl ProviderCredentialState {
             .read()
             .expect("provider credential state poisoned");
         let mut env = inner.current.child_env.clone();
+
+        if let Some(ref resolver) = inner.combined_resolver {
+            for key in crate::inference::ANTHROPIC_STATIC_CONFIG_KEYS {
+                if !env.contains_key(*key) {
+                    continue;
+                }
+                let placeholder = crate::secrets::placeholder_for_env_key(key);
+                if let Some(value) = resolver.resolve_placeholder(&placeholder) {
+                    env.insert((*key).to_string(), value.to_string());
+                }
+            }
+        }
 
         let has_gcp_metadata = env.contains_key("GCE_METADATA_HOST");
         let has_gcp_config = google_cloud::STATIC_CONFIG_KEYS
@@ -421,14 +436,14 @@ mod tests {
     }
 
     #[test]
-    fn child_env_with_gcp_resolved_without_gcp_returns_unchanged() {
+    fn child_env_with_static_config_resolved_without_gcp_returns_unchanged() {
         let state = ProviderCredentialState::from_environment(
             1,
             HashMap::from([("GITHUB_TOKEN".to_string(), "ghp_abc".to_string())]),
             HashMap::new(),
             HashMap::new(),
         );
-        let env = state.child_env_with_gcp_resolved();
+        let env = state.child_env_with_static_config_resolved();
         assert_eq!(
             env.get("GITHUB_TOKEN").map(String::as_str),
             Some("openshell:resolve:env:v1_GITHUB_TOKEN"),
@@ -439,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn child_env_with_gcp_resolved_overrides_gcp_static_vars() {
+    fn child_env_with_static_config_resolved_overrides_gcp_static_vars() {
         let state = ProviderCredentialState::from_environment(
             1,
             HashMap::from([
@@ -454,7 +469,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        let env = state.child_env_with_gcp_resolved();
+        let env = state.child_env_with_static_config_resolved();
 
         assert_eq!(
             env.get("GCE_METADATA_HOST").map(String::as_str),
@@ -483,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn child_env_with_gcp_resolved_handles_missing_config_keys() {
+    fn child_env_with_static_config_resolved_handles_missing_config_keys() {
         let state = ProviderCredentialState::from_environment(
             1,
             HashMap::from([
@@ -493,7 +508,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        let env = state.child_env_with_gcp_resolved();
+        let env = state.child_env_with_static_config_resolved();
 
         assert_eq!(
             env.get("GCE_METADATA_HOST").map(String::as_str),
@@ -506,6 +521,37 @@ mod tests {
                     .unwrap()
                     .starts_with("openshell:resolve:env:"),
             "missing config key should not be injected with a real value"
+        );
+    }
+
+    #[test]
+    fn child_env_with_static_config_resolved_resolves_anthropic_base_url() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([
+                (
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "https://inference.local".to_string(),
+                ),
+                (
+                    "ANTHROPIC_AUTH_TOKEN".to_string(),
+                    "inference-local".to_string(),
+                ),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let env = state.child_env_with_static_config_resolved();
+
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("https://inference.local"),
+            "base URL must be a parseable real value at process startup"
+        );
+        let token = env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str).unwrap();
+        assert!(
+            token.starts_with("openshell:resolve:env:"),
+            "ANTHROPIC_AUTH_TOKEN must stay as placeholder, got: {token}"
         );
     }
 
@@ -588,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn child_env_with_gcp_resolved_resolves_vertex_vars_without_metadata_host() {
+    fn child_env_with_static_config_resolved_resolves_vertex_vars_without_metadata_host() {
         let state = ProviderCredentialState::from_environment(
             1,
             HashMap::from([
@@ -602,7 +648,7 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
         );
-        let env = state.child_env_with_gcp_resolved();
+        let env = state.child_env_with_static_config_resolved();
         assert_eq!(
             env.get("GOOSE_PROVIDER").map(String::as_str),
             Some("gcp_vertex_ai"),

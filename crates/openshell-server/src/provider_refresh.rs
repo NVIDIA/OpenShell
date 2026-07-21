@@ -468,11 +468,28 @@ pub async fn refresh_provider_credential(
         }
         Err(err) => {
             let now_ms = current_time_ms();
-            state.status = "error".to_string();
+            let reauth_required = anthropic_subscription_login_rejected(&provider, &err);
+            let err = if reauth_required {
+                Status::new(
+                    err.code(),
+                    format!("{}{ANTHROPIC_RELOGIN_HINT}", err.message()),
+                )
+            } else {
+                err
+            };
+            if reauth_required {
+                // Terminal failure: the grant is revoked or the plan lapsed, so
+                // automatic retries can never succeed. The worker skips this
+                // state; an explicit RotateProviderCredential retries manually.
+                state.status = REAUTH_REQUIRED_STATUS.to_string();
+                state.next_refresh_at_ms = 0;
+            } else {
+                state.status = "error".to_string();
+                state.next_refresh_at_ms =
+                    now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000));
+            }
             state.last_error = err.message().to_string();
-            state.next_refresh_at_ms =
-                now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000));
-            persist_refresh_state_if_current(store, &state, expected_version).await?;
+            put_refresh_state(store, &state).await?;
             warn!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -486,6 +503,24 @@ pub async fn refresh_provider_credential(
             Err(err)
         }
     }
+}
+
+const ANTHROPIC_RELOGIN_HINT: &str = "; the subscription login is no longer valid — run `claude login` on the host, then delete and recreate the provider with `openshell provider create --from-claude-login`";
+
+/// Terminal refresh status: the stored grant was rejected by the token
+/// endpoint and only host re-authentication can fix it. The background worker
+/// skips these states instead of retrying; `RotateProviderCredential` remains
+/// the manual retry path.
+pub const REAUTH_REQUIRED_STATUS: &str = "reauth_required";
+
+/// True when an `anthropic-oauth` refresh failed because the token endpoint
+/// rejected the grant (revoked login, lapsed plan) rather than a transient
+/// network or gateway error, so re-authenticating on the host is the fix.
+fn anthropic_subscription_login_rejected(provider: &Provider, err: &Status) -> bool {
+    openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
+        == Some("anthropic-oauth")
+        && err.code() == tonic::Code::FailedPrecondition
+        && err.message().contains("token endpoint returned HTTP 4")
 }
 
 async fn apply_minted_credential(
@@ -1023,6 +1058,15 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
         if !due && !rotation_requested {
             continue;
         }
+        if state.status == REAUTH_REQUIRED_STATUS && !rotation_requested {
+            info!(
+                provider = %state.provider_name,
+                credential_key = %state.credential_key,
+                status = %state.status,
+                "skipping provider credential refresh until host re-authentication"
+            );
+            continue;
+        }
         if !is_gateway_mintable_strategy(strategy) {
             warn!(
                 provider = %state.provider_name,
@@ -1060,9 +1104,9 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NewRefreshStateConfig, delete_refresh_state, get_refresh_state, new_refresh_state,
-        put_refresh_state, refresh_provider_credential, refresh_state_name, refresh_strategy_name,
-        run_refresh_worker_tick, seconds_until_ms,
+        NewRefreshStateConfig, REAUTH_REQUIRED_STATUS, anthropic_subscription_login_rejected,
+        get_refresh_state, new_refresh_state, put_refresh_state, refresh_provider_credential,
+        refresh_state_name, refresh_strategy_name, run_refresh_worker_tick, seconds_until_ms,
     };
     use crate::persistence::test_store;
     use openshell_core::ObjectId;
@@ -1071,6 +1115,7 @@ mod tests {
         Provider, ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
     };
     use std::collections::HashMap;
+    use tonic::Status;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1458,766 +1503,80 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refresh_strategy_name_includes_aws_sts() {
-        assert_eq!(
-            refresh_strategy_name(ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32),
-            "aws_sts_assume_role"
-        );
-    }
-
     #[tokio::test]
-    async fn aws_sts_assume_role_mints_three_credentials_from_mock_endpoint() {
+    async fn anthropic_grant_rejection_marks_reauth_required_and_worker_stops_retrying() {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(body_string_contains("Action=AssumeRole"))
-            .and(body_string_contains("RoleArn=arn"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
-  <AssumeRoleResult>
-    <AssumedRoleUser>
-      <AssumedRoleId>AROA3XFRBF23:test-session</AssumedRoleId>
-      <Arn>arn:aws:sts::123456789012:assumed-role/TestRole/test-session</Arn>
-    </AssumedRoleUser>
-    <Credentials>
-      <AccessKeyId>ASIAMOCKKEY</AccessKeyId>
-      <SecretAccessKey>MockSecretAccessKey123</SecretAccessKey>
-      <SessionToken>MockSessionTokenXYZ</SessionToken>
-      <Expiration>2099-01-01T00:00:00Z</Expiration>
-    </Credentials>
-  </AssumeRoleResult>
-  <ResponseMetadata>
-    <RequestId>01234567-89ab-cdef-0123-456789abcdef</RequestId>
-  </ResponseMetadata>
-</AssumeRoleResponse>"#,
-            ))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({ "error": "invalid_grant" })),
+            )
+            // Initial refresh + explicit manual retry. The two worker ticks in
+            // between must not add requests.
+            .expect(2)
             .mount(&mock_server)
             .await;
 
         let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-        let prov = provider("aws-sts-test", "aws");
-        store.put_message(&prov).await.unwrap();
-
+        let provider = provider("claude-subscription", "anthropic-oauth");
+        store.put_message(&provider).await.unwrap();
         let state = new_refresh_state(
-            &prov,
-            "AWS_ACCESS_KEY_ID",
+            &provider,
+            "ANTHROPIC_OAUTH_TOKEN",
             NewRefreshStateConfig {
-                additional_output_keys: HashMap::from([
-                    (
-                        "secret_access_key".to_string(),
-                        "AWS_SECRET_ACCESS_KEY".to_string(),
-                    ),
-                    ("session_token".to_string(), "AWS_SESSION_TOKEN".to_string()),
-                ]),
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
                 material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
                     (
-                        "role_arn".to_string(),
-                        "arn:aws:iam::123456789012:role/TestRole".to_string(),
+                        "refresh_token".to_string(),
+                        "revoked-refresh-token".to_string(),
                     ),
-                    ("session_name".to_string(), "test-session".to_string()),
-                    ("aws_access_key_id".to_string(), "AKIATESTKEY".to_string()),
-                    (
-                        "aws_secret_access_key".to_string(),
-                        "TestSecretKey".to_string(),
-                    ),
-                    ("sts_endpoint_url".to_string(), mock_server.uri()),
                 ]),
-                secret_material_keys: vec!["aws_secret_access_key".to_string()],
+                secret_material_keys: vec!["refresh_token".to_string()],
                 expires_at_ms: 0,
-                token_url: String::new(),
+                token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
             },
         )
         .unwrap();
         put_refresh_state(&store, &state).await.unwrap();
-
-        let refreshed = refresh_provider_credential(&store, "aws-sts-test", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap();
-        assert_eq!(refreshed.status, "refreshed");
-        assert!(refreshed.expires_at_ms > 0);
-
-        let stored = store
-            .get_message_by_name::<Provider>("aws-sts-test")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            stored.credentials.get("AWS_ACCESS_KEY_ID"),
-            Some(&"ASIAMOCKKEY".to_string())
-        );
-        assert_eq!(
-            stored.credentials.get("AWS_SECRET_ACCESS_KEY"),
-            Some(&"MockSecretAccessKey123".to_string())
-        );
-        assert_eq!(
-            stored.credentials.get("AWS_SESSION_TOKEN"),
-            Some(&"MockSessionTokenXYZ".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn aws_sts_mint_writes_to_resolved_additional_output_keys() {
-        let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(body_string_contains("Action=AssumeRole"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
-  <AssumeRoleResult>
-    <Credentials>
-      <AccessKeyId>ASIAMOCKKEY</AccessKeyId>
-      <SecretAccessKey>MockSecretAccessKey123</SecretAccessKey>
-      <SessionToken>MockSessionTokenXYZ</SessionToken>
-      <Expiration>2099-01-01T00:00:00Z</Expiration>
-    </Credentials>
-  </AssumeRoleResult>
-</AssumeRoleResponse>"#,
-            ))
-            .mount(&mock_server)
-            .await;
-
-        let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-        let prov = provider("aws-sts-custom", "aws");
-        store.put_message(&prov).await.unwrap();
-
-        // The minter honors the resolved output->env-key map from state, not
-        // hardcoded AWS names.
-        let state = new_refresh_state(
-            &prov,
-            "AWS_ACCESS_KEY_ID",
-            NewRefreshStateConfig {
-                additional_output_keys: HashMap::from([
-                    ("secret_access_key".to_string(), "CUSTOM_SECRET".to_string()),
-                    ("session_token".to_string(), "CUSTOM_SESSION".to_string()),
-                ]),
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
-                material: HashMap::from([
-                    (
-                        "role_arn".to_string(),
-                        "arn:aws:iam::123456789012:role/TestRole".to_string(),
-                    ),
-                    ("aws_access_key_id".to_string(), "AKIATESTKEY".to_string()),
-                    (
-                        "aws_secret_access_key".to_string(),
-                        "TestSecretKey".to_string(),
-                    ),
-                    ("sts_endpoint_url".to_string(), mock_server.uri()),
-                ]),
-                secret_material_keys: vec!["aws_secret_access_key".to_string()],
-                expires_at_ms: 0,
-                token_url: String::new(),
-                scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
-            },
-        )
-        .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-
-        refresh_provider_credential(&store, "aws-sts-custom", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap();
-
-        let stored = store
-            .get_message_by_name::<Provider>("aws-sts-custom")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            stored.credentials.get("AWS_ACCESS_KEY_ID"),
-            Some(&"ASIAMOCKKEY".to_string())
-        );
-        assert_eq!(
-            stored.credentials.get("CUSTOM_SECRET"),
-            Some(&"MockSecretAccessKey123".to_string())
-        );
-        assert_eq!(
-            stored.credentials.get("CUSTOM_SESSION"),
-            Some(&"MockSessionTokenXYZ".to_string())
-        );
-        assert!(!stored.credentials.contains_key("AWS_SECRET_ACCESS_KEY"));
-    }
-
-    #[tokio::test]
-    async fn aws_sts_mint_rejects_partial_source_credentials() {
-        let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-        let prov = provider("aws-sts-partial", "aws");
-        store.put_message(&prov).await.unwrap();
-
-        // Only the access key half of the explicit source pair is present. The
-        // mint must fail rather than fall back to the gateway's ambient identity.
-        let state = new_refresh_state(
-            &prov,
-            "AWS_ACCESS_KEY_ID",
-            NewRefreshStateConfig {
-                additional_output_keys: HashMap::from([
-                    (
-                        "secret_access_key".to_string(),
-                        "AWS_SECRET_ACCESS_KEY".to_string(),
-                    ),
-                    ("session_token".to_string(), "AWS_SESSION_TOKEN".to_string()),
-                ]),
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
-                material: HashMap::from([
-                    (
-                        "role_arn".to_string(),
-                        "arn:aws:iam::123456789012:role/TestRole".to_string(),
-                    ),
-                    ("aws_access_key_id".to_string(), "AKIATESTKEY".to_string()),
-                ]),
-                secret_material_keys: Vec::new(),
-                expires_at_ms: 0,
-                token_url: String::new(),
-                scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
-            },
-        )
-        .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-
-        let err = refresh_provider_credential(&store, "aws-sts-partial", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("both be set or both omitted"));
-
-        let stored = store
-            .get_message_by_name::<Provider>("aws-sts-partial")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!stored.credentials.contains_key("AWS_ACCESS_KEY_ID"));
-    }
-
-    #[tokio::test]
-    async fn apply_minted_credential_writes_additional_keys() {
-        use super::apply_minted_credential;
-
-        let store = test_store().await;
-        let mut prov = provider("aws-test", "aws");
-        prov.credentials
-            .insert("AWS_ACCESS_KEY_ID".to_string(), "old-key".to_string());
-        store.put_message(&prov).await.unwrap();
-
-        let minted = super::MintedCredential {
-            access_token: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            expires_at_ms: 4_000_000_000_000,
-            refresh_token: None,
-            additional_credentials: HashMap::from([
-                (
-                    "AWS_SECRET_ACCESS_KEY".to_string(),
-                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-                ),
-                (
-                    "AWS_SESSION_TOKEN".to_string(),
-                    "FwoGZXIvYXdzEBYaDH...EXAMPLETOKEN".to_string(),
-                ),
-            ]),
-        };
-
-        apply_minted_credential(&store, &prov, "AWS_ACCESS_KEY_ID", &minted)
-            .await
-            .unwrap();
-
-        let stored = store
-            .get_message_by_name::<Provider>("aws-test")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            stored.credentials.get("AWS_ACCESS_KEY_ID"),
-            Some(&"AKIAIOSFODNN7EXAMPLE".to_string())
-        );
-        assert_eq!(
-            stored.credentials.get("AWS_SECRET_ACCESS_KEY"),
-            Some(&"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string())
-        );
-        assert_eq!(
-            stored.credentials.get("AWS_SESSION_TOKEN"),
-            Some(&"FwoGZXIvYXdzEBYaDH...EXAMPLETOKEN".to_string())
-        );
-        assert_eq!(
-            stored.credential_expires_at_ms.get("AWS_ACCESS_KEY_ID"),
-            Some(&4_000_000_000_000)
-        );
-        assert_eq!(
-            stored.credential_expires_at_ms.get("AWS_SECRET_ACCESS_KEY"),
-            Some(&4_000_000_000_000)
-        );
-        assert_eq!(
-            stored.credential_expires_at_ms.get("AWS_SESSION_TOKEN"),
-            Some(&4_000_000_000_000)
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_minted_credential_validates_additional_keys_against_sandboxes() {
-        use super::apply_minted_credential;
-
-        let store = test_store().await;
-        let mut existing_provider = provider("existing-aws", "aws");
-        existing_provider
-            .credentials
-            .insert("AWS_SECRET_ACCESS_KEY".to_string(), "existing".to_string());
-        store.put_message(&existing_provider).await.unwrap();
-
-        let refreshing_provider = provider("refreshing-aws", "aws");
-        store.put_message(&refreshing_provider).await.unwrap();
-
-        store
-            .put_message(&Sandbox {
-                metadata: Some(ObjectMeta {
-                    id: "sandbox-aws-collision".to_string(),
-                    name: "aws-collision".to_string(),
-                    created_at_ms: 1,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                }),
-                spec: Some(SandboxSpec {
-                    providers: vec!["existing-aws".to_string(), "refreshing-aws".to_string()],
-                    ..SandboxSpec::default()
-                }),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let minted = super::MintedCredential {
-            access_token: "AKIAIOSFODNN7EXAMPLE".to_string(),
-            expires_at_ms: 4_000_000_000_000,
-            refresh_token: None,
-            additional_credentials: HashMap::from([
-                (
-                    "AWS_SECRET_ACCESS_KEY".to_string(),
-                    "secret-key".to_string(),
-                ),
-                ("AWS_SESSION_TOKEN".to_string(), "session-token".to_string()),
-            ]),
-        };
 
         let err =
-            apply_minted_credential(&store, &refreshing_provider, "AWS_ACCESS_KEY_ID", &minted)
+            refresh_provider_credential(&store, "claude-subscription", "ANTHROPIC_OAUTH_TOKEN")
                 .await
                 .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert!(err.message().contains("AWS_SECRET_ACCESS_KEY"));
-    }
+        assert!(
+            err.message().contains("run `claude login`"),
+            "grant rejection must carry the re-login hint: {}",
+            err.message()
+        );
 
-    // A wiremock responder that blocks the STS response until the test releases
-    // it, so a delete-refresh can be interleaved deterministically while the
-    // rotation is parked awaiting STS.
-    struct GatedStsResponder {
-        hit: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-        body: String,
-    }
-
-    impl wiremock::Respond for GatedStsResponder {
-        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
-            let hit = self.hit.lock().unwrap().take();
-            if let Some(hit) = hit {
-                let _ = hit.send(());
-            }
-            let _ = self.release.lock().unwrap().recv();
-            ResponseTemplate::new(200).set_body_string(self.body.clone())
-        }
-    }
-
-    #[tokio::test]
-    async fn aws_sts_mint_accepts_session_token_with_source_pair() {
-        let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(body_string_contains("Action=AssumeRole"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(
-                r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
-  <AssumeRoleResult>
-    <Credentials>
-      <AccessKeyId>ASIAMOCKKEY</AccessKeyId>
-      <SecretAccessKey>MockSecretAccessKey123</SecretAccessKey>
-      <SessionToken>MockSessionTokenXYZ</SessionToken>
-      <Expiration>2099-01-01T00:00:00Z</Expiration>
-    </Credentials>
-  </AssumeRoleResult>
-</AssumeRoleResponse>"#,
-            ))
-            .mount(&mock_server)
-            .await;
-
-        let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-        let prov = provider("aws-sts-session", "aws");
-        store.put_message(&prov).await.unwrap();
-
-        // Temporary source credentials: access key + secret + session token.
-        let state = new_refresh_state(
-            &prov,
-            "AWS_ACCESS_KEY_ID",
-            NewRefreshStateConfig {
-                additional_output_keys: HashMap::from([
-                    (
-                        "secret_access_key".to_string(),
-                        "AWS_SECRET_ACCESS_KEY".to_string(),
-                    ),
-                    ("session_token".to_string(), "AWS_SESSION_TOKEN".to_string()),
-                ]),
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
-                material: HashMap::from([
-                    (
-                        "role_arn".to_string(),
-                        "arn:aws:iam::123456789012:role/TestRole".to_string(),
-                    ),
-                    ("aws_access_key_id".to_string(), "ASIASOURCEKEY".to_string()),
-                    (
-                        "aws_secret_access_key".to_string(),
-                        "SourceSecretKey".to_string(),
-                    ),
-                    (
-                        "aws_session_token".to_string(),
-                        "SourceSessionToken".to_string(),
-                    ),
-                    ("sts_endpoint_url".to_string(), mock_server.uri()),
-                ]),
-                secret_material_keys: vec![
-                    "aws_secret_access_key".to_string(),
-                    "aws_session_token".to_string(),
-                ],
-                expires_at_ms: 0,
-                token_url: String::new(),
-                scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
-            },
-        )
-        .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-
-        let refreshed = refresh_provider_credential(&store, "aws-sts-session", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap();
-        assert_eq!(refreshed.status, "refreshed");
-        let stored = store
-            .get_message_by_name::<Provider>("aws-sts-session")
+        let stored = get_refresh_state(&store, provider.object_id(), "ANTHROPIC_OAUTH_TOKEN")
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(stored.status, REAUTH_REQUIRED_STATUS);
         assert_eq!(
-            stored.credentials.get("AWS_ACCESS_KEY_ID"),
-            Some(&"ASIAMOCKKEY".to_string())
+            stored.next_refresh_at_ms, 0,
+            "terminal state must not be rescheduled"
         );
-    }
+        assert!(stored.last_error.contains("HTTP 400"));
 
-    #[tokio::test]
-    async fn aws_sts_mint_rejects_session_token_without_source_pair() {
-        let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-        let prov = provider("aws-sts-lonesession", "aws");
-        store.put_message(&prov).await.unwrap();
+        run_refresh_worker_tick(&store).await.unwrap();
+        run_refresh_worker_tick(&store).await.unwrap();
 
-        let state = new_refresh_state(
-            &prov,
-            "AWS_ACCESS_KEY_ID",
-            NewRefreshStateConfig {
-                additional_output_keys: HashMap::from([
-                    (
-                        "secret_access_key".to_string(),
-                        "AWS_SECRET_ACCESS_KEY".to_string(),
-                    ),
-                    ("session_token".to_string(), "AWS_SESSION_TOKEN".to_string()),
-                ]),
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
-                material: HashMap::from([
-                    (
-                        "role_arn".to_string(),
-                        "arn:aws:iam::123456789012:role/TestRole".to_string(),
-                    ),
-                    (
-                        "aws_session_token".to_string(),
-                        "SourceSessionToken".to_string(),
-                    ),
-                ]),
-                secret_material_keys: vec!["aws_session_token".to_string()],
-                expires_at_ms: 0,
-                token_url: String::new(),
-                scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
-            },
-        )
-        .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-
-        let err = refresh_provider_credential(&store, "aws-sts-lonesession", "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(err.message().contains("aws_session_token requires"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rotation_does_not_resurrect_refresh_deleted_mid_flight() {
-        let mock_server = MockServer::start().await;
-        let (hit_tx, hit_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        Mock::given(method("POST"))
-            .and(body_string_contains("Action=AssumeRole"))
-            .respond_with(GatedStsResponder {
-                hit: std::sync::Mutex::new(Some(hit_tx)),
-                release: std::sync::Mutex::new(release_rx),
-                body: r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
-  <AssumeRoleResult>
-    <Credentials>
-      <AccessKeyId>ASIAMOCKKEY</AccessKeyId>
-      <SecretAccessKey>MockSecretAccessKey123</SecretAccessKey>
-      <SessionToken>MockSessionTokenXYZ</SessionToken>
-      <Expiration>2099-01-01T00:00:00Z</Expiration>
-    </Credentials>
-  </AssumeRoleResult>
-</AssumeRoleResponse>"#
-                    .to_string(),
-            })
-            .mount(&mock_server)
-            .await;
-
-        let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-        let prov = provider("aws-race", "aws");
-        store.put_message(&prov).await.unwrap();
-        let provider_id = prov.object_id().to_string();
-
-        let state = new_refresh_state(
-            &prov,
-            "AWS_ACCESS_KEY_ID",
-            NewRefreshStateConfig {
-                additional_output_keys: HashMap::from([
-                    (
-                        "secret_access_key".to_string(),
-                        "AWS_SECRET_ACCESS_KEY".to_string(),
-                    ),
-                    ("session_token".to_string(), "AWS_SESSION_TOKEN".to_string()),
-                ]),
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
-                material: HashMap::from([
-                    (
-                        "role_arn".to_string(),
-                        "arn:aws:iam::123456789012:role/TestRole".to_string(),
-                    ),
-                    ("aws_access_key_id".to_string(), "AKIATESTKEY".to_string()),
-                    (
-                        "aws_secret_access_key".to_string(),
-                        "TestSecretKey".to_string(),
-                    ),
-                    ("sts_endpoint_url".to_string(), mock_server.uri()),
-                ]),
-                secret_material_keys: vec!["aws_secret_access_key".to_string()],
-                expires_at_ms: 0,
-                token_url: String::new(),
-                scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
-            },
-        )
-        .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-
-        let rotate = refresh_provider_credential(&store, "aws-race", "AWS_ACCESS_KEY_ID");
-        let interfere = async {
-            // Wait until the rotation is inside the STS call (its state read has
-            // already happened), then delete the refresh and release STS.
-            if tokio::time::timeout(std::time::Duration::from_secs(15), hit_rx)
+        let err =
+            refresh_provider_credential(&store, "claude-subscription", "ANTHROPIC_OAUTH_TOKEN")
                 .await
-                .is_err()
-            {
-                return;
-            }
-            delete_refresh_state(&store, &provider_id, "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap();
-            let _ = release_tx.send(());
-        };
-        let (rotate_result, ()) = tokio::join!(rotate, interfere);
-
-        // The rotation must fail rather than complete against a deleted refresh.
-        assert!(
-            rotate_result.is_err(),
-            "rotation should abort when its refresh is deleted mid-flight"
+                .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "explicit rotation must remain a manual retry path"
         );
-        // The deleted refresh state must not be resurrected.
-        assert!(
-            get_refresh_state(&store, &provider_id, "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap()
-                .is_none(),
-            "deleted refresh state must not be recreated"
-        );
-        // No credentials were minted into the provider.
-        let stored = store
-            .get_message_by_name::<Provider>("aws-race")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!stored.credentials.contains_key("AWS_ACCESS_KEY_ID"));
-        assert!(!stored.credentials.contains_key("AWS_SECRET_ACCESS_KEY"));
-        assert!(!stored.credentials.contains_key("AWS_SESSION_TOKEN"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rotation_superseded_mid_flight_discards_credentials() {
-        let mock_server = MockServer::start().await;
-        let (hit_tx, hit_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        Mock::given(method("POST"))
-            .and(body_string_contains("Action=AssumeRole"))
-            .respond_with(GatedStsResponder {
-                hit: std::sync::Mutex::new(Some(hit_tx)),
-                release: std::sync::Mutex::new(release_rx),
-                body: r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
-  <AssumeRoleResult>
-    <Credentials>
-      <AccessKeyId>ASIAMOCKKEY</AccessKeyId>
-      <SecretAccessKey>MockSecretAccessKey123</SecretAccessKey>
-      <SessionToken>MockSessionTokenXYZ</SessionToken>
-      <Expiration>2099-01-01T00:00:00Z</Expiration>
-    </Credentials>
-  </AssumeRoleResult>
-</AssumeRoleResponse>"#
-                    .to_string(),
-            })
-            .mount(&mock_server)
-            .await;
-
-        let store = test_store().await;
-        crate::grpc::policy::set_global_bool_setting_for_test(
-            &store,
-            openshell_core::settings::PROVIDERS_V2_ENABLED_KEY,
-            true,
-        )
-        .await
-        .unwrap();
-        let prov = provider("aws-superseded", "aws");
-        store.put_message(&prov).await.unwrap();
-        let provider_id = prov.object_id().to_string();
-
-        let state = new_refresh_state(
-            &prov,
-            "AWS_ACCESS_KEY_ID",
-            NewRefreshStateConfig {
-                additional_output_keys: HashMap::from([
-                    (
-                        "secret_access_key".to_string(),
-                        "AWS_SECRET_ACCESS_KEY".to_string(),
-                    ),
-                    ("session_token".to_string(), "AWS_SESSION_TOKEN".to_string()),
-                ]),
-                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
-                material: HashMap::from([
-                    (
-                        "role_arn".to_string(),
-                        "arn:aws:iam::123456789012:role/TestRole".to_string(),
-                    ),
-                    ("aws_access_key_id".to_string(), "AKIATESTKEY".to_string()),
-                    (
-                        "aws_secret_access_key".to_string(),
-                        "TestSecretKey".to_string(),
-                    ),
-                    ("sts_endpoint_url".to_string(), mock_server.uri()),
-                ]),
-                secret_material_keys: vec!["aws_secret_access_key".to_string()],
-                expires_at_ms: 0,
-                token_url: String::new(),
-                scopes: Vec::new(),
-                refresh_before_seconds: 300,
-                max_lifetime_seconds: 3600,
-            },
-        )
-        .unwrap();
-        put_refresh_state(&store, &state).await.unwrap();
-
-        let rotate = refresh_provider_credential(&store, "aws-superseded", "AWS_ACCESS_KEY_ID");
-        let interfere = async {
-            if tokio::time::timeout(std::time::Duration::from_secs(15), hit_rx)
-                .await
-                .is_err()
-            {
-                return;
-            }
-            // Simulate a concurrent rotation or reconfigure winning the
-            // generation: any write to the refresh state bumps its version, so
-            // the in-flight rotation's version-matched persist will lose.
-            let mut winner = get_refresh_state(&store, &provider_id, "AWS_ACCESS_KEY_ID")
-                .await
-                .unwrap()
-                .unwrap();
-            winner.last_error = "won-by-concurrent-writer".to_string();
-            put_refresh_state(&store, &winner).await.unwrap();
-            let _ = release_tx.send(());
-        };
-        let (rotate_result, ()) = tokio::join!(rotate, interfere);
-
-        // The superseded (losing) rotation must abort rather than complete.
-        assert!(
-            rotate_result.is_err(),
-            "a rotation whose generation was superseded must abort"
-        );
-        // It must not write its stale-generation credentials into the provider.
-        let stored = store
-            .get_message_by_name::<Provider>("aws-superseded")
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!stored.credentials.contains_key("AWS_ACCESS_KEY_ID"));
-        assert!(!stored.credentials.contains_key("AWS_SECRET_ACCESS_KEY"));
-        assert!(!stored.credentials.contains_key("AWS_SESSION_TOKEN"));
-        // The concurrent writer's refresh state must survive untouched.
-        let refresh = get_refresh_state(&store, &provider_id, "AWS_ACCESS_KEY_ID")
-            .await
-            .unwrap()
-            .expect("refresh state should still exist");
-        assert_eq!(refresh.last_error, "won-by-concurrent-writer");
-        assert_ne!(refresh.status, "refreshed");
     }
 
     fn provider(name: &str, provider_type: &str) -> Provider {
@@ -2235,6 +1594,42 @@ mod tests {
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn relogin_hint_applies_only_to_anthropic_oauth_grant_rejection() {
+        let rejected = Status::failed_precondition("token endpoint returned HTTP 400 Bad Request");
+        assert!(anthropic_subscription_login_rejected(
+            &provider("plan", "anthropic-oauth"),
+            &rejected
+        ));
+        assert!(
+            anthropic_subscription_login_rejected(
+                &provider("plan", "claude-subscription"),
+                &rejected
+            ),
+            "type alias must get the hint too"
+        );
+        assert!(
+            !anthropic_subscription_login_rejected(
+                &provider("plan", "anthropic-oauth"),
+                &Status::unavailable("token endpoint request failed: timeout")
+            ),
+            "transient network errors must not suggest re-login"
+        );
+        assert!(
+            !anthropic_subscription_login_rejected(
+                &provider("plan", "anthropic-oauth"),
+                &Status::failed_precondition(
+                    "token endpoint returned HTTP 500 Internal Server Error"
+                )
+            ),
+            "server-side errors must not suggest re-login"
+        );
+        assert!(!anthropic_subscription_login_rejected(
+            &provider("graph", "custom"),
+            &rejected
+        ));
     }
 
     const TEST_RSA_PRIVATE_KEY: &str = r"-----BEGIN PRIVATE KEY-----

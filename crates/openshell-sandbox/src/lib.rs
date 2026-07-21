@@ -287,7 +287,7 @@ pub async fn run_sandbox(
                 provider_credential_expires_at_ms,
                 dynamic_credentials,
             );
-            let provider_env = provider_credentials.child_env_with_gcp_resolved();
+            let provider_env = provider_credentials.child_env_with_static_config_resolved();
             (provider_credentials, provider_env)
         };
     let process_control_writer = process_control_connection
@@ -2698,7 +2698,9 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                         env_result.credential_expires_at_ms,
                         env_result.dynamic_credentials,
                     );
-                    let child_env = ctx.provider_credentials.child_env_with_gcp_resolved();
+                    let child_env = ctx
+                        .provider_credentials
+                        .child_env_with_static_config_resolved();
                     let env_count = child_env.len();
                     if let Some(publisher) = ctx.sidecar_control_publisher.as_ref() {
                         publisher.publish_provider_env(
