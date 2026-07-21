@@ -98,36 +98,6 @@ Registration is static. Restart the gateway after adding, removing, or changing 
 
 Start with the invariant the interceptor must preserve, then identify every gateway RPC that can establish or weaken it. For example, an interceptor that owns sandbox policy can use `modify_operation` on `CreateSandbox` to apply an approved initial policy and `validate` on `UpdateConfig` to reject unauthorized changes.
 
-The following unary mutation RPCs are interceptable:
-
-| Area | RPC selector |
-| --- | --- |
-| Sandbox | `openshell.v1.OpenShell/CreateSandbox` |
-| Sandbox | `openshell.v1.OpenShell/AttachSandboxProvider` |
-| Sandbox | `openshell.v1.OpenShell/DetachSandboxProvider` |
-| Sandbox | `openshell.v1.OpenShell/DeleteSandbox` |
-| Sandbox access | `openshell.v1.OpenShell/CreateSshSession` |
-| Sandbox access | `openshell.v1.OpenShell/RevokeSshSession` |
-| Service exposure | `openshell.v1.OpenShell/ExposeService` |
-| Service exposure | `openshell.v1.OpenShell/DeleteService` |
-| Provider | `openshell.v1.OpenShell/CreateProvider` |
-| Provider | `openshell.v1.OpenShell/UpdateProvider` |
-| Provider | `openshell.v1.OpenShell/DeleteProvider` |
-| Provider profile | `openshell.v1.OpenShell/ImportProviderProfiles` |
-| Provider profile | `openshell.v1.OpenShell/UpdateProviderProfiles` |
-| Provider profile | `openshell.v1.OpenShell/DeleteProviderProfile` |
-| Provider credential | `openshell.v1.OpenShell/ConfigureProviderRefresh` |
-| Provider credential | `openshell.v1.OpenShell/RotateProviderCredential` |
-| Provider credential | `openshell.v1.OpenShell/DeleteProviderRefresh` |
-| Policy | `openshell.v1.OpenShell/UpdateConfig` |
-| Policy analysis | `openshell.v1.OpenShell/SubmitPolicyAnalysis` |
-| Policy draft | `openshell.v1.OpenShell/ApproveDraftChunk` |
-| Policy draft | `openshell.v1.OpenShell/RejectDraftChunk` |
-| Policy draft | `openshell.v1.OpenShell/ApproveAllDraftChunks` |
-| Policy draft | `openshell.v1.OpenShell/EditDraftChunk` |
-| Policy draft | `openshell.v1.OpenShell/UndoDraftChunk` |
-| Policy draft | `openshell.v1.OpenShell/ClearDraftChunks` |
-
 The gateway maintains the canonical [interceptable route allowlist](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-gateway-interceptors/src/routes.rs). Read the interceptor manifest and gateway startup diagnostics when selecting bindings. Unknown, streaming, read-only, and non-allowlisted RPCs cannot be intercepted.
 
 Choose a phase by intent:
