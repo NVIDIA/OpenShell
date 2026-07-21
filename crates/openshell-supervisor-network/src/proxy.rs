@@ -5236,7 +5236,7 @@ network_policies: {}
     }
 
     #[test]
-     fn forward_policy_denial_ocsf_includes_validation_rationale() {
+    fn forward_policy_denial_ocsf_includes_validation_rationale() {
         let reason = "policy validation failed; fail-closed quarantine is active; candidate version 7 rejected: conflicting tls metadata";
         let event = build_forward_policy_deny_ocsf_event(
             "127.0.0.1:45123".parse().unwrap(),
@@ -5252,10 +5252,10 @@ network_policies: {}
         );
         let json = event.to_json().unwrap();
 
-         assert_eq!(json["status_detail"], reason);
-         assert_eq!(json["action"], "Denied");
-         assert_eq!(json["disposition"], "Blocked");
-     }
+        assert_eq!(json["status_detail"], reason);
+        assert_eq!(json["action"], "Denied");
+        assert_eq!(json["disposition"], "Blocked");
+    }
 
     #[test]
     fn endpoint_only_opa_allows_declared_endpoint_without_process_identity() {
@@ -10396,6 +10396,6 @@ network_policies:
         assert_eq!(res, 3);
         assert_eq!(unk, 2);
     }
-    #[path = "phase0.rs"]
-    mod phase0;
+    #[path = "compatibility.rs"]
+    mod compatibility;
 }

@@ -4182,9 +4182,9 @@ filesystem_policy:
         assert_eq!(config["unmapped"]["previous_policy_active"], true);
         assert!(
             config["message"]
-                 .as_str()
-                 .unwrap()
-                 .contains("previous policy IS active")
-         );
+                .as_str()
+                .unwrap()
+                .contains("previous policy IS active")
+        );
     }
 }

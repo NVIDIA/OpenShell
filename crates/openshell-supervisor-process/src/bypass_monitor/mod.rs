@@ -496,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn phase0_bypass_ocsf_contract_is_stable() {
+    fn bypass_ocsf_contract_is_stable() {
         let event = BypassEvent {
             dst_addr: "93.184.216.34".to_string(),
             dst_port: 443,

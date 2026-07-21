@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase0_metadata_loopback_dispatches_method_path_and_response() {
+    async fn metadata_loopback_dispatches_method_path_and_response() {
         let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
         let handler = RecordingHandler {
             requests: requests_tx,
@@ -202,7 +202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn phase0_metadata_loopback_rejects_oversized_headers_before_handler() {
+    async fn metadata_loopback_rejects_oversized_headers_before_handler() {
         let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
         let handler = RecordingHandler {
             requests: requests_tx,

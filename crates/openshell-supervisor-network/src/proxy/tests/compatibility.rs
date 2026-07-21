@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Compatibility fixtures for RFC 0005 Phase 0.
+//! Compatibility and regression contracts for the shared proxy egress pipeline.
 
 use super::*;
 use std::io::Write;
@@ -27,7 +27,7 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
     EgressDecision {
         intent,
         action: NetworkAction::Allow {
-            matched_policy: Some("phase0".to_string()),
+            matched_policy: Some("proxy_compatibility".to_string()),
         },
         l4_policy_generation: 0,
         identity: ProcessIdentityEvidence::Available,
@@ -98,7 +98,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
     for (kind, detail) in cases {
         let denial = DestinationDenial {
             kind,
-            reason: "phase0 destination failure".to_string(),
+            reason: "proxy compatibility destination failure".to_string(),
         };
         let peer: SocketAddr = "127.0.0.1:41000".parse().unwrap();
 
@@ -142,7 +142,7 @@ async fn destination_denials_preserve_adapter_specific_wire_contracts() {
             "42",
             "/usr/bin/sh",
             "curl",
-            "phase0",
+            "proxy_compatibility",
             &allowed_decision(EgressIntent::forward_http(
                 "target.example".to_string(),
                 8080,
@@ -213,7 +213,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
                     "42",
                     "/usr/bin/sh",
                     "curl --proxy",
-                    "phase0",
+                    "proxy_compatibility",
                     &allowed_decision(EgressIntent::forward_http(
                         "target.example".to_string(),
                         8080,
@@ -263,7 +263,7 @@ fn representative_adapter_denials_preserve_ocsf_fields() {
     assert_eq!(forward["dst_endpoint"]["domain"], "target.example");
     assert_eq!(forward["dst_endpoint"]["port"], 8080);
     assert_eq!(forward["http_request"]["http_method"], "POST");
-    assert_eq!(forward["firewall_rule"]["name"], "phase0");
+    assert_eq!(forward["firewall_rule"]["name"], "proxy_compatibility");
     assert_eq!(forward["firewall_rule"]["type"], "ssrf");
     assert_eq!(
         forward["message"],
@@ -283,7 +283,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         "42",
         "/usr/bin/sh",
         "curl --proxy",
-        "phase0",
+        "proxy_compatibility",
         true,
     ))
     .unwrap();
@@ -296,7 +296,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     assert_eq!(connect["dst_endpoint"]["domain"], "target.example");
     assert_eq!(connect["dst_endpoint"]["port"], 8443);
     assert_eq!(connect["actor"]["process"]["name"], "/usr/bin/curl");
-    assert_eq!(connect["firewall_rule"]["name"], "phase0");
+    assert_eq!(connect["firewall_rule"]["name"], "proxy_compatibility");
     assert_eq!(connect["firewall_rule"]["type"], "opa");
     assert_eq!(connect["message"], "CONNECT_L7 allowed target.example:8443");
 
@@ -310,7 +310,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         "42",
         "/usr/bin/sh",
         "curl --proxy",
-        "phase0",
+        "proxy_compatibility",
     ))
     .unwrap();
     assert_eq!(forward["class_name"], "HTTP Activity");
@@ -322,7 +322,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
     assert_eq!(forward["dst_endpoint"]["domain"], "target.example");
     assert_eq!(forward["dst_endpoint"]["port"], 8080);
     assert_eq!(forward["http_request"]["http_method"], "GET");
-    assert_eq!(forward["firewall_rule"]["name"], "phase0");
+    assert_eq!(forward["firewall_rule"]["name"], "proxy_compatibility");
     assert_eq!(forward["firewall_rule"]["type"], "opa");
     assert_eq!(
         forward["message"],
@@ -335,8 +335,8 @@ fn poisoned_engine() -> OpaEngine {
         include_str!("../../../data/sandbox-policy.rego"),
         r#"
 network_policies:
-  phase0:
-    name: phase0
+  proxy_compatibility:
+    name: proxy_compatibility
     endpoints:
       - host: target.example
         port: 443
@@ -397,8 +397,8 @@ fn identity_required_policy_accepts_real_binary_and_rejects_empty_exec_path() {
         include_str!("../../../data/sandbox-policy.rego"),
         r#"
 network_policies:
-  phase0:
-    name: phase0
+  proxy_compatibility:
+    name: proxy_compatibility
     endpoints:
       - host: target.example
         port: 443
@@ -524,7 +524,7 @@ async fn exercise_benchmark_request(proxy_addr: SocketAddr, target: SocketAddr, 
         format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n")
     } else {
         format!(
-            "GET http://{authority}/phase0 HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+            "GET http://{authority}/proxy-baseline HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
         )
     };
     client.write_all(request.as_bytes()).await.unwrap();
@@ -534,10 +534,10 @@ async fn exercise_benchmark_request(proxy_addr: SocketAddr, target: SocketAddr, 
 }
 
 /// Run with:
-/// `cargo test -p openshell-supervisor-network phase0_proxy_performance_baseline -- --ignored --nocapture --test-threads=1`
+/// `cargo test -p openshell-supervisor-network proxy_performance_baseline -- --ignored --nocapture --test-threads=1`
 #[test]
-#[ignore = "manual Phase 0 allocation/query/latency baseline"]
-fn phase0_proxy_performance_baseline() {
+#[ignore = "manual proxy allocation/query/latency baseline"]
+fn proxy_performance_baseline() {
     temp_env::with_vars(
         [(
             openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY,
@@ -559,8 +559,8 @@ fn phase0_proxy_performance_baseline() {
                     let policy = format!(
                         r#"
 network_policies:
-  phase0:
-    name: phase0
+  proxy_compatibility:
+    name: proxy_compatibility
     endpoints:
       - host: {host}
         port: {port}
@@ -642,7 +642,7 @@ network_policies:
                         "{}",
                         serde_json::json!({
                             "iterations": iterations,
-                            "phase0_proxy_baseline": results,
+                            "proxy_performance_baseline": results,
                             "scenario": "declared_loopback_destination_denied",
                             "schema_version": 1,
                         })

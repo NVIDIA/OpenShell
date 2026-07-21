@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn phase0_validation_mode_precedence_is_explicit_and_stable() {
+    fn validation_mode_precedence_is_explicit_and_stable() {
         let trusted_ip = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
         let trusted = build_validation_plan(
             "host.openshell.internal",

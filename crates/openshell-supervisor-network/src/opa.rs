@@ -5283,7 +5283,7 @@ process:
     }
 
     #[test]
-    fn phase0_overlapping_policy_outputs_are_snapshotted_independently() {
+    fn overlapping_policy_outputs_are_snapshotted_independently() {
         let engine = OpaEngine::from_strings(TEST_POLICY, OVERLAPPING_L7_TEST_DATA)
             .expect("engine should load overlapping data");
         let input = NetworkInput {
