@@ -38,16 +38,20 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
     extract_field(output, "Created sandbox").or_else(|| extract_field(output, "Name"))
 }
 
-async fn sandbox_list_names(deadline: Instant) -> Vec<String> {
+async fn sandbox_list_names(deadline: Instant) -> Option<Vec<String>> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+
     let mut cmd = openshell_cmd();
     cmd.args(["sandbox", "list", "--names"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = tokio::time::timeout_at(deadline, cmd.output())
-        .await
-        .expect("openshell sandbox list exceeded sandbox presence deadline")
-        .expect("spawn openshell sandbox list");
+    let output = match tokio::time::timeout_at(deadline, cmd.output()).await {
+        Ok(output) => output.expect("spawn openshell sandbox list"),
+        Err(_) => return None,
+    };
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
@@ -57,12 +61,14 @@ async fn sandbox_list_names(deadline: Instant) -> Vec<String> {
         output.status.code()
     );
 
-    combined
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+    Some(
+        combined
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect(),
+    )
 }
 
 async fn assert_sandbox_presence_eventually(
@@ -70,9 +76,12 @@ async fn assert_sandbox_presence_eventually(
     should_exist: bool,
 ) -> Result<(), Vec<String>> {
     let deadline = Instant::now() + SANDBOX_PRESENCE_TIMEOUT;
+    let mut last_sandbox_names = Vec::new();
 
     loop {
-        let sandbox_names = sandbox_list_names(deadline).await;
+        let Some(sandbox_names) = sandbox_list_names(deadline).await else {
+            return Err(last_sandbox_names);
+        };
         let exists = sandbox_names.iter().any(|name| name == sandbox_name);
         if exists == should_exist {
             return Ok(());
@@ -83,6 +92,7 @@ async fn assert_sandbox_presence_eventually(
             return Err(sandbox_names);
         }
 
+        last_sandbox_names = sandbox_names;
         sleep(SANDBOX_LIST_POLL_INTERVAL.min(deadline - now)).await;
     }
 }

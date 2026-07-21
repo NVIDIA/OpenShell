@@ -3283,6 +3283,26 @@ mod tests {
         }
     }
 
+    fn service_endpoint_record(id: &str, sandbox: &Sandbox) -> ServiceEndpoint {
+        ServiceEndpoint {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: id.to_string(),
+                name: format!("{}--web", sandbox.object_name()),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+                annotations: HashMap::new(),
+                workspace: sandbox.object_workspace().to_string(),
+                deletion_timestamp_ms: 0,
+            }),
+            sandbox_id: sandbox.object_id().to_string(),
+            sandbox_name: sandbox.object_name().to_string(),
+            service_name: "web".to_string(),
+            target_port: 8080,
+            domain: true,
+        }
+    }
+
     async fn seed_sandbox_owned_records(runtime: &ComputeRuntime, sandbox: &Sandbox) -> SshSession {
         runtime
             .store
@@ -3298,6 +3318,36 @@ mod tests {
             .unwrap();
         let session = ssh_session_record("owned", sandbox.object_id());
         runtime.store.put_message(&session).await.unwrap();
+
+        let endpoint = service_endpoint_record("endpoint-owned", sandbox);
+        runtime.store.put_message(&endpoint).await.unwrap();
+
+        runtime
+            .store
+            .put_scoped(
+                POLICY_OBJECT_TYPE,
+                "policy-owned",
+                "policy-owned",
+                sandbox.object_workspace(),
+                sandbox.object_id(),
+                br#"{"version":1}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put_scoped(
+                DRAFT_CHUNK_OBJECT_TYPE,
+                "draft-owned",
+                "draft-owned",
+                sandbox.object_workspace(),
+                sandbox.object_id(),
+                br#"{"chunk":1}"#,
+                None,
+            )
+            .await
+            .unwrap();
         session
     }
 
@@ -3336,6 +3386,33 @@ mod tests {
             runtime
                 .store
                 .get_message::<SshSession>(session.object_id())
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<ServiceEndpoint>("endpoint-owned")
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get(POLICY_OBJECT_TYPE, "policy-owned")
+                .await
+                .unwrap()
+                .is_some(),
+            expected
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get(DRAFT_CHUNK_OBJECT_TYPE, "draft-owned")
                 .await
                 .unwrap()
                 .is_some(),
