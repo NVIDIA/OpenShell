@@ -160,6 +160,9 @@ tolerations: []
 # -- Affinity rules for the gateway pod.
 affinity: {}
 
+# -- Whether to enable telemetry in gateway and sandbox pods.
+enableTelemetry: true
+
 # Server configuration
 server:
   # -- Gateway log level.

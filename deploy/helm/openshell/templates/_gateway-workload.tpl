@@ -57,6 +57,10 @@ spec:
               name: {{ .Values.server.externalDbSecret }}
               key: uri
         {{- end }}
+        {{- if not .Values.enableTelemetry }}
+        - name: OPENSHELL_TELEMETRY_ENABLED
+          value: "false"
+        {{- end }}
         # All gateway settings live in the ConfigMap-backed TOML file
         # mounted at /etc/openshell/gateway.toml. The only env var below
         # is a process-level setting consumed by libraries outside
