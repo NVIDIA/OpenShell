@@ -718,6 +718,7 @@ fn normalize_compute_driver_socket_args(args: &mut RunArgs, matches: &ArgMatches
                         | ComputeDriverKind::Podman
                         | ComputeDriverKind::Kubernetes
                         | ComputeDriverKind::Vm
+                        | ComputeDriverKind::Oci
                 )
             ) {
                 return Err(miette::miette!(
@@ -745,7 +746,12 @@ fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
 fn is_singleplayer_driver(args: &RunArgs) -> bool {
     matches!(
         effective_single_driver(args),
-        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
+        Some(
+            ComputeDriverKind::Docker
+                | ComputeDriverKind::Podman
+                | ComputeDriverKind::Vm
+                | ComputeDriverKind::Oci
+        )
     )
 }
 

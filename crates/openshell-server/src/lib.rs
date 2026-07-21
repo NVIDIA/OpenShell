@@ -854,6 +854,18 @@ async fn build_compute_runtime(
             )
             .await
         }
+        ConfiguredComputeDriver::Builtin(ComputeDriverKind::Oci) => {
+            let oci_config = compute::driver_config::oci_config_from_context(driver_startup)?;
+            ComputeRuntime::new_oci(
+                oci_config,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+        }
         ConfiguredComputeDriver::Remote { name } => {
             let remote_config =
                 compute::driver_config::remote_driver_config_from_context(driver_startup, &name)?;

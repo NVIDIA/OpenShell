@@ -337,6 +337,7 @@ fn inheritable_keys(driver_name: &str) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
+        Some(ComputeDriverKind::Oci) => &["default_image"],
         None => &[],
     }
 }

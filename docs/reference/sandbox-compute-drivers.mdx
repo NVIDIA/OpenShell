@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Sandbox Compute Drivers"
 sidebar-title: "Compute Drivers"
-description: "Reference for Docker, Podman, MicroVM, and Kubernetes sandbox compute drivers."
-keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, Reference"
+description: "Reference for Docker, Podman, MicroVM, OCI, and Kubernetes sandbox compute drivers."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, OCI, containerd, Kubernetes, Reference"
 position: 4
 ---
 
@@ -21,17 +21,17 @@ Configure the compute driver on the gateway. Current releases accept one driver 
 compute_drivers = ["docker"]
 ```
 
-Reserved built-in values are `docker`, `podman`, `kubernetes`, and `vm`.
+Reserved built-in values are `docker`, `podman`, `kubernetes`, `vm`, and `oci`.
 Non-reserved names select an extension driver and require a
 `socket_path` in `[openshell.drivers.<name>]`.
 
-When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Local container runtimes must respond to an API probe before the gateway selects them. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
+When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM and OCI drivers are never auto-detected; configure them explicitly with `compute_drivers = ["vm"]` / `compute_drivers = ["oci"]` or set `OPENSHELL_DRIVERS=vm` / `OPENSHELL_DRIVERS=oci` in the launch environment.
 
 Common gateway options:
 
 | Gateway TOML option | Description |
 |---|---|
-| `compute_drivers = ["<driver>"]` | Select the compute driver. Built-in values are `docker`, `podman`, `kubernetes`, and `vm`; custom names require `[openshell.drivers.<name>].socket_path`. |
+| `compute_drivers = ["<driver>"]` | Select the compute driver. Built-in values are `docker`, `podman`, `kubernetes`, `vm`, and `oci`; custom names require `[openshell.drivers.<name>].socket_path`. |
 
 Set driver-specific values such as sandbox images, callback endpoints, network names, TLS material, and VM sizing in the gateway TOML file. See the [Gateway Configuration File](./gateway-config) reference for the full `[openshell.drivers.<name>]` schema.
 
@@ -284,6 +284,52 @@ systemctl --user start podman.socket
 The VM driver creates nftables rules on the host for each sandbox VM's TAP network interface. These rules provide NAT for VM connectivity and defense-in-depth isolation: unsolicited inbound connections to the VM are dropped, and the VM can only reach the gateway port on the host. Primary security enforcement (proxy-only egress and bypass detection) is handled by the sandbox supervisor inside the VM guest.
 
 On hosts with restrictive firewalls (e.g. firewalld), the host firewall may additionally block VM traffic that the driver's rules accept. If VM sandboxes cannot reach the network, verify that the host firewall allows forwarding and input for `vmtap-*` interfaces. See the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md#host-side-nftables-rules) for details.
+
+## OCI Driver
+
+<Warning>
+The OCI driver is an early, opt-in driver. It is not auto-detected and
+has known gaps — see below before using it for anything beyond local
+experimentation.
+</Warning>
+
+OCI-backed sandboxes run as containers constructed directly from Linux kernel primitives (namespaces, cgroups v2) instead of a container engine daemon. **The gateway itself — not containerd — spawns the sandbox's process.** It uses a **system-installed `containerd`** over its own gRPC API only for image pull/unpack and snapshot management; it never creates a containerd container or task, and containerd's shim is never involved. The gateway builds a standard OCI bundle from the snapshot containerd prepared and drives a configurable low-level runtime — `runc` by default, or `crun`, or any other OCI-runtime-spec-compatible binary already installed on the host — directly through its own `create`/`start`/`state`/`delete` CLI contract. It never bundles, installs, or manages containerd itself, and it never bundles the low-level runtime either — both must already be present on the host.
+
+This is not a Docker/Podman replacement for image-building workflows: it does not talk to a Docker- or Podman-compatible API, and it does not build images. Use it when you want sandbox isolation constructed directly from kernel primitives against an existing `containerd` install, without adding a Docker or Podman daemon dependency on top of it.
+
+### Enable the OCI Driver
+
+The OCI driver is opt-in, like the VM driver. Enable it by setting `compute_drivers = ["oci"]` in the gateway TOML file:
+
+```toml
+[openshell.gateway]
+compute_drivers = ["oci"]
+
+[openshell.drivers.oci]
+containerd_socket_path = "/run/containerd/containerd.sock"
+runtime_binary = "runc"
+```
+
+Configure `containerd_socket_path`, `containerd_namespace`, `runtime_binary`, `snapshotter`, `default_image`, `state_dir`, `supervisor_binary_path`, and `veth_subnet_base` in `[openshell.drivers.oci]`. See the [Gateway Configuration File](./gateway-config) reference for the full schema.
+
+### System dependency
+
+Unlike the driver's original design goal, this is **not a zero-host-dependency driver**: it requires a reachable, already-running system `containerd` (the gateway does not install or start one, and only uses it for image pull/unpack and snapshot management) plus the configured `runtime_binary` (`runc` by default) installed and directly executable by the gateway. It never auto-detects; you must opt in explicitly even on a host where containerd happens to already be running (for example, as part of a Docker Engine install), so the gateway never silently starts using a container backend it wasn't told to use.
+
+### Networking
+
+Each sandbox gets its own network namespace, joined to the host through a dedicated veth pair, with an nftables ruleset scoping traffic to NAT plus a default-deny policy that only allows the sandbox to reach the gateway's port on the host — the same ruleset shape the VM driver uses for its TAP interfaces (see [Host Firewall](#host-firewall) above), generalized into a shared `openshell-nft-ruleset` crate so both drivers stay consistent.
+
+### GPU support
+
+GPU passthrough currently covers kernel device-node access only (`/dev/nvidia<N>` plus the shared control devices, added to the container's device cgroup allow-list). It does not yet perform full CDI spec injection the way `nvidia-container-toolkit` does for Docker, Podman, and Kubernetes' CRI plugin (userspace driver library mounts, `nvidia-ctk`-style hooks). Workloads that only need kernel device access work; workloads that additionally need the NVIDIA userspace libraries injected do not yet.
+
+### Known gaps
+
+- **Rootless mode is not yet functional.** The driver can generate an OCI spec with a Linux user namespace mapping container root to an unprivileged host UID range, but the underlying containerd-prepared writable snapshot is not remapped to match, so container start currently fails while mounting `/proc`. Rootless is therefore off by default; do not enable it until this is fixed.
+- **No image-based supervisor injection yet.** Docker, Podman, and the VM driver source the sandbox supervisor from a dedicated OCI image mounted into the container. The OCI driver instead bind-mounts a supervisor binary from a host path (`supervisor_binary_path`) — simpler for now, but it means the supervisor binary must already exist on the gateway host rather than being pulled like every other driver's sandbox image.
+- **`WatchSandboxes` polls rather than subscribes to containerd's event stream.** Functionally correct, but higher-latency than a push-based subscription.
+- **No containerd container/task object is ever created**, so the gateway tracks which sandboxes exist itself, by scanning its own state directory rather than querying containerd — see the driver README for why (and for how the underlying snapshot is protected from containerd's garbage collector via a lease, since nothing else references it).
 
 ## Kubernetes Driver
 

@@ -3759,7 +3759,7 @@ dependencies = [
  "http-auth",
  "jsonwebtoken 10.3.0",
  "lazy_static",
- "oci-spec",
+ "oci-spec 0.9.0",
  "olpc-cjson",
  "regex",
  "reqwest 0.13.2",
@@ -3777,6 +3777,23 @@ name = "oci-spec"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8445a2631507cec628a15fdd6154b54a3ab3f20ed4fe9d73a3b8b7a4e1ba03a"
+dependencies = [
+ "const_format",
+ "derive_builder",
+ "getset",
+ "regex",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "oci-spec"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3df6f876ad774d6a676f7e968f5c3edacc32f90e65fe680a8b686235396556fb"
 dependencies = [
  "const_format",
  "derive_builder",
@@ -3959,6 +3976,34 @@ dependencies = [
  "serde",
  "serde_json",
  "temp-env",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "openshell-driver-oci"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "futures",
+ "miette",
+ "nix",
+ "oci-spec 0.10.0",
+ "openshell-core",
+ "openshell-nft-ruleset",
+ "openshell-policy",
+ "openshell-rootfs",
+ "prost",
+ "prost-types",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -4221,6 +4266,7 @@ dependencies = [
  "openshell-core",
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
+ "openshell-driver-oci",
  "openshell-driver-podman",
  "openshell-gateway-interceptors",
  "openshell-ocsf",

@@ -9,6 +9,7 @@ pub mod vm;
 
 pub use openshell_driver_docker::DockerComputeConfig;
 pub use openshell_driver_kubernetes::KubernetesComputeConfig;
+pub use openshell_driver_oci::OciComputeConfig;
 pub use openshell_driver_podman::PodmanComputeConfig;
 pub use vm::VmComputeConfig;
 
@@ -42,6 +43,7 @@ use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
+use openshell_driver_oci::{ComputeDriverService as OciDriverService, OciComputeDriver};
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
 use std::collections::HashMap;
@@ -558,6 +560,32 @@ impl ComputeRuntime {
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
             ComputeDriverKind::Podman.as_str().to_string(),
+            driver,
+            None,
+            None,
+            None,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn new_oci(
+        config: OciComputeConfig,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let driver = OciComputeDriver::new(config).await?;
+        let driver: SharedComputeDriver = Arc::new(OciDriverService::new(driver));
+        Self::from_driver(
+            ComputeDriverKind::Oci.as_str().to_string(),
             driver,
             None,
             None,

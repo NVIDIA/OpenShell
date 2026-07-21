@@ -73,9 +73,9 @@ provisioner on top of it.
 
 `ContainerdRootfsProvider` is the first implementation, backed by a
 system-provided containerd used only for image pull/unpack and snapshot
-management. The VM driver's image acquisition and ext4 materialization
-pipeline is the same boundary shape; converging it onto the shared types is
-tracked follow-up work.
+management. The OCI driver consumes it; the VM driver's image acquisition
+and ext4 materialization pipeline is the same boundary shape, and converging
+it onto the shared types is tracked follow-up work.
 
 ## Runtime Summary
 
@@ -85,12 +85,14 @@ tracked follow-up work.
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
-| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a non-reserved custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. Reserved built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot be used as unmanaged socket endpoints. The gateway connects to a UDS the operator already provisioned, runs `GetCapabilities`, logs the advertised `driver_name`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
+| OCI | Early/opt-in kernel-primitive isolation against an existing system `containerd`. | Container built from Linux namespaces + cgroups v2. | In-process driver, like Docker/Podman/Kubernetes. The driver itself — not containerd — spawns the configured `runtime_binary` (`runc` by default, `crun`, or another OCI-runtime-spec-compatible binary) directly through its `create`/`start`/`state`/`delete` CLI contract; containerd is used only for image pull/unpack and snapshot management — consumed through the `openshell-rootfs` provider boundary (see Rootfs Provisioning Boundary above), which protects each sandbox's snapshot from containerd's GC via a lease since no containerd `Container`/`Task` is ever created — and never bundled. Sandboxes are tracked by scanning the driver's own state directory rather than querying containerd or the runtime for a global list. Per-sandbox network namespace + veth pair + nftables ruleset (shared `openshell-nft-ruleset` crate, also used by the VM driver). GPU support is kernel-device-node passthrough only. Rootless mode is implemented but not yet functional (defaults off) — see `crates/openshell-driver-oci/README.md`. |
+| Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a non-reserved custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. Reserved built-in names such as `vm`, `docker`, `podman`, `kubernetes`, and `oci` cannot be used as unmanaged socket endpoints. The gateway connects to a UDS the operator already provisioned, runs `GetCapabilities`, logs the advertised `driver_name`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
-but currently ignores them.
+but currently ignores them. The OCI driver applies them as cgroup v2 CPU quota/period
+and memory limits in the generated OCI spec.
 
 Docker and Podman also accept per-sandbox driver-config mounts for existing
 runtime-managed named volumes and tmpfs mounts. Podman additionally accepts
@@ -123,6 +125,7 @@ Runtime-specific implementation notes belong in the driver crate README:
 - `crates/openshell-driver-podman/README.md`
 - `crates/openshell-driver-kubernetes/README.md`
 - `crates/openshell-driver-vm/README.md`
+- `crates/openshell-driver-oci/README.md`
 
 The combined VM topology runs `openshell-sandbox` as guest PID 1. libkrun
 executes the driver-owned guest bootstrap as PID 1, and the bootstrap preserves
@@ -138,6 +141,7 @@ The supervisor must be available inside each sandbox workload:
 | Podman | Read-only OCI image volume containing the supervisor binary. |
 | Kubernetes | Supervisor image side-loaded into the sandbox pod by image volume or init container. |
 | VM | Embedded in the guest rootfs bundle. |
+| OCI | Bind-mounted from a host path (`supervisor_binary_path`), not sourced from an image like the other in-tree drivers — see the driver README's Known Gaps. |
 | Extension | Defined by the out-of-tree driver. |
 
 Driver-controlled environment variables must override sandbox image or template
