@@ -69,10 +69,9 @@ impl FromStr for ImagePullPolicy {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PodmanComputeConfig {
-    /// Path to the Podman API Unix socket.
-    /// Default: `$XDG_RUNTIME_DIR/podman/podman.sock` (Linux),
-    /// `$HOME/.local/share/containers/podman/machine/podman.sock` (macOS).
-    pub socket_path: PathBuf,
+    /// Podman API Unix socket. When unset, use the socket selected by
+    /// gateway auto-detection.
+    pub socket_path: Option<PathBuf>,
     /// Default OCI image for sandboxes.
     pub default_image: String,
     /// Image pull policy for sandbox images.
@@ -215,38 +214,12 @@ impl PodmanComputeConfig {
             String::new()
         }
     }
-
-    /// Resolve the default socket path from the environment.
-    ///
-    /// - **macOS**: `$HOME/.local/share/containers/podman/machine/podman.sock`
-    ///   (the symlink created by `podman machine` pointing to the VM API socket).
-    /// - **Linux**: `$XDG_RUNTIME_DIR/podman/podman.sock` when set (by
-    ///   `pam_systemd`/logind), otherwise `/run/user/{uid}/podman/podman.sock`
-    ///   using the real UID via `getuid()`.
-    #[must_use]
-    pub fn default_socket_path() -> PathBuf {
-        #[cfg(target_os = "macos")]
-        {
-            let home = std::env::var("HOME").expect("HOME must be set on macOS");
-            PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
-        }
-        #[cfg(target_os = "linux")]
-        {
-            std::env::var("XDG_RUNTIME_DIR").map_or_else(
-                |_| {
-                    let uid = rustix::process::getuid().as_raw();
-                    PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
-                },
-                |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
-            )
-        }
-    }
 }
 
 impl Default for PodmanComputeConfig {
     fn default() -> Self {
         Self {
-            socket_path: Self::default_socket_path(),
+            socket_path: None,
             default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
@@ -295,39 +268,6 @@ impl std::fmt::Debug for PodmanComputeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serialises env-mutating tests so that parallel test threads cannot
-    /// observe each other's changes to `XDG_RUNTIME_DIR`.
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn default_socket_path_respects_xdg_runtime_dir() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        temp_env::with_vars([("XDG_RUNTIME_DIR", Some("/tmp/test-xdg"))], || {
-            let path = PodmanComputeConfig::default_socket_path();
-            assert_eq!(path, PathBuf::from("/tmp/test-xdg/podman/podman.sock"));
-        });
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn default_socket_path_falls_back_to_uid() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        temp_env::with_vars([("XDG_RUNTIME_DIR", None::<&str>)], || {
-            let path = PodmanComputeConfig::default_socket_path();
-            let uid = rustix::process::getuid().as_raw();
-            assert_eq!(
-                path,
-                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
-            );
-        });
-    }
 
     #[test]
     fn default_config_sets_health_check_interval() {
@@ -380,21 +320,6 @@ mod tests {
         };
         let err = cfg.validate_runtime_limits().unwrap_err();
         assert!(err.to_string().contains("sandbox_pids_limit"));
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn default_socket_path_uses_podman_machine_on_macos() {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        temp_env::with_vars([("HOME", Some("/Users/testuser"))], || {
-            let path = PodmanComputeConfig::default_socket_path();
-            assert_eq!(
-                path,
-                PathBuf::from("/Users/testuser/.local/share/containers/podman/machine/podman.sock")
-            );
-        });
     }
 
     // ── TLS config validation ─────────────────────────────────────────

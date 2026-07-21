@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub use openshell_core::activity::ActivityEvent;
 
@@ -45,10 +45,13 @@ impl ActivityAggregator {
         }
     }
 
-    pub async fn run<F, Fut>(mut self, flush_callback: F)
+    /// `ready_gate` is checked before each flush. When it returns `false`,
+    /// the drain is skipped and events stay in the buffer until the next tick.
+    pub async fn run<F, Fut, G>(mut self, flush_callback: F, ready_gate: G)
     where
         F: Fn(FlushableActivitySummary) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
+        G: Fn() -> bool,
     {
         let (flush_tx, mut flush_rx) =
             mpsc::channel::<FlushableActivitySummary>(ACTIVITY_FLUSH_QUEUE_CAPACITY);
@@ -68,15 +71,26 @@ impl ActivityAggregator {
                     if let Some(event) = event {
                         self.ingest(event);
                     } else {
-                        if let Some(summary) = self.drain() {
-                            queue_flush_summary(&flush_tx, summary);
+                        if self.network_activity_count > 0 {
+                            if ready_gate() {
+                                if let Some(summary) = self.drain() {
+                                    queue_flush_summary(&flush_tx, summary);
+                                }
+                            } else {
+                                warn!(
+                                    count = self.network_activity_count,
+                                    "ActivityAggregator: dropping unflushed events, workspace not yet known"
+                                );
+                            }
                         }
                         debug!("ActivityAggregator: channel closed, exiting");
                         return;
                     }
                 }
                 _ = flush_interval.tick() => {
-                    if let Some(summary) = self.drain() {
+                    if ready_gate()
+                        && let Some(summary) = self.drain()
+                    {
                         debug!(
                             count = summary.network_activity_count,
                             denied = summary.denied_action_count,

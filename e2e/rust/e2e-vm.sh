@@ -23,9 +23,12 @@
 #   mise run e2e:vm
 #
 # What the script does:
-#   1. Ensures the VM runtime (libkrun + gvproxy) and bundled supervisor are staged.
+#   1. When no prebuilt VM driver is supplied, ensures the VM runtime
+#      (libkrun + gvproxy) and bundled supervisor are staged.
 #   2. Builds `openshell-gateway`, `openshell-driver-vm`, and the
-#      `openshell` CLI with the embedded runtime.
+#      `openshell` CLI with the embedded runtime as needed. When CI supplies
+#      OPENSHELL_GATEWAY_BIN, OPENSHELL_VM_DRIVER_BIN, or OPENSHELL_BIN, the
+#      matching prebuilt binary is reused instead of rebuilt.
 #   3. On macOS, codesigns the VM driver (libkrun needs the
 #      `com.apple.security.hypervisor` entitlement).
 #   4. Writes a per-run gateway config with `[openshell.drivers.vm]`
@@ -35,7 +38,7 @@
 #   5. Tears the gateway down and (on failure) preserves the gateway
 #      log and every VM serial console log for post-mortem.
 #
-# Prerequisites (handled automatically by this script if missing):
+# Prerequisites (handled automatically by this script for local VM-driver builds):
 #   - `mise run vm:setup`      — downloads / builds the libkrun runtime.
 #   - `mise run vm:supervisor` — builds the bundled sandbox supervisor.
 
@@ -45,8 +48,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/e2e/support/gateway-common.sh"
 
 COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
-GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
-DRIVER_BIN="${ROOT}/target/debug/openshell-driver-vm"
+GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
+DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
+CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
 
@@ -73,25 +77,59 @@ if [ -n "${RUSTC_WRAPPER:-}" ] && [ "${OPENSHELL_E2E_VM_ALLOW_RUSTC_WRAPPER:-0}"
   unset RUSTC_WRAPPER
 fi
 
-mkdir -p "${COMPRESSED_DIR}"
+if [ -z "${OPENSHELL_VM_DRIVER_BIN:-}" ]; then
+  mkdir -p "${COMPRESSED_DIR}"
 
-if ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
-  echo "==> Preparing embedded VM runtime (mise run vm:setup)"
-  mise run vm:setup
+  if ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
+    echo "==> Preparing embedded VM runtime (mise run vm:setup)"
+    mise run vm:setup
+  fi
+
+  if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
+    echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
+    mise run vm:supervisor
+  fi
+
+  export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR}}"
+else
+  echo "==> Skipping embedded VM runtime prep; prebuilt VM driver was supplied"
 fi
 
-if [ ! -f "${COMPRESSED_DIR}/openshell-sandbox.zst" ]; then
-  echo "==> Building bundled VM supervisor (mise run vm:supervisor)"
-  mise run vm:supervisor
+build_packages=()
+if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
+  build_packages+=(-p openshell-server)
+else
+  echo "==> Using prebuilt openshell-gateway at ${GATEWAY_BIN}"
+fi
+if [ -z "${OPENSHELL_VM_DRIVER_BIN:-}" ]; then
+  build_packages+=(-p openshell-driver-vm)
+else
+  echo "==> Using prebuilt openshell-driver-vm at ${DRIVER_BIN}"
+fi
+if [ -z "${OPENSHELL_BIN:-}" ]; then
+  build_packages+=(-p openshell-cli)
+else
+  echo "==> Using prebuilt openshell CLI at ${CLI_BIN}"
 fi
 
-export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${COMPRESSED_DIR}}"
+if [ "${#build_packages[@]}" -gt 0 ]; then
+  echo "==> Building ${build_packages[*]}"
+  cargo build "${build_packages[@]}"
+fi
 
-echo "==> Building openshell-gateway, openshell-driver-vm, openshell (CLI)"
-cargo build \
-  -p openshell-server \
-  -p openshell-driver-vm \
-  -p openshell-cli
+for pair in \
+  "openshell-gateway:${GATEWAY_BIN}" \
+  "openshell-driver-vm:${DRIVER_BIN}" \
+  "openshell CLI:${CLI_BIN}"; do
+  label="${pair%%:*}"
+  path="${pair#*:}"
+  if [ ! -x "${path}" ]; then
+    echo "ERROR: expected ${label} binary at ${path}" >&2
+    exit 1
+  fi
+done
+export OPENSHELL_BIN="${CLI_BIN}"
+DRIVER_DIR="$(dirname "${DRIVER_BIN}")"
 
 if [ "$(uname -s)" = "Darwin" ]; then
   echo "==> Codesigning openshell-driver-vm (Hypervisor entitlement)"
@@ -224,7 +262,7 @@ ttl_secs = 0
 
 [openshell.drivers.vm]
 grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
-driver_dir = "${ROOT}/target/debug"
+driver_dir = "${DRIVER_DIR}"
 state_dir = "${RUN_STATE_DIR}"
 guest_tls_ca = "${PKI_DIR}/ca.crt"
 guest_tls_cert = "${PKI_DIR}/client/tls.crt"

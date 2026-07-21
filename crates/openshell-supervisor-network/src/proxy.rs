@@ -1673,6 +1673,12 @@ fn resolve_owner_identity(
 #[cfg(target_os = "linux")]
 fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathBuf)> {
     const MAX_DEPTH: usize = 64;
+
+    // When the socket owner IS the entrypoint, there are no intermediate
+    // ancestors to verify — the chain is empty by definition.
+    if start_pid == stop_pid {
+        return vec![];
+    }
     let mut ancestors = Vec::new();
     let mut current = start_pid;
 

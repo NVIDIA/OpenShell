@@ -126,7 +126,7 @@ echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 
 Project requirements:
 
-- Rust 1.88+
+- Rust 1.90+
 - Python 3.11+
 - Docker (running)
 - Z3 solver library (for the policy prover crate)
@@ -194,6 +194,28 @@ Because `mise` adds `scripts/bin` to `PATH` for this project, you can run `opens
 openshell --help
 openshell sandbox create -- codex
 ```
+
+### Rust build cache
+
+Mise preserves an existing `SCCACHE_DIR` so each environment can choose where
+to store compiler cache entries. When `SCCACHE_DIR` is unset, OpenShell uses
+the worktree-local `.cache/sccache` directory. To make cache entries available
+to multiple worktrees on a workstation, set the variable to a user-level
+directory before activating mise. For example:
+
+```shell
+export SCCACHE_DIR="$HOME/.cache/openshell/sccache"
+```
+
+CI can select a different directory or configure a remote sccache backend
+without changing the workstation setting. Cargo output remains in each
+worktree's `target/` directory.
+
+OpenShell does not set `SCCACHE_BASEDIRS`. Sccache loads base directories when
+its machine-local daemon starts, but the correct workspace root differs for
+each worktree. Cache reuse therefore depends on the compiler inputs: outputs
+that embed absolute paths, including Rust dependencies in some builds, can
+still miss across worktrees.
 
 ## Main Tasks
 

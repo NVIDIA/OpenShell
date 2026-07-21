@@ -21,7 +21,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES:-e2e,e2e-host-gateway,e2e-kubernetes}"
 
-cargo build -p openshell-cli
+# Docker and Podman build their local gateway and CLI together in the shared
+# gateway wrapper. Kubernetes consumes published gateway images, so only its
+# local CLI needs to be built when CI has not supplied a prebuilt one.
+if [ -z "${OPENSHELL_BIN:-}" ]; then
+  cargo build -p openshell-cli
+fi
 
 test_filter=()
 if [ -n "${OPENSHELL_E2E_KUBE_TEST:-}" ]; then

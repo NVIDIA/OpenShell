@@ -11,7 +11,7 @@ name = "openshell-e2e"
 description = "End-to-end tests for the OpenShell CLI"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 license = "Apache-2.0"
 publish = false
 
@@ -103,6 +103,11 @@ path = "tests/forward_proxy_jsonrpc_l7.rs"
 required-features = ["e2e-host-gateway"]
 
 [[test]]
+name = "workspace_lifecycle"
+path = "tests/workspace_lifecycle.rs"
+required-features = ["e2e"]
+
+[[test]]
 name = "gpu"
 path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
@@ -115,7 +120,7 @@ futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-prost = "0.13"
+prost = "0.14"
 tokio = { version = "1.43", features = ["full"] }
 tempfile = "3"
 sha1 = "0.10"

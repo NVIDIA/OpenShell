@@ -13,7 +13,10 @@ pub use openshell_driver_podman::PodmanComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
-use crate::persistence::{ObjectId, ObjectName, ObjectRecord, ObjectType, Store, WriteCondition};
+use crate::persistence::{
+    DRAFT_CHUNK_OBJECT_TYPE, ObjectId, ObjectName, ObjectRecord, ObjectType, POLICY_OBJECT_TYPE,
+    Store, WriteCondition,
+};
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
@@ -32,14 +35,16 @@ use openshell_core::proto::compute::v1::{
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, SshSession,
+    SandboxTemplate, ServiceEndpoint, SshSession,
 };
+use openshell_core::{ObjectLabels, ObjectWorkspace};
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
     ComputeDriverService as KubernetesDriverService, KubernetesComputeDriver,
 };
 use openshell_driver_podman::{ComputeDriverService as PodmanDriverService, PodmanComputeDriver};
 use prost::Message;
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -67,7 +72,7 @@ const DELETE_PHASE_CAS_RETRY_LIMIT: usize = 3;
 /// after the last request using a sandbox's gate completes.
 #[derive(Debug, Default)]
 struct DeleteGateRegistry {
-    gates: StdMutex<std::collections::HashMap<String, Weak<Mutex<()>>>>,
+    gates: StdMutex<HashMap<String, Weak<Mutex<()>>>>,
 }
 
 impl DeleteGateRegistry {
@@ -610,20 +615,22 @@ impl ComputeRuntime {
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
         let mut sandbox = sandbox;
-        let labels_json = sandbox
-            .metadata
-            .as_ref()
-            .map(|metadata| &metadata.labels)
-            .filter(|labels| !labels.is_empty())
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?;
+        let labels_map = sandbox.object_labels();
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&labels_map)
+                    .map_err(|e| Status::internal(format!("failed to serialize labels: {e}")))?,
+            )
+        };
         let result = self
             .store
             .put_if(
                 Sandbox::object_type(),
                 &sandbox_id,
                 sandbox.object_name(),
+                sandbox.object_workspace(),
                 &sandbox.encode_to_vec(),
                 labels_json.as_deref(),
                 WriteCondition::MustCreate,
@@ -692,13 +699,17 @@ impl ComputeRuntime {
         }
     }
 
-    pub(crate) async fn delete_sandbox(&self, name: &str) -> Result<DeleteSandboxResult, Status> {
+    pub(crate) async fn delete_sandbox(
+        &self,
+        workspace: &str,
+        name: &str,
+    ) -> Result<DeleteSandboxResult, Status> {
         // Resolve and acquire both request-side locks before spawning the
         // owned worker. Cancellation while any of these awaits is pending is
         // harmless because no mutation or detached work has started.
         let candidate = self
             .store
-            .get_message_by_name::<Sandbox>(name)
+            .get_message_by_name::<Sandbox>(workspace, name)
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
@@ -741,7 +752,7 @@ impl ComputeRuntime {
             // A delete that owned this ID's gate completed while this request
             // waited. A different sandbox may now use the old name; this
             // request acknowledges only the disappearance of its original ID.
-            self.cleanup_removed_sandbox_state(&target.sandbox_id).await;
+            self.cleanup_removed_sandbox_state(&target.sandbox_id);
             return Ok(DeleteSandboxResult {
                 sandbox_id: target.sandbox_id,
                 deleted: true,
@@ -891,7 +902,7 @@ impl ComputeRuntime {
             let record = match self.store.get(Sandbox::object_type(), sandbox_id).await {
                 Ok(Some(record)) => record,
                 Ok(None) => {
-                    self.cleanup_removed_sandbox_state(sandbox_id).await;
+                    self.cleanup_removed_sandbox_state(sandbox_id);
                     return true;
                 }
                 Err(err) => {
@@ -945,9 +956,9 @@ impl ComputeRuntime {
 
     /// Removes the sandbox by stable ID only when the expected resource
     /// version still owns the row. The caller holds `sync_lock`; a successful
-    /// delete also performs best-effort settings cleanup, while successful or
-    /// already-completed removal clears this replica's index, sessions, and
-    /// watch/log buses.
+    /// delete also removes sandbox-owned records, while successful or
+    /// already-completed removal clears this replica's index and watch/log
+    /// buses.
     async fn remove_sandbox_record_if_version_locked(
         &self,
         sandbox_id: &str,
@@ -959,7 +970,7 @@ impl ComputeRuntime {
             .await
             .map_err(|err| err.to_string())?
         else {
-            self.cleanup_removed_sandbox_state(sandbox_id).await;
+            self.cleanup_removed_sandbox_state(sandbox_id);
             return Ok(false);
         };
 
@@ -973,6 +984,9 @@ impl ComputeRuntime {
             return Ok(false);
         }
 
+        let sandbox = decode_sandbox_record(&record)?;
+        self.cleanup_sandbox_owned_records(&sandbox).await?;
+
         match self
             .store
             .delete_if(
@@ -983,13 +997,11 @@ impl ComputeRuntime {
             .await
         {
             Ok(true) => {
-                self.cleanup_sandbox_settings(sandbox_id, &record.name)
-                    .await;
-                self.cleanup_removed_sandbox_state(sandbox_id).await;
+                self.cleanup_removed_sandbox_state(sandbox_id);
                 Ok(true)
             }
             Ok(false) => {
-                self.cleanup_removed_sandbox_state(sandbox_id).await;
+                self.cleanup_removed_sandbox_state(sandbox_id);
                 Ok(false)
             }
             Err(crate::persistence::PersistenceError::Conflict {
@@ -1105,7 +1117,7 @@ impl ComputeRuntime {
                             recovery_action,
                             "Delete recovery found the row removed by another replica; cleaning local state"
                         );
-                        self.cleanup_removed_sandbox_state(sandbox_id).await;
+                        self.cleanup_removed_sandbox_state(sandbox_id);
                         return;
                     }
                     Ok(Some(record))
@@ -1172,7 +1184,7 @@ impl ComputeRuntime {
                     recovery_action,
                     "Delete recovery found the row removed by another replica; cleaning local state"
                 );
-                self.cleanup_removed_sandbox_state(sandbox_id).await;
+                self.cleanup_removed_sandbox_state(sandbox_id);
             }
             Ok(Some(_)) => {
                 debug!(
@@ -1226,6 +1238,7 @@ impl ComputeRuntime {
                 Sandbox::object_type(),
                 &id,
                 &name,
+                sandbox.object_workspace(),
                 &sandbox.encode_to_vec(),
                 labels_json.as_deref(),
                 WriteCondition::MatchResourceVersion(expected_resource_version),
@@ -1282,7 +1295,7 @@ impl ComputeRuntime {
 
         let records = self
             .store
-            .list(Sandbox::object_type(), 1000, 0)
+            .list_by_type(Sandbox::object_type(), 1000, 0)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -1582,7 +1595,7 @@ impl ComputeRuntime {
 
         let records = self
             .store
-            .list(Sandbox::object_type(), 500, 0)
+            .list_by_type(Sandbox::object_type(), 500, 0)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -1783,16 +1796,16 @@ impl ComputeRuntime {
             .get_message::<Sandbox>(sandbox_id)
             .await
             .map_err(|e| e.to_string())?;
-        let removed = self
+        if let Some(sandbox) = sandbox.as_ref() {
+            self.cleanup_sandbox_owned_records(sandbox).await?;
+        }
+
+        let _ = self
             .store
             .delete(Sandbox::object_type(), sandbox_id)
             .await
             .map_err(|e| e.to_string())?;
-        if removed && let Some(sandbox) = sandbox.as_ref() {
-            self.cleanup_sandbox_settings(sandbox_id, sandbox.object_name())
-                .await;
-        }
-        self.cleanup_removed_sandbox_state(sandbox_id).await;
+        self.cleanup_removed_sandbox_state(sandbox_id);
         Ok(())
     }
 
@@ -1807,40 +1820,88 @@ impl ComputeRuntime {
         Ok(())
     }
 
-    async fn cleanup_sandbox_settings(&self, sandbox_id: &str, sandbox_name: &str) {
-        if let Err(err) = self
-            .store
-            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_name)
+    async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) -> Result<(), String> {
+        self.cleanup_sandbox_ssh_sessions(sandbox.object_id(), sandbox.object_workspace())
+            .await?;
+        self.cleanup_sandbox_service_endpoints(sandbox.object_id(), sandbox.object_workspace())
+            .await?;
+
+        self.store
+            .delete_by_name(
+                SANDBOX_SETTINGS_OBJECT_TYPE,
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+            )
             .await
-        {
-            warn!(
-                sandbox_id,
-                sandbox_name,
-                error = %err,
-                "Failed to delete sandbox settings during cleanup"
-            );
+            .map_err(|e| format!("delete sandbox settings: {e}"))?;
+
+        for (object_type, label) in [
+            (POLICY_OBJECT_TYPE, "policy revisions"),
+            (DRAFT_CHUNK_OBJECT_TYPE, "draft policy chunks"),
+        ] {
+            self.store
+                .delete_by_scope(object_type, sandbox.object_id())
+                .await
+                .map_err(|e| format!("delete {label}: {e}"))?;
         }
+
+        Ok(())
     }
 
-    async fn cleanup_sandbox_ssh_sessions(&self, sandbox_id: &str) {
-        if let Ok(records) = self.store.list(SshSession::object_type(), 1000, 0).await {
-            for record in records {
-                if let Ok(session) = SshSession::decode(record.payload.as_slice())
-                    && session.sandbox_id == sandbox_id
-                    && let Err(e) = self
-                        .store
-                        .delete(SshSession::object_type(), session.object_id())
-                        .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        session_id = %session.object_id(),
-                        error = %e,
-                        "Failed to delete SSH session during sandbox cleanup"
-                    );
-                }
+    async fn cleanup_sandbox_ssh_sessions(
+        &self,
+        sandbox_id: &str,
+        workspace: &str,
+    ) -> Result<(), String> {
+        let records = self
+            .store
+            .list(SshSession::object_type(), workspace, 1000, 0)
+            .await
+            .map_err(|e| format!("list SSH sessions: {e}"))?;
+
+        for record in records {
+            if let Ok(session) = SshSession::decode(record.payload.as_slice())
+                && session.sandbox_id == sandbox_id
+            {
+                self.store
+                    .delete(SshSession::object_type(), session.object_id())
+                    .await
+                    .map_err(|e| format!("delete SSH session {}: {e}", session.object_id()))?;
             }
         }
+
+        Ok(())
+    }
+
+    // TODO: introduce a per-sandbox cap on service endpoints and paginate
+    // this cleanup loop, or query by sandbox label instead of scanning the
+    // full workspace. Without a cap the flat 1,000-record page could miss
+    // endpoints in large workspaces.
+    async fn cleanup_sandbox_service_endpoints(
+        &self,
+        sandbox_id: &str,
+        workspace: &str,
+    ) -> Result<(), String> {
+        let records = self
+            .store
+            .list(ServiceEndpoint::object_type(), workspace, 1000, 0)
+            .await
+            .map_err(|e| format!("list service endpoints: {e}"))?;
+
+        for record in records {
+            if let Ok(endpoint) = ServiceEndpoint::decode(record.payload.as_slice())
+                && endpoint.sandbox_id == sandbox_id
+            {
+                self.store
+                    .delete(ServiceEndpoint::object_type(), endpoint.object_id())
+                    .await
+                    .map_err(|e| {
+                        format!("delete service endpoint {}: {e}", endpoint.object_id())
+                    })?;
+            }
+        }
+
+        Ok(())
     }
 
     async fn cleanup_local_state_if_sandbox_absent(
@@ -1855,13 +1916,12 @@ impl ComputeRuntime {
             .await
             .map_err(|err| Status::internal(format!("fetch sandbox failed: {err}")))?;
         if record.is_none() {
-            self.cleanup_removed_sandbox_state(sandbox_id).await;
+            self.cleanup_removed_sandbox_state(sandbox_id);
         }
         Ok(())
     }
 
-    async fn cleanup_removed_sandbox_state(&self, sandbox_id: &str) {
-        self.cleanup_sandbox_ssh_sessions(sandbox_id).await;
+    fn cleanup_removed_sandbox_state(&self, sandbox_id: &str) {
         self.sandbox_index.remove_sandbox(sandbox_id);
         self.sandbox_watch_bus.notify(sandbox_id);
         self.cleanup_sandbox_state(sandbox_id);
@@ -2075,6 +2135,7 @@ fn driver_sandbox_from_public(
             .map(|spec| driver_sandbox_spec_from_public(spec, driver_name))
             .transpose()?,
         status: sandbox.status.as_ref().map(driver_status_from_public),
+        workspace: sandbox.object_workspace().to_string(),
     })
 }
 
@@ -3194,6 +3255,8 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             ..Default::default()
         };
@@ -3210,6 +3273,8 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             sandbox_id: sandbox_id.to_string(),
             token: format!("token-{id}"),
@@ -3225,6 +3290,7 @@ mod tests {
                 SANDBOX_SETTINGS_OBJECT_TYPE,
                 &format!("settings-{}", sandbox.object_id()),
                 sandbox.object_name(),
+                sandbox.object_workspace(),
                 br#"{"revision":1,"settings":{}}"#,
                 None,
             )
@@ -3237,8 +3303,7 @@ mod tests {
 
     async fn remove_sandbox_owned_records_from_store(runtime: &ComputeRuntime, sandbox: &Sandbox) {
         runtime
-            .store
-            .delete_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
+            .cleanup_sandbox_owned_records(sandbox)
             .await
             .unwrap();
         runtime
@@ -3257,7 +3322,11 @@ mod tests {
         assert_eq!(
             runtime
                 .store
-                .get_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
+                .get_by_name(
+                    SANDBOX_SETTINGS_OBJECT_TYPE,
+                    sandbox.object_workspace(),
+                    sandbox.object_name(),
+                )
                 .await
                 .unwrap()
                 .is_some(),
@@ -3300,6 +3369,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             namespace: "default".to_string(),
+            workspace: "default".to_string(),
             spec: None,
             status: Some(DriverSandboxStatus {
                 sandbox_name: name.to_string(),
@@ -3770,6 +3840,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             })
             .await
             .unwrap();
@@ -3847,7 +3918,7 @@ mod tests {
         assert!(
             runtime
                 .sandbox_index
-                .sandbox_id_for_sandbox_name("unmanaged")
+                .sandbox_id_for_sandbox_name("default", "unmanaged")
                 .is_none()
         );
         assert!(matches!(
@@ -3913,7 +3984,9 @@ mod tests {
         let mut sandbox_b_rx = runtime.sandbox_watch_bus.subscribe("sb-b");
         let delete_runtime = runtime.clone();
         let delete_handle =
-            tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("delete did not reach the driver");
@@ -3974,13 +4047,17 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         let first_runtime = runtime.clone();
-        let first = tokio::spawn(async move { first_runtime.delete_sandbox("sandbox-a").await });
+        let first =
+            tokio::spawn(async move { first_runtime.delete_sandbox("default", "sandbox-a").await });
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("first delete did not reach the driver");
 
         let second_runtime = runtime.clone();
-        let second = tokio::spawn(async move { second_runtime.delete_sandbox("sandbox-a").await });
+        let second =
+            tokio::spawn(
+                async move { second_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         driver.release_delete();
 
         assert!(
@@ -4014,13 +4091,17 @@ mod tests {
 
         let delete_gate = runtime.delete_gates.gate_for(sandbox.object_id());
         let first_runtime = runtime.clone();
-        let first = tokio::spawn(async move { first_runtime.delete_sandbox("sandbox-a").await });
+        let first =
+            tokio::spawn(async move { first_runtime.delete_sandbox("default", "sandbox-a").await });
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("first delete did not reach the driver");
 
         let second_runtime = runtime.clone();
-        let second = tokio::spawn(async move { second_runtime.delete_sandbox("sandbox-a").await });
+        let second =
+            tokio::spawn(
+                async move { second_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), async {
             while Arc::strong_count(&delete_gate) < 3 {
                 tokio::task::yield_now().await;
@@ -4074,13 +4155,17 @@ mod tests {
 
         let delete_gate = runtime.delete_gates.gate_for(sandbox.object_id());
         let first_runtime = runtime.clone();
-        let first = tokio::spawn(async move { first_runtime.delete_sandbox("sandbox-a").await });
+        let first =
+            tokio::spawn(async move { first_runtime.delete_sandbox("default", "sandbox-a").await });
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("first delete did not reach the driver");
 
         let second_runtime = runtime.clone();
-        let second = tokio::spawn(async move { second_runtime.delete_sandbox("sandbox-a").await });
+        let second =
+            tokio::spawn(
+                async move { second_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), async {
             while Arc::strong_count(&delete_gate) < 3 {
                 tokio::task::yield_now().await;
@@ -4130,7 +4215,10 @@ mod tests {
         let delete_gate = runtime.delete_gates.gate_for(original.object_id());
         let delete_guard = delete_gate.lock().await;
         let delete_runtime = runtime.clone();
-        let delete = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), async {
             while Arc::strong_count(&delete_gate) < 2 {
                 tokio::task::yield_now().await;
@@ -4170,7 +4258,10 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         let delete_runtime = runtime.clone();
-        let request = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let request =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("delete did not reach the driver");
@@ -4208,7 +4299,13 @@ mod tests {
         runtime.sandbox_index.update_from_sandbox(&sandbox);
         let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
 
-        assert!(!runtime.delete_sandbox("sandbox-a").await.unwrap().deleted);
+        assert!(
+            !runtime
+                .delete_sandbox("default", "sandbox-a")
+                .await
+                .unwrap()
+                .deleted
+        );
         assert!(
             runtime
                 .store
@@ -4221,7 +4318,7 @@ mod tests {
         assert!(
             runtime
                 .sandbox_index
-                .sandbox_id_for_sandbox_name("sandbox-a")
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
                 .is_none()
         );
 
@@ -4250,7 +4347,10 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         let delete_runtime = runtime.clone();
-        let delete = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("delete did not reach the driver");
@@ -4284,7 +4384,10 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         let delete_runtime = runtime.clone();
-        let delete = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("delete did not reach the driver");
@@ -4323,7 +4426,13 @@ mod tests {
         let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
-        assert!(runtime.delete_sandbox("sandbox-a").await.unwrap().deleted);
+        assert!(
+            runtime
+                .delete_sandbox("default", "sandbox-a")
+                .await
+                .unwrap()
+                .deleted
+        );
 
         let stored = runtime
             .store
@@ -4363,7 +4472,10 @@ mod tests {
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
         let delete_runtime = runtime.clone();
-        let delete = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("delete did not reach the driver");
@@ -4387,7 +4499,7 @@ mod tests {
         assert!(
             runtime
                 .sandbox_index
-                .sandbox_id_for_sandbox_name("sandbox-a")
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
                 .is_none()
         );
         assert!(watch_rx.try_recv().is_ok());
@@ -4410,7 +4522,10 @@ mod tests {
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
         let delete_runtime = runtime.clone();
-        let delete = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("delete did not reach the driver");
@@ -4434,7 +4549,7 @@ mod tests {
         assert!(
             runtime
                 .sandbox_index
-                .sandbox_id_for_sandbox_name("sandbox-a")
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
                 .is_none()
         );
         assert!(watch_rx.try_recv().is_ok());
@@ -4453,7 +4568,10 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
         let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
 
-        runtime.delete_sandbox("sandbox-a").await.unwrap_err();
+        runtime
+            .delete_sandbox("default", "sandbox-a")
+            .await
+            .unwrap_err();
 
         assert!(
             runtime
@@ -4479,7 +4597,10 @@ mod tests {
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
         let delete_runtime = runtime.clone();
-        let delete = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("delete did not reach the driver");
@@ -4500,7 +4621,7 @@ mod tests {
         assert!(
             runtime
                 .sandbox_index
-                .sandbox_id_for_sandbox_name("sandbox-a")
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
                 .is_none()
         );
         assert!(watch_rx.try_recv().is_ok());
@@ -4525,7 +4646,10 @@ mod tests {
         let mut watch_rx = runtime.sandbox_watch_bus.subscribe("sb-1");
 
         let delete_runtime = runtime.clone();
-        let delete = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.get_started.notified())
             .await
             .expect("delete recovery did not reach the driver lookup");
@@ -4546,7 +4670,7 @@ mod tests {
         assert!(
             runtime
                 .sandbox_index
-                .sandbox_id_for_sandbox_name("sandbox-a")
+                .sandbox_id_for_sandbox_name("default", "sandbox-a")
                 .is_none()
         );
         assert!(watch_rx.try_recv().is_ok());
@@ -4588,7 +4712,10 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
         let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
 
-        let error = runtime.delete_sandbox("sandbox-a").await.unwrap_err();
+        let error = runtime
+            .delete_sandbox("default", "sandbox-a")
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), Code::Internal);
 
         let stored = runtime
@@ -4618,7 +4745,10 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
         let session = seed_sandbox_owned_records(&runtime, &sandbox).await;
 
-        runtime.delete_sandbox("sandbox-a").await.unwrap_err();
+        runtime
+            .delete_sandbox("default", "sandbox-a")
+            .await
+            .unwrap_err();
 
         let stored = runtime
             .store
@@ -4646,7 +4776,10 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         let delete_runtime = runtime.clone();
-        let delete = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("delete did not reach the driver");
@@ -4687,7 +4820,10 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         let delete_runtime = runtime.clone();
-        let delete = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("delete did not reach the driver");
@@ -4725,7 +4861,10 @@ mod tests {
         runtime.store.put_message(&sandbox).await.unwrap();
 
         let delete_runtime = runtime.clone();
-        let delete = tokio::spawn(async move { delete_runtime.delete_sandbox("sandbox-a").await });
+        let delete =
+            tokio::spawn(
+                async move { delete_runtime.delete_sandbox("default", "sandbox-a").await },
+            );
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("delete did not reach the driver");
@@ -4847,6 +4986,7 @@ mod tests {
                 namespace: "default".to_string(),
                 spec: None,
                 status: None,
+                workspace: "default".to_string(),
             })
             .await
             .unwrap();
@@ -4895,6 +5035,7 @@ mod tests {
                     "Starting",
                     "VM is starting",
                 ))),
+                workspace: "default".to_string(),
             })
             .await
             .unwrap();
@@ -5014,6 +5155,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             }],
             current_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
@@ -5034,6 +5176,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             }],
         }))
         .await;
@@ -5082,6 +5225,7 @@ mod tests {
                     "DependenciesNotReady",
                     "Pod exists with phase: Pending; Service Exists",
                 ))),
+                workspace: "default".to_string(),
             }],
             current_sandboxes: vec![DriverSandbox {
                 id: "sb-1".to_string(),
@@ -5095,6 +5239,7 @@ mod tests {
                     message: "Pod is Ready".to_string(),
                     last_transition_time: String::new(),
                 })),
+                workspace: "default".to_string(),
             }],
         }))
         .await;
@@ -5136,6 +5281,7 @@ mod tests {
                     }],
                     deleting: false,
                 }),
+                workspace: "default".to_string(),
             }],
             ..Default::default()
         }))
@@ -5174,7 +5320,32 @@ mod tests {
                 SANDBOX_SETTINGS_OBJECT_TYPE,
                 "settings-sb-1",
                 sandbox.object_name(),
+                sandbox.object_workspace(),
                 br#"{"revision":1,"settings":{}}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put(
+                POLICY_OBJECT_TYPE,
+                "policy-sb-1",
+                sandbox.object_id(),
+                sandbox.object_workspace(),
+                br#"{"version":1}"#,
+                None,
+            )
+            .await
+            .unwrap();
+        runtime
+            .store
+            .put(
+                DRAFT_CHUNK_OBJECT_TYPE,
+                "draft-sb-1",
+                sandbox.object_id(),
+                sandbox.object_workspace(),
+                br#"{"chunk":1}"#,
                 None,
             )
             .await
@@ -5200,16 +5371,36 @@ mod tests {
         assert!(
             runtime
                 .sandbox_index
-                .sandbox_id_for_sandbox_name(sandbox.object_name())
+                .sandbox_id_for_sandbox_name(sandbox.object_workspace(), sandbox.object_name())
                 .is_none()
         );
         assert!(
             runtime
                 .store
-                .get_by_name(SANDBOX_SETTINGS_OBJECT_TYPE, sandbox.object_name())
+                .get_by_name(
+                    SANDBOX_SETTINGS_OBJECT_TYPE,
+                    sandbox.object_workspace(),
+                    sandbox.object_name()
+                )
                 .await
                 .unwrap()
                 .is_none()
+        );
+        assert!(
+            runtime
+                .store
+                .list_by_scope(POLICY_OBJECT_TYPE, sandbox.object_id(), 100, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .store
+                .list_by_scope(DRAFT_CHUNK_OBJECT_TYPE, sandbox.object_id(), 100, 0)
+                .await
+                .unwrap()
+                .is_empty()
         );
         assert!(
             runtime
@@ -5481,7 +5672,13 @@ mod tests {
 
         runtime.validate_sandbox_create(&sandbox).await.unwrap();
         runtime.create_sandbox(sandbox, None).await.unwrap();
-        assert!(runtime.delete_sandbox("uds-sandbox").await.unwrap().deleted);
+        assert!(
+            runtime
+                .delete_sandbox("default", "uds-sandbox")
+                .await
+                .unwrap()
+                .deleted
+        );
 
         let calls = driver.calls();
         assert_eq!(calls.len(), 4, "unexpected calls: {calls:?}");
@@ -5538,6 +5735,8 @@ mod tests {
             labels: HashMap::new(),
             resource_version: 0,
             annotations: HashMap::new(),
+            workspace: "default".to_string(),
+            deletion_timestamp_ms: 0,
         });
 
         let created = runtime.create_sandbox(sandbox, None).await.unwrap();
@@ -5579,7 +5778,7 @@ mod tests {
 
         let matching = runtime
             .store
-            .list_messages_with_selector::<Sandbox>("env=prod", 10, 0)
+            .list_messages_with_selector::<Sandbox>("default", "env=prod", 10, 0)
             .await
             .unwrap();
         assert_eq!(matching.len(), 1);
@@ -5636,7 +5835,7 @@ mod tests {
             .expect("should have one successful creation");
         let retrieved = runtime
             .store
-            .get_message_by_name::<Sandbox>("test-concurrent")
+            .get_message_by_name::<Sandbox>("default", "test-concurrent")
             .await
             .unwrap();
         assert!(
@@ -5648,5 +5847,74 @@ mod tests {
             created_sandbox.object_id(),
             "retrieved sandbox should match created sandbox"
         );
+    }
+
+    #[test]
+    fn driver_sandbox_from_public_populates_workspace() {
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "work".to_string(),
+                workspace: "alpha".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let driver_sb = driver_sandbox_from_public(&sandbox, "kubernetes").unwrap();
+        assert_eq!(driver_sb.workspace, "alpha");
+        assert_eq!(driver_sb.name, "work");
+        assert_eq!(driver_sb.id, "sb-1");
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_ignores_unknown_workspace_snapshot() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-w1".to_string(),
+                name: "work".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "DependenciesNotReady",
+                    "Provisioning",
+                ))),
+                workspace: "team-ml".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime.store.get_message::<Sandbox>("sb-w1").await.unwrap();
+        assert!(stored.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_preserves_workspace() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-w2", "work", SandboxPhase::Provisioning);
+        sandbox.metadata.as_mut().unwrap().workspace = "alpha".to_string();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-w2".to_string(),
+                name: "work".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "DependenciesNotReady",
+                    "Provisioning",
+                ))),
+                workspace: "different-workspace".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-w2")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.object_workspace(), "alpha");
     }
 }

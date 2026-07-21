@@ -8,6 +8,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+# shellcheck source=tasks/scripts/build-env.sh
+source "${SCRIPT_DIR}/build-env.sh"
+
 usage() {
   echo "Usage: stage-prebuilt-binaries.sh <gateway|sandbox|supervisor|supervisor-output|all>" >&2
 }
@@ -229,6 +232,11 @@ fi
 
 restore_cargo_toml=0
 trap restore_workspace_version EXIT
+
+# Raise the open-file limit before any host cargo-zigbuild cross-compile. This
+# single chokepoint covers the docker, podman, and all docker:*/multiarch host
+# staging paths. No-op on Linux and when cargo-zigbuild is absent.
+ensure_build_nofile_limit
 
 patch_workspace_version
 

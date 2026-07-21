@@ -48,6 +48,11 @@ if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/pulls/1865/reviews" ]]; t
     exit 0
 fi
 
+if [[ "$1" == "api" && "$*" == *"repos/NVIDIA/OpenShell/pulls/1865/reviews"* ]]; then
+    printf '%s\n' 'review posted'
+    exit 0
+fi
+
 if [[ "$1" == "api" && "$*" == *"repos/NVIDIA/OpenShell/issues/1865/comments"* ]]; then
     printf '%s\n' 'posted'
     exit 0
@@ -76,6 +81,47 @@ run_case() {
 
     set +e
     OPENSHELL_REAL_GH="$tmp/mock-gh" "$WRAPPER" api --method POST repos/NVIDIA/OpenShell/issues/1865/comments --input "$tmp/body.json" >/tmp/gh-wrapper-test.out 2>/tmp/gh-wrapper-test.err
+    local status=$?
+    set -e
+
+    assert_status "$expected_status" "$status" "$name"
+    rm -rf "$tmp"
+    trap - RETURN
+}
+
+run_review_case() {
+    local name="$1"
+    local existing_body="$2"
+    local expected_status="$3"
+
+    local tmp
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' RETURN
+    export MOCK_GH_LOG="$tmp/gh.log"
+    make_mock_gh "$tmp" "$existing_body"
+
+    jq -n \
+        --arg body '> **gator-agent**
+
+## PR Review Status
+
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
+        --arg inline_body '> **gator-agent**
+
+**Warning:** Keep this validation bound to the accepted value.' \
+        '{
+            event: "COMMENT",
+            body: $body,
+            comments: [{
+                path: "crates/example/src/lib.rs",
+                line: 42,
+                side: "RIGHT",
+                body: $inline_body
+            }]
+        }' > "$tmp/review.json"
+
+    set +e
+    OPENSHELL_REAL_GH="$tmp/mock-gh" "$WRAPPER" api --method POST repos/NVIDIA/OpenShell/pulls/1865/reviews --input "$tmp/review.json" >/tmp/gh-wrapper-test.out 2>/tmp/gh-wrapper-test.err
     local status=$?
     set -e
 
@@ -171,5 +217,13 @@ run_case "blocks duplicate draft blocker while PR remains draft" \
 Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
     20 \
     true
+
+run_review_case "allows first batched inline review as one disposition" \
+    '' \
+    0
+
+run_review_case "blocks a later batched inline review for the same SHA" \
+    "$same_sha_body" \
+    20
 
 printf 'PASS: gh same-SHA guard tests\n'

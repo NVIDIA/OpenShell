@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use openshell_core::denial::DenialEvent;
 
@@ -65,10 +65,14 @@ impl DenialAggregator {
     ///
     /// `flush_callback` is called periodically with the accumulated summaries.
     /// In production this calls `SubmitPolicyAnalysis` on the gateway.
-    pub async fn run<F, Fut>(mut self, flush_callback: F)
+    ///
+    /// `ready_gate` is checked before each flush. When it returns `false`,
+    /// the drain is skipped and events stay in the buffer until the next tick.
+    pub async fn run<F, Fut, G>(mut self, flush_callback: F, ready_gate: G)
     where
         F: Fn(Vec<FlushableDenialSummary>) -> Fut,
         Fut: Future<Output = ()>,
+        G: Fn() -> bool,
     {
         let mut flush_interval =
             tokio::time::interval(std::time::Duration::from_secs(self.flush_interval_secs));
@@ -83,15 +87,22 @@ impl DenialAggregator {
                     } else {
                         // Channel closed; do a final flush and exit.
                         if !self.summaries.is_empty() {
-                            let batch = self.drain();
-                            flush_callback(batch).await;
+                            if ready_gate() {
+                                let batch = self.drain();
+                                flush_callback(batch).await;
+                            } else {
+                                warn!(
+                                    count = self.summaries.len(),
+                                    "DenialAggregator: dropping unflushed summaries, workspace not yet known"
+                                );
+                            }
                         }
                         debug!("DenialAggregator: channel closed, exiting");
                         return;
                     }
                 }
                 _ = flush_interval.tick() => {
-                    if !self.summaries.is_empty() {
+                    if ready_gate() && !self.summaries.is_empty() {
                         let batch = self.drain();
                         debug!(count = batch.len(), "DenialAggregator: flushing summaries");
                         flush_callback(batch).await;

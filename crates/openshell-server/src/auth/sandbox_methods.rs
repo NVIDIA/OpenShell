@@ -49,10 +49,10 @@ mod tests {
             "/openshell.v1.OpenShell/ApproveDraftChunk"
         ));
         assert!(!is_sandbox_callable(
-            "/openshell.inference.v1.Inference/GetClusterInference"
+            "/openshell.inference.v1.Inference/GetInferenceRoute"
         ));
         assert!(!is_sandbox_callable(
-            "/openshell.inference.v1.Inference/SetClusterInference"
+            "/openshell.inference.v1.Inference/SetInferenceRoute"
         ));
     }
 }

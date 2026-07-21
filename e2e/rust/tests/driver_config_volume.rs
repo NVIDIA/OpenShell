@@ -126,7 +126,8 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
         "type": "bind",
         "source": bind_source,
         "target": BIND_TARGET,
-        "read_only": false
+        "read_only": false,
+        "selinux_label": "private"
     });
     let driver_config = driver_config_mount_json(&driver, &bind_mount);
     // Host bind mounts are explicitly unsafe: this test validates driver mount

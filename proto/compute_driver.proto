@@ -74,6 +74,9 @@ message DriverSandbox {
   DriverSandboxSpec spec = 4;
   // Raw platform-observed status.
   DriverSandboxStatus status = 5;
+  // Workspace the sandbox belongs to. Used by drivers to construct
+  // collision-safe resource names and labels in shared-namespace mode.
+  string workspace = 6;
 }
 
 // Driver-owned provisioning inputs required to create a sandbox.

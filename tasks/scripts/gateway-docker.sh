@@ -112,9 +112,11 @@ HOST_OS="$(uname -s)"
 HOST_ARCH="$(normalize_arch "$(uname -m)")"
 SUPERVISOR_TARGET="$(linux_target_triple "${DAEMON_ARCH}")"
 # Cache the supervisor binary alongside the gateway state. Reuses the same
-# Docker pipeline used for the supervisor image, so the cross-compile happens
-# inside Linux containers — sidestepping macOS's per-process
-# file-descriptor cap that breaks zig/ld for this many rlibs.
+# Docker pipeline used for the supervisor image. The Dockerfiles do not compile
+# Rust; the cross-compile runs on the host via cargo zigbuild and the binary is
+# staged into the build context. On macOS the host staging path raises the
+# per-process file-descriptor limit automatically (see build-env.sh), so the
+# static musl link no longer hits ProcessFdQuotaExceeded on this many rlibs.
 SUPERVISOR_OUT_DIR="${STATE_DIR}/supervisor/${DAEMON_ARCH}"
 SUPERVISOR_BIN="${SUPERVISOR_OUT_DIR}/openshell-sandbox"
 

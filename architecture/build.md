@@ -59,7 +59,12 @@ and the supervisor image from `deploy/docker/Dockerfile.supervisor`. Neither
 Dockerfile compiles Rust — both copy a staged binary out of
 `deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
 
-Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
+Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Because
+staging cross-compiles on the host, it sources `tasks/scripts/build-env.sh` and
+raises the per-process open-file limit before invoking `cargo zigbuild` on
+macOS — the static musl link opens hundreds of `.rlib` files at once and would
+otherwise fail with `ProcessFdQuotaExceeded` under macOS's default soft limit of
+256. The guard is a no-op on Linux and when `cargo-zigbuild` is absent. Gateway
 binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.28, including
 native-architecture builds, so the gateway image, standalone tarballs, and Linux
 packages share the same host portability floor. The gateway build enables

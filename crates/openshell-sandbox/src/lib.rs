@@ -361,6 +361,11 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     drop(bypass_activity_tx);
 
+    // Workspace watch: the policy poll loop learns the workspace from
+    // GetSandboxConfig and broadcasts it. Flush tasks and the policy.local
+    // API read the current value so proposals target the correct workspace.
+    let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
+
     let networking = if network_enabled {
         #[cfg(target_os = "linux")]
         let proxy_bind_ip = netns
@@ -384,6 +389,7 @@ pub async fn run_sandbox(
                 inference_routes.as_deref(),
                 denial_tx,
                 activity_tx,
+                workspace_rx.clone(),
             )
             .await?,
         )
@@ -482,20 +488,31 @@ pub async fn run_sandbox(
             .unwrap_or(10);
 
         let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
+        let denial_workspace_gate = workspace_rx.clone();
+        let denial_workspace_rx = workspace_rx.clone();
 
         tokio::spawn(async move {
             aggregator
-                .run(|summaries| {
-                    let endpoint = agg_endpoint.clone();
-                    let sandbox_name = agg_name.clone();
-                    async move {
-                        if let Err(e) =
-                            flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries).await
-                        {
-                            warn!(error = %e, "Failed to flush denial summaries to gateway");
+                .run(
+                    |summaries| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        let workspace = denial_workspace_rx.borrow().clone();
+                        async move {
+                            if let Err(e) = flush_proposals_to_gateway(
+                                &endpoint,
+                                &sandbox_name,
+                                &workspace,
+                                summaries,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "Failed to flush denial summaries to gateway");
+                            }
                         }
-                    }
-                })
+                    },
+                    move || !denial_workspace_gate.borrow().is_empty(),
+                )
                 .await;
         });
     }
@@ -516,20 +533,31 @@ pub async fn run_sandbox(
         );
 
         let aggregator = activity_aggregator::ActivityAggregator::new(rx, flush_interval_secs);
+        let activity_workspace_gate = workspace_rx.clone();
+        let activity_workspace_rx = workspace_rx.clone();
 
         tokio::spawn(async move {
             aggregator
-                .run(move |summary| {
-                    let endpoint = agg_endpoint.clone();
-                    let sandbox_name = agg_name.clone();
-                    async move {
-                        if let Err(e) =
-                            flush_activity_to_gateway(&endpoint, &sandbox_name, summary).await
-                        {
-                            warn!(error = %e, "Failed to flush activity summary to gateway");
+                .run(
+                    move |summary| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        let workspace = activity_workspace_rx.borrow().clone();
+                        async move {
+                            if let Err(e) = flush_activity_to_gateway(
+                                &endpoint,
+                                &sandbox_name,
+                                &workspace,
+                                summary,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "Failed to flush activity summary to gateway");
+                            }
                         }
-                    }
-                })
+                    },
+                    move || !activity_workspace_gate.borrow().is_empty(),
+                )
                 .await;
         });
     }
@@ -565,6 +593,7 @@ pub async fn run_sandbox(
             policy_local_ctx: poll_policy_local,
             middleware_registry_status,
             sidecar_control_publisher: sidecar_control_publisher.clone(),
+            workspace_tx,
         };
 
         tokio::spawn(async move {
@@ -981,12 +1010,14 @@ fn process_policy_for_topology(
 async fn flush_proposals_to_gateway(
     endpoint: &str,
     sandbox_name: &str,
+    workspace: &str,
     summaries: Vec<denial_aggregator::FlushableDenialSummary>,
 ) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::{DenialSummary, L7RequestSample};
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
+    client.set_workspace(workspace.to_string());
 
     let proto_summaries: Vec<DenialSummary> = summaries
         .into_iter()
@@ -1049,12 +1080,14 @@ async fn flush_proposals_to_gateway(
 async fn flush_activity_to_gateway(
     endpoint: &str,
     sandbox_name: &str,
+    workspace: &str,
     summary: activity_aggregator::FlushableActivitySummary,
 ) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::{DenialGroupCount, NetworkActivitySummary};
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
+    client.set_workspace(workspace.to_string());
 
     let proto_summary = NetworkActivitySummary {
         network_activity_count: summary.network_activity_count,
@@ -1889,12 +1922,14 @@ async fn load_policy(
 
             // Sync and re-fetch over a single connection to avoid extra
             // TLS handshakes.
+            let ws = snapshot.workspace.clone();
             snapshot = grpc_retry("Policy discovery sync", || {
                 openshell_core::grpc_client::sync_policy_and_fetch_snapshot(
                     endpoint,
                     id,
                     sandbox,
                     &discovered,
+                    &ws,
                 )
             })
             .await?;
@@ -1921,6 +1956,7 @@ async fn load_policy(
                     id,
                     sandbox_name,
                     &sync_policy,
+                    &snapshot.workspace,
                 )
                 .await
                 {
@@ -2470,6 +2506,7 @@ struct PolicyPollLoopContext {
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
     middleware_registry_status: MiddlewareRegistryStatus,
     sidecar_control_publisher: Option<sidecar_control::Publisher>,
+    workspace_tx: tokio::sync::watch::Sender<String>,
 }
 
 async fn connect_middleware_registry(
@@ -2581,35 +2618,38 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     // policy revision the supervisor actually loaded. A mismatched result is
     // reconciled below instead of being recorded as already applied.
     match client.poll_settings(&ctx.sandbox_id).await {
-        Ok(result) => match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
-            InitialPollDisposition::Acknowledge(candidate) => {
-                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                current_config_revision = candidate.config_revision;
-                current_policy_hash.clone_from(&candidate.policy_hash);
-                current_middleware_services = result.supervisor_middleware_services;
-                current_settings = result.settings;
-                enqueue_policy_status(
-                    &status_sender,
-                    PolicyStatusUpdate::initial_loaded(&candidate),
-                );
-                debug!(
-                    config_revision = current_config_revision,
-                    "Settings poll: initial policy matches loaded revision"
-                );
+        Ok(result) => {
+            let _ = ctx.workspace_tx.send(client.workspace());
+            match initial_poll_disposition(&ctx.loaded_policy_origin, &result) {
+                InitialPollDisposition::Acknowledge(candidate) => {
+                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    current_config_revision = candidate.config_revision;
+                    current_policy_hash.clone_from(&candidate.policy_hash);
+                    current_middleware_services = result.supervisor_middleware_services;
+                    current_settings = result.settings;
+                    enqueue_policy_status(
+                        &status_sender,
+                        PolicyStatusUpdate::initial_loaded(&candidate),
+                    );
+                    debug!(
+                        config_revision = current_config_revision,
+                        "Settings poll: initial policy matches loaded revision"
+                    );
+                }
+                InitialPollDisposition::Reconcile => pending_result = Some(result),
+                InitialPollDisposition::TrackOnly => {
+                    apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
+                    current_config_revision = result.config_revision;
+                    current_policy_hash = result.policy_hash.clone();
+                    current_middleware_services = result.supervisor_middleware_services;
+                    current_settings = result.settings;
+                    debug!(
+                        config_revision = current_config_revision,
+                        "Settings poll: tracking gateway config while preserving local policy override"
+                    );
+                }
             }
-            InitialPollDisposition::Reconcile => pending_result = Some(result),
-            InitialPollDisposition::TrackOnly => {
-                apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-                current_config_revision = result.config_revision;
-                current_policy_hash = result.policy_hash.clone();
-                current_middleware_services = result.supervisor_middleware_services;
-                current_settings = result.settings;
-                debug!(
-                    config_revision = current_config_revision,
-                    "Settings poll: tracking gateway config while preserving local policy override"
-                );
-            }
-        },
+        }
         Err(e) => {
             warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
         }
@@ -2622,7 +2662,10 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         } else {
             tokio::time::sleep(interval).await;
             match client.poll_settings(&ctx.sandbox_id).await {
-                Ok(result) => result,
+                Ok(result) => {
+                    let _ = ctx.workspace_tx.send(client.workspace());
+                    result
+                }
                 Err(e) => {
                     debug!(error = %e, "Settings poll: server unreachable, will retry");
                     continue;
@@ -3273,6 +3316,7 @@ filesystem_policy:
             global_policy_version: 0,
             provider_env_revision: 0,
             supervisor_middleware_services: Vec::new(),
+            workspace: String::new(),
         }
     }
 
@@ -3550,5 +3594,22 @@ filesystem_policy:
                 PolicyStatusUpdate::loaded(version)
             );
         }
+    }
+
+    #[test]
+    fn settings_snapshot_carries_workspace_for_policy_sync() {
+        let mut snapshot = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        snapshot.workspace = "beta".to_string();
+
+        let revision = LoadedPolicyRevision::from_snapshot(&snapshot);
+        assert_eq!(revision.version, 1);
+        assert_eq!(
+            snapshot.workspace, "beta",
+            "workspace must survive the snapshot so sync_policy_and_fetch_snapshot receives it"
+        );
     }
 }

@@ -318,7 +318,8 @@ pub struct CreateSandboxForm {
     /// When the create animation started (for pacman timing).
     pub anim_start: Option<Instant>,
     /// Buffered create result — held until min display time elapses.
-    pub create_result: Option<Result<String, String>>,
+    /// `Ok((name, workspace))` or `Err(message)`.
+    pub create_result: Option<Result<(String, String), String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -529,12 +530,19 @@ pub struct App {
     pub gateway_selected: usize,
     pub pending_gateway_switch: Option<String>,
 
+    // Workspace filter
+    pub current_workspace: String,
+    pub all_workspaces: bool,
+    pub workspace_names: Vec<String>,
+    pub pending_workspace_refresh: bool,
+
     // Provider list
     pub providers_v2_enabled: bool,
     pub provider_entries: Vec<ProviderV2Entry>,
     pub provider_names: Vec<String>,
     pub provider_types: Vec<String>,
     pub provider_cred_keys: Vec<String>,
+    pub provider_workspaces: Vec<String>,
     pub provider_selected: usize,
     pub provider_count: usize,
 
@@ -577,6 +585,7 @@ pub struct App {
     pub sandbox_labels: Vec<String>,
     /// Formatted annotations for each sandbox (e.g., "policy-signature=abc" or empty string).
     pub sandbox_annotations: Vec<String>,
+    pub sandbox_workspaces: Vec<String>,
     pub sandbox_policy_versions: Vec<u32>,
     pub sandbox_selected: usize,
     pub sandbox_count: usize,
@@ -862,6 +871,7 @@ impl App {
         client: OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>,
         gateway_name: String,
         endpoint: String,
+        workspace: String,
         theme: crate::theme::Theme,
     ) -> Self {
         Self {
@@ -890,11 +900,16 @@ impl App {
             confirm_setting_delete: None,
             pending_setting_set: false,
             pending_setting_delete: false,
+            current_workspace: workspace,
+            all_workspaces: false,
+            workspace_names: Vec::new(),
+            pending_workspace_refresh: false,
             providers_v2_enabled: false,
             provider_entries: Vec::new(),
             provider_names: Vec::new(),
             provider_types: Vec::new(),
             provider_cred_keys: Vec::new(),
+            provider_workspaces: Vec::new(),
             provider_selected: 0,
             provider_count: 0,
             create_provider_form: None,
@@ -914,6 +929,7 @@ impl App {
             sandbox_notes: Vec::new(),
             sandbox_labels: Vec::new(),
             sandbox_annotations: Vec::new(),
+            sandbox_workspaces: Vec::new(),
             sandbox_policy_versions: Vec::new(),
             sandbox_selected: 0,
             sandbox_count: 0,
@@ -1061,6 +1077,43 @@ impl App {
         if self.screen == Screen::Splash {
             self.screen = Screen::Dashboard;
             self.splash_start = None;
+        }
+    }
+
+    pub fn cycle_workspace(&mut self) {
+        if self.all_workspaces {
+            self.all_workspaces = false;
+            self.current_workspace = "default".to_string();
+        } else if self.workspace_names.is_empty() {
+            self.all_workspaces = true;
+            self.current_workspace = "default".to_string();
+        } else {
+            let current_idx = self
+                .workspace_names
+                .iter()
+                .position(|n| n == &self.current_workspace);
+            match current_idx {
+                Some(idx) if idx + 1 < self.workspace_names.len() => {
+                    self.current_workspace = self.workspace_names[idx + 1].clone();
+                }
+                _ => {
+                    self.all_workspaces = true;
+                    self.current_workspace = "default".to_string();
+                }
+            }
+        }
+        // Reset selection indices so the cursor doesn't point past the end
+        // of the new workspace's (potentially shorter) sandbox/provider lists.
+        self.sandbox_selected = 0;
+        self.provider_selected = 0;
+        self.pending_workspace_refresh = true;
+    }
+
+    pub fn workspace_display(&self) -> &str {
+        if self.all_workspaces {
+            "all"
+        } else {
+            &self.current_workspace
         }
     }
 
@@ -1280,7 +1333,12 @@ impl App {
                 }
             }
             KeyCode::Char('c') if !self.providers_v2_enabled => {
-                self.open_create_provider_form();
+                if self.all_workspaces {
+                    self.status_text =
+                        "Switch to a specific workspace to create providers.".to_string();
+                } else {
+                    self.open_create_provider_form();
+                }
             }
             // Fetch and show provider detail.
             KeyCode::Enter if self.provider_count > 0 => {
@@ -1459,6 +1517,9 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
+            KeyCode::Char('w') => {
+                self.cycle_workspace();
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.sandbox_count > 0 && self.sandbox_selected < self.sandbox_count - 1 {
                     self.sandbox_selected += 1;
@@ -1474,7 +1535,12 @@ impl App {
                 }
             }
             KeyCode::Char('c') => {
-                self.open_create_form();
+                if self.all_workspaces {
+                    self.status_text =
+                        "Switch to a specific workspace to create sandboxes.".to_string();
+                } else {
+                    self.open_create_form();
+                }
             }
             KeyCode::Enter if self.sandbox_count > 0 => {
                 self.screen = Screen::Sandbox;
@@ -2626,6 +2692,25 @@ impl App {
             .map(String::as_str)
     }
 
+    /// Get the workspace of the currently selected sandbox.
+    ///
+    /// In the all-workspaces view, returns the workspace from the selected row
+    /// rather than the globally active workspace.
+    pub fn selected_sandbox_workspace(&self) -> String {
+        self.sandbox_workspaces
+            .get(self.sandbox_selected)
+            .cloned()
+            .unwrap_or_else(|| self.current_workspace.clone())
+    }
+
+    /// Get the workspace of the currently selected provider row.
+    pub fn selected_provider_workspace(&self) -> String {
+        self.provider_workspaces
+            .get(self.provider_selected)
+            .cloned()
+            .unwrap_or_else(|| self.current_workspace.clone())
+    }
+
     /// Get the name of the currently selected provider.
     pub fn selected_provider_name(&self) -> Option<&str> {
         self.provider_names
@@ -2640,7 +2725,7 @@ impl App {
         let profile = self
             .provider_entries
             .iter()
-            .find(|entry| provider_name(&entry.provider) == provider_name(provider))
+            .find(|entry| provider_id(&entry.provider) == provider_id(provider))
             .and_then(|entry| entry.profile.as_ref());
 
         let mut credential_keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
@@ -2875,6 +2960,7 @@ impl App {
         self.sandbox_labels.clear();
         self.sandbox_annotations.clear();
         self.sandbox_policy_versions.clear();
+        self.sandbox_workspaces.clear();
         self.sandbox_selected = 0;
         self.sandbox_count = 0;
         self.sandbox_log_lines.clear();
@@ -2894,6 +2980,7 @@ impl App {
         self.provider_names.clear();
         self.provider_types.clear();
         self.provider_cred_keys.clear();
+        self.provider_workspaces.clear();
         self.provider_selected = 0;
         self.provider_count = 0;
         self.confirm_provider_delete = false;
@@ -3039,5 +3126,49 @@ mod tests {
         };
 
         assert_eq!(gateway.source_label(), "unknown");
+    }
+
+    // -- selected_sandbox_workspace ----------------------------------------
+
+    #[test]
+    fn selected_sandbox_workspace_returns_per_row_value() {
+        let workspaces = ["default", "beta", "staging"];
+        let selected: usize = 1;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "beta");
+    }
+
+    #[test]
+    fn selected_sandbox_workspace_falls_back_to_current() {
+        let workspaces: &[&str] = &[];
+        let selected: usize = 0;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "default");
+    }
+
+    // -- selected_provider_workspace ----------------------------------------
+
+    #[test]
+    fn selected_provider_workspace_returns_per_row_value() {
+        let workspaces = ["default", "beta", "staging"];
+        let selected: usize = 1;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "beta");
+    }
+
+    #[test]
+    fn selected_provider_workspace_falls_back_to_current() {
+        let workspaces: &[&str] = &[];
+        let selected: usize = 0;
+        let current = "default";
+
+        let result = workspaces.get(selected).unwrap_or(&current);
+        assert_eq!(*result, "default");
     }
 }

@@ -111,6 +111,7 @@ pub struct SandboxSpec {
 pub struct SandboxRef {
     pub id: String,
     pub name: String,
+    pub workspace: String,
     pub phase: SandboxPhase,
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
@@ -123,9 +124,38 @@ impl SandboxRef {
         Self {
             id: meta.id,
             name: meta.name,
+            workspace: meta.workspace,
             phase,
             labels: meta.labels,
             resource_version: meta.resource_version,
+        }
+    }
+}
+
+/// Reference to a workspace on the gateway.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct WorkspaceRef {
+    pub name: String,
+    pub phase: String,
+    pub labels: HashMap<String, String>,
+}
+
+impl WorkspaceRef {
+    pub(crate) fn from_proto(workspace: proto::Workspace) -> Self {
+        let meta = workspace.metadata.unwrap_or_default();
+        let phase = workspace
+            .status
+            .and_then(|s| proto::datamodel::v1::WorkspacePhase::try_from(s.phase).ok())
+            .map_or("Unknown", |p| match p {
+                proto::datamodel::v1::WorkspacePhase::Unspecified => "Unspecified",
+                proto::datamodel::v1::WorkspacePhase::Active => "Active",
+                proto::datamodel::v1::WorkspacePhase::Terminating => "Terminating",
+            });
+        Self {
+            name: meta.name,
+            phase: phase.to_string(),
+            labels: meta.labels,
         }
     }
 }

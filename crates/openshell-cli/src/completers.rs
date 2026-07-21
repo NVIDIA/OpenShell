@@ -11,7 +11,7 @@ use openshell_bootstrap::{list_gateways, load_active_gateway, load_gateway_metad
 use openshell_core::ObjectName;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
-use openshell_core::proto::{ListProvidersRequest, ListSandboxesRequest};
+use openshell_core::proto::{ListProvidersRequest, ListSandboxesRequest, ListWorkspacesRequest};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
@@ -39,6 +39,8 @@ pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
                 limit: 200,
                 offset: 0,
                 label_selector: String::new(),
+                workspace: workspace_from_args(),
+                all_workspaces: false,
             })
             .await
             .ok()?;
@@ -62,6 +64,8 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
             .list_providers(ListProvidersRequest {
                 limit: 200,
                 offset: 0,
+                workspace: workspace_from_args(),
+                all_workspaces: false,
             })
             .await
             .ok()?;
@@ -74,6 +78,44 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
                 .collect(),
         )
     })
+}
+
+/// Complete workspace names by querying the active gateway.
+pub fn complete_workspace_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
+    blocking_complete(async {
+        let (endpoint, gateway_name) = resolve_active_gateway()?;
+        let mut client = completion_grpc_client(&endpoint, &gateway_name).await?;
+        let response = client
+            .list_workspaces(ListWorkspacesRequest {
+                limit: 200,
+                offset: 0,
+                label_selector: String::new(),
+            })
+            .await
+            .ok()?;
+        Some(
+            response
+                .into_inner()
+                .workspaces
+                .into_iter()
+                .map(|w| CompletionCandidate::new(w.object_name()))
+                .collect(),
+        )
+    })
+}
+
+fn workspace_from_args() -> String {
+    let args: Vec<String> = std::env::args().collect();
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--workspace" {
+            if let Some(val) = args.get(i + 1) {
+                return val.clone();
+            }
+        } else if let Some(val) = arg.strip_prefix("--workspace=") {
+            return val.to_string();
+        }
+    }
+    std::env::var("OPENSHELL_WORKSPACE").unwrap_or_else(|_| "default".to_string())
 }
 
 fn resolve_active_gateway() -> Option<(String, String)> {

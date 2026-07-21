@@ -344,17 +344,7 @@ impl OpaEngine {
 
         // Validate BEFORE expanding presets
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
-        for w in &warnings {
-            openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                    .severity(openshell_ocsf::SeverityId::Medium)
-                    .status(openshell_ocsf::StatusId::Success)
-                    .state(openshell_ocsf::StateId::Enabled, "validated")
-                    .unmapped("warning", serde_json::json!(w.clone()))
-                    .message(format!("L7 policy validation warning: {w}"))
-                    .build()
-            );
-        }
+        emit_l7_config_warnings(&warnings, "L7 policy validation warning");
         if !errors.is_empty() {
             return Err(miette::miette!(
                 "L7 policy validation failed:\n{}",
@@ -365,7 +355,8 @@ impl OpaEngine {
         normalize_l7_policy_rule_aliases(&mut data);
 
         // Expand access presets to explicit rules after validation
-        crate::l7::expand_access_presets(&mut data);
+        let expansion_warnings = crate::l7::expand_access_presets(&mut data);
+        emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
         let data_json = data.to_string();
         let mut engine = regorus::Engine::new();
@@ -1032,6 +1023,20 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
     }
 }
 
+fn emit_l7_config_warnings(warnings: &[String], prefix: &str) {
+    for w in warnings {
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                .severity(openshell_ocsf::SeverityId::Medium)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "validated")
+                .unmapped("warning", serde_json::json!(w))
+                .message(format!("{prefix}: {w}"))
+                .build()
+        );
+    }
+}
+
 /// Preprocess YAML policy data: parse, normalize, validate, expand access presets, return JSON.
 fn preprocess_yaml_data(
     yaml_str: &str,
@@ -1073,17 +1078,7 @@ fn preprocess_yaml_data(
     }
 
     let (errors, warnings) = crate::l7::validate_l7_policies(&data);
-    for w in &warnings {
-        openshell_ocsf::ocsf_emit!(
-            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
-                .severity(openshell_ocsf::SeverityId::Medium)
-                .status(openshell_ocsf::StatusId::Success)
-                .state(openshell_ocsf::StateId::Enabled, "validated")
-                .unmapped("warning", serde_json::json!(w.clone()))
-                .message(format!("L7 policy validation warning: {w}"))
-                .build()
-        );
-    }
+    emit_l7_config_warnings(&warnings, "L7 policy validation warning");
     if !errors.is_empty() {
         return Err(miette::miette!(
             "L7 policy validation failed:\n{}",
@@ -1094,7 +1089,8 @@ fn preprocess_yaml_data(
     normalize_l7_policy_rule_aliases(&mut data);
 
     // Expand access presets to explicit rules after validation
-    crate::l7::expand_access_presets(&mut data);
+    let expansion_warnings = crate::l7::expand_access_presets(&mut data);
+    emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
     serde_json::to_string(&data).map_err(|e| miette::miette!("failed to serialize data: {e}"))
 }
@@ -3741,6 +3737,61 @@ network_policies:
         let mut get_with_method = l7_jsonrpc_input("jsonrpc.post.test", 8000, "/rpc", "initialize");
         get_with_method["request"]["method"] = serde_json::json!("GET");
         assert!(!eval_l7(&engine, &get_with_method));
+    }
+
+    // Mirrors the default GitHub provider's github.com git-transport endpoint
+    // (providers/github.yaml). Git smart HTTP clone/fetch performs a GET on
+    // */info/refs followed by a POST to */git-upload-pack; push uses
+    // */git-receive-pack, which must stay blocked. Regression test for #1769.
+    #[test]
+    fn l7_github_git_transport_allows_clone_blocks_push() {
+        let data = r#"
+network_policies:
+  github:
+    name: github
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "**" }
+          - allow: { method: HEAD, path: "**" }
+          - allow: { method: OPTIONS, path: "**" }
+          - allow: { method: POST, path: "/**/git-upload-pack" }
+    binaries:
+      # l7_input() issues requests as /usr/bin/curl.
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        // Reference discovery (GET) is allowed.
+        let refs = l7_input("github.com", 443, "GET", "/NVIDIA/OpenShell.git/info/refs");
+        assert!(eval_l7(&engine, &refs), "GET info/refs should be allowed");
+
+        // Clone/fetch (POST git-upload-pack) is allowed.
+        let upload_pack = l7_input(
+            "github.com",
+            443,
+            "POST",
+            "/NVIDIA/OpenShell.git/git-upload-pack",
+        );
+        assert!(
+            eval_l7(&engine, &upload_pack),
+            "POST git-upload-pack should be allowed for clone/fetch"
+        );
+
+        // Push (POST git-receive-pack) is denied.
+        let receive_pack = l7_input(
+            "github.com",
+            443,
+            "POST",
+            "/NVIDIA/OpenShell.git/git-receive-pack",
+        );
+        assert!(
+            !eval_l7(&engine, &receive_pack),
+            "POST git-receive-pack (push) must be denied"
+        );
     }
 
     #[test]
