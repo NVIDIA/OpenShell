@@ -28,6 +28,13 @@ enrichment adds existing GPU device nodes as read-write paths and promotes
 `/proc` to read-write because CUDA workloads write thread metadata under
 `/proc/<pid>/task/<tid>/comm`.
 
+Landlock rules are tailored to the inode type reported by the already-opened
+path descriptor. Directories retain the requested directory and file rights;
+regular files, device nodes, sockets, and other non-directories retain only
+file-compatible rights. This avoids rejecting valid mixed-path policies without
+weakening `hard_requirement`: genuine unsupported ABI capabilities and
+preparation failures still fail sandbox startup.
+
 ## Network Decisions
 
 Ordinary network traffic follows this order:
