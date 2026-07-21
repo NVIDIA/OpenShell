@@ -744,10 +744,11 @@ impl KubernetesComputeDriver {
             .await?;
         match tokio::time::timeout(
             KUBE_API_TIMEOUT,
-            agent_sandbox_api.api.list(
-                &ListParams::default()
-                    .labels(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}")),
-            ),
+            agent_sandbox_api
+                .api
+                .list(&ListParams::default().labels(&format!(
+                    "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}"
+                ))),
         )
         .await
         {
@@ -755,8 +756,16 @@ impl KubernetesComputeDriver {
                 let mut sandboxes: Vec<Sandbox> = list
                     .items
                     .into_iter()
-                    .filter_map(|obj| sandbox_from_object(&self.config.namespace, obj).ok())
-                    .map(|(_, s)| s)
+                    .filter_map(|obj| {
+                        let name = obj.metadata.name.clone().unwrap_or_default();
+                        match sandbox_from_object(&self.config.namespace, obj) {
+                            Ok((_, s)) => Some(s),
+                            Err(err) => {
+                                warn!(object_name = %name, error = %err, "skipping unrecognized Sandbox in list");
+                                None
+                            }
+                        }
+                    })
                     .collect();
                 sandboxes.sort_by(|left, right| {
                     left.name
@@ -1034,8 +1043,9 @@ impl KubernetesComputeDriver {
             .supported_agent_sandbox_api(self.watch_client.clone())
             .await?;
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
-        let watcher_config = watcher::Config::default()
-            .labels(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"));
+        let watcher_config = watcher::Config::default().labels(&format!(
+            "{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}"
+        ));
         let mut sandbox_stream = watcher::watcher(agent_sandbox_api.api, watcher_config).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
         let (tx, rx) = mpsc::channel(256);
