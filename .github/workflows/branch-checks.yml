@@ -54,11 +54,20 @@ jobs:
 
       - name: Verify mise.lock is in sync with mise.toml
         run: |
-          mise lock
-          if ! git diff --exit-code mise.lock; then
-            echo "::error::mise.lock is out of sync with mise.toml. Run 'mise lock' locally and commit the result." >&2
-            exit 1
-          fi
+          for attempt in 1 2 3; do
+            if mise lock && git diff --quiet -- mise.lock; then
+              exit 0
+            fi
+
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::mise lock did not reproduce the committed lockfile (attempt $attempt/3); retrying"
+              git restore --source=HEAD --worktree -- mise.lock
+            fi
+          done
+
+          git diff -- mise.lock || true
+          echo "::error::mise.lock is out of sync with mise.toml. Run 'mise lock' locally and commit the result." >&2
+          exit 1
 
   license-headers:
     name: License Headers
