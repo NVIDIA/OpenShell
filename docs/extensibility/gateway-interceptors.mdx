@@ -42,19 +42,19 @@ The gateway runs built-in operation and driver validation after `modify_operatio
 
 ## Implement an Interceptor Service
 
-An interceptor implements the [`openshell.gateway_interceptor.v1.GatewayInterceptor` gRPC service](https://github.com/NVIDIA/OpenShell/blob/main/proto/gateway_interceptor.proto#L14-L26):
+An interceptor implements the `openshell.gateway_interceptor.v1.GatewayInterceptor` gRPC service defined in [`proto/gateway_interceptor.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/gateway_interceptor.proto):
 
 - `Describe` declares the service's bindings and capabilities.
 - `Evaluate` handles one selected operation phase.
 - `SnapshotProviderProfiles` optionally returns a provider profile catalog.
 
-Each [`InterceptorEvaluation`](https://github.com/NVIDIA/OpenShell/blob/main/proto/gateway_interceptor.proto#L39-L60) identifies the configured interceptor, manifest binding, public OpenShell service and method, authenticated principal, and active phase. The phase determines whether the payload contains a proposed operation, optional current state, or committed response.
+Each `InterceptorEvaluation` identifies the configured interceptor, manifest binding, public OpenShell service and method, authenticated principal, and active phase. The phase determines whether the payload contains a proposed operation, optional current state, or committed response.
 
-The interceptor returns an [`InterceptorResult`](https://github.com/NVIDIA/OpenShell/blob/main/proto/gateway_interceptor.proto#L79-L91) with an allow or deny decision, an optional denial status and reason, JSON patches during `modify_operation`, and non-secret log annotations.
+The interceptor returns an `InterceptorResult` with an allow or deny decision, an optional denial status and reason, JSON patches during `modify_operation`, and non-secret log annotations.
 
 ## Declare and Authorize Bindings
 
-The interceptor declares bindings in its [`InterceptorManifest`](https://github.com/NVIDIA/OpenShell/blob/main/proto/gateway_interceptor.proto#L93-L103) returned by `Describe`. Each binding selects one public OpenShell RPC and one or more phases. The gateway validates these declarations at startup against its compiled protobuf descriptors and explicit interceptable RPC allowlist.
+The interceptor declares bindings in its `InterceptorManifest` returned by `Describe`. Each binding selects one public OpenShell RPC and one or more phases. The gateway validates these declarations at startup against its compiled protobuf descriptors and explicit interceptable RPC allowlist.
 
 The operator chooses how the manifest and gateway configuration combine with `binding_policy`:
 
@@ -128,7 +128,7 @@ The following unary mutation RPCs are interceptable:
 | Policy draft | `openshell.v1.OpenShell/UndoDraftChunk` |
 | Policy draft | `openshell.v1.OpenShell/ClearDraftChunks` |
 
-The gateway maintains the canonical [interceptable route allowlist](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-gateway-interceptors/src/routes.rs#L17-L43). Read the interceptor manifest and gateway startup diagnostics when selecting bindings. Unknown, streaming, read-only, and non-allowlisted RPCs cannot be intercepted.
+The gateway maintains the canonical [interceptable route allowlist](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-gateway-interceptors/src/routes.rs). Read the interceptor manifest and gateway startup diagnostics when selecting bindings. Unknown, streaming, read-only, and non-allowlisted RPCs cannot be intercepted.
 
 Choose a phase by intent:
 
@@ -161,7 +161,7 @@ Use `fail_open` only when bypassing an unavailable or invalid interceptor preser
 
 ## Vend Provider Profiles
 
-An interceptor can advertise `provider_profiles = true` in its manifest and implement [`SnapshotProviderProfiles`](https://github.com/NVIDIA/OpenShell/blob/main/proto/gateway_interceptor.proto#L18-L21). The RPC returns a [`ProviderProfileSnapshot`](https://github.com/NVIDIA/OpenShell/blob/main/proto/gateway_interceptor.proto#L105-L110). Add that interceptor to `provider_profile_sources` to include its profiles in the gateway's effective catalog.
+An interceptor can advertise `provider_profiles = true` in its manifest and implement `SnapshotProviderProfiles`. The RPC returns a `ProviderProfileSnapshot`. Add that interceptor to `provider_profile_sources` to include its profiles in the gateway's effective catalog.
 
 Select only the interceptor to make its catalog authoritative:
 
