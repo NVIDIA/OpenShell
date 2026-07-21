@@ -17,6 +17,7 @@ openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
 
 base64 = { workspace = true }
+chrono = "0.4"
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 terminal-colorsaurus = { workspace = true }
