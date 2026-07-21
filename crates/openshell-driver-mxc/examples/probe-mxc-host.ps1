@@ -119,6 +119,10 @@ $pcTrialMessage = "wxc-exec not found"
 $isoTrialResult = "absent"
 $isoTrialMessage = "wxc-exec not found"
 
+$probeTempPath = Join-Path ([System.IO.Path]::GetTempPath()) ("openshell-mxc-probe-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $probeTempPath | Out-Null
+
+try {
 if ($wxcInfo.exists) {
     # --probe
     $probeResult = Invoke-WxcProbe -wxc $WxcExecPath
@@ -131,11 +135,11 @@ if ($wxcInfo.exists) {
         containment = "processcontainer"
         process     = @{
             commandLine = "cmd /c exit 0"
-            cwd         = "%TEMP%"
+            cwd         = $probeTempPath
             timeout     = 0
         }
         filesystem  = @{
-            readwritePaths = @("%TEMP%")
+            readwritePaths = @($probeTempPath)
         }
     }
     $dryResult = Invoke-WxcDryRun -wxc $WxcExecPath -config $dryConfig
@@ -149,14 +153,21 @@ if ($wxcInfo.exists) {
         containment = "processcontainer"
         process     = @{
             commandLine = "cmd /c exit 0"
-            cwd         = "%TEMP%"
-            timeout     = 10
+            cwd         = $probeTempPath
+            timeout     = 30000
         }
         filesystem  = @{
-            readwritePaths = @("%TEMP%")
+            readwritePaths = @($probeTempPath)
         }
         processContainer = @{
             leastPrivilege = $false
+        }
+        # cmd.exe needs the Win32k calls represented by disable = false.
+        # Filesystem and network restrictions remain default-deny.
+        ui = @{
+            disable   = $false
+            clipboard = "none"
+            injection = $false
         }
     }
     $pcResult = Invoke-WxcPhase -wxc $WxcExecPath -config $pcConfig
@@ -259,6 +270,9 @@ if ($wxcInfo.exists) {
         $isoTrialResult  = "error"
         $isoTrialMessage = "exit $($isoResult.ExitCode): $isoOutput"
     }
+}
+} finally {
+    Remove-Item -LiteralPath $probeTempPath -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # ── Verdicts ──────────────────────────────────────────────────────────────────
