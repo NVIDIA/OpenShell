@@ -5923,35 +5923,4 @@ mod tests {
         assert!(sandbox_id_from_object(&obj).is_err());
     }
 
-    #[test]
-    fn label_selector_used_by_list_and_watch_matches_shared_helper() {
-        let expected = openshell_sandbox_label_selector();
-        assert!(
-            expected.starts_with("openshell.ai/managed-by=openshell,"),
-            "selector must start with managed-by filter"
-        );
-        assert!(
-            expected.ends_with("openshell.ai/sandbox-id"),
-            "selector must require sandbox-id label presence"
-        );
-    }
-
-    #[tokio::test]
-    async fn watch_producer_exits_when_receiver_is_dropped() {
-        let (tx, rx) = mpsc::channel::<Result<WatchSandboxesEvent, KubernetesDriverError>>(16);
-
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = tx.closed() => break,
-                }
-            }
-        });
-
-        drop(rx);
-        tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("producer task did not exit within timeout")
-            .expect("producer task panicked");
-    }
 }

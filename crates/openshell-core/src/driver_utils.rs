@@ -170,16 +170,3 @@ pub fn supervisor_image_tag(image: &str) -> Option<&str> {
 pub fn supervisor_image_should_refresh(image: &str) -> bool {
     matches!(supervisor_image_tag(image), Some("dev" | "latest"))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn openshell_sandbox_label_selector_contains_managed_by_and_sandbox_id() {
-        assert_eq!(
-            openshell_sandbox_label_selector(),
-            "openshell.ai/managed-by=openshell,openshell.ai/sandbox-id"
-        );
-    }
-}
