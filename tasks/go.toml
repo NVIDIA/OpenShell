@@ -83,53 +83,29 @@ echo "Docs check passed: all public packages have documentation."
 hide = true
 
 ["go:proto:gen"]
-description = "Generate Go bindings from proto files"
+description = "Generate Go bindings from proto files using buf"
 dir = "sdk/go"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Check required tools
-for tool in protoc protoc-gen-go protoc-gen-go-grpc; do
+for tool in buf protoc-gen-go protoc-gen-go-grpc; do
   if ! command -v "$tool" &>/dev/null; then
     echo "ERROR: $tool not found. Run 'mise install' to install it."
     exit 1
   fi
 done
 
-MODULE="github.com/NVIDIA/OpenShell/sdk/go"
-PROTO_DIR="proto"
+# Clean previous output before regeneration
+find proto -name '*.pb.go' -delete 2>/dev/null || true
 
-# Create output directories
-mkdir -p "$PROTO_DIR/openshellv1" "$PROTO_DIR/datamodelv1" "$PROTO_DIR/sandboxv1"
-
-# M flag mappings for Go package paths
-M_FLAGS=""
-M_FLAGS="$M_FLAGS --go_opt=Mopenshell.proto=$MODULE/proto/openshellv1"
-M_FLAGS="$M_FLAGS --go_opt=Mdatamodel.proto=$MODULE/proto/datamodelv1"
-M_FLAGS="$M_FLAGS --go_opt=Msandbox.proto=$MODULE/proto/sandboxv1"
-M_FLAGS="$M_FLAGS --go-grpc_opt=Mopenshell.proto=$MODULE/proto/openshellv1"
-M_FLAGS="$M_FLAGS --go-grpc_opt=Mdatamodel.proto=$MODULE/proto/datamodelv1"
-M_FLAGS="$M_FLAGS --go-grpc_opt=Msandbox.proto=$MODULE/proto/sandboxv1"
-
-# Generate Go code for all proto files
-# Use module= option to strip the module prefix from the output path,
-# so files land in proto/openshellv1/ etc. instead of the full module path
-protoc \
-  --proto_path="$PROTO_DIR" \
-  --go_out=. \
-  --go_opt=module=$MODULE \
-  --go-grpc_out=. \
-  --go-grpc_opt=module=$MODULE \
-  $M_FLAGS \
-  "$PROTO_DIR/openshell.proto" \
-  "$PROTO_DIR/datamodel.proto" \
-  "$PROTO_DIR/sandbox.proto"
+buf generate
 
 echo "Proto generation complete."
 echo "Generated packages:"
-for pkg in openshellv1 datamodelv1 sandboxv1; do
-  echo "  $PROTO_DIR/$pkg/: $(ls "$PROTO_DIR/$pkg/"*.go 2>/dev/null | wc -l | tr -d ' ') files"
+for pkg in openshellv1 datamodelv1 sandboxv1 optionsv1; do
+  count=$(find "proto/$pkg" -name '*.go' 2>/dev/null | wc -l | tr -d ' ')
+  echo "  proto/$pkg/: $count files"
 done
 """
 hide = true
@@ -141,45 +117,21 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Check required tools
-for tool in protoc protoc-gen-go protoc-gen-go-grpc; do
+for tool in buf protoc-gen-go protoc-gen-go-grpc; do
   if ! command -v "$tool" &>/dev/null; then
     echo "ERROR: $tool not found. Run 'mise install' to install it."
     exit 1
   fi
 done
 
-MODULE="github.com/NVIDIA/OpenShell/sdk/go"
-PROTO_DIR="proto"
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-# Create output directories in temp
-mkdir -p "$WORK_DIR/proto/openshellv1" "$WORK_DIR/proto/datamodelv1" "$WORK_DIR/proto/sandboxv1"
+# Generate to temp directory with adjusted output path
+sed "s|out: \\.|out: $WORK_DIR|" buf.gen.yaml > "$WORK_DIR/buf.gen.yaml"
+buf generate --template "$WORK_DIR/buf.gen.yaml"
 
-# M flag mappings (same as proto:gen)
-M_FLAGS=""
-M_FLAGS="$M_FLAGS --go_opt=Mopenshell.proto=$MODULE/proto/openshellv1"
-M_FLAGS="$M_FLAGS --go_opt=Mdatamodel.proto=$MODULE/proto/datamodelv1"
-M_FLAGS="$M_FLAGS --go_opt=Msandbox.proto=$MODULE/proto/sandboxv1"
-M_FLAGS="$M_FLAGS --go-grpc_opt=Mopenshell.proto=$MODULE/proto/openshellv1"
-M_FLAGS="$M_FLAGS --go-grpc_opt=Mdatamodel.proto=$MODULE/proto/datamodelv1"
-M_FLAGS="$M_FLAGS --go-grpc_opt=Msandbox.proto=$MODULE/proto/sandboxv1"
-
-# Generate to temp directory
-protoc \
-  --proto_path="$PROTO_DIR" \
-  --go_out="$WORK_DIR" \
-  --go_opt=module=$MODULE \
-  --go-grpc_out="$WORK_DIR" \
-  --go-grpc_opt=module=$MODULE \
-  $M_FLAGS \
-  "$PROTO_DIR/openshell.proto" \
-  "$PROTO_DIR/datamodel.proto" \
-  "$PROTO_DIR/sandbox.proto"
-
-# Diff against committed files
-DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "$PROTO_DIR" \
+DIFF_OUTPUT=$(diff -r "$WORK_DIR/proto" "proto" \
   --exclude="*.proto" \
   2>&1) || true
 
@@ -192,59 +144,5 @@ if [ -n "$DIFF_OUTPUT" ]; then
 fi
 
 echo "Proto check passed: generated files are up to date."
-"""
-hide = true
-
-["go:proto:clean"]
-description = "Remove all generated Go SDK proto files"
-dir = "sdk/go"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-
-PROTO_DIR="proto"
-
-# Remove all generated .pb.go files
-find "$PROTO_DIR" -name "*.pb.go" -delete 2>/dev/null || true
-
-# Remove empty generated subdirectories
-for dir in "$PROTO_DIR"/*/; do
-  [ -d "$dir" ] && rmdir "$dir" 2>/dev/null || true
-done
-
-echo "Proto clean complete."
-"""
-hide = true
-
-["go:proto:sync"]
-description = "Sync Go SDK proto files from root proto directory"
-dir = "sdk/go"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-
-UPSTREAM_PATH="${UPSTREAM_PATH:-../../proto}"
-
-if [ ! -d "$UPSTREAM_PATH" ]; then
-  echo "ERROR: Upstream proto directory not found: $UPSTREAM_PATH"
-  echo "Expected root proto/ directory at $UPSTREAM_PATH (relative to sdk/go/)."
-  exit 1
-fi
-
-PROTO_DIR="proto"
-mkdir -p "$PROTO_DIR"
-
-PROTO_FILES="openshell.proto datamodel.proto sandbox.proto"
-for f in $PROTO_FILES; do
-  src="$UPSTREAM_PATH/$f"
-  if [ ! -f "$src" ]; then
-    echo "ERROR: Proto file not found: $src"
-    exit 1
-  fi
-  cp "$src" "$PROTO_DIR/$f"
-  echo "Copied $f"
-done
-
-echo "Proto sync complete."
 """
 hide = true
