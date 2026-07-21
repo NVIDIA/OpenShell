@@ -29,7 +29,7 @@ The long-running container permissions differ by topology:
 
 | Topology | Pod or container | UID/GID | Privilege escalation | Capabilities | Result |
 |---|---|---|---|---|---|
-| `combined` | Agent container, which also runs the supervisor | Not forced by topology | Not explicitly disabled by the driver | Adds `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, and `SYSLOG`; adds `SETUID`, `SETGID`, and `DAC_READ_SEARCH` when user namespaces are enabled | Full supervisor controls run in the agent container. |
+| `combined` | Agent container, which also runs the supervisor | Not forced by topology | Not explicitly disabled by the driver | Adds `SYS_ADMIN`, `NET_ADMIN`, and `SYS_PTRACE`; adds `SETUID`, `SETGID`, and `DAC_READ_SEARCH` when user namespaces are enabled | Full supervisor controls run in the agent container. Bypass-detection log entries arrive over an NFLOG socket covered by `NET_ADMIN`. |
 | `sidecar` | Agent container, process-only supervisor (`network-only`) | `sandbox_uid:sandbox_gid` | `false` | Drops `ALL` | Agent and workload run without added Linux capabilities. |
 | `sidecar` | Network supervisor sidecar, binary-aware mode (default) | `0:sandbox_gid` | `false` | Drops `ALL`; adds `SYS_PTRACE` and `DAC_READ_SEARCH` | Root sidecar inspects cross-UID workload `/proc` entries. The nftables fence exempts UID 0, so do not inject other root containers into these pods. |
 | `sidecar` | Network supervisor sidecar, endpoint/L7-only mode | `proxyUid:sandbox_gid` | `false` | Drops `ALL` | Non-root sidecar enforces endpoint and L7 policy without matching `policy.binaries`. |

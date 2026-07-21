@@ -2534,7 +2534,10 @@ fn sandbox_template_to_k8s_with_validated_config(
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
 
-    let mut capabilities: Vec<&str> = vec!["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"];
+    // Bypass-detection log entries arrive over an NFLOG socket (covered by
+    // NET_ADMIN), so CAP_SYSLOG is not needed. With user namespaces every
+    // remaining capability is scoped to the pod's user namespace.
+    let mut capabilities: Vec<&str> = vec!["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"];
     if use_user_namespaces {
         // In a user namespace the bounding set is reset. SETUID/SETGID are
         // needed for the supervisor to drop privileges to the sandbox user.
@@ -3874,7 +3877,7 @@ mod tests {
                     "image": "custom-image:latest",
                     "securityContext": {
                         "capabilities": {
-                            "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
+                            "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
                         }
                     }
                 }]
@@ -5179,8 +5182,12 @@ mod tests {
         let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
             .as_array()
             .unwrap();
-        assert_eq!(caps.len(), 4);
+        assert_eq!(caps.len(), 3);
         assert!(!caps.contains(&serde_json::json!("SETUID")));
+        assert!(
+            !caps.contains(&serde_json::json!("SYSLOG")),
+            "CAP_SYSLOG must not be requested; bypass detection uses NFLOG"
+        );
     }
 
     #[test]
@@ -5202,11 +5209,10 @@ mod tests {
         assert!(caps.contains(&serde_json::json!("SYS_ADMIN")));
         assert!(caps.contains(&serde_json::json!("NET_ADMIN")));
         assert!(caps.contains(&serde_json::json!("SYS_PTRACE")));
-        assert!(caps.contains(&serde_json::json!("SYSLOG")));
         assert!(caps.contains(&serde_json::json!("SETUID")));
         assert!(caps.contains(&serde_json::json!("SETGID")));
         assert!(caps.contains(&serde_json::json!("DAC_READ_SEARCH")));
-        assert_eq!(caps.len(), 7);
+        assert_eq!(caps.len(), 6);
     }
 
     #[test]
@@ -5280,7 +5286,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             caps.len(),
-            4,
+            3,
             "extra capabilities must not be added when user namespaces are disabled"
         );
     }

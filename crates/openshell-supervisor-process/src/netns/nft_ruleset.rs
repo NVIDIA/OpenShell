@@ -22,6 +22,29 @@ pub struct NftCommand {
     pub required: bool,
 }
 
+/// Delivery backend for bypass log rules.
+pub enum LogBackend {
+    /// `log ... flags skuid` — kernel ring buffer via printk
+    /// (`nf_log_syslog`). Reading entries requires `CAP_SYSLOG` in the
+    /// initial user namespace.
+    Ringbuffer,
+    /// `log ... group <N>` — `nfnetlink_log` delivery to a netlink socket
+    /// bound inside the same network namespace. Reading needs only
+    /// `CAP_NET_ADMIN` over the namespace owner.
+    Nflog {
+        /// NFLOG group number matching the listener socket.
+        group: u16,
+    },
+}
+
+/// Log rule specification: entry prefix plus delivery backend.
+pub struct LogSpec<'a> {
+    /// Prefix attached to each log entry, used by the monitor to filter.
+    pub prefix: &'a str,
+    /// How log entries reach the bypass monitor.
+    pub backend: LogBackend,
+}
+
 /// Generate nft commands for sandbox network bypass enforcement.
 ///
 /// Creates an `inet` family table (handles both IPv4 and IPv6) with rules that:
@@ -30,13 +53,14 @@ pub struct NftCommand {
 /// 3. Accept established/related connections (optional; requires `nf_conntrack`)
 /// 4. Reject TCP and UDP bypass attempts (both IPv4 and IPv6)
 ///
-/// If `log_prefix` is provided, log rules are inserted before each reject rule
-/// so that bypass attempts are recorded in the kernel ring buffer before being
-/// rejected. Log rules are always non-required since they need `nf_log` support.
+/// If `log` is provided, log rules are inserted before each reject rule so
+/// that bypass attempts are recorded (via the ring buffer or NFLOG, per the
+/// spec's backend) before being rejected. Log rules are always non-required
+/// since they need kernel logging support.
 pub fn generate_bypass_commands(
     host_ip: &str,
     proxy_port: u16,
-    log_prefix: Option<&str>,
+    log: Option<&LogSpec<'_>>,
 ) -> Vec<NftCommand> {
     let table = "openshell_bypass";
     let mut cmds = vec![
@@ -92,14 +116,8 @@ pub fn generate_bypass_commands(
         ),
     ];
 
-    if let Some(prefix) = log_prefix {
-        cmds.push(nft_cmd(
-            false,
-            &[
-                "add", "rule", "inet", table, "output", "tcp", "flags", "syn", "limit", "rate",
-                "5/second", "burst", "10", "packets", "log", "prefix", prefix, "flags", "skuid",
-            ],
-        ));
+    if let Some(log) = log {
+        cmds.push(tcp_log_rule(table, log));
     }
 
     cmds.push(nft_cmd(
@@ -145,14 +163,8 @@ pub fn generate_bypass_commands(
         ],
     ));
 
-    if let Some(prefix) = log_prefix {
-        cmds.push(nft_cmd(
-            false,
-            &[
-                "add", "rule", "inet", table, "output", "meta", "l4proto", "udp", "limit", "rate",
-                "5/second", "burst", "10", "packets", "log", "prefix", prefix, "flags", "skuid",
-            ],
-        ));
+    if let Some(log) = log {
+        cmds.push(udp_log_rule(table, log));
     }
 
     cmds.push(nft_cmd(
@@ -201,6 +213,50 @@ pub fn generate_bypass_commands(
     cmds
 }
 
+/// Rate-limited log rule for TCP connection attempts (SYN packets).
+fn tcp_log_rule(table: &str, log: &LogSpec<'_>) -> NftCommand {
+    log_rule(
+        &[
+            "add", "rule", "inet", table, "output", "tcp", "flags", "syn", "limit", "rate",
+            "5/second", "burst", "10", "packets",
+        ],
+        log,
+    )
+}
+
+/// Rate-limited log rule for UDP packets.
+fn udp_log_rule(table: &str, log: &LogSpec<'_>) -> NftCommand {
+    log_rule(
+        &[
+            "add", "rule", "inet", table, "output", "meta", "l4proto", "udp", "limit", "rate",
+            "5/second", "burst", "10", "packets",
+        ],
+        log,
+    )
+}
+
+/// Append the backend-specific `log` statement to a rule.
+///
+/// The ring buffer backend adds `flags skuid` so the workload UID appears in
+/// the text entry; NFLOG entries carry the UID as a netlink attribute
+/// automatically, and nft rejects `flags` combined with `group`.
+fn log_rule(base: &[&str], log: &LogSpec<'_>) -> NftCommand {
+    let mut args: Vec<String> = base.iter().map(|s| (*s).to_string()).collect();
+    args.extend([
+        "log".to_string(),
+        "prefix".to_string(),
+        log.prefix.to_string(),
+    ]);
+    match log.backend {
+        LogBackend::Ringbuffer => args.extend(["flags".to_string(), "skuid".to_string()]),
+        LogBackend::Nflog { group } => args.extend(["group".to_string(), group.to_string()]),
+    }
+    NftCommand {
+        args,
+        required: false,
+    }
+}
+
 /// Generate nft commands for Kubernetes sidecar enforcement.
 ///
 /// The network sidecar and the process supervisor share a pod network
@@ -211,7 +267,7 @@ pub fn generate_bypass_commands(
 /// the sidecar policy fence.
 pub fn generate_sidecar_bypass_commands(
     proxy_uid: u32,
-    log_prefix: Option<&str>,
+    log: Option<&LogSpec<'_>>,
 ) -> Vec<NftCommand> {
     let table = "openshell_sidecar_bypass";
     let uid_str = proxy_uid.to_string();
@@ -257,14 +313,8 @@ pub fn generate_sidecar_bypass_commands(
         ),
     ];
 
-    if let Some(prefix) = log_prefix {
-        cmds.push(nft_cmd(
-            false,
-            &[
-                "add", "rule", "inet", table, "output", "tcp", "flags", "syn", "limit", "rate",
-                "5/second", "burst", "10", "packets", "log", "prefix", prefix, "flags", "skuid",
-            ],
-        ));
+    if let Some(log) = log {
+        cmds.push(tcp_log_rule(table, log));
     }
 
     cmds.push(nft_cmd(
@@ -310,14 +360,8 @@ pub fn generate_sidecar_bypass_commands(
         ],
     ));
 
-    if let Some(prefix) = log_prefix {
-        cmds.push(nft_cmd(
-            false,
-            &[
-                "add", "rule", "inet", table, "output", "meta", "l4proto", "udp", "limit", "rate",
-                "5/second", "burst", "10", "packets", "log", "prefix", prefix, "flags", "skuid",
-            ],
-        ));
+    if let Some(log) = log {
+        cmds.push(udp_log_rule(table, log));
     }
 
     cmds.push(nft_cmd(
@@ -385,6 +429,20 @@ mod tests {
         cmds.iter().map(cmd_str).collect::<Vec<_>>().join("\n")
     }
 
+    const fn ringbuffer_spec(prefix: &str) -> LogSpec<'_> {
+        LogSpec {
+            prefix,
+            backend: LogBackend::Ringbuffer,
+        }
+    }
+
+    const fn nflog_spec(prefix: &str, group: u16) -> LogSpec<'_> {
+        LogSpec {
+            prefix,
+            backend: LogBackend::Nflog { group },
+        }
+    }
+
     #[test]
     fn generates_bypass_commands_with_proxy_rule() {
         let cmds = generate_bypass_commands("10.0.2.2", 8080, None);
@@ -449,7 +507,11 @@ mod tests {
 
     #[test]
     fn log_commands_contain_prefix_for_tcp_and_udp() {
-        let cmds = generate_bypass_commands("10.0.2.2", 8080, Some("openshell:bypass:test:"));
+        let cmds = generate_bypass_commands(
+            "10.0.2.2",
+            8080,
+            Some(&ringbuffer_spec("openshell:bypass:test:")),
+        );
         let text = all_strs(&cmds);
         let count = text.matches("log prefix openshell:bypass:test:").count();
         assert_eq!(count, 2, "need log rules for both TCP and UDP");
@@ -458,8 +520,45 @@ mod tests {
     }
 
     #[test]
+    fn ringbuffer_log_rules_use_skuid_not_group() {
+        let cmds = generate_bypass_commands(
+            "10.0.2.2",
+            8080,
+            Some(&ringbuffer_spec("openshell:bypass:test:")),
+        );
+        let text = all_strs(&cmds);
+        assert_eq!(text.matches("flags skuid").count(), 2);
+        assert!(
+            !text.contains(" group "),
+            "ring buffer rules must not use NFLOG groups"
+        );
+    }
+
+    #[test]
+    fn nflog_log_rules_use_group_not_skuid() {
+        let cmds = generate_bypass_commands(
+            "10.0.2.2",
+            8080,
+            Some(&nflog_spec("openshell:bypass:test:", 1)),
+        );
+        let text = all_strs(&cmds);
+        let count = text
+            .matches("log prefix openshell:bypass:test: group 1")
+            .count();
+        assert_eq!(count, 2, "need NFLOG rules for both TCP and UDP");
+        assert!(
+            !text.contains("skuid"),
+            "nft rejects log flags combined with group; UID arrives as an NFLOG attribute"
+        );
+    }
+
+    #[test]
     fn log_rules_appear_before_reject_rules() {
-        let cmds = generate_bypass_commands("10.0.2.2", 8080, Some("openshell:bypass:test:"));
+        let cmds = generate_bypass_commands(
+            "10.0.2.2",
+            8080,
+            Some(&ringbuffer_spec("openshell:bypass:test:")),
+        );
         let text = all_strs(&cmds);
         let tcp_log_pos = text.find("tcp flags syn").unwrap();
         let tcp_reject_pos = text
@@ -495,7 +594,11 @@ mod tests {
 
     #[test]
     fn log_rules_are_not_required() {
-        let cmds = generate_bypass_commands("10.0.2.2", 8080, Some("openshell:bypass:test:"));
+        let cmds = generate_bypass_commands(
+            "10.0.2.2",
+            8080,
+            Some(&ringbuffer_spec("openshell:bypass:test:")),
+        );
         for cmd in &cmds {
             if cmd_str(cmd).contains("log prefix") {
                 assert!(
@@ -517,7 +620,8 @@ mod tests {
 
     #[test]
     fn sidecar_commands_reject_tcp_and_udp_egress() {
-        let cmds = generate_sidecar_bypass_commands(0, Some("openshell:sidecar:test:"));
+        let cmds =
+            generate_sidecar_bypass_commands(0, Some(&ringbuffer_spec("openshell:sidecar:test:")));
         let text = all_strs(&cmds);
         assert!(text.contains("meta nfproto ipv4 meta l4proto tcp reject"));
         assert!(text.contains("meta nfproto ipv6 meta l4proto tcp reject"));

@@ -243,10 +243,14 @@ async fn sandbox_pod_spec_has_user_namespace_fields() {
             "sandbox pod must include {cap} in capabilities when user namespaces are enabled, got: {caps_val}"
         );
     }
-    for cap in ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"] {
+    for cap in ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"] {
         assert!(
             caps_val.contains(cap),
             "sandbox pod must include {cap} in capabilities, got: {caps_val}"
         );
     }
+    assert!(
+        !caps_val.contains("SYSLOG"),
+        "sandbox pod must not request CAP_SYSLOG; bypass detection uses NFLOG, got: {caps_val}"
+    );
 }

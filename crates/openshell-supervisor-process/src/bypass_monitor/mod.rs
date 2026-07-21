@@ -1,21 +1,30 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bypass detection monitor — reads kernel log messages from `/dev/kmsg` to
-//! detect and report direct connection attempts that bypass the HTTP CONNECT
-//! proxy.
+//! Bypass detection monitor — reports direct connection attempts that bypass
+//! the HTTP CONNECT proxy.
 //!
 //! When the sandbox network namespace has nftables log rules installed (see
-//! `NetworkNamespace::install_bypass_rules`), the kernel writes a log line for
-//! each dropped packet. This module reads those messages, parses the nftables
-//! LOG format, and emits structured tracing events + denial aggregator entries.
+//! `NetworkNamespace::install_bypass_rules`), each rejected packet produces a
+//! log entry. This module consumes those entries and emits structured tracing
+//! events + denial aggregator entries.
+//!
+//! Two delivery backends are supported, preferred in order:
+//!
+//! 1. **NFLOG** (`log group N` rules + an `nfnetlink_log` socket bound inside
+//!    the sandbox netns). Needs only `CAP_NET_ADMIN` over the netns owner, so
+//!    it works in user-namespaced pods. See [`nflog`].
+//! 2. **Kernel ring buffer** (`log` rules + `dmesg --follow`). Needs
+//!    `CAP_SYSLOG` in the initial user namespace; kept as a fallback for
+//!    kernels without `nfnetlink_log`.
 //!
 //! ## Graceful degradation
 //!
-//! If `/dev/kmsg` cannot be opened (e.g., restricted container environment),
-//! the monitor logs a one-time warning and returns. The nftables reject rules
-//! still provide fast-fail UX — the monitor only adds diagnostic visibility.
+//! If neither backend is available the monitor logs a one-time warning and
+//! returns. The nftables reject rules still provide fast-fail UX — the
+//! monitor only adds diagnostic visibility.
 
+pub mod nflog;
 mod procfs;
 
 use openshell_core::activity::{ActivitySender, try_record_activity};
@@ -104,24 +113,90 @@ fn hint_for_event(event: &BypassEvent) -> &'static str {
     }
 }
 
+/// Shared reporting sink for bypass events, independent of the log backend.
+struct BypassReporter {
+    entrypoint_pid: Arc<AtomicU32>,
+    denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: Option<ActivitySender>,
+}
+
 /// Spawn the bypass monitor as a background tokio task.
 ///
-/// Uses `dmesg --follow` to tail the kernel ring buffer for nftables log
-/// entries matching the given namespace. Falls back gracefully if `dmesg`
-/// is not available.
+/// Prefers reading nftables log entries from the NFLOG socket bound during
+/// namespace setup (see `NetworkNamespace::install_bypass_rules`). When no
+/// socket is available it falls back to tailing the kernel ring buffer with
+/// `dmesg --follow`, which requires `CAP_SYSLOG` in the initial user
+/// namespace.
 ///
-/// We use `dmesg` rather than reading `/dev/kmsg` directly because the
-/// container runtime's device cgroup policy blocks direct `/dev/kmsg` access
-/// even with `CAP_SYSLOG`. The `dmesg` command reads via the `syslog(2)`
-/// syscall which is permitted with `CAP_SYSLOG`.
-///
-/// Returns a `JoinHandle` if the monitor was started, or `None` if `dmesg`
-/// is not available.
+/// Returns a `JoinHandle` if a monitor was started, or `None` when no
+/// backend is available.
 pub fn spawn(
     namespace_name: String,
     entrypoint_pid: Arc<AtomicU32>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    nflog_socket: Option<nflog::NflogSocket>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let namespace_prefix = format!("openshell:bypass:{namespace_name}:");
+    let reporter = BypassReporter {
+        entrypoint_pid,
+        denial_tx,
+        activity_tx,
+    };
+
+    if let Some(socket) = nflog_socket {
+        debug!(
+            namespace = %namespace_name,
+            group = socket.group(),
+            "Starting bypass detection monitor via NFLOG"
+        );
+        return Some(tokio::task::spawn_blocking(move || {
+            run_nflog_loop(&socket, &namespace_prefix, &reporter);
+        }));
+    }
+
+    spawn_dmesg_monitor(namespace_name, namespace_prefix, reporter)
+}
+
+/// Blocking receive loop over the NFLOG socket.
+fn run_nflog_loop(socket: &nflog::NflogSocket, namespace_prefix: &str, reporter: &BypassReporter) {
+    let mut buf = vec![0u8; nflog::RECV_BUFFER_LEN];
+    loop {
+        match socket.recv(&mut buf) {
+            Ok(len) => {
+                for event in nflog::parse_datagram(&buf[..len], socket.group(), namespace_prefix) {
+                    reporter.report(&event);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // The kernel dropped entries because the socket buffer overran.
+            // Detection continues with the next datagram.
+            Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                debug!(error = %e, "NFLOG socket overrun; kernel dropped bypass log entries");
+            }
+            Err(e) => {
+                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Other)
+                    .severity(SeverityId::Low)
+                    .message(format!("NFLOG bypass monitor stopped: {e}"))
+                    .build();
+                ocsf_emit!(event);
+                return;
+            }
+        }
+    }
+}
+
+/// Spawn the ring-buffer fallback monitor.
+///
+/// We use `dmesg` rather than reading `/dev/kmsg` directly because the
+/// container runtime's device cgroup policy blocks direct `/dev/kmsg` access
+/// even with `CAP_SYSLOG`. The `dmesg` command reads via the `syslog(2)`
+/// syscall which is permitted with `CAP_SYSLOG`.
+fn spawn_dmesg_monitor(
+    namespace_name: String,
+    namespace_prefix: String,
+    reporter: BypassReporter,
 ) -> Option<tokio::task::JoinHandle<()>> {
     use std::io::BufRead;
     use std::process::{Command, Stdio};
@@ -146,7 +221,6 @@ pub fn spawn(
         return None;
     }
 
-    let namespace_prefix = format!("openshell:bypass:{namespace_name}:");
     debug!(
         namespace = %namespace_name,
         "Starting bypass detection monitor via dmesg --follow"
@@ -197,93 +271,7 @@ pub fn spawn(
             let Some(event) = parse_kmsg_line(&line, &namespace_prefix) else {
                 continue;
             };
-
-            // Attempt process identity resolution (best-effort, TCP only).
-            let pid = entrypoint_pid.load(Ordering::Acquire);
-            let (binary, binary_pid, ancestors) =
-                if event.proto == "tcp" && event.src_port > 0 && pid > 0 {
-                    resolve_process_identity(pid, event.src_port)
-                } else {
-                    ("-".to_string(), "-".to_string(), "-".to_string())
-                };
-
-            let hint = hint_for_event(&event);
-            let reason = "direct connection bypassed HTTP CONNECT proxy";
-
-            // Dual-emit: Network Activity [4001] + Detection Finding [2004]
-            {
-                let dst_ep = if let Ok(ip) = event.dst_addr.parse::<std::net::IpAddr>() {
-                    Endpoint::from_ip(ip, event.dst_port)
-                } else {
-                    Endpoint::from_domain(&event.dst_addr, event.dst_port)
-                };
-
-                let net_event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Refuse)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Medium)
-                    .dst_endpoint(dst_ep.clone())
-                    .actor_process(Process::from_bypass(&binary, &binary_pid, &ancestors))
-                    .firewall_rule("bypass-detect", "nftables")
-                    .observation_point(3)
-                    .message(format!(
-                        "BYPASS_DETECT {}:{} proto={} binary={binary} action=reject reason={reason}",
-                        event.dst_addr, event.dst_port, event.proto,
-                    ))
-                    .build();
-                ocsf_emit!(net_event);
-
-                let finding_event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
-                    .activity(ActivityId::Open)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Medium)
-                    .is_alert(true)
-                    .confidence(ConfidenceId::High)
-                    .finding_info(
-                        FindingInfo::new("bypass-detect", "Proxy Bypass Detected")
-                            .with_desc(reason),
-                    )
-                    .remediation(hint)
-                    .evidence_pairs(&[
-                        ("dst_addr", &event.dst_addr),
-                        ("dst_port", &event.dst_port.to_string()),
-                        ("proto", &event.proto),
-                        ("binary", &binary),
-                        ("binary_pid", &binary_pid),
-                        ("ancestors", &ancestors),
-                    ])
-                    .message(format!(
-                        "BYPASS_DETECT {}:{} proto={} binary={binary} hint={hint}",
-                        event.dst_addr, event.dst_port, event.proto,
-                    ))
-                    .build();
-                ocsf_emit!(finding_event);
-            }
-
-            // Send to denial aggregator if available.
-            if let Some(ref tx) = denial_tx {
-                let ancestors_vec: Vec<String> = if ancestors == "-" {
-                    vec![]
-                } else {
-                    ancestors.split(" -> ").map(String::from).collect()
-                };
-
-                let _ = tx.send(DenialEvent {
-                    host: event.dst_addr.clone(),
-                    port: event.dst_port,
-                    binary: binary.clone(),
-                    ancestors: ancestors_vec,
-                    deny_reason: "direct connection bypassed HTTP CONNECT proxy".to_string(),
-                    denial_stage: "bypass".to_string(),
-                    l7_method: None,
-                    l7_path: None,
-                });
-            }
-            if let Some(ref tx) = activity_tx {
-                let _ = try_record_activity(tx, true, "bypass");
-            }
+            reporter.report(&event);
         }
 
         // Clean up the dmesg child process.
@@ -293,6 +281,96 @@ pub fn spawn(
     });
 
     Some(handle)
+}
+
+impl BypassReporter {
+    /// Emit OCSF events and denial/activity records for one bypass attempt.
+    fn report(&self, event: &BypassEvent) {
+        // Attempt process identity resolution (best-effort, TCP only).
+        let pid = self.entrypoint_pid.load(Ordering::Acquire);
+        let (binary, binary_pid, ancestors) =
+            if event.proto == "tcp" && event.src_port > 0 && pid > 0 {
+                resolve_process_identity(pid, event.src_port)
+            } else {
+                ("-".to_string(), "-".to_string(), "-".to_string())
+            };
+
+        let hint = hint_for_event(event);
+        let reason = "direct connection bypassed HTTP CONNECT proxy";
+
+        // Dual-emit: Network Activity [4001] + Detection Finding [2004]
+        {
+            let dst_ep = event.dst_addr.parse::<std::net::IpAddr>().map_or_else(
+                |_| Endpoint::from_domain(&event.dst_addr, event.dst_port),
+                |ip| Endpoint::from_ip(ip, event.dst_port),
+            );
+
+            let net_event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Refuse)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .dst_endpoint(dst_ep)
+                .actor_process(Process::from_bypass(&binary, &binary_pid, &ancestors))
+                .firewall_rule("bypass-detect", "nftables")
+                .observation_point(3)
+                .message(format!(
+                    "BYPASS_DETECT {}:{} proto={} binary={binary} action=reject reason={reason}",
+                    event.dst_addr, event.dst_port, event.proto,
+                ))
+                .build();
+            ocsf_emit!(net_event);
+
+            let finding_event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .is_alert(true)
+                .confidence(ConfidenceId::High)
+                .finding_info(
+                    FindingInfo::new("bypass-detect", "Proxy Bypass Detected").with_desc(reason),
+                )
+                .remediation(hint)
+                .evidence_pairs(&[
+                    ("dst_addr", &event.dst_addr),
+                    ("dst_port", &event.dst_port.to_string()),
+                    ("proto", &event.proto),
+                    ("binary", &binary),
+                    ("binary_pid", &binary_pid),
+                    ("ancestors", &ancestors),
+                ])
+                .message(format!(
+                    "BYPASS_DETECT {}:{} proto={} binary={binary} hint={hint}",
+                    event.dst_addr, event.dst_port, event.proto,
+                ))
+                .build();
+            ocsf_emit!(finding_event);
+        }
+
+        // Send to denial aggregator if available.
+        if let Some(ref tx) = self.denial_tx {
+            let ancestors_vec: Vec<String> = if ancestors == "-" {
+                vec![]
+            } else {
+                ancestors.split(" -> ").map(String::from).collect()
+            };
+
+            let _ = tx.send(DenialEvent {
+                host: event.dst_addr.clone(),
+                port: event.dst_port,
+                binary,
+                ancestors: ancestors_vec,
+                deny_reason: "direct connection bypassed HTTP CONNECT proxy".to_string(),
+                denial_stage: "bypass".to_string(),
+                l7_method: None,
+                l7_path: None,
+            });
+        }
+        if let Some(ref tx) = self.activity_tx {
+            let _ = try_record_activity(tx, true, "bypass");
+        }
+    }
 }
 
 /// Resolve process identity from a TCP source port.

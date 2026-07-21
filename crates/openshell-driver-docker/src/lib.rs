@@ -2355,7 +2355,6 @@ fn build_container_create_body_with_gpu_devices(
                 "SYS_ADMIN".to_string(),
                 "NET_ADMIN".to_string(),
                 "SYS_PTRACE".to_string(),
-                "SYSLOG".to_string(),
             ]),
             // The sandbox supervisor needs to bind-mount `/run/netns`,
             // mark it shared, and create per-process network namespaces.

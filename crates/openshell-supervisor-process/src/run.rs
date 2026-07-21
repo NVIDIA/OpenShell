@@ -107,11 +107,12 @@ pub async fn run_process(
     // and the SSH listener and entrypoint child have not been exposed yet.
     crate::sandbox::apply_supervisor_startup_hardening()?;
 
-    // Spawn the bypass detection monitor. It tails dmesg for nftables LOG
-    // entries fired by rules installed on the workload's network namespace
-    // and reports direct connection attempts that would have bypassed the
-    // proxy. Spawn it before the entrypoint child so the first packets are
-    // not missed. Best-effort: returns None when dmesg is unavailable.
+    // Spawn the bypass detection monitor. It reads nftables log entries
+    // fired by rules installed on the workload's network namespace (via the
+    // NFLOG socket bound during namespace setup, or dmesg as fallback) and
+    // reports direct connection attempts that would have bypassed the proxy.
+    // Spawn it before the entrypoint child so the first packets are not
+    // missed. Best-effort: returns None when no log backend is available.
     #[cfg(target_os = "linux")]
     let _bypass_handle = netns.and_then(|ns| {
         crate::bypass_monitor::spawn(
@@ -119,6 +120,7 @@ pub async fn run_process(
             entrypoint_pid.clone(),
             bypass_denial_tx,
             bypass_activity_tx,
+            ns.take_nflog_socket(),
         )
     });
 

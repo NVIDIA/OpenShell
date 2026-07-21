@@ -932,12 +932,12 @@ pub fn build_container_spec_with_token_and_gpu_devices(
         cap_add: vec![
             // seccomp filter installation, namespace creation, Landlock setup.
             "SYS_ADMIN".into(),
-            // Network namespace veth setup, IP/route configuration.
+            // Network namespace veth setup, IP/route configuration. Also
+            // covers the NFLOG socket that delivers bypass-detection log
+            // entries, so CAP_SYSLOG is not needed.
             "NET_ADMIN".into(),
             // Reading /proc/<pid>/exe and ancestor walk for process identity in policy.
             "SYS_PTRACE".into(),
-            // Reading /dev/kmsg for bypass-detection diagnostics.
-            "SYSLOG".into(),
             // Reading /proc/<pid>/fd/ across UIDs for process identity resolution.
             // In rootless Podman the supervisor runs as UID 0 inside a user namespace
             // while sandbox processes run as the sandbox user. The kernel's
@@ -1469,7 +1469,10 @@ mod tests {
         assert!(added.contains(&"SYS_ADMIN"), "missing SYS_ADMIN");
         assert!(added.contains(&"NET_ADMIN"), "missing NET_ADMIN");
         assert!(added.contains(&"SYS_PTRACE"), "missing SYS_PTRACE");
-        assert!(added.contains(&"SYSLOG"), "missing SYSLOG");
+        assert!(
+            !added.contains(&"SYSLOG"),
+            "CAP_SYSLOG must not be requested; bypass detection uses NFLOG"
+        );
         assert!(
             added.contains(&"DAC_READ_SEARCH"),
             "missing DAC_READ_SEARCH"

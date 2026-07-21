@@ -46,6 +46,9 @@ pub struct NetworkNamespace {
     sandbox_ip: IpAddr,
     /// File descriptor for the namespace (for setns)
     ns_fd: Option<RawFd>,
+    /// NFLOG listener bound during `install_bypass_rules`, held until the
+    /// bypass monitor takes it. `None` when the ring-buffer fallback is used.
+    nflog_socket: std::sync::Mutex<Option<crate::bypass_monitor::nflog::NflogSocket>>,
 }
 
 impl NetworkNamespace {
@@ -184,6 +187,7 @@ impl NetworkNamespace {
             host_ip,
             sandbox_ip,
             ns_fd,
+            nflog_socket: std::sync::Mutex::new(None),
         })
     }
 
@@ -255,8 +259,9 @@ impl NetworkNamespace {
     /// This provides two benefits:
     /// - **Fast-fail UX**: applications get immediate ECONNREFUSED instead of
     ///   a 30-second timeout when they bypass the proxy
-    /// - **Diagnostics**: nftables LOG entries are picked up by the bypass
-    ///   monitor to emit structured tracing events
+    /// - **Diagnostics**: nftables log entries (NFLOG, or the kernel ring
+    ///   buffer as fallback) are picked up by the bypass monitor to emit
+    ///   structured tracing events
     ///
     /// Degrades gracefully if `nft` is not available — the namespace
     /// still provides isolation via routing, just without fast-fail and
@@ -280,13 +285,25 @@ impl NetworkNamespace {
         let host_ip_str = self.host_ip.to_string();
         let log_prefix = format!("openshell:bypass:{}:", &self.name);
 
-        // The kernel's nf_log_syslog module suppresses log output from
-        // non-init network namespaces by default. Enable it so the bypass
-        // monitor can see log entries from the sandbox namespace.
-        enable_nf_log_all_netns();
+        // Prefer NFLOG delivery: it is scoped to the sandbox netns and
+        // reading it needs only CAP_NET_ADMIN over the namespace owner. The
+        // kernel ring buffer fallback requires CAP_SYSLOG in the initial
+        // user namespace, which user-namespaced pods cannot use.
+        let log_backend = self.bind_nflog_backend();
 
+        if matches!(log_backend, nft_ruleset::LogBackend::Ringbuffer) {
+            // The kernel's nf_log_syslog module suppresses log output from
+            // non-init network namespaces by default. Enable it so the bypass
+            // monitor can see log entries from the sandbox namespace.
+            enable_nf_log_all_netns();
+        }
+
+        let log_spec = nft_ruleset::LogSpec {
+            prefix: &log_prefix,
+            backend: log_backend,
+        };
         let commands =
-            nft_ruleset::generate_bypass_commands(&host_ip_str, proxy_port, Some(&log_prefix));
+            nft_ruleset::generate_bypass_commands(&host_ip_str, proxy_port, Some(&log_spec));
 
         if let Err(e) = run_nft_commands_netns(&self.name, &nft_path, &commands) {
             openshell_ocsf::ocsf_emit!(
@@ -316,6 +333,74 @@ impl NetworkNamespace {
         );
 
         Ok(())
+    }
+
+    /// Bind an NFLOG listener inside the namespace and return the backend
+    /// the bypass log rules should target.
+    ///
+    /// On success the socket is parked on the namespace handle until the
+    /// bypass monitor takes it via [`Self::take_nflog_socket`]. Any failure
+    /// selects the ring-buffer backend so behavior degrades to the previous
+    /// `dmesg`-based monitoring.
+    fn bind_nflog_backend(&self) -> nft_ruleset::LogBackend {
+        use crate::bypass_monitor::nflog::{BYPASS_NFLOG_GROUP, NflogSocket};
+        use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
+
+        let Some(ns_fd) = self.ns_fd else {
+            debug!(
+                namespace = %self.name,
+                "No namespace fd available; using ring-buffer bypass logging"
+            );
+            return nft_ruleset::LogBackend::Ringbuffer;
+        };
+
+        match NflogSocket::open_in_netns(ns_fd, BYPASS_NFLOG_GROUP) {
+            Ok(socket) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "nflog")
+                        .message(format!(
+                            "Bypass log backend: NFLOG group {BYPASS_NFLOG_GROUP} [ns:{}]",
+                            self.name
+                        ))
+                        .build()
+                );
+                if let Ok(mut slot) = self.nflog_socket.lock() {
+                    *slot = Some(socket);
+                }
+                nft_ruleset::LogBackend::Nflog {
+                    group: BYPASS_NFLOG_GROUP,
+                }
+            }
+            Err(e) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .state(StateId::Enabled, "ringbuffer")
+                        .message(format!(
+                            "NFLOG unavailable ({e}); bypass logging falls back to the \
+                             kernel ring buffer, which requires CAP_SYSLOG to read [ns:{}]",
+                            self.name
+                        ))
+                        .build()
+                );
+                nft_ruleset::LogBackend::Ringbuffer
+            }
+        }
+    }
+
+    /// Take the NFLOG socket bound during rule installation, if any.
+    ///
+    /// The bypass monitor consumes it; `None` selects the `dmesg` fallback.
+    #[must_use]
+    pub fn take_nflog_socket(&self) -> Option<crate::bypass_monitor::nflog::NflogSocket> {
+        self.nflog_socket
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 
     /// Bind a TCP listener inside this network namespace on a dedicated thread.
@@ -398,8 +483,9 @@ impl Drop for NetworkNamespace {
 /// rules. Returns `None` when the policy is not in proxy mode.
 ///
 /// The namespace is shared infrastructure: the proxy binds to its host-side
-/// veth IP and reads /dev/kmsg from inside it for bypass detection, while
-/// the workload child and SSH sessions enter it via `setns()`.
+/// veth IP and receives bypass-detection log entries from it (NFLOG, or the
+/// kernel ring buffer as fallback), while the workload child and SSH
+/// sessions enter it via `setns()`.
 ///
 /// # Errors
 ///
@@ -479,8 +565,14 @@ fn install_sidecar_nft_bypass_rules(proxy_uid: u32) -> Result<()> {
             "trusted nft helper not found; sidecar network enforcement requires nftables"
         )
     })?;
-    let log_prefix = Some("openshell:sidecar-bypass:");
-    let commands = nft_ruleset::generate_sidecar_bypass_commands(proxy_uid, log_prefix);
+    // The sidecar topology has no bypass log listener today, so the rules
+    // keep the ring-buffer backend; entries remain greppable via dmesg on
+    // hosts that permit it.
+    let log_spec = nft_ruleset::LogSpec {
+        prefix: "openshell:sidecar-bypass:",
+        backend: nft_ruleset::LogBackend::Ringbuffer,
+    };
+    let commands = nft_ruleset::generate_sidecar_bypass_commands(proxy_uid, Some(&log_spec));
     run_nft_commands_current_namespace(&nft_cmd, &commands)
 }
 
