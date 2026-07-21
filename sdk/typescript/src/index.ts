@@ -21,18 +21,24 @@ export type {
   ForwardHandle,
   ForwardOptions,
   Health,
+  HealthStatus,
   ListOptions,
+  PolicySourceName,
   ProviderChange,
   ProviderChangeOptions,
   ProviderRef,
   SandboxConfig,
+  SandboxPhaseName,
   SandboxPolicy,
   SandboxRef,
   SandboxSpec,
   SetPolicyOptions,
+  SettingScopeName,
   SettingValue,
   SshSession,
   UpdateConfigResult,
   WaitOptions,
 } from './client.js';
 export { errorCode, OpenShellClient, SandboxClient } from './client.js';
+export type { SdkErrorCode } from './errors.js';
+export { SdkError } from './errors.js';

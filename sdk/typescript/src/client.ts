@@ -40,8 +40,29 @@ export { errorCode };
 
 // ---- Curated public types --------------------------------------------------
 
+// The gateway enums (SandboxPhase, ServiceStatus, SettingScope, PolicySource)
+// arrive as protoc-gen-es numeric enums. The lowercase literal unions below are
+// a hand-maintained mirror of them so consumers get exhaustive, typo-proof
+// switches instead of a bare `string`. They are deliberately duplicated by
+// hand, not generated, and are expected to stay stable. If a proto enum ever
+// gains, removes, or renames a member, update the matching union AND its
+// `*_NAMES` map below: the exhaustive `Record` stops compiling, and the
+// 'enum name maps' drift test in client.test.ts fails until both sides agree.
+
+/** Lowercase mirror of the generated `SandboxPhase` enum. Hand-maintained. */
+export type SandboxPhaseName = 'unspecified' | 'provisioning' | 'ready' | 'error' | 'deleting' | 'unknown';
+
+/** Lowercase mirror of the generated `ServiceStatus` enum. Hand-maintained. */
+export type HealthStatus = 'unspecified' | 'healthy' | 'degraded' | 'unhealthy';
+
+/** Lowercase mirror of the generated `SettingScope` enum. Hand-maintained. */
+export type SettingScopeName = 'unspecified' | 'sandbox' | 'global';
+
+/** Lowercase mirror of the generated `PolicySource` enum. Hand-maintained. */
+export type PolicySourceName = 'unspecified' | 'sandbox' | 'global';
+
 export interface Health {
-  status: string;
+  status: HealthStatus;
   version: string;
 }
 
@@ -71,7 +92,7 @@ export interface SandboxSpec {
 export interface SandboxRef {
   id: string;
   name: string;
-  phase: string;
+  phase: SandboxPhaseName;
   labels: Record<string, string>;
   /** u64 rendered as a string — JS numbers can't hold it safely. */
   resourceVersion: string;
@@ -88,6 +109,8 @@ export interface ExecOptions {
   environment?: Record<string, string>;
   timeoutSecs?: number;
   stdin?: Buffer;
+  /** Abort the exec (and the in-flight stream RPC) early. */
+  signal?: AbortSignal;
 }
 
 export interface ExecResult {
@@ -123,6 +146,8 @@ export interface ExecInteractiveOptions {
   cols?: number;
   /** Initial terminal rows (0 = server default). */
   rows?: number;
+  /** Abort the interactive exec (and the in-flight stream RPC) early. */
+  signal?: AbortSignal;
 }
 
 // The transport half of an interactive exec: raw stdin/stdout/stderr plus
@@ -152,6 +177,8 @@ export interface ForwardOptions {
   localPort?: number;
   /** Local address to bind. Default 127.0.0.1. */
   localHost?: string;
+  /** Abort forward setup and tear down the local listener early. */
+  signal?: AbortSignal;
 }
 
 // A process-lifetime local listener that tunnels each accepted connection into
@@ -201,7 +228,7 @@ export interface ProviderChangeOptions {
 export interface EffectiveSettingView {
   value?: SettingValue;
   /** 'unspecified' | 'sandbox' | 'global'. */
-  scope: string;
+  scope: SettingScopeName;
 }
 
 export interface SandboxConfig {
@@ -212,7 +239,7 @@ export interface SandboxConfig {
   /** u64 rendered as a string. */
   configRevision: string;
   /** 'unspecified' | 'sandbox' | 'global'. */
-  policySource: string;
+  policySource: PolicySourceName;
   globalPolicyVersion: number;
   /** u64 rendered as a string. */
   providerEnvRevision: string;
@@ -237,17 +264,44 @@ export interface UpdateConfigResult {
 
 // ---- enum → lowercase string -----------------------------------------------
 
-function phaseName(p: SandboxPhase): string {
-  return (SandboxPhase[p] ?? 'UNSPECIFIED').toLowerCase();
+// Exported for the enum-name drift test only; not re-exported from index.ts, so
+// they are not part of the public package API.
+export const PHASE_NAMES: Record<SandboxPhase, SandboxPhaseName> = {
+  [SandboxPhase.UNSPECIFIED]: 'unspecified',
+  [SandboxPhase.PROVISIONING]: 'provisioning',
+  [SandboxPhase.READY]: 'ready',
+  [SandboxPhase.ERROR]: 'error',
+  [SandboxPhase.DELETING]: 'deleting',
+  [SandboxPhase.UNKNOWN]: 'unknown',
+};
+export const STATUS_NAMES: Record<ServiceStatus, HealthStatus> = {
+  [ServiceStatus.UNSPECIFIED]: 'unspecified',
+  [ServiceStatus.HEALTHY]: 'healthy',
+  [ServiceStatus.DEGRADED]: 'degraded',
+  [ServiceStatus.UNHEALTHY]: 'unhealthy',
+};
+export const SCOPE_NAMES: Record<SettingScope, SettingScopeName> = {
+  [SettingScope.UNSPECIFIED]: 'unspecified',
+  [SettingScope.SANDBOX]: 'sandbox',
+  [SettingScope.GLOBAL]: 'global',
+};
+export const POLICY_SOURCE_NAMES: Record<PolicySource, PolicySourceName> = {
+  [PolicySource.UNSPECIFIED]: 'unspecified',
+  [PolicySource.SANDBOX]: 'sandbox',
+  [PolicySource.GLOBAL]: 'global',
+};
+
+function phaseName(p: SandboxPhase): SandboxPhaseName {
+  return PHASE_NAMES[p] ?? 'unspecified';
 }
-function statusName(s: ServiceStatus): string {
-  return (ServiceStatus[s] ?? 'UNSPECIFIED').toLowerCase();
+function statusName(s: ServiceStatus): HealthStatus {
+  return STATUS_NAMES[s] ?? 'unspecified';
 }
-function scopeName(s: SettingScope): string {
-  return (SettingScope[s] ?? 'UNSPECIFIED').toLowerCase();
+function scopeName(s: SettingScope): SettingScopeName {
+  return SCOPE_NAMES[s] ?? 'unspecified';
 }
-function policySourceName(s: PolicySource): string {
-  return (PolicySource[s] ?? 'UNSPECIFIED').toLowerCase();
+function policySourceName(s: PolicySource): PolicySourceName {
+  return POLICY_SOURCE_NAMES[s] ?? 'unspecified';
 }
 
 function sandboxRef(sandbox: Sandbox | undefined): SandboxRef {
@@ -307,7 +361,8 @@ function updateConfigResult(resp: UpdateConfigResponse): UpdateConfigResult {
 }
 
 // Optimistic-concurrency version pin: absent/empty means 0n (server uses the
-// current version, backward-compatible). A mismatch surfaces as Aborted → rpc.
+// current version, backward-compatible). A mismatch surfaces as Aborted →
+// SdkError code 'aborted'.
 function versionPin(value: string | undefined): bigint {
   return value ? BigInt(value) : 0n;
 }
@@ -560,16 +615,19 @@ export class SandboxClient {
   ): AsyncGenerator<ExecStreamEvent, void, void> {
     try {
       // Resolve the sandbox id first, exactly like the gateway client.
-      const sandbox = await this.get(name);
-      const stream = this.grpc.execSandbox({
-        sandboxId: sandbox.id,
-        command,
-        workdir: options?.workdir ?? '',
-        environment: options?.environment ?? {},
-        timeoutSeconds: options?.timeoutSecs ?? 0,
-        stdin: options?.stdin ? new Uint8Array(options.stdin) : new Uint8Array(),
-        tty: false,
-      });
+      const sandbox = await this.get(name, options?.signal ? { signal: options.signal } : undefined);
+      const stream = this.grpc.execSandbox(
+        {
+          sandboxId: sandbox.id,
+          command,
+          workdir: options?.workdir ?? '',
+          environment: options?.environment ?? {},
+          timeoutSeconds: options?.timeoutSecs ?? 0,
+          stdin: options?.stdin ? new Uint8Array(options.stdin) : new Uint8Array(),
+          tty: false,
+        },
+        { signal: options?.signal },
+      );
 
       let sawExit = false;
       for await (const event of stream) {
@@ -630,7 +688,7 @@ export class SandboxClient {
   ): Promise<ExecInteractiveSession> {
     let sandboxId: string;
     try {
-      sandboxId = (await this.get(name)).id;
+      sandboxId = (await this.get(name, options?.signal ? { signal: options.signal } : undefined)).id;
     } catch (e) {
       throw e instanceof SdkError ? e : fromConnect(e);
     }
@@ -653,7 +711,7 @@ export class SandboxClient {
       },
     });
 
-    const stream = this.grpc.execSandboxInteractive(input);
+    const stream = this.grpc.execSandboxInteractive(input, { signal: options?.signal });
     let resolveDone!: (code: number) => void;
     let rejectDone!: (err: unknown) => void;
     const done = new Promise<number>((resolve, reject) => {
@@ -725,7 +783,7 @@ export class SandboxClient {
 
     let sandboxId: string;
     try {
-      const ref = await this.get(name);
+      const ref = await this.get(name, opts.signal ? { signal: opts.signal } : undefined);
       if (ref.phase !== 'ready') {
         throw new SdkError('connect', `sandbox '${name}' is not ready (phase: ${ref.phase})`);
       }
@@ -763,16 +821,24 @@ export class SandboxClient {
       });
     });
 
+    const teardown = async (): Promise<void> => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    };
+
+    // Caller cancellation tears the local listener down the same way close() does.
+    if (opts.signal) {
+      if (opts.signal.aborted) void teardown();
+      else opts.signal.addEventListener('abort', () => void teardown(), { once: true });
+    }
+
     const addr = server.address() as AddressInfo | null;
     return {
       localHost,
       localPort: addr ? addr.port : localPort,
       targetHost,
       targetPort,
-      close: async (): Promise<void> => {
-        for (const socket of sockets) socket.destroy();
-        await new Promise<void>((resolve) => server.close(() => resolve()));
-      },
+      close: teardown,
       closed,
     };
   }
