@@ -115,8 +115,8 @@ impl StartupResume for DockerComputeDriver {
 }
 #[tonic::async_trait]
 impl StartupResume for PodmanComputeDriver {
-    async fn resume_sandbox(&self, _sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
-        Self::resume_sandbox(self, sandbox_name)
+    async fn resume_sandbox(&self, sandbox_id: &str, _sandbox_name: &str) -> Result<bool, String> {
+        Self::resume_sandbox(self, sandbox_id)
             .await
             .map_err(|err| err.to_string())
     }
