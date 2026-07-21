@@ -3990,6 +3990,7 @@ dependencies = [
  "nix",
  "oci-client",
  "openshell-core",
+ "openshell-nft-ruleset",
  "openshell-policy",
  "openshell-vfio",
  "polling",
@@ -4030,6 +4031,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "openshell-nft-ruleset"
+version = "0.0.0"
 
 [[package]]
 name = "openshell-ocsf"
