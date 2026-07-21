@@ -11,8 +11,8 @@ import * as net from 'node:net';
 import type { MessageInitShape } from '@bufbuild/protobuf';
 import { Code, ConnectError, createRouterTransport, type ServiceImpl, type Transport } from '@connectrpc/connect';
 import { describe, expect, it } from 'vitest';
-import { errorCode, SandboxClient } from './client.js';
-import { OpenShell, SandboxPhase } from './gen/openshell_pb.js';
+import { errorCode, PHASE_NAMES, POLICY_SOURCE_NAMES, SandboxClient, SCOPE_NAMES, STATUS_NAMES } from './client.js';
+import { OpenShell, SandboxPhase, ServiceStatus } from './gen/openshell_pb.js';
 import { PolicySource, SettingScope } from './gen/sandbox_pb.js';
 
 function client(impl: Partial<ServiceImpl<typeof OpenShell>>): SandboxClient {
@@ -143,6 +143,42 @@ describe('exec / execStream', () => {
       },
     });
     await expect(sandbox.exec('sb', ['x'])).rejects.toMatchObject({ code: 'rpc' });
+  });
+
+  it('execStream rejects when the caller signal is already aborted', async () => {
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      // eslint-disable-next-line require-yield
+      execSandbox: async function* () {
+        yield { payload: { case: 'stdout', value: { data: enc('never') } } };
+        yield { payload: { case: 'exit', value: { exitCode: 0 } } };
+      },
+    });
+    const signal = AbortSignal.abort();
+    await expect(
+      (async () => {
+        for await (const _event of sandbox.execStream('sb', ['x'], { signal })) {
+          // drain to completion
+        }
+      })(),
+    ).rejects.toBeInstanceOf(Error);
+  });
+
+  it('exec rejects when the caller signal aborts mid-stream', async () => {
+    const controller = new AbortController();
+    const sandbox = client({
+      getSandbox: () => readySandbox('sb', 'sb-id-1'),
+      execSandbox: async function* (_req, ctx) {
+        yield { payload: { case: 'stdout', value: { data: enc('partial') } } };
+        await new Promise<void>((_resolve, reject) => {
+          ctx.signal.addEventListener('abort', () => reject(new ConnectError('canceled', Code.Canceled)), {
+            once: true,
+          });
+        });
+      },
+    });
+    setTimeout(() => controller.abort(), 10);
+    await expect(sandbox.exec('sb', ['x'], { signal: controller.signal })).rejects.toBeInstanceOf(Error);
   });
 
   it('maps a NotFound from get() to an SdkError not_found', async () => {
@@ -695,4 +731,32 @@ describe('forward', () => {
     await handle.close();
     await handle.closed;
   });
+});
+
+// The lowercase enum-name unions in client.ts are a hand-maintained mirror of
+// the generated proto enums. This pins every hand-written literal to its
+// generated member name (lowercased), so a proto enum change that slips past
+// the exhaustive Record type is still caught here at runtime.
+describe('enum name maps', () => {
+  function numericMembers(genEnum: Record<string, unknown>): Array<[string, number]> {
+    return Object.entries(genEnum).filter((e): e is [string, number] => typeof e[1] === 'number');
+  }
+
+  const cases: Array<[string, Record<string, unknown>, Record<number, string>]> = [
+    ['SandboxPhase', SandboxPhase, PHASE_NAMES],
+    ['ServiceStatus', ServiceStatus, STATUS_NAMES],
+    ['SettingScope', SettingScope, SCOPE_NAMES],
+    ['PolicySource', PolicySource, POLICY_SOURCE_NAMES],
+  ];
+
+  for (const [label, genEnum, names] of cases) {
+    it(`${label} maps every generated member to its lowercased name`, () => {
+      const members = numericMembers(genEnum);
+      for (const [name, value] of members) {
+        expect(names[value]).toBe(name.toLowerCase());
+      }
+      // No missing or extra map entries versus the generated enum.
+      expect(Object.keys(names).length).toBe(members.length);
+    });
+  }
 });
