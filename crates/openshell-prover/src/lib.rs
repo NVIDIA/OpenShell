@@ -26,11 +26,11 @@ use policy::parse_policy;
 use queries::run_all_queries;
 use report::{render_compact, render_report};
 
-/// Run the prover end-to-end and return an exit code.
+/// Run the prover end-to-end and return a result containing an exit code.
 ///
-/// - `0` — pass (no critical/high findings, or all accepted)
-/// - `1` — fail (critical or high findings present)
-/// - `2` — input error
+/// - `Ok(0)` — pass (no findings, or all accepted)
+/// - `Ok(1)` — fail (one or more unaccepted findings present)
+/// - `Err(_)` — input or registry loading error
 ///
 /// Binary and API capability registries are embedded at compile time.
 /// Pass `registry_dir` to override with a custom filesystem registry.
