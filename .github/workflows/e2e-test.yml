@@ -74,7 +74,7 @@ jobs:
       OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
       OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           persist-credentials: false
@@ -93,7 +93,7 @@ jobs:
 
       - name: Check out MCP conformance tests
         if: matrix.suite == 'mcp'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: modelcontextprotocol/conformance
           # Pin after v0.1.16 to include the tools_call client scenario fix.
@@ -149,7 +149,7 @@ jobs:
       OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           persist-credentials: false
@@ -257,7 +257,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           persist-credentials: false

@@ -67,7 +67,7 @@ jobs:
       # probe below and by the e2e tests in e2e/rust/tests/gpu/device_selection.rs.
       OPENSHELL_E2E_GPU_PROBE_IMAGE: "nvcr.io/nvidia/base/ubuntu:noble-20251013"
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Use prebuilt OpenShell CLI
         if: inputs.cli-artifact-prefix != ''
