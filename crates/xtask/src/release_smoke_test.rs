@@ -6,8 +6,10 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, ExitStatus};
 
+use crate::lima::LimaProvider;
 use crate::machine::{
     DEFAULT_MACHINE_OS, MachineOptions, MachineOptionsBuilder, MachineProvider, MachineRequest,
+    Provider,
 };
 use crate::platform::{Arch, MachineOs, OsFamily, parse_machine_os};
 use crate::tasks::{TaskResult, exit_code, print_help_if_requested};
@@ -34,7 +36,7 @@ pub fn run(args: impl Iterator<Item = OsString>) -> TaskResult {
     }
 
     let command = ReleaseSmokeTestCommand::parse(args)?;
-    release_smoke_test(&command.machine.provider, &command).map(exit_code)
+    release_smoke_test(&LimaProvider, &command).map(exit_code)
 }
 
 struct ReleaseSmokeTestCommand {
@@ -80,11 +82,16 @@ impl ReleaseSmokeTestCommand {
             ));
         }
 
+        let machine = machine
+            .finish(Some(os))?
+            .expect("release smoke tests always request a target machine");
+        if machine.provider != Provider::Lima {
+            return Err("release-smoke-test only supports --provider lima".to_owned());
+        }
+
         Ok(Self {
             deb: deb.ok_or_else(|| "release-smoke-test requires --deb <path>".to_owned())?,
-            machine: machine
-                .finish(Some(os))?
-                .expect("release smoke tests always request a target machine"),
+            machine,
         })
     }
 }
@@ -265,6 +272,19 @@ mod tests {
 
         assert_eq!(command.machine.provider, Provider::Lima);
         assert_eq!(command.machine.os, MachineOs::Ubuntu26_04);
+    }
+
+    #[test]
+    fn release_smoke_test_rejects_the_host_provider() {
+        let error = ReleaseSmokeTestCommand::parse(
+            ["--deb", "artifact.deb", "--provider", "host"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .err()
+        .expect("release smoke tests should remain Lima-only");
+
+        assert_eq!(error, "release-smoke-test only supports --provider lima");
     }
 
     #[test]

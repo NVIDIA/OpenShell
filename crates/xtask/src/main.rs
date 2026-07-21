@@ -5,11 +5,11 @@ use std::env;
 use std::process::ExitCode;
 
 mod e2e;
+mod e2e_host;
 mod e2e_machine;
 mod lima;
 mod machine;
 mod platform;
-mod provider;
 mod release_smoke_test;
 pub mod tasks;
 

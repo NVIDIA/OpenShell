@@ -4,6 +4,18 @@
 
 set -Eeuo pipefail
 
+echo "==> Preparing rootless Podman"
+if ! grep -q "^${USER}:" /etc/subuid; then
+	sudo usermod --add-subuids 100000-165535 "${USER}"
+fi
+if ! grep -q "^${USER}:" /etc/subgid; then
+	sudo usermod --add-subgids 100000-165535 "${USER}"
+fi
+
+runtime_dir="/run/user/$(id -u)"
+sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "${runtime_dir}"
+export XDG_RUNTIME_DIR="${runtime_dir}"
+
 echo "==> Configuring rootless Podman"
 containers_config_dir="${HOME}/.config/containers"
 containers_config_drop_in_dir="${containers_config_dir}/containers.conf.d"
@@ -25,14 +37,16 @@ install -m 0644 \
 	"${containers_config_dir}/containers.conf" \
 	"${containers_config_drop_in_dir}/99-openshell.conf"
 
-echo "==> Enabling the rootless Podman socket"
-sudo loginctl enable-linger "$USER"
-systemctl --user daemon-reload
-systemctl --user enable --now podman.socket
-if ! systemctl --user is-active --quiet podman.socket; then
-	echo "rootless Podman socket did not become active" >&2
-	systemctl --user status --no-pager podman.socket >&2 || true
-	exit 1
+if [ "${OPENSHELL_SKIP_PODMAN_SOCKET:-0}" != "1" ]; then
+	echo "==> Enabling the rootless Podman socket"
+	sudo loginctl enable-linger "$USER"
+	systemctl --user daemon-reload
+	systemctl --user enable --now podman.socket
+	if ! systemctl --user is-active --quiet podman.socket; then
+		echo "rootless Podman socket did not become active" >&2
+		systemctl --user status --no-pager podman.socket >&2 || true
+		exit 1
+	fi
 fi
 
 require_podman_info() {

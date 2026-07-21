@@ -13,14 +13,16 @@ pub const DEFAULT_MACHINE_OS: MachineOs = MachineOs::Ubuntu26_04;
 pub enum Provider {
     #[default]
     Lima,
+    Host,
 }
 
 impl Provider {
     pub fn parse(value: &OsStr) -> Result<Self, String> {
         match value.to_str() {
             Some("lima") => Ok(Self::Lima),
+            Some("host") => Ok(Self::Host),
             Some(value) => Err(format!(
-                "unsupported machine provider: {value} (expected lima)"
+                "unsupported provider: {value} (expected host or lima)"
             )),
             None => Err("--provider must be valid UTF-8".to_owned()),
         }
@@ -123,6 +125,33 @@ impl MachineOptionsBuilder {
     }
 
     pub fn finish(self, os: Option<MachineOs>) -> Result<Option<MachineOptions>, String> {
+        let provider = self.provider.unwrap_or_default();
+        if provider == Provider::Host {
+            let os = os.ok_or_else(|| "--provider host requires --os".to_owned())?;
+            let incompatible = if self.arch.is_some() {
+                Some("--arch")
+            } else if self.keep {
+                Some("--keep-machine")
+            } else if self.rebuild {
+                Some("--rebuild-machine")
+            } else if self.snapshot {
+                Some("--snapshot")
+            } else {
+                None
+            };
+            if let Some(option) = incompatible {
+                return Err(format!("{option} is not supported with --provider host"));
+            }
+            return Ok(Some(MachineOptions {
+                arch: None,
+                keep: false,
+                provider,
+                rebuild: false,
+                snapshot: false,
+                os,
+            }));
+        }
+
         let os = match os {
             Some(os) => os,
             None if self.provider.is_some() => DEFAULT_MACHINE_OS,
@@ -151,7 +180,7 @@ impl MachineOptionsBuilder {
         Ok(Some(MachineOptions {
             arch: self.arch,
             keep: self.keep,
-            provider: self.provider.unwrap_or_default(),
+            provider,
             rebuild: self.rebuild,
             snapshot: self.snapshot,
             os,
@@ -282,6 +311,7 @@ mod tests {
     fn parses_and_defaults_the_machine_provider() {
         assert_eq!(Provider::default(), Provider::Lima);
         assert_eq!(Provider::parse(OsStr::new("lima")), Ok(Provider::Lima));
+        assert_eq!(Provider::parse(OsStr::new("host")), Ok(Provider::Host));
         assert!(Provider::parse(OsStr::new("cloud")).is_err());
     }
 
@@ -324,6 +354,29 @@ mod tests {
             .finish(Some(MachineOs::Ubuntu24_04))
             .expect_err("rebuilding without snapshots should fail");
         assert!(error.contains("--rebuild-machine requires --snapshot"));
+    }
+
+    #[test]
+    fn host_provider_requires_an_os_and_rejects_machine_options() {
+        let missing_os = MachineOptionsBuilder {
+            provider: Some(Provider::Host),
+            ..Default::default()
+        }
+        .finish(None)
+        .expect_err("host execution should require an OS");
+        assert_eq!(missing_os, "--provider host requires --os");
+
+        let with_snapshot = MachineOptionsBuilder {
+            provider: Some(Provider::Host),
+            snapshot: true,
+            ..Default::default()
+        }
+        .finish(Some(MachineOs::Ubuntu24_04))
+        .expect_err("host execution should reject machine reuse options");
+        assert_eq!(
+            with_snapshot,
+            "--snapshot is not supported with --provider host"
+        );
     }
 
     #[test]

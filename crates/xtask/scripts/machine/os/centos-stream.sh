@@ -13,7 +13,7 @@ fi
 . /etc/os-release
 
 if [ "${ID:-}" != "centos" ] || [[ "${VERSION_ID:-}" != 10* ]]; then
-	echo "expected a CentOS Stream 10 guest, found ${PRETTY_NAME:-unknown}" >&2
+	echo "expected a CentOS Stream 10 system, found ${PRETTY_NAME:-unknown}" >&2
 	exit 1
 fi
 

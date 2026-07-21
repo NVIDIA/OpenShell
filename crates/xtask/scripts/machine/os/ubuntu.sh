@@ -13,7 +13,13 @@ fi
 . /etc/os-release
 
 if [ "${ID:-}" != "ubuntu" ]; then
-	echo "expected an Ubuntu guest, found ${ID:-unknown}" >&2
+	echo "expected an Ubuntu system, found ${ID:-unknown}" >&2
+	exit 1
+fi
+
+if [ -n "${OPENSHELL_EXPECTED_OS:-}" ] \
+	&& [ "ubuntu-${VERSION_ID:-unknown}" != "${OPENSHELL_EXPECTED_OS}" ]; then
+	echo "expected ${OPENSHELL_EXPECTED_OS}, found ubuntu-${VERSION_ID:-unknown}" >&2
 	exit 1
 fi
 

@@ -11,9 +11,10 @@ use crate::tasks::{TaskResult, exit_code, print_help_if_requested};
 const HELP: &str = "Run an e2e suite locally or on a target machine.
 
 Usage:
-  cargo xtask e2e --suite <podman> [--test <name>] [--os <centos-stream-10|ubuntu-24.04|ubuntu-26.04>] [--provider <lima>] [--arch <amd64|arm64>] [--snapshot] [--rebuild-machine] [--keep-machine]
+  cargo xtask e2e --suite <podman> [--test <name>] [--os <centos-stream-10|ubuntu-24.04|ubuntu-26.04>] [--provider <host|lima>] [--arch <amd64|arm64>] [--snapshot] [--rebuild-machine] [--keep-machine]
 
-Defaults for machine execution:
+Provider behavior:
+  --provider host requires --os and prepares the current host
   --provider lima
   --os ubuntu-26.04 when --provider is supplied";
 
@@ -25,6 +26,9 @@ pub fn run(args: impl Iterator<Item = OsString>) -> TaskResult {
 
     let command = E2eCommand::parse(args)?;
     let status = match command.machine {
+        Some(options) if options.provider == crate::machine::Provider::Host => {
+            crate::e2e_host::run(&command.selection, &options)
+        }
         Some(options) => crate::e2e_machine::run(&command.selection, &options),
         None => run_local(&command.selection),
     }?;
@@ -51,13 +55,13 @@ impl E2eSuite {
         }
     }
 
-    const fn script(self) -> &'static str {
+    pub(crate) const fn script(self) -> &'static str {
         match self {
             Self::Podman => "e2e/rust/e2e-podman.sh",
         }
     }
 
-    const fn test_environment(self) -> &'static str {
+    pub(crate) const fn test_environment(self) -> &'static str {
         match self {
             Self::Podman => "OPENSHELL_E2E_PODMAN_TEST",
         }
@@ -251,6 +255,48 @@ mod tests {
             .expect("a provider should request a machine");
         assert_eq!(machine.provider, Provider::Lima);
         assert_eq!(machine.os, MachineOs::Ubuntu26_04);
+    }
+
+    #[test]
+    fn parses_prepared_host_execution() {
+        let command = E2eCommand::parse(
+            [
+                "--suite",
+                "podman",
+                "--provider",
+                "host",
+                "--os",
+                "ubuntu-26.04",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect("prepared host execution should parse");
+
+        let options = command.machine.expect("host execution should have options");
+        assert_eq!(options.provider, Provider::Host);
+        assert_eq!(options.os, MachineOs::Ubuntu26_04);
+    }
+
+    #[test]
+    fn parses_centos_stream_prepared_host_execution() {
+        let command = E2eCommand::parse(
+            [
+                "--suite",
+                "podman",
+                "--provider",
+                "host",
+                "--os",
+                "centos-stream-10",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect("prepared host execution should support CentOS Stream");
+
+        let options = command.machine.expect("host execution should have options");
+        assert_eq!(options.provider, Provider::Host);
+        assert_eq!(options.os, MachineOs::CentosStream10);
     }
 
     #[test]

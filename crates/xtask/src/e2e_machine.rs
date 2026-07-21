@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use crate::e2e::{E2eSelection, E2eSuite};
+use crate::lima::LimaProvider;
 use crate::machine::{
     HostMount, MachineOptions, MachineProvider, MachineRequest, PersistentDisk, path_hash,
     stable_hash,
@@ -43,7 +44,10 @@ pub(crate) fn run(
     selection: &E2eSelection,
     options: &MachineOptions,
 ) -> Result<ExitStatus, String> {
-    run_with_provider(&options.provider, selection, options)
+    if options.provider != crate::machine::Provider::Lima {
+        return Err("machine-backed e2e requires --provider lima".to_owned());
+    }
+    run_with_provider(&LimaProvider, selection, options)
 }
 
 fn run_with_provider<P: MachineProvider>(
@@ -63,7 +67,6 @@ fn run_with_provider<P: MachineProvider>(
             source.display()
         ));
     }
-
     let arch = options.arch.map_or_else(host_arch, Ok)?;
     let cache_disk = options
         .snapshot
@@ -266,7 +269,7 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::machine::Provider;
+    use crate::lima::LimaProvider;
 
     #[test]
     fn composes_setup_and_delegates_to_the_local_runner() {
@@ -283,7 +286,7 @@ mod tests {
             cache_disk.name,
             "os-e2e-cache-ubuntu2404-podman-a64-7e4fa9a2"
         );
-        let cache_mount = Provider::Lima.persistent_disk_mount_point(&cache_disk);
+        let cache_mount = LimaProvider.persistent_disk_mount_point(&cache_disk);
 
         let setup = development_setup_script(
             MachineOs::Ubuntu24_04,

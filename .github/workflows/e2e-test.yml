@@ -121,24 +121,15 @@ jobs:
         run: ${{ matrix.cmd }}
 
   e2e-podman-rootless:
-    name: E2E (rust-podman-rootless, ${{ matrix.runner }})
-    # Run directly on the Ubuntu host so the test observes the host's AppArmor
-    # and unprivileged-user-namespace policy. A privileged job container masks
-    # the restrictions that production rootless Podman installations enforce.
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    name: E2E (rust-podman-rootless, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Ubuntu 24.04 matches the environment reported in #2069 and ships
-          # Podman 4.x. The probe records whether AppArmor blocks the drop.
-          - runner: ubuntu-24.04
-            podman_major: "4"
-          # Ubuntu 26.04 provides the supported Podman 5.x coverage for
-          # comparison with the Ubuntu 24.04 environment.
-          - runner: ubuntu-26.04
-            podman_major: "5"
+        os:
+          - ubuntu-24.04
+          - ubuntu-26.04
     env:
       IMAGE_TAG: ${{ inputs.image-tag }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -175,76 +166,9 @@ jobs:
       - name: Install tools
         run: mise install --locked
 
-      - name: Install Podman and build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            clang \
-            fuse-overlayfs \
-            libssl-dev \
-            libz3-dev \
-            openssh-client \
-            passt \
-            pkg-config \
-            podman \
-            slirp4netns \
-            uidmap
-
-      - name: Configure rootless Podman
-        run: |
-          set -euo pipefail
-          if ! grep -q "^${USER}:" /etc/subuid; then
-            sudo usermod --add-subuids 100000-165535 "$USER"
-          fi
-          if ! grep -q "^${USER}:" /etc/subgid; then
-            sudo usermod --add-subgids 100000-165535 "$USER"
-          fi
-          runtime_dir="/run/user/$(id -u)"
-          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
-          echo "XDG_RUNTIME_DIR=$runtime_dir" >> "$GITHUB_ENV"
-
-      - name: Verify rootless Podman environment
-        run: |
-          set -euo pipefail
-          podman_version="$(podman version --format '{{.Client.Version}}')"
-          case "$podman_version" in
-            "${{ matrix.podman_major }}".*) ;;
-            *) echo "ERROR: expected Podman ${{ matrix.podman_major }}.x, found $podman_version" >&2; exit 1 ;;
-          esac
-          test "$(podman info --format '{{.Host.Security.Rootless}}')" = "true"
-          test "$(sudo sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = "1"
-          echo "=== host ==="
-          uname -a
-          echo "=== AppArmor ==="
-          cat /proc/self/attr/current
-          sudo aa-status || true
-          echo "=== Podman ==="
-          podman version
-          podman info --debug
-
-      - name: Probe rootless capability bounding set
-        run: |
-          set -euo pipefail
-          probe="$RUNNER_TEMP/openshell-capbset-probe"
-          cc -static -O2 -Wall -Wextra -Werror \
-            e2e/support/capbset-probe.c \
-            -o "$probe"
-          podman run --rm \
-            --cap-add=SETPCAP \
-            --volume "$probe:/openshell-capbset-probe:ro" \
-            docker.io/library/alpine:3.22 \
-            /openshell-capbset-probe
-
-      - name: Log in to GHCR with Podman
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
-
       - name: Run rootless Podman E2E
-        run: mise run --no-deps --skip-deps e2e:podman:rootless
-
-      - name: Print AppArmor denials
-        if: always()
-        run: sudo dmesg | grep -E 'apparmor=.*DENIED|profile="unprivileged_userns"' | tail -100 || true
+        timeout-minutes: 90
+        run: cargo xtask e2e --suite podman --provider host --os "${{ matrix.os }}"
 
   e2e-vm:
     name: E2E (rust-vm)
