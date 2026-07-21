@@ -462,6 +462,12 @@ fn build_env(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
         openshell_core::telemetry::enabled_env_value().into(),
     );
+    // RFC 0012: the driver provisions the topology and delivers its descriptor
+    // to the supervisor through the driver-controlled environment.
+    env.insert(
+        openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR.into(),
+        openshell_isolation::contract::TopologyDescriptor::in_pod().to_env_value(),
+    );
 
     // 3. TLS client cert paths (when mTLS is enabled). These point to
     //    the container-side mount paths where the cert files are

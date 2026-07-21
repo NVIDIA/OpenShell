@@ -4125,6 +4125,14 @@ fn build_guest_environment(
         openshell_core::sandbox_env::LOG_LEVEL.to_string(),
         openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
     );
+    // RFC 0012: the driver provisions the topology and delivers its descriptor
+    // to the supervisor through the driver-controlled environment. The VM
+    // supervisor is co-located with the agent inside the guest, so it drives
+    // the in-pod backend.
+    environment.insert(
+        openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR.to_string(),
+        openshell_isolation::contract::TopologyDescriptor::in_pod().to_env_value(),
+    );
     if config.requires_tls_materials() {
         environment.insert(
             openshell_core::sandbox_env::TLS_CA.to_string(),

@@ -49,6 +49,22 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.
 
+## Isolation Backend
+
+The supervisor does not build the boundary inline. It drives an **isolation
+backend** (RFC 0012) through one runtime contract (`ensure_boundary` → `bind`
+→ `boundary_ready` → `start_agent`), so the same supervisor code runs wherever
+the boundary sits. Today only the in-pod backend exists: it builds the boundary
+in the same process that operates it, over the existing primitives (network
+namespace, proxy, the pre-exec Landlock/seccomp ceiling, procfs identity).
+
+The contract covers the full isolation envelope. `ensure_boundary` establishes
+the network namespace; `start_agent` establishes filesystem (Landlock) and
+syscall (seccomp) at process entry; `identity` resolves the connecting binary
+from procfs at runtime. The lifecycle handles are unforgeable type-state
+tokens, so the order (and thus "no workload runs before the boundary is
+ready") holds by construction rather than by convention.
+
 ## Network and Inference
 
 All ordinary agent egress is routed through the sandbox proxy. The proxy

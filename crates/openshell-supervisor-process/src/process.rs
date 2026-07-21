@@ -120,6 +120,9 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::TLS_CERT,
     openshell_core::sandbox_env::TLS_KEY,
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+    // Supervisor-only bootstrap state (RFC 0012): never exposed to the agent,
+    // exec sessions, or any other process inside the boundary.
+    openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR,
 ];
 
 pub fn is_supervisor_only_env_var(key: &str) -> bool {

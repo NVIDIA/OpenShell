@@ -9,6 +9,7 @@
 //! aggregate them.
 
 pub mod identity;
+pub mod identity_source;
 pub mod inference_routes;
 pub mod l7;
 pub mod opa;

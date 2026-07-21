@@ -8,6 +8,7 @@
 //! and log push. Populated by follow-up commits as modules migrate out of
 //! `openshell-sandbox`.
 
+pub mod boundary_io;
 pub mod child_env;
 pub mod debug_rpc;
 #[cfg(unix)]

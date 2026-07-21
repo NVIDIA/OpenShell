@@ -2223,6 +2223,12 @@ fn build_environment_for_oci_user(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
+    // RFC 0012: the driver provisions the topology and delivers its descriptor
+    // to the supervisor through the driver-controlled environment.
+    environment.insert(
+        openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR.to_string(),
+        openshell_isolation::contract::TopologyDescriptor::in_pod().to_env_value(),
+    );
     // The root supervisor executes namespace helpers during bootstrap; keep
     // their search path driver-owned even when the template/spec set PATH.
     environment.insert("PATH".to_string(), SUPERVISOR_PATH.to_string());

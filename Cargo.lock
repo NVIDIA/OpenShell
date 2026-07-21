@@ -3896,6 +3896,7 @@ dependencies = [
  "bytes",
  "futures",
  "openshell-core",
+ "openshell-isolation",
  "prost-types",
  "serde",
  "serde_json",
@@ -3920,6 +3921,7 @@ dependencies = [
  "kube-runtime",
  "miette",
  "openshell-core",
+ "openshell-isolation",
  "openshell-policy",
  "prost",
  "prost-types",
@@ -3946,6 +3948,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-isolation",
  "prost-types",
  "rustix 1.1.4",
  "serde",
@@ -3974,6 +3977,7 @@ dependencies = [
  "nix 0.29.0",
  "oci-client",
  "openshell-core",
+ "openshell-isolation",
  "openshell-policy",
  "openshell-vfio",
  "polling",
@@ -4013,6 +4017,15 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "openshell-isolation"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "openshell-core",
+ "tokio",
 ]
 
 [[package]]
@@ -4103,11 +4116,13 @@ dependencies = [
 name = "openshell-sandbox"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "clap",
  "futures",
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-isolation",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-supervisor-middleware",
@@ -4280,6 +4295,7 @@ name = "openshell-supervisor-network"
 version = "0.0.0"
 dependencies = [
  "apollo-parser",
+ "async-trait",
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
@@ -4294,6 +4310,7 @@ dependencies = [
  "libc",
  "miette",
  "openshell-core",
+ "openshell-isolation",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
@@ -4330,6 +4347,7 @@ name = "openshell-supervisor-process"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "capctl",
  "hex",
@@ -4338,6 +4356,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-isolation",
  "openshell-ocsf",
  "openshell-policy",
  "rand 0.10.2",

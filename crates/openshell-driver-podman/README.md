@@ -274,6 +274,7 @@ via sandbox templates:
 - `OPENSHELL_SSH_SOCKET_PATH`
 - `OPENSHELL_CONTAINER_IMAGE`
 - `OPENSHELL_SANDBOX_COMMAND`
+- `OPENSHELL_TOPOLOGY_DESCRIPTOR` (RFC 0012 topology descriptor for the boundary)
 
 ## Sandbox Lifecycle
 

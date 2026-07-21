@@ -2941,6 +2941,13 @@ fn apply_required_env(
         openshell_core::sandbox_env::TELEMETRY_ENABLED,
         openshell_core::telemetry::enabled_env_value(),
     );
+    // RFC 0012: the driver provisions the topology and delivers its descriptor
+    // to the supervisor through the driver-controlled environment.
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR,
+        &openshell_isolation::contract::TopologyDescriptor::in_pod().to_env_value(),
+    );
     if !ssh_socket_path.is_empty() {
         upsert_env(
             env,

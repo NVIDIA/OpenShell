@@ -42,15 +42,20 @@ fn ocsf_ctx() -> &'static openshell_ocsf::SandboxContext {
     openshell_ocsf::ctx::ctx()
 }
 
-/// Spawn the workload entrypoint, wire up SSH and supervisor session, and
-/// wait for the entrypoint child to exit.
+/// Spawn the workload entrypoint behind the boundary, wire up SSH and the
+/// supervisor session, and return an owned [`SpawnedAgent`] handle.
+///
+/// The agent keeps running after this returns; the caller drives it through
+/// [`SpawnedAgent::wait`]/[`SpawnedAgent::signal`]. This is the placement-
+/// sensitive spawn the in-pod backend's `RunningBoundary` owns (RFC 0012):
+/// the returned handle, not an exit code, is the process control surface.
 ///
 /// # Errors
 ///
-/// Returns an error if SSH server startup fails, if the entrypoint child
-/// fails to spawn, or if waiting for the child returns an OS error.
+/// Returns an error if SSH server startup fails or if the entrypoint child
+/// fails to spawn.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
-pub async fn run_process(
+pub async fn spawn_workload(
     program: &str,
     args: &[String],
     workdir: Option<&str>,
@@ -74,7 +79,7 @@ pub async fn run_process(
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
     >,
     #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
-) -> Result<i32> {
+) -> Result<SpawnedAgent> {
     // Platform drivers with a resolved numeric UID/GID retain the legacy
     // account-file update. OCI-image identity leaves those environment values
     // empty, so the image's account files remain unchanged.
@@ -116,7 +121,7 @@ pub async fn run_process(
     // proxy. Spawn it before the entrypoint child so the first packets are
     // not missed. Best-effort: returns None when dmesg is unavailable.
     #[cfg(target_os = "linux")]
-    let _bypass_handle = netns.and_then(|ns| {
+    let bypass_handle = netns.and_then(|ns| {
         crate::bypass_monitor::spawn(
             ns.name().to_string(),
             entrypoint_pid.clone(),
@@ -238,6 +243,13 @@ pub async fn run_process(
 
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
+        // Inject the in-pod loopback port-forward (RFC 0012). The SSH server
+        // drives it through the `BoundaryPortForward` interface, so a delegated
+        // backend would supply a different implementation without the SSH
+        // server changing.
+        let port_forward: Arc<dyn openshell_isolation::contract::BoundaryPortForward> =
+            Arc::new(crate::boundary_io::NetnsPortForward { netns_fd });
+
         tokio::spawn(async move {
             if let Err(err) = crate::ssh::run_ssh_server(
                 listen_path,
@@ -252,6 +264,7 @@ pub async fn run_process(
                 resolved_process_identity,
                 enforcement_mode,
                 shared_ssh_socket,
+                port_forward,
             )
             .await
             {
@@ -308,7 +321,9 @@ pub async fn run_process(
             endpoint.to_string(),
             id.to_string(),
             socket.clone(),
-            ssh_netns_fd,
+            Arc::new(crate::boundary_io::NetnsPortForward {
+                netns_fd: ssh_netns_fd,
+            }),
             None,
             Arc::clone(&supervisor_terminating),
         );
@@ -316,7 +331,7 @@ pub async fn run_process(
     }
 
     #[cfg(target_os = "linux")]
-    let mut handle = ProcessHandle::spawn(
+    let handle = ProcessHandle::spawn(
         program,
         args,
         workdir,
@@ -330,7 +345,7 @@ pub async fn run_process(
     )?;
 
     #[cfg(not(target_os = "linux"))]
-    let mut handle = ProcessHandle::spawn(
+    let handle = ProcessHandle::spawn(
         program,
         args,
         workdir,
@@ -360,49 +375,173 @@ pub async fn run_process(
             .build()
     );
 
-    let outcome =
-        wait_for_process_exit_or_shutdown(&mut handle, timeout_secs, &supervisor_terminating)
-            .await?;
+    Ok(SpawnedAgent {
+        handle,
+        timeout_secs,
+        supervisor_terminating,
+        #[cfg(target_os = "linux")]
+        _bypass_handle: bypass_handle,
+    })
+}
 
-    let status = match outcome {
-        ProcessWaitOutcome::Exited(status) => status,
-        ProcessWaitOutcome::TimedOut => {
-            ocsf_emit!(
-                ProcessActivityBuilder::new(ocsf_ctx())
-                    .activity(ActivityId::Close)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Critical)
-                    .status(StatusId::Failure)
-                    .message("Process timed out, killing")
-                    .build()
-            );
-            return Ok(124); // Standard timeout exit code
+/// An owned, running workload entrypoint plus the background guards whose
+/// lifetime is tied to it (the bypass monitor).
+///
+/// The in-pod `RunningBoundary` owns this; dropping it kills the child via the
+/// handle's `kill_on_drop`.
+pub struct SpawnedAgent {
+    handle: ProcessHandle,
+    timeout_secs: u64,
+    supervisor_terminating: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    _bypass_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SpawnedAgent {
+    /// The host PID of the entrypoint, for diagnostics only.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.handle.pid()
+    }
+
+    /// A lock-free signaling handle derived from the entrypoint's pid.
+    ///
+    /// Separated from the waitable [`SpawnedAgent`] so a signal can be delivered
+    /// while another task holds the agent to await it: the running boundary
+    /// keeps the agent behind a mutex for `wait`, but signals go through this
+    /// pid-based handle and never contend for that lock.
+    #[must_use]
+    pub fn signaler(&self) -> AgentSignaler {
+        AgentSignaler {
+            pid: self.handle.pid(),
         }
-        ProcessWaitOutcome::ShutdownSignal { signal, status } => {
-            info!(
-                signal,
-                exit_code = status.code(),
-                "Entrypoint exited after supervisor shutdown signal"
-            );
-            status
-        }
-    };
-    supervisor_terminating.store(true, Ordering::Release);
+    }
 
-    ocsf_emit!(
-        ProcessActivityBuilder::new(ocsf_ctx())
-            .activity(ActivityId::Close)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .exit_code(status.code())
-            .message(format!("Process exited with code {}", status.code()))
-            .build()
-    );
+    /// Wait for the entrypoint to exit, applying the policy timeout. Returns the
+    /// exit code (128 + signal if signaled, 124 on timeout-kill).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if waiting on the child returns an OS error.
+    pub async fn wait(&mut self) -> Result<i32> {
+        let outcome = wait_for_process_exit_or_shutdown(
+            &mut self.handle,
+            self.timeout_secs,
+            &self.supervisor_terminating,
+        )
+        .await?;
 
-    Ok(status.code())
+        let status = match outcome {
+            ProcessWaitOutcome::Exited(status) => status,
+            ProcessWaitOutcome::TimedOut => {
+                ocsf_emit!(
+                    ProcessActivityBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Close)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Critical)
+                        .status(StatusId::Failure)
+                        .message("Process timed out, killing")
+                        .build()
+                );
+                return Ok(124); // Standard timeout exit code
+            }
+            ProcessWaitOutcome::ShutdownSignal { signal, status } => {
+                info!(
+                    signal,
+                    exit_code = status.code(),
+                    "Entrypoint exited after supervisor shutdown signal"
+                );
+                status
+            }
+        };
+
+        ocsf_emit!(
+            ProcessActivityBuilder::new(ocsf_ctx())
+                .activity(ActivityId::Close)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .exit_code(status.code())
+                .message(format!("Process exited with code {}", status.code()))
+                .build()
+        );
+
+        Ok(status.code())
+    }
+
+    /// Send a signal to the entrypoint process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signal cannot be delivered.
+    #[cfg(unix)]
+    pub fn signal(&self, sig: nix::sys::signal::Signal) -> Result<()> {
+        self.handle.signal(sig)
+    }
+
+    /// Terminate the entrypoint (SIGTERM, then SIGKILL).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process cannot be killed.
+    pub fn kill(&mut self) -> Result<()> {
+        self.handle.kill()
+    }
+}
+
+/// A lock-free, pid-based signaling handle to a spawned agent.
+///
+/// Delivers signals to the entrypoint process without holding the waitable
+/// handle's lock, so a signal and an in-flight `wait` never deadlock.
+/// Placement-neutral signal mapping (e.g. RFC 0012's `BoundarySignal`) is the
+/// caller's job; this handle exposes only the concrete deliveries so `nix`
+/// stays in this crate.
+#[derive(Clone, Copy)]
+pub struct AgentSignaler {
+    pid: u32,
+}
+
+#[cfg(unix)]
+impl AgentSignaler {
+    fn deliver(self, sig: nix::sys::signal::Signal) -> Result<()> {
+        use nix::unistd::Pid;
+        let pid = i32::try_from(self.pid).unwrap_or(i32::MAX);
+        nix::sys::signal::kill(Pid::from_raw(pid), sig).into_diagnostic()
+    }
+
+    /// Send `SIGTERM`.
+    ///
+    /// # Errors
+    /// Returns an error if the signal cannot be delivered.
+    pub fn term(self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGTERM)
+    }
+
+    /// Send `SIGKILL`.
+    ///
+    /// # Errors
+    /// Returns an error if the signal cannot be delivered.
+    pub fn kill(self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGKILL)
+    }
+
+    /// Send `SIGINT`.
+    ///
+    /// # Errors
+    /// Returns an error if the signal cannot be delivered.
+    pub fn interrupt(self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGINT)
+    }
+
+    /// Send `SIGHUP`.
+    ///
+    /// # Errors
+    /// Returns an error if the signal cannot be delivered.
+    pub fn hangup(self) -> Result<()> {
+        self.deliver(nix::sys::signal::Signal::SIGHUP)
+    }
 }
 
 enum ProcessWaitOutcome {
