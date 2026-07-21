@@ -1169,14 +1169,11 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
 /// malicious container images. The TOCTOU window is not exploitable because
 /// no untrusted process is running yet.
 ///
-/// The walk does not cross filesystem boundaries (compares `st_dev`) so that
-/// read-only mounts nested under `/sandbox` are left untouched. Any remaining
 /// `EROFS` errors from `chown` are logged at debug level and the walk still
-/// recurses into children (a read-only directory may contain writable submounts).
+/// recurses into children (a read-only directory may contain writable submounts
+/// or siblings that must be owned by the sandbox user).
 #[cfg(unix)]
 fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
     let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
     if meta.file_type().is_symlink() {
         return Err(miette::miette!(
@@ -1185,15 +1182,16 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
         ));
     }
 
-    let root_dev = meta.dev();
-    chown_recursive(root, uid, gid, root_dev)
+    chown_recursive(root, uid, gid, &nix::unistd::chown)
 }
 
 #[cfg(unix)]
-fn chown_recursive(path: &Path, uid: Option<Uid>, gid: Option<Gid>, root_dev: u64) -> Result<()> {
-    use nix::unistd::chown;
-    use std::os::unix::fs::MetadataExt;
-
+fn chown_recursive(
+    path: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
     let meta = std::fs::symlink_metadata(path).into_diagnostic()?;
 
     if meta.file_type().is_symlink() {
@@ -1201,12 +1199,7 @@ fn chown_recursive(path: &Path, uid: Option<Uid>, gid: Option<Gid>, root_dev: u6
         return Ok(());
     }
 
-    if meta.dev() != root_dev {
-        debug!(path = %path.display(), "Skipping mount boundary during sandbox home chown");
-        return Ok(());
-    }
-
-    if let Err(e) = chown(path, uid, gid) {
+    if let Err(e) = do_chown(path, uid, gid) {
         if e == nix::errno::Errno::EROFS {
             debug!(path = %path.display(), "Skipping read-only path during sandbox home chown");
         } else {
@@ -1220,7 +1213,7 @@ fn chown_recursive(path: &Path, uid: Option<Uid>, gid: Option<Gid>, root_dev: u6
         for entry in entries {
             let entry = entry.into_diagnostic()?;
             let child = entry.path();
-            chown_recursive(&child, uid, gid, root_dev)?;
+            chown_recursive(&child, uid, gid, do_chown)?;
         }
     }
 
@@ -2142,79 +2135,72 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn chown_recursive_skips_different_device() {
-        use std::os::unix::fs::MetadataExt;
+    fn chown_recursive_skips_erofs_and_continues() {
+        use std::sync::{Arc, Mutex};
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sandbox");
         std::fs::create_dir(&root).unwrap();
-        let child = root.join("file.txt");
-        std::fs::write(&child, "hello").unwrap();
 
-        let before_root = std::fs::metadata(&root).unwrap();
-        let before_child = std::fs::metadata(&child).unwrap();
+        let readonly_dir = root.join("ro-mount");
+        std::fs::create_dir(&readonly_dir).unwrap();
+        std::fs::write(readonly_dir.join("writable-child.txt"), "data").unwrap();
+
+        std::fs::write(root.join("writable-sibling.txt"), "data").unwrap();
 
         let uid = Some(nix::unistd::geteuid());
         let gid = Some(nix::unistd::getegid());
 
-        // Pass a fake root_dev that doesn't match the temp directory's device.
-        // chown_recursive should skip the path entirely instead of failing.
-        let fake_dev = std::fs::symlink_metadata(&root)
-            .unwrap()
-            .dev()
-            .wrapping_add(1);
-        chown_recursive(&root, uid, gid, fake_dev)
-            .expect("should skip paths on a different device");
+        let chowned: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let chowned_ref = Arc::clone(&chowned);
 
-        let after_root = std::fs::metadata(&root).unwrap();
-        let after_child = std::fs::metadata(&child).unwrap();
-        assert_eq!(
-            before_root.uid(),
-            after_root.uid(),
-            "root directory should not have been chowned"
+        let readonly_dir_clone = readonly_dir.clone();
+        let fake_chown = move |path: &Path,
+                               _uid: Option<Uid>,
+                               _gid: Option<Gid>|
+              -> nix::Result<()> {
+            if path == readonly_dir_clone {
+                return Err(nix::errno::Errno::EROFS);
+            }
+            chowned_ref.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        };
+
+        chown_recursive(&root, uid, gid, &fake_chown)
+            .expect("EROFS should be handled gracefully");
+
+        let chowned = chowned.lock().unwrap();
+        assert!(
+            chowned.contains(&root),
+            "root should have been chowned"
         );
-        assert_eq!(
-            before_child.uid(),
-            after_child.uid(),
-            "child file should not have been chowned"
+        assert!(
+            chowned.contains(&readonly_dir.join("writable-child.txt")),
+            "writable child under EROFS directory should still be chowned"
+        );
+        assert!(
+            chowned.contains(&root.join("writable-sibling.txt")),
+            "writable sibling should still be chowned"
         );
     }
 
     #[cfg(unix)]
     #[test]
-    #[allow(clippy::similar_names)]
-    fn chown_sandbox_home_does_not_chown_across_device_boundary() {
-        use std::os::unix::fs::MetadataExt;
-
+    fn chown_recursive_propagates_non_erofs_errors() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sandbox");
         std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("owned.txt"), "writable").unwrap();
-        let subdir = root.join("mount");
-        std::fs::create_dir(&subdir).unwrap();
-        std::fs::write(subdir.join("skipped.txt"), "read-only").unwrap();
 
-        let expected_uid = nix::unistd::geteuid();
-        let expected_gid = nix::unistd::getegid();
+        let uid = Some(nix::unistd::geteuid());
+        let gid = Some(nix::unistd::getegid());
 
-        chown_sandbox_home(&root, Some(expected_uid), Some(expected_gid)).unwrap();
+        let fake_chown = |_path: &Path,
+                          _uid: Option<Uid>,
+                          _gid: Option<Gid>|
+              -> nix::Result<()> { Err(nix::errno::Errno::EPERM) };
 
-        let owned = std::fs::metadata(root.join("owned.txt")).unwrap();
-        assert_eq!(
-            owned.uid(),
-            expected_uid.as_raw(),
-            "same-device file should be chowned"
-        );
-
-        // subdir is on the same device in this test, so it WILL be chowned.
-        // This test documents the normal same-device behavior. The cross-device
-        // skip is tested by chown_recursive_skips_different_device above.
-        let sub = std::fs::metadata(&subdir).unwrap();
-        assert_eq!(
-            sub.uid(),
-            expected_uid.as_raw(),
-            "same-device subdirectory should be chowned"
-        );
+        let result = chown_recursive(&root, uid, gid, &fake_chown);
+        assert!(result.is_err(), "non-EROFS errors should propagate");
     }
 
     #[cfg(unix)]
