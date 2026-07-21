@@ -1196,6 +1196,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "containerd-client"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "814eedf2860b6df6e8002f917a0fbabf53bace3d3d9d2c2022661ae55a6ab6e4"
+dependencies = [
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower 0.5.3",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4084,6 +4100,18 @@ dependencies = [
  "serde_yml",
  "thiserror 2.0.18",
  "url",
+]
+
+[[package]]
+name = "openshell-rootfs"
+version = "0.0.0"
+dependencies = [
+ "containerd-client",
+ "futures",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tonic",
 ]
 
 [[package]]

@@ -58,6 +58,25 @@ owned task prevents cancellation from stranding a mutation. A gateway restart
 does not resume a persisted `Deleting` operation. If the backend completed the
 delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 
+## Rootfs Provisioning Boundary
+
+Rootfs provisioning — resolving an OCI image reference into a root filesystem
+a sandbox can be launched from — is a provider concern, separate from sandbox
+provisioning (namespaces, cgroups, VM boot). `openshell-rootfs` defines that
+boundary: a provider produces provider-neutral `PreparedRootfs` mounts keyed
+by a per-sandbox key, and owns image resolution, acquisition, unpacking, and
+the lifetime of whatever backend resources realize the root filesystem.
+Backend concepts (containerd snapshots, leases, chain IDs) must stay behind
+the provider and out of the compute-driver contract, so a daemon-backed
+provider can be replaced by a daemonless one without redesigning the
+provisioner on top of it.
+
+`ContainerdRootfsProvider` is the first implementation, backed by a
+system-provided containerd used only for image pull/unpack and snapshot
+management. The VM driver's image acquisition and ext4 materialization
+pipeline is the same boundary shape; converging it onto the shared types is
+tracked follow-up work.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |
