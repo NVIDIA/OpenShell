@@ -19,8 +19,8 @@ cargo run --manifest-path e2e/rust/Cargo.toml --bin openshell-conformance -- \
 The runner requires an explicit gateway endpoint, either through
 `--gateway-endpoint` or `OPENSHELL_GATEWAY_ENDPOINT`. HTTPS gateways require
 explicit `--tls-ca`, `--tls-cert`, and `--tls-key` paths. Each created sandbox
-uses the name
-`conformance-<scenario>-<run-id>`. The runner performs best-effort cleanup, and
+uses a compact `osct-<scenario-code>-<run-id>` name that fits the gateway's
+19-character routable-name limit. The runner performs best-effort cleanup, and
 the prefix makes any sandbox left after an interruption easy to identify.
 
 The capabilities scenario remains deferred until the gateway exposes driver

@@ -1055,6 +1055,7 @@ dependencies = [
  "openshell-core",
  "prost",
  "rand",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yml",
