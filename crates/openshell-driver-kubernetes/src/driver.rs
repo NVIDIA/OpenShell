@@ -1139,7 +1139,7 @@ impl KubernetesComputeDriver {
                             break;
                         }
                     },
-                    _ = tx.closed() => break,
+                    () = tx.closed() => break,
                 }
             }
         });
