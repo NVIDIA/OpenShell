@@ -34,10 +34,6 @@ default = ["telemetry"]
 ## `--no-default-features` (plus any other features you need) for a build that
 ## contains no telemetry endpoint, no HTTP client, and no emission code at all.
 telemetry = ["dep:reqwest", "dep:chrono"]
-## Expose proposals::test_helpers (`ProposalsFlagGuard`) to downstream test
-## code in other crates. Enabled by openshell-sandbox and
-## openshell-supervisor-network dev builds.
-test-helpers = []
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

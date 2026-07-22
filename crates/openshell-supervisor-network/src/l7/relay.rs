@@ -63,6 +63,8 @@ pub struct L7EvalContext {
     /// Dynamic token grant resolver for endpoint-bound credentials.
     pub(crate) token_grant_resolver:
         Option<Arc<dyn crate::l7::token_grant_injection::TokenGrantResolver>>,
+    /// Shared feature state for agent-driven policy proposals.
+    pub(crate) agent_proposals: openshell_core::proposals::AgentProposals,
 }
 
 #[derive(Default)]
@@ -177,11 +179,13 @@ where
         engine_type_for_protocol(config.protocol),
     );
     crate::l7::rest::RestProvider::default()
-        .deny(
+        .deny_with_redacted_target(
             req,
             &ctx.policy_name,
             crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL,
             client,
+            None,
+            Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
         )
         .await?;
     Ok(true)
@@ -297,11 +301,13 @@ where
 
         let Some(config) = select_l7_config_for_path(configs, &req.target) else {
             crate::l7::rest::RestProvider::default()
-                .deny(
+                .deny_with_redacted_target(
                     &req,
                     &ctx.policy_name,
                     "no L7 endpoint path matched request",
                     client,
+                    None,
+                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
                 )
                 .await?;
             return Ok(());
@@ -417,11 +423,7 @@ where
                     "websocket endpoint requires a valid WebSocket upgrade request",
                     client,
                     Some(&redacted_target),
-                    Some(crate::l7::rest::DenyResponseContext {
-                        host: Some(&ctx.host),
-                        port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
-                    }),
+                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
                 )
                 .await?;
             return Ok(());
@@ -552,11 +554,7 @@ where
                     &reason,
                     client,
                     Some(&redacted_target),
-                    Some(crate::l7::rest::DenyResponseContext {
-                        host: Some(&ctx.host),
-                        port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
-                    }),
+                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
                 )
                 .await?;
             return Ok(());
@@ -885,11 +883,7 @@ where
                     "websocket endpoint requires a valid WebSocket upgrade request",
                     client,
                     Some(&redacted_target),
-                    Some(crate::l7::rest::DenyResponseContext {
-                        host: Some(&ctx.host),
-                        port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
-                    }),
+                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
                 )
                 .await?;
             return Ok(());
@@ -1068,11 +1062,7 @@ where
                     &reason,
                     client,
                     Some(&redacted_target),
-                    Some(crate::l7::rest::DenyResponseContext {
-                        host: Some(&ctx.host),
-                        port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
-                    }),
+                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
                 )
                 .await?;
             return Ok(());
@@ -1300,11 +1290,7 @@ where
                     &reason,
                     client,
                     Some(&redacted_target),
-                    Some(crate::l7::rest::DenyResponseContext {
-                        host: Some(&ctx.host),
-                        port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
-                    }),
+                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
                 )
                 .await?;
             return Ok(());
@@ -1536,11 +1522,7 @@ where
                     &reason,
                     client,
                     Some(&redacted_target),
-                    Some(crate::l7::rest::DenyResponseContext {
-                        host: Some(&ctx.host),
-                        port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
-                    }),
+                    Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
                 )
                 .await?;
             return Ok(());
@@ -2295,9 +2277,9 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
         };
 
         (config, tunnel_engine, ctx, fixture)
@@ -2403,9 +2385,9 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
         };
 
         (generation_guard, ctx, fixture)

@@ -239,6 +239,9 @@ impl ProxyHandle {
                  host-gateway aliases exempt from SSRF always-blocked check"
             );
         }
+        let agent_proposals = policy_local_ctx
+            .as_ref()
+            .map_or_else(Default::default, |ctx| ctx.agent_proposals());
 
         let join = tokio::spawn(async move {
             // Wait for the OPA engine's symlink resolution reload to complete
@@ -274,6 +277,7 @@ impl ProxyHandle {
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
                         let policy_local = policy_local_ctx.clone();
+                        let proposals = agent_proposals.clone();
                         let gw = trusted_host_gateway.clone();
                         let resolver = provider_credentials
                             .as_ref()
@@ -295,6 +299,7 @@ impl ProxyHandle {
                                 tls,
                                 inf,
                                 policy_local,
+                                proposals,
                                 gw,
                                 resolver,
                                 dynamic_credentials,
@@ -626,6 +631,7 @@ async fn handle_tcp_connection(
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    agent_proposals: openshell_core::proposals::AgentProposals,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     dynamic_credentials: Option<
@@ -694,6 +700,7 @@ async fn handle_tcp_connection(
             identity_cache,
             entrypoint_pid,
             policy_local_ctx,
+            agent_proposals,
             trusted_host_gateway,
             secret_resolver,
             dynamic_credentials,
@@ -1242,6 +1249,7 @@ async fn handle_tcp_connection(
         token_grant_resolver: dynamic_credentials
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
+        agent_proposals,
     };
 
     if effective_tls_skip {
@@ -3542,6 +3550,7 @@ async fn handle_forward_proxy(
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    agent_proposals: openshell_core::proposals::AgentProposals,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     dynamic_credentials: Option<
@@ -3821,6 +3830,7 @@ async fn handle_forward_proxy(
         token_grant_resolver: dynamic_credentials
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
+        agent_proposals,
     };
     let mut l7_activity_pending = false;
 
@@ -5035,6 +5045,7 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 )]
 mod tests {
     use super::*;
+    use openshell_core::proposals::AgentProposals;
     use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
@@ -5071,6 +5082,7 @@ network_policies: {}
             None,
             None,
             None,
+            AgentProposals::default(),
             Arc::new(None),
             None,
             None,
@@ -5806,9 +5818,9 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
-            activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            ..Default::default()
         };
 
         (ctx, fixture)
@@ -9386,14 +9398,15 @@ network_policies:
                 engine,
                 cache,
                 entrypoint_pid,
-                None,            // tls_state — ephemeral CA unavailable
-                None,            // inference_ctx
-                None,            // policy_local_ctx
-                Arc::new(None),  // trusted_host_gateway
-                None,            // secret_resolver
-                None,            // dynamic_credentials
-                Some(denial_tx), // denial_tx — positive allow/deny signal
-                None,            // activity_tx
+                None,                      // tls_state — ephemeral CA unavailable
+                None,                      // inference_ctx
+                None,                      // policy_local_ctx
+                AgentProposals::default(), // agent_proposals
+                Arc::new(None),            // trusted_host_gateway
+                None,                      // secret_resolver
+                None,                      // dynamic_credentials
+                Some(denial_tx),           // denial_tx — positive allow/deny signal
+                None,                      // activity_tx
             )),
         )
         .await

@@ -60,7 +60,6 @@ default = ["telemetry"]
 telemetry = ["openshell-core/telemetry"]
 
 [dev-dependencies]
-openshell-core = { path = "../openshell-core", features = ["test-helpers"] }
 tempfile = "3"
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }
