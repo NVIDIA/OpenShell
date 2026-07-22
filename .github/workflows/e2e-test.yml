@@ -310,6 +310,12 @@ jobs:
             socat \
             zstd
 
+      - name: Validate VM host tools
+        run: |
+          command -v mke2fs
+          command -v mkfs.ext4
+          command -v debugfs
+
       - name: Install mise
         run: |
           curl https://mise.run | MISE_VERSION=v2026.4.25 sh

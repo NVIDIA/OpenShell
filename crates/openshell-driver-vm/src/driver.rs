@@ -3538,6 +3538,8 @@ impl VmDriver {
             apply_registry_layer_blob(image_ref, rootfs, layer).await?;
         }
 
+        remove_registry_layer_staging(staging_dir).await?;
+
         Ok(())
     }
 
@@ -3684,6 +3686,16 @@ async fn apply_registry_layer_blob(
         Status::failed_precondition(format!(
             "failed to apply layer '{}' for vm sandbox image '{image_ref}': {err}",
             layer.digest
+        ))
+    })
+}
+
+async fn remove_registry_layer_staging(staging_dir: &Path) -> Result<(), Status> {
+    let layers_dir = staging_dir.join("layers");
+    tokio::fs::remove_dir_all(&layers_dir).await.map_err(|err| {
+        Status::internal(format!(
+            "remove registry layer staging dir '{}' failed: {err}",
+            layers_dir.display()
         ))
     })
 }
@@ -6613,6 +6625,29 @@ mod tests {
             registry_layer_download_concurrency_value(Some("999")),
             MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY
         );
+    }
+
+    #[tokio::test]
+    async fn remove_registry_layer_staging_preserves_merged_rootfs() {
+        let base = unique_temp_dir();
+        let layers_dir = base.join("layers");
+        let rootfs_dir = base.join("rootfs");
+        fs::create_dir_all(&layers_dir).unwrap();
+        fs::create_dir_all(&rootfs_dir).unwrap();
+        fs::write(layers_dir.join("layer.blob"), b"compressed layer").unwrap();
+        fs::write(rootfs_dir.join("merged.txt"), b"merged rootfs").unwrap();
+
+        remove_registry_layer_staging(&base)
+            .await
+            .expect("remove layer staging");
+
+        assert!(!layers_dir.exists());
+        assert_eq!(
+            fs::read(rootfs_dir.join("merged.txt")).unwrap(),
+            b"merged rootfs"
+        );
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
