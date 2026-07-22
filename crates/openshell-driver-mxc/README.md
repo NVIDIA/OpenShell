@@ -135,6 +135,5 @@ velocity keys not enabled, isolation_session absent).
 ## Deferred work
 
 - **Interactive exec/connect/forward** — gateway interactive-exec surgery (follow-on)
-- **Governed egress polish** — gateway denial/activity bus wiring,  broader real-MXC HTTPS L7 scenario coverage, and per-sandbox port allocation
 - **Restart durability** (deprovision orphaned sessions on startup) → follow-on
 - **GPU passthrough** → not pursued in host-side-governance design
