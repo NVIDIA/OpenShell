@@ -1,0 +1,18 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_library(
+    name = "openshell-supervisor-process",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    compile_data = glob(["src/skills/**/*.md"]),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "openshell-supervisor-process_test",
+    crate = ":openshell-supervisor-process",
+    deps = all_crate_deps(normal_dev = True),
+)

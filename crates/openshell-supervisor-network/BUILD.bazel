@@ -1,0 +1,63 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_library(
+    name = "openshell-supervisor-network",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    compile_data = glob(["data/**/*"]),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "openshell-supervisor-network_test",
+    compile_data = glob(["testdata/**/*"]),
+    crate = ":openshell-supervisor-network",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "system_inference_integration_test",
+    srcs = ["tests/system_inference.rs"],
+    aliases = aliases(),
+    crate_root = "tests/system_inference.rs",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [":openshell-supervisor-network"],
+)
+
+rust_test(
+    name = "websocket_upgrade_integration_test",
+    srcs = ["tests/websocket_upgrade.rs"],
+    aliases = aliases(),
+    crate_root = "tests/websocket_upgrade.rs",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [":openshell-supervisor-network"],
+)
+
+rust_test(
+    name = "accept_fd_exhaustion_integration_test",
+    srcs = ["tests/accept_fd_exhaustion.rs"],
+    aliases = aliases(),
+    crate_root = "tests/accept_fd_exhaustion.rs",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
+rust_test(
+    name = "sigv4_localstack_integration_test",
+    srcs = ["tests/sigv4_localstack.rs"],
+    aliases = aliases(),
+    crate_root = "tests/sigv4_localstack.rs",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [":openshell-supervisor-network"],
+)

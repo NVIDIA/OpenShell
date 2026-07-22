@@ -1,0 +1,28 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
+
+rust_library(
+    name = "openshell-router",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    visibility = ["//visibility:public"],
+    deps = all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "openshell-router_test",
+    crate = ":openshell-router",
+    deps = all_crate_deps(normal_dev = True),
+)
+
+rust_test(
+    name = "backend_integration_test",
+    srcs = ["tests/backend_integration.rs"],
+    aliases = aliases(),
+    crate_root = "tests/backend_integration.rs",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + [":openshell-router"],
+)
