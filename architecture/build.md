@@ -133,11 +133,11 @@ do not infer from kube context.
 ## Python Wheel Packaging
 
 The generated protobuf/gRPC stubs under `python/openshell/_proto/` are gitignored
-build outputs of `mise run python:proto`. Before generation, the task installs
-the locked development dependencies into the current worktree's `.venv`; its
-subsequent `uv run` commands disable implicit synchronization. maturin honors
-`.gitignore` when collecting `python-source` files, so native builds (Linux CI,
-local `pip install .`) would drop them and ship an unimportable wheel. `pyproject.toml`
+build outputs of `mise run python:proto`. The task uses `uv run --frozen` to
+synchronize the current worktree's `.venv` from `uv.lock` before generation.
+maturin honors `.gitignore` when collecting `python-source` files, so native
+builds (Linux CI, local `pip install .`) would drop them and ship an unimportable
+wheel. `pyproject.toml`
 pins them back in with `[tool.maturin].include` globs. The release workflows
 install each Linux wheel in a clean image and import `openshell.sandbox` as a
 smoke check.
