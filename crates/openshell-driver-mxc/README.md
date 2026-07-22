@@ -16,7 +16,7 @@ readiness; there is no in-sandbox supervisor or `ConnectSupervisor` relay.
 | Capability | MXC driver | Closing it requires |
 |---|---|---|
 | Filesystem policy (read-write / read-only grants) | ✅ provision-time AppContainer shares | — |
-| Governed egress (CONNECT proxy + OPA + L7) | Available behind `egress_proxy` on `process_container`; the driver starts a per-sandbox host CONNECT proxy from the trimmed network policy | HTTPS MITM trust bootstrap and gateway event-bus wiring follow-on |
+| Governed egress (CONNECT proxy + OPA + L7) | Available behind `egress_proxy` on `process_container`; the driver starts a per-sandbox host CONNECT proxy, generates HTTPS MITM trust material, and injects the CA bundle into the sandbox process env | Gateway event-bus wiring follow-on |
 | Network policy | Split into MXC `network.proxy` + trimmed OpenShell policy on `process_container`; `isolation_session` still rejects network config | MXC feedback item M1 for persistent sessions |
 | Process policy (seccomp, uid/gid) | ❌ host-side governance design; OS isolation only | not pursued |
 | Interactive exec/connect/forward | ❌ exec runs in-driver, no client attach | gateway interactive-exec surgery (follow-on) |
@@ -82,7 +82,11 @@ instead: MXC receives filesystem grants plus a loopback `network.proxy`
 redirect, and the driver starts a host CONNECT proxy from the trimmed
 network-only `SandboxPolicy`. The proxy uses the configured agent command as
 the static sandbox process identity because MXC does not expose Linux-style
-procfs socket ownership. The development export surface remains the
+procfs socket ownership. For HTTPS L7 inspection, the host proxy generates a
+per-sandbox CA, grants the CA directory read-only in MXC, and injects
+`NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
+`CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` into the agent process env. The
+development export surface remains the
 [`policy-to-mxc`](examples/policy-to-mxc.rs) example; there is no production
 `openshell policy export-mxc` subcommand yet.
 
@@ -131,6 +135,6 @@ velocity keys not enabled, isolation_session absent).
 ## Deferred work
 
 - **Interactive exec/connect/forward** — gateway interactive-exec surgery (follow-on)
-- **Governed egress polish** — HTTPS MITM trust bootstrap, gateway denial/activity bus wiring, and per-sandbox port allocation
+- **Governed egress polish** — gateway denial/activity bus wiring,  broader real-MXC HTTPS L7 scenario coverage, and per-sandbox port allocation
 - **Restart durability** (deprovision orphaned sessions on startup) → follow-on
 - **GPU passthrough** → not pursued in host-side-governance design

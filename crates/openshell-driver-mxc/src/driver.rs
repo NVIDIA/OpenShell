@@ -343,6 +343,58 @@ fn host_proxy_binary_path(config: &MxcSandboxConfig) -> PathBuf {
         .map_or_else(|| PathBuf::from("mxc-agent"), PathBuf::from)
 }
 
+const TLS_ENV_KEYS: [&str; 6] = [
+    "NODE_EXTRA_CA_CERTS",
+    "DENO_CERT",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+];
+
+fn append_tls_env_vars(env: &mut Vec<String>, ca_paths: Option<&(PathBuf, PathBuf)>) {
+    let Some((ca_cert_path, combined_bundle_path)) = ca_paths else {
+        return;
+    };
+
+    env.retain(|entry| {
+        let key = entry.split_once('=').map_or(entry.as_str(), |(key, _)| key);
+        !TLS_ENV_KEYS
+            .iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+    });
+
+    let ca_cert_path = ca_cert_path.display().to_string();
+    let combined_bundle_path = combined_bundle_path.display().to_string();
+    env.extend([
+        format!("NODE_EXTRA_CA_CERTS={ca_cert_path}"),
+        format!("DENO_CERT={ca_cert_path}"),
+        format!("SSL_CERT_FILE={combined_bundle_path}"),
+        format!("REQUESTS_CA_BUNDLE={combined_bundle_path}"),
+        format!("CURL_CA_BUNDLE={combined_bundle_path}"),
+        format!("GIT_SSL_CAINFO={combined_bundle_path}"),
+    ]);
+}
+
+fn append_tls_readonly_grant(
+    readonly_paths: &mut Vec<String>,
+    ca_paths: Option<&(PathBuf, PathBuf)>,
+) {
+    let Some((ca_cert_path, _)) = ca_paths else {
+        return;
+    };
+    let Some(dir) = ca_cert_path.parent() else {
+        return;
+    };
+    let dir = dir.display().to_string();
+    if !readonly_paths
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&dir))
+    {
+        readonly_paths.push(dir);
+    }
+}
+
 impl MxcComputeBackend {
     pub fn new(config: MxcComputeConfig) -> Self {
         let invoker = WxcExecInvoker::new(&config.wxc_exec_path, config.debug);
@@ -788,6 +840,7 @@ async fn run_lifecycle(
     } else {
         None
     };
+    let host_proxy_ca_paths = host_proxy.as_ref().and_then(|proxy| proxy.ca_file_paths());
     drop(reserved_proxy_listener.take());
     if let Some(addr) = proxy_addr {
         {
@@ -805,18 +858,22 @@ async fn run_lifecycle(
         ));
     }
 
+    let mut readonly_paths = mapped.readonly_paths;
+    append_tls_readonly_grant(&mut readonly_paths, host_proxy_ca_paths.as_ref());
     let filesystem = MxcFilesystem {
         readwrite_paths: mapped.readwrite_paths,
-        readonly_paths: mapped.readonly_paths,
+        readonly_paths,
         // OpenShell's policy model has no explicit deny field; default-deny is
         // implicit and enforced by processContainer at the OS boundary.
         denied_paths: Vec::new(),
     };
     let command_line = encode_windows_command_line(&sandbox_config.command);
+    let mut environment = sandbox_environment(&sandbox);
+    append_tls_env_vars(&mut environment, host_proxy_ca_paths.as_ref());
     let process = MxcProcess {
         command_line: command_line.clone(),
         cwd: sandbox_config.cwd,
-        env: sandbox_environment(&sandbox),
+        env: environment,
         timeout: 0,
     };
     let network = proxy_addr.map(|addr| MxcNetwork {
@@ -1205,6 +1262,48 @@ mod lifecycle_tests {
             sandbox_environment(&sandbox),
             vec!["SHARED=spec".to_string(), "TOKEN=value".to_string()]
         );
+    }
+
+    #[test]
+    fn tls_env_vars_replace_user_trust_overrides() {
+        let ca_cert = PathBuf::from("C:\\openshell\\tls\\openshell-ca.pem");
+        let bundle = PathBuf::from("C:\\openshell\\tls\\ca-bundle.pem");
+        let mut env = vec![
+            "FOO=bar".to_string(),
+            "SSL_CERT_FILE=C:\\old\\bundle.pem".to_string(),
+            "node_extra_ca_certs=C:\\old\\ca.pem".to_string(),
+        ];
+
+        append_tls_env_vars(&mut env, Some(&(ca_cert, bundle)));
+
+        assert!(env.contains(&"FOO=bar".to_string()));
+        assert!(
+            !env.iter()
+                .any(|entry| entry == "SSL_CERT_FILE=C:\\old\\bundle.pem")
+        );
+        assert!(
+            !env.iter()
+                .any(|entry| entry == "node_extra_ca_certs=C:\\old\\ca.pem")
+        );
+        assert!(
+            env.contains(&"NODE_EXTRA_CA_CERTS=C:\\openshell\\tls\\openshell-ca.pem".to_string())
+        );
+        assert!(env.contains(&"DENO_CERT=C:\\openshell\\tls\\openshell-ca.pem".to_string()));
+        assert!(env.contains(&"SSL_CERT_FILE=C:\\openshell\\tls\\ca-bundle.pem".to_string()));
+        assert!(env.contains(&"REQUESTS_CA_BUNDLE=C:\\openshell\\tls\\ca-bundle.pem".to_string()));
+        assert!(env.contains(&"CURL_CA_BUNDLE=C:\\openshell\\tls\\ca-bundle.pem".to_string()));
+        assert!(env.contains(&"GIT_SSL_CAINFO=C:\\openshell\\tls\\ca-bundle.pem".to_string()));
+    }
+
+    #[test]
+    fn tls_readonly_grant_adds_ca_directory_once() {
+        let ca_cert = PathBuf::from("C:\\openshell\\tls\\openshell-ca.pem");
+        let bundle = PathBuf::from("C:\\openshell\\tls\\ca-bundle.pem");
+        let mut readonly = vec!["c:\\openshell\\tls".to_string()];
+
+        append_tls_readonly_grant(&mut readonly, Some(&(ca_cert, bundle)));
+
+        assert_eq!(readonly, vec!["c:\\openshell\\tls"]);
     }
 
     #[test]
