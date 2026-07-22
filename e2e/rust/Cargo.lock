@@ -1057,6 +1057,7 @@ dependencies = [
  "openshell-core",
  "prost",
  "rand",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yml",
@@ -1394,6 +1395,7 @@ checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
 dependencies = [
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
