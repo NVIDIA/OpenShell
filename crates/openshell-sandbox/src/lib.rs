@@ -1790,11 +1790,20 @@ fn resolve_cdi_requirements_from_env(
     if context_path.is_empty() {
         return Ok(None);
     }
+    if context_path != openshell_core::cdi::CDI_CONTEXT_PATH {
+        let message = format!(
+            "CDI context path must be '{}', got '{context_path}'",
+            openshell_core::cdi::CDI_CONTEXT_PATH
+        );
+        emit_cdi_validation_failure(&message);
+        return Err(miette::miette!("{message}"));
+    }
 
     let context = openshell_core::cdi::read_context(context_path).map_err(|err| {
         emit_cdi_validation_failure(&err.to_string());
         miette::miette!("Failed to load CDI context from {context_path}: {err}")
     })?;
+    validate_cdi_context_mount_roots(&context)?;
     ocsf_emit!(
         ConfigStateChangeBuilder::new(ocsf_ctx())
             .severity(SeverityId::Informational)
@@ -1815,6 +1824,23 @@ fn resolve_cdi_requirements_from_env(
             miette::miette!("Failed to resolve CDI requirements: {err}")
         })?;
     Ok(Some(requirements))
+}
+
+fn validate_cdi_context_mount_roots(context: &openshell_core::cdi::CdiContext) -> Result<()> {
+    let expected_prefix = format!("{}/", openshell_core::cdi::CDI_SPEC_DIR_BASE);
+    for spec_dir in &context.spec_dirs {
+        let normalized = openshell_core::paths::normalize_path(&spec_dir.path);
+        if !normalized.starts_with(&expected_prefix) {
+            let message = format!(
+                "CDI spec dir must be under '{}', got '{}'",
+                openshell_core::cdi::CDI_SPEC_DIR_BASE,
+                spec_dir.path
+            );
+            emit_cdi_validation_failure(&message);
+            return Err(miette::miette!("{message}"));
+        }
+    }
+    Ok(())
 }
 
 fn emit_cdi_validation_failure(message: &str) {

@@ -1496,15 +1496,15 @@ fn build_container_create_body_adds_cdi_context_env_and_spec_mounts_for_gpu() {
 }
 
 #[test]
-fn build_container_create_body_omits_cdi_context_for_non_gpu() {
+fn build_container_create_body_clears_cdi_context_for_non_gpu() {
     let mut config = runtime_config(false);
     config.gpu.cdi_spec_dirs = vec![TEST_CDI_SPEC_DIR.to_string()];
     let create_body = build_container_create_body(&test_sandbox(), &config).unwrap();
 
     let env = create_body.env.expect("env should be set");
     assert!(
-        !env.iter()
-            .any(|entry| entry.starts_with(openshell_core::sandbox_env::CDI_CONTEXT))
+        env.iter()
+            .any(|entry| { entry == &format!("{}=", openshell_core::sandbox_env::CDI_CONTEXT) })
     );
 
     let binds = create_body

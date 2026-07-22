@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::hash::BuildHasher;
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Component, Path, PathBuf};
 
 pub const CDI_CONTEXT_VERSION: u32 = 1;
@@ -78,6 +80,8 @@ pub struct CdiDerivedRequirements {
 pub enum CdiPathKind {
     File,
     Directory,
+    CharacterDevice,
+    BlockDevice,
     Other,
 }
 
@@ -86,6 +90,8 @@ impl fmt::Display for CdiPathKind {
         match self {
             Self::File => f.write_str("file"),
             Self::Directory => f.write_str("directory"),
+            Self::CharacterDevice => f.write_str("character device"),
+            Self::BlockDevice => f.write_str("block device"),
             Self::Other => f.write_str("other"),
         }
     }
@@ -129,6 +135,8 @@ pub enum CdiError {
     WritableMountNotAllowed { path: String },
     #[error("CDI writable mount '{path}' must target a single file, found {kind}")]
     WritableMountNotFile { path: String, kind: String },
+    #[error("CDI device node '{path}' must target a character or block device, found {kind}")]
+    DeviceNodeNotDevice { path: String, kind: String },
     #[error("CDI mount '{path}' has conflicting ro/rw options")]
     ConflictingMountOptions { path: String },
 }
@@ -174,7 +182,20 @@ struct RequirementAccumulator {
 }
 
 impl RequirementAccumulator {
-    fn add_device_node(&mut self, path: String) -> Result<(), CdiError> {
+    fn add_device_node<F>(&mut self, path: String, path_kind: &F) -> Result<(), CdiError>
+    where
+        F: Fn(&str) -> Option<CdiPathKind>,
+    {
+        let kind = path_kind(&path);
+        if !matches!(
+            kind,
+            Some(CdiPathKind::CharacterDevice | CdiPathKind::BlockDevice)
+        ) {
+            return Err(CdiError::DeviceNodeNotDevice {
+                path,
+                kind: kind.map_or_else(|| "missing".to_string(), |kind| kind.to_string()),
+            });
+        }
         match self.mount_paths.get(&path).copied() {
             Some(CdiAccess::ReadOnly) => Err(CdiError::ConflictingAccess { path }),
             Some(CdiAccess::ReadWrite) | None => {
@@ -392,7 +413,7 @@ where
 {
     for device_node in &edits.device_nodes {
         let path = normalize_policy_path(&device_node.path)?;
-        accumulator.add_device_node(path)?;
+        accumulator.add_device_node(path, path_kind)?;
     }
 
     for mount in &edits.mounts {
@@ -467,9 +488,19 @@ fn validate_absolute_no_parent(path: &str) -> Result<(), &'static str> {
 
 pub fn filesystem_path_kind(path: &str) -> Option<CdiPathKind> {
     let metadata = std::fs::metadata(path).ok()?;
-    if metadata.is_file() {
+    let file_type = metadata.file_type();
+    #[cfg(unix)]
+    {
+        if file_type.is_char_device() {
+            return Some(CdiPathKind::CharacterDevice);
+        }
+        if file_type.is_block_device() {
+            return Some(CdiPathKind::BlockDevice);
+        }
+    }
+    if file_type.is_file() {
         Some(CdiPathKind::File)
-    } else if metadata.is_dir() {
+    } else if file_type.is_dir() {
         Some(CdiPathKind::Directory)
     } else {
         Some(CdiPathKind::Other)
@@ -512,6 +543,11 @@ mod tests {
         None
     }
 
+    fn fake_device_node(path: &str) -> Option<CdiPathKind> {
+        path.starts_with("/dev/")
+            .then_some(CdiPathKind::CharacterDevice)
+    }
+
     #[test]
     fn resolves_native_single_device_requirements() {
         let dir = tempfile::tempdir().unwrap();
@@ -536,7 +572,7 @@ devices:
         let requirements = resolve_with_kind(
             &context(dir.path(), &["nvidia.com/gpu=0"]),
             &[],
-            always_missing,
+            fake_device_node,
         )
         .unwrap();
 
@@ -572,7 +608,7 @@ devices:
         let requirements = resolve_with_kind(
             &context(dir.path(), &["nvidia.com/gpu=all"]),
             &[],
-            always_missing,
+            fake_device_node,
         )
         .unwrap();
 
@@ -605,7 +641,7 @@ devices:
         let requirements = resolve_with_kind(
             &context(dir.path(), &["nvidia.com/gpu=all"]),
             &[],
-            always_missing,
+            fake_device_node,
         )
         .unwrap();
 
@@ -639,7 +675,7 @@ devices:
         let requirements = resolve_with_kind(
             &context(dir.path(), &["nvidia.com/gpu=0"]),
             &[],
-            always_missing,
+            fake_device_node,
         )
         .unwrap();
 
@@ -746,7 +782,7 @@ devices:
         let err = resolve_with_kind(
             &context(dir.path(), &["nvidia.com/gpu=0"]),
             &[],
-            always_missing,
+            fake_device_node,
         )
         .unwrap_err();
 
@@ -855,7 +891,7 @@ devices:
         let err = resolve_with_kind(
             &context(dir.path(), &["nvidia.com/gpu=0"]),
             &[],
-            always_missing,
+            fake_device_node,
         )
         .unwrap_err();
 
@@ -886,5 +922,30 @@ devices:
         .unwrap();
 
         assert_eq!(requirements.additional_gids, vec![44]);
+    }
+
+    #[test]
+    fn rejects_device_node_that_is_not_device() {
+        let dir = tempfile::tempdir().unwrap();
+        write_spec(
+            dir.path(),
+            "regular-file-node.yaml",
+            r#"
+cdiVersion: 1.1.0
+kind: nvidia.com/gpu
+devices:
+  - name: "0"
+    containerEdits:
+      deviceNodes:
+        - path: /opt/nvidia/not-a-device
+"#,
+        );
+
+        let err = resolve_with_kind(&context(dir.path(), &["nvidia.com/gpu=0"]), &[], |path| {
+            (path == "/opt/nvidia/not-a-device").then_some(CdiPathKind::File)
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, CdiError::DeviceNodeNotDevice { .. }));
     }
 }

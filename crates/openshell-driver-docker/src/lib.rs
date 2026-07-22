@@ -801,7 +801,8 @@ impl DockerComputeDriver {
             .map_err(|status| {
                 DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
             })?;
-        self.docker
+        if let Err(err) = self
+            .docker
             .create_container(
                 Some(
                     CreateContainerOptionsBuilder::default()
@@ -811,12 +812,13 @@ impl DockerComputeDriver {
                 create_body,
             )
             .await
-            .map_err(|err| {
-                DockerProvisioningFailure::from_status(
-                    "ContainerCreateFailed",
-                    create_status_from_docker_error("create docker sandbox container", err),
-                )
-            })?;
+        {
+            cleanup_sandbox_token_file(sandbox, &self.config);
+            return Err(DockerProvisioningFailure::from_status(
+                "ContainerCreateFailed",
+                create_status_from_docker_error("create docker sandbox container", err),
+            ));
+        }
         self.publish_docker_progress(
             &sandbox.id,
             "Created",
@@ -833,6 +835,7 @@ impl DockerComputeDriver {
                 "CDI context upload failure",
             )
             .await;
+            cleanup_sandbox_token_file(sandbox, &self.config);
             return Err(DockerProvisioningFailure::from_status(
                 "CdiContextUploadFailed",
                 err,
@@ -846,6 +849,7 @@ impl DockerComputeDriver {
                 "container start failure",
             )
             .await;
+            cleanup_sandbox_token_file(sandbox, &self.config);
             return Err(DockerProvisioningFailure::from_status(
                 "ContainerStartFailed",
                 create_status_from_docker_error("start docker sandbox container", err),
@@ -2287,12 +2291,14 @@ fn build_environment(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),
     );
-    if include_cdi_context {
-        environment.insert(
-            openshell_core::sandbox_env::CDI_CONTEXT.to_string(),
-            openshell_core::cdi::CDI_CONTEXT_PATH.to_string(),
-        );
-    }
+    environment.insert(
+        openshell_core::sandbox_env::CDI_CONTEXT.to_string(),
+        if include_cdi_context {
+            openshell_core::cdi::CDI_CONTEXT_PATH.to_string()
+        } else {
+            String::new()
+        },
+    );
     // The root supervisor executes namespace helpers during bootstrap; keep
     // their search path driver-owned even when the template/spec set PATH.
     environment.insert("PATH".to_string(), SUPERVISOR_PATH.to_string());
