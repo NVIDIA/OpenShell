@@ -734,7 +734,7 @@ async fn handle_tcp_connection(
     }
 
     let peer_addr = client.peer_addr().into_diagnostic()?;
-    let _local_addr = client.local_addr().into_diagnostic()?;
+    let local_addr = client.local_addr().into_diagnostic()?;
 
     // Evaluate OPA policy with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
@@ -746,6 +746,7 @@ async fn handle_tcp_connection(
     let decision = tokio::task::spawn_blocking(move || {
         evaluate_opa_tcp(
             peer_addr,
+            local_addr,
             &opa_clone,
             &cache_clone,
             &pid_clone,
@@ -1718,16 +1719,18 @@ fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathB
 #[cfg(target_os = "linux")]
 fn resolve_process_identity(
     entrypoint_pid: u32,
-    peer_port: u16,
+    peer_addr: SocketAddr,
+    proxy_addr: SocketAddr,
     identity_cache: &BinaryIdentityCache,
 ) -> std::result::Result<ResolvedIdentity, IdentityError> {
-    let socket_owners = crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
-        .map_err(|e| IdentityError {
-            reason: format!("failed to resolve peer binary: {e}"),
-            binary: None,
-            binary_pid: None,
-            ancestors: vec![],
-        })?;
+    let socket_owners =
+        crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, peer_addr, proxy_addr)
+            .map_err(|e| IdentityError {
+                reason: format!("failed to resolve peer binary: {e}"),
+                binary: None,
+                binary_pid: None,
+                ancestors: vec![],
+            })?;
 
     let mut identities = Vec::with_capacity(socket_owners.owners.len());
     for owner in &socket_owners.owners {
@@ -1787,6 +1790,7 @@ fn resolve_process_identity(
 #[cfg(target_os = "linux")]
 fn evaluate_opa_tcp(
     peer_addr: SocketAddr,
+    proxy_addr: SocketAddr,
     engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
     entrypoint_pid: &AtomicU32,
@@ -1833,9 +1837,12 @@ fn evaluate_opa_tcp(
     };
 
     let total_start = std::time::Instant::now();
-    let peer_port = peer_addr.port();
-
-    let identity = match resolve_process_identity(proc_net_anchor_pid, peer_port, identity_cache) {
+    let identity = match resolve_process_identity(
+        proc_net_anchor_pid,
+        peer_addr,
+        proxy_addr,
+        identity_cache,
+    ) {
         Ok(id) => id,
         Err(err) => {
             return deny(
@@ -1939,6 +1946,7 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> Conn
 #[cfg(not(target_os = "linux"))]
 fn evaluate_opa_tcp(
     _peer_addr: SocketAddr,
+    _proxy_addr: SocketAddr,
     engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
@@ -3646,7 +3654,7 @@ async fn handle_forward_proxy(
 
     // 2. Evaluate OPA policy (same identity binding as CONNECT)
     let peer_addr = client.peer_addr().into_diagnostic()?;
-    let _local_addr = client.local_addr().into_diagnostic()?;
+    let local_addr = client.local_addr().into_diagnostic()?;
 
     let opa_clone = opa_engine.clone();
     let cache_clone = identity_cache.clone();
@@ -3655,6 +3663,7 @@ async fn handle_forward_proxy(
     let decision = tokio::task::spawn_blocking(move || {
         evaluate_opa_tcp(
             peer_addr,
+            local_addr,
             &opa_clone,
             &cache_clone,
             &pid_clone,
@@ -9626,9 +9635,9 @@ network_policies:
     /// 4. Spawn the temp bash as a child with a `/dev/tcp` one-liner that
     ///    opens a real TCP connection to the listener and holds it open
     ///    inside the bash process.
-    /// 5. Accept the connection on the listener side and capture the peer's
-    ///    ephemeral port — that's what `resolve_process_identity` uses to
-    ///    walk `/proc/net/tcp` back to the child PID.
+    /// 5. Accept the connection on the listener side and capture both socket
+    ///    endpoints — that's what `resolve_process_identity` uses to walk
+    ///    `/proc/net/tcp` back to the child PID.
     /// 6. Overwrite the temp bash on disk with different bytes to simulate
     ///    a `docker cp` hot-swap. The running child is unaffected (it still
     ///    executes from its in-memory image), but `/proc/<child>/exe` will
@@ -9656,7 +9665,7 @@ network_policies:
 
         // 1. Start a listener on loopback.
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let listener_port = listener.local_addr().unwrap().port();
+        let proxy_addr = listener.local_addr().unwrap();
 
         // 2. Copy /bin/bash to a temp path.
         let tmp = tempfile::TempDir::new().unwrap();
@@ -9676,8 +9685,10 @@ network_policies:
         //    to keep it open. Do not use an external command like `sleep`:
         //    it inherits the socket fd and intentionally trips the shared
         //    socket ambiguity guard instead of exercising the hot-swap path.
-        let script =
-            format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; read -r -t 30 _ <&3 || true");
+        let script = format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{}; read -r -t 30 _ <&3 || true",
+            proxy_addr.port()
+        );
         let mut child = Command::new(&bash_v1)
             .arg("-c")
             .arg(&script)
@@ -9687,7 +9698,7 @@ network_policies:
             .spawn()
             .expect("spawn hotswap-bash child");
 
-        // 5. Accept on the listener side, capture the peer port.
+        // 5. Accept on the listener side and capture the peer endpoint.
         listener.set_nonblocking(false).expect("blocking listener");
         let (mut stream, peer_addr) = match listener.accept() {
             Ok(pair) => pair,
@@ -9697,7 +9708,6 @@ network_policies:
                 panic!("failed to accept child connection: {e}");
             }
         };
-        let peer_port = peer_addr.port();
         // Drain any spurious data; we just need the socket open.
         stream
             .set_read_timeout(Some(Duration::from_millis(50)))
@@ -9724,7 +9734,7 @@ network_policies:
         //    contract: hash the live executable via /proc/<pid>/exe while
         //    returning a clean display path for policy/logging.
         let test_pid = std::process::id();
-        let result = resolve_process_identity(test_pid, peer_port, &cache);
+        let result = resolve_process_identity(test_pid, peer_addr, proxy_addr, &cache);
         let child_pid = child.id();
 
         // Always clean up the child before asserting so a failure doesn't
@@ -9799,9 +9809,9 @@ network_policies:
         }
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let listener_port = listener.local_addr().unwrap().port();
-        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
-        let peer_port = stream.local_addr().unwrap().port();
+        let proxy_addr = listener.local_addr().unwrap();
+        let stream = TcpStream::connect(proxy_addr).expect("connect");
+        let peer_addr = stream.local_addr().unwrap();
         let (_accepted, _) = listener.accept().expect("accept");
 
         let fd = stream.as_raw_fd();
@@ -9857,7 +9867,7 @@ network_policies:
 
         let cache = BinaryIdentityCache::new();
 
-        let mut result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
+        let mut result = resolve_process_identity(entrypoint_pid, peer_addr, proxy_addr, &cache);
         for _ in 0..10 {
             match &result {
                 Err(err)
@@ -9866,7 +9876,8 @@ network_policies:
                 {
                     // /proc/<pid>/fd scan transiently failed; give procfs time to settle.
                     std::thread::sleep(Duration::from_millis(50));
-                    result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
+                    result =
+                        resolve_process_identity(entrypoint_pid, peer_addr, proxy_addr, &cache);
                 }
                 Ok(_) => {
                     // On arm64 under heavy CI load the /proc fd scan can transiently
@@ -9874,7 +9885,8 @@ network_policies:
                     // the child as owner and yielding a spurious Ok.  Retry to give
                     // both owners time to appear consistently in /proc/<pid>/fd.
                     std::thread::sleep(Duration::from_millis(50));
-                    result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
+                    result =
+                        resolve_process_identity(entrypoint_pid, peer_addr, proxy_addr, &cache);
                 }
                 _ => break,
             }

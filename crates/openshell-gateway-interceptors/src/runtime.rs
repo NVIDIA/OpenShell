@@ -911,7 +911,6 @@ mod tests {
             .with_ansi(false)
             .without_time();
         let subscriber = tracing_subscriber::registry().with(fmt_layer);
-        let dispatch = tracing::Dispatch::new(subscriber);
         let plan = BindingPlan {
             interceptor_name: "test".to_string(),
             binding_id: "binding".to_string(),
@@ -940,7 +939,11 @@ mod tests {
             ..InterceptorResult::default()
         };
 
-        tracing::dispatcher::with_default(&dispatch, || {
+        tracing::subscriber::with_default(subscriber, || {
+            // Other parallel tests may register this callsite while no subscriber
+            // is active. Refresh the process-wide cache after installing this
+            // thread-local subscriber so the event cannot remain disabled.
+            tracing::callsite::rebuild_interest_cache();
             emit_evaluation_log(&plan, &result, "allow", 2);
         });
 
