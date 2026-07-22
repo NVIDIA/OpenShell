@@ -580,18 +580,38 @@ impl ForwardSpec {
     }
 
     /// The SSH `-L` local-forward argument: `bind_addr:port:127.0.0.1:port`.
+    /// IPv6 bind addresses are bracketed as OpenSSH requires (`[::1]:port:...`).
     pub fn ssh_forward_arg(&self) -> String {
-        format!("{}:{}:127.0.0.1:{}", self.bind_addr, self.port, self.port)
+        format!(
+            "{}:{}:127.0.0.1:{}",
+            bracket_ipv6(&self.bind_addr),
+            self.port,
+            self.port
+        )
     }
 
     /// A human-readable URL for the forwarded port.
     pub fn access_url(&self) -> String {
         let host = if self.bind_addr == "0.0.0.0" || self.bind_addr == "::" {
-            "localhost"
+            "localhost".to_string()
         } else {
-            &self.bind_addr
+            bracket_ipv6(&self.bind_addr)
         };
         format!("http://{host}:{}/", self.port)
+    }
+}
+
+/// Bracket an IPv6 literal for use in `host:port` contexts (SSH `-L`
+/// arguments and URLs); leave other addresses unchanged.
+fn bracket_ipv6(addr: &str) -> String {
+    if addr
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_ipv6())
+        && !addr.starts_with('[')
+    {
+        format!("[{addr}]")
+    } else {
+        addr.to_string()
     }
 }
 
@@ -1411,6 +1431,9 @@ mod tests {
 
         let spec = ForwardSpec::parse("8080").unwrap();
         assert_eq!(spec.ssh_forward_arg(), "127.0.0.1:8080:127.0.0.1:8080");
+
+        let spec = ForwardSpec::parse("::1:8080").unwrap();
+        assert_eq!(spec.ssh_forward_arg(), "[::1]:8080:127.0.0.1:8080");
     }
 
     #[test]
@@ -1661,6 +1684,9 @@ mod tests {
 
         let spec = ForwardSpec::parse("0.0.0.0:8080").unwrap();
         assert_eq!(spec.access_url(), "http://localhost:8080/");
+
+        let spec = ForwardSpec::parse("::1:8080").unwrap();
+        assert_eq!(spec.access_url(), "http://[::1]:8080/");
     }
 
     #[test]
