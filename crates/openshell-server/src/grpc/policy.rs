@@ -19,7 +19,7 @@ use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 #[cfg(test)]
 use crate::provider_profile_sources::ProviderProfileSources;
-use openshell_core::net::is_internal_ip;
+use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -906,15 +906,23 @@ async fn resolve_proposal_approval_mode(
     Ok((false, "default"))
 }
 
+struct AutoApproveChunkContext<'a> {
+    sandbox: &'a Sandbox,
+    workspace: &'a str,
+    source: &'a str,
+    resolved_from: &'a str,
+    current_policy: &'a ProtoSandboxPolicy,
+    credential_set: &'a CredentialSet,
+}
+
 async fn auto_approve_chunk(
     state: &Arc<ServerState>,
-    sandbox_id: &str,
-    workspace: &str,
-    sandbox_name: &str,
     chunk_id: &str,
-    source: &str,
-    resolved_from: &str,
+    context: AutoApproveChunkContext<'_>,
 ) -> Result<(), Status> {
+    let sandbox_id = context.sandbox.object_id();
+    let sandbox_name = context.sandbox.object_name();
+
     // Same gate the human-driven approve paths apply: if a global policy is
     // active, sandbox-scoped chunk approvals are meaningless because
     // `GetSandboxConfig` prefers the global policy. Auto-approving here
@@ -937,8 +945,47 @@ async fn auto_approve_chunk(
         return Ok(());
     }
 
+    // Mechanistic dedup may return an existing row whose proposed rule was
+    // edited after its original validation. Re-run the prover against that
+    // stored rule instead of trusting the incoming proposal's verdict.
+    let rule = decode_draft_chunk_rule(&chunk)?
+        .ok_or_else(|| Status::failed_precondition("draft chunk has no proposed rule"))?;
+    let validation_result = validation_result_for_agent_proposal(
+        context.current_policy.clone(),
+        &chunk.rule_name,
+        &rule,
+        context.credential_set,
+    );
+    if validation_result != "prover: no new findings" {
+        info!(
+            sandbox_id = %sandbox_id,
+            chunk_id = %chunk_id,
+            rule_name = %chunk.rule_name,
+            validation_result = %validation_result,
+            source = %context.source,
+            resolved_from = %context.resolved_from,
+            "Auto-approval skipped: current stored rule has prover findings"
+        );
+        return Ok(());
+    }
+
+    let security_notes = current_draft_chunk_security_notes(&chunk)?;
+    if !security_notes.is_empty() {
+        info!(
+            sandbox_id = %sandbox_id,
+            chunk_id = %chunk_id,
+            rule_name = %chunk.rule_name,
+            security_notes = %security_notes,
+            source = %context.source,
+            resolved_from = %context.resolved_from,
+            "Auto-approval skipped: current rule is security-flagged"
+        );
+        return Ok(());
+    }
+
     let (version, hash) =
-        merge_chunk_into_policy(state.store.as_ref(), sandbox_id, workspace, &chunk).await?;
+        merge_chunk_into_policy(state.store.as_ref(), sandbox_id, context.workspace, &chunk)
+            .await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
     let now_ms = current_time_ms();
@@ -950,10 +997,10 @@ async fn auto_approve_chunk(
 
     state.sandbox_watch_bus.notify(sandbox_id);
 
-    let source_label = if source.is_empty() {
+    let source_label = if context.source.is_empty() {
         "unspecified"
     } else {
-        source
+        context.source
     };
     emit_gateway_policy_auto_approve_audit_log(
         sandbox_id,
@@ -964,7 +1011,7 @@ async fn auto_approve_chunk(
         version,
         &hash,
         source_label,
-        resolved_from,
+        context.resolved_from,
     );
 
     info!(
@@ -974,7 +1021,7 @@ async fn auto_approve_chunk(
         version = version,
         policy_hash = %hash,
         source = %source_label,
-        resolved_from = %resolved_from,
+        resolved_from = %context.resolved_from,
         "Auto-approved chunk: no new prover findings"
     );
 
@@ -2669,13 +2716,15 @@ pub(super) async fn handle_submit_policy_analysis(
             .map(Message::encode_to_vec)
             .unwrap_or_default();
 
-        let rule_ref = chunk.proposed_rule.as_ref();
+        let rule_ref = chunk.proposed_rule.as_ref().expect("checked above");
         let (ep_host, ep_port) = rule_ref
-            .and_then(|r| r.endpoints.first())
+            .endpoints
+            .first()
             .map(|ep| (ep.host.to_lowercase(), ep.port as i32))
             .unwrap_or_default();
         let ep_binary = rule_ref
-            .and_then(|r| r.binaries.first())
+            .binaries
+            .first()
             .map(|b| b.path.clone())
             .unwrap_or_default();
 
@@ -2686,7 +2735,7 @@ pub(super) async fn handle_submit_policy_analysis(
         let validation_result = validation_result_for_agent_proposal(
             current_policy.clone(),
             &chunk.rule_name,
-            chunk.proposed_rule.as_ref().expect("checked above"),
+            rule_ref,
             &credential_set,
         );
 
@@ -2701,10 +2750,7 @@ pub(super) async fn handle_submit_policy_analysis(
             rule_name: chunk.rule_name.clone(),
             proposed_rule: proposed_rule_bytes,
             rationale: chunk.rationale.clone(),
-            security_notes: generate_security_notes(
-                &ep_host,
-                u16::try_from(ep_port as u32).unwrap_or(0),
-            ),
+            security_notes: generate_security_notes(rule_ref),
             confidence: f64::from(chunk.confidence.clamp(0.0, 1.0)),
             created_at_ms: now_ms,
             decided_at_ms: None,
@@ -2784,15 +2830,17 @@ pub(super) async fn handle_submit_policy_analysis(
         // string means findings or infrastructure error, both of which
         // require human attention.
         if auto_approve_enabled
-            && validation_result == "prover: no new findings"
             && let Err(err) = auto_approve_chunk(
                 state,
-                &sandbox_id,
-                &workspace,
-                sandbox.object_name(),
                 &effective_id,
-                &req.analysis_mode,
-                resolved_from,
+                AutoApproveChunkContext {
+                    sandbox: &sandbox,
+                    workspace: &workspace,
+                    source: &req.analysis_mode,
+                    resolved_from,
+                    current_policy: &current_policy,
+                    credential_set: &credential_set,
+                },
             )
             .await
         {
@@ -3152,12 +3200,13 @@ async fn handle_approve_all_draft_chunks_inner(
     let mut last_hash = String::new();
 
     for chunk in &pending_chunks {
-        if !req.include_security_flagged && !chunk.security_notes.is_empty() {
+        let security_notes = current_draft_chunk_security_notes(chunk)?;
+        if !req.include_security_flagged && !security_notes.is_empty() {
             info!(
                 sandbox_id = %sandbox_id,
                 chunk_id = %chunk.id,
                 rule_name = %chunk.rule_name,
-                security_notes = %chunk.security_notes,
+                security_notes = %security_notes,
                 "ApproveAllDraftChunks: skipping security-flagged chunk"
             );
             chunks_skipped += 1;
@@ -3577,17 +3626,27 @@ fn compute_config_revision(
     u64::from_le_bytes(bytes)
 }
 
-fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk, Status> {
-    use openshell_core::proto::NetworkPolicyRule;
-
-    let proposed_rule = if record.proposed_rule.is_empty() {
-        None
+fn decode_draft_chunk_rule(record: &DraftChunkRecord) -> Result<Option<NetworkPolicyRule>, Status> {
+    if record.proposed_rule.is_empty() {
+        Ok(None)
     } else {
-        Some(
-            NetworkPolicyRule::decode(record.proposed_rule.as_slice())
-                .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?,
-        )
-    };
+        NetworkPolicyRule::decode(record.proposed_rule.as_slice())
+            .map(Some)
+            .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))
+    }
+}
+
+fn current_draft_chunk_security_notes(record: &DraftChunkRecord) -> Result<String, Status> {
+    Ok(decode_draft_chunk_rule(record)?
+        .as_ref()
+        .map_or_else(String::new, generate_security_notes))
+}
+
+fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk, Status> {
+    let proposed_rule = decode_draft_chunk_rule(record)?;
+    let security_notes = proposed_rule
+        .as_ref()
+        .map_or_else(String::new, generate_security_notes);
 
     Ok(PolicyChunk {
         id: record.id.clone(),
@@ -3595,7 +3654,7 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
         rule_name: record.rule_name.clone(),
         proposed_rule,
         rationale: record.rationale.clone(),
-        security_notes: record.security_notes.clone(),
+        security_notes,
         confidence: record.confidence as f32,
         created_at_ms: record.created_at_ms,
         decided_at_ms: record.decided_at_ms.unwrap_or(0),
@@ -3636,41 +3695,90 @@ fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> San
     }
 }
 
+fn allowed_ip_is_internal(entry: &str) -> bool {
+    use openshell_core::net::{is_always_blocked_net, is_internal_net};
+
+    let parsed = entry.parse::<ipnet::IpNet>().or_else(|_| {
+        entry.parse::<IpAddr>().map(|ip| match ip {
+            IpAddr::V4(v4) => ipnet::IpNet::V4(ipnet::Ipv4Net::from(v4)),
+            IpAddr::V6(v6) => ipnet::IpNet::V6(ipnet::Ipv6Net::from(v6)),
+        })
+    });
+    let Ok(net) = parsed else {
+        return false;
+    };
+
+    // These remain hard validation failures, not warning-only destinations.
+    if is_always_blocked_net(net) {
+        return false;
+    }
+
+    is_internal_net(net)
+}
+
 /// Re-validate security notes server-side for a proposed policy chunk.
-fn generate_security_notes(host: &str, port: u16) -> String {
+fn generate_security_notes(rule: &NetworkPolicyRule) -> String {
     let mut notes = Vec::new();
 
-    // Flag destinations that are an internal/private address. Parse the host as
-    // an IP literal and defer to the canonical RFC-accurate classifier
-    // (openshell-core net::is_internal_ip) rather than naive string prefixes:
-    // `starts_with("172.")` wrongly matched 172.0-15 / 172.32-255 (RFC 1918 is
-    // only 172.16.0.0/12) and missed CGNAT (100.64.0.0/10), IPv6 ULA, etc. The
-    // "localhost" hostname is not an IP literal, so it is checked separately.
-    // See #1777.
-    let resolves_internal = host.parse::<IpAddr>().is_ok_and(is_internal_ip);
-    if resolves_internal || host == "localhost" {
-        notes.push(format!(
-            "Destination '{host}' appears to be an internal/private address."
-        ));
-    }
+    for endpoint in &rule.endpoints {
+        let host = endpoint.host.to_lowercase();
 
-    if host.contains('*') {
-        notes.push(format!(
-            "Host '{host}' contains a wildcard — this may match unintended destinations."
-        ));
-    }
+        // Flag destinations that are an internal/private address. Parse the host as
+        // an IP literal and defer to the canonical RFC-accurate classifier
+        // (openshell-core net::is_internal_ip) rather than naive string prefixes:
+        // `starts_with("172.")` wrongly matched 172.0-15 / 172.32-255 (RFC 1918 is
+        // only 172.16.0.0/12) and missed CGNAT (100.64.0.0/10), IPv6 ULA, etc. The
+        // Always-blocked destinations are rejected by merge validation instead
+        // of being presented as advisory findings. See #1777.
+        let resolves_advisory_internal = host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| is_internal_ip(ip) && !is_always_blocked_ip(ip));
+        if resolves_advisory_internal {
+            notes.push(format!(
+                "Destination '{host}' appears to be an internal/private address."
+            ));
+        }
 
-    if port > 49152 {
-        notes.push(format!(
-            "Port {port} is in the ephemeral range — this may be a temporary service."
-        ));
-    }
+        if host.contains('*') {
+            notes.push(format!(
+                "Host '{host}' contains a wildcard — this may match unintended destinations."
+            ));
+        }
 
-    const DB_PORTS: [u16; 7] = [5432, 3306, 6379, 27017, 9200, 11211, 5672];
-    if DB_PORTS.contains(&port) {
-        notes.push(format!(
-            "Port {port} is a well-known database/service port."
-        ));
+        for allowed_ip in &endpoint.allowed_ips {
+            if allowed_ip_is_internal(allowed_ip) {
+                notes.push(format!(
+                    "allowed_ips includes private/internal range '{allowed_ip}'."
+                ));
+            }
+        }
+        if host.trim().is_empty() && !endpoint.allowed_ips.is_empty() {
+            notes.push(
+                "allowed_ips allowlist is hostless and may match any hostname resolving within the configured range."
+                    .to_string(),
+            );
+        }
+
+        let ports = if endpoint.ports.is_empty() {
+            std::slice::from_ref(&endpoint.port)
+        } else {
+            endpoint.ports.as_slice()
+        };
+        for raw_port in ports {
+            let port = u16::try_from(*raw_port).unwrap_or(0);
+            if port > 49152 {
+                notes.push(format!(
+                    "Port {port} is in the ephemeral range — this may be a temporary service."
+                ));
+            }
+
+            const DB_PORTS: [u16; 7] = [5432, 3306, 6379, 27017, 9200, 11211, 5672];
+            if DB_PORTS.contains(&port) {
+                notes.push(format!(
+                    "Port {port} is a well-known database/service port."
+                ));
+            }
+        }
     }
 
     notes.join(" ")
@@ -4444,25 +4552,159 @@ mod tests {
         request
     }
 
+    fn security_notes_for_host(host: &str) -> String {
+        generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                host: host.to_string(),
+                port: 80,
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
     #[test]
     fn security_notes_use_canonical_internal_ip_classifier() {
         // RFC 1918 is 172.16.0.0/12 only: the old starts_with("172.") prefix
         // wrongly flagged 172.15/172.32 and missed CGNAT (100.64.0.0/10). #1777.
-        assert!(generate_security_notes("172.16.0.1", 80).contains("internal/private"));
-        assert!(!generate_security_notes("172.15.0.1", 80).contains("internal/private"));
-        assert!(!generate_security_notes("172.32.0.1", 80).contains("internal/private"));
-        assert!(generate_security_notes("100.64.0.1", 80).contains("internal/private"));
-        assert!(generate_security_notes("10.0.0.1", 80).contains("internal/private"));
-        assert!(generate_security_notes("192.168.1.1", 80).contains("internal/private"));
-        assert!(generate_security_notes("127.0.0.1", 80).contains("internal/private"));
-        assert!(generate_security_notes("localhost", 80).contains("internal/private"));
-        assert!(!generate_security_notes("8.8.8.8", 80).contains("internal/private"));
+        assert!(security_notes_for_host("172.16.0.1").contains("internal/private"));
+        assert!(!security_notes_for_host("172.15.0.1").contains("internal/private"));
+        assert!(!security_notes_for_host("172.32.0.1").contains("internal/private"));
+        assert!(security_notes_for_host("100.64.0.1").contains("internal/private"));
+        assert!(security_notes_for_host("10.0.0.1").contains("internal/private"));
+        assert!(security_notes_for_host("192.168.1.1").contains("internal/private"));
+        assert!(!security_notes_for_host("8.8.8.8").contains("internal/private"));
         // Hostnames that merely start with a private-range prefix must NOT be
         // flagged: classification parses an IP literal, not a string prefix. #1824.
-        assert!(!generate_security_notes("10.example.com", 80).contains("internal/private"));
-        assert!(!generate_security_notes("172.example.com", 80).contains("internal/private"));
+        assert!(!security_notes_for_host("10.example.com").contains("internal/private"));
+        assert!(!security_notes_for_host("172.example.com").contains("internal/private"));
         // IPv6 ULA (fc00::/7, RFC 4193) is internal/private.
-        assert!(generate_security_notes("fd00::1", 80).contains("internal/private"));
+        assert!(security_notes_for_host("fd00::1").contains("internal/private"));
+    }
+
+    #[test]
+    fn security_notes_exclude_always_blocked_destinations() {
+        let notes = generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![
+                NetworkEndpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+                NetworkEndpoint {
+                    host: "169.254.169.254".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+                NetworkEndpoint {
+                    host: "localhost".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+                NetworkEndpoint {
+                    host: "metadata.google.internal".to_string(),
+                    port: 443,
+                    allowed_ips: vec![
+                        "127.0.0.0/8".to_string(),
+                        "169.254.0.0/16".to_string(),
+                        "::/128".to_string(),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        assert!(notes.is_empty(), "{notes}");
+    }
+
+    #[test]
+    fn security_notes_flag_private_allowed_ips() {
+        let notes = generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                host: "service.example.com".to_string(),
+                port: 443,
+                allowed_ips: vec!["10.0.0.0/8".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        assert!(notes.contains("allowed_ips includes private/internal range '10.0.0.0/8'."));
+    }
+
+    #[test]
+    fn security_notes_flag_cidr_overlapping_cgnat() {
+        let notes = generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                host: "service.example.com".to_string(),
+                port: 443,
+                allowed_ips: vec!["100.0.0.0/9".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        assert!(notes.contains("allowed_ips includes private/internal range '100.0.0.0/9'."));
+    }
+
+    #[test]
+    fn security_notes_do_not_flag_large_public_allowed_ips() {
+        let notes = generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                host: "service.example.com".to_string(),
+                port: 443,
+                allowed_ips: vec!["8.8.0.0/16".to_string(), "8.8.8.0/24".to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        assert!(notes.is_empty(), "{notes}");
+    }
+
+    #[test]
+    fn security_notes_flag_hostless_allowed_ips() {
+        let notes = generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![NetworkEndpoint {
+                allowed_ips: vec!["192.168.0.0/16".to_string()],
+                port: 443,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        assert!(notes.contains("allowed_ips includes private/internal range '192.168.0.0/16'."));
+        assert!(notes.contains(
+            "allowed_ips allowlist is hostless and may match any hostname resolving within the configured range."
+        ));
+    }
+
+    #[test]
+    fn security_notes_inspect_all_endpoints_and_effective_ports() {
+        let notes = generate_security_notes(&NetworkPolicyRule {
+            endpoints: vec![
+                NetworkEndpoint {
+                    host: "service.example.com".to_string(),
+                    port: 443,
+                    ..Default::default()
+                },
+                NetworkEndpoint {
+                    host: "*.internal.example".to_string(),
+                    port: 3306,
+                    ports: vec![5432, 50_000],
+                    allowed_ips: vec!["172.16.0.0/12".to_string()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        assert!(notes.contains("Host '*.internal.example' contains a wildcard"));
+        assert!(notes.contains("allowed_ips includes private/internal range '172.16.0.0/12'."));
+        assert!(notes.contains("Port 5432 is a well-known database/service port."));
+        assert!(notes.contains("Port 50000 is in the ephemeral range"));
+        assert!(!notes.contains("Port 3306"));
     }
 
     #[test]
@@ -6670,6 +6912,497 @@ mod tests {
         save_global_settings(state.store.as_ref(), &settings)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn approve_all_skips_private_allowed_ips_unless_included() {
+        let state = test_server_state().await;
+        let sandbox_name = "private-allowed-ips";
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-private-allowed-ips",
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "private_service".to_string(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        name: "private_service".to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "service.example.com".to_string(),
+                            port: 443,
+                            allowed_ips: vec!["10.0.0.0/8".to_string()],
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                            ..Default::default()
+                        }],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = submit.accepted_chunk_ids[0].clone();
+        let chunk = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            chunk
+                .security_notes
+                .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
+        );
+
+        let skipped = handle_approve_all_draft_chunks(
+            &state,
+            with_user(Request::new(ApproveAllDraftChunksRequest {
+                name: sandbox_name.to_string(),
+                include_security_flagged: false,
+                workspace: "default".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(skipped.chunks_approved, 0);
+        assert_eq!(skipped.chunks_skipped, 1);
+        assert_eq!(
+            state
+                .store
+                .get_draft_chunk(&chunk_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+
+        let approved = handle_approve_all_draft_chunks(
+            &state,
+            with_user(Request::new(ApproveAllDraftChunksRequest {
+                name: sandbox_name.to_string(),
+                include_security_flagged: true,
+                workspace: "default".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(approved.chunks_approved, 1);
+        assert_eq!(approved.chunks_skipped, 0);
+        assert_eq!(
+            state
+                .store
+                .get_draft_chunk(&chunk_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_recomputes_security_notes_before_read_and_approve_all() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-edit-security-notes";
+        let sandbox_name = "edit-security-notes";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let safe_rule = NetworkPolicyRule {
+            name: "edited_service".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "service.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "edited_service".to_string(),
+                    proposed_rule: Some(safe_rule.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = submit.accepted_chunk_ids[0].clone();
+
+        let mut private_rule = safe_rule;
+        private_rule.endpoints[0].allowed_ips = vec!["10.0.0.0/8".to_string()];
+        handle_edit_draft_chunk(
+            &state,
+            with_user(Request::new(EditDraftChunkRequest {
+                name: sandbox_name.to_string(),
+                chunk_id: chunk_id.clone(),
+                proposed_rule: Some(private_rule),
+                workspace: "default".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+
+        let stored = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.security_notes.is_empty());
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.to_string(),
+                status_filter: String::new(),
+                workspace: "default".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(
+            draft.chunks[0]
+                .security_notes
+                .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
+        );
+
+        let skipped = handle_approve_all_draft_chunks(
+            &state,
+            with_user(Request::new(ApproveAllDraftChunksRequest {
+                name: sandbox_name.to_string(),
+                include_security_flagged: false,
+                workspace: "default".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(skipped.chunks_approved, 0);
+        assert_eq!(skipped.chunks_skipped, 1);
+        assert_eq!(
+            state
+                .store
+                .get_draft_chunk(&chunk_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn approve_all_recomputes_empty_legacy_security_notes() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-stale-security-notes";
+        let sandbox_name = "stale-security-notes";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let rule = NetworkPolicyRule {
+            name: "legacy_private".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "service.example.com".to_string(),
+                port: 443,
+                allowed_ips: vec!["10.0.0.0/8".to_string()],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let mut chunk = pending_draft_chunk("legacy-private", sandbox_id);
+        chunk.rule_name = rule.name.clone();
+        chunk.proposed_rule = rule.encode_to_vec();
+        chunk.host = "service.example.com".to_string();
+        chunk.port = 443;
+        state
+            .store
+            .put_draft_chunk(&chunk, None, "default")
+            .await
+            .unwrap();
+
+        let skipped = handle_approve_all_draft_chunks(
+            &state,
+            with_user(Request::new(ApproveAllDraftChunksRequest {
+                name: sandbox_name.to_string(),
+                include_security_flagged: false,
+                workspace: "default".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(skipped.chunks_approved, 0);
+        assert_eq!(skipped.chunks_skipped, 1);
+        assert_eq!(
+            state
+                .store
+                .get_draft_chunk(&chunk.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn security_flagged_empty_delta_does_not_auto_approve() {
+        let state = test_server_state().await;
+        let sandbox_name = "security-flagged-auto";
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-security-flagged-auto",
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        seed_sandbox_approval_mode(&state, sandbox_name, "auto").await;
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                analysis_mode: "mechanistic".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "private_service".to_string(),
+                    proposed_rule: Some(NetworkPolicyRule {
+                        name: "private_service".to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "service.example.com".to_string(),
+                            port: 443,
+                            allowed_ips: vec!["10.0.0.0/8".to_string()],
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".to_string(),
+                            ..Default::default()
+                        }],
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.to_string(),
+                status_filter: String::new(),
+                workspace: "default".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(draft.chunks[0].validation_result, "prover: no new findings");
+        assert_eq!(draft.chunks[0].status, "pending");
+        assert!(
+            draft.chunks[0]
+                .security_notes
+                .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
+        );
+    }
+
+    #[tokio::test]
+    async fn mechanistic_dedup_auto_approval_rechecks_edited_stored_rule() {
+        let state = test_server_state().await;
+        let sandbox_id = "sb-stored-prover-verdict";
+        let sandbox_name = "stored-prover-verdict";
+        state
+            .store
+            .put_message(&test_provider("github-pat", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                sandbox_name,
+                ProtoSandboxPolicy::default(),
+                vec!["github-pat".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        // The first observation is clean and remains pending in the default
+        // manual mode. Its normalized endpoint columns become the dedup key.
+        let safe_rule = NetworkPolicyRule {
+            name: "safe_service".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "service.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let first = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                analysis_mode: "mechanistic".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: safe_rule.name.clone(),
+                    proposed_rule: Some(safe_rule.clone()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = first.accepted_chunk_ids[0].clone();
+        let original = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.status, "pending");
+        assert_eq!(original.validation_result, "prover: no new findings");
+
+        // Editing only replaces the stored protobuf payload; the normalized
+        // dedup columns remain service.example.com:443 + /usr/bin/curl. This
+        // replacement has no advisory notes but does add credentialed reach.
+        let finding_rule = NetworkPolicyRule {
+            name: safe_rule.name.clone(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: safe_rule.binaries.clone(),
+        };
+        assert!(generate_security_notes(&finding_rule).is_empty());
+        let credential_set = CredentialSet {
+            credentials: vec![Credential {
+                name: "github-pat".to_string(),
+                cred_type: "github".to_string(),
+                scopes: Vec::new(),
+                injected_via: String::new(),
+                target_hosts: vec!["api.github.com".to_string()],
+            }],
+            api_registries: HashMap::new(),
+        };
+        assert!(
+            validation_result_for_agent_proposal(
+                ProtoSandboxPolicy::default(),
+                &finding_rule.name,
+                &finding_rule,
+                &credential_set,
+            )
+            .contains("credential_reach_expansion")
+        );
+        handle_edit_draft_chunk(
+            &state,
+            with_user(Request::new(EditDraftChunkRequest {
+                name: sandbox_name.to_string(),
+                chunk_id: chunk_id.clone(),
+                proposed_rule: Some(finding_rule),
+                workspace: "default".to_string(),
+            })),
+        )
+        .await
+        .unwrap();
+
+        seed_sandbox_approval_mode(&state, sandbox_name, "auto").await;
+
+        // The duplicate incoming proposal is clean. Dedup returns the edited
+        // row, so auto-approval must evaluate that stored payload instead.
+        let duplicate = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                analysis_mode: "mechanistic".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: safe_rule.name.clone(),
+                    proposed_rule: Some(safe_rule),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(duplicate.accepted_chunk_ids, vec![chunk_id.clone()]);
+
+        let stored = state
+            .store
+            .get_draft_chunk(&chunk_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "pending");
+        let stored_rule = NetworkPolicyRule::decode(stored.proposed_rule.as_slice()).unwrap();
+        assert_eq!(stored_rule.endpoints[0].host, "api.github.com");
+        assert!(generate_security_notes(&stored_rule).is_empty());
+        assert!(
+            state
+                .store
+                .get_latest_policy(sandbox_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -9106,9 +9839,9 @@ mod tests {
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
-            name: "allow_10_0_0_5_8080".to_string(),
+            name: "allow_example_8080".to_string(),
             endpoints: vec![NetworkEndpoint {
-                host: "10.0.0.5".to_string(),
+                host: "example.com".to_string(),
                 port: 8080,
                 ..Default::default()
             }],
@@ -9128,7 +9861,7 @@ mod tests {
                         name: sandbox_name,
                         analysis_mode: "mechanistic".to_string(),
                         proposed_chunks: vec![PolicyChunk {
-                            rule_name: "allow_10_0_0_5_8080".to_string(),
+                            rule_name: "allow_example_8080".to_string(),
                             proposed_rule: Some(rule),
                             ..Default::default()
                         }],
@@ -9207,7 +9940,7 @@ mod tests {
             .expect("auto-approve must have persisted a policy revision");
         let policy = SandboxPolicy::decode(latest.policy_payload.as_slice()).unwrap();
         assert!(
-            policy.network_policies.contains_key("allow_10_0_0_5_8080"),
+            policy.network_policies.contains_key("allow_example_8080"),
             "approved rule must stay merged after resubmit; keys: {:?}",
             policy.network_policies.keys().collect::<Vec<_>>()
         );

@@ -122,17 +122,25 @@ through the proposal loop instead of treating the denial as terminal.
    policy plus the sandbox's attached-provider credential set, then computes
    the delta of findings between the current baseline and the merged policy.
 3. **Auto-approval gate (proposer-agnostic, opt-in).** Auto-approval fires
-   when *both* (a) the prover delta is empty (`prover: no new findings`) AND
-   (b) the `proposal_approval_mode` setting resolves to `"auto"` — gateway
-   scope wins, sandbox scope is the per-sandbox override, default is
-   `"manual"`. When both hold, the gateway internally invokes the approve
-   path with actor identity `system:auto`. The audit event uses
-   `CONFIG:APPROVED` and carries `auto=true`, `source=<mode>`,
-   `prover_delta=empty`, and `resolved_from=<gateway|sandbox>` as unmapped
-   fields, with message text `"auto-approved: no new prover findings"` —
-   never `safe`. The opt-in gate preserves OpenShell's default-deny
-   posture: with no setting at either scope, every proposal lands in
-   `pending` for human review, even when the prover sees no findings.
+   only when *all three* conditions hold: (a) `proposal_approval_mode`
+   resolves to `"auto"` — gateway scope wins, sandbox scope is the
+   per-sandbox override, default is `"manual"`; (b) the prover delta is empty
+   (`prover: no new findings`); and (c) the security notes recomputed from
+   the chunk's current proposed rule are empty (see
+   [Security-notes gate](#security-notes-gate)). Before merging, the gateway
+   reloads the stored chunk and reruns both checks on its current rule. This is
+   important after edits and mechanistic deduplication: the stored rule, not a
+   duplicate incoming payload or stale persisted analysis, controls the
+   decision. The recalculated prover verdict is decision-local rather than
+   persisted, so `validation_result` reads can still show the submit-time
+   verdict after an edit or deduplication. Decode, prover, or merge failures
+   leave the chunk pending. The audit event uses `CONFIG:APPROVED` and carries
+   `auto=true`, `source=<mode>`, `prover_delta=empty`, and
+   `resolved_from=<gateway|sandbox>` as unmapped fields, with message text
+   `"auto-approved: no new prover findings"` — never `safe`. The opt-in gate
+   preserves OpenShell's default-deny posture: with no setting at either
+   scope, every proposal lands in `pending` for human review, even
+   when the prover sees no findings.
 4. **Implicit supersede.** On any successful submission, the gateway scans
    the sandbox's pending chunks for matches on `(host, port, binary)` and
    auto-rejects the older ones with reason `"superseded by chunk X"`. This
@@ -151,6 +159,30 @@ through the proposal loop instead of treating the denial as terminal.
    would leave the governance ledger disagreeing with the still-enforced
    policy.
 6. **Escalation.** Anything else lands in `pending` for human review.
+
+### Security-notes gate
+
+Separately from the prover, each chunk carries advisory `security_notes`.
+Reads, bulk approval, and auto-approval regenerate them from the current
+stored proposed rule instead of trusting a persisted value that may be stale
+after an edit. Non-empty notes block auto-approval and make
+`ApproveAllDraftChunks` skip the chunk unless `include_security_flagged` is
+set. The chunk stays `pending`; an explicit human approval can still merge a
+flagged chunk.
+
+Private/internal destinations are advisory, not blocking. A literal endpoint
+IP, `allowed_ips` entry, or CIDR intersection in RFC 1918, CGNAT
+`100.64.0.0/10`, IPv6 ULA `fc00::/7`, or another special-use range covered by
+`openshell-core` `net::is_internal_net` produces a note. A hostless rule
+carrying `allowed_ips` earns an extra note because it can match any hostname
+resolving into the range.
+
+Always-blocked destinations are separate from this advisory classification.
+Loopback, link-local, and unspecified IPs/CIDRs, plus `localhost` and known
+metadata endpoint hostnames, are excluded from security notes. Submit and edit
+may store such a draft, but existing merge validation rejects it when an
+approval attempts to add it to policy; runtime SSRF protections remain the
+final enforcement boundary.
 
 ## What the prover decides
 
