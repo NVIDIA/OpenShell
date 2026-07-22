@@ -20,6 +20,9 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 
 type GrpcClient = OpenShellClient<Channel>;
 
+const MAX_SANDBOX_NAME_LEN: usize = 19;
+const SANDBOX_NAME_PREFIX: &str = "osct";
+
 /// Explicit connection material for an existing gateway installation.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectionOptions {
@@ -32,6 +35,10 @@ pub struct ConnectionOptions {
 }
 
 async fn grpc_client(server: &str, options: &ConnectionOptions) -> Result<GrpcClient> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
+
     let mut endpoint = Endpoint::from_shared(server.to_string())
         .into_diagnostic()?
         .connect_timeout(Duration::from_secs(10))
@@ -102,7 +109,7 @@ fn all_scenarios() -> &'static [Scenario] {
         Scenario {
             name: "lifecycle",
             description: "Create → running → stop → delete completes without error",
-            sandbox_name_stems: &["lifecycle"],
+            sandbox_name_stems: &["life"],
         },
         Scenario {
             name: "not-found",
@@ -112,7 +119,7 @@ fn all_scenarios() -> &'static [Scenario] {
         Scenario {
             name: "idempotent-delete",
             description: "Deleting an already-deleted sandbox returns NOT_FOUND",
-            sandbox_name_stems: &["idempotent-delete"],
+            sandbox_name_stems: &["del"],
         },
         Scenario {
             name: "validate",
@@ -122,12 +129,12 @@ fn all_scenarios() -> &'static [Scenario] {
         Scenario {
             name: "concurrent",
             description: "Two sandboxes created simultaneously do not interfere",
-            sandbox_name_stems: &["concurrent-a", "concurrent-b"],
+            sandbox_name_stems: &["con-a", "con-b"],
         },
         Scenario {
             name: "labels",
             description: "Labels are persisted on create and filter list results correctly",
-            sandbox_name_stems: &["labels-a", "labels-b"],
+            sandbox_name_stems: &["lbl-a", "lbl-b"],
         },
         Scenario {
             name: "exec",
@@ -137,7 +144,7 @@ fn all_scenarios() -> &'static [Scenario] {
         Scenario {
             name: "process-hardening",
             description: "Sandbox processes start with core dumps disabled",
-            sandbox_name_stems: &["process-hardening"],
+            sandbox_name_stems: &["hard"],
         },
     ]
 }
@@ -146,9 +153,16 @@ impl Scenario {
     fn sandbox_names(&self, run_id: &str) -> Vec<String> {
         self.sandbox_name_stems
             .iter()
-            .map(|stem| format!("conformance-{stem}-{run_id}"))
+            .map(|stem| sandbox_name(stem, run_id))
             .collect()
     }
+}
+
+fn sandbox_name(stem: &str, run_id: &str) -> String {
+    let stem_budget =
+        MAX_SANDBOX_NAME_LEN.saturating_sub(SANDBOX_NAME_PREFIX.len() + run_id.len() + 2);
+    let stem = &stem[..stem.len().min(stem_budget)];
+    format!("{SANDBOX_NAME_PREFIX}-{stem}-{run_id}")
 }
 
 fn select_scenarios(filter: Option<&str>) -> Result<Vec<&'static Scenario>> {
@@ -397,7 +411,7 @@ async fn wait_for_not_found(client: &mut GrpcClient, sandbox_name: &str) -> Resu
 /// deletes it. Verifies that the sandbox appears in the list between create
 /// and delete, and that delete reports it as deleted.
 async fn scenario_lifecycle(client: &mut GrpcClient, run_id: &str) -> Result<()> {
-    let sandbox_name = format!("conformance-lifecycle-{run_id}");
+    let sandbox_name = sandbox_name("life", run_id);
 
     // ── 1. Create ────────────────────────────────────────────────────────
     let response = client
@@ -478,7 +492,7 @@ async fn scenario_lifecycle(client: &mut GrpcClient, run_id: &str) -> Result<()>
 /// Verifies that `GetSandbox` and `DeleteSandbox` return `NOT_FOUND` for a
 /// name that was never created.
 async fn scenario_not_found(client: &mut GrpcClient, run_id: &str) -> Result<()> {
-    let phantom_name = format!("conformance-not-found-{run_id}");
+    let phantom_name = sandbox_name("miss", run_id);
 
     // ── 1. GetSandbox → NOT_FOUND ────────────────────────────────────────
     let err = client
@@ -521,7 +535,7 @@ async fn scenario_not_found(client: &mut GrpcClient, run_id: &str) -> Result<()>
 /// `deleted: true`), then deletes it again and asserts the second call returns
 /// `NOT_FOUND` because the gateway record has already been removed.
 async fn scenario_idempotent_delete(client: &mut GrpcClient, run_id: &str) -> Result<()> {
-    let sandbox_name = format!("conformance-idempotent-delete-{run_id}");
+    let sandbox_name = sandbox_name("del", run_id);
 
     // ── 1. Create ────────────────────────────────────────────────────────
     let response = client
@@ -650,8 +664,8 @@ async fn scenario_validate(client: &mut GrpcClient) -> Result<()> {
 /// Ready in parallel, verifies both appear in `ListSandboxes`, then deletes
 /// both. Any failure cleans up both sandboxes before returning.
 async fn scenario_concurrent(client: &mut GrpcClient, run_id: &str) -> Result<()> {
-    let name_a = format!("conformance-concurrent-a-{run_id}");
-    let name_b = format!("conformance-concurrent-b-{run_id}");
+    let name_a = sandbox_name("con-a", run_id);
+    let name_b = sandbox_name("con-b", run_id);
 
     // ── 1. Create both sandboxes concurrently ────────────────────────────
     let mut client_a = client.clone();
@@ -761,8 +775,8 @@ async fn scenario_concurrent(client: &mut GrpcClient, run_id: &str) -> Result<()
 /// returned. Labels are stored by the gateway on creation so no Ready wait
 /// is required; both sandboxes are deleted after the assertion.
 async fn scenario_labels(client: &mut GrpcClient, run_id: &str) -> Result<()> {
-    let name_a = format!("conformance-labels-a-{run_id}");
-    let name_b = format!("conformance-labels-b-{run_id}");
+    let name_a = sandbox_name("lbl-a", run_id);
+    let name_b = sandbox_name("lbl-b", run_id);
     let label_key = "conformance-scenario".to_string();
 
     // ── 1. Create two sandboxes with distinct label values ───────────────
@@ -924,7 +938,7 @@ async fn create_ready_sandbox(client: &mut GrpcClient, sandbox_name: &str) -> Re
 async fn scenario_exec(client: &mut GrpcClient, run_id: &str) -> Result<()> {
     const OUTPUT_MARKER: &str = "conformance-exec-ok";
 
-    let sandbox_name = format!("conformance-exec-{run_id}");
+    let sandbox_name = sandbox_name("exec", run_id);
     let sandbox_id = create_ready_sandbox(client, &sandbox_name).await?;
 
     let exec_result = async {
@@ -976,7 +990,7 @@ async fn scenario_exec(client: &mut GrpcClient, run_id: &str) -> Result<()> {
 async fn scenario_process_hardening(client: &mut GrpcClient, run_id: &str) -> Result<()> {
     const OUTPUT_MARKER: &str = "core-limit-ok";
 
-    let sandbox_name = format!("conformance-process-hardening-{run_id}");
+    let sandbox_name = sandbox_name("hard", run_id);
     let sandbox_id = create_ready_sandbox(client, &sandbox_name).await?;
     let command_result = exec_command(
         client,
@@ -1056,7 +1070,9 @@ pub fn conformance_list(output: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{all_scenarios, select_scenarios};
+    use std::collections::HashSet;
+
+    use super::{MAX_SANDBOX_NAME_LEN, all_scenarios, sandbox_name, select_scenarios};
 
     #[test]
     fn ci_scenario_set_contains_only_implemented_scenarios() {
@@ -1102,15 +1118,26 @@ mod tests {
         assert_eq!(
             names,
             [
-                "conformance-lifecycle-deadbeef",
-                "conformance-idempotent-delete-deadbeef",
-                "conformance-concurrent-a-deadbeef",
-                "conformance-concurrent-b-deadbeef",
-                "conformance-labels-a-deadbeef",
-                "conformance-labels-b-deadbeef",
-                "conformance-exec-deadbeef",
-                "conformance-process-hardening-deadbeef",
+                "osct-life-deadbeef",
+                "osct-del-deadbeef",
+                "osct-con-a-deadbeef",
+                "osct-con-b-deadbeef",
+                "osct-lbl-a-deadbeef",
+                "osct-lbl-b-deadbeef",
+                "osct-exec-deadbeef",
+                "osct-hard-deadbeef",
             ]
         );
+
+        assert!(names.iter().all(|name| name.len() <= MAX_SANDBOX_NAME_LEN));
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), names.len());
+    }
+
+    #[test]
+    fn sandbox_names_trim_long_stems_to_the_gateway_limit() {
+        let name = sandbox_name("unexpectedly-long-scenario-name", "deadbeef");
+
+        assert_eq!(name, "osct-unexp-deadbeef");
+        assert_eq!(name.len(), MAX_SANDBOX_NAME_LEN);
     }
 }
