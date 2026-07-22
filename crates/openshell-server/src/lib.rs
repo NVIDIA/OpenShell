@@ -402,6 +402,10 @@ pub(crate) async fn run_server(
     }
 
     state.compute.spawn_watchers(shutdown_rx.clone());
+    state.compute.spawn_sandbox_claim_activation(
+        Arc::new(warm_pod_activation::GatewaySupervisorBootstrapActivator::new(state.clone())),
+        shutdown_rx.clone(),
+    );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));

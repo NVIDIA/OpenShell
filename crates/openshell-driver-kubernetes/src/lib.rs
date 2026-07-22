@@ -5,6 +5,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod driver;
 pub mod grpc;
+pub mod sandboxclaim;
 
 pub use bootstrap::{
     K8sIdentityResolver, KubernetesSupervisorBootstrapIdentityProvider, LiveK8sResolver,
@@ -16,3 +17,4 @@ pub use config::{
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;
+pub use sandboxclaim::SandboxClaimActivationController;
