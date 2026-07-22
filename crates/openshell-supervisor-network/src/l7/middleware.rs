@@ -562,9 +562,7 @@ mod tests {
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let req = crate::l7::provider::L7Request {
             action: "POST".into(),
@@ -612,9 +610,7 @@ mod tests {
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
             secret_resolver: None,
-            activity_tx: None,
-            dynamic_credentials: None,
-            token_grant_resolver: None,
+            ..Default::default()
         };
         let req = crate::l7::provider::L7Request {
             action: "POST".into(),
