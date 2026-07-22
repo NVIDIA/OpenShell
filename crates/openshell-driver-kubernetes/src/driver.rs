@@ -1041,8 +1041,7 @@ impl KubernetesComputeDriver {
             .supported_agent_sandbox_api(self.watch_client.clone())
             .await?;
         let event_api: Api<KubeEventObj> = Api::namespaced(self.watch_client.clone(), &namespace);
-        let watcher_config =
-            watcher::Config::default().labels(&openshell_sandbox_label_selector());
+        let watcher_config = watcher::Config::default().labels(&openshell_sandbox_label_selector());
         let mut sandbox_stream = watcher::watcher(agent_sandbox_api.api, watcher_config).boxed();
         let mut event_stream = watcher::watcher(event_api, watcher::Config::default()).boxed();
         let (tx, rx) = mpsc::channel(256);
@@ -5922,5 +5921,4 @@ mod tests {
         };
         assert!(sandbox_id_from_object(&obj).is_err());
     }
-
 }
