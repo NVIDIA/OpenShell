@@ -7144,7 +7144,10 @@ fn parse_duration_to_ms(s: &str) -> Result<i64> {
     if s.is_empty() {
         return Err(miette::miette!("empty duration string"));
     }
-    let (num_str, unit) = s.split_at(s.len() - 1);
+    // Split off the last character by its UTF-8 length: indexing by byte
+    // length would panic on multi-byte units (e.g. "5\u{20ac}").
+    let last_len = s.chars().last().map_or(0, char::len_utf8);
+    let (num_str, unit) = s.split_at(s.len() - last_len);
     let num: i64 = num_str
         .parse()
         .map_err(|_| miette::miette!("invalid duration: {s} (expected e.g. 5m, 1h, 30s)"))?;
@@ -8891,12 +8894,12 @@ mod tests {
         git_sync_files, http_health_check, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
-        plaintext_gateway_is_remote, policy_revision_to_json, progress_step_from_metadata,
-        provider_profile_allows_empty_credentials, provisioning_timeout_message,
-        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
-        service_url_for_gateway,
+        parse_credential_pairs, parse_driver_config_json, parse_duration_to_ms,
+        parse_secret_material_env_pairs, plaintext_gateway_is_remote, policy_revision_to_json,
+        progress_step_from_metadata, provider_profile_allows_empty_credentials,
+        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
+        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
+        service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -9027,6 +9030,22 @@ mod tests {
             auth_mode: Some("cloudflare_jwt".to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn parse_duration_to_ms_parses_supported_units() {
+        assert_eq!(parse_duration_to_ms("30s").expect("parse"), 30_000);
+        assert_eq!(parse_duration_to_ms("5m").expect("parse"), 300_000);
+        assert_eq!(parse_duration_to_ms("1h").expect("parse"), 3_600_000);
+    }
+
+    #[test]
+    fn parse_duration_to_ms_rejects_multi_byte_unit_without_panicking() {
+        let err = parse_duration_to_ms("5\u{20ac}").expect_err("multi-byte unit should error");
+        assert!(err.to_string().contains("unknown duration unit"));
+
+        let err = parse_duration_to_ms("\u{20ac}").expect_err("missing number should error");
+        assert!(err.to_string().contains("invalid duration"));
     }
 
     #[test]
