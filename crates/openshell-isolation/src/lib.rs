@@ -26,7 +26,7 @@
 //! # Ordering is a security property
 //!
 //! The lifecycle states run in order: attach -> Bound -> confirm -> Ready ->
-//! start_agent -> Running. Nothing untrusted runs inside the boundary until it
+//! `start_agent` -> Running. Nothing untrusted runs inside the boundary until it
 //! is confirmed ready. This is enforced *by construction*: each transition
 //! consumes the prior state by value, and no state type has a public
 //! constructor, so the supervisor cannot skip a stage or run a workload before

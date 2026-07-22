@@ -52,6 +52,16 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// `openshell-sandbox`.
 pub const IN_POD_BACKEND_ID: &str = "in-pod";
 
+/// The well-known backend id of the Kubernetes sidecar topology.
+///
+/// Selected for the agent container, whose supervisor runs this backend to
+/// operate the workload; network mediation runs in a separate network-sidecar
+/// container that the backend coordinates. A distinct topology from `in-pod`.
+/// Lives in the contract crate because compute drivers create the
+/// [`TopologyDescriptor`] naming it; the implementation lives in
+/// `openshell-sandbox`.
+pub const SIDECAR_BACKEND_ID: &str = "sidecar";
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -190,6 +200,19 @@ impl TopologyDescriptor {
         }
     }
 
+    /// The descriptor for the Kubernetes sidecar topology's agent container: the
+    /// supervisor there resolves the sidecar backend. The payload is empty; the
+    /// backend reads its operational data (control socket, expected peer) from
+    /// the driver-controlled environment for now.
+    #[must_use]
+    pub fn sidecar() -> Self {
+        Self {
+            contract_version: CONTRACT_VERSION,
+            backend_id: SIDECAR_BACKEND_ID.to_string(),
+            payload: Vec::new(),
+        }
+    }
+
     /// Serialize for the driver-controlled environment transport
     /// (`OPENSHELL_TOPOLOGY_DESCRIPTOR`): `<version>:<backend_id>:<hex payload>`.
     /// Other transports deliver the same envelope with equivalent integrity.
@@ -251,7 +274,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if !hex.is_ascii() || hex.len() % 2 != 0 {
+    if !hex.is_ascii() || !hex.len().is_multiple_of(2) {
         return None;
     }
     (0..hex.len())
@@ -444,9 +467,11 @@ pub trait BoundBoundary: Send {
     async fn confirm(self: Box<Self>) -> Result<Box<dyn ReadyBoundary>, BackendError>;
 }
 
-/// Ready: mediation is initialized, standing enforcement is confirmed, and the
-/// backend is prepared to ensure the admitted launch-time controls are in force
-/// before untrusted execution. Only agent activation is possible from here.
+/// Ready: mediation is initialized and standing enforcement is confirmed.
+///
+/// The backend is prepared to ensure the admitted launch-time controls are in
+/// force before untrusted execution. Only agent activation is possible from
+/// here.
 #[async_trait]
 pub trait ReadyBoundary: Send {
     /// Make the admitted agent runnable behind the boundary and return its
@@ -459,10 +484,11 @@ pub trait ReadyBoundary: Send {
     async fn start_agent(self: Box<Self>) -> Result<Box<dyn RunningBoundary>, BackendError>;
 }
 
-/// Running: the agent is runnable behind the boundary and the returned agent
-/// handle owns the complete workload tree. Exec and forwarding are available.
-/// All interface accessors return owned `Arc`s so a consumer can retain them
-/// past any later state consumption.
+/// Running: the agent is runnable behind the boundary.
+///
+/// The returned agent handle owns the complete workload tree. Exec and
+/// forwarding are available. All interface accessors return owned `Arc`s so a
+/// consumer can retain them past any later state consumption.
 pub trait RunningBoundary: Send + Sync {
     /// The agent process handle (owns the complete workload tree).
     fn agent(&self) -> Arc<dyn BoundaryProcess>;
@@ -558,6 +584,7 @@ pub struct ExecSpec {
 }
 
 /// In-boundary process entry, consumed by the SSH server and supervisor session.
+///
 /// Like `start_agent`, every exec ensures the applicable launch-time controls
 /// are in force before the new process executes its first untrusted instruction
 /// and preserves the provisioned execution environment.

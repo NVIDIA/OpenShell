@@ -52,18 +52,29 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 ## Isolation Backend
 
 The supervisor does not build the boundary inline. It drives an **isolation
-backend** (RFC 0012) through one runtime contract (`ensure_boundary` → `bind`
-→ `boundary_ready` → `start_agent`), so the same supervisor code runs wherever
-the boundary sits. Today only the in-pod backend exists: it builds the boundary
-in the same process that operates it, over the existing primitives (network
-namespace, proxy, the pre-exec Landlock/seccomp ceiling, procfs identity).
+backend** (RFC 0012) through one runtime contract (`attach` → `confirm` →
+`start_agent`, over the `Bound`/`Ready`/`Running` type-state), so the same
+supervisor code runs wherever the boundary sits. The supervisor selects the
+backend from the driver-provided `TopologyDescriptor` and never branches on
+which one it resolved. Two backends exist:
 
-The contract covers the full isolation envelope. `ensure_boundary` establishes
-the network namespace; `start_agent` establishes filesystem (Landlock) and
-syscall (seccomp) at process entry; `identity` resolves the connecting binary
-from procfs at runtime. The lifecycle handles are unforgeable type-state
-tokens, so the order (and thus "no workload runs before the boundary is
-ready") holds by construction rather than by convention.
+- **in-pod** — builds and operates the boundary in the same process, over the
+  existing primitives (network namespace, proxy, the pre-exec Landlock/seccomp
+  ceiling, procfs identity).
+- **sidecar** (Kubernetes) — the agent container's supervisor runs this backend
+  to operate the workload; network mediation runs in a separate network-sidecar
+  container the backend coordinates (the agent container holds no gateway
+  credentials and receives its policy over a peer-cred-authenticated control
+  socket). The agent stays autonomous — it spawns its own workload — so the
+  backend wraps that path rather than inverting control.
+
+`attach` binds the trusted sandbox context and establishes standing enforcement;
+`confirm` verifies it (fail-closed); `start_agent` establishes the per-process
+launch-time controls (Landlock/seccomp) before the first untrusted instruction;
+identity resolves the connecting binary from procfs at runtime. The lifecycle
+handles are unforgeable type-state tokens, so the order (and thus "no workload
+runs before the boundary is ready") holds by construction rather than by
+convention.
 
 ## Network and Inference
 

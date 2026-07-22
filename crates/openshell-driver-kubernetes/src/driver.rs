@@ -1996,6 +1996,16 @@ fn apply_supervisor_sidecar_topology(
                 openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET,
                 SIDECAR_CONTROL_SOCKET,
             );
+            // RFC 0012: the agent container's supervisor resolves the sidecar
+            // backend, so override the default in-pod descriptor set by
+            // `apply_required_env`. (The network sidecar container keeps the
+            // in-pod default; it runs the mediation component, not a backend, so
+            // its descriptor is never resolved.)
+            upsert_env(
+                env,
+                openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR,
+                &openshell_isolation::contract::TopologyDescriptor::sidecar().to_env_value(),
+            );
             upsert_env(
                 env,
                 openshell_core::sandbox_env::PROXY_TLS_DIR,
@@ -4255,6 +4265,13 @@ mod tests {
             rendered_env(agent, openshell_core::sandbox_env::SIDECAR_CONTROL_SOCKET),
             Some(SIDECAR_CONTROL_SOCKET)
         );
+        // RFC 0012: the agent container resolves the sidecar backend.
+        let sidecar_descriptor =
+            openshell_isolation::contract::TopologyDescriptor::sidecar().to_env_value();
+        assert_eq!(
+            rendered_env(agent, openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR),
+            Some(sidecar_descriptor.as_str())
+        );
         assert_eq!(rendered_env(agent, "OPENSHELL_SUPERVISOR_READY_FILE"), None);
         assert_eq!(rendered_env(agent, "OPENSHELL_ENTRYPOINT_PID_FILE"), None);
         assert_eq!(
@@ -4287,6 +4304,16 @@ mod tests {
         assert_eq!(
             sidecar["command"],
             serde_json::json!([SUPERVISOR_IMAGE_BINARY_PATH, "--mode=network"])
+        );
+        // The network sidecar container runs the mediation component, not a
+        // backend, so it keeps the default in-pod descriptor (never resolved).
+        assert_eq!(
+            rendered_env(sidecar, openshell_core::sandbox_env::TOPOLOGY_DESCRIPTOR),
+            Some(
+                openshell_isolation::contract::TopologyDescriptor::in_pod()
+                    .to_env_value()
+                    .as_str()
+            )
         );
         assert_eq!(sidecar["securityContext"]["runAsUser"], 0);
         assert_eq!(sidecar["securityContext"]["runAsGroup"], 1500);
