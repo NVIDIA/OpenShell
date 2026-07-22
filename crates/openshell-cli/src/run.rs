@@ -5805,7 +5805,7 @@ pub async fn sandbox_policy_set(
             "{} Policy unchanged (version {}, hash: {})",
             "·".dimmed(),
             resp.version,
-            &resp.policy_hash[..12]
+            short_hash(&resp.policy_hash)
         );
         return Ok(());
     }
@@ -5814,7 +5814,7 @@ pub async fn sandbox_policy_set(
         "{} Policy version {} submitted (hash: {})",
         "✓".green().bold(),
         resp.version,
-        &resp.policy_hash[..12]
+        short_hash(&resp.policy_hash)
     );
 
     if !wait {
@@ -6513,7 +6513,13 @@ fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicy
             &rev.policy_hash
         };
         let error_short = if rev.load_error.len() > 40 {
-            format!("{}...", &rev.load_error[..40])
+            // Back off to a char boundary: byte-index slicing panics on
+            // multi-byte UTF-8 in server-supplied error messages.
+            let mut end = 40;
+            while !rev.load_error.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...", &rev.load_error[..end])
         } else {
             rev.load_error.clone()
         };
