@@ -3,11 +3,11 @@
 
 #![cfg(feature = "e2e")]
 
-//! E2E test: load a Docker archive (.tar) and run a sandbox with it.
+//! E2E test: create a sandbox from a flat rootfs tar archive.
 //!
 //! Prerequisites:
-//! - A running Docker-backed openshell gateway (`mise run gateway:docker`)
-//! - Docker daemon running (for image build + save)
+//! - A running VM-backed openshell gateway with a default sandbox image configured
+//! - Docker daemon running (for image build + container export)
 //! - The `openshell` binary (built automatically from the workspace)
 
 use openshell_e2e::harness::container::ContainerEngine;
@@ -24,17 +24,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
 RUN groupadd -g 1000660000 sandbox && \
     useradd -m -u 1000660000 -g sandbox sandbox
 
-RUN echo "docker-archive-e2e-marker" > /etc/marker.txt
+RUN echo "rootfs-tar-e2e-marker" > /etc/marker.txt
 
 CMD ["sleep", "infinity"]
 "#;
 
-const MARKER: &str = "docker-archive-e2e-marker";
+const MARKER: &str = "rootfs-tar-e2e-marker";
 
-/// Build a Docker image, export it as a .tar archive, then create a sandbox
-/// from that archive and verify it contains the expected marker file.
+/// Build a Docker image, export its filesystem as a flat rootfs tar, then
+/// create a sandbox from that tar and verify it contains the expected marker.
 #[tokio::test]
-async fn sandbox_from_docker_archive() {
+async fn sandbox_from_rootfs_tar() {
     let engine = ContainerEngine::from_env().expect("container engine available");
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
 
@@ -43,7 +43,7 @@ async fn sandbox_from_docker_archive() {
     std::fs::write(&dockerfile_path, DOCKERFILE_CONTENT).expect("write Dockerfile");
 
     let tag = format!(
-        "openshell/e2e-archive-test:{}",
+        "openshell/e2e-rootfs-tar-test:{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -64,32 +64,48 @@ async fn sandbox_from_docker_archive() {
         String::from_utf8_lossy(&build_output.stderr)
     );
 
-    // Step 2: Export the image to a .tar archive.
-    let archive_path = tmpdir.path().join("image.tar");
-    let save_output = engine
+    // Step 2: Create a temporary container and export its filesystem as a
+    // flat rootfs tar (equivalent to `docker export`).
+    let container_name = format!("openshell-e2e-rootfs-export-{}", std::process::id());
+
+    let create_output = engine
         .command()
-        .args(["save", "-o"])
-        .arg(&archive_path)
-        .arg(&tag)
+        .args(["create", "--name", &container_name, &tag])
         .output()
-        .expect("spawn docker save");
+        .expect("spawn docker create");
 
     assert!(
-        save_output.status.success(),
-        "docker save failed:\n{}",
-        String::from_utf8_lossy(&save_output.stderr)
+        create_output.status.success(),
+        "docker create failed:\n{}",
+        String::from_utf8_lossy(&create_output.stderr)
     );
 
-    // Step 3: Remove the local image so the sandbox must load from the archive.
+    let rootfs_tar_path = tmpdir.path().join("rootfs.tar");
+    let export_output = engine
+        .command()
+        .args(["export", "-o"])
+        .arg(&rootfs_tar_path)
+        .arg(&container_name)
+        .output()
+        .expect("spawn docker export");
+
+    assert!(
+        export_output.status.success(),
+        "docker export failed:\n{}",
+        String::from_utf8_lossy(&export_output.stderr)
+    );
+
+    // Clean up the temporary container and image.
+    let _ = engine.command().args(["rm", &container_name]).output();
     let _ = engine.command().args(["rmi", &tag]).output();
 
-    // Step 4: Create a sandbox from the Docker archive.
-    let archive_str = archive_path.to_str().expect("archive path is UTF-8");
-    let mut guard = SandboxGuard::create(&["--from", archive_str, "--", "cat", "/etc/marker.txt"])
+    // Step 3: Create a sandbox from the rootfs tar.
+    let tar_str = rootfs_tar_path.to_str().expect("tar path is UTF-8");
+    let mut guard = SandboxGuard::create(&["--from", tar_str, "--", "cat", "/etc/marker.txt"])
         .await
-        .expect("sandbox create from Docker archive");
+        .expect("sandbox create from rootfs tar");
 
-    // Step 5: Verify the marker file content appears in the output.
+    // Step 4: Verify the marker file content appears in the output.
     let clean_output = strip_ansi(&guard.create_output);
     assert!(
         clean_output.contains(MARKER),

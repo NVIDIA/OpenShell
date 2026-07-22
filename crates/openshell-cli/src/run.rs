@@ -464,26 +464,26 @@ pub async fn sandbox_create(
     let effective_tls = tls.clone();
 
     // Resolve the --from flag into a container image reference, building from
-    // a Dockerfile first if necessary.
-    let image: Option<String> = match from {
+    // a Dockerfile first if necessary, or a rootfs tar path for the VM driver.
+    let (image, rootfs_tar_path): (Option<String>, Option<PathBuf>) = match from {
         Some(val) => {
             let resolved = resolve_from(val)?;
             match resolved {
-                ResolvedSource::Image(img) => Some(img),
+                ResolvedSource::Image(img) => (Some(img), None),
                 ResolvedSource::Dockerfile {
                     dockerfile,
                     context,
                 } => {
                     let tag = build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
-                    Some(tag)
+                    (Some(tag), None)
                 }
-                ResolvedSource::DockerArchive { path } => {
-                    let tag = load_from_docker_archive(&path, gateway_name).await?;
-                    Some(tag)
+                ResolvedSource::RootfsTar { path } => {
+                    validate_rootfs_tar_source(gateway_name, &mut client, &path).await?;
+                    (None, Some(path))
                 }
             }
         }
-        None => None,
+        None => (None, None),
     };
     let inferred_provider = inferred_provider_type(command);
     let providers_v2_enabled =
@@ -508,11 +508,20 @@ pub async fn sandbox_create(
 
     let policy = load_sandbox_policy(policy)?;
     let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
-    let driver_config = driver_config_json
+    let mut driver_config = driver_config_json
         .map(parse_driver_config_json)
         .transpose()?;
 
-    let template = if image.is_some() || resource_limits.is_some() || driver_config.is_some() {
+    if let Some(tar_path) = &rootfs_tar_path {
+        let rootfs_config = rootfs_tar_driver_config(tar_path)?;
+        driver_config = Some(merge_driver_config(driver_config, rootfs_config));
+    }
+
+    let template = if image.is_some()
+        || resource_limits.is_some()
+        || driver_config.is_some()
+        || rootfs_tar_path.is_some()
+    {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
             resources: resource_limits,
@@ -1041,20 +1050,23 @@ enum ResolvedSource {
         dockerfile: PathBuf,
         context: PathBuf,
     },
-    /// A Docker archive (`.tar` or `.tar.gz`) to load into the local daemon.
-    DockerArchive { path: PathBuf },
+    /// A flat rootfs tar archive (`.tar`, `.tar.gz`, `.tgz`) to pass directly
+    /// to the VM compute driver.
+    RootfsTar { path: PathBuf },
 }
 
 /// Classify the `--from` value into an image reference, a Dockerfile that
-/// needs building, or a Docker archive that needs loading.
+/// needs building, or a rootfs tar to pass to the VM driver.
 ///
 /// Resolution order:
-/// 1. Existing file whose name contains "Dockerfile" → build from file.
-///    1b. Existing file with `.tar`/`.tar.gz`/`.tgz` extension → load archive.
+/// 1. Existing file whose name contains "dockerfile" → build from Dockerfile.
 /// 2. Existing directory that contains a `Dockerfile` → build from directory.
-/// 3. Missing explicit local paths → local error, not image pull.
-/// 4. Value contains `/`, `:`, or `.` → treat as a full image reference.
-/// 5. Otherwise → community sandbox name, expanded via the registry prefix.
+/// 3. Existing file with `.tar`, `.tar.gz`, or `.tgz` extension → rootfs tar archive.
+/// 4. Other existing local paths → error.
+/// 5. Non-existent path-like values (`./…`, `../…`, `/…`, `~/…`) → local
+///    error, so they don't reach the gateway as broken image-pull requests.
+/// 6. Value contains `/`, `:`, or `.` → treat as a full image reference.
+/// 7. Otherwise → community sandbox name, expanded via the registry prefix.
 fn resolve_from(value: &str) -> Result<ResolvedSource> {
     let path = Path::new(value);
 
@@ -1075,17 +1087,17 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
             });
         }
 
-        if filename_looks_like_docker_archive(path) {
-            let archive_path = path
+        if filename_looks_like_rootfs_tar(path) {
+            let tar_path = path
                 .canonicalize()
                 .into_diagnostic()
                 .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
-            return Ok(ResolvedSource::DockerArchive { path: archive_path });
+            return Ok(ResolvedSource::RootfsTar { path: tar_path });
         }
 
         if value_looks_like_local_source(value) {
             return Err(miette::miette!(
-                "local --from file is not a Dockerfile or Docker archive (.tar/.tar.gz/.tgz): {}",
+                "local --from file is not a Dockerfile or rootfs tar (.tar/.tar.gz/.tgz): {}",
                 path.display()
             ));
         }
@@ -1124,7 +1136,7 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
     if value_looks_like_local_source(value) {
         return Err(miette::miette!(
             "local --from path does not exist: {}\n\
-             Use an existing Dockerfile, directory containing Dockerfile, Docker archive (.tar/.tar.gz/.tgz), or a container image reference.",
+             Use an existing Dockerfile, directory containing Dockerfile, rootfs tar (.tar/.tar.gz/.tgz), or a container image reference.",
             path.display()
         ));
     }
@@ -1142,20 +1154,17 @@ fn filename_looks_like_dockerfile(path: &Path) -> bool {
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     let lower = name.to_lowercase();
-    lower.contains("dockerfile") || lower.ends_with(".dockerfile")
+    lower.contains("dockerfile")
 }
 
-fn filename_looks_like_docker_archive(path: &Path) -> bool {
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // already lowercased
+fn filename_looks_like_rootfs_tar(path: &Path) -> bool {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     let lower = name.to_lowercase();
-    // `.tar.gz` has extension `gz`, so check the compound suffix with ends_with.
-    lower.ends_with(".tar.gz")
-        || Path::new(&*lower)
-            .extension()
-            .is_some_and(|ext| ext == "tar" || ext == "tgz")
+    lower.ends_with(".tar.gz") || lower.ends_with(".tar") || lower.ends_with(".tgz")
 }
 
 fn value_looks_like_local_source(value: &str) -> bool {
@@ -1237,41 +1246,75 @@ async fn build_from_dockerfile(
     Ok(tag)
 }
 
-/// Load a Docker archive and return the image tag.
-///
-/// Local-gateway only — same constraint as Dockerfile sources.
-async fn load_from_docker_archive(archive_path: &Path, gateway_name: &str) -> Result<String> {
+/// Validate that a rootfs tar source is usable with the current gateway.
+async fn validate_rootfs_tar_source(
+    gateway_name: &str,
+    client: &mut crate::tls::GrpcClient,
+    tar_path: &Path,
+) -> Result<()> {
     let metadata = get_gateway_metadata(gateway_name);
     if !dockerfile_sources_supported_for_gateway(metadata.as_ref()) {
         return Err(miette!(
-            "local Docker archive sources are only supported for local gateways; gateway '{}' is remote",
+            "local rootfs tar sources are only supported for local gateways; gateway '{}' is remote",
             gateway_name
         ));
     }
 
+    let info = client
+        .get_gateway_info(GetGatewayInfoRequest {})
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to query gateway compute driver")?
+        .into_inner();
+
+    let driver_name = info
+        .compute_drivers
+        .first()
+        .map(|d| d.name.as_str())
+        .unwrap_or("");
+
+    if driver_name != "vm" {
+        return Err(miette!(
+            "rootfs tar sources are only supported by the VM compute driver, \
+             but gateway '{}' uses the '{}' driver",
+            gateway_name,
+            driver_name
+        ));
+    }
+
     eprintln!(
-        "Loading Docker archive {} for gateway '{}'",
-        archive_path.display().to_string().cyan(),
+        "Using rootfs tar {} for gateway '{}'",
+        tar_path.display().to_string().cyan(),
         gateway_name,
     );
     eprintln!();
 
-    let mut on_log = |msg: String| {
-        eprintln!("  {msg}");
-    };
+    Ok(())
+}
 
-    let tag = openshell_bootstrap::build::load_docker_archive(archive_path, &mut on_log).await?;
+/// Build a `driver_config` struct carrying the rootfs tar path for the VM driver.
+fn rootfs_tar_driver_config(tar_path: &Path) -> Result<prost_types::Struct> {
+    let fields = serde_json::Map::from_iter([(
+        "rootfs_tar_path".to_string(),
+        serde_json::Value::String(tar_path.to_string_lossy().into_owned()),
+    )]);
+    openshell_core::proto_struct::json_object_to_struct(fields)
+        .into_diagnostic()
+        .wrap_err("failed to encode rootfs_tar_path in driver_config")
+}
 
-    eprintln!();
-    eprintln!(
-        "{} Image {} is available in the local Docker daemon for gateway '{}'.",
-        "✓".green().bold(),
-        tag.cyan(),
-        gateway_name,
-    );
-    eprintln!();
-
-    Ok(tag)
+/// Merge a rootfs tar config into an existing `driver_config`, if any.
+fn merge_driver_config(
+    base: Option<prost_types::Struct>,
+    overlay: prost_types::Struct,
+) -> prost_types::Struct {
+    match base {
+        Some(mut base) => {
+            base.fields.extend(overlay.fields);
+            base
+        }
+        None => overlay,
+    }
 }
 
 /// Load sandbox policy YAML.
@@ -7801,13 +7844,13 @@ mod tests {
     #[test]
     fn resolve_from_classifies_tar_archive() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
-        let archive = temp.path().join("image.tar");
+        let archive = temp.path().join("rootfs.tar");
         fs::write(&archive, b"fake tar content").expect("failed to write archive");
 
         match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
-            .expect("expected DockerArchive source")
+            .expect("expected RootfsTar source")
         {
-            super::ResolvedSource::DockerArchive { path } => {
+            super::ResolvedSource::RootfsTar { path } => {
                 assert_eq!(
                     path,
                     archive
@@ -7815,20 +7858,20 @@ mod tests {
                         .expect("failed to canonicalize archive")
                 );
             }
-            other => panic!("expected DockerArchive source, got {other:?}"),
+            other => panic!("expected RootfsTar source, got {other:?}"),
         }
     }
 
     #[test]
     fn resolve_from_classifies_tar_gz_archive() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
-        let archive = temp.path().join("image.tar.gz");
+        let archive = temp.path().join("rootfs.tar.gz");
         fs::write(&archive, b"fake tar.gz content").expect("failed to write archive");
 
         match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
-            .expect("expected DockerArchive source")
+            .expect("expected RootfsTar source")
         {
-            super::ResolvedSource::DockerArchive { path } => {
+            super::ResolvedSource::RootfsTar { path } => {
                 assert_eq!(
                     path,
                     archive
@@ -7836,20 +7879,20 @@ mod tests {
                         .expect("failed to canonicalize archive")
                 );
             }
-            other => panic!("expected DockerArchive source, got {other:?}"),
+            other => panic!("expected RootfsTar source, got {other:?}"),
         }
     }
 
     #[test]
     fn resolve_from_classifies_tgz_archive() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
-        let archive = temp.path().join("image.tgz");
+        let archive = temp.path().join("rootfs.tgz");
         fs::write(&archive, b"fake tgz content").expect("failed to write archive");
 
         match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
-            .expect("expected DockerArchive source")
+            .expect("expected RootfsTar source")
         {
-            super::ResolvedSource::DockerArchive { path } => {
+            super::ResolvedSource::RootfsTar { path } => {
                 assert_eq!(
                     path,
                     archive
@@ -7857,7 +7900,7 @@ mod tests {
                         .expect("failed to canonicalize archive")
                 );
             }
-            other => panic!("expected DockerArchive source, got {other:?}"),
+            other => panic!("expected RootfsTar source, got {other:?}"),
         }
     }
 
@@ -7876,19 +7919,15 @@ mod tests {
     }
 
     #[test]
-    fn filename_looks_like_docker_archive_detects_extensions() {
-        use super::filename_looks_like_docker_archive;
-        assert!(filename_looks_like_docker_archive(Path::new("image.tar")));
-        assert!(filename_looks_like_docker_archive(Path::new(
-            "image.tar.gz"
-        )));
-        assert!(filename_looks_like_docker_archive(Path::new("image.tgz")));
-        assert!(filename_looks_like_docker_archive(Path::new("IMAGE.TAR")));
-        assert!(filename_looks_like_docker_archive(Path::new(
-            "my-image.TAR.GZ"
-        )));
-        assert!(!filename_looks_like_docker_archive(Path::new("Dockerfile")));
-        assert!(!filename_looks_like_docker_archive(Path::new("image.zip")));
+    fn filename_looks_like_rootfs_tar_detects_extensions() {
+        use super::filename_looks_like_rootfs_tar;
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tar")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tar.gz")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tgz")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("IMAGE.TAR")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("my-image.TAR.GZ")));
+        assert!(!filename_looks_like_rootfs_tar(Path::new("Dockerfile")));
+        assert!(!filename_looks_like_rootfs_tar(Path::new("image.zip")));
     }
 
     #[test]
