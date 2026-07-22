@@ -9629,9 +9629,9 @@ network_policies:
     /// 4. Spawn the temp bash as a child with a `/dev/tcp` one-liner that
     ///    opens a real TCP connection to the listener and holds it open
     ///    inside the bash process.
-    /// 5. Accept the connection on the listener side and capture the peer's
-    ///    ephemeral port — that's what `resolve_process_identity` uses to
-    ///    walk `/proc/net/tcp` back to the child PID.
+    /// 5. Accept the connection on the listener side and capture both socket
+    ///    endpoints — that's what `resolve_process_identity` uses to walk
+    ///    `/proc/net/tcp` back to the child PID.
     /// 6. Overwrite the temp bash on disk with different bytes to simulate
     ///    a `docker cp` hot-swap. The running child is unaffected (it still
     ///    executes from its in-memory image), but `/proc/<child>/exe` will
@@ -9692,7 +9692,7 @@ network_policies:
             .spawn()
             .expect("spawn hotswap-bash child");
 
-        // 5. Accept on the listener side, capture the peer port.
+        // 5. Accept on the listener side and capture the peer endpoint.
         listener.set_nonblocking(false).expect("blocking listener");
         let (mut stream, workload_addr) = match listener.accept() {
             Ok(pair) => pair,
@@ -9702,7 +9702,6 @@ network_policies:
                 panic!("failed to accept child connection: {e}");
             }
         };
-        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         // Drain any spurious data; we just need the socket open.
         stream
             .set_read_timeout(Some(Duration::from_millis(50)))
@@ -9729,6 +9728,7 @@ network_policies:
         //    contract: hash the live executable via /proc/<pid>/exe while
         //    returning a clean display path for policy/logging.
         let test_pid = std::process::id();
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let result = resolve_process_identity(test_pid, connection, &cache);
         let child_pid = child.id();
 

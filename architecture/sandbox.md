@@ -53,7 +53,10 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 
 All ordinary agent egress is routed through the sandbox proxy. The proxy
 identifies the calling binary, checks trust-on-first-use binary identity, rejects
-unsafe internal destinations, and evaluates the active policy.
+unsafe internal destinations, and evaluates the active policy. On Linux, it
+maps an accepted proxy connection back to the workload socket by matching the
+complete local-to-remote TCP tuple before resolving every process that owns the
+socket inode.
 For inspected HTTP traffic, the proxy can enforce REST method/path rules,
 WebSocket upgrade and text-message rules, GraphQL operation rules, and
 MCP method, tool, and supported params rules or generic JSON-RPC method rules

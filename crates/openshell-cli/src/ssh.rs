@@ -18,6 +18,7 @@ use openshell_core::proto::{
 };
 use owo_colors::OwoColorize;
 use std::fs;
+use std::future::Future;
 use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -447,9 +448,24 @@ async fn wait_for_forward_start(child: &mut Child, spec: &ForwardSpec) -> Result
 /// last probe error is folded into the timeout diagnostic, so a failure reports
 /// why the listener never opened, not just that it timed out.
 async fn wait_for_forward_listener(spec: &ForwardSpec, wait_for: Duration) -> Result<()> {
+    wait_for_forward_listener_with_probe(spec, wait_for, |spec| async move {
+        probe_forward_listener(&spec).await
+    })
+    .await
+}
+
+async fn wait_for_forward_listener_with_probe<F, Fut>(
+    spec: &ForwardSpec,
+    wait_for: Duration,
+    mut probe: F,
+) -> Result<()>
+where
+    F: FnMut(ForwardSpec) -> Fut,
+    Fut: Future<Output = std::result::Result<(), String>>,
+{
     let deadline = tokio::time::Instant::now() + wait_for;
     loop {
-        let probe_error = match probe_forward_listener(spec).await {
+        let probe_error = match probe(spec.clone()).await {
             Ok(()) => return Ok(()),
             Err(err) => err,
         };
@@ -1816,17 +1832,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_forward_listener_rejects_missing_listener() {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let spec = ForwardSpec::new(port);
+    async fn wait_for_forward_listener_reports_failed_probe() {
+        let spec = ForwardSpec::new(12345);
 
-        let err = wait_for_forward_listener(&spec, Duration::from_millis(20))
-            .await
-            .unwrap_err();
+        let err = wait_for_forward_listener_with_probe(&spec, Duration::ZERO, |_| {
+            std::future::ready(Err("connection refused".to_string()))
+        })
+        .await
+        .unwrap_err();
         let text = format!("{err:?}");
         assert!(text.contains("local forward listener did not open"));
+        assert!(text.contains("connection refused"));
     }
 
     #[test]
