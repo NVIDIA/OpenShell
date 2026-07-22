@@ -1169,10 +1169,11 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
 /// malicious container images. The TOCTOU window is not exploitable because
 /// no untrusted process is running yet.
 ///
-/// `EROFS` errors from `chown` cause the walker to skip that path and its
-/// entire subtree — descending into a read-only mount we do not control would
-/// be a TOCTOU risk (CWE-367/CWE-59). Siblings of the read-only path are
-/// still visited.
+/// The root path is chowned unconditionally — EROFS there is a hard error
+/// (a read-only `/sandbox` is a misconfiguration). For children, `EROFS`
+/// causes the walker to skip that path and its entire subtree — descending
+/// into a read-only mount we do not control would be a TOCTOU risk
+/// (CWE-367/CWE-59). Siblings of the read-only path are still visited.
 #[cfg(unix)]
 fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
     let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
@@ -1183,7 +1184,37 @@ fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result
         ));
     }
 
-    chown_recursive(root, uid, gid, &nix::unistd::chown)
+    nix::unistd::chown(root, uid, gid).into_diagnostic()?;
+
+    if meta.is_dir() {
+        chown_children(root, uid, gid, &nix::unistd::chown)?;
+    }
+
+    Ok(())
+}
+
+/// Walk directory children and chown each entry, skipping symlinks and
+/// EROFS subtrees. Called after the parent has already been chowned.
+#[cfg(unix)]
+fn chown_children(
+    dir: &Path,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    do_chown: &impl Fn(&Path, Option<Uid>, Option<Gid>) -> nix::Result<()>,
+) -> Result<()> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.into_diagnostic()?;
+                let child = entry.path();
+                chown_recursive(&child, uid, gid, do_chown)?;
+            }
+        }
+        Err(e) => {
+            debug!(path = %dir.display(), error = %e, "Cannot list directory during sandbox home chown");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1208,14 +1239,8 @@ fn chown_recursive(
         return Err(e).into_diagnostic();
     }
 
-    if meta.is_dir()
-        && let Ok(entries) = std::fs::read_dir(path)
-    {
-        for entry in entries {
-            let entry = entry.into_diagnostic()?;
-            let child = entry.path();
-            chown_recursive(&child, uid, gid, do_chown)?;
-        }
+    if meta.is_dir() {
+        chown_children(path, uid, gid, do_chown)?;
     }
 
     Ok(())
@@ -2165,10 +2190,9 @@ mod tests {
                 Ok(())
             };
 
-        chown_recursive(&root, uid, gid, &fake_chown).expect("EROFS should be handled gracefully");
+        chown_children(&root, uid, gid, &fake_chown).expect("EROFS should be handled gracefully");
 
         let chowned = chowned.lock().unwrap();
-        assert!(chowned.contains(&root), "root should have been chowned");
         assert!(
             !chowned.contains(&readonly_dir.join("child-under-ro.txt")),
             "children under EROFS directory must NOT be descended into"
@@ -2195,6 +2219,27 @@ mod tests {
 
         let result = chown_recursive(&root, uid, gid, &fake_chown);
         assert!(result.is_err(), "non-EROFS errors should propagate");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_children_skips_all_erofs_children_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sandbox");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::write(root.join("b.txt"), "data").unwrap();
+
+        let uid = Some(nix::unistd::geteuid());
+        let gid = Some(nix::unistd::getegid());
+
+        let always_erofs = |_path: &Path,
+                            _uid: Option<Uid>,
+                            _gid: Option<Gid>|
+         -> nix::Result<()> { Err(nix::errno::Errno::EROFS) };
+
+        chown_children(&root, uid, gid, &always_erofs)
+            .expect("EROFS on all children should be skipped gracefully");
     }
 
     #[cfg(unix)]
