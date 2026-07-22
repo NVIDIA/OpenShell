@@ -20,8 +20,15 @@ use openshell_core::policy::ProxyPolicy;
 use openshell_core::proposals::AgentProposals;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_ocsf::{
+    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::l7::tls::{
+    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
+    write_ca_files,
+};
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::{ProxyHandle, ProxyIdentityMode};
@@ -50,6 +57,9 @@ pub struct HostProxyConfig {
 /// RAII handle for a host-side proxy. Dropping it aborts the proxy accept loop.
 pub struct HostProxyHandle {
     proxy: ProxyHandle,
+    ca_file_paths: Option<(PathBuf, PathBuf)>,
+    #[allow(dead_code)]
+    tls_dir: Option<tempfile::TempDir>,
     pub policy_local_ctx: Arc<PolicyLocalContext>,
 }
 
@@ -57,6 +67,11 @@ impl HostProxyHandle {
     #[must_use]
     pub const fn http_addr(&self) -> Option<SocketAddr> {
         self.proxy.http_addr()
+    }
+
+    #[must_use]
+    pub fn ca_file_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        self.ca_file_paths.clone()
     }
 }
 
@@ -96,15 +111,93 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
         http_addr: Some(config.bind_addr),
     };
     let upstream_proxy_args = crate::upstream_proxy::UpstreamProxyArgs::default();
+    let (tls_state, ca_file_paths, tls_dir) = match tempfile::Builder::new()
+        .prefix("openshell-mxc-tls-")
+        .tempdir()
+    {
+        Ok(tls_dir) => match SandboxCa::generate() {
+            Ok(ca) => {
+                let system_ca_bundle = read_system_ca_bundle();
+                match write_ca_files(&ca, tls_dir.path(), &system_ca_bundle) {
+                    Ok(paths) => match build_upstream_client_config(&system_ca_bundle) {
+                        Ok(upstream_config) => {
+                            let cert_cache = CertCache::new(ca);
+                            let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
+                            ocsf_emit!(
+                                ConfigStateChangeBuilder::new(ocsf_ctx())
+                                    .severity(SeverityId::Informational)
+                                    .status(StatusId::Success)
+                                    .state(StateId::Enabled, "enabled")
+                                    .message(
+                                        "Host proxy TLS termination enabled: ephemeral CA generated"
+                                    )
+                                    .build()
+                            );
+                            (Some(state), Some(paths), Some(tls_dir))
+                        }
+                        Err(e) => {
+                            ocsf_emit!(
+                                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                                        .severity(SeverityId::High)
+                                        .status(StatusId::Failure)
+                                        .state(StateId::Disabled, "disabled")
+                                        .message(format!(
+                                            "Failed to build host proxy upstream TLS config, TLS termination disabled: {e}"
+                                        ))
+                                        .build()
+                                );
+                            (None, None, Some(tls_dir))
+                        }
+                    },
+                    Err(e) => {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::High)
+                                .status(StatusId::Failure)
+                                .state(StateId::Disabled, "disabled")
+                                .message(format!(
+                                    "Failed to write host proxy CA files, TLS termination disabled: {e}"
+                                ))
+                                .build()
+                        );
+                        (None, None, Some(tls_dir))
+                    }
+                }
+            }
+            Err(e) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::High)
+                        .status(StatusId::Failure)
+                        .state(StateId::Disabled, "disabled")
+                        .message(format!(
+                            "Failed to generate host proxy ephemeral CA, TLS termination disabled: {e}"
+                        ))
+                        .build()
+                );
+                (None, None, Some(tls_dir))
+            }
+        },
+        Err(e) => {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::High)
+                    .status(StatusId::Failure)
+                    .state(StateId::Disabled, "disabled")
+                    .message(format!(
+                        "Failed to create host proxy TLS trust directory, TLS termination disabled: {e}"
+                    ))
+                    .build()
+            );
+            (None, None, None)
+        }
+    };
     let proxy = ProxyHandle::start_with_bind_addr(
         &proxy_policy,
         Some(config.bind_addr),
         engine,
         Arc::new(ProxyIdentityMode::static_binary(config.binary_path)?),
-        // Host mode does not install a CA into the sandbox yet; L4 policy and
-        // plaintext/forward-proxy L7 paths are active, while HTTPS MITM is a
-        // follow-up once MXC has a trust-bootstrap story.
-        None,
+        tls_state,
         inference_ctx,
         config.provider_credentials,
         Some(policy_local_ctx.clone()),
@@ -117,6 +210,8 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
 
     Ok(HostProxyHandle {
         proxy,
+        ca_file_paths,
+        tls_dir,
         policy_local_ctx,
     })
 }
@@ -170,6 +265,7 @@ mod tests {
 
     #[tokio::test]
     async fn starts_loopback_proxy_and_serves_policy_local() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let binary = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(binary.path(), b"agent").unwrap();
 
@@ -183,6 +279,19 @@ mod tests {
         let addr = handle.http_addr().expect("proxy should report bound addr");
         assert!(addr.ip().is_loopback());
         assert_ne!(addr.port(), 0);
+        let (ca_cert, bundle) = handle.ca_file_paths().expect("CA paths");
+        assert!(ca_cert.exists(), "standalone CA cert should exist");
+        assert!(bundle.exists(), "combined CA bundle should exist");
+        assert!(
+            std::fs::read_to_string(ca_cert)
+                .unwrap()
+                .contains("BEGIN CERTIFICATE")
+        );
+        assert!(
+            std::fs::read_to_string(bundle)
+                .unwrap()
+                .contains("BEGIN CERTIFICATE")
+        );
 
         let mut client = TcpStream::connect(addr).await.unwrap();
         client
