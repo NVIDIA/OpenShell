@@ -222,6 +222,7 @@ env = { UV_NO_SYNC = "1" }
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
+uv sync --frozen --group dev
 uv run python -m grpc_tools.protoc \
   -Iproto \
   --python_out=python/openshell/_proto \
