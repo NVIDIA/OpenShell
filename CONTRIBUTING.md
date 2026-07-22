@@ -181,10 +181,6 @@ mise trust
 mise run gateway
 ```
 
-Python tasks install the locked development dependencies into the current
-worktree's `.venv` when needed. You do not need to share or manually populate a
-virtual environment across worktrees.
-
 ## Building the `openshell` CLI
 
 Inside this repository, `openshell` is a local shortcut script at `scripts/bin/openshell`. The script will
