@@ -20,6 +20,7 @@ run = """
     exit 1
   fi
 """
+run_windows = "echo Skipping helm:docs:check: Helm validation is not part of the native Windows lane."
 hide = true
 
 ["helm:lint"]
@@ -38,6 +39,7 @@ run = """
   done
   echo "All variants passed."
 """
+run_windows = "echo Skipping helm:lint: Helm validation is not part of the native Windows lane."
 
 ["helm:test"]
 description = "Run Helm chart unit tests"
@@ -49,6 +51,7 @@ run = """
   helm dependency build deploy/helm/openshell
   helm unittest deploy/helm/openshell
 """
+run_windows = "echo Skipping helm:test: Helm validation is not part of the native Windows lane."
 
 ["helm:skaffold:dev"]
 description = "Run skaffold dev for deploy/helm/openshell (iterative deploy)"
