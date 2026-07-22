@@ -60,6 +60,7 @@ The skill reads these environment variables (PowerShell syntax):
 | `$env:OPENSHELL_WXC_EXEC_PATH` | unset | Optional path to `wxc-exec.exe`. Validated for existence and architecture match only. Not used in this build-only skill. |
 | `$env:OPENSHELL_MXC_SKIP_ARM64` | `0` | Set to `1` to skip aarch64 build (e.g., for fast x64-only iterations). |
 | `$env:OPENSHELL_MXC_FORK_BRANCH` | `windows-mxc-build` | Branch name created in the fork. |
+| `$env:Z3_SYS_BUNDLED_DIR_OVERRIDE` | pinned source cached under `CARGO_TARGET_DIR` | Reuse an existing Z3 source tree containing `src/api/z3.h`; otherwise the wrapper fetches and caches the pinned revision automatically. |
 
 ## Workflow
 
@@ -194,6 +195,11 @@ The PowerShell wrapper must:
 7. Fail fast if a Windows-only task is invoked on a non-Windows host.
 
 Use `mise run --skip-tools windows:*` in GitHub Actions and local Windows automation. `--skip-tools` is intentional: this repo should not ask mise to install Rust on Windows because the MSVC flow relies on rustup plus Visual Studio Build Tools.
+
+For bundled Z3, the wrapper fetches the revision pinned by `z3-sys` through
+Git, caches it under `CARGO_TARGET_DIR`, and sets
+`Z3_SYS_BUNDLED_DIR_OVERRIDE`. This bypasses the unauthenticated GitHub
+Contents API lookup that can fail with HTTP 403 on shared networks.
 
 ### Step 6: mise check on x86_64-pc-windows-msvc
 

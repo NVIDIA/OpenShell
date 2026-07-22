@@ -78,6 +78,12 @@ Same pattern — gate with `#[cfg(unix)]`.
 
 `libsecret` only works on Linux. If `openshell-providers` pulls it in, gate it. The build-only skill does not need credential storage on Windows; that is a follow-on skill.
 
+### Bundled Z3 fails with HTTP 403
+
+The wrapper should fetch the pinned Z3 revision through Git before Cargo starts.
+If that prefetch fails, inspect the reported partial checkout and verify that
+Git can reach `https://github.com/Z3Prover/z3.git`.
+
 ## Cfg gating patterns
 
 ### Module-level
@@ -180,6 +186,11 @@ check/build, ARM64 crypto crates use `clang-cl` while bundled Z3 stays on
 native MSVC `cl.exe` with Ninja. Use a short `CARGO_TARGET_DIR` if Windows
 path-length limits are reached. Test tasks reject a target that does not match
 the Windows host architecture.
+
+Bundled Z3 source is pinned by revision, fetched through Git, and cached under
+`CARGO_TARGET_DIR`. The wrapper sets `Z3_SYS_BUNDLED_DIR_OVERRIDE` so `z3-sys`
+does not make an unauthenticated GitHub Contents API call. An explicit override
+must point to a source tree containing `src/api/z3.h`.
 
 ## What NOT to do in this skill
 

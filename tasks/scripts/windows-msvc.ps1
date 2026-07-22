@@ -40,6 +40,10 @@ if ([string]::IsNullOrWhiteSpace($TargetDir)) {
 $UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-podman --exclude openshell-driver-vm"
 $BundledZ3WorkspaceFeatures = "--features openshell-prover/bundled-z3"
 $BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-prover/bundled-z3"
+$BundledZ3Repository = "https://github.com/Z3Prover/z3.git"
+$BundledZ3SysVersion = "0.10.9"
+# This is the matching z3-sys submodule revision. Update both pins together.
+$BundledZ3Revision = "ddb49568d3520e99799e364fb22f35fc67d887b1"
 $Z3WorkspaceFeatures = $BundledZ3WorkspaceFeatures
 $Z3ServerFeatures = $BundledZ3ServerFeatures
 
@@ -330,9 +334,87 @@ function Resolve-Z3HeaderPath([string] $HeaderPath) {
     return (Resolve-Path $HeaderPath).Path
 }
 
+function Assert-BundledZ3Source([string] $SourcePath, [string] $ExpectedRevision) {
+    if (-not (Test-Path $SourcePath -PathType Container)) {
+        throw "Bundled Z3 source directory does not exist: $SourcePath"
+    }
+
+    $header = Join-Path $SourcePath "src\api\z3.h"
+    if (-not (Test-Path $header -PathType Leaf)) {
+        throw "Bundled Z3 source directory does not contain src\api\z3.h: $SourcePath"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedRevision)) {
+        $actualRevision = (& git -C $SourcePath rev-parse HEAD 2>$null)
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($actualRevision)) {
+            throw "Could not verify the bundled Z3 source revision at: $SourcePath"
+        }
+        if ($actualRevision.Trim() -ne $ExpectedRevision) {
+            throw "Bundled Z3 source revision mismatch at ${SourcePath}: expected $ExpectedRevision, found $($actualRevision.Trim())"
+        }
+    }
+
+    return (Resolve-Path $SourcePath).Path
+}
+
+function Resolve-BundledZ3Source {
+    if (-not [string]::IsNullOrWhiteSpace($env:Z3_SYS_BUNDLED_DIR_OVERRIDE)) {
+        return Assert-BundledZ3Source $env:Z3_SYS_BUNDLED_DIR_OVERRIDE ""
+    }
+
+    $cargoLock = Get-Content (Join-Path $RepoRoot "Cargo.lock") -Raw
+    $packagePattern = '(?ms)^\[\[package\]\]\s+name = "z3-sys"\s+version = "([^"]+)"'
+    $packageMatches = [regex]::Matches($cargoLock, $packagePattern)
+    if ($packageMatches.Count -ne 1 -or $packageMatches[0].Groups[1].Value -ne $BundledZ3SysVersion) {
+        throw "Bundled Z3 source pin expects z3-sys $BundledZ3SysVersion. Update the version and revision pins for the z3-sys version in Cargo.lock."
+    }
+
+    $revisionPrefix = $BundledZ3Revision.Substring(0, 12)
+    $sourcePath = Join-Path $TargetDir "z3-source-$revisionPrefix"
+    if (Test-Path $sourcePath) {
+        return Assert-BundledZ3Source $sourcePath $BundledZ3Revision
+    }
+
+    if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
+        throw "Bundled Z3 source preparation requires git.exe on PATH."
+    }
+    if (-not (Test-Path $TargetDir -PathType Container)) {
+        New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+    }
+
+    $stagingPath = "$sourcePath.partial-$([guid]::NewGuid().ToString('N'))"
+    Write-Host "==> Fetching bundled Z3 source"
+    Write-Host "    repository: $BundledZ3Repository"
+    Write-Host "    revision:   $BundledZ3Revision"
+    Write-Host "    cache:      $sourcePath"
+
+    & git init --quiet $stagingPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "git init failed while preparing bundled Z3 source at: $stagingPath"
+    }
+    & git -C $stagingPath remote add origin $BundledZ3Repository
+    if ($LASTEXITCODE -ne 0) {
+        throw "git remote add failed while preparing bundled Z3 source at: $stagingPath"
+    }
+    & git -C $stagingPath fetch --quiet --depth 1 origin $BundledZ3Revision
+    if ($LASTEXITCODE -ne 0) {
+        throw "git fetch failed for bundled Z3 revision $BundledZ3Revision. Partial source remains at: $stagingPath"
+    }
+    & git -C $stagingPath checkout --quiet --detach FETCH_HEAD
+    if ($LASTEXITCODE -ne 0) {
+        throw "git checkout failed for bundled Z3 revision $BundledZ3Revision. Partial source remains at: $stagingPath"
+    }
+
+    Assert-BundledZ3Source $stagingPath $BundledZ3Revision | Out-Null
+    Move-Item -Path $stagingPath -Destination $sourcePath
+    return Assert-BundledZ3Source $sourcePath $BundledZ3Revision
+}
+
 function Configure-Z3 {
     if ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE)) {
         Write-Host "==> Z3: bundled"
+        $env:Z3_SYS_BUNDLED_DIR_OVERRIDE = Resolve-BundledZ3Source
+        Write-Host "    Z3_SYS_BUNDLED_DIR_OVERRIDE=$env:Z3_SYS_BUNDLED_DIR_OVERRIDE"
         return [pscustomobject]@{
             WorkspaceFeatures = $BundledZ3WorkspaceFeatures
             ServerFeatures = $BundledZ3ServerFeatures
