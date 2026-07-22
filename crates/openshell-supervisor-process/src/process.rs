@@ -1169,9 +1169,10 @@ fn rewrite_group_at(path: &Path, gid: &str) -> Result<()> {
 /// malicious container images. The TOCTOU window is not exploitable because
 /// no untrusted process is running yet.
 ///
-/// `EROFS` errors from `chown` are logged at debug level and the walk still
-/// recurses into children (a read-only directory may contain writable submounts
-/// or siblings that must be owned by the sandbox user).
+/// `EROFS` errors from `chown` cause the walker to skip that path and its
+/// entire subtree — descending into a read-only mount we do not control would
+/// be a TOCTOU risk (CWE-367/CWE-59). Siblings of the read-only path are
+/// still visited.
 #[cfg(unix)]
 fn chown_sandbox_home(root: &Path, uid: Option<Uid>, gid: Option<Gid>) -> Result<()> {
     let meta = std::fs::symlink_metadata(root).into_diagnostic()?;
@@ -1202,9 +1203,9 @@ fn chown_recursive(
     if let Err(e) = do_chown(path, uid, gid) {
         if e == nix::errno::Errno::EROFS {
             debug!(path = %path.display(), "Skipping read-only path during sandbox home chown");
-        } else {
-            return Err(e).into_diagnostic();
+            return Ok(());
         }
+        return Err(e).into_diagnostic();
     }
 
     if meta.is_dir()
@@ -2135,7 +2136,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn chown_recursive_skips_erofs_and_continues() {
+    fn chown_recursive_skips_erofs_subtree_but_continues_siblings() {
         use std::sync::{Arc, Mutex};
 
         let dir = tempfile::tempdir().unwrap();
@@ -2144,7 +2145,7 @@ mod tests {
 
         let readonly_dir = root.join("ro-mount");
         std::fs::create_dir(&readonly_dir).unwrap();
-        std::fs::write(readonly_dir.join("writable-child.txt"), "data").unwrap();
+        std::fs::write(readonly_dir.join("child-under-ro.txt"), "data").unwrap();
 
         std::fs::write(root.join("writable-sibling.txt"), "data").unwrap();
 
@@ -2169,8 +2170,8 @@ mod tests {
         let chowned = chowned.lock().unwrap();
         assert!(chowned.contains(&root), "root should have been chowned");
         assert!(
-            chowned.contains(&readonly_dir.join("writable-child.txt")),
-            "writable child under EROFS directory should still be chowned"
+            !chowned.contains(&readonly_dir.join("child-under-ro.txt")),
+            "children under EROFS directory must NOT be descended into"
         );
         assert!(
             chowned.contains(&root.join("writable-sibling.txt")),
