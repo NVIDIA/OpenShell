@@ -494,7 +494,7 @@ pub(super) fn validate_label_key(key: &str) -> Result<(), Status> {
     // Name must contain only alphanumeric, hyphens, underscores, and dots
     if !name
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
         return Err(Status::invalid_argument(format!(
             "label key name segment contains invalid characters (must be alphanumeric, '-', '_', or '.'): '{key}'"
@@ -504,12 +504,12 @@ pub(super) fn validate_label_key(key: &str) -> Result<(), Status> {
     // Name must start and end with alphanumeric
     let first = name.chars().next().unwrap(); // safe: we checked !is_empty()
     let last = name.chars().last().unwrap();
-    if !first.is_alphanumeric() {
+    if !first.is_ascii_alphanumeric() {
         return Err(Status::invalid_argument(format!(
             "label key name segment must start with alphanumeric character: '{key}'"
         )));
     }
-    if !last.is_alphanumeric() {
+    if !last.is_ascii_alphanumeric() {
         return Err(Status::invalid_argument(format!(
             "label key name segment must end with alphanumeric character: '{key}'"
         )));
@@ -585,7 +585,7 @@ pub(super) fn validate_label_value(value: &str) -> Result<(), Status> {
     // Must contain only alphanumeric, hyphens, underscores, and dots
     if !value
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
     {
         return Err(Status::invalid_argument(format!(
             "label value contains invalid characters (must be alphanumeric, '-', '_', or '.'): '{value}'"
@@ -595,12 +595,12 @@ pub(super) fn validate_label_value(value: &str) -> Result<(), Status> {
     // Must start and end with alphanumeric
     let first = value.chars().next().unwrap(); // safe: we checked !is_empty()
     let last = value.chars().last().unwrap();
-    if !first.is_alphanumeric() {
+    if !first.is_ascii_alphanumeric() {
         return Err(Status::invalid_argument(format!(
             "label value must start with alphanumeric character: '{value}'"
         )));
     }
-    if !last.is_alphanumeric() {
+    if !last.is_ascii_alphanumeric() {
         return Err(Status::invalid_argument(format!(
             "label value must end with alphanumeric character: '{value}'"
         )));
@@ -1480,6 +1480,17 @@ mod tests {
         assert!(err.message().contains("invalid characters"));
     }
 
+    #[test]
+    fn validate_label_key_rejects_unicode_characters() {
+        // The Kubernetes label spec is ASCII-only; Unicode alphanumerics
+        // must not pass gateway validation.
+        let err = validate_label_key("日本語").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+
+        let err = validate_label_key("café").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
     // ---- Label value validation ----
 
     #[test]
@@ -1545,6 +1556,14 @@ mod tests {
         let err = validate_label_value("value@123").unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("invalid characters"));
+    }
+
+    #[test]
+    fn validate_label_value_rejects_unicode_characters() {
+        // The Kubernetes label spec is ASCII-only; Unicode alphanumerics
+        // must not pass gateway validation.
+        let err = validate_label_value("café").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     // ---- Label selector validation ----
