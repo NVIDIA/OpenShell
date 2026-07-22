@@ -2714,6 +2714,7 @@ mod tests {
             port,
             path: path.to_string(),
             protocol: "rest".to_string(),
+            access: "full".to_string(),
             ..Default::default()
         }];
         handle_import_provider_profiles(
@@ -2842,6 +2843,7 @@ mod tests {
             port: 443,
             path: "/v1/**".to_string(),
             protocol: "rest".to_string(),
+            access: "full".to_string(),
             ..Default::default()
         }];
         let response = handle_import_provider_profiles(
@@ -3167,6 +3169,7 @@ mod tests {
             port: 443,
             path: "/v1/**".to_string(),
             protocol: "rest".to_string(),
+            access: "full".to_string(),
             ..Default::default()
         }];
         let response = handle_update_provider_profiles(

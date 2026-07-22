@@ -10,6 +10,7 @@
 //! these types, ensuring round-trip fidelity.
 
 mod compose;
+mod l7_validate;
 mod merge;
 mod middleware;
 
@@ -29,6 +30,7 @@ pub use compose::{
     PROVIDER_RULE_NAME_PREFIX, ProviderPolicyLayer, compose_effective_policy,
     is_provider_rule_name, provider_rule_name, strip_provider_rule_names,
 };
+pub use l7_validate::{L7EndpointFields, L7Protocol, validate_l7_endpoint_semantics};
 pub use merge::{
     PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
     merge_policy, policy_covers_rule,

@@ -8113,6 +8113,7 @@ mod tests {
                         host: "api.github.com".to_string(),
                         port: 443,
                         protocol: "rest".to_string(),
+                        access: "full".to_string(),
                         deny_rules: vec![L7DenyRule {
                             method: "DELETE".to_string(),
                             path: "/repos/*".to_string(),

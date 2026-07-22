@@ -5732,6 +5732,17 @@ fn load_profile_import_item(
     }
     .map_err(|err| profile_file_diagnostic(&source, err.to_string()))?;
 
+    let pre_lower = profile.validate_before_lowering(&source);
+    if let Some(diag) = pre_lower.into_iter().find(|d| d.severity == "error") {
+        return Err(ProviderProfileDiagnostic {
+            source: diag.source,
+            profile_id: diag.profile_id,
+            field: diag.field,
+            message: diag.message,
+            severity: diag.severity,
+        });
+    }
+
     Ok(ProviderProfileImportItem {
         profile: Some(profile.to_proto()),
         source,
