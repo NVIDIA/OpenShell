@@ -42,7 +42,7 @@ impl PolicyGetView {
         }
     }
 
-    pub fn includes_policy(self) -> bool {
+    pub(crate) fn includes_policy(self) -> bool {
         matches!(self, Self::Base | Self::Full)
     }
 }
