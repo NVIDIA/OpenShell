@@ -1266,8 +1266,11 @@ mod lifecycle_tests {
 
     #[test]
     fn tls_env_vars_replace_user_trust_overrides() {
-        let ca_cert = PathBuf::from("C:\\openshell\\tls\\openshell-ca.pem");
-        let bundle = PathBuf::from("C:\\openshell\\tls\\ca-bundle.pem");
+        let tls_dir = std::env::temp_dir().join("openshell-mxc-tls-test");
+        let ca_cert = tls_dir.join("openshell-ca.pem");
+        let bundle = tls_dir.join("ca-bundle.pem");
+        let ca_cert_path = ca_cert.display().to_string();
+        let bundle_path = bundle.display().to_string();
         let mut env = vec![
             "FOO=bar".to_string(),
             "SSL_CERT_FILE=C:\\old\\bundle.pem".to_string(),
@@ -1285,25 +1288,25 @@ mod lifecycle_tests {
             !env.iter()
                 .any(|entry| entry == "node_extra_ca_certs=C:\\old\\ca.pem")
         );
-        assert!(
-            env.contains(&"NODE_EXTRA_CA_CERTS=C:\\openshell\\tls\\openshell-ca.pem".to_string())
-        );
-        assert!(env.contains(&"DENO_CERT=C:\\openshell\\tls\\openshell-ca.pem".to_string()));
-        assert!(env.contains(&"SSL_CERT_FILE=C:\\openshell\\tls\\ca-bundle.pem".to_string()));
-        assert!(env.contains(&"REQUESTS_CA_BUNDLE=C:\\openshell\\tls\\ca-bundle.pem".to_string()));
-        assert!(env.contains(&"CURL_CA_BUNDLE=C:\\openshell\\tls\\ca-bundle.pem".to_string()));
-        assert!(env.contains(&"GIT_SSL_CAINFO=C:\\openshell\\tls\\ca-bundle.pem".to_string()));
+        assert!(env.contains(&format!("NODE_EXTRA_CA_CERTS={ca_cert_path}")));
+        assert!(env.contains(&format!("DENO_CERT={ca_cert_path}")));
+        assert!(env.contains(&format!("SSL_CERT_FILE={bundle_path}")));
+        assert!(env.contains(&format!("REQUESTS_CA_BUNDLE={bundle_path}")));
+        assert!(env.contains(&format!("CURL_CA_BUNDLE={bundle_path}")));
+        assert!(env.contains(&format!("GIT_SSL_CAINFO={bundle_path}")));
     }
 
     #[test]
     fn tls_readonly_grant_adds_ca_directory_once() {
-        let ca_cert = PathBuf::from("C:\\openshell\\tls\\openshell-ca.pem");
-        let bundle = PathBuf::from("C:\\openshell\\tls\\ca-bundle.pem");
-        let mut readonly = vec!["c:\\openshell\\tls".to_string()];
+        let tls_dir = std::env::temp_dir().join("openshell-mxc-tls-test");
+        let ca_cert = tls_dir.join("openshell-ca.pem");
+        let bundle = tls_dir.join("ca-bundle.pem");
+        let existing = tls_dir.display().to_string().to_ascii_lowercase();
+        let mut readonly = vec![existing.clone()];
 
         append_tls_readonly_grant(&mut readonly, Some(&(ca_cert, bundle)));
 
-        assert_eq!(readonly, vec!["c:\\openshell\\tls"]);
+        assert_eq!(readonly, vec![existing]);
     }
 
     #[test]
