@@ -10,7 +10,9 @@ Podman, or VM runtime host.
 - Keep the Linux and macOS build paths unchanged.
 - Preserve gateway configuration parsing for all existing compute driver names.
 - Return clear unsupported errors when a Windows gateway is configured to use Docker, Kubernetes, Podman, or VM.
-- Validate the Windows lane through mise tasks that are separate from the default Linux `ci` task.
+- Keep dedicated `windows:*` validation tasks while allowing the repository-wide
+  `pre-commit` task to delegate compiler-bearing Rust checks to the native
+  Windows MSVC environment.
 
 ## Non-Goals
 
@@ -59,6 +61,14 @@ Visual Studio's `VsDevCmd.bat` with `vswhere` or by enumerating installed
 release directories, validates the requested compiler and ARM64 Spectre
 libraries, adds rustup MSVC targets, clears inherited `RUSTC_WRAPPER`, and
 keeps build artifacts under the normal Cargo target tree.
+On Windows, the generic `rust:check`, `rust:lint`, and `test:rust` tasks call
+the same wrapper with the host-native MSVC target. The wrapper preserves the
+Unix Cargo commands on Linux and macOS, excludes unsupported Windows runtime
+packages, and runs the server test-support suite separately. Windows Clippy
+continues to deny all warnings except unused imports, dead code, and unused
+async functions caused by cfg-gated Windows stubs. Repository-wide pre-commit
+skips only Linux-specific installer and packaging-asset tests; its
+cross-platform Python, Markdown, license, and documentation checks still run.
 Test tasks require the Rust target architecture to match the Windows host, so
 an ARM64 test result is native coverage rather than x64 emulation coverage.
 By default it enables bundled Z3 for reproducible Windows builds. When

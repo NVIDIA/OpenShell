@@ -101,7 +101,7 @@ def find_repo_root() -> Path:
 
 def is_excluded(rel: Path) -> bool:
     """Return True if a path should be skipped."""
-    rel_str = str(rel)
+    rel_str = rel.as_posix()
 
     # Exact filename exclusions.
     if rel.name in EXCLUDE_FILES:

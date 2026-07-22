@@ -165,6 +165,13 @@ After every cfg gate change, run `cargo check --workspace` on the Linux baseline
 
 The Windows build path is additive. Keep the repository's Linux `mise run ci`, default Cargo tasks, and Linux documentation unchanged. Windows automation lives in `tasks/windows.toml` and delegates to `tasks/scripts/windows-msvc.ps1`.
 
+On Windows, `mise run pre-commit` routes `rust:check`, `rust:lint`, and
+`test:rust` through the same wrapper for the host-native target. Shared task
+definitions retain their Unix commands. Only Linux installer and
+service/RPM-packaging tests skip. The Windows Clippy command allows unused
+imports, dead code, and unused async functions caused by cfg-gated stubs; other
+warnings remain errors.
+
 | Task | Expected behavior |
 |---|---|
 | `mise run --skip-tools windows:check:x64` | Runs x64 MSVC `cargo check --workspace` |

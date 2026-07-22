@@ -201,6 +201,13 @@ Git, caches it under `CARGO_TARGET_DIR`, and sets
 `Z3_SYS_BUNDLED_DIR_OVERRIDE`. This bypasses the unauthenticated GitHub
 Contents API lookup that can fail with HTTP 403 on shared networks.
 
+The repository-wide `mise run pre-commit` task is supported on Windows.
+`tasks/rust.toml` and `tasks/test.toml` route compiler-bearing checks through
+the wrapper for the native host target, while `tasks/markdown.toml` provides a
+Windows-safe dependency setup command. Keep existing Unix `run` bodies
+unchanged when adding `run_windows` behavior. Linux installer and packaging
+asset tests skip explicitly; cross-platform checks continue to run.
+
 ### Step 6: mise check on x86_64-pc-windows-msvc
 
 ```powershell

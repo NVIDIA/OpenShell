@@ -8,6 +8,8 @@ use std::path::Path;
 
 use miette::Result;
 
+// Keep this stub's signature aligned with the supported-platform implementation.
+#[allow(clippy::implicit_hasher)]
 pub async fn build_local_image(
     _dockerfile_path: &Path,
     _tag: &str,

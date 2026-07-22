@@ -6,11 +6,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet("check", "build", "test", "test-unsupported", "artifacts", "ci")]
+    [ValidateSet("check", "lint", "build", "test", "test-precommit", "test-unsupported", "artifacts", "ci")]
     [string] $Action,
 
     [Parameter(Position = 1)]
-    [ValidateSet("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc", "all")]
+    [ValidateSet("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc", "native", "all")]
     [string] $Target = "all",
 
     [string] $LogDir
@@ -37,7 +37,9 @@ if ([string]::IsNullOrWhiteSpace($TargetDir)) {
     $TargetDir = Join-Path $RepoRoot "target"
 }
 
-$UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-podman --exclude openshell-driver-vm"
+$UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-podman --exclude openshell-driver-vm --exclude openshell-supervisor-process"
+$WindowsClippyPackageExcludes = $UnsupportedDriverPackageExcludes
+$WindowsClippyLintArgs = "-D warnings -A dead-code -A unused-imports -A clippy::unused-async"
 $BundledZ3WorkspaceFeatures = "--features openshell-prover/bundled-z3"
 $BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-prover/bundled-z3"
 $BundledZ3Repository = "https://github.com/Z3Prover/z3.git"
@@ -309,6 +311,12 @@ function Assert-NativeTestTarget([string] $RustTarget) {
 }
 
 function Get-SelectedTargets([string] $RequestedTarget) {
+    if ($RequestedTarget -eq "native") {
+        switch (Get-HostArch) {
+            "arm64" { return @("aarch64-pc-windows-msvc") }
+            default { return @("x86_64-pc-windows-msvc") }
+        }
+    }
     if ($RequestedTarget -eq "all") {
         $targets = @("x86_64-pc-windows-msvc")
         if ($env:OPENSHELL_MXC_SKIP_ARM64 -ne "1") {
@@ -505,6 +513,17 @@ function Invoke-Check([string] $RustTarget) {
         -LogName "build-$RustTarget-check.log"
 }
 
+function Invoke-Lint([string] $RustTarget) {
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo clippy --workspace --all-targets --no-deps $WindowsClippyPackageExcludes --target $RustTarget $Z3WorkspaceFeatures -- $WindowsClippyLintArgs" `
+        -LogName "lint-$RustTarget-workspace.log"
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo clippy --manifest-path e2e/rust/Cargo.toml --all-targets --no-deps --target $RustTarget -- $WindowsClippyLintArgs" `
+        -LogName "lint-$RustTarget-e2e.log"
+}
+
 function Invoke-Build([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
@@ -518,6 +537,18 @@ function Invoke-Test([string] $RustTarget) {
         -RustTarget $RustTarget `
         -CargoArgs "cargo test --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --no-fail-fast $Z3WorkspaceFeatures" `
         -LogName "test-$RustTarget.log"
+}
+
+function Invoke-PreCommitTest([string] $RustTarget) {
+    Assert-NativeTestTarget $RustTarget
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo test --workspace --exclude openshell-server $UnsupportedDriverPackageExcludes --target $RustTarget --no-fail-fast $Z3WorkspaceFeatures" `
+        -LogName "test-$RustTarget-precommit-workspace.log"
+    Invoke-VsCargo `
+        -RustTarget $RustTarget `
+        -CargoArgs "cargo test -p openshell-server --features test-support --target $RustTarget --no-fail-fast $Z3ServerFeatures" `
+        -LogName "test-$RustTarget-precommit-server.log"
 }
 
 function Invoke-UnsupportedContractTests([string] $RustTarget) {
@@ -579,13 +610,13 @@ if ($Action -eq "ci" -and (Get-HostArch) -ne "amd64") {
 }
 
 $targets = Get-SelectedTargets $Target
-if ($Action -in @("test", "test-unsupported")) {
+if ($Action -in @("test", "test-precommit", "test-unsupported")) {
     foreach ($rustTarget in $targets) {
         Assert-NativeTestTarget $rustTarget
     }
 }
 
-if ($Action -in @("check", "build", "test", "test-unsupported", "ci")) {
+if ($Action -in @("check", "lint", "build", "test", "test-precommit", "test-unsupported", "ci")) {
     $z3Features = Configure-Z3
     $Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
     $Z3ServerFeatures = $z3Features.ServerFeatures
@@ -601,6 +632,11 @@ switch ($Action) {
             Invoke-Check $rustTarget
         }
     }
+    "lint" {
+        foreach ($rustTarget in $targets) {
+            Invoke-Lint $rustTarget
+        }
+    }
     "build" {
         foreach ($rustTarget in $targets) {
             Invoke-Build $rustTarget
@@ -610,6 +646,11 @@ switch ($Action) {
     "test" {
         foreach ($rustTarget in $targets) {
             Invoke-Test $rustTarget
+        }
+    }
+    "test-precommit" {
+        foreach ($rustTarget in $targets) {
+            Invoke-PreCommitTest $rustTarget
         }
     }
     "test-unsupported" {
