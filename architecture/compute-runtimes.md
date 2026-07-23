@@ -118,7 +118,7 @@ delete, reconciliation removes the row; otherwise it can remain `Deleting`.
 |---|---|---|---|
 | Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
-| Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
+| Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, GPU resources, and optionally Agent Sandbox v1beta1 warm-pool claims. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Managed endpoint-backed driver. The gateway spawns `openshell-driver-vm`, waits for its Unix socket, and then consumes it through the same remote `compute_driver.proto` path used by unmanaged endpoint drivers. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
 | Extension | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Selected by a non-reserved custom `compute_drivers = ["<name>"]` entry with `[openshell.drivers.<name>].socket_path`, or at launch time by pairing `--drivers <name>` with `--compute-driver-socket=<path>`. Reserved built-in names such as `vm`, `docker`, `podman`, and `kubernetes` cannot be used as unmanaged socket endpoints. The gateway connects to a UDS the operator already provisioned, runs `GetCapabilities`, logs the advertised `driver_name`, and dispatches all sandbox lifecycle calls through `compute_driver.proto`. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove unmanaged extension drivers. The trust boundary is the socket's filesystem permissions: the operator must ensure only the gateway uid can read/write it. |
 
@@ -211,6 +211,33 @@ JWT. The supervisor installs that JWT in memory and starts the normal
 `ConnectSupervisor` session as the activated sandbox. The gateway does not dial
 pod IPs or require an inbound activation port; activation is supervisor
 initiated over the existing outbound gRPC connection.
+
+When compatible OpenShell-enabled Agent Sandbox warm pools exist, the
+Kubernetes driver can create a `SandboxClaim` instead of a direct `Sandbox`.
+The driver watches warm pools and templates into a local cache so create
+requests do not list or fetch extension objects on the hot path. This remains
+behind the compute-driver boundary: other drivers and the driver-agnostic
+gateway lifecycle continue to operate on OpenShell sandbox identity and status.
+Warm-pool activation uses the same trust boundary as direct Kubernetes
+activation. The direct path validates `pod token -> live pod -> owning Sandbox
+CR -> Sandbox sandbox-id metadata`; the warm path validates `pod token -> live
+pod -> owning Sandbox CR -> associated SandboxClaim -> SandboxClaim sandbox-id
+metadata`. In both paths, sandbox-id metadata is not cryptographic proof by
+itself. It is trusted because the gateway and Agent Sandbox controllers own the
+relevant Kubernetes objects, and RBAC must prevent sandbox workloads and
+untrusted users from creating or mutating trusted `Sandbox`, `SandboxClaim`, pod
+metadata, or sandbox service-account identity in the gateway-managed namespace.
+Under that model, warm pooling does not require a separate anti-spoofing token
+or gateway-side claim mapping beyond the same live Kubernetes ownership and
+metadata consistency checks used by the direct path. If an operator grants
+untrusted principals write access to those objects, both warm and direct
+activation require a broader common proof model.
+The Kubernetes driver can optionally run a separate ConfigMap profile
+reconciler that turns admin-authored TOML profiles into generated
+`SandboxTemplate` and `SandboxWarmPool` resources. That reconciler is
+independent of the create-path matcher: admins can use it, Helm, kubectl, or
+another controller to create warm pools, and the matcher only considers the
+resulting enabled warm-pool resources and their fingerprints.
 
 Kubernetes can run the supervisor in the default combined topology or in a
 sidecar topology. Combined mode keeps network and process supervision in the

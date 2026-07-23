@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
     GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, NetworkActivitySummary,
-    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
+    PodActivationMessage, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
     RegisterSupervisorPodRequest, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
     inference_client::InferenceClient, open_shell_client::OpenShellClient,
@@ -272,7 +272,9 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
         && !sa_path.is_empty()
     {
         return Ok(AcquiredToken {
-            token: acquire_k8s_sandbox_token(endpoint, plain_channel, &sa_path).await?,
+            token: acquire_k8s_supervisor_activation(endpoint, plain_channel, &sa_path)
+                .await?
+                .token,
             refresh_mode: RefreshMode::GatewayJwt(TokenSource::K8sServiceAccount),
         });
     }
@@ -290,6 +292,18 @@ async fn acquire_k8s_sandbox_token(
     plain_channel: &Channel,
     sa_path: &str,
 ) -> Result<String> {
+    Ok(
+        acquire_k8s_supervisor_activation(endpoint, plain_channel, sa_path)
+            .await?
+            .token,
+    )
+}
+
+async fn acquire_k8s_supervisor_activation(
+    endpoint: &str,
+    plain_channel: &Channel,
+    sa_path: &str,
+) -> Result<PodActivationMessage> {
     let sa_token = std::fs::read_to_string(sa_path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read K8s SA token from {sa_path}"))?
@@ -324,7 +338,61 @@ async fn acquire_k8s_sandbox_token(
         sandbox_name = %activation.sandbox_name,
         "received supervisor pod activation"
     );
-    Ok(activation.token)
+    Ok(activation)
+}
+
+/// Register a Kubernetes supervisor pod and install the activated gateway JWT.
+///
+/// Warm pods call this before policy loading. The registration stream remains
+/// pending until the Kubernetes driver observes a claim binding and the gateway
+/// sends activation.
+pub async fn register_k8s_supervisor_pod(endpoint: &str) -> Result<PodActivationMessage> {
+    let sa_path = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
+        .ok()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            miette::miette!(
+                "{} must be set to register Kubernetes supervisor pod",
+                sandbox_env::K8S_SA_TOKEN_FILE
+            )
+        })?;
+
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let activation = {
+            let guard = TOKEN_INIT_LOCK.lock().await;
+            if TOKEN_SLOT.get().is_some() {
+                return Err(miette::miette!(
+                    "Kubernetes supervisor pod registration was requested after sandbox token initialization"
+                ));
+            }
+
+            match async {
+                let plain_channel = build_plain_channel(endpoint).await?;
+                acquire_k8s_supervisor_activation(endpoint, &plain_channel, &sa_path).await
+            }
+            .await
+            {
+                Ok(activation) => activation,
+                Err(err) => {
+                    warn!(
+                        endpoint = %endpoint,
+                        error = %err,
+                        retry_after_secs = backoff.as_secs(),
+                        "Kubernetes supervisor pod registration failed; retrying: {err:#}"
+                    );
+                    drop(guard);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                    continue;
+                }
+            }
+        };
+
+        let _slot = install_token_slot(&activation.token)?;
+        let _ = TOKEN_REFRESH_MODE.set(RefreshMode::GatewayJwt(TokenSource::K8sServiceAccount));
+        return Ok(activation);
+    }
 }
 
 /// Build an authenticated channel for direct external use (e.g. the

@@ -125,6 +125,20 @@ impl KubernetesSidecarConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesWarmPoolingConfig {
+    /// Allow the Kubernetes driver to satisfy compatible create requests by
+    /// creating v1beta1 Agent Sandbox `SandboxClaim` resources.
+    pub enabled: bool,
+}
+
+impl Default for KubernetesWarmPoolingConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Kubernetes `AppArmor` profile requested for the sandbox agent container.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppArmorProfile {
@@ -253,6 +267,8 @@ pub struct KubernetesComputeConfig {
     pub topology: SupervisorTopology,
     /// Sidecar-only settings used when `topology = "sidecar"`.
     pub sidecar: KubernetesSidecarConfig,
+    /// Warm-pool allocation settings.
+    pub warm_pooling: KubernetesWarmPoolingConfig,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -346,6 +362,7 @@ impl Default for KubernetesComputeConfig {
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             topology: SupervisorTopology::default(),
             sidecar: KubernetesSidecarConfig::default(),
+            warm_pooling: KubernetesWarmPoolingConfig::default(),
             grpc_endpoint: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             client_tls_secret_name: String::new(),
@@ -544,6 +561,34 @@ mod tests {
     fn default_sidecar_requires_process_binary_aware_network_policy() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.sidecar.process_binary_aware_network_policy);
+    }
+
+    #[test]
+    fn default_warm_pooling_is_enabled() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.warm_pooling.enabled);
+    }
+
+    #[test]
+    fn serde_override_warm_pooling_enabled() {
+        let json = serde_json::json!({
+            "warm_pooling": {
+                "enabled": false
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert!(!cfg.warm_pooling.enabled);
+    }
+
+    #[test]
+    fn serde_rejects_unknown_warm_pooling_field() {
+        let json = serde_json::json!({
+            "warm_pooling": {
+                "mode": "always"
+            }
+        });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]

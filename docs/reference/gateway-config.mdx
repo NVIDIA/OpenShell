@@ -298,6 +298,11 @@ provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.soc
 # sandbox_uid = 1500
 # sandbox_gid = 1500
 
+[openshell.drivers.kubernetes.warm_pooling]
+# When enabled, compatible creates may use v1beta1 SandboxClaim resources
+# backed by the driver's cache of OpenShell-enabled SandboxWarmPool resources.
+enabled = true
+
 [openshell.drivers.kubernetes.sidecar]
 # UID used by relaxed long-running network sidecars. Strict process/binary-aware
 # sidecars run as UID 0 so Kubernetes grants the required /proc inspection

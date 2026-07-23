@@ -159,6 +159,15 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\.sidecar\].*?process_binary_aware_network_policy\s*=\s*false'
 
+  - it: renders warm pooling config under [openshell.drivers.kubernetes.warm_pooling]
+    template: templates/gateway-config.yaml
+    set:
+      server.warmPooling.enabled: false
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.warm_pooling\].*?enabled\s*=\s*false'
+
   - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
     template: templates/gateway-config.yaml
     set:

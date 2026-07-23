@@ -345,6 +345,16 @@ process/binary identity through `/proc/<entrypoint-pid>`.
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. It detects the served Sandbox API at runtime, caches the selected API version for the gateway process, and uses `v1beta1` when available before falling back to `v1alpha1`, so supported Agent Sandbox installations work without version-specific operator configuration. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 
+When Kubernetes warm pooling is enabled, the driver can satisfy compatible
+create requests by creating `extensions.agents.x-k8s.io/v1beta1`
+`SandboxClaim` resources instead of direct `Sandbox` resources. The driver
+discovers `SandboxWarmPool` resources labelled `openshell.ai/enabled=true`
+across namespaces it can observe, resolves each pool's `SandboxTemplate`, and
+matches only against pools in the Kubernetes namespace selected for the
+OpenShell workspace. Set
+`openshell.drivers.kubernetes.warm_pooling.enabled = false` to force direct
+`Sandbox` creation.
+
 If Agent Sandbox is upgraded in place, restart the OpenShell gateway after the controller and CRD rollout completes so the gateway can detect the served API versions again.
 
 <Note>

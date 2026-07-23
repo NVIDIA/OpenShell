@@ -26,6 +26,26 @@ by the gateway.
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
 indefinitely when the API server is slow or unavailable.
 
+## Warm-Pool Allocation
+
+The driver can use Agent Sandbox extension CRDs for transparent warm-pool
+allocation. When `warm_pooling.enabled` is true, the driver watches and caches
+`extensions.agents.x-k8s.io/v1beta1` `SandboxWarmPool` resources labelled
+`openshell.ai/enabled=true`, resolves each pool's referenced
+`SandboxTemplate`, and computes an in-memory fingerprint of the template spec.
+
+On create, the driver renders the Kubernetes spec that direct `Sandbox`
+creation would use, strips per-sandbox identity values from the fingerprint,
+and matches it against the warm-pool cache for the target Kubernetes namespace.
+If exactly one pool matches, the driver creates a v1beta1 `SandboxClaim` with
+`spec.warmPoolRef.name` set to that pool. If no pool matches, multiple pools
+match, RBAC prevents cache maintenance, or the v1beta1 extension APIs are
+unavailable, the driver falls back to direct `Sandbox` creation.
+
+The extension CRDs are intentionally v1beta1-only. The core
+`agents.x-k8s.io/Sandbox` CRD still supports the existing v1beta1-to-v1alpha1
+fallback.
+
 ## Workspace Persistence
 
 Sandbox pods use a PVC-backed `/sandbox` workspace. An init container seeds the

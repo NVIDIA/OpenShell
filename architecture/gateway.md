@@ -169,6 +169,19 @@ token with Kubernetes `TokenReview`, requires the configured sandbox service
 account, checks the returned pod binding against the live pod UID, and verifies
 the pod's controlling `Sandbox` ownerReference against the live Sandbox CR UID
 and sandbox-id label before sending an activation message with the gateway JWT.
+For warm-pooled Kubernetes sandboxes, the same check is re-anchored through the
+claim that adopted the warm pod: the live pod must still be controlled by a
+live `Sandbox`, that `Sandbox` must be associated with the live
+`SandboxClaim`, and the sandbox-id metadata on that claim must identify the
+same OpenShell sandbox record before activation can complete. This is not a
+separate warm-only spoofing defense; it is the warm-path equivalent of the
+direct path's owner-reference and sandbox-id consistency check. Both paths
+depend on the same Kubernetes RBAC boundary: sandbox workloads and untrusted
+users must not be able to create or mutate trusted Agent Sandbox objects, pod
+metadata, or the configured sandbox ServiceAccount in the gateway-managed
+namespace. If that boundary is weakened, a fix must cover both direct
+`Sandbox` and warm `SandboxClaim` activation rather than adding a warm-only
+proof.
 The bootstrap path accepts both `agents.x-k8s.io/v1beta1` ownerReferences from
 newer Agent Sandbox controllers and `agents.x-k8s.io/v1alpha1` ownerReferences
 from existing deployments. `IssueSandboxToken` remains as a compatibility shim

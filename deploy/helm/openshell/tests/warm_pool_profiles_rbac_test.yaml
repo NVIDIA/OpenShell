@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: warm pool profile RBAC
+templates:
+  - templates/clusterrole.yaml
+  - templates/warm-pool-profile-role.yaml
+  - templates/warm-pool-profile-rolebinding.yaml
+release:
+  name: openshell
+  namespace: gateway-ns
+
+tests:
+  - it: does not render profile namespace RBAC when profile reconciliation is explicitly disabled
+    template: templates/warm-pool-profile-role.yaml
+    set:
+      server.warmPooling.profiles.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders profile ConfigMap RBAC in the release namespace by default
+    template: templates/warm-pool-profile-role.yaml
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: gateway-ns
+      - contains:
+          path: rules[0].resources
+          content: configmaps
+      - contains:
+          path: rules[0].verbs
+          content: patch
+
+  - it: renders profile ConfigMap RBAC in the configured namespace
+    template: templates/warm-pool-profile-rolebinding.yaml
+    set:
+      server.warmPooling.profiles.namespace: profiles-ns
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: profiles-ns
+      - equal:
+          path: subjects[0].namespace
+          value: gateway-ns
+
+  - it: adds generated warm-pool write verbs to the ClusterRole when enabled
+    template: templates/clusterrole.yaml
+    asserts:
+      - contains:
+          path: rules[4].verbs
+          content: create
+      - contains:
+          path: rules[4].verbs
+          content: patch
+      - contains:
+          path: rules[4].verbs
+          content: delete

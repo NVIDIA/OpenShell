@@ -3944,6 +3944,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "temp-env",
  "thiserror 2.0.18",
  "tokio",
