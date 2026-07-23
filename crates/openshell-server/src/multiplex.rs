@@ -1484,7 +1484,7 @@ mod tests {
         // An exhausted limiter must report ready even when the inner service is
         // pending, so `call` returns RESOURCE_EXHAUSTED instead of waiting on
         // inner backpressure.
-        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let config = Config::default().with_grpc_rate_limit(Some(1), Some(60));
         let limiter = GrpcRateLimiter::from_config(&config).expect("limiter should be enabled");
         // Consume the single token so the limiter is exhausted.
         assert!(limiter.allow());
@@ -1499,7 +1499,7 @@ mod tests {
         assert_eq!(grpc_status_from_response(&response), "8");
 
         // A limiter with capacity must still respect inner backpressure.
-        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let config = Config::default().with_grpc_rate_limit(Some(1), Some(60));
         let limiter = GrpcRateLimiter::from_config(&config);
         let mut with_capacity = GrpcRateLimitService::new(PendingInnerService::new(), limiter);
         assert!(
@@ -1515,7 +1515,7 @@ mod tests {
         // rate-limit window then rolls over before `call`, the request must
         // still be rejected rather than forwarded to an inner service that
         // never reported readiness (a Tower contract violation).
-        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let config = Config::default().with_grpc_rate_limit(Some(1), Some(60));
         let limiter = GrpcRateLimiter::from_config(&config).expect("limiter should be enabled");
         // Exhaust the single token.
         assert!(limiter.allow());
@@ -1560,7 +1560,7 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_rate_limit_returns_resource_exhausted_after_limit() {
-        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let config = Config::default().with_grpc_rate_limit(Some(1), Some(60));
         let limiter = GrpcRateLimiter::from_config(&config);
         let calls = Arc::new(AtomicUsize::new(0));
         let mut service = GrpcRateLimitService::new(
@@ -1592,7 +1592,7 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_rate_limit_disabled_passes_requests_through() {
-        let config = Config::new(None).with_grpc_rate_limit(Some(0), Some(60));
+        let config = Config::default().with_grpc_rate_limit(Some(0), Some(60));
         let limiter = GrpcRateLimiter::from_config(&config);
         let calls = Arc::new(AtomicUsize::new(0));
         let mut service = GrpcRateLimitService::new(
@@ -1617,7 +1617,7 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_rate_limit_resets_after_window() {
-        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let config = Config::default().with_grpc_rate_limit(Some(1), Some(60));
         let limiter = GrpcRateLimiter::from_config(&config).expect("limiter should be enabled");
         let calls = Arc::new(AtomicUsize::new(0));
         let mut service = GrpcRateLimitService::new(
@@ -1660,7 +1660,7 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_rate_limit_state_is_shared_across_service_clones() {
-        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let config = Config::default().with_grpc_rate_limit(Some(1), Some(60));
         let limiter = GrpcRateLimiter::from_config(&config);
         let calls = Arc::new(AtomicUsize::new(0));
         let mut first_service = GrpcRateLimitService::new(

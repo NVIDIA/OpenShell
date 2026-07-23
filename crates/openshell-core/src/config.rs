@@ -897,6 +897,12 @@ impl Config {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
 impl Default for ServiceRoutingConfig {
     fn default() -> Self {
         Self {
@@ -1035,24 +1041,24 @@ mod tests {
     #[test]
     fn config_defaults_to_loopback_bind_address() {
         let expected: SocketAddr = "127.0.0.1:17670".parse().expect("valid address");
-        assert_eq!(Config::new(None).bind_address, expected);
+        assert_eq!(Config::default().bind_address, expected);
     }
 
     #[test]
     fn config_new_disables_health_bind_by_default() {
-        let cfg = Config::new(None);
+        let cfg = Config::default();
         assert!(cfg.health_bind_address.is_none());
     }
 
     #[test]
     fn config_disables_unauthenticated_users_by_default() {
-        let cfg = Config::new(None);
+        let cfg = Config::default();
         assert!(!cfg.auth.allow_unauthenticated_users);
     }
 
     #[test]
     fn config_defaults_to_builtin_and_user_provider_profile_sources() {
-        let cfg = Config::new(None);
+        let cfg = Config::default();
         assert_eq!(
             cfg.provider_profile_sources,
             vec![
@@ -1105,21 +1111,21 @@ mod tests {
 
     #[test]
     fn grpc_rate_limit_requires_positive_pair() {
-        assert!(Config::new(None).grpc_rate_limit().is_none());
+        assert!(Config::default().grpc_rate_limit().is_none());
         assert!(
-            Config::new(None)
+            Config::default()
                 .with_grpc_rate_limit(Some(10), None)
                 .grpc_rate_limit()
                 .is_none()
         );
         assert!(
-            Config::new(None)
+            Config::default()
                 .with_grpc_rate_limit(Some(0), Some(60))
                 .grpc_rate_limit()
                 .is_none()
         );
         assert_eq!(
-            Config::new(None)
+            Config::default()
                 .with_grpc_rate_limit(Some(10), Some(60))
                 .grpc_rate_limit(),
             Some((10, Duration::from_secs(60)))
@@ -1128,7 +1134,7 @@ mod tests {
 
     #[test]
     fn service_routing_allows_loopback_plaintext_http_by_default() {
-        let cfg = Config::new(None);
+        let cfg = Config::default();
         assert_eq!(
             cfg.service_routing.base_domains,
             vec![DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()]
@@ -1138,7 +1144,7 @@ mod tests {
 
     #[test]
     fn server_sans_update_preserves_loopback_plaintext_http_flag() {
-        let cfg = Config::new(None)
+        let cfg = Config::default()
             .with_loopback_service_http(false)
             .with_server_sans(["*.dev.openshell.localhost"]);
 
@@ -1154,7 +1160,7 @@ mod tests {
 
     #[test]
     fn service_routing_domains_are_derived_from_wildcard_server_sans() {
-        let cfg = Config::new(None).with_server_sans([
+        let cfg = Config::default().with_server_sans([
             "gateway.example.com",
             "*.apps.example.com",
             "127.0.0.1",
@@ -1175,7 +1181,7 @@ mod tests {
     #[test]
     fn config_with_health_bind_address_sets_address() {
         let addr: SocketAddr = "0.0.0.0:9090".parse().expect("valid address");
-        let cfg = Config::new(None).with_health_bind_address(addr);
+        let cfg = Config::default().with_health_bind_address(addr);
         assert_eq!(cfg.health_bind_address, Some(addr));
     }
 

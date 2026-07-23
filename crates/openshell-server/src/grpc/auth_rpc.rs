@@ -169,7 +169,7 @@ mod tests {
         );
         let compute = new_test_runtime(store.clone()).await;
         let mut state = ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            Config::default().with_database_url("sqlite::memory:?cache=shared"),
             store,
             compute,
             SandboxIndex::new(),
@@ -348,7 +348,7 @@ mod tests {
         );
         let compute = new_test_runtime(store.clone()).await;
         let state = Arc::new(ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            Config::default().with_database_url("sqlite::memory:?cache=shared"),
             store,
             compute,
             SandboxIndex::new(),

@@ -807,7 +807,7 @@ pub mod test_support {
         crate::ensure_default_workspace(&store).await.unwrap();
         let compute = new_test_runtime(store.clone()).await;
         Arc::new(ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            Config::default().with_database_url("sqlite::memory:?cache=shared"),
             store,
             compute,
             SandboxIndex::new(),
