@@ -266,10 +266,12 @@ impl ProxyHandle {
             }
 
             let mut consecutive_fd_errors: u32 = 0;
+            let mut consecutive_unknown_errors: u32 = 0;
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
                         consecutive_fd_errors = 0;
+                        consecutive_unknown_errors = 0;
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
@@ -316,24 +318,24 @@ impl ProxyHandle {
                         });
                     }
                     Err(err) => {
-                        let is_fd_exhaustion = is_fd_exhaustion_error(&err);
-                        let (severity, backoff) = if is_fd_exhaustion {
-                            consecutive_fd_errors = consecutive_fd_errors.saturating_add(1);
-                            (SeverityId::Medium, accept_backoff(consecutive_fd_errors))
-                        } else {
-                            (SeverityId::Low, std::time::Duration::from_millis(100))
-                        };
+                        let outcome = handle_accept_error(
+                            &err,
+                            &mut consecutive_fd_errors,
+                            &mut consecutive_unknown_errors,
+                        );
+
                         let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                             .activity(ActivityId::Fail)
-                            .severity(severity)
+                            .severity(outcome.severity)
                             .status(StatusId::Failure)
-                            .message(format!(
-                                "Proxy accept error (retrying in {}ms): {err}",
-                                backoff.as_millis(),
-                            ))
+                            .message(outcome.message)
                             .build();
                         ocsf_emit!(event);
-                        tokio::time::sleep(backoff).await;
+
+                        match outcome.backoff {
+                            Some(backoff) => tokio::time::sleep(backoff).await,
+                            None => break,
+                        }
                     }
                 }
             }
@@ -363,6 +365,29 @@ fn emit_activity(tx: &Option<ActivitySender>, denied: bool, deny_group: &'static
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorClass {
+    Transient,
+    Terminal,
+    Unknown,
+}
+
+#[cfg(unix)]
+fn classify_accept_error(err: &std::io::Error) -> AcceptErrorClass {
+    match err.raw_os_error() {
+        Some(libc::EMFILE) | Some(libc::ENFILE) => AcceptErrorClass::Transient,
+        Some(libc::ECONNABORTED) | Some(libc::ECONNRESET) => AcceptErrorClass::Transient,
+        Some(libc::EINTR) => AcceptErrorClass::Transient,
+        Some(libc::EBADF) | Some(libc::EINVAL) | Some(libc::ENOTSOCK) => AcceptErrorClass::Terminal,
+        _ => AcceptErrorClass::Unknown,
+    }
+}
+
+#[cfg(not(unix))]
+fn classify_accept_error(_err: &std::io::Error) -> AcceptErrorClass {
+    AcceptErrorClass::Unknown
+}
+
 #[cfg(unix)]
 fn is_fd_exhaustion_error(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
@@ -375,6 +400,7 @@ fn is_fd_exhaustion_error(_err: &std::io::Error) -> bool {
 
 const ACCEPT_BACKOFF_BASE_MS: u64 = 100;
 const ACCEPT_BACKOFF_MAX_MS: u64 = 5_000;
+const MAX_CONSECUTIVE_UNKNOWN_ERRORS: u32 = 5;
 
 fn accept_backoff(consecutive_errors: u32) -> std::time::Duration {
     let exponent = consecutive_errors.saturating_sub(1).min(7);
@@ -382,6 +408,72 @@ fn accept_backoff(consecutive_errors: u32) -> std::time::Duration {
         .saturating_mul(1u64 << exponent)
         .min(ACCEPT_BACKOFF_MAX_MS);
     std::time::Duration::from_millis(ms)
+}
+
+struct AcceptErrorOutcome {
+    severity: SeverityId,
+    message: String,
+    backoff: Option<std::time::Duration>,
+}
+
+fn handle_accept_error(
+    err: &std::io::Error,
+    consecutive_fd_errors: &mut u32,
+    consecutive_unknown_errors: &mut u32,
+) -> AcceptErrorOutcome {
+    let class = classify_accept_error(err);
+
+    match class {
+        AcceptErrorClass::Terminal => AcceptErrorOutcome {
+            severity: SeverityId::High,
+            message: format!("Proxy accept error (terminal, exiting): {err}"),
+            backoff: None,
+        },
+        AcceptErrorClass::Unknown => {
+            *consecutive_unknown_errors = consecutive_unknown_errors.saturating_add(1);
+            if *consecutive_unknown_errors > MAX_CONSECUTIVE_UNKNOWN_ERRORS {
+                AcceptErrorOutcome {
+                    severity: SeverityId::High,
+                    message: format!(
+                        "Proxy accept error (exceeded {MAX_CONSECUTIVE_UNKNOWN_ERRORS} retries, exiting): {err}"
+                    ),
+                    backoff: None,
+                }
+            } else {
+                let backoff = accept_backoff(*consecutive_unknown_errors);
+                AcceptErrorOutcome {
+                    severity: SeverityId::Medium,
+                    message: format!(
+                        "Proxy accept error (retry {}/{MAX_CONSECUTIVE_UNKNOWN_ERRORS} in {}ms): {err}",
+                        *consecutive_unknown_errors,
+                        backoff.as_millis(),
+                    ),
+                    backoff: Some(backoff),
+                }
+            }
+        }
+        AcceptErrorClass::Transient => {
+            *consecutive_unknown_errors = 0;
+            if is_fd_exhaustion_error(err) {
+                *consecutive_fd_errors = consecutive_fd_errors.saturating_add(1);
+                let backoff = accept_backoff(*consecutive_fd_errors);
+                AcceptErrorOutcome {
+                    severity: SeverityId::Medium,
+                    message: format!(
+                        "Proxy accept error (retrying in {}ms): {err}",
+                        backoff.as_millis(),
+                    ),
+                    backoff: Some(backoff),
+                }
+            } else {
+                AcceptErrorOutcome {
+                    severity: SeverityId::Low,
+                    message: format!("Proxy accept error (retrying in 100ms): {err}"),
+                    backoff: Some(std::time::Duration::from_millis(100)),
+                }
+            }
+        }
+    }
 }
 
 fn l7_inspection_active(l7_route: Option<&L7RouteSnapshot>) -> bool {
@@ -9904,5 +9996,155 @@ network_policies:
     fn is_fd_exhaustion_rejects_other_errors() {
         let err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
         assert!(!is_fd_exhaustion_error(&err));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_accept_error_fd_exhaustion_is_transient() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EMFILE)),
+            AcceptErrorClass::Transient,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENFILE)),
+            AcceptErrorClass::Transient,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_accept_error_connection_errors_are_transient() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ECONNABORTED)),
+            AcceptErrorClass::Transient,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ECONNRESET)),
+            AcceptErrorClass::Transient,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EINTR)),
+            AcceptErrorClass::Transient,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_accept_error_broken_listener_is_terminal() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EBADF)),
+            AcceptErrorClass::Terminal,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EINVAL)),
+            AcceptErrorClass::Terminal,
+        );
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::ENOTSOCK)),
+            AcceptErrorClass::Terminal,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_accept_error_unrecognized_errno_is_unknown() {
+        assert_eq!(
+            classify_accept_error(&std::io::Error::from_raw_os_error(libc::EPERM)),
+            AcceptErrorClass::Unknown,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_terminal_exits_immediately() {
+        let mut fd = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::EBADF);
+        let outcome = handle_accept_error(&err, &mut fd, &mut unk);
+        assert!(outcome.backoff.is_none());
+        assert_eq!(outcome.severity, SeverityId::High);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_transient_retries_indefinitely() {
+        let mut fd = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
+        for i in 1..=20 {
+            let outcome = handle_accept_error(&err, &mut fd, &mut unk);
+            assert!(outcome.backoff.is_some(), "should retry on attempt {i}");
+            assert_eq!(outcome.severity, SeverityId::Medium);
+        }
+        assert_eq!(fd, 20);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_unknown_exits_after_limit() {
+        let mut fd = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::EPERM);
+        for i in 1..=MAX_CONSECUTIVE_UNKNOWN_ERRORS {
+            let outcome = handle_accept_error(&err, &mut fd, &mut unk);
+            assert!(
+                outcome.backoff.is_some(),
+                "should retry on attempt {i}/{MAX_CONSECUTIVE_UNKNOWN_ERRORS}",
+            );
+            assert_eq!(outcome.severity, SeverityId::Medium);
+        }
+        let outcome = handle_accept_error(&err, &mut fd, &mut unk);
+        assert!(
+            outcome.backoff.is_none(),
+            "should exit after limit exceeded"
+        );
+        assert_eq!(outcome.severity, SeverityId::High);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_transient_resets_unknown_counter() {
+        let mut fd = 0;
+        let mut unk = 0;
+        let unknown_err = std::io::Error::from_raw_os_error(libc::EPERM);
+        let transient_err = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+
+        // Accumulate unknowns up to the limit.
+        for _ in 1..=MAX_CONSECUTIVE_UNKNOWN_ERRORS {
+            handle_accept_error(&unknown_err, &mut fd, &mut unk);
+        }
+        assert_eq!(unk, MAX_CONSECUTIVE_UNKNOWN_ERRORS);
+
+        // A transient error resets the unknown counter.
+        let outcome = handle_accept_error(&transient_err, &mut fd, &mut unk);
+        assert!(outcome.backoff.is_some());
+        assert_eq!(unk, 0);
+
+        // Unknown errors can retry again from zero.
+        let outcome = handle_accept_error(&unknown_err, &mut fd, &mut unk);
+        assert!(outcome.backoff.is_some());
+        assert_eq!(unk, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_accept_error_fd_exhaustion_uses_exponential_backoff() {
+        let mut fd = 0;
+        let mut unk = 0;
+        let err = std::io::Error::from_raw_os_error(libc::EMFILE);
+
+        let b1 = handle_accept_error(&err, &mut fd, &mut unk)
+            .backoff
+            .unwrap();
+        let b2 = handle_accept_error(&err, &mut fd, &mut unk)
+            .backoff
+            .unwrap();
+        let b3 = handle_accept_error(&err, &mut fd, &mut unk)
+            .backoff
+            .unwrap();
+
+        assert_eq!(b1.as_millis(), 100);
+        assert_eq!(b2.as_millis(), 200);
+        assert_eq!(b3.as_millis(), 400);
     }
 }
