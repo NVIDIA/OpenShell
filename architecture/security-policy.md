@@ -104,7 +104,9 @@ deny rules only when their connection and request-processing metadata agree;
 conflicting TLS, destination, credential, parser, or enforcement metadata
 rejects the complete generation. Plain L4 endpoints do not contribute
 request-processing metadata, so they may overlap an L7 endpoint when their
-connection metadata agrees.
+connection metadata agrees. When request paths overlap, a path endpoint with a
+higher specificity rank deterministically overrides broader request-processing
+metadata. Equally specific overlapping endpoints must agree.
 
 The `[openshell.gateway] policy_validation_failure_mode` configuration controls
 rejected generations. It defaults to `fail_closed`, which publishes a quarantine

@@ -92,6 +92,8 @@ pub fn find_endpoint_ambiguities(policy: &SandboxPolicy) -> Vec<EndpointAmbiguit
             if endpoint_contributes_request_pipeline_metadata(left.endpoint)
                 && endpoint_contributes_request_pipeline_metadata(right.endpoint)
                 && path_patterns_overlap(&left.endpoint.path, &right.endpoint.path)
+                && path_selector_specificity(&left.endpoint.path)
+                    == path_selector_specificity(&right.endpoint.path)
             {
                 conflicts.extend(request_pipeline_conflicts(left.endpoint, right.endpoint));
             }
@@ -347,6 +349,20 @@ fn path_patterns_overlap(left: &str, right: &str) -> bool {
     glob_patterns_overlap(left, right, '/')
 }
 
+/// Match the runtime route-selection rank used by `L7EndpointConfig`.
+///
+/// Overlapping endpoints with different ranks do not compete for request
+/// metadata: the endpoint with the more-specific path wins. Equal-rank
+/// overlaps must agree because iteration order would otherwise decide which
+/// parser, credential handling, or enforcement behavior applies.
+fn path_selector_specificity(path: &str) -> usize {
+    if path.is_empty() {
+        0
+    } else {
+        path.chars().filter(|character| *character != '*').count()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlobToken {
     Literal(char),
@@ -537,6 +553,19 @@ mod tests {
         let mut right = endpoint("api.example.com", 443);
         right.path = "/repos/**".to_string();
         right.protocol = "rest".to_string();
+
+        assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
+    }
+
+    #[test]
+    fn more_specific_path_may_override_request_pipeline_metadata() {
+        let mut left = endpoint("api.example.com", 443);
+        left.protocol = "rest".to_string();
+        left.enforcement = "enforce".to_string();
+        let mut right = endpoint("api.example.com", 443);
+        right.path = "/graphql".to_string();
+        right.protocol = "graphql".to_string();
+        right.enforcement = "enforce".to_string();
 
         assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
     }
