@@ -25,8 +25,9 @@ The compute runtime selects the agent's numeric UID and GID; sandbox creators
 do not control it. Docker and Podman start the supervisor as root, inject the
 driver-resolved identity, and the supervisor drops only the agent child to that
 identity. A container image therefore need not contain a matching passwd or
-group entry. Agent children receive a stable `HOME=/sandbox`; numeric identities
-use the UID as their `USER` and `LOGNAME` presentation value.
+group entry. The managed workspace remains mounted at `/sandbox` and serves as
+the agent's home regardless of its identity; numeric identities use the UID as
+their `USER` and `LOGNAME` presentation value.
 
 ## Startup Flow
 

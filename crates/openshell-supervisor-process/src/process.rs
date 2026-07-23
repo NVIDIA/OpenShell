@@ -80,6 +80,8 @@ const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
 ];
 
+const SANDBOX_HOME: &str = "/sandbox";
+
 pub fn is_supervisor_only_env_var(key: &str) -> bool {
     SUPERVISOR_ONLY_ENV_VARS.contains(&key)
 }
@@ -861,11 +863,12 @@ impl ProcessHandle {
 /// Derive the presentation identity and home directory for an agent child.
 ///
 /// Numeric identities intentionally do not require an NSS entry, so they use
-/// `/sandbox` as their stable home while retaining the numeric UID as USER.
+/// the managed workspace as their stable home while retaining the numeric UID
+/// as USER.
 pub(crate) fn child_user_and_home(policy: &SandboxPolicy) -> (String, String) {
     match policy.process.run_as_user.as_deref() {
         Some(user) if !user.is_empty() && user.parse::<u32>().is_ok() => {
-            (user.to_string(), "/sandbox".to_string())
+            (user.to_string(), SANDBOX_HOME.to_string())
         }
         Some(user) if !user.is_empty() => {
             let home = User::from_name(user).ok().flatten().map_or_else(
@@ -874,7 +877,7 @@ pub(crate) fn child_user_and_home(policy: &SandboxPolicy) -> (String, String) {
             );
             (user.to_string(), home)
         }
-        _ => ("sandbox".to_string(), "/sandbox".to_string()),
+        _ => ("sandbox".to_string(), SANDBOX_HOME.to_string()),
     }
 }
 
@@ -1146,7 +1149,7 @@ fn rewrite_passwd_at(path: &Path, uid: &str, gid: &str) -> Result<()> {
         .collect();
 
     if !found {
-        lines.push(format!("sandbox:x:{uid}:{gid}::/sandbox:/bin/sh"));
+        lines.push(format!("sandbox:x:{uid}:{gid}::{SANDBOX_HOME}:/bin/sh"));
     }
 
     let mut output = lines.join("\n");
@@ -1340,9 +1343,14 @@ pub fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     // Recursively chown /sandbox so the sandbox process can use its home
     // directory.
     if std::env::var(openshell_core::sandbox_env::SANDBOX_UID).is_ok() {
-        let sandbox_home = Path::new("/sandbox");
+        let sandbox_home = Path::new(SANDBOX_HOME);
         if sandbox_home.exists() {
-            info!(?uid, ?gid, "Chowning /sandbox for driver-injected UID/GID");
+            info!(
+                path = SANDBOX_HOME,
+                ?uid,
+                ?gid,
+                "Chowning sandbox home for driver-injected UID/GID"
+            );
             chown_sandbox_home(sandbox_home, uid, gid)?;
         }
     }
