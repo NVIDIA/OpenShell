@@ -9644,8 +9644,8 @@ network_policies:
         );
         assert!(response.contains("ssrf_denied"));
         assert!(
-            response.contains("GET 127.0.0.1:80 blocked: internal address"),
-            "loopback must use the hard internal-address denial; got: {response:?}"
+            response.contains("GET 127.0.0.1:80 blocked: declared endpoint check failed"),
+            "an explicit loopback endpoint must fail declared-endpoint validation; got: {response:?}"
         );
         assert_eq!(denial_stages, ["ssrf"]);
     }
