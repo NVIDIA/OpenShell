@@ -90,7 +90,7 @@ pub fn run(args: ConfigArgs, explicit_path: Option<PathBuf>) -> Result<()> {
     match args.command {
         ConfigCommand::Set(settings) => {
             let path = explicit_path.map_or_else(defaults::default_gateway_config_path, Ok)?;
-            set(&path, &settings)?;
+            update_file(&path, &settings)?;
             println!("updated gateway configuration: {}", path.display());
             println!("Restart the gateway service for changes to take effect.");
         }
@@ -98,25 +98,33 @@ pub fn run(args: ConfigArgs, explicit_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn set(path: &Path, settings: &SetArgs) -> Result<()> {
+fn update_file(path: &Path, settings: &SetArgs) -> Result<()> {
     let write_path = resolve_write_path(path)?;
-    let original = match fs::read_to_string(&write_path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => {
-            return Err(err)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to read gateway config '{}'", path.display()));
-        }
-    };
+    let original = read_config(&write_path)
+        .wrap_err_with(|| format!("failed to read gateway config '{}'", path.display()))?;
+    let document = update_document(&original, settings)
+        .wrap_err_with(|| format!("failed to update gateway config '{}'", path.display()))?;
+    let rendered = document.to_string();
+    config_file::parse(&rendered, path).map_err(|err| miette::miette!("{err}"))?;
+    write_atomically(&write_path, rendered.as_bytes())
+}
 
+fn read_config(path: &Path) -> Result<String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(contents),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err).into_diagnostic(),
+    }
+}
+
+fn update_document(original: &str, settings: &SetArgs) -> Result<DocumentMut> {
     let mut document = if original.trim().is_empty() {
         DocumentMut::new()
     } else {
         original
             .parse::<DocumentMut>()
             .into_diagnostic()
-            .wrap_err_with(|| format!("failed to parse gateway config '{}'", path.display()))?
+            .wrap_err("failed to parse gateway configuration")?
     };
 
     let openshell = ensure_table(document.as_table_mut(), "openshell")?;
@@ -128,9 +136,7 @@ fn set(path: &Path, settings: &SetArgs) -> Result<()> {
         apply_assignment(&mut document, assignment)?;
     }
 
-    let rendered = document.to_string();
-    config_file::parse(&rendered, path).map_err(|err| miette::miette!("{err}"))?;
-    write_atomically(&write_path, rendered.as_bytes())
+    Ok(document)
 }
 
 fn resolve_write_path(path: &Path) -> Result<PathBuf> {
@@ -242,7 +248,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("openshell/gateway.toml");
 
-        set(
+        update_file(
             &path,
             &settings(&[
                 "openshell.gateway.compute_drivers=[\"podman\"]",
@@ -283,25 +289,18 @@ mod tests {
     }
 
     #[test]
-    fn set_preserves_comments_and_unrelated_settings() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("gateway.toml");
-        fs::write(
-            &path,
-            "# keep this comment\n[openshell]\nversion = 1\n\n[openshell.gateway]\nlog_level = \"info\" # keep this inline comment\ncompute_drivers = [\"docker\"]\n",
-        )
-        .unwrap();
-
-        set(
-            &path,
+    fn update_document_preserves_comments_and_unrelated_settings() {
+        let original = "# keep this comment\n[openshell]\nversion = 1\n\n[openshell.gateway]\nlog_level = \"info\" # keep this inline comment\ncompute_drivers = [\"docker\"]\n";
+        let updated = update_document(
+            original,
             &settings(&[
                 "openshell.gateway.log_level=\"debug\"",
                 "openshell.gateway.compute_drivers=[\"podman\"]",
             ]),
         )
-        .unwrap();
+        .unwrap()
+        .to_string();
 
-        let updated = fs::read_to_string(&path).unwrap();
         assert!(updated.contains("# keep this comment"));
         assert!(updated.contains("log_level = \"debug\" # keep this inline comment"));
     }
@@ -321,7 +320,7 @@ mod tests {
         .unwrap();
         symlink("managed-gateway.toml", &path).unwrap();
 
-        set(&path, &settings(&["openshell.gateway.log_level=\"debug\""])).unwrap();
+        update_file(&path, &settings(&["openshell.gateway.log_level=\"debug\""])).unwrap();
 
         assert!(
             fs::symlink_metadata(&path)
@@ -347,7 +346,8 @@ mod tests {
         let path = temp.path().join("gateway.toml");
         symlink("missing-gateway.toml", &path).unwrap();
 
-        let error = set(&path, &settings(&["openshell.gateway.log_level=\"debug\""])).unwrap_err();
+        let error =
+            update_file(&path, &settings(&["openshell.gateway.log_level=\"debug\""])).unwrap_err();
 
         assert!(
             format!("{error:?}").contains("failed to resolve gateway config symlink"),
@@ -363,20 +363,18 @@ mod tests {
     }
 
     #[test]
-    fn later_assignment_to_the_same_key_wins() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("gateway.toml");
-
-        set(
-            &path,
+    fn update_document_applies_assignments_in_order() {
+        let updated = update_document(
+            "",
             &settings(&[
                 "openshell.gateway.log_level=\"info\"",
                 "openshell.gateway.log_level=\"debug\"",
             ]),
         )
-        .unwrap();
+        .unwrap()
+        .to_string();
 
-        let loaded = config_file::load(&path).unwrap();
+        let loaded = config_file::parse(&updated, Path::new("gateway.toml")).unwrap();
         assert_eq!(loaded.openshell.gateway.log_level.as_deref(), Some("debug"));
     }
 
@@ -437,7 +435,7 @@ mod tests {
         let original = "[openshell]\nversion = 1\n\n[openshell.gateway]\nlog_level = \"info\"\n";
         fs::write(&path, original).unwrap();
 
-        let error = set(
+        let error = update_file(
             &path,
             &settings(&[
                 "openshell.gateway.log_level=\"debug\"",
