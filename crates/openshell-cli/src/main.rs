@@ -582,7 +582,11 @@ enum Commands {
 
     /// Show gateway status and information.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Status,
+    Status {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
 
     /// Manage inference configuration.
     #[command(after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
@@ -1434,6 +1438,10 @@ enum SandboxCommands {
         #[arg(long, value_parser = ["manual", "auto"], default_value = "manual")]
         approval_mode: String,
 
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["editor", "command", "no_keep"])]
+        output: OutputFormat,
+
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -1447,8 +1455,12 @@ enum SandboxCommands {
         name: Option<String>,
 
         /// Print only the active policy YAML (same policy as the default view; stdout only).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         policy_only: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List sandboxes.
@@ -2270,11 +2282,17 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         // Top-level status
         // -----------------------------------------------------------
-        Some(Commands::Status) => {
+        Some(Commands::Status { output }) => {
             if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
-                run::gateway_status(&ctx.name, &ctx.endpoint, &tls, auth_error.as_deref()).await?;
+                run::gateway_status(&ctx.name, &ctx.endpoint, output.as_str(), &tls, auth_error.as_deref()).await?;
+            } else if openshell_cli::output::print_output_single(
+                output.as_str(),
+                &(),
+                |()| serde_json::json!({"status": "not_configured"}),
+            )? {
+                // Structured output handled.
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();
@@ -2885,6 +2903,7 @@ async fn main() -> Result<()> {
                     labels,
                     envs,
                     approval_mode,
+                    output,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -2971,6 +2990,7 @@ async fn main() -> Result<()> {
                             labels: labels_map,
                             environment: env_map,
                             approval_mode: &approval_mode,
+                            output: output.as_str(),
                         },
                         &cli.workspace,
                         &tls,
@@ -3030,10 +3050,21 @@ async fn main() -> Result<()> {
                         | SandboxCommands::Download { .. } => {
                             unreachable!()
                         }
-                        SandboxCommands::Get { name, policy_only } => {
+                        SandboxCommands::Get {
+                            name,
+                            policy_only,
+                            output,
+                        } => {
                             let name = resolve_sandbox_name(name, &ctx.name, &cli.workspace)?;
-                            run::sandbox_get(endpoint, &name, policy_only, &cli.workspace, &tls)
-                                .await?;
+                            run::sandbox_get(
+                                endpoint,
+                                &name,
+                                policy_only,
+                                output.as_str(),
+                                &cli.workspace,
+                                &tls,
+                            )
+                            .await?;
                         }
                         SandboxCommands::List {
                             limit,
@@ -3883,7 +3914,7 @@ mod tests {
             .expect("global gateway flag should parse with subcommands");
 
         assert_eq!(cli.gateway.as_deref(), Some("demo"));
-        assert!(matches!(cli.command, Some(Commands::Status)));
+        assert!(matches!(cli.command, Some(Commands::Status { .. })));
     }
 
     #[test]

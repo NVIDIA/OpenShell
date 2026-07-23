@@ -126,6 +126,12 @@ passed the gateway authentication layer. If authentication fails while status
 remains connected, run `openshell gateway login <name>` to refresh the stored
 credentials.
 
+For automation or scripting, use `--output json` or `--output yaml` to get machine-readable output:
+
+```shell
+openshell status --output json
+```
+
 Use `openshell gateway info` when you need elevated runtime details such as
 initialized compute drivers and driver-reported capability versions:
 
