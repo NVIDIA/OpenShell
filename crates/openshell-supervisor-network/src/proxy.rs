@@ -9643,7 +9643,10 @@ network_policies:
             "internal forward destination must get the SSRF 403; got: {response:?}"
         );
         assert!(response.contains("ssrf_denied"));
-        assert!(response.contains("GET 127.0.0.1:80 blocked: allowed_ips check failed"));
+        assert!(
+            response.contains("GET 127.0.0.1:80 blocked: internal address"),
+            "loopback must use the hard internal-address denial; got: {response:?}"
+        );
         assert_eq!(denial_stages, ["ssrf"]);
     }
 
