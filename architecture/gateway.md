@@ -558,10 +558,11 @@ Driver implementation settings live in the TOML driver tables. See
 0003 for the full schema.
 
 `openshell-gateway config set` updates a single resolved TOML file from
-repeatable dotted `KEY=VALUE` assignments. It preserves comments, validates
-the complete gateway schema, and replaces the file atomically. Local
-development tasks can apply overrides to their generated configuration through
-this command without changing gateway startup precedence.
+repeatable TOML dotted `KEY=VALUE` assignments. Keys and values use TOML
+syntax, matching Cargo's command-line configuration override convention. It
+preserves comments, validates the complete gateway schema, and replaces the
+file atomically. Local development tasks can apply overrides to their generated
+configuration through this command without changing gateway startup precedence.
 
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).

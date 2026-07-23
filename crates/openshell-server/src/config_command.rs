@@ -23,20 +23,24 @@ pub struct ConfigArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
-    /// Update fields in the gateway TOML configuration.
+    /// Update the selected gateway TOML file.
+    ///
+    /// The command validates the result and atomically replaces the file.
     Set(SetArgs),
 }
 
 #[derive(Debug, Args)]
 struct SetArgs {
-    /// Dotted TOML key and value to set. May be repeated.
+    /// TOML dotted key and value to set. May be repeated.
+    /// String values must be quoted according to TOML syntax.
+    /// Array elements cannot be addressed individually; assign the complete array instead.
     #[arg(required = true, value_name = "KEY=VALUE")]
     assignments: Vec<Assignment>,
 }
 
 #[derive(Clone, Debug)]
 struct Assignment {
-    key: Vec<String>,
+    path: Vec<String>,
     value: Item,
 }
 
@@ -44,31 +48,42 @@ impl FromStr for Assignment {
     type Err = String;
 
     fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
-        let (raw_key, raw_value) = input.split_once('=').ok_or_else(|| {
-            format!("invalid assignment '{input}': expected a dotted KEY=VALUE argument")
+        let document = input.parse::<DocumentMut>().map_err(|err| {
+            format!("invalid assignment: expected one TOML KEY=VALUE assignment: {err}")
         })?;
-
-        let key = raw_key
-            .split('.')
-            .map(|component| {
-                if component.is_empty()
-                    || !component
-                        .chars()
-                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-                {
-                    return Err(format!(
-                        "invalid config key '{raw_key}': use dot-separated TOML bare keys"
-                    ));
-                }
-                Ok(component.to_string())
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let values = document.as_table().get_values();
+        let [(keys, value)] = values.as_slice() else {
+            return Err(
+                "invalid assignment: expected exactly one TOML KEY=VALUE assignment".to_string(),
+            );
+        };
+        if !has_only_dotted_parents(document.as_table(), keys) {
+            return Err(
+                "invalid assignment: expected a TOML dotted key, not a table header".to_string(),
+            );
+        }
+        let mut value = (*value).clone();
+        value.decor_mut().clear();
 
         Ok(Self {
-            key,
-            value: parse_assignment_value(raw_value.trim()),
+            path: keys.iter().map(|key| key.get().to_string()).collect(),
+            value: Item::Value(value),
         })
     }
+}
+
+fn has_only_dotted_parents(table: &Table, keys: &[&toml_edit::Key]) -> bool {
+    let mut current = table;
+    for key in keys.iter().take(keys.len().saturating_sub(1)) {
+        let Some(Item::Table(next)) = current.get(key.get()) else {
+            return false;
+        };
+        if !next.is_dotted() {
+            return false;
+        }
+        current = next;
+    }
+    true
 }
 
 pub fn run(args: ConfigArgs, explicit_path: Option<PathBuf>) -> Result<()> {
@@ -136,18 +151,9 @@ fn resolve_write_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn parse_assignment_value(raw: &str) -> Item {
-    let source = format!("value = {raw}");
-    source
-        .parse::<DocumentMut>()
-        .ok()
-        .and_then(|mut document| document.as_table_mut().remove("value"))
-        .unwrap_or_else(|| value(raw))
-}
-
 fn apply_assignment(document: &mut DocumentMut, assignment: &Assignment) -> Result<()> {
     let (key, parents) = assignment
-        .key
+        .path
         .split_last()
         .ok_or_else(|| miette::miette!("config assignment key must not be empty"))?;
     let mut table = document.as_table_mut();
@@ -240,11 +246,12 @@ mod tests {
             &path,
             &settings(&[
                 "openshell.gateway.compute_drivers=[\"podman\"]",
-                "openshell.gateway.bind_address=0.0.0.0:17670",
-                "openshell.gateway.log_level=debug",
+                "openshell.gateway.bind_address=\"0.0.0.0:17670\"",
+                "openshell.gateway.log_level=\"debug\"",
                 "openshell.gateway.grpc_rate_limit_requests=42",
                 "openshell.gateway.enable_loopback_service_http=false",
                 "openshell.drivers.vm.vcpus=4",
+                "openshell.drivers.\"containerd.io\".socket_path=\"/run/containerd.sock\"",
             ]),
         )
         .unwrap();
@@ -267,6 +274,12 @@ mod tests {
                 .and_then(toml::Value::as_integer),
             Some(4)
         );
+        assert_eq!(
+            loaded.openshell.drivers["containerd.io"]
+                .get("socket_path")
+                .and_then(toml::Value::as_str),
+            Some("/run/containerd.sock")
+        );
     }
 
     #[test]
@@ -282,7 +295,7 @@ mod tests {
         set(
             &path,
             &settings(&[
-                "openshell.gateway.log_level=debug",
+                "openshell.gateway.log_level=\"debug\"",
                 "openshell.gateway.compute_drivers=[\"podman\"]",
             ]),
         )
@@ -308,7 +321,7 @@ mod tests {
         .unwrap();
         symlink("managed-gateway.toml", &path).unwrap();
 
-        set(&path, &settings(&["openshell.gateway.log_level=debug"])).unwrap();
+        set(&path, &settings(&["openshell.gateway.log_level=\"debug\""])).unwrap();
 
         assert!(
             fs::symlink_metadata(&path)
@@ -334,7 +347,7 @@ mod tests {
         let path = temp.path().join("gateway.toml");
         symlink("missing-gateway.toml", &path).unwrap();
 
-        let error = set(&path, &settings(&["openshell.gateway.log_level=debug"])).unwrap_err();
+        let error = set(&path, &settings(&["openshell.gateway.log_level=\"debug\""])).unwrap_err();
 
         assert!(
             format!("{error:?}").contains("failed to resolve gateway config symlink"),
@@ -357,8 +370,8 @@ mod tests {
         set(
             &path,
             &settings(&[
-                "openshell.gateway.log_level=info",
-                "openshell.gateway.log_level=debug",
+                "openshell.gateway.log_level=\"info\"",
+                "openshell.gateway.log_level=\"debug\"",
             ]),
         )
         .unwrap();
@@ -368,16 +381,53 @@ mod tests {
     }
 
     #[test]
-    fn assignment_requires_key_value_syntax_and_bare_dotted_keys() {
+    fn assignment_requires_exactly_one_toml_key_value() {
         let missing_value = "openshell.gateway.log_level"
             .parse::<Assignment>()
             .unwrap_err();
         assert!(missing_value.contains("KEY=VALUE"));
 
-        let invalid_key = "openshell.gateway.bad key=value"
+        let unquoted_string = "openshell.gateway.log_level=debug"
             .parse::<Assignment>()
             .unwrap_err();
-        assert!(invalid_key.contains("dot-separated TOML bare keys"));
+        assert!(unquoted_string.contains("TOML KEY=VALUE"));
+
+        let multiple = "openshell.gateway.log_level=\"debug\"\nopenshell.gateway.disable_tls=true"
+            .parse::<Assignment>()
+            .unwrap_err();
+        assert!(multiple.contains("exactly one"));
+
+        let table_header = "[openshell.gateway]\nlog_level=\"debug\""
+            .parse::<Assignment>()
+            .unwrap_err();
+        assert!(table_header.contains("exactly one"));
+    }
+
+    #[test]
+    fn assignment_uses_toml_key_and_value_syntax() {
+        let assignment =
+            "openshell.drivers.\"containerd.io\".socket_path = \"/run/containerd.sock\""
+                .parse::<Assignment>()
+                .unwrap();
+
+        assert_eq!(
+            assignment.path,
+            ["openshell", "drivers", "containerd.io", "socket_path"]
+        );
+        assert_eq!(assignment.value.as_str(), Some("/run/containerd.sock"));
+    }
+
+    #[test]
+    fn assignment_accepts_multiline_toml_strings() {
+        let basic = "openshell.gateway.log_level=\"\"\"debug\ntrace\"\"\""
+            .parse::<Assignment>()
+            .unwrap();
+        assert_eq!(basic.value.as_str(), Some("debug\ntrace"));
+
+        let literal = "openshell.gateway.log_level='''debug\\n\ntrace'''"
+            .parse::<Assignment>()
+            .unwrap();
+        assert_eq!(literal.value.as_str(), Some("debug\\n\ntrace"));
     }
 
     #[test]
@@ -390,8 +440,8 @@ mod tests {
         let error = set(
             &path,
             &settings(&[
-                "openshell.gateway.log_level=debug",
-                "openshell.gateway.unknown_setting=value",
+                "openshell.gateway.log_level=\"debug\"",
+                "openshell.gateway.unknown_setting=\"value\"",
             ]),
         )
         .unwrap_err();

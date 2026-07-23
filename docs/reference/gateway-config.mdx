@@ -20,30 +20,32 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 ## Update Configuration from the Command Line
 
-Use `openshell-gateway config set` with one or more dotted `KEY=VALUE`
+Use `openshell-gateway config set` with one or more TOML dotted `KEY=VALUE`
 assignments:
 
 ```shell
 openshell-gateway config set \
   'openshell.gateway.compute_drivers=["podman"]' \
-  openshell.gateway.bind_address=0.0.0.0:17670
+  'openshell.gateway.bind_address="0.0.0.0:17670"'
 ```
 
 The command updates `$XDG_CONFIG_HOME/openshell/gateway.toml`, creating the
 file and parent directory when needed. Pass `--config <PATH>` or set
 `OPENSHELL_GATEWAY_CONFIG` to update another file. It preserves comments,
 validates the resulting gateway schema, and replaces the file atomically.
-Assignments accept TOML strings, integers, booleans, arrays, and tables;
-unquoted values that are not valid TOML become strings. Later assignments to
-the same key win.
+Assignments use TOML syntax, including quotes around string values. They accept
+TOML strings, integers, booleans, arrays, and inline tables. Quoted TOML keys
+can address names that contain dots. Later assignments to the same key win.
+Array elements cannot be addressed individually; assign the complete array
+value instead.
 
 For the local Docker development gateway, pass assignments through the Mise
 task. The task applies them after generating its normal configuration:
 
 ```shell
 mise run gateway:docker -- \
-  --set openshell.drivers.docker.network_name=openshell-dev \
-  --set openshell.drivers.docker.image_pull_policy=Never
+  --set 'openshell.drivers.docker.network_name="openshell-dev"' \
+  --set 'openshell.drivers.docker.image_pull_policy="Never"'
 ```
 
 Gateway CLI flags and `OPENSHELL_*` environment variables still take

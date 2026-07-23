@@ -120,11 +120,13 @@ configured in the TOML file passed with **--config**.
 # CONFIGURATION COMMANDS
 
 **config set** *KEY=VALUE*...
-:   Update one or more dotted keys in the gateway TOML file. The command
-    preserves comments, validates the resulting schema, and replaces the
-    file atomically. Later assignments to the same key win. Use
-    **--config** or **OPENSHELL_GATEWAY_CONFIG** to select a non-default
-    file.
+:   Update one or more TOML dotted keys in the gateway TOML file. Each
+    assignment must use TOML syntax, including quotes around string values.
+    The command preserves comments, validates the resulting schema, and
+    replaces the file atomically. Later assignments to the same key win.
+    Use **--config** or **OPENSHELL_GATEWAY_CONFIG** to select a non-default
+    file. Array elements cannot be addressed individually; assign the complete
+    array value instead.
 
 # SYSTEMD INTEGRATION
 

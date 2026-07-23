@@ -1106,7 +1106,7 @@ mod tests {
             "--config",
             &path_string,
             "openshell.gateway.compute_drivers=[\"podman\"]",
-            "openshell.gateway.bind_address=0.0.0.0:17670",
+            "openshell.gateway.bind_address=\"0.0.0.0:17670\"",
         ])
         .expect("config set should parse without runtime arguments");
         let Cli { command, run } = cli;
@@ -1149,6 +1149,24 @@ mod tests {
         .expect_err("config set arguments must use KEY=VALUE syntax");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn config_set_help_documents_whole_array_replacement() {
+        let mut command = command();
+        let config = command
+            .find_subcommand_mut("config")
+            .expect("config subcommand");
+        let set = config
+            .find_subcommand_mut("set")
+            .expect("config set subcommand");
+        let mut help = Vec::new();
+        set.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("validates the result and atomically replaces the file"));
+        assert!(help.contains("Array elements cannot be addressed individually"));
+        assert!(help.contains("assign the complete array instead"));
     }
 
     #[test]

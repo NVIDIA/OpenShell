@@ -16,7 +16,7 @@
 #   OPENSHELL_DOCKER_GATEWAY_NAME=my-docker-gateway mise run gateway:docker
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:docker
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:docker
-#   mise run gateway:docker -- --set openshell.drivers.docker.network_name=my-network
+#   mise run gateway:docker -- --set 'openshell.drivers.docker.network_name="my-network"'
 #
 # After the gateway is running, point the CLI at it with either:
 #   openshell --gateway docker-dev <command>
@@ -42,14 +42,15 @@ Usage: mise run gateway:docker -- [--set KEY=VALUE]...
 Start a local OpenShell gateway backed by Docker.
 
 Options:
-  --set KEY=VALUE  Override a dotted key in the generated gateway TOML.
-                   Repeat to set multiple values; later values win.
+  --set KEY=VALUE  Override a TOML dotted key in the generated gateway TOML.
+                   Values use TOML syntax. Repeat to set multiple values;
+                   later values win.
   -h, --help       Show this help.
 
 Example:
   mise run gateway:docker -- \
-    --set openshell.drivers.docker.network_name=openshell-dev \
-    --set openshell.drivers.docker.image_pull_policy=Never
+    --set 'openshell.drivers.docker.network_name="openshell-dev"' \
+    --set 'openshell.drivers.docker.image_pull_policy="Never"'
 EOF
 }
 
