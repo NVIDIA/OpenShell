@@ -21,7 +21,7 @@ use crate::commands::common::{
 use crate::policy_update::build_policy_update_plan;
 use crate::tls::{
     TlsOptions, build_insecure_rustls_config, build_rustls_config, grpc_client,
-    grpc_inference_client, require_tls_materials,
+    grpc_inference_client, grpc_status_clients, require_tls_materials,
 };
 use bytes::Bytes;
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
@@ -44,25 +44,26 @@ use openshell_bootstrap::{
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
-    ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, DeleteInferenceRouteRequest,
-    DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
-    DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest,
-    ExposeServiceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
-    GetGatewayInfoRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest,
-    GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
-    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, ServiceStatus, SetInferenceRouteRequest,
-    SettingScope, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    AuthenticationProvider, ClearDraftChunksRequest, ConfigureProviderRefreshRequest,
+    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest,
+    DeleteInferenceRouteRequest, DeleteProviderProfileRequest, DeleteProviderRefreshRequest,
+    DeleteProviderRequest, DeleteSandboxRequest, DeleteServiceRequest,
+    DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
+    GetAuthenticationStatusRequest, GetAuthenticationStatusResponse, GetDraftHistoryRequest,
+    GetDraftPolicyRequest, GetGatewayConfigRequest, GetGatewayInfoRequest,
+    GetInferenceRouteRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuResourceRequirements,
+    HealthRequest, ImportProviderProfilesRequest, LintProviderProfilesRequest,
+    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    ListSandboxProvidersRequest, ListSandboxesRequest, ListServicesRequest, PolicySource,
+    PolicyStatus, Provider, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+    ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
+    ServiceStatus, SetInferenceRouteRequest, SettingScope, TcpForwardFrame, TcpForwardInit,
+    TcpRelayTarget, UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest,
+    WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
@@ -124,24 +125,46 @@ struct ComputeDriverCapabilitiesView {
 
 /// Show gateway status.
 #[allow(clippy::branches_sharing_code)]
-pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn gateway_status(
+    gateway_name: &str,
+    server: &str,
+    tls: &TlsOptions,
+    auth_preparation_error: Option<&str>,
+) -> Result<()> {
     println!("{}", "Server Status".cyan().bold());
     println!();
     println!("  {} {}", "Gateway:".dimmed(), gateway_name);
     println!("  {} {}", "Server:".dimmed(), server);
-    if tls.is_bearer_auth() {
-        println!("  {} Edge (bearer token)", "Auth:".dimmed());
-    }
 
     // Try to connect and get health
-    match grpc_client(server, tls).await {
-        Ok(mut client) => match client.health(HealthRequest {}).await {
+    match grpc_status_clients(server, tls).await {
+        Ok((mut client, mut authentication)) => match client.health(HealthRequest {}).await {
             Ok(response) => {
                 let health = response.into_inner();
                 println!("  {} {}", "Status:".dimmed(), "Connected".green());
+                let authentication = match auth_preparation_error {
+                    Some(error) => GatewayAuthenticationState::Failed(error.to_string()),
+                    None => gateway_authentication_state(
+                        authentication
+                            .get_status(GetAuthenticationStatusRequest {})
+                            .await
+                            .map(tonic::Response::into_inner),
+                        tls,
+                        server,
+                    ),
+                };
+                print_gateway_authentication_state(&authentication);
                 println!("  {} {}", "Version:".dimmed(), health.version);
             }
             Err(e) => {
+                let authentication = auth_preparation_error.map_or_else(
+                    || {
+                        GatewayAuthenticationState::Unverified(
+                            "gRPC health check failed".to_string(),
+                        )
+                    },
+                    |error| GatewayAuthenticationState::Failed(error.to_string()),
+                );
                 if let Some(status) = http_health_check(server, tls).await? {
                     if status.is_success() {
                         println!("  {} {}", "Status:".dimmed(), "Connected (HTTP)".yellow());
@@ -156,9 +179,14 @@ pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) 
                     println!("  {} {}", "Status:".dimmed(), "Error".red());
                     println!("  {} {}", "Error:".dimmed(), e);
                 }
+                print_gateway_authentication_state(&authentication);
             }
         },
         Err(e) => {
+            let authentication = auth_preparation_error.map_or_else(
+                || GatewayAuthenticationState::Unverified("gateway unreachable".to_string()),
+                |error| GatewayAuthenticationState::Failed(error.to_string()),
+            );
             if let Some(status) = http_health_check(server, tls).await? {
                 if status.is_success() {
                     println!("  {} {}", "Status:".dimmed(), "Connected (HTTP)".yellow());
@@ -173,10 +201,106 @@ pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) 
                 println!("  {} {}", "Status:".dimmed(), "Disconnected".red());
                 println!("  {} {}", "Error:".dimmed(), e);
             }
+            print_gateway_authentication_state(&authentication);
         }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GatewayAuthenticationState {
+    Authenticated(&'static str),
+    NotRequired(&'static str),
+    NotEnforced,
+    Failed(String),
+    Unverified(String),
+}
+
+fn gateway_authentication_state(
+    result: std::result::Result<GetAuthenticationStatusResponse, Status>,
+    tls: &TlsOptions,
+    server: &str,
+) -> GatewayAuthenticationState {
+    match result {
+        Ok(response) if response.authenticated => {
+            let provider = match response.provider() {
+                AuthenticationProvider::Oidc => "OIDC",
+                AuthenticationProvider::Mtls => "mTLS",
+                AuthenticationProvider::CloudflareAccess => "edge",
+                AuthenticationProvider::LocalDev => "local development",
+                AuthenticationProvider::Unspecified => "gateway",
+            };
+            GatewayAuthenticationState::Authenticated(provider)
+        }
+        Ok(response) if response.provider() == AuthenticationProvider::LocalDev => {
+            GatewayAuthenticationState::NotRequired("local development")
+        }
+        Ok(_) if tls.edge_token.is_some() => GatewayAuthenticationState::Authenticated("edge"),
+        Ok(_) if tls.oidc_token.is_some() || server.starts_with("https://") => {
+            GatewayAuthenticationState::NotEnforced
+        }
+        Ok(_) => GatewayAuthenticationState::NotRequired("gateway"),
+        Err(status) if status.code() == Code::Unauthenticated => {
+            GatewayAuthenticationState::Failed(status.message().to_string())
+        }
+        Err(status) if status.code() == Code::PermissionDenied => {
+            GatewayAuthenticationState::Authenticated("authorization denied")
+        }
+        Err(status) if status.code() == Code::Unimplemented && tls.edge_token.is_some() => {
+            GatewayAuthenticationState::Authenticated("edge")
+        }
+        Err(status)
+            if status.code() == Code::Unimplemented
+                && !tls.is_bearer_auth()
+                && server.starts_with("http://") =>
+        {
+            GatewayAuthenticationState::NotRequired("gateway")
+        }
+        Err(status)
+            if status.code() == Code::Unimplemented
+                && !tls.is_bearer_auth()
+                && server.starts_with("https://") =>
+        {
+            GatewayAuthenticationState::Authenticated("mTLS transport")
+        }
+        Err(status) if status.code() == Code::Unimplemented => {
+            GatewayAuthenticationState::Unverified(
+                "gateway does not support authentication checks".to_string(),
+            )
+        }
+        Err(status) => GatewayAuthenticationState::Unverified(status.message().to_string()),
+    }
+}
+
+fn print_gateway_authentication_state(state: &GatewayAuthenticationState) {
+    match state {
+        GatewayAuthenticationState::Authenticated(provider) => println!(
+            "  {} {} ({provider})",
+            "Authentication:".dimmed(),
+            "Authenticated".green()
+        ),
+        GatewayAuthenticationState::NotRequired(mode) => println!(
+            "  {} {} ({mode})",
+            "Authentication:".dimmed(),
+            "Not required".green()
+        ),
+        GatewayAuthenticationState::NotEnforced => println!(
+            "  {} {}",
+            "Authentication:".dimmed(),
+            "Not enforced by gateway".yellow()
+        ),
+        GatewayAuthenticationState::Failed(error) => println!(
+            "  {} {} ({error})",
+            "Authentication:".dimmed(),
+            "Failed".red()
+        ),
+        GatewayAuthenticationState::Unverified(reason) => println!(
+            "  {} {} ({reason})",
+            "Authentication:".dimmed(),
+            "Unverified".yellow()
+        ),
+    }
 }
 
 fn gateway_service_status_name(status: i32) -> &'static str {
@@ -7993,11 +8117,12 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverCapabilitiesView, ComputeDriverInfoView, GatewayInfoView, PolicyGetView,
-        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
-        dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
-        format_gateway_select_items, format_provider_attachment_table, gateway_add,
-        gateway_auth_label, gateway_env_override_warning, gateway_info_to_json,
+        ComputeDriverCapabilitiesView, ComputeDriverInfoView, GatewayAuthenticationState,
+        GatewayInfoView, PolicyGetView, ProvisioningStep, TlsOptions,
+        build_sandbox_resource_limits, dockerfile_sources_supported_for_gateway, format_endpoint,
+        format_gateway_select_header, format_gateway_select_items,
+        format_provider_attachment_table, gateway_add, gateway_auth_label,
+        gateway_authentication_state, gateway_env_override_warning, gateway_info_to_json,
         gateway_remote_label, gateway_select_with, gateway_to_json, gateway_type_label,
         git_sync_files, http_health_check, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
@@ -8029,12 +8154,79 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GpuResourceRequirements, PolicyStatus, Provider, ProviderCredentialRefresh,
-        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, SandboxCondition, SandboxPolicyRevision, SandboxStatus,
-        datamodel::v1::ObjectMeta,
+        AuthenticationProvider, GetAuthenticationStatusResponse, GpuResourceRequirements,
+        PolicyStatus, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
+        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
+        ProviderProfileCredential, ResourceRequirements, SandboxCondition, SandboxPolicyRevision,
+        SandboxStatus, datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn gateway_status_reports_authenticated_oidc_principal() {
+        let mut tls = TlsOptions::default();
+        tls.oidc_token = Some("token".to_string());
+
+        let state = gateway_authentication_state(
+            Ok(GetAuthenticationStatusResponse {
+                authenticated: true,
+                provider: AuthenticationProvider::Oidc.into(),
+            }),
+            &tls,
+            "https://gateway.example.com",
+        );
+
+        assert_eq!(state, GatewayAuthenticationState::Authenticated("OIDC"));
+    }
+
+    #[test]
+    fn gateway_status_reports_rejected_bearer_token() {
+        let mut tls = TlsOptions::default();
+        tls.oidc_token = Some("expired".to_string());
+
+        let state = gateway_authentication_state(
+            Err(Status::unauthenticated("invalid token: ExpiredSignature")),
+            &tls,
+            "https://gateway.example.com",
+        );
+
+        assert_eq!(
+            state,
+            GatewayAuthenticationState::Failed("invalid token: ExpiredSignature".to_string())
+        );
+    }
+
+    #[test]
+    fn gateway_status_marks_oidc_unverified_on_older_gateway() {
+        let mut tls = TlsOptions::default();
+        tls.oidc_token = Some("token".to_string());
+
+        let state = gateway_authentication_state(
+            Err(Status::unimplemented("unknown service")),
+            &tls,
+            "https://gateway.example.com",
+        );
+
+        assert_eq!(
+            state,
+            GatewayAuthenticationState::Unverified(
+                "gateway does not support authentication checks".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn gateway_status_reports_local_plaintext_auth_not_required() {
+        let state = gateway_authentication_state(
+            Ok(GetAuthenticationStatusResponse {
+                authenticated: false,
+                provider: AuthenticationProvider::Unspecified.into(),
+            }),
+            &TlsOptions::default(),
+            "http://127.0.0.1:8080",
+        );
+
+        assert_eq!(state, GatewayAuthenticationState::NotRequired("gateway"));
+    }
 
     #[test]
     fn policy_revision_json_includes_revision_provenance() {

@@ -4,8 +4,9 @@
 //! Public input types for the SDK: how callers describe a gateway and the
 //! credentials used to talk to it.
 //!
-//! The CLI keeps its own filesystem-aware `TlsOptions` for plumbing; it
-//! converts to a `ClientConfig` at the moment of dialing the gateway.
+//! The CLI keeps its own filesystem-aware `TlsOptions` for transport plumbing
+//! and reuses the SDK's OIDC refresh primitive. Other consumers describe the
+//! complete transport with [`ClientConfig`].
 
 use crate::refresh::Refresh;
 use std::sync::Arc;

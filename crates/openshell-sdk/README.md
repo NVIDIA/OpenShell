@@ -26,7 +26,9 @@ client bound to the current token. When a refresher is wired, use
 `force_refresh` to recover after a raw RPC returns `Unauthenticated`.
 
 The SDK consumes a `Refresh` trait that the caller implements; it does not run
-the OIDC browser flow itself.
+the OIDC browser flow itself. Its non-interactive refresh-token exchange also
+accepts scopes that identity providers may require to select the API resource
+for the refreshed access token.
 
 ## Transport modes
 

@@ -181,7 +181,9 @@ package-managed or Helm gateways, use `systemctl`, `journalctl`, `kubectl`, and
 
 ### `openshell status`
 
-Show server connectivity and version for the active gateway.
+Show server connectivity, authentication status, and version for the active
+gateway. Connectivity uses the public health RPC; authentication is checked
+separately and can fail while the gateway remains connected.
 
 ---
 

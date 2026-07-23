@@ -64,17 +64,23 @@ impl AuthzPolicy {
     /// (authentication-only mode for providers like GitHub).
     #[allow(clippy::result_large_err)]
     pub fn check(&self, identity: &Identity, method: &str) -> Result<(), Status> {
-        let required = match method_authz::required_role(method) {
-            Some(Role::Admin) => &self.admin_role,
+        let required = method_authz::lookup(method).map_or(
             // Default to user role for unknown methods, matching the
             // pre-annotation behavior. The exhaustiveness test ensures
             // every real RPC has an explicit declaration.
-            Some(Role::User) | None => &self.user_role,
-        };
+            Some(&self.user_role),
+            |method| match method.role {
+                Some(Role::Admin) => Some(&self.admin_role),
+                Some(Role::User) => Some(&self.user_role),
+                None => None,
+            },
+        );
 
         // Empty role name = skip role check for this level (auth-only mode).
         // Scope enforcement still applies if enabled.
-        if !required.is_empty() {
+        if let Some(required) = required
+            && !required.is_empty()
+        {
             // Admin role implicitly satisfies user role requirements.
             let has_role = identity.roles.iter().any(|r| r == required)
                 || (!self.admin_role.is_empty()
@@ -108,7 +114,15 @@ impl AuthzPolicy {
             return Ok(());
         }
 
-        let required_scope = method_authz::required_scope(method).unwrap_or(SCOPE_ALL);
+        let required_scope = match method_authz::lookup(method) {
+            Some(method) => {
+                let Some(scope) = method.scope else {
+                    return Ok(());
+                };
+                scope
+            }
+            None => SCOPE_ALL,
+        };
 
         if identity.scopes.iter().any(|s| s == required_scope) {
             return Ok(());
@@ -308,6 +322,18 @@ mod tests {
         assert!(
             policy
                 .check(&id, "/openshell.v1.OpenShell/ListSandboxes")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn authentication_status_requires_no_role_or_scope() {
+        let id = identity_with_roles_and_scopes(&[], &[]);
+        let policy = scoped_policy();
+
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.Authentication/GetStatus")
                 .is_ok()
         );
     }

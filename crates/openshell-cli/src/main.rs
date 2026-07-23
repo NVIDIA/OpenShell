@@ -157,19 +157,30 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 /// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
 /// if it's near expiry.
 fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
-    let Some(meta) = get_gateway_metadata(gateway_name) else {
-        return;
-    };
+    let _ = apply_auth_with_status(tls, gateway_name);
+}
+
+/// Apply stored authentication and return a user-facing preparation failure,
+/// if the CLI already knows the credentials cannot be used.
+fn apply_auth_with_status(tls: &mut TlsOptions, gateway_name: &str) -> Option<String> {
+    let meta = get_gateway_metadata(gateway_name)?;
     match meta.auth_mode.as_deref() {
         Some("cloudflare_jwt") => {
             if let Some(token) = load_edge_token(gateway_name) {
                 tls.edge_token = Some(token);
+                None
+            } else {
+                Some(format!(
+                    "edge credentials are missing; run `openshell gateway login {gateway_name}`"
+                ))
             }
         }
         Some("oidc") => {
             let Some(bundle) = openshell_bootstrap::oidc_token::load_oidc_token(gateway_name)
             else {
-                return;
+                return Some(format!(
+                    "OIDC credentials are missing; run `openshell gateway login {gateway_name}`"
+                ));
             };
             if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
                 let insecure = std::env::var("OPENSHELL_GATEWAY_INSECURE")
@@ -178,7 +189,11 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
-                        openshell_cli::oidc_auth::oidc_refresh_token(&bundle, insecure),
+                        openshell_cli::oidc_auth::oidc_refresh_token(
+                            &bundle,
+                            meta.oidc_scopes.as_deref(),
+                            insecure,
+                        ),
                     )
                 }) {
                     Ok(refreshed) => {
@@ -187,19 +202,24 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                             &refreshed,
                         );
                         tls.oidc_token = Some(refreshed.access_token);
+                        None
                     }
                     Err(e) => {
                         tracing::warn!("OIDC token refresh failed: {e}");
                         // Use the expired token anyway — server will reject it
                         // with a clear error prompting re-login.
                         tls.oidc_token = Some(bundle.access_token);
+                        Some(format!(
+                            "OIDC token refresh failed; run `openshell gateway login {gateway_name}`"
+                        ))
                     }
                 }
             } else {
                 tls.oidc_token = Some(bundle.access_token);
+                None
             }
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -2253,8 +2273,8 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => {
             if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                 let mut tls = tls.with_gateway_name(&ctx.name);
-                apply_auth(&mut tls, &ctx.name);
-                run::gateway_status(&ctx.name, &ctx.endpoint, &tls).await?;
+                let auth_error = apply_auth_with_status(&mut tls, &ctx.name);
+                run::gateway_status(&ctx.name, &ctx.endpoint, &tls, auth_error.as_deref()).await?;
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();
@@ -4147,6 +4167,25 @@ mod tests {
             apply_auth(&mut tls, "edge-gateway");
 
             assert_eq!(tls.edge_token.as_deref(), Some("token-123"));
+        });
+    }
+
+    #[test]
+    fn apply_auth_reports_missing_edge_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            store_gateway_metadata(
+                "edge-gateway",
+                &edge_metadata("edge-gateway", "https://gw.example.com"),
+            )
+            .unwrap();
+
+            let mut tls = TlsOptions::default();
+            let error = apply_auth_with_status(&mut tls, "edge-gateway")
+                .expect("missing credentials should be reported");
+
+            assert!(error.contains("edge credentials are missing"));
+            assert!(!tls.is_bearer_auth());
         });
     }
 

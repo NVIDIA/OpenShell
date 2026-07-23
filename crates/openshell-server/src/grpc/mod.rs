@@ -4,6 +4,7 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+pub mod authentication;
 pub mod policy;
 pub mod provider;
 mod sandbox;
