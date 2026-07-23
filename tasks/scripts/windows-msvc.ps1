@@ -32,9 +32,22 @@ if (-not (Test-Path $LogDir)) {
 }
 $LogDir = (Resolve-Path $LogDir).Path
 
+$TargetDirWasConfigured = -not [string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)
 $TargetDir = $env:CARGO_TARGET_DIR
-if ([string]::IsNullOrWhiteSpace($TargetDir)) {
+if (-not $TargetDirWasConfigured) {
     $TargetDir = Join-Path $RepoRoot "target"
+}
+
+$BundledZ3CacheRoot = $TargetDir
+if (-not $TargetDirWasConfigured) {
+    $userCacheRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    if ([string]::IsNullOrWhiteSpace($userCacheRoot)) {
+        $userCacheRoot = $env:LOCALAPPDATA
+    }
+    if ([string]::IsNullOrWhiteSpace($userCacheRoot)) {
+        $userCacheRoot = [IO.Path]::GetTempPath()
+    }
+    $BundledZ3CacheRoot = Join-Path $userCacheRoot "OpenShell\cache\z3"
 }
 
 $BuildJobsValue = $env:OPENSHELL_WINDOWS_BUILD_JOBS
@@ -358,7 +371,7 @@ function Resolve-BundledZ3Source {
     }
 
     $revisionPrefix = $BundledZ3Revision.Substring(0, 12)
-    $sourcePath = Join-Path $TargetDir "z3-source-$revisionPrefix"
+    $sourcePath = Join-Path $BundledZ3CacheRoot "z3-source-$revisionPrefix"
     if (Test-Path $sourcePath) {
         return Assert-BundledZ3Source $sourcePath $BundledZ3Revision
     }
@@ -366,8 +379,8 @@ function Resolve-BundledZ3Source {
     if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
         throw "Bundled Z3 source preparation requires git.exe on PATH."
     }
-    if (-not (Test-Path $TargetDir -PathType Container)) {
-        New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
+    if (-not (Test-Path $BundledZ3CacheRoot -PathType Container)) {
+        New-Item -ItemType Directory -Force -Path $BundledZ3CacheRoot | Out-Null
     }
 
     $stagingPath = "$sourcePath.partial-$([guid]::NewGuid().ToString('N'))"
@@ -394,7 +407,26 @@ function Resolve-BundledZ3Source {
     }
 
     Assert-BundledZ3Source $stagingPath $BundledZ3Revision | Out-Null
-    Move-Item -Path $stagingPath -Destination $sourcePath
+    try {
+        # Directory.Move is an atomic rename on the same volume and, unlike
+        # Move-Item, fails when the destination already exists. A concurrent
+        # x64/ARM64 invocation can therefore win publication without the loser
+        # nesting its staging directory inside the shared cache.
+        [IO.Directory]::Move($stagingPath, $sourcePath)
+    } catch {
+        if (-not (Test-Path $sourcePath -PathType Container)) {
+            throw
+        }
+        Write-Host "==> Reusing bundled Z3 source published by another process"
+    } finally {
+        if (Test-Path $stagingPath -PathType Container) {
+            try {
+                Remove-Item -LiteralPath $stagingPath -Recurse -Force
+            } catch {
+                Write-Warning "Could not remove redundant bundled Z3 staging directory: $stagingPath"
+            }
+        }
+    }
     return Assert-BundledZ3Source $sourcePath $BundledZ3Revision
 }
 

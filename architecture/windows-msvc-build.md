@@ -76,12 +76,16 @@ By default it enables bundled Z3 for reproducible Windows builds. When
 `Z3_LIBRARY_PATH_OVERRIDE` points at a directory containing `libz3.lib`, the
 wrapper uses that system Z3 instead and requires `Z3_SYS_Z3_HEADER` to point at
 the full path to `z3.h`. For bundled builds, the wrapper fetches the Z3 source
-revision pinned by `z3-sys` through Git, caches it under `CARGO_TARGET_DIR`, and
-sets `Z3_SYS_BUNDLED_DIR_OVERRIDE`. This avoids the unauthenticated GitHub API
-lookup in the `z3-sys` build script, which can fail with HTTP 403 when a shared
-runner or developer network exhausts its API rate limit. An explicitly set
-`Z3_SYS_BUNDLED_DIR_OVERRIDE` remains supported and must contain
-`src/api/z3.h`.
+revision pinned by `z3-sys` through Git and sets
+`Z3_SYS_BUNDLED_DIR_OVERRIDE`. When `CARGO_TARGET_DIR` is explicit, the wrapper
+uses it for the source cache. Otherwise, it caches under the current user's
+local application data directory, outside the checkout. Publishing uses an
+atomic directory rename so concurrent x64 and ARM64 commands can share the
+cache safely. This keeps downloaded sources outside the checkout by default and
+avoids the unauthenticated GitHub API lookup in the `z3-sys` build script, which
+can fail with HTTP 403 when a shared runner or developer network exhausts its
+API rate limit. An explicitly set `Z3_SYS_BUNDLED_DIR_OVERRIDE` remains
+supported and must contain `src/api/z3.h`.
 
 The lane uses `mise run --skip-tools windows:*` because Windows Rust comes from
 rustup and linking comes from Visual Studio Build Tools. Mise orchestrates the
