@@ -375,10 +375,10 @@ enum AcceptErrorClass {
 #[cfg(unix)]
 fn classify_accept_error(err: &std::io::Error) -> AcceptErrorClass {
     match err.raw_os_error() {
-        Some(libc::EMFILE) | Some(libc::ENFILE) => AcceptErrorClass::Transient,
-        Some(libc::ECONNABORTED) | Some(libc::ECONNRESET) => AcceptErrorClass::Transient,
-        Some(libc::EINTR) => AcceptErrorClass::Transient,
-        Some(libc::EBADF) | Some(libc::EINVAL) | Some(libc::ENOTSOCK) => AcceptErrorClass::Terminal,
+        Some(libc::EMFILE | libc::ENFILE | libc::ECONNABORTED | libc::ECONNRESET | libc::EINTR) => {
+            AcceptErrorClass::Transient
+        }
+        Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK) => AcceptErrorClass::Terminal,
         _ => AcceptErrorClass::Unknown,
     }
 }
@@ -390,7 +390,7 @@ fn classify_accept_error(_err: &std::io::Error) -> AcceptErrorClass {
 
 #[cfg(unix)]
 fn is_fd_exhaustion_error(err: &std::io::Error) -> bool {
-    matches!(err.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
+    matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
 }
 
 #[cfg(not(unix))]
