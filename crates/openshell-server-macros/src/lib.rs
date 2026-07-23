@@ -5,9 +5,8 @@
 //!
 //! `#[rpc_authz(service = "...")]` is applied to a tonic service `impl`
 //! block. Each method inside the impl carries an `#[rpc_auth(...)]`
-//! attribute describing its auth mode and optional Bearer scope/role pair.
-//! Omitting both on a Bearer method makes it authentication-only. The macro
-//! emits a const `&[MethodAuth]` adjacent to
+//! attribute describing its auth mode, optional Bearer scope, and
+//! required role. The macro emits a const `&[MethodAuth]` adjacent to
 //! the impl and re-emits the impl block with the per-method
 //! `#[rpc_auth]` attributes stripped so other macros (notably
 //! `#[tonic::async_trait]`) see a clean impl.
@@ -132,10 +131,16 @@ impl RpcAuth {
                 }
             }
             AuthMode::Bearer | AuthMode::Dual => {
-                if scope.is_some() != role.is_some() {
+                if scope.is_none() {
                     return Err(Error::new(
                         span,
-                        "`auth = \"bearer\"` and `auth = \"dual\"` require both `scope` and `role`, or neither for authentication-only methods",
+                        "`auth = \"bearer\"` and `auth = \"dual\"` require `scope = \"...\"`",
+                    ));
+                }
+                if role.is_none() {
+                    return Err(Error::new(
+                        span,
+                        "`auth = \"bearer\"` and `auth = \"dual\"` require `role = \"...\"`",
                     ));
                 }
             }

@@ -3,7 +3,6 @@
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::auth::EdgeAuthInterceptor;
-use openshell_core::proto::authentication_client::AuthenticationClient;
 use openshell_core::proto::inference_client::InferenceClient;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use rustls::{
@@ -25,9 +24,6 @@ use tracing::debug;
 
 /// Concrete gRPC client type used by all commands.
 pub type GrpcClient = OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
-/// Concrete authentication status client type.
-pub type GrpcAuthenticationClient =
-    AuthenticationClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
 /// Concrete inference client type.
 pub type GrpcInferenceClient = InferenceClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
 
@@ -442,19 +438,6 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     let channel = build_channel(server, tls).await?;
     let interceptor = interceptor_from_tls(tls)?;
     Ok(OpenShellClient::with_interceptor(channel, interceptor))
-}
-
-/// Build `OpenShell` and authentication clients over one shared channel.
-pub async fn grpc_status_clients(
-    server: &str,
-    tls: &TlsOptions,
-) -> Result<(GrpcClient, GrpcAuthenticationClient)> {
-    let channel = build_channel(server, tls).await?;
-    let interceptor = interceptor_from_tls(tls)?;
-    Ok((
-        OpenShellClient::with_interceptor(channel.clone(), interceptor.clone()),
-        AuthenticationClient::with_interceptor(channel, interceptor),
-    ))
 }
 
 fn interceptor_from_tls(tls: &TlsOptions) -> Result<EdgeAuthInterceptor> {

@@ -19,8 +19,7 @@ use hyper_util::{
 use metrics::{counter, histogram};
 use openshell_core::Config;
 use openshell_core::proto::{
-    authentication_server::AuthenticationServer, inference_server::InferenceServer,
-    open_shell_server::OpenShellServer,
+    inference_server::InferenceServer, open_shell_server::OpenShellServer,
 };
 use openshell_gateway_interceptors::{EvaluationContext, GatewayInterceptorRuntime};
 use std::collections::BTreeMap;
@@ -42,7 +41,6 @@ use crate::{
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
     auth::principal::{Principal, UserPrincipal},
-    grpc::authentication::AuthenticationService,
     http_router,
     inference::InferenceService,
     service_http_router,
@@ -164,8 +162,6 @@ impl MultiplexService {
             GatewayInterceptorGrpcService::new(openshell, self.state.gateway_interceptors.clone());
         let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
-        let authentication = AuthenticationServer::new(AuthenticationService)
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -173,7 +169,7 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, authentication, inference),
+            GrpcRouter::new(openshell, inference),
             authenticator_chain,
             authz_policy,
             self.state
@@ -642,39 +638,31 @@ where
     }
 }
 
-/// Combined gRPC service that routes between the `OpenShell`, `Authentication`,
-/// and `Inference` services based on the request path prefix.
+/// Combined gRPC service that routes between `OpenShell` and Inference services
+/// based on the request path prefix.
 #[derive(Clone)]
-pub struct GrpcRouter<N, A, I> {
+pub struct GrpcRouter<N, I> {
     openshell: N,
-    authentication: A,
     inference: I,
 }
 
-impl<N, A, I> GrpcRouter<N, A, I> {
-    fn new(openshell: N, authentication: A, inference: I) -> Self {
+impl<N, I> GrpcRouter<N, I> {
+    fn new(openshell: N, inference: I) -> Self {
         Self {
             openshell,
-            authentication,
             inference,
         }
     }
 }
 
-const AUTHENTICATION_PATH_PREFIX: &str = "/openshell.v1.Authentication/";
 const INFERENCE_PATH_PREFIX: &str = "/openshell.inference.v1.Inference/";
 
-impl<N, A, I, B> tower::Service<Request<B>> for GrpcRouter<N, A, I>
+impl<N, I, B> tower::Service<Request<B>> for GrpcRouter<N, I>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
     N::Future: Send,
     N::Error: Send,
-    A: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
-        + Clone
-        + Send
-        + 'static,
-    A::Future: Send,
     I: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
         + Clone
         + Send
@@ -691,12 +679,9 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let path = req.uri().path();
+        let is_inference = req.uri().path().starts_with(INFERENCE_PATH_PREFIX);
 
-        if path.starts_with(AUTHENTICATION_PATH_PREFIX) {
-            let mut svc = self.authentication.clone();
-            Box::pin(async move { svc.ready().await?.call(req).await })
-        } else if path.starts_with(INFERENCE_PATH_PREFIX) {
+        if is_inference {
             let mut svc = self.inference.clone();
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {

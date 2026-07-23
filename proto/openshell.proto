@@ -275,14 +275,6 @@ service OpenShell {
   rpc ListWorkspaceMembers(ListWorkspaceMembersRequest) returns (ListWorkspaceMembersResponse);
 }
 
-// Authentication exposes a side-effect-free credential check independently
-// from the public health endpoint and resource-specific authorization.
-service Authentication {
-  // Verify the caller's configured gateway credentials.
-  rpc GetStatus(GetAuthenticationStatusRequest)
-      returns (GetAuthenticationStatusResponse);
-}
-
 // IssueSandboxToken request. Empty body; identity is established by the
 // authentication credentials carried in the request headers (a projected
 // Kubernetes ServiceAccount JWT in the K8s driver path).
@@ -324,28 +316,6 @@ message HealthResponse {
 
   // Service version.
   string version = 2;
-}
-
-// Authentication status request.
-message GetAuthenticationStatusRequest {}
-
-// Authentication status response. Invalid credentials are rejected by the
-// gateway authentication middleware before this response is produced.
-message GetAuthenticationStatusResponse {
-  // Whether the gateway established an authenticated user principal.
-  bool authenticated = 1;
-
-  // Authentication provider that established the principal.
-  AuthenticationProvider provider = 2;
-}
-
-// Authentication provider used for the current gateway request.
-enum AuthenticationProvider {
-  AUTHENTICATION_PROVIDER_UNSPECIFIED = 0;
-  AUTHENTICATION_PROVIDER_OIDC = 1;
-  AUTHENTICATION_PROVIDER_MTLS = 2;
-  AUTHENTICATION_PROVIDER_CLOUDFLARE_ACCESS = 3;
-  AUTHENTICATION_PROVIDER_LOCAL_DEV = 4;
 }
 
 // Gateway info request.

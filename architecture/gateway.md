@@ -144,12 +144,13 @@ OAuth scopes.
 
 Gateway health and user authentication are separate probes. `OpenShell.Health`
 remains unauthenticated so deployment and load-balancer health checks do not
-depend on user credentials. `Authentication.GetStatus` is side-effect-free and
-traverses every configured authentication layer, but deliberately requires no
-application role or OAuth scope. The CLI combines both results so a reachable
-gateway with an expired or rejected token is reported as connected but
-unauthenticated; gateways with no configured user-auth layer report that
-authentication is not required.
+depend on user credentials. The CLI uses the existing, side-effect-free
+`OpenShell.GetGatewayInfo` capability query as its protected authentication
+probe. `Unauthenticated` means the credentials were rejected, while
+`PermissionDenied` proves authentication succeeded before the caller failed
+the capability query's admin authorization check. The CLI combines the health
+and capability results so a reachable gateway with an expired or rejected
+token is reported as connected but unauthenticated.
 
 Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
 does not grant sandbox identity. Kubernetes deployments use the

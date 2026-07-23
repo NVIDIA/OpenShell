@@ -22,9 +22,9 @@ The CLI loads gateway metadata from `~/.config/openshell/gateways/<name>/metadat
 
 ## Authentication Status
 
-`openshell status` reports gateway reachability and authentication separately. The public health RPC determines whether the gateway is connected and supplies its version. A separate side-effect-free authentication RPC verifies configured credentials without requiring a resource-specific role or scope.
+`openshell status` reports gateway reachability and authentication separately. The public health RPC determines whether the gateway is connected and supplies its version. The CLI then calls the existing protected gateway-info capability query to verify the configured credentials. An authorization denial still confirms that the gateway authenticated the caller.
 
-For example, an expired bearer token can produce `Status: Connected` and `Authentication: Failed`. This means the gateway is healthy but protected commands cannot use the current credentials. Run `openshell gateway login <name>` to re-authenticate. When a gateway predates the authentication status RPC, the CLI reports `Authentication: Unverified` rather than treating a successful public health check as proof of authentication.
+For example, an expired bearer token can produce `Status: Connected` and `Authentication: Failed`. This means the gateway is healthy but protected commands cannot use the current credentials. Run `openshell gateway login <name>` to re-authenticate. When a gateway predates the gateway-info capability query, the CLI reports `Authentication: Unverified` rather than treating a successful public health check as proof of authentication.
 
 ## Authentication Modes
 

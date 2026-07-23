@@ -54,11 +54,7 @@ pub enum Role {
 /// Add a new service by appending its module's `AUTH_METADATA` const here.
 /// The constant name is fixed by `#[rpc_authz]`; service disambiguation
 /// comes from the module path.
-const SERVICES: &[&[MethodAuth]] = &[
-    crate::grpc::AUTH_METADATA,
-    crate::grpc::authentication::AUTH_METADATA,
-    crate::inference::AUTH_METADATA,
-];
+const SERVICES: &[&[MethodAuth]] = &[crate::grpc::AUTH_METADATA, crate::inference::AUTH_METADATA];
 
 /// Find the auth metadata for `method`, if any.
 #[must_use]
@@ -75,6 +71,19 @@ pub fn lookup(method: &str) -> Option<&'static MethodAuth> {
 #[cfg(test)]
 pub fn all_paths() -> impl Iterator<Item = &'static str> {
     SERVICES.iter().flat_map(|s| s.iter()).map(|m| m.path)
+}
+
+/// Required Bearer scope for the method, or `None` if scopes don't
+/// apply (`unauthenticated`, `sandbox`).
+#[must_use]
+pub fn required_scope(method: &str) -> Option<&'static str> {
+    lookup(method).and_then(|m| m.scope)
+}
+
+/// Required role for the method on the Bearer path.
+#[must_use]
+pub fn required_role(method: &str) -> Option<Role> {
+    lookup(method).and_then(|m| m.role)
 }
 
 /// `true` if the method bypasses authentication entirely.

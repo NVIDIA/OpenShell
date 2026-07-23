@@ -183,7 +183,8 @@ package-managed or Helm gateways, use `systemctl`, `journalctl`, `kubectl`, and
 
 Show server connectivity, authentication status, and version for the active
 gateway. Connectivity uses the public health RPC; authentication is checked
-separately and can fail while the gateway remains connected.
+with the protected gateway-info capability query and can fail while the gateway
+remains connected.
 
 ---
 
