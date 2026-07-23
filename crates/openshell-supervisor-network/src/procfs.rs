@@ -67,6 +67,23 @@ impl std::fmt::Display for WorkloadProxyTcpConnection {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcTcpAddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcTcpAddressFamily {
+    fn table_name(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "tcp",
+            Self::Ipv6 => "tcp6",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DescendantPid {
     pid: u32,
@@ -325,13 +342,13 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
 #[cfg(target_os = "linux")]
 fn parse_proc_net_tcp(pid: u32, connection: WorkloadProxyTcpConnection) -> Result<u64> {
     // Check IPv4 first (most common), then IPv6.
-    for (suffix, ipv6) in [("tcp", false), ("tcp6", true)] {
-        let path = format!("/proc/{pid}/net/{suffix}");
+    for address_family in [ProcTcpAddressFamily::Ipv4, ProcTcpAddressFamily::Ipv6] {
+        let path = format!("/proc/{pid}/net/{}", address_family.table_name());
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
 
-        if let Some(inode) = find_proc_net_tcp_inode(&content, ipv6, connection)? {
+        if let Some(inode) = find_proc_net_tcp_inode(&content, address_family, connection)? {
             return Ok(inode);
         }
     }
@@ -344,7 +361,7 @@ fn parse_proc_net_tcp(pid: u32, connection: WorkloadProxyTcpConnection) -> Resul
 #[cfg(target_os = "linux")]
 fn find_proc_net_tcp_inode(
     content: &str,
-    ipv6: bool,
+    address_family: ProcTcpAddressFamily,
     connection: WorkloadProxyTcpConnection,
 ) -> Result<Option<u64>> {
     for line in content.lines().skip(1) {
@@ -353,10 +370,10 @@ fn find_proc_net_tcp_inode(
             continue;
         }
 
-        let Some(local_addr) = parse_proc_socket_addr(fields[1], ipv6) else {
+        let Some(local_addr) = parse_proc_socket_addr(fields[1], address_family) else {
             continue;
         };
-        let Some(remote_addr) = parse_proc_socket_addr(fields[2], ipv6) else {
+        let Some(remote_addr) = parse_proc_socket_addr(fields[2], address_family) else {
             continue;
         };
 
@@ -376,24 +393,27 @@ fn find_proc_net_tcp_inode(
 }
 
 #[cfg(target_os = "linux")]
-fn parse_proc_socket_addr(value: &str, ipv6: bool) -> Option<SocketAddr> {
+fn parse_proc_socket_addr(value: &str, address_family: ProcTcpAddressFamily) -> Option<SocketAddr> {
     let (address, port) = value.rsplit_once(':')?;
     let port = u16::from_str_radix(port, 16).ok()?;
 
-    let ip = if ipv6 {
-        if address.len() != 32 {
-            return None;
+    let ip = match address_family {
+        ProcTcpAddressFamily::Ipv4 => {
+            let address = u32::from_str_radix(address, 16).ok()?;
+            IpAddr::V4(Ipv4Addr::from(address.to_le_bytes()))
         }
-        let mut bytes = [0u8; 16];
-        for (index, chunk) in address.as_bytes().chunks_exact(8).enumerate() {
-            let chunk = std::str::from_utf8(chunk).ok()?;
-            let word = u32::from_str_radix(chunk, 16).ok()?;
-            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        ProcTcpAddressFamily::Ipv6 => {
+            if address.len() != 32 {
+                return None;
+            }
+            let mut bytes = [0u8; 16];
+            for (index, chunk) in address.as_bytes().chunks_exact(8).enumerate() {
+                let chunk = std::str::from_utf8(chunk).ok()?;
+                let word = u32::from_str_radix(chunk, 16).ok()?;
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            IpAddr::V6(Ipv6Addr::from(bytes))
         }
-        IpAddr::V6(Ipv6Addr::from(bytes))
-    } else {
-        let address = u32::from_str_radix(address, 16).ok()?;
-        IpAddr::V4(Ipv4Addr::from(address.to_le_bytes()))
     };
 
     Some(SocketAddr::new(ip, port))
@@ -835,9 +855,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn parse_proc_socket_addr_decodes_ipv4_and_mapped_ipv6() {
-        let ipv4 = parse_proc_socket_addr("0100007F:C350", false).unwrap();
-        let mapped_ipv6 =
-            parse_proc_socket_addr("0000000000000000FFFF00000100007F:C350", true).unwrap();
+        let ipv4 = parse_proc_socket_addr("0100007F:C350", ProcTcpAddressFamily::Ipv4).unwrap();
+        let mapped_ipv6 = parse_proc_socket_addr(
+            "0000000000000000FFFF00000100007F:C350",
+            ProcTcpAddressFamily::Ipv6,
+        )
+        .unwrap();
 
         assert_eq!(ipv4, "127.0.0.1:50000".parse().unwrap());
         assert!(socket_addrs_match(ipv4, mapped_ipv6));
@@ -855,7 +878,8 @@ mod tests {
             "127.0.0.1:8080".parse().unwrap(),
         );
 
-        let inode = find_proc_net_tcp_inode(content, false, connection).unwrap();
+        let inode =
+            find_proc_net_tcp_inode(content, ProcTcpAddressFamily::Ipv4, connection).unwrap();
 
         assert_eq!(inode, Some(22222));
     }
