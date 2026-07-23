@@ -181,23 +181,31 @@ e2e_build_gateway_binaries() {
 
   target_dir="$(e2e_cargo_target_dir "${root}")"
   printf -v "${target_var}" '%s' "${target_dir}"
-  printf -v "${gateway_var}" '%s' "${target_dir}/debug/openshell-gateway"
-  printf -v "${cli_var}" '%s' "${target_dir}/debug/openshell"
+  printf -v "${gateway_var}" '%s' "${OPENSHELL_GATEWAY_BIN:-${target_dir}/debug/openshell-gateway}"
+  printf -v "${cli_var}" '%s' "${OPENSHELL_BIN:-${target_dir}/debug/openshell}"
 
-  echo "Building openshell-gateway..."
-  cargo build "${jobs[@]}" \
-    -p openshell-server --bin openshell-gateway
+  if [ -z "${OPENSHELL_GATEWAY_BIN:-}" ]; then
+    echo "Building openshell-gateway..."
+    cargo build "${jobs[@]}" \
+      -p openshell-server --bin openshell-gateway
+  else
+    echo "Using prebuilt openshell gateway at ${OPENSHELL_GATEWAY_BIN}"
+  fi
 
-  echo "Building openshell-cli..."
-  cargo build "${jobs[@]}" \
-    -p openshell-cli
+  if [ -z "${OPENSHELL_BIN:-}" ]; then
+    echo "Building openshell-cli..."
+    cargo build "${jobs[@]}" \
+      -p openshell-cli
+  else
+    echo "Using prebuilt openshell CLI at ${OPENSHELL_BIN}"
+  fi
 
-  if [ ! -x "${target_dir}/debug/openshell-gateway" ]; then
-    echo "ERROR: expected openshell-gateway binary at ${target_dir}/debug/openshell-gateway" >&2
+  if [ ! -x "${!gateway_var}" ]; then
+    echo "ERROR: expected openshell-gateway binary at ${!gateway_var}" >&2
     exit 1
   fi
-  if [ ! -x "${target_dir}/debug/openshell" ]; then
-    echo "ERROR: expected openshell CLI binary at ${target_dir}/debug/openshell" >&2
+  if [ ! -x "${!cli_var}" ]; then
+    echo "ERROR: expected openshell CLI binary at ${!cli_var}" >&2
     exit 1
   fi
 }

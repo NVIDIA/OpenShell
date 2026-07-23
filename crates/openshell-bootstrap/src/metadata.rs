@@ -275,10 +275,14 @@ pub fn load_active_gateway() -> Option<String> {
 }
 
 /// Save the last-used sandbox name for a gateway to persistent storage.
-pub fn save_last_sandbox(gateway: &str, sandbox: &str) -> Result<()> {
+///
+/// The workspace is stored alongside the name so that `load_last_sandbox`
+/// only returns a sandbox that belongs to the requested workspace.
+pub fn save_last_sandbox(gateway: &str, workspace: &str, sandbox: &str) -> Result<()> {
     let path = last_sandbox_path(gateway)?;
     ensure_parent_dir_restricted(&path)?;
-    std::fs::write(&path, sandbox)
+    let content = format!("{workspace}\n{sandbox}");
+    std::fs::write(&path, content)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write last sandbox to {}", path.display()))?;
     Ok(())
@@ -286,20 +290,31 @@ pub fn save_last_sandbox(gateway: &str, sandbox: &str) -> Result<()> {
 
 /// Load the last-used sandbox name for a gateway from persistent storage.
 ///
-/// Returns `None` if no last sandbox has been set.
-pub fn load_last_sandbox(gateway: &str) -> Option<String> {
-    last_sandbox_path(gateway)
+/// Returns the sandbox name only if the stored workspace matches the
+/// requested workspace. Returns `None` if no last sandbox has been set
+/// or the workspace does not match.
+pub fn load_last_sandbox(gateway: &str, workspace: &str) -> Option<String> {
+    let content = last_sandbox_path(gateway)
         .ok()
         .as_deref()
-        .and_then(read_nonempty_trimmed)
+        .and_then(read_nonempty_trimmed)?;
+    let mut lines = content.lines();
+    let stored_workspace = lines.next()?.trim();
+    let sandbox = lines.next().map(str::trim).filter(|s| !s.is_empty())?;
+    if stored_workspace == workspace {
+        Some(sandbox.to_string())
+    } else {
+        None
+    }
 }
 
-/// Clear the last-used sandbox record for a gateway if it matches the given name.
+/// Clear the last-used sandbox record for a gateway if it matches the given
+/// workspace and name.
 ///
 /// This should be called after a sandbox is deleted so that subsequent commands
 /// don't try to connect to a sandbox that no longer exists.
-pub fn clear_last_sandbox_if_matches(gateway: &str, sandbox: &str) {
-    if let Some(current) = load_last_sandbox(gateway)
+pub fn clear_last_sandbox_if_matches(gateway: &str, workspace: &str, sandbox: &str) {
+    if let Some(current) = load_last_sandbox(gateway, workspace)
         && current == sandbox
         && let Ok(path) = last_sandbox_path(gateway)
     {
@@ -507,8 +522,11 @@ mod tests {
     fn save_and_load_last_sandbox_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            save_last_sandbox("mygateway", "dev-box").unwrap();
-            assert_eq!(load_last_sandbox("mygateway"), Some("dev-box".to_string()));
+            save_last_sandbox("mygateway", "default", "dev-box").unwrap();
+            assert_eq!(
+                load_last_sandbox("mygateway", "default"),
+                Some("dev-box".to_string())
+            );
         });
     }
 
@@ -516,7 +534,7 @@ mod tests {
     fn load_last_sandbox_returns_none_when_not_set() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            assert_eq!(load_last_sandbox("no-such-gateway"), None);
+            assert_eq!(load_last_sandbox("no-such-gateway", "default"), None);
         });
     }
 
@@ -524,9 +542,12 @@ mod tests {
     fn save_last_sandbox_overwrites_previous() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            save_last_sandbox("g1", "first").unwrap();
-            save_last_sandbox("g1", "second").unwrap();
-            assert_eq!(load_last_sandbox("g1"), Some("second".to_string()));
+            save_last_sandbox("g1", "default", "first").unwrap();
+            save_last_sandbox("g1", "default", "second").unwrap();
+            assert_eq!(
+                load_last_sandbox("g1", "default"),
+                Some("second".to_string())
+            );
         });
     }
 
@@ -534,24 +555,22 @@ mod tests {
     fn save_last_sandbox_creates_parent_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            // The gateway subdir doesn't exist yet — save should create it.
-            save_last_sandbox("brand-new-gateway", "sb1").unwrap();
+            save_last_sandbox("brand-new-gateway", "default", "sb1").unwrap();
             assert_eq!(
-                load_last_sandbox("brand-new-gateway"),
+                load_last_sandbox("brand-new-gateway", "default"),
                 Some("sb1".to_string())
             );
         });
     }
 
     #[test]
-    fn load_last_sandbox_ignores_whitespace() {
+    fn load_last_sandbox_returns_none_for_legacy_single_line_file() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            // Write the file manually with surrounding whitespace.
             let path = last_sandbox_path("ws-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "  my-sb \n").unwrap();
-            assert_eq!(load_last_sandbox("ws-gateway"), Some("my-sb".to_string()));
+            assert_eq!(load_last_sandbox("ws-gateway", "default"), None);
         });
     }
 
@@ -562,7 +581,7 @@ mod tests {
             let path = last_sandbox_path("empty-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "   \n").unwrap();
-            assert_eq!(load_last_sandbox("empty-gateway"), None);
+            assert_eq!(load_last_sandbox("empty-gateway", "default"), None);
         });
     }
 
@@ -570,16 +589,29 @@ mod tests {
     fn last_sandbox_is_per_gateway() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            save_last_sandbox("gateway-a", "sandbox-a").unwrap();
-            save_last_sandbox("gateway-b", "sandbox-b").unwrap();
+            save_last_sandbox("gateway-a", "default", "sandbox-a").unwrap();
+            save_last_sandbox("gateway-b", "default", "sandbox-b").unwrap();
             assert_eq!(
-                load_last_sandbox("gateway-a"),
+                load_last_sandbox("gateway-a", "default"),
                 Some("sandbox-a".to_string())
             );
             assert_eq!(
-                load_last_sandbox("gateway-b"),
+                load_last_sandbox("gateway-b", "default"),
                 Some("sandbox-b".to_string())
             );
+        });
+    }
+
+    #[test]
+    fn last_sandbox_is_workspace_scoped() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            save_last_sandbox("gw", "alpha", "sb-alpha").unwrap();
+            assert_eq!(
+                load_last_sandbox("gw", "alpha"),
+                Some("sb-alpha".to_string())
+            );
+            assert_eq!(load_last_sandbox("gw", "beta"), None);
         });
     }
 
@@ -635,9 +667,12 @@ mod tests {
         with_tmp_xdg_and_system(user.path(), system.path(), || {
             write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
 
-            save_last_sandbox("shared", "sb-123").unwrap();
+            save_last_sandbox("shared", "default", "sb-123").unwrap();
 
-            assert_eq!(load_last_sandbox("shared"), Some("sb-123".to_string()));
+            assert_eq!(
+                load_last_sandbox("shared", "default"),
+                Some("sb-123".to_string())
+            );
             assert_eq!(
                 gateway_metadata_source("shared").unwrap(),
                 Some(GatewayMetadataSource::System)
@@ -671,12 +706,12 @@ mod tests {
                 .to_path_buf();
             assert!(!user_gateway_dir.exists());
 
-            save_last_sandbox("shared", "sb-123").unwrap();
+            save_last_sandbox("shared", "default", "sb-123").unwrap();
 
             assert!(user_gateway_dir.is_dir());
             assert_eq!(
                 std::fs::read_to_string(user_gateway_dir.join("last_sandbox")).unwrap(),
-                "sb-123"
+                "default\nsb-123"
             );
             assert!(!user_gateway_dir.join("metadata.json").exists());
             assert_eq!(
@@ -692,11 +727,11 @@ mod tests {
         let system = tempfile::tempdir().unwrap();
         with_tmp_xdg_and_system(user.path(), system.path(), || {
             write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
-            save_last_sandbox("shared", "sb-123").unwrap();
+            save_last_sandbox("shared", "default", "sb-123").unwrap();
 
-            clear_last_sandbox_if_matches("shared", "sb-123");
+            clear_last_sandbox_if_matches("shared", "default", "sb-123");
 
-            assert_eq!(load_last_sandbox("shared"), None);
+            assert_eq!(load_last_sandbox("shared", "default"), None);
             let gateways = list_gateways_with_source().unwrap();
             assert_eq!(gateways.len(), 1);
             assert_eq!(gateways[0].metadata.name, "shared");
@@ -924,7 +959,7 @@ mod tests {
             };
             assert!(store_gateway_metadata("../escape", &meta).is_err());
             assert!(load_gateway_metadata("../escape").is_err());
-            assert!(save_last_sandbox("../escape", "sb-123").is_err());
+            assert!(save_last_sandbox("../escape", "default", "sb-123").is_err());
             assert!(save_active_gateway("../escape").is_err());
         });
     }

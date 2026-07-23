@@ -865,6 +865,7 @@ name = "openshell-core"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "glob",
  "ipnet",
  "miette",
  "prost",
@@ -907,6 +908,7 @@ version = "0.0.0"
 dependencies = [
  "miette",
  "openshell-core",
+ "prost-types",
  "serde",
  "serde_json",
  "serde_yml",

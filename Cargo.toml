@@ -110,6 +110,7 @@ pin-project-lite = "0.2"
 tokio-stream = "0.1"
 protobuf-src = "1.1.0"
 url = "2"
+indexmap = "2"
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "migrate"] }

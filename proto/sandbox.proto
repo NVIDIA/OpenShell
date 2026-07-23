@@ -364,6 +364,9 @@ message GetSandboxConfigResponse {
   // Operator-registered supervisor middleware services required by the
   // effective policy. Built-in middleware is not included.
   repeated SupervisorMiddlewareService supervisor_middleware_services = 9;
+  // Workspace the sandbox belongs to. Allows the supervisor to learn its
+  // workspace context for subsequent workspace-scoped RPCs.
+  string workspace = 10;
 }
 
 // Connection details for one operator-registered supervisor middleware service.

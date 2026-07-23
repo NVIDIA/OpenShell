@@ -120,6 +120,8 @@ mod tests {
             discovery: DiscoveryProfile {
                 credentials: vec!["api_key".to_string(), "secondary".to_string()],
             },
+            source: String::new(),
+            scope: String::new(),
         }
     }
 

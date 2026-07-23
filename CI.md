@@ -20,7 +20,7 @@ Three opt-in labels enable the long-running E2E suites:
 - `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
   (`replicaCount: 2` and bundled PostgreSQL) in `Branch E2E Checks`
 
-When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once and fans out all enabled suites in parallel.
+When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once, builds one CLI artifact per runner architecture, builds the Linux VM driver artifact once, and fans out all enabled suites in parallel. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E jobs reuse the matching prebuilt gateway and CLI binaries instead of compiling additional debug binaries in each job; Kubernetes E2E consumes the gateway image directly and reuses the prebuilt CLI. VM E2E also reuses the prebuilt VM driver artifact and falls back to local VM-driver/runtime preparation for local runs or workflow invocations that omit the artifact.
 The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while HA behavior is under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
 
 The GitHub ruleset should require the `OpenShell / ...` statuses published by `Required CI Gates`, not the push-triggered workflow jobs directly.

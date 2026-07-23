@@ -315,6 +315,7 @@ mod tests {
             name: "demo".to_string(),
             labels: HashMap::from([("team".to_string(), "agent".to_string())]),
             annotations: HashMap::new(),
+            workspace: String::new(),
         };
         let bytes = request.encode_to_vec();
         let json = codec
@@ -342,6 +343,7 @@ mod tests {
                 config: HashMap::from([("region".to_string(), "us-west".to_string())]),
                 ..Provider::default()
             }),
+            workspace: String::new(),
         };
         let encoded = request.encode_to_vec();
 

@@ -17,7 +17,7 @@ use tonic::Status;
 use super::{
     MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
     MAX_METADATA_ANNOTATIONS_ENTRIES, MAX_NAME_LEN, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
-    MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
+    MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS, MAX_ROUTABLE_NAME_LEN,
     MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
 };
 
@@ -98,6 +98,46 @@ pub(super) fn reject_newline_chars(value: &str, field_name: &str) -> Result<(), 
 }
 
 // ---------------------------------------------------------------------------
+// DNS-1123 label validation
+// ---------------------------------------------------------------------------
+
+/// Validate that a string conforms to DNS-1123 label rules: lowercase
+/// alphanumeric and hyphens, no leading/trailing hyphens, no consecutive
+/// hyphens, max 63 characters. `field` is used in error messages.
+///
+/// Empty names are allowed (the caller decides whether empty is valid).
+pub(super) fn validate_dns1123_label(name: &str, field: &str) -> Result<(), Status> {
+    if name.is_empty() {
+        return Ok(());
+    }
+    if name.len() > MAX_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "{field} exceeds maximum length ({} > {MAX_NAME_LEN})",
+            name.len()
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(Status::invalid_argument(format!(
+            "{field} must contain only lowercase alphanumeric characters or hyphens",
+        )));
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        return Err(Status::invalid_argument(format!(
+            "{field} must not start or end with a hyphen",
+        )));
+    }
+    if name.contains("--") {
+        return Err(Status::invalid_argument(format!(
+            "{field} must not contain consecutive hyphens",
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Sandbox spec validation
 // ---------------------------------------------------------------------------
 
@@ -109,12 +149,13 @@ pub(super) fn validate_sandbox_spec(
     spec: &openshell_core::proto::SandboxSpec,
 ) -> Result<(), Status> {
     // --- request.name ---
-    if name.len() > MAX_NAME_LEN {
+    if !name.is_empty() && name.len() > MAX_ROUTABLE_NAME_LEN {
         return Err(Status::invalid_argument(format!(
-            "name exceeds maximum length ({} > {MAX_NAME_LEN})",
+            "name exceeds maximum length ({} > {MAX_ROUTABLE_NAME_LEN})",
             name.len()
         )));
     }
+    validate_dns1123_label(name, "name")?;
 
     // --- spec.providers ---
     if spec.providers.len() > MAX_PROVIDERS {
@@ -859,16 +900,39 @@ mod tests {
 
     #[test]
     fn validate_sandbox_spec_accepts_at_limit_name() {
-        let name = "a".repeat(MAX_NAME_LEN);
+        let name = "a".repeat(MAX_ROUTABLE_NAME_LEN);
         assert!(validate_sandbox_spec(&name, &default_spec()).is_ok());
     }
 
     #[test]
     fn validate_sandbox_spec_rejects_over_limit_name() {
-        let name = "a".repeat(MAX_NAME_LEN + 1);
+        let name = "a".repeat(MAX_ROUTABLE_NAME_LEN + 1);
         let err = validate_sandbox_spec(&name, &default_spec()).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("name"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_uppercase_name() {
+        let err = validate_sandbox_spec("MySandbox", &default_spec()).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_leading_hyphen_name() {
+        let err = validate_sandbox_spec("-sandbox", &default_spec()).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_consecutive_hyphens_name() {
+        let err = validate_sandbox_spec("my--sandbox", &default_spec()).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_single_hyphens_name() {
+        assert!(validate_sandbox_spec("my-sandbox", &default_spec()).is_ok());
     }
 
     #[test]
@@ -1181,11 +1245,14 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: String::new(),
+                deletion_timestamp_ms: 0,
             }),
             r#type: provider_type.to_string(),
             credentials,
             config,
             credential_expires_at_ms: HashMap::new(),
+            profile_workspace: "default".to_string(),
         }
     }
 

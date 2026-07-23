@@ -1,0 +1,167 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Gateway Interceptors"
+sidebar-title: "Gateway Interceptors"
+description: "Extend OpenShell gateway operations with deployment-specific governance and business logic."
+keywords: "Generative AI, Cybersecurity, AI Agents, Gateway Interceptors, Extensibility, Governance"
+---
+Gateway interceptors let operators add deployment-specific governance to OpenShell control-plane operations without modifying the gateway. An external gRPC service can modify or validate selected API writes before the gateway handles them, then observe successful responses after commit.
+
+See the [governance interceptor example](https://github.com/NVIDIA/OpenShell/tree/main/examples/governance-interceptor) for a complete service that vends provider profiles, applies a signed policy to new sandboxes, and rejects attempts to weaken that policy.
+
+## Choose Gateway Interceptors
+
+Use a gateway interceptor when an external service needs to govern gateway API operations. For example, an interceptor can:
+
+- Apply an approved policy to every new sandbox.
+- Reject provider or policy changes that violate organizational rules.
+- Enforce tenant quotas or naming conventions.
+- Observe committed operations for an audit or inventory service.
+- Vend an authoritative or composed provider profile catalog.
+
+Gateway interceptors do not replace gateway persistence, authentication, authorization, policy safety checks, or driver validation. The gateway remains the system of record and validates an operation after interceptor modification.
+
+## How Interception Works
+
+The gateway runs interceptors after authentication and before dispatching a request to its handler:
+
+`authenticate → decode and omit secrets → modify_operation → validate → gateway handler → post_commit`
+
+| Phase              | Input                                       | Capabilities                                     |
+| ------------------ | ------------------------------------------- | ------------------------------------------------ |
+| `modify_operation` | Proposed request                            | Allow, deny, or return RFC 6902 JSON patches.    |
+| `validate`         | Modified request and optional current state | Allow or deny.                                   |
+| `post_commit`      | Successful gateway response                 | Observe the response and attach log annotations. |
+
+Only explicitly allowlisted unary mutation RPCs are interceptable. The gateway converts an operation to its protobuf JSON representation before evaluation. It applies patches atomically, validates the result against the RPC's protobuf schema, and converts the operation back to protobuf before the handler receives it.
+
+The gateway runs built-in operation and driver validation after `modify_operation`. A patched operation cannot bypass gateway-owned invariants.
+
+`post_commit` is observational. It cannot deny or modify an operation that the gateway has already committed.
+
+## Implement an Interceptor Service
+
+An interceptor implements the `openshell.gateway_interceptor.v1.GatewayInterceptor` gRPC service defined in [`proto/gateway_interceptor.proto`](https://github.com/NVIDIA/OpenShell/blob/main/proto/gateway_interceptor.proto):
+
+- `Describe` declares the service's bindings and capabilities.
+- `Evaluate` handles one selected operation phase.
+- `SnapshotProviderProfiles` optionally returns a provider profile catalog.
+
+Each `InterceptorEvaluation` identifies the configured interceptor, manifest binding, public OpenShell service and method, authenticated principal, and active phase. The phase determines whether the payload contains a proposed operation, optional current state, or committed response.
+
+The interceptor returns an `InterceptorResult` with an allow or deny decision, an optional denial status and reason, JSON patches during `modify_operation`, and non-secret log annotations.
+
+## Declare and Authorize Bindings
+
+The interceptor declares bindings in its `InterceptorManifest` returned by `Describe`. Each binding selects one public OpenShell RPC and one or more phases. The gateway validates these declarations at startup against its compiled protobuf descriptors and explicit interceptable RPC allowlist.
+
+The operator chooses how the manifest and gateway configuration combine with `binding_policy`:
+
+| Policy      | Behavior                                                                                                                                          |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dynamic`   | Enables valid manifest bindings. Gateway configuration may narrow or disable them. This is the compatibility default and emits a startup warning. |
+| `allowlist` | Enables only operator-configured RPCs and phases. Extra manifest bindings are ignored and logged.                                                 |
+| `exact`     | Requires the configured RPCs and phases to match the manifest exactly.                                                                            |
+
+Use `allowlist` or `exact` when interceptor authority is part of a security boundary. These modes select bindings by public RPC rather than manifest binding ID, so renaming a binding does not change its authority.
+
+## Register an Interceptor Service
+
+Start the interceptor before the gateway, then register it in gateway TOML:
+
+```toml
+[[openshell.gateway.interceptors]]
+name               = "policy-governance"
+grpc_endpoint      = "http://127.0.0.1:18081"
+order              = 10
+failure_policy     = "fail_closed"
+binding_policy     = "allowlist"
+timeout            = "500ms"
+max_response_bytes = 1048576
+max_patches        = 32
+
+[[openshell.gateway.interceptors.bindings]]
+rpc    = "openshell.v1.OpenShell/CreateSandbox"
+phases = ["modify_operation", "validate"]
+
+[[openshell.gateway.interceptors.bindings]]
+rpc    = "openshell.v1.OpenShell/UpdateConfig"
+phases = ["validate"]
+```
+
+The gateway supports `http://`, `https://`, and `unix://` interceptor endpoints. It calls `Describe` and builds an immutable execution plan during startup. An unavailable service, invalid manifest, or unauthorized configured binding prevents the gateway from starting.
+
+Registration is static. Restart the gateway after adding, removing, or changing an interceptor. See [Gateway Configuration](/reference/gateway-config#gateway-interceptors) for the complete field reference.
+
+## Select RPCs and Phases
+
+Start with the invariant the interceptor must preserve, then identify every gateway RPC that can establish or weaken it. For example, an interceptor that owns sandbox policy can use `modify_operation` on `CreateSandbox` to apply an approved initial policy and `validate` on `UpdateConfig` to reject unauthorized changes.
+
+The gateway maintains the canonical [interceptable route allowlist](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-gateway-interceptors/src/routes.rs). Read the interceptor manifest and gateway startup diagnostics when selecting bindings. Unknown, streaming, read-only, and non-allowlisted RPCs cannot be intercepted.
+
+Choose a phase by intent:
+
+- Use `modify_operation` to apply defaults or controlled changes.
+- Use `validate` to enforce a rule without changing the request.
+- Use `post_commit` to notify or audit an external system after success.
+
+## Mutate Operations Safely
+
+Operations and committed responses use protobuf JSON field names and shapes. Only `modify_operation` accepts RFC 6902 JSON patches.
+
+The gateway applies all patches returned by one binding as an atomic candidate. It then encodes that candidate as the RPC's protobuf request type and decodes it back to canonical protobuf JSON. If any patch or the resulting operation is invalid, the gateway discards the complete candidate and applies the binding's failure policy. Later bindings see only schema-valid operations that the handler can receive.
+
+Fields marked secret in the protobuf schema are recursively omitted from interceptor requests and committed responses. An interceptor cannot patch an omitted field, use one as a patch source, or replace a containing object. Gateway handlers retain the complete operation and continue to receive secret fields that were omitted from the interceptor view.
+
+## Configure Failure Behavior
+
+Failure policy controls what happens when the gateway cannot obtain or apply a valid result. Failures include timeouts, transport errors, invalid responses, response-size violations, invalid phase behavior, and patch-limit violations.
+
+| Policy        | Behavior                                                                                           |
+| ------------- | -------------------------------------------------------------------------------------------------- |
+| `fail_closed` | Rejects the API operation before handler dispatch.                                                 |
+| `fail_open`   | Skips the failed result, continues with the previous valid operation, and emits warning telemetry. |
+
+A valid deny result during `modify_operation` or `validate` always rejects the operation. It is not an interceptor failure and does not follow the failure policy.
+
+Bindings that include `post_commit` must resolve to `fail_open`. The gateway rejects fail-closed post-commit configuration at startup because an observer cannot revoke an already committed response. A post-commit observation or evaluation failure is logged and counted without replacing the successful gateway response.
+
+Use `fail_open` only when bypassing an unavailable or invalid interceptor preserves the intended governance boundary.
+
+## Vend Provider Profiles
+
+An interceptor can advertise `provider_profiles = true` in its manifest and implement `SnapshotProviderProfiles`. The RPC returns a `ProviderProfileSnapshot`. Add that interceptor to `provider_profile_sources` to include its profiles in the gateway's effective catalog.
+
+Select only the interceptor to make its catalog authoritative:
+
+```toml
+[openshell.gateway]
+provider_profile_sources = [
+  { type = "interceptor", name = "provider-governance" },
+]
+```
+
+Include `{ type = "builtin" }` or `{ type = "user" }` entries to compose interceptor profiles with the built-in or user-managed sources. Duplicate normalized profile IDs fail instead of overriding one source with another.
+
+The gateway validates snapshot structure and provider profile semantics. It treats the configured interceptor as a trusted source and does not verify interceptor-defined signature, hash, or key annotations.
+
+## Operate and Observe Interceptors
+
+Plan interceptor deployment around these boundaries:
+
+- Start every configured service before the gateway.
+- Restart the gateway after changing registrations or bindings.
+- Keep fail-closed services available whenever the gateway accepts writes.
+- Treat the endpoint and its operator configuration as part of the gateway trust boundary.
+- Do not include secrets in denial reasons or log annotations.
+
+The gateway emits structured evaluation logs containing the interceptor name, binding ID, RPC, phase, decision, patch count, and interceptor-provided log annotations. Metrics record evaluation decisions, latency, patch application, fail-open and fail-closed outcomes, and post-commit observation failures.
+
+## Current Limitations
+
+- Only explicitly allowlisted unary write RPCs are interceptable. New gateway RPCs are non-interceptable until added to the allowlist.
+- `current_state` is available only in the `validate` contract. The gateway does not yet populate it with method-specific state.
+- Registration changes require a gateway restart.
+- Custom TLS roots, client authentication, service health checks, and runtime registration are not available.
+- Interceptors cannot receive or mutate protobuf fields marked secret.

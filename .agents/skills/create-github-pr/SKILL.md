@@ -24,6 +24,10 @@ in the same branch. If the change affects user-facing compute-driver setup,
 also update `docs/reference/sandbox-compute-drivers.mdx` or the relevant
 deployment docs.
 
+### Check Agent Infrastructure
+
+Use the `sync-agent-infra` skill's maintenance map to identify related skill updates when the branch changes behavior, commands, or development workflows. Run its full consistency check when the branch adds, removes, or renames skills or crates; changes workflow relationships or skill coverage; modifies issue or PR templates; or changes agent cross-references. Resolve any drift before creating the PR.
+
 ### Run Pre-commit Checks
 
 Run the local pre-commit task before opening a PR:

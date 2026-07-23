@@ -639,6 +639,7 @@ File.open(dockerfile_path, "a") do |file|
   file.puts
   file.puts "USER root"
   file.puts "COPY openshell-agent-payload/ #{payload_image_dir}/"
+  file.puts "RUN chmod -R a+rX #{payload_image_dir}"
   file.puts "RUN chmod -R a-w #{payload_image_dir}"
   file.puts final_user if final_user
 end

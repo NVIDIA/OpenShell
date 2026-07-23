@@ -1463,23 +1463,76 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
     (errors, warnings)
 }
 
+/// Map a supported L7 `access` preset to explicit rules for `protocol`.
+///
+/// Returns `None` when `access` is not `read-only`, `read-write`, or `full`.
+/// Graphql and websocket presets differ from REST; all other protocols use
+/// REST presets. Requires prior `validate_l7_policies` so mcp/json-rpc `access`
+/// is rejected before expansion runs.
+fn access_preset_rules(protocol: &str, access: &str) -> Option<Vec<serde_json::Value>> {
+    if protocol == "graphql" {
+        match access {
+            "read-only" => Some(vec![graphql_rule_json("query")]),
+            "read-write" => Some(vec![
+                graphql_rule_json("query"),
+                graphql_rule_json("mutation"),
+            ]),
+            "full" => Some(vec![graphql_rule_json("*")]),
+            _ => None,
+        }
+    } else if protocol == "websocket" {
+        match access {
+            "read-only" => Some(vec![rule_json("GET", "**")]),
+            "read-write" => Some(vec![
+                rule_json("GET", "**"),
+                rule_json("WEBSOCKET_TEXT", "**"),
+            ]),
+            "full" => Some(vec![rule_json("*", "**")]),
+            _ => None,
+        }
+    } else {
+        match access {
+            "read-only" => Some(vec![
+                rule_json("GET", "**"),
+                rule_json("HEAD", "**"),
+                rule_json("OPTIONS", "**"),
+            ]),
+            "read-write" => Some(vec![
+                rule_json("GET", "**"),
+                rule_json("HEAD", "**"),
+                rule_json("OPTIONS", "**"),
+                rule_json("POST", "**"),
+                rule_json("PUT", "**"),
+                rule_json("PATCH", "**"),
+            ]),
+            "full" => Some(vec![rule_json("*", "**")]),
+            _ => None,
+        }
+    }
+}
+
 /// Expand `access` presets into explicit `rules` in the policy data.
 ///
 /// This preprocesses the JSON data so Rego only needs to handle explicit rules.
-pub fn expand_access_presets(data: &mut serde_json::Value) {
+/// Returns warnings for unsupported `access` values that were ignored.
+///
+/// Unsupported preset detection lives here rather than in `validate_l7_policies`
+/// so supported presets stay defined only in `access_preset_rules`.
+pub fn expand_access_presets(data: &mut serde_json::Value) -> Vec<String> {
+    let mut warnings = Vec::new();
     let Some(policies) = data
         .get_mut("network_policies")
         .and_then(|v| v.as_object_mut())
     else {
-        return;
+        return warnings;
     };
 
-    for (_name, policy) in policies.iter_mut() {
+    for (name, policy) in policies.iter_mut() {
         let Some(endpoints) = policy.get_mut("endpoints").and_then(|v| v.as_array_mut()) else {
             continue;
         };
 
-        for ep in endpoints.iter_mut() {
+        for (i, ep) in endpoints.iter_mut().enumerate() {
             let protocol = ep
                 .get("protocol")
                 .and_then(|v| v.as_str())
@@ -1520,38 +1573,13 @@ pub fn expand_access_presets(data: &mut serde_json::Value) {
                 continue;
             }
 
-            let rules = if protocol == "graphql" {
-                match access.as_str() {
-                    "read-only" => vec![graphql_rule_json("query")],
-                    "read-write" => vec![graphql_rule_json("query"), graphql_rule_json("mutation")],
-                    "full" => vec![graphql_rule_json("*")],
-                    _ => continue,
-                }
-            } else if protocol == "websocket" {
-                match access.as_str() {
-                    "read-only" => vec![rule_json("GET", "**")],
-                    "read-write" => vec![rule_json("GET", "**"), rule_json("WEBSOCKET_TEXT", "**")],
-                    "full" => vec![rule_json("*", "**")],
-                    _ => continue,
-                }
-            } else {
-                match access.as_str() {
-                    "read-only" => vec![
-                        rule_json("GET", "**"),
-                        rule_json("HEAD", "**"),
-                        rule_json("OPTIONS", "**"),
-                    ],
-                    "read-write" => vec![
-                        rule_json("GET", "**"),
-                        rule_json("HEAD", "**"),
-                        rule_json("OPTIONS", "**"),
-                        rule_json("POST", "**"),
-                        rule_json("PUT", "**"),
-                        rule_json("PATCH", "**"),
-                    ],
-                    "full" => vec![rule_json("*", "**")],
-                    _ => continue,
-                }
+            let Some(rules) = access_preset_rules(protocol, &access) else {
+                let loc = format!("{name}.endpoints[{i}]");
+                let warning = format!(
+                    "{loc}: unsupported L7 access preset '{access}' ignored; expected one of: read-only, read-write, full"
+                );
+                warnings.push(warning);
+                continue;
             };
 
             ep.as_object_mut()
@@ -1559,6 +1587,8 @@ pub fn expand_access_presets(data: &mut serde_json::Value) {
                 .insert("rules".to_string(), serde_json::Value::Array(rules));
         }
     }
+
+    warnings
 }
 
 fn rule_json(method: &str, path: &str) -> serde_json::Value {
@@ -1849,7 +1879,8 @@ mod tests {
             }
         });
 
-        expand_access_presets(&mut data);
+        let warnings = expand_access_presets(&mut data);
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
         let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
             .as_array()
             .unwrap();
@@ -2709,7 +2740,8 @@ mod tests {
                 }
             }
         });
-        expand_access_presets(&mut data);
+        let warnings = expand_access_presets(&mut data);
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
         let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
             .as_array()
             .unwrap();
@@ -2738,13 +2770,44 @@ mod tests {
                 }
             }
         });
-        expand_access_presets(&mut data);
+        let warnings = expand_access_presets(&mut data);
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
         let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
             .as_array()
             .unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0]["allow"]["method"].as_str().unwrap(), "*");
         assert_eq!(rules[0]["allow"]["path"].as_str().unwrap(), "**");
+    }
+
+    #[test]
+    fn expand_unsupported_access_preset_warns_and_leaves_rules_unexpanded() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "allow-my-service": {
+                    "endpoints": [{
+                        "host": "my-service.example.com",
+                        "port": 80,
+                        "protocol": "rest",
+                        "access": "allow"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let warnings = expand_access_presets(&mut data);
+        assert!(
+            data["network_policies"]["allow-my-service"]["endpoints"][0]
+                .get("rules")
+                .is_none(),
+            "unsupported access preset must not expand rules"
+        );
+        assert_eq!(
+            warnings,
+            vec![
+                "allow-my-service.endpoints[0]: unsupported L7 access preset 'allow' ignored; expected one of: read-only, read-write, full".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2762,7 +2825,8 @@ mod tests {
                 }
             }
         });
-        expand_access_presets(&mut data);
+        let warnings = expand_access_presets(&mut data);
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
         let rules = data["network_policies"]["test"]["endpoints"][0]["rules"]
             .as_array()
             .unwrap();
@@ -2835,7 +2899,8 @@ mod tests {
                 }
             }
         });
-        expand_access_presets(&mut data);
+        let warnings = expand_access_presets(&mut data);
+        assert!(warnings.is_empty(), "expected no warnings: {warnings:?}");
         assert!(
             data["network_policies"]["test"]["endpoints"][0]
                 .get("rules")

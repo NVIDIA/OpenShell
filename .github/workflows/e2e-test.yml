@@ -17,8 +17,24 @@ on:
         required: false
         type: string
         default: ""
+      cli-artifact-prefix:
+        description: "Optional prebuilt CLI artifact prefix (artifact suffix is linux-<arch>)"
+        required: false
+        type: string
+        default: ""
+      gateway-artifact-prefix:
+        description: "Optional prebuilt gateway artifact prefix (artifact suffix is linux-<arch>)"
+        required: false
+        type: string
+        default: ""
+      vm-driver-artifact-name:
+        description: "Optional prebuilt VM driver artifact name"
+        required: false
+        type: string
+        default: ""
 
 permissions:
+  actions: read
   contents: read
   packages: read
 
@@ -58,14 +74,26 @@ jobs:
       OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
       OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           persist-credentials: false
 
+      - name: Use prebuilt OpenShell CLI
+        if: inputs.cli-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-cli
+        with:
+          artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell gateway
+        if: inputs.gateway-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
+
       - name: Check out MCP conformance tests
         if: matrix.suite == 'mcp'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: modelcontextprotocol/conformance
           # Pin after v0.1.16 to include the tools_call client scenario fix.
@@ -121,10 +149,22 @@ jobs:
       OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           persist-credentials: false
+
+      - name: Use prebuilt OpenShell CLI
+        if: inputs.cli-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-cli
+        with:
+          artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell gateway
+        if: inputs.gateway-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
 
       - name: Install mise
         run: |
@@ -217,10 +257,28 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           persist-credentials: false
+
+      - name: Use prebuilt OpenShell CLI
+        if: inputs.cli-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-cli
+        with:
+          artifact-prefix: ${{ inputs.cli-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell gateway
+        if: inputs.gateway-artifact-prefix != ''
+        uses: ./.github/actions/setup-e2e-gateway
+        with:
+          artifact-prefix: ${{ inputs.gateway-artifact-prefix }}
+
+      - name: Use prebuilt OpenShell VM driver
+        if: inputs.vm-driver-artifact-name != ''
+        uses: ./.github/actions/setup-e2e-vm-driver
+        with:
+          artifact-name: ${{ inputs.vm-driver-artifact-name }}
 
       - name: Enable KVM access
         run: |
@@ -251,6 +309,12 @@ jobs:
             pkg-config \
             socat \
             zstd
+
+      - name: Validate VM host tools
+        run: |
+          command -v mke2fs
+          command -v mkfs.ext4
+          command -v debugfs
 
       - name: Install mise
         run: |

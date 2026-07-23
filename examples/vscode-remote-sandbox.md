@@ -32,7 +32,7 @@ To reopen an existing sandbox in VS Code:
 openshell sandbox connect my-sandbox --editor vscode
 ```
 
-OpenShell maintains the generated `Host openshell-my-sandbox` entry in its own
+OpenShell maintains the generated `Host openshell-my-sandbox.default` entry in its own
 managed SSH config include file.
 
 ### 3. Optional manual workflow
@@ -40,7 +40,7 @@ managed SSH config include file.
 If you want to inspect the generated SSH stanza directly:
 
 ```text
-Host openshell-my-sandbox
+Host openshell-my-sandbox.default
     User sandbox
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
@@ -58,13 +58,13 @@ openshell sandbox ssh-config my-sandbox
 ### 4. Open VS Code manually
 
 Open VSCode and run **Remote-SSH: Connect to Host...** from the command
-palette (`Cmd+Shift+P` / `Ctrl+Shift+P`). Select `openshell-my-sandbox` from the
+palette (`Cmd+Shift+P` / `Ctrl+Shift+P`). Select `openshell-my-sandbox.default` from the
 list. VSCode will open a remote window connected to the sandbox.
 
 Alternatively, from the terminal:
 
 ```bash
-code --remote ssh-remote+openshell-my-sandbox /sandbox
+code --remote ssh-remote+openshell-my-sandbox.default /sandbox
 ```
 
 ### 5. Clean up

@@ -201,6 +201,8 @@ mod tests {
                 labels: HashMap::default(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,

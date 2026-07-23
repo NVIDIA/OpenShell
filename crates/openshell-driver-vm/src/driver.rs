@@ -3270,10 +3270,9 @@ async fn connect_local_container_engine() -> Option<Docker> {
         return Some(docker);
     }
 
-    let podman_socket = podman_socket_path();
-    if podman_socket.exists()
-        && let Ok(docker) =
-            Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
+    let podman_socket = openshell_core::config::detect_podman_socket()?;
+    if let Ok(docker) =
+        Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
         && docker.ping().await.is_ok()
     {
         info!(
@@ -3284,25 +3283,6 @@ async fn connect_local_container_engine() -> Option<Docker> {
     }
 
     None
-}
-
-/// Podman user socket path for the current platform.
-fn podman_socket_path() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var("XDG_RUNTIME_DIR").map_or_else(
-            |_| {
-                let uid = nix::unistd::getuid();
-                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
-            },
-            |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
-        )
-    }
 }
 
 fn is_openshell_local_build_image_ref(image_ref: &str) -> bool {
@@ -3558,6 +3538,8 @@ impl VmDriver {
             apply_registry_layer_blob(image_ref, rootfs, layer).await?;
         }
 
+        remove_registry_layer_staging(staging_dir).await?;
+
         Ok(())
     }
 
@@ -3704,6 +3686,16 @@ async fn apply_registry_layer_blob(
         Status::failed_precondition(format!(
             "failed to apply layer '{}' for vm sandbox image '{image_ref}': {err}",
             layer.digest
+        ))
+    })
+}
+
+async fn remove_registry_layer_staging(staging_dir: &Path) -> Result<(), Status> {
+    let layers_dir = staging_dir.join("layers");
+    tokio::fs::remove_dir_all(&layers_dir).await.map_err(|err| {
+        Status::internal(format!(
+            "remove registry layer staging dir '{}' failed: {err}",
+            layers_dir.display()
         ))
     })
 }
@@ -4982,6 +4974,7 @@ fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bo
         id: sandbox.id.clone(),
         name: sandbox.name.clone(),
         namespace: sandbox.namespace.clone(),
+        workspace: sandbox.workspace.clone(),
         status: Some(SandboxStatus {
             sandbox_name: sandbox.name.clone(),
             instance_id: String::new(),
@@ -6632,6 +6625,29 @@ mod tests {
             registry_layer_download_concurrency_value(Some("999")),
             MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY
         );
+    }
+
+    #[tokio::test]
+    async fn remove_registry_layer_staging_preserves_merged_rootfs() {
+        let base = unique_temp_dir();
+        let layers_dir = base.join("layers");
+        let rootfs_dir = base.join("rootfs");
+        fs::create_dir_all(&layers_dir).unwrap();
+        fs::create_dir_all(&rootfs_dir).unwrap();
+        fs::write(layers_dir.join("layer.blob"), b"compressed layer").unwrap();
+        fs::write(rootfs_dir.join("merged.txt"), b"merged rootfs").unwrap();
+
+        remove_registry_layer_staging(&base)
+            .await
+            .expect("remove layer staging");
+
+        assert!(!layers_dir.exists());
+        assert_eq!(
+            fs::read(rootfs_dir.join("merged.txt")).unwrap(),
+            b"merged rootfs"
+        );
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

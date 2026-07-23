@@ -27,6 +27,16 @@ pub const LABEL_SANDBOX_NAME: &str = "openshell.ai/sandbox-name";
 /// Container/pod label carrying the sandbox namespace.
 pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
 
+/// Container/pod label carrying the sandbox workspace.
+pub const LABEL_SANDBOX_WORKSPACE: &str = "openshell.ai/sandbox-workspace";
+
+/// Label selector that matches all OpenShell-managed resources which carry a
+/// sandbox ID label.  Used by list and watch operations to exclude foreign
+/// resources from the same namespace.
+pub fn openshell_sandbox_label_selector() -> String {
+    format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE},{LABEL_SANDBOX_ID}")
+}
+
 // ---------------------------------------------------------------------------
 
 /// Path to the sandbox supervisor binary inside the container image.

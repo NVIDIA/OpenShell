@@ -633,10 +633,16 @@ endpoints:
   - host: github.com
     port: 443
     protocol: rest
-    access: read-only
     enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "**" }
+      - allow: { method: HEAD, path: "**" }
+      - allow: { method: OPTIONS, path: "**" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
 binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]
 ```
+
+The `github.com` git-transport endpoint uses explicit rules instead of the `read-only` preset so HTTPS clone and fetch work out of the box. Git smart HTTP performs a `GET` on `*/info/refs` followed by a `POST` to `*/git-upload-pack`; the read-only preset (`GET`/`HEAD`/`OPTIONS`) blocks that `POST`. The rules permit the read-only methods plus `POST */git-upload-pack` only, so clone and fetch succeed while push (`git-receive-pack`) and other API mutations stay denied. Enabling push requires an explicit policy proposal.
 
 If a sandbox attaches a provider named `work-github`, the effective policy includes a generated provider rule:
 
@@ -670,8 +676,12 @@ network_policies:
       - host: github.com
         port: 443
         protocol: rest
-        access: read-only
         enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "**" }
+          - allow: { method: HEAD, path: "**" }
+          - allow: { method: OPTIONS, path: "**" }
+          - allow: { method: POST, path: "/**/git-upload-pack" }
     binaries:
       - path: /usr/bin/gh
       - path: /usr/local/bin/gh

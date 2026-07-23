@@ -1,11 +1,11 @@
 ---
 name: debug-openshell-cluster
-description: Debug why an OpenShell gateway deployment is unhealthy, unreachable, or unable to create sandboxes. Use when the user has a gateway health failure, Docker/Podman runtime issue, Helm install failure, Kubernetes scheduling issue, TLS secret issue, VM driver issue, or sandbox startup problem. Trigger keywords - debug gateway, gateway failing, deployment failing, helm install failing, cluster health, gateway health, gateway not starting, health check failed, sandbox pending, docker driver, podman driver, vm driver.
+description: Debug why an OpenShell gateway deployment is unhealthy, unreachable, or unable to create sandboxes. Use for gateway health failures, Docker/Podman runtime issues, Helm failures, Kubernetes scheduling, TLS or auth, gateway interceptors, supervisor middleware startup or runtime failures, external compute-driver sockets, VM drivers, or sandbox startup. Trigger keywords - debug gateway, gateway failing, deployment failing, helm install failing, cluster health, gateway health, gateway not starting, health check failed, sandbox pending, docker driver, podman driver, kubernetes driver, external driver, compute driver socket, gateway interceptor, supervisor middleware, middleware failed, vm driver.
 ---
 
 # Debug OpenShell Gateway Deployment
 
-Diagnose a gateway and its selected compute platform. Do not assume OpenShell provisions Kubernetes or runs a k3s container. OpenShell targets a reachable gateway endpoint backed by Docker, Podman, Kubernetes, or the experimental VM driver.
+Diagnose a gateway and its selected compute platform. Do not assume OpenShell provisions Kubernetes or runs a k3s container. OpenShell targets a reachable gateway endpoint backed by Docker, Podman, Kubernetes, the experimental VM driver, or an operator-managed out-of-tree compute driver.
 
 Use `openshell` first to identify the active endpoint. Then use the platform tools that match the gateway's compute driver: `docker`, `podman`, `kubectl`/`helm`, or VM driver logs.
 
@@ -15,7 +15,7 @@ The target deployment flow is:
 
 1. Operator starts or deploys the gateway with system packages, systemd, Helm, or a development task. The CLI does not start, stop, or destroy gateway services.
 2. Operator configures the compute driver.
-3. Operator provides TLS and SSH relay material for the deployment mode.
+3. Operator provides the CLI and supervisor authentication material required by the deployment mode: edge or OIDC user auth, optional CLI mTLS, and gateway-minted sandbox JWTs.
 4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.
 5. The gateway creates sandboxes through the selected compute driver.
 
@@ -25,7 +25,7 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 
 - The `openshell` CLI must be available for endpoint checks.
 - Know the active gateway name and endpoint, or be able to inspect local gateway metadata.
-- Know the compute platform: Docker, Podman, Kubernetes, or VM.
+- Know the compute platform: Docker, Podman, Kubernetes, VM, or an out-of-tree driver.
 - For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
 - For Docker or Podman: the runtime socket must be reachable from the gateway host.
 
@@ -36,15 +36,24 @@ Run diagnostics in order and stop once the root cause is clear.
 ### Step 1: Check CLI Reachability
 
 ```bash
+openshell gateway list --output json
 openshell gateway info
 openshell status
+```
+
+For a one-off endpoint check that bypasses stored gateway selection and metadata:
+
+```bash
+openshell --gateway-endpoint <url> status
 ```
 
 Common findings:
 
 - `No active gateway`: register one with `openshell gateway add <endpoint>`.
 - Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
-- TLS/certificate errors: CLI mTLS bundle does not match the gateway CA, or the gateway is running with unexpected TLS settings.
+- TLS/certificate errors: the endpoint scheme or trust chain is wrong, a local mTLS bundle does not match the gateway CA, or TLS termination does not match the gateway listener.
+- `Unauthenticated` from an edge or OIDC gateway: refresh stored credentials with `openshell gateway login [name]`, then retry. Use `gateway logout` only when intentionally clearing local credentials.
+- A direct development endpoint with a private or self-signed certificate can be isolated with `--gateway-endpoint <url> --gateway-insecure`; do not persist or recommend insecure verification for shared gateways.
 
 ### Step 2: Identify the Compute Platform
 
@@ -56,8 +65,48 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 | Podman | Podman socket, rootless networking, sandbox containers, image pulls. |
 | Kubernetes | Helm release, gateway workload, service, secrets, sandbox pods, events. |
 | VM | VM driver logs, rootfs availability, host virtualization support. |
+| Extension | External driver process, Unix socket ownership/mode, configured driver name, capability handshake, gateway logs. |
 
-### Step 3: Check Docker-Backed Gateways
+### Step 3: Check Gateway Startup Dependencies
+
+Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
+
+For out-of-tree compute drivers, confirm the custom driver name and socket agree across CLI flags or `gateway.toml`, and that the operator-owned driver is running before the gateway starts:
+
+```bash
+rg -n 'compute_drivers|socket_path' /etc/openshell/gateway.toml
+stat /run/openshell/<driver>.sock
+journalctl -u <driver-service> --no-pager --lines=200
+journalctl -u openshell-gateway --no-pager --lines=200
+```
+
+The custom driver name must not be a reserved built-in name (`docker`, `podman`, `kubernetes`, or `vm`). The socket must be accessible only to the intended gateway identity. Check gateway logs for connection errors, `GetCapabilities` failures, or an unexpected advertised driver name. The gateway does not create or supervise out-of-tree driver processes or sockets.
+
+For configured gateway interceptors, inspect `[[openshell.gateway.interceptors]]`, their Unix or network endpoints, and gateway startup logs:
+
+```bash
+rg -n 'interceptors|provider_profile_sources|grpc_endpoint|binding_policy|failure_policy' /etc/openshell/gateway.toml
+stat /run/openshell/interceptors/<name>.sock
+journalctl -u <interceptor-service> --no-pager --lines=200
+journalctl -u openshell-gateway --no-pager --lines=200
+```
+
+The gateway calls each interceptor's `Describe` RPC and validates its manifest at startup. Check for unreachable endpoints, invalid RPC/phase bindings, strict `allowlist` or `exact` mismatches, and `post_commit` bindings that resolve to `fail_closed`. If `provider_profile_sources` names an interceptor, that interceptor must advertise provider-profile capability and return a valid, duplicate-free catalog. A selected interceptor-only source is authoritative; include `builtin` or `user` sources explicitly when composition is intended.
+
+For operator-run supervisor middleware, inspect `[[openshell.supervisor.middleware]]`, service reachability, and both gateway and supervisor logs:
+
+```bash
+rg -n 'supervisor|middleware|grpc_endpoint|max_body_bytes|timeout' /etc/openshell/gateway.toml
+journalctl -u <middleware-service> --no-pager --lines=200
+journalctl -u openshell-gateway --no-pager --lines=200
+openshell logs <sandbox-name> --tail --source sandbox
+```
+
+The middleware service must start before the gateway and be reachable from both the gateway and sandbox supervisors. Gateway startup fails if `Describe` is unavailable, a manifest exposes duplicate `HttpRequest/pre_credentials` bindings, the registration claims the reserved `openshell/` namespace, or body and timeout limits are invalid. Changing a registration requires a gateway restart. A policy update can also fail before persistence if the selected implementation rejects its `network_middlewares` config.
+
+At request time, distinguish an explicit `middleware_denied` result from `middleware_failed`. A denial is always enforced. A failure follows the policy-local `on_error`: `fail_closed` blocks the request, while `fail_open` bypasses only that stage and emits a detection finding. If a running supervisor cannot install a new registry, it preserves its last-known-good generation and emits a configuration failure event.
+
+### Step 4: Check Docker-Backed Gateways
 
 ```bash
 docker info
@@ -110,7 +159,7 @@ For source checkout development, restart the local gateway with:
 mise run gateway:docker
 ```
 
-### Step 4: Check Podman-Backed Gateways
+### Step 5: Check Podman-Backed Gateways
 
 ```bash
 podman info
@@ -126,7 +175,7 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Supervisor cannot call back: check callback endpoint and gateway logs.
 
-### Step 5: Check Kubernetes Helm Gateways
+### Step 6: Check Kubernetes Helm Gateways
 
 ```bash
 helm -n openshell status openshell
@@ -319,7 +368,7 @@ kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-supervisor-networ
 kubectl -n <sandbox-namespace> logs <sandbox-pod> -c agent --tail=200
 ```
 
-### Step 6: Check VM-Backed Gateways
+### Step 7: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:
 
@@ -346,6 +395,13 @@ openshell logs <sandbox-name>
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
+| Edge or OIDC gateway returns `Unauthenticated` | Stored login expired, audience/scopes mismatch, or gateway auth configuration changed | `openshell gateway info`, `openshell gateway login <name>`, gateway auth logs |
+| Gateway fails before serving health after enabling an interceptor | Interceptor endpoint unavailable or manifest/binding validation failed | Gateway and interceptor logs; interceptor socket; `binding_policy`, phases, and failure policy |
+| Provider profiles disappear after enabling an interceptor catalog | `provider_profile_sources` selected only an authoritative interceptor or returned invalid/duplicate IDs | Inspect source list and interceptor `Describe`/catalog logs; include `builtin` and `user` when intended |
+| Gateway fails after registering supervisor middleware | Service unavailable, invalid manifest, duplicate binding, reserved name, or invalid body/timeout limit | Middleware service and gateway logs; `[[openshell.supervisor.middleware]]`; `Describe` response |
+| Policy update rejects `network_middlewares` | Unknown middleware name, implementation-owned config invalid, duplicate order, broad/invalid host selector, or fail-closed coverage of `tls: skip` | Policy error, gateway logs, middleware `ValidateConfig`, selector and order fields |
+| HTTP request returns `middleware_failed` or `middleware_denied` | Selected stage failed or explicitly denied the admitted request | Sandbox OCSF logs; policy-local middleware config; service availability; `on_error` |
+| Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or configured with a reserved/mismatched name | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
@@ -359,7 +415,7 @@ When handing results back to the user, include:
 - Compute platform and driver.
 - Gateway process or workload status.
 - Recent gateway log summary.
-- Missing or malformed TLS or SSH relay material.
+- Missing or malformed TLS, OIDC/mTLS, or sandbox JWT material.
 - Service exposure status.
 - Sandbox workload status.
 - The exact command that failed and the shortest fix.

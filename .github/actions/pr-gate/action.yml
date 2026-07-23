@@ -26,7 +26,7 @@ runs:
     - id: get_pr_info
       if: github.event_name == 'push'
       continue-on-error: true
-      uses: nv-gha-runners/get-pr-info@main
+      uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
     - id: gate
       shell: bash

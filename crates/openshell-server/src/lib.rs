@@ -54,7 +54,7 @@ pub mod tracing_bus;
 mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openshell_core::{ComputeDriverKind, Config, Error, Result};
+use openshell_core::{ComputeDriverKind, Config, Error, ObjectLabels, Result};
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -429,6 +429,8 @@ pub(crate) async fn run_server(
     // shutdown so the running compute state matches the persisted store.
     // Runs before watchers spawn so the watch loop sees the post-resume
     // snapshot on its first poll.
+    ensure_default_workspace(&store).await?;
+
     if let Err(err) = state.compute.resume_persisted_sandboxes().await {
         warn!(error = %err, "Failed to resume persisted sandboxes during startup");
     }
@@ -955,6 +957,65 @@ fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config) {
     }
 }
 
+pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
+    use grpc::workspace::{DEFAULT_WORKSPACE_NAME, WORKSPACE_OBJECT_TYPE};
+    use openshell_core::proto::Workspace;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use prost::Message;
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let workspace = Workspace {
+        metadata: Some(ObjectMeta {
+            id: id.clone(),
+            name: DEFAULT_WORKSPACE_NAME.to_string(),
+            created_at_ms: persistence::current_time_ms(),
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            resource_version: 0,
+            workspace: String::new(),
+            deletion_timestamp_ms: 0,
+        }),
+        status: Some(openshell_core::proto::datamodel::v1::WorkspaceStatus {
+            phase: openshell_core::proto::datamodel::v1::WorkspacePhase::Active.into(),
+        }),
+    };
+
+    let labels_map = workspace.object_labels();
+    let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&labels_map).map_err(|e| Error::Config {
+                message: format!("failed to serialize labels: {e}"),
+            })?,
+        )
+    };
+    match store
+        .put_if(
+            WORKSPACE_OBJECT_TYPE,
+            &id,
+            DEFAULT_WORKSPACE_NAME,
+            "",
+            &workspace.encode_to_vec(),
+            labels_json.as_deref(),
+            persistence::WriteCondition::MustCreate,
+        )
+        .await
+    {
+        Ok(_) => {
+            info!("Created default workspace");
+            Ok(())
+        }
+        Err(persistence::PersistenceError::UniqueViolation { .. }) => {
+            debug!("Default workspace already exists");
+            Ok(())
+        }
+        Err(e) => Err(Error::config(format!(
+            "failed to ensure default workspace: {e}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1089,7 +1150,7 @@ mod tests {
 
     fn service_request(addr: SocketAddr, extra_headers: &[(&str, &str)]) -> String {
         let mut request = format!(
-            "GET / HTTP/1.1\r\nHost: my-sandbox--web.dev.openshell.localhost:{}\r\nConnection: close\r\n",
+            "GET / HTTP/1.1\r\nHost: default--my-sandbox--web.dev.openshell.localhost:{}\r\nConnection: close\r\n",
             addr.port()
         );
         for (name, value) in extra_headers {
@@ -1220,7 +1281,7 @@ mod tests {
         let (addr, shutdown, handle, _tls_dir) =
             start_tls_gateway_listener("127.0.0.1:0", true).await;
         let origin = format!(
-            "http://my-sandbox--web.dev.openshell.localhost:{}",
+            "http://default--my-sandbox--web.dev.openshell.localhost:{}",
             addr.port()
         );
         let response = send_plain_http(

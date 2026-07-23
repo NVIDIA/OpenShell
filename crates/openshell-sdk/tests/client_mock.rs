@@ -27,10 +27,13 @@ use tonic::{Response, Status};
 #[derive(Default)]
 struct MockState {
     last_get_name: Mutex<Option<String>>,
+    last_get_workspace: Mutex<Option<String>>,
     last_create: Mutex<Option<proto::CreateSandboxRequest>>,
     last_delete_name: Mutex<Option<String>>,
+    last_delete_workspace: Mutex<Option<String>>,
     last_list_request: Mutex<Option<proto::ListSandboxesRequest>>,
     last_exec_request: Mutex<Option<proto::ExecSandboxRequest>>,
+    last_workspace_request: Mutex<Option<String>>,
     get_calls: AtomicU32,
     phase_sequence: Vec<proto::SandboxPhase>,
     get_returns_not_found: bool,
@@ -48,6 +51,14 @@ struct TestOpenShell {
 }
 
 fn sandbox_with_phase(name: &str, phase: proto::SandboxPhase) -> proto::Sandbox {
+    sandbox_with_phase_ws(name, phase, "default")
+}
+
+fn sandbox_with_phase_ws(
+    name: &str,
+    phase: proto::SandboxPhase,
+    workspace: &str,
+) -> proto::Sandbox {
     proto::Sandbox {
         metadata: Some(proto::datamodel::v1::ObjectMeta {
             id: format!("id-{name}"),
@@ -56,11 +67,31 @@ fn sandbox_with_phase(name: &str, phase: proto::SandboxPhase) -> proto::Sandbox 
             labels: HashMap::new(),
             annotations: HashMap::new(),
             resource_version: 1,
+            deletion_timestamp_ms: 0,
+            workspace: workspace.to_string(),
         }),
         spec: None,
         status: Some(proto::SandboxStatus {
             phase: phase.into(),
             ..Default::default()
+        }),
+    }
+}
+
+fn workspace_proto(name: &str, phase: proto::datamodel::v1::WorkspacePhase) -> proto::Workspace {
+    proto::Workspace {
+        metadata: Some(proto::datamodel::v1::ObjectMeta {
+            id: format!("ws-{name}"),
+            name: name.to_string(),
+            created_at_ms: 1_000_000,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            resource_version: 1,
+            deletion_timestamp_ms: 0,
+            workspace: String::new(),
+        }),
+        status: Some(proto::datamodel::v1::WorkspaceStatus {
+            phase: phase.into(),
         }),
     }
 }
@@ -127,8 +158,10 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<proto::GetSandboxRequest>,
     ) -> Result<Response<proto::SandboxResponse>, Status> {
-        let name = request.into_inner().name;
+        let req = request.into_inner();
+        let name = req.name;
         *self.state.last_get_name.lock().await = Some(name.clone());
+        *self.state.last_get_workspace.lock().await = Some(req.workspace.clone());
         let count = self.state.get_calls.fetch_add(1, Ordering::SeqCst);
 
         if self.state.get_returns_not_found {
@@ -195,8 +228,9 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<proto::DeleteSandboxRequest>,
     ) -> Result<Response<proto::DeleteSandboxResponse>, Status> {
-        let name = request.into_inner().name;
-        *self.state.last_delete_name.lock().await = Some(name);
+        let req = request.into_inner();
+        *self.state.last_delete_name.lock().await = Some(req.name);
+        *self.state.last_delete_workspace.lock().await = Some(req.workspace);
         Ok(Response::new(proto::DeleteSandboxResponse {
             deleted: true,
         }))
@@ -576,6 +610,77 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<proto::RefreshSandboxTokenResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+
+    async fn create_workspace(
+        &self,
+        request: tonic::Request<proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<proto::CreateWorkspaceResponse>, Status> {
+        let req = request.into_inner();
+        *self.state.last_workspace_request.lock().await = Some(req.name.clone());
+        Ok(Response::new(proto::CreateWorkspaceResponse {
+            workspace: Some(workspace_proto(
+                &req.name,
+                proto::datamodel::v1::WorkspacePhase::Active,
+            )),
+        }))
+    }
+
+    async fn get_workspace(
+        &self,
+        request: tonic::Request<proto::GetWorkspaceRequest>,
+    ) -> Result<Response<proto::GetWorkspaceResponse>, Status> {
+        let name = request.into_inner().name;
+        *self.state.last_workspace_request.lock().await = Some(name.clone());
+        Ok(Response::new(proto::GetWorkspaceResponse {
+            workspace: Some(workspace_proto(
+                &name,
+                proto::datamodel::v1::WorkspacePhase::Active,
+            )),
+        }))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _: tonic::Request<proto::ListWorkspacesRequest>,
+    ) -> Result<Response<proto::ListWorkspacesResponse>, Status> {
+        Ok(Response::new(proto::ListWorkspacesResponse {
+            workspaces: vec![
+                workspace_proto("default", proto::datamodel::v1::WorkspacePhase::Active),
+                workspace_proto("staging", proto::datamodel::v1::WorkspacePhase::Active),
+            ],
+        }))
+    }
+
+    async fn delete_workspace(
+        &self,
+        request: tonic::Request<proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<proto::DeleteWorkspaceResponse>, Status> {
+        *self.state.last_workspace_request.lock().await = Some(request.into_inner().name);
+        Ok(Response::new(proto::DeleteWorkspaceResponse {
+            deleted: true,
+        }))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _: tonic::Request<proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _: tonic::Request<proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _: tonic::Request<proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<proto::ListWorkspaceMembersResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
 }
 
 /// Spin up the mock gateway, return its endpoint URL.
@@ -890,6 +995,163 @@ async fn unauthenticated_without_refresher_surfaces_error() {
         1,
         "exactly one attempt; no retry without a refresher"
     );
+}
+
+// ---- Workspace-scoped client tests ----
+
+#[tokio::test]
+async fn workspace_scoped_create_passes_workspace() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let ws = client.workspace("staging");
+    let spec = SandboxSpec {
+        name: Some("my-box".to_string()),
+        ..Default::default()
+    };
+    let result = ws.create_sandbox(spec).await.unwrap();
+    assert_eq!(result.name, "my-box");
+
+    let observed = state.last_create.lock().await.clone().unwrap();
+    assert_eq!(observed.workspace, "staging");
+}
+
+#[tokio::test]
+async fn workspace_scoped_get_passes_workspace() {
+    let state = Arc::new(MockState {
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let ws = client.workspace("production");
+    let sandbox = ws.get_sandbox("my-box").await.unwrap();
+    assert_eq!(sandbox.name, "my-box");
+
+    let observed_ws = state.last_get_workspace.lock().await.clone();
+    assert_eq!(observed_ws.as_deref(), Some("production"));
+}
+
+#[tokio::test]
+async fn workspace_scoped_list_passes_workspace() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let ws = client.workspace("dev");
+    let items = ws.list_sandboxes(ListOptions::default()).await.unwrap();
+    assert_eq!(items.len(), 2);
+
+    let observed = state.last_list_request.lock().await.clone().unwrap();
+    assert_eq!(observed.workspace, "dev");
+    assert!(!observed.all_workspaces);
+}
+
+#[tokio::test]
+async fn workspace_scoped_delete_passes_workspace() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let ws = client.workspace("staging");
+    let deleted = ws.delete_sandbox("doomed").await.unwrap();
+    assert!(deleted);
+
+    let observed_ws = state.last_delete_workspace.lock().await.clone();
+    assert_eq!(observed_ws.as_deref(), Some("staging"));
+}
+
+#[tokio::test]
+async fn list_sandboxes_all_workspaces_sets_flag() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let items = client
+        .list_sandboxes_all_workspaces(ListOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 2);
+
+    let observed = state.last_list_request.lock().await.clone().unwrap();
+    assert!(observed.all_workspaces);
+    assert!(observed.workspace.is_empty());
+}
+
+// ---- Workspace CRUD tests ----
+
+#[tokio::test]
+async fn create_workspace_returns_ref() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let ws = client
+        .create_workspace("staging", HashMap::new())
+        .await
+        .unwrap();
+    assert_eq!(ws.name, "staging");
+    assert_eq!(ws.phase, "Active");
+
+    let observed = state.last_workspace_request.lock().await.clone();
+    assert_eq!(observed.as_deref(), Some("staging"));
+}
+
+#[tokio::test]
+async fn get_workspace_returns_ref() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let ws = client.get_workspace("production").await.unwrap();
+    assert_eq!(ws.name, "production");
+    assert_eq!(ws.phase, "Active");
+
+    let observed = state.last_workspace_request.lock().await.clone();
+    assert_eq!(observed.as_deref(), Some("production"));
+}
+
+#[tokio::test]
+async fn list_workspaces_returns_all() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let workspaces = client
+        .list_workspaces(ListOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(workspaces.len(), 2);
+    assert_eq!(workspaces[0].name, "default");
+    assert_eq!(workspaces[1].name, "staging");
+}
+
+#[tokio::test]
+async fn delete_workspace_returns_ack() {
+    let state = Arc::new(MockState::default());
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let deleted = client.delete_workspace("doomed").await.unwrap();
+    assert!(deleted);
+
+    let observed = state.last_workspace_request.lock().await.clone();
+    assert_eq!(observed.as_deref(), Some("doomed"));
+}
+
+#[tokio::test]
+async fn sandbox_ref_includes_workspace_field() {
+    let state = Arc::new(MockState {
+        phase_sequence: vec![proto::SandboxPhase::Ready],
+        ..Default::default()
+    });
+    let endpoint = start_mock(state.clone()).await;
+    let client = connect(&endpoint).await;
+
+    let sandbox = client.get_sandbox("my-box").await.unwrap();
+    assert_eq!(sandbox.workspace, "default");
 }
 
 /// Regression (P1): raw RPCs do not drive refresh. A call through the plain

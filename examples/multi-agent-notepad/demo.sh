@@ -14,6 +14,10 @@ DEMO_TOPIC="${DEMO_TOPIC:-How should teams evaluate sandboxed coding agents?}"
 DEMO_AGENT_COUNT="${DEMO_AGENT_COUNT:-5}"
 DEMO_BRANCH="${DEMO_BRANCH:-main}"
 DEMO_RUN_ID="${DEMO_RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+# Sandbox names are capped at 19 characters. Derive a short tag from the
+# run ID for sandbox naming while keeping the full ID for providers and
+# GitHub paths.
+SANDBOX_TAG="${DEMO_RUN_ID:2:12}"  # e.g. "260718-12345" (12 chars)
 DEMO_KEEP_SANDBOXES="${DEMO_KEEP_SANDBOXES:-0}"
 DEMO_CODEX_PROVIDER_NAME="${DEMO_CODEX_PROVIDER_NAME:-codex-oauth-${DEMO_RUN_ID}}"
 DEMO_GITHUB_PROVIDER_NAME="${DEMO_GITHUB_PROVIDER_NAME:-github-memory-${DEMO_RUN_ID}}"
@@ -63,9 +67,9 @@ cleanup() {
 
     if [[ "$DEMO_KEEP_SANDBOXES" != "1" ]]; then
         for i in $(seq 1 "$DEMO_AGENT_COUNT"); do
-            "$OPENSHELL_BIN" sandbox delete "codex-gh-${DEMO_RUN_ID}-a${i}" >/dev/null 2>&1 || true
+            "$OPENSHELL_BIN" sandbox delete "mn-${SANDBOX_TAG}-a${i}" >/dev/null 2>&1 || true
         done
-        "$OPENSHELL_BIN" sandbox delete "codex-gh-${DEMO_RUN_ID}-summary" >/dev/null 2>&1 || true
+        "$OPENSHELL_BIN" sandbox delete "mn-${SANDBOX_TAG}-sum" >/dev/null 2>&1 || true
     else
         printf "\n${YELLOW}Keeping sandboxes because DEMO_KEEP_SANDBOXES=1.${RESET}\n"
     fi
@@ -167,7 +171,7 @@ run_sandbox() {
 run_worker() {
     local index="$1"
     local slice_index=$(( (index - 1) % ${#WORKER_SLICES[@]} ))
-    local name="codex-gh-${DEMO_RUN_ID}-a${index}"
+    local name="mn-${SANDBOX_TAG}-a${index}"
     run_sandbox "$name" worker "$DEMO_GITHUB_OWNER" "$DEMO_GITHUB_REPO" "$DEMO_BRANCH" "$DEMO_RUN_ID" "$index" "$DEMO_AGENT_COUNT" "$DEMO_TOPIC" "${WORKER_SLICES[$slice_index]}"
 }
 
@@ -197,7 +201,7 @@ run_workers() {
 }
 
 run_synthesis() {
-    local name="codex-gh-${DEMO_RUN_ID}-summary"
+    local name="mn-${SANDBOX_TAG}-sum"
     run_sandbox "$name" synthesis "$DEMO_GITHUB_OWNER" "$DEMO_GITHUB_REPO" "$DEMO_BRANCH" "$DEMO_RUN_ID" "0" "$DEMO_AGENT_COUNT" "$DEMO_TOPIC" \
         >"${LOG_DIR}/summary.log" 2>&1 || {
             printf "\n${RED}synthesis failed; log follows:${RESET}\n"

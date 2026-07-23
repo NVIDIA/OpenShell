@@ -37,7 +37,7 @@ async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
     let now_ms = now_ms();
 
     let records = store
-        .list(SshSession::object_type(), 1000, 0)
+        .list_by_type(SshSession::object_type(), 1000, 0)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -87,6 +87,8 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: "default".to_string(),
+                deletion_timestamp_ms: 0,
             }),
             sandbox_id: sandbox_id.to_string(),
             token: id.to_string(),

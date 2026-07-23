@@ -95,6 +95,8 @@ impl OpenShell for TestOpenShell {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: String::new(),
+                deletion_timestamp_ms: 0,
             }),
             ..Sandbox::default()
         };
@@ -117,6 +119,8 @@ impl OpenShell for TestOpenShell {
                 labels: HashMap::new(),
                 resource_version: 0,
                 annotations: HashMap::new(),
+                workspace: String::new(),
+                deletion_timestamp_ms: 0,
             }),
             ..Sandbox::default()
         };
@@ -378,6 +382,8 @@ impl OpenShell for TestOpenShell {
                     labels: HashMap::new(),
                     resource_version: 0,
                     annotations: HashMap::new(),
+                    workspace: String::new(),
+                    deletion_timestamp_ms: 0,
                 }),
                 ..Sandbox::default()
             };
@@ -663,6 +669,55 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn create_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::CreateWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::GetWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspaces(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspacesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspacesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn delete_workspace(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteWorkspaceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteWorkspaceResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn add_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::AddWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::AddWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn remove_workspace_member(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RemoveWorkspaceMemberRequest>,
+    ) -> Result<Response<openshell_core::proto::RemoveWorkspaceMemberResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_workspace_members(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListWorkspaceMembersRequest>,
+    ) -> Result<Response<openshell_core::proto::ListWorkspaceMembersResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 }
@@ -1139,6 +1194,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1146,7 +1202,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
 
     assert!(deleted_names(&server).await.is_empty());
     assert_eq!(
-        load_last_sandbox("openshell").as_deref(),
+        load_last_sandbox("openshell", "default").as_deref(),
         Some("default-command"),
         "default sandboxes should be persisted as last-used"
     );
@@ -1171,6 +1227,7 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1238,6 +1295,7 @@ async fn sandbox_create_sends_driver_config_json() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1299,6 +1357,7 @@ async fn sandbox_create_sends_gpu_default_request() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1333,6 +1392,7 @@ async fn sandbox_create_sends_gpu_count_request() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1368,6 +1428,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
             tty_override: Some(true),
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1413,6 +1474,7 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1454,6 +1516,7 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1487,6 +1550,7 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1517,6 +1581,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1527,7 +1592,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         vec![vec!["ephemeral-command".to_string()]]
     );
     assert_eq!(
-        load_last_sandbox("openshell"),
+        load_last_sandbox("openshell", "default"),
         None,
         "no-keep sandboxes should not be persisted as last-used"
     );
@@ -1551,6 +1616,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
             tty_override: Some(true),
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1561,7 +1627,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         vec![vec!["ephemeral-shell".to_string()]]
     );
     assert_eq!(
-        load_last_sandbox("openshell"),
+        load_last_sandbox("openshell", "default"),
         None,
         "no-keep shell sessions should not be persisted as last-used"
     );
@@ -1584,6 +1650,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1591,7 +1658,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
 
     assert!(deleted_names(&server).await.is_empty());
     assert_eq!(
-        load_last_sandbox("openshell").as_deref(),
+        load_last_sandbox("openshell", "default").as_deref(),
         Some("persistent-keep"),
         "persistent sandboxes should remain selectable as last-used"
     );
@@ -1619,6 +1686,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
             command: &["echo".into(), "OK".into()],
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await
@@ -1646,9 +1714,16 @@ async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails(
     drop(listener);
 
     let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    run::sandbox_forward(&server.endpoint, "owned-forward", &spec, true, &tls)
-        .await
-        .expect("background forward should track the owned SSH child without PID discovery");
+    run::sandbox_forward(
+        &server.endpoint,
+        "owned-forward",
+        &spec,
+        true,
+        &tls,
+        "default",
+    )
+    .await
+    .expect("background forward should track the owned SSH child without PID discovery");
     let record = openshell_core::forward::read_forward_pid("owned-forward", forward_port)
         .expect("owned background forward should write a PID file");
 
@@ -1676,9 +1751,16 @@ async fn sandbox_forward_foreground_fails_when_ssh_exits_before_listener_opens()
     drop(listener);
 
     let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    let err = run::sandbox_forward(&server.endpoint, "foreground-forward", &spec, false, &tls)
-        .await
-        .expect_err("foreground forward should fail when ssh exits before listener readiness");
+    let err = run::sandbox_forward(
+        &server.endpoint,
+        "foreground-forward",
+        &spec,
+        false,
+        &tls,
+        "default",
+    )
+    .await
+    .expect_err("foreground forward should fail when ssh exits before listener readiness");
     let msg = format!("{err}");
     assert!(
         msg.contains("ssh exited before local forward listener opened"),
@@ -1699,9 +1781,16 @@ async fn sandbox_forward_background_terminates_owned_child_when_listener_never_o
     drop(listener);
 
     let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    let err = run::sandbox_forward(&server.endpoint, "unreachable-forward", &spec, true, &tls)
-        .await
-        .expect_err("background forward should fail when the listener never opens");
+    let err = run::sandbox_forward(
+        &server.endpoint,
+        "unreachable-forward",
+        &spec,
+        true,
+        &tls,
+        "default",
+    )
+    .await
+    .expect_err("background forward should fail when the listener never opens");
     let msg = format!("{err}");
     assert!(
         msg.contains("ssh process started but local forward listener was not reachable"),
@@ -1758,6 +1847,7 @@ async fn sandbox_create_sends_environment_variables() {
             ]),
             ..test_config()
         },
+        "default",
         &tls,
     )
     .await

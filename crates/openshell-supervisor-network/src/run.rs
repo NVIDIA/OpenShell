@@ -83,9 +83,10 @@ pub async fn run_networking(
     sandbox_id: Option<&str>,
     sandbox_name: Option<&str>,
     openshell_endpoint: Option<&str>,
-    inference_routes: Option<&str>,
+    #[allow(unused_variables)] inference_routes: Option<&str>,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    workspace_rx: tokio::sync::watch::Receiver<String>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -96,6 +97,7 @@ pub async fn run_networking(
         sandbox_name
             .map(str::to_string)
             .or_else(|| sandbox_id.map(str::to_string)),
+        workspace_rx,
     ));
 
     // Readiness signal for the proxy accept loop: the proxy binds the TCP
