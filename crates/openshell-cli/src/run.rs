@@ -2008,8 +2008,8 @@ pub async fn sandbox_create(
     let effective_server = server.to_string();
     let effective_tls = tls.clone();
 
-    // Resolve the --from flag into a container image reference, building from
-    // a Dockerfile first if necessary.
+    // Resolve the `--from` flag into a container image reference, building from
+    // a Dockerfile, Containerfile, or custom build file first if necessary.
     let image: Option<String> = match from {
         Some(val) => {
             let resolved = resolve_from(val)?;
@@ -2535,61 +2535,59 @@ enum ResolvedSource {
     },
 }
 
-/// Classify the `--from` value into an image reference or a Dockerfile that
-/// needs building.
+/// Classify the `--from` value into an image reference or a container build file that
+/// needs building (Dockerfile, Containerfile, or custom build file).
 ///
 /// Resolution order:
-/// 1. Existing file whose name contains "Dockerfile" → build from file.
-/// 2. Existing directory that contains a `Dockerfile` → build from directory.
-/// 3. Missing explicit local paths → local error, not image pull.
-/// 4. Value contains `/`, `:`, or `.` → treat as a full image reference.
-/// 5. Otherwise → community sandbox name, expanded via the registry prefix.
+/// 1. Existing file -> build from file path.
+/// 2. Existing directory containing `Dockerfile` or `Containerfile` -> build from directory.
+/// 3. Missing explicit local paths -> local error, not image pull.
+/// 4. Value contains `/`, `:`, or `.` -> treat as a full image reference.
+/// 5. Otherwise -> community sandbox name, expanded via the registry prefix.
 fn resolve_from(value: &str) -> Result<ResolvedSource> {
     let path = Path::new(value);
 
-    // 1. Existing file that looks like a Dockerfile.
+// 1. Existing file — treat any valid file path as a container build file.
     if path.is_file() {
-        if filename_looks_like_dockerfile(path) {
-            let dockerfile = path
-                .canonicalize()
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
-            let context = dockerfile
-                .parent()
-                .ok_or_else(|| miette::miette!("Dockerfile has no parent directory"))?
-                .to_path_buf();
-            return Ok(ResolvedSource::Dockerfile {
-                dockerfile,
-                context,
-            });
-        }
-
-        if value_looks_like_local_source(value) {
-            return Err(miette::miette!(
-                "local --from file is not a Dockerfile: {}",
-                path.display()
-            ));
-        }
+        let dockerfile = path
+            .canonicalize()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
+        let context = dockerfile
+            .parent()
+            .ok_or_else(|| miette::miette!("file has no parent directory"))?
+            .to_path_buf();
+        return Ok(ResolvedSource::Dockerfile {
+            dockerfile,
+            context,
+        });
     }
 
-    // 2. Existing directory containing a Dockerfile.
+// 2. Existing directory containing a Dockerfile or Containerfile.
     if path.is_dir() {
-        let candidate = path.join("Dockerfile");
-        if candidate.is_file() {
-            let context = path
-                .canonicalize()
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
-            let dockerfile = context.join("Dockerfile");
-            return Ok(ResolvedSource::Dockerfile {
-                dockerfile,
-                context,
-            });
-        }
-        return Err(miette::miette!(
-            "No Dockerfile found in directory: {}",
-            path.display()
-        ));
+        let canonical_context = path
+            .canonicalize()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
+
+        let candidate_dockerfile = canonical_context.join("Dockerfile");
+        let candidate_containerfile = canonical_context.join("Containerfile");
+
+        let dockerfile = if candidate_dockerfile.is_file() {
+            candidate_dockerfile
+        } else if candidate_containerfile.is_file() {
+            candidate_containerfile
+        } else {
+            return Err(miette::miette!(
+                "No Dockerfile or Containerfile found in directory: {}",
+                path.display()
+            ));
+        };
+
+        return Ok(ResolvedSource::Dockerfile {
+            dockerfile,
+            context: canonical_context,
+        });
     }
 
     if path.exists() {
@@ -2604,8 +2602,7 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
     // Docker pull errors.
     if value_looks_like_local_source(value) {
         return Err(miette::miette!(
-            "local --from path does not exist: {}\n\
-             Use an existing Dockerfile, a directory containing Dockerfile, or a container image reference.",
+            "local --from path does not exist: {}\nUse an existing Dockerfile/Containerfile, a directory containing Dockerfile/Containerfile, or a container image path.",
             path.display()
         ));
     }
@@ -2623,7 +2620,10 @@ fn filename_looks_like_dockerfile(path: &Path) -> bool {
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     let lower = name.to_lowercase();
-    lower.contains("dockerfile") || lower.ends_with(".dockerfile")
+    lower.contains("dockerfile") 
+        || lower.ends_with(".dockerfile")
+        || lower.contains("containerfile")
+        || lower.ends_with(".containerfile")
 }
 
 fn value_looks_like_local_source(value: &str) -> bool {
@@ -9559,6 +9559,27 @@ mod tests {
             err.to_string().contains("local --from path does not exist"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_from_accepts_containerfile_and_custom_files() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+
+        // Test direct Containerfile
+        let containerfile = temp.path().join("Containerfile");
+        fs::write(&containerfile, "FROM alpine").unwrap();
+        let res = resolve_from(containerfile.to_str().unwrap()).unwrap();
+        assert!(matches!(res, super::ResolvedSource::Dockerfile { .. }));
+
+        // Test directory containing Containerfile fallback
+        let _dir_res = resolve_from(temp.path().to_str().unwrap()).unwrap();
+        assert!(matches!(_dir_res, super::ResolvedSource::Dockerfile { .. }));
+
+        // Test arbitrary custom filename (e.g. MyBuild.file)
+        let custom_file = temp.path().join("MyBuild.file");
+        fs::write(&custom_file, "FROM alpine").unwrap();
+        let custom_res = resolve_from(custom_file.to_str().unwrap()).unwrap();
+        assert!(matches!(custom_res, super::ResolvedSource::Dockerfile { .. }));
     }
 
     #[test]
