@@ -89,7 +89,10 @@ pub fn find_endpoint_ambiguities(policy: &SandboxPolicy) -> Vec<EndpointAmbiguit
             }
 
             let mut conflicts = connection_conflicts(left.endpoint, right.endpoint);
-            if path_patterns_overlap(&left.endpoint.path, &right.endpoint.path) {
+            if endpoint_contributes_request_pipeline_metadata(left.endpoint)
+                && endpoint_contributes_request_pipeline_metadata(right.endpoint)
+                && path_patterns_overlap(&left.endpoint.path, &right.endpoint.path)
+            {
                 conflicts.extend(request_pipeline_conflicts(left.endpoint, right.endpoint));
             }
             if conflicts.is_empty() {
@@ -177,6 +180,15 @@ fn connection_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<
         &right.advisor_proposed,
     );
     conflicts
+}
+
+/// Keep request-pipeline ambiguity checks aligned with Rego's
+/// `endpoint_has_extended_config` predicate. Plain L4 endpoints authorize a
+/// destination but do not participate in endpoint-config selection, so they
+/// cannot compete with the single L7/connection-config endpoint selected for
+/// that request.
+fn endpoint_contributes_request_pipeline_metadata(endpoint: &NetworkEndpoint) -> bool {
+    !endpoint.protocol.is_empty() || !endpoint.allowed_ips.is_empty() || !endpoint.tls.is_empty()
 }
 
 fn request_pipeline_conflicts(left: &NetworkEndpoint, right: &NetworkEndpoint) -> Vec<String> {
@@ -503,6 +515,16 @@ mod tests {
         let mut right = left.clone();
         left.access = "read-only".to_string();
         right.access = "read-write".to_string();
+
+        assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
+    }
+
+    #[test]
+    fn plain_l4_endpoint_does_not_compete_with_l7_endpoint_metadata() {
+        let left = endpoint("api.example.com", 443);
+        let mut right = endpoint("api.example.com", 443);
+        right.protocol = "rest".to_string();
+        right.enforcement = "enforce".to_string();
 
         assert!(find_endpoint_ambiguities(&policy_with(left, right)).is_empty());
     }

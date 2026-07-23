@@ -86,11 +86,10 @@ fn build_bypass_ocsf_events(
     let hint = hint_for_event(event);
     let reason = "direct connection bypassed HTTP CONNECT proxy";
     let dst_port = event.dst_port.to_string();
-    let dst_ep = if let Ok(ip) = event.dst_addr.parse::<std::net::IpAddr>() {
-        Endpoint::from_ip(ip, event.dst_port)
-    } else {
-        Endpoint::from_domain(&event.dst_addr, event.dst_port)
-    };
+    let dst_ep = event.dst_addr.parse::<std::net::IpAddr>().map_or_else(
+        |_| Endpoint::from_domain(&event.dst_addr, event.dst_port),
+        |ip| Endpoint::from_ip(ip, event.dst_port),
+    );
 
     let net_event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Refuse)

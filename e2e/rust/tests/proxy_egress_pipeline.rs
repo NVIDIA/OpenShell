@@ -64,6 +64,36 @@ async fn run_cli(args: &[&str]) -> Result<String, String> {
     Ok(combined)
 }
 
+async fn wait_for_sandbox_logs(
+    sandbox_name: &str,
+    expected: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    loop {
+        let logs = run_cli(&[
+            "logs",
+            sandbox_name,
+            "-n",
+            "500",
+            "--since",
+            "2m",
+            "--source",
+            "sandbox",
+        ])
+        .await?;
+        if expected(&logs) {
+            return Ok(logs);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for expected sandbox logs:\n{logs}"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 async fn delete_provider(name: &str) {
     let mut cmd = openshell_cmd();
     cmd.args(["provider", "delete", name])
@@ -1023,16 +1053,12 @@ async fn ambiguous_policy_update_fails_closed_without_contacting_upstream() {
         "quarantined requests must not contact the upstream server"
     );
 
-    let logs = run_cli(&[
-        "logs",
-        &guard.name,
-        "-n",
-        "500",
-        "--since",
-        "2m",
-        "--source",
-        "sandbox",
-    ])
+    let logs = wait_for_sandbox_logs(&guard.name, |logs| {
+        logs.contains("configured_mode=fail_closed effective_mode=fail_closed")
+            && logs.contains("previous policy IS NOT active")
+            && logs.contains("conflicting metadata")
+            && logs.contains("tls")
+    })
     .await
     .expect("fetch sandbox logs after rejection");
     assert!(
@@ -1455,16 +1481,11 @@ print("UNINSPECTABLE_MIDDLEWARE_BLOCKED")
         "uninspectable payload reached upstream before middleware denial"
     );
 
-    let logs = run_cli(&[
-        "logs",
-        &guard.name,
-        "-n",
-        "500",
-        "--since",
-        "2m",
-        "--source",
-        "sandbox",
-    ])
+    let logs = wait_for_sandbox_logs(&guard.name, |logs| {
+        logs.contains("openshell.middleware.traffic_uninspectable")
+            && logs
+                .contains("Unsupported tunnel protocol cannot be inspected by required middleware")
+    })
     .await
     .expect("fetch sandbox logs after middleware denial");
     assert!(

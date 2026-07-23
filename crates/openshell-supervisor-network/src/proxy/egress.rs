@@ -91,6 +91,7 @@ impl EgressIntent {
 pub(super) enum IdentityUnavailableReason {
     EndpointOnlyMode,
     LookupFailed,
+    #[cfg(not(target_os = "linux"))]
     UnsupportedPlatform,
 }
 

@@ -102,7 +102,9 @@ The supervisor validates complete effective policy generations before
 activation. Overlapping endpoint selectors may contribute request allow and
 deny rules only when their connection and request-processing metadata agree;
 conflicting TLS, destination, credential, parser, or enforcement metadata
-rejects the complete generation.
+rejects the complete generation. Plain L4 endpoints do not contribute
+request-processing metadata, so they may overlap an L7 endpoint when their
+connection metadata agrees.
 
 The `[openshell.gateway] policy_validation_failure_mode` configuration controls
 rejected generations. It defaults to `fail_closed`, which publishes a quarantine
