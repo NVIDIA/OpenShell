@@ -1224,10 +1224,21 @@ async fn explicit_allowed_ips_and_implicit_ip_literals_succeed_through_both_adap
         .lines()
         .find_map(|line| line.trim().strip_prefix("GATEWAY_IP="))
         .expect("sandbox gateway IPv4 output")
-        .to_string();
-    gateway_ip
         .parse::<std::net::Ipv4Addr>()
-        .expect("host gateway must resolve to IPv4 for this Docker e2e");
+        .expect("host gateway must resolve to IPv4 for this e2e");
+
+    // Rootless Podman with pasta exposes its trusted host-gateway alias as a
+    // link-local address. The hostname receives a narrow runtime exemption,
+    // but the equivalent raw IP literal must remain hard-blocked. Other
+    // drivers still exercise the successful IP-literal path below.
+    if gateway_ip.is_loopback() || gateway_ip.is_link_local() || gateway_ip.is_unspecified() {
+        eprintln!(
+            "skipping IP-literal success assertions: host gateway {gateway_ip} is always blocked"
+        );
+        return;
+    }
+
+    let gateway_ip = gateway_ip.to_string();
 
     let explicit_server = KeepAliveHttpServer::start()
         .await
