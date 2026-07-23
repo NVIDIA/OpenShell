@@ -3,7 +3,11 @@
 
 #![cfg(feature = "e2e")]
 
-//! E2E test: build a custom container image and run a sandbox with it.
+//! E2E test: verify Docker and Podman inject an identity into a userless image.
+//!
+//! This target is intentionally scoped to the local container drivers changed
+//! by this feature. Cross-driver coverage also requires driver-specific image
+//! provisioning for VM and Kubernetes and belongs in a shared conformance test.
 //!
 //! Prerequisites:
 //! - A running Docker- or Podman-backed OpenShell gateway
@@ -49,8 +53,9 @@ async fn assert_userless_image(image: &str) {
     guard.cleanup().await;
 }
 
-/// Docker's local Dockerfile builder provides the image directly to a Docker
-/// gateway, so this path uses the CLI's standard `--from Dockerfile` flow.
+/// Verify Docker injects the configured identity without a passwd/group entry.
+/// Docker's local builder provides the image directly to the gateway, so this
+/// path uses the CLI's standard `--from Dockerfile` flow.
 #[cfg(feature = "e2e-docker")]
 #[tokio::test]
 async fn docker_sandbox_from_userless_dockerfile() {
@@ -75,6 +80,7 @@ async fn docker_sandbox_from_userless_dockerfile() {
     guard.cleanup().await;
 }
 
+/// Verify Podman injects the configured identity without a passwd/group entry.
 /// Podman has its own local image store, so build the shared fixture with the
 /// selected engine instead of relying on Docker's `--from Dockerfile` path.
 #[cfg(all(feature = "e2e-podman", not(feature = "e2e-docker")))]
