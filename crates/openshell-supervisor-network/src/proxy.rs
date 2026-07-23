@@ -733,8 +733,9 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    let peer_addr = client.peer_addr().into_diagnostic()?;
-    let local_addr = client.local_addr().into_diagnostic()?;
+    let workload_addr = client.peer_addr().into_diagnostic()?;
+    let proxy_addr = client.local_addr().into_diagnostic()?;
+    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
 
     // Evaluate OPA policy with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
@@ -745,8 +746,7 @@ async fn handle_tcp_connection(
     let host_clone = host_lc.clone();
     let decision = tokio::task::spawn_blocking(move || {
         evaluate_opa_tcp(
-            peer_addr,
-            local_addr,
+            connection,
             &opa_clone,
             &cache_clone,
             &pid_clone,
@@ -804,7 +804,7 @@ async fn handle_tcp_connection(
             .severity(SeverityId::Medium)
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
             .actor_process(
                 Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                     .with_cmd_line(&cmdline_str),
@@ -887,7 +887,7 @@ async fn handle_tcp_connection(
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -941,7 +941,7 @@ async fn handle_tcp_connection(
                                 .severity(SeverityId::Medium)
                                 .status(StatusId::Failure)
                                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                                .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                                 .actor_process(
                                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                         .with_cmd_line(&cmdline_str),
@@ -989,7 +989,7 @@ async fn handle_tcp_connection(
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -1041,7 +1041,7 @@ async fn handle_tcp_connection(
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -1091,7 +1091,7 @@ async fn handle_tcp_connection(
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -1146,7 +1146,7 @@ async fn handle_tcp_connection(
             .severity(SeverityId::High)
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
             .actor_process(
                 Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                     .with_cmd_line(&cmdline_str),
@@ -1202,7 +1202,7 @@ async fn handle_tcp_connection(
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
             .actor_process(
                 Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                     .with_cmd_line(&cmdline_str),
@@ -1395,7 +1395,7 @@ async fn handle_tcp_connection(
                 .severity(SeverityId::High)
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                 .actor_process(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
@@ -1518,7 +1518,7 @@ async fn handle_tcp_connection(
                 .severity(SeverityId::Medium)
                 .status(StatusId::Failure)
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .src_endpoint_addr(workload_addr.ip(), workload_addr.port())
                 .actor_process(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
@@ -1719,18 +1719,16 @@ fn collect_ancestor_identities(start_pid: u32, stop_pid: u32) -> Vec<(u32, PathB
 #[cfg(target_os = "linux")]
 fn resolve_process_identity(
     entrypoint_pid: u32,
-    peer_addr: SocketAddr,
-    proxy_addr: SocketAddr,
+    connection: crate::procfs::WorkloadProxyTcpConnection,
     identity_cache: &BinaryIdentityCache,
 ) -> std::result::Result<ResolvedIdentity, IdentityError> {
-    let socket_owners =
-        crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, peer_addr, proxy_addr)
-            .map_err(|e| IdentityError {
-                reason: format!("failed to resolve peer binary: {e}"),
-                binary: None,
-                binary_pid: None,
-                ancestors: vec![],
-            })?;
+    let socket_owners = crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, connection)
+        .map_err(|e| IdentityError {
+        reason: format!("failed to resolve peer binary: {e}"),
+        binary: None,
+        binary_pid: None,
+        ancestors: vec![],
+    })?;
 
     let mut identities = Vec::with_capacity(socket_owners.owners.len());
     for owner in &socket_owners.owners {
@@ -1789,8 +1787,7 @@ fn resolve_process_identity(
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
 #[cfg(target_os = "linux")]
 fn evaluate_opa_tcp(
-    peer_addr: SocketAddr,
-    proxy_addr: SocketAddr,
+    connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     identity_cache: &BinaryIdentityCache,
     entrypoint_pid: &AtomicU32,
@@ -1837,12 +1834,7 @@ fn evaluate_opa_tcp(
     };
 
     let total_start = std::time::Instant::now();
-    let identity = match resolve_process_identity(
-        proc_net_anchor_pid,
-        peer_addr,
-        proxy_addr,
-        identity_cache,
-    ) {
+    let identity = match resolve_process_identity(proc_net_anchor_pid, connection, identity_cache) {
         Ok(id) => id,
         Err(err) => {
             return deny(
@@ -1945,8 +1937,7 @@ fn evaluate_endpoint_only_opa(engine: &OpaEngine, host: &str, port: u16) -> Conn
 /// Non-Linux stub: OPA identity binding requires /proc.
 #[cfg(not(target_os = "linux"))]
 fn evaluate_opa_tcp(
-    _peer_addr: SocketAddr,
-    _proxy_addr: SocketAddr,
+    _connection: crate::procfs::WorkloadProxyTcpConnection,
     engine: &OpaEngine,
     _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
@@ -3653,8 +3644,9 @@ async fn handle_forward_proxy(
         canonicalize_forward_host_header(&buf[..used], &canonical_authority)?;
 
     // 2. Evaluate OPA policy (same identity binding as CONNECT)
-    let peer_addr = client.peer_addr().into_diagnostic()?;
-    let local_addr = client.local_addr().into_diagnostic()?;
+    let workload_addr = client.peer_addr().into_diagnostic()?;
+    let proxy_addr = client.local_addr().into_diagnostic()?;
+    let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
 
     let opa_clone = opa_engine.clone();
     let cache_clone = identity_cache.clone();
@@ -3662,8 +3654,7 @@ async fn handle_forward_proxy(
     let host_clone = host_lc.clone();
     let decision = tokio::task::spawn_blocking(move || {
         evaluate_opa_tcp(
-            peer_addr,
-            local_addr,
+            connection,
             &opa_clone,
             &cache_clone,
             &pid_clone,
@@ -3719,7 +3710,7 @@ async fn handle_forward_proxy(
                         OcsfUrl::new("http", &host_lc, &path, port),
                     ))
                     .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                    .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                    .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                     .actor_process(
                         Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                             .with_cmd_line(&cmdline_str),
@@ -3980,7 +3971,7 @@ async fn handle_forward_proxy(
                     OcsfUrl::new("http", &host_lc, &path, port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                 .actor_process(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
@@ -4222,7 +4213,7 @@ async fn handle_forward_proxy(
                     OcsfUrl::new("http", &host_lc, &path, port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                 .actor_process(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
@@ -4303,7 +4294,7 @@ async fn handle_forward_proxy(
                             OcsfUrl::new("http", &host_lc, &path, port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -4360,7 +4351,10 @@ async fn handle_forward_proxy(
                                     OcsfUrl::new("http", &host_lc, &path, port),
                                 ))
                                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                                .src_endpoint(Endpoint::from_ip(
+                                    workload_addr.ip(),
+                                    workload_addr.port(),
+                                ))
                                 .actor_process(
                                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                         .with_cmd_line(&cmdline_str),
@@ -4412,7 +4406,7 @@ async fn handle_forward_proxy(
                             OcsfUrl::new("http", &host_lc, &path, port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -4469,7 +4463,7 @@ async fn handle_forward_proxy(
                             OcsfUrl::new("http", &host_lc, &path, port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -4523,7 +4517,7 @@ async fn handle_forward_proxy(
                             OcsfUrl::new("http", &host_lc, &path, port),
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                         .actor_process(
                             Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                                 .with_cmd_line(&cmdline_str),
@@ -4598,7 +4592,7 @@ async fn handle_forward_proxy(
                     OcsfUrl::new("http", &host_lc, &path, port),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
                 .actor_process(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
@@ -4805,7 +4799,7 @@ async fn handle_forward_proxy(
                 OcsfUrl::new("http", &host_lc, &path, port),
             ))
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+            .src_endpoint(Endpoint::from_ip(workload_addr.ip(), workload_addr.port()))
             .actor_process(
                 Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                     .with_cmd_line(&cmdline_str),
@@ -9700,7 +9694,7 @@ network_policies:
 
         // 5. Accept on the listener side and capture the peer endpoint.
         listener.set_nonblocking(false).expect("blocking listener");
-        let (mut stream, peer_addr) = match listener.accept() {
+        let (mut stream, workload_addr) = match listener.accept() {
             Ok(pair) => pair,
             Err(e) => {
                 let _ = child.kill();
@@ -9708,6 +9702,7 @@ network_policies:
                 panic!("failed to accept child connection: {e}");
             }
         };
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         // Drain any spurious data; we just need the socket open.
         stream
             .set_read_timeout(Some(Duration::from_millis(50)))
@@ -9734,7 +9729,7 @@ network_policies:
         //    contract: hash the live executable via /proc/<pid>/exe while
         //    returning a clean display path for policy/logging.
         let test_pid = std::process::id();
-        let result = resolve_process_identity(test_pid, peer_addr, proxy_addr, &cache);
+        let result = resolve_process_identity(test_pid, connection, &cache);
         let child_pid = child.id();
 
         // Always clean up the child before asserting so a failure doesn't
@@ -9811,7 +9806,8 @@ network_policies:
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let proxy_addr = listener.local_addr().unwrap();
         let stream = TcpStream::connect(proxy_addr).expect("connect");
-        let peer_addr = stream.local_addr().unwrap();
+        let workload_addr = stream.local_addr().unwrap();
+        let connection = crate::procfs::WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let (_accepted, _) = listener.accept().expect("accept");
 
         let fd = stream.as_raw_fd();
@@ -9867,7 +9863,7 @@ network_policies:
 
         let cache = BinaryIdentityCache::new();
 
-        let mut result = resolve_process_identity(entrypoint_pid, peer_addr, proxy_addr, &cache);
+        let mut result = resolve_process_identity(entrypoint_pid, connection, &cache);
         for _ in 0..10 {
             match &result {
                 Err(err)
@@ -9876,8 +9872,7 @@ network_policies:
                 {
                     // /proc/<pid>/fd scan transiently failed; give procfs time to settle.
                     std::thread::sleep(Duration::from_millis(50));
-                    result =
-                        resolve_process_identity(entrypoint_pid, peer_addr, proxy_addr, &cache);
+                    result = resolve_process_identity(entrypoint_pid, connection, &cache);
                 }
                 Ok(_) => {
                     // On arm64 under heavy CI load the /proc fd scan can transiently
@@ -9885,8 +9880,7 @@ network_policies:
                     // the child as owner and yielding a spurious Ok.  Retry to give
                     // both owners time to appear consistently in /proc/<pid>/fd.
                     std::thread::sleep(Duration::from_millis(50));
-                    result =
-                        resolve_process_identity(entrypoint_pid, peer_addr, proxy_addr, &cache);
+                    result = resolve_process_identity(entrypoint_pid, connection, &cache);
                 }
                 _ => break,
             }

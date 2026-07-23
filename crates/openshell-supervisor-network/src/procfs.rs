@@ -9,8 +9,9 @@
 use miette::Result;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
+use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -40,6 +41,29 @@ pub struct SocketOwner {
 pub struct TcpPeerSocketOwners {
     pub inode: u64,
     pub owners: Vec<SocketOwner>,
+}
+
+/// TCP endpoints for a workload connection accepted by the sandbox proxy.
+///
+/// `/proc/<pid>/net/tcp{,6}` reports the socket from the workload side, so its
+/// local endpoint should match `workload` and its remote endpoint should match
+/// `proxy`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkloadProxyTcpConnection {
+    pub workload: SocketAddr,
+    pub proxy: SocketAddr,
+}
+
+impl WorkloadProxyTcpConnection {
+    pub fn new(workload: SocketAddr, proxy: SocketAddr) -> Self {
+        Self { workload, proxy }
+    }
+}
+
+impl std::fmt::Display for WorkloadProxyTcpConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} -> {}", self.workload, self.proxy)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -123,10 +147,9 @@ pub fn binary_path(pid: i32) -> Result<PathBuf> {
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_binary(
     entrypoint_pid: u32,
-    peer_addr: SocketAddr,
-    proxy_addr: SocketAddr,
+    connection: WorkloadProxyTcpConnection,
 ) -> Result<PathBuf> {
-    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_addr, proxy_addr)?;
+    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, connection)?;
     binary_path(owner.pid.cast_signed())
 }
 
@@ -138,10 +161,9 @@ pub fn resolve_tcp_peer_binary(
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_socket_owners(
     entrypoint_pid: u32,
-    peer_addr: SocketAddr,
-    proxy_addr: SocketAddr,
+    connection: WorkloadProxyTcpConnection,
 ) -> Result<TcpPeerSocketOwners> {
-    let inode = parse_proc_net_tcp(entrypoint_pid, peer_addr, proxy_addr)?;
+    let inode = parse_proc_net_tcp(entrypoint_pid, connection)?;
     let owners = find_socket_inode_owners(inode, entrypoint_pid)?;
     Ok(TcpPeerSocketOwners { inode, owners })
 }
@@ -150,10 +172,9 @@ pub fn resolve_tcp_peer_socket_owners(
 #[cfg(target_os = "linux")]
 fn resolve_single_tcp_peer_owner(
     entrypoint_pid: u32,
-    peer_addr: SocketAddr,
-    proxy_addr: SocketAddr,
+    connection: WorkloadProxyTcpConnection,
 ) -> Result<SocketOwner> {
-    let socket_owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_addr, proxy_addr)?;
+    let socket_owners = resolve_tcp_peer_socket_owners(entrypoint_pid, connection)?;
     match socket_owners.owners.as_slice() {
         [owner] => Ok(owner.clone()),
         owners => {
@@ -177,10 +198,9 @@ fn resolve_single_tcp_peer_owner(
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_identity(
     entrypoint_pid: u32,
-    peer_addr: SocketAddr,
-    proxy_addr: SocketAddr,
+    connection: WorkloadProxyTcpConnection,
 ) -> Result<(PathBuf, u32)> {
-    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_addr, proxy_addr)?;
+    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, connection)?;
     let path = binary_path(owner.pid.cast_signed())?;
     Ok((path, owner.pid))
 }
@@ -303,7 +323,7 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
 /// - State `01` = ESTABLISHED
 /// - Inode is field index 9 (0-indexed)
 #[cfg(target_os = "linux")]
-fn parse_proc_net_tcp(pid: u32, peer_addr: SocketAddr, proxy_addr: SocketAddr) -> Result<u64> {
+fn parse_proc_net_tcp(pid: u32, connection: WorkloadProxyTcpConnection) -> Result<u64> {
     // Check IPv4 first (most common), then IPv6.
     for (suffix, ipv6) in [("tcp", false), ("tcp6", true)] {
         let path = format!("/proc/{pid}/net/{suffix}");
@@ -311,14 +331,13 @@ fn parse_proc_net_tcp(pid: u32, peer_addr: SocketAddr, proxy_addr: SocketAddr) -
             continue;
         };
 
-        if let Some(inode) = find_proc_net_tcp_inode(&content, ipv6, peer_addr, proxy_addr)? {
+        if let Some(inode) = find_proc_net_tcp_inode(&content, ipv6, connection)? {
             return Ok(inode);
         }
     }
 
     Err(miette::miette!(
-        "No ESTABLISHED TCP connection found for {peer_addr} -> {proxy_addr} in /proc/{}/net/tcp{{,6}}",
-        pid
+        "No ESTABLISHED TCP connection found for {connection} in /proc/{pid}/net/tcp{{,6}}"
     ))
 }
 
@@ -326,8 +345,7 @@ fn parse_proc_net_tcp(pid: u32, peer_addr: SocketAddr, proxy_addr: SocketAddr) -
 fn find_proc_net_tcp_inode(
     content: &str,
     ipv6: bool,
-    peer_addr: SocketAddr,
-    proxy_addr: SocketAddr,
+    connection: WorkloadProxyTcpConnection,
 ) -> Result<Option<u64>> {
     for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -342,7 +360,8 @@ fn find_proc_net_tcp_inode(
             continue;
         };
 
-        if socket_addrs_match(local_addr, peer_addr) && socket_addrs_match(remote_addr, proxy_addr)
+        if socket_addrs_match(local_addr, connection.workload)
+            && socket_addrs_match(remote_addr, connection.proxy)
         {
             let inode: u64 = fields[9]
                 .parse()
@@ -831,10 +850,12 @@ mod tests {
   sl  local_address rem_address   st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode\n\
    0: 0100007F:C350 0100007F:1F91 01 00000000:00000000 00:00000000 00000000 1000 0 11111\n\
    1: 0100007F:C350 0100007F:1F90 01 00000000:00000000 00:00000000 00000000 1000 0 22222\n";
-        let peer_addr = "127.0.0.1:50000".parse().unwrap();
-        let proxy_addr = "127.0.0.1:8080".parse().unwrap();
+        let connection = WorkloadProxyTcpConnection::new(
+            "127.0.0.1:50000".parse().unwrap(),
+            "127.0.0.1:8080".parse().unwrap(),
+        );
 
-        let inode = find_proc_net_tcp_inode(content, false, peer_addr, proxy_addr).unwrap();
+        let inode = find_proc_net_tcp_inode(content, false, connection).unwrap();
 
         assert_eq!(inode, Some(22222));
     }
@@ -859,7 +880,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let proxy_addr = listener.local_addr().unwrap();
         let stream = TcpStream::connect(proxy_addr).expect("connect");
-        let peer_addr = stream.local_addr().unwrap();
+        let workload_addr = stream.local_addr().unwrap();
+        let connection = WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let (_accepted, _) = listener.accept().expect("accept");
 
         // libc/syscall FFI requires unsafe
@@ -880,7 +902,7 @@ mod tests {
         let entrypoint_pid = std::process::id();
         let deadline = Instant::now() + Duration::from_secs(5);
         let owners = loop {
-            let owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_addr, proxy_addr)
+            let owners = resolve_tcp_peer_socket_owners(entrypoint_pid, connection)
                 .expect("resolve socket owners");
             let owner_pids = owners
                 .owners
